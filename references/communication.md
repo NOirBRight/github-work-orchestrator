@@ -1,0 +1,70 @@
+# Worker communication protocol
+
+Treat a visible Worker as an independent user-owned Codex task. Do not assume
+that its final answer is automatically returned to the Orchestrator. Combine
+explicit Worker signals with Orchestrator polling.
+
+## Dispatch setup
+
+- Put the Orchestrator task ID in the private Worker prompt as the callback
+  target. Use the delegation `source_thread_id` when it identifies the current
+  Orchestrator.
+- Never publish callback or Worker task IDs, local worktree paths, credentials,
+  or private machine details to GitHub.
+- Tell the Worker to keep its current model and reasoning settings when sending
+  a callback.
+- Keep the full plan, evidence, and completion report in the Worker task. A
+  callback is a short notification, not a second state ledger.
+
+## Required signals
+
+Send each signal once per meaningful transition. Re-send only when its payload
+materially changes.
+
+| Signal | Send when |
+|---|---|
+| `BLOCKED` | Progress requires an Orchestrator decision, new authority, an upstream merge, missing evidence, or resolution of a write-set collision |
+| `PR_OPENED` | The branch is pushed and a PR exists; checks may still be running |
+| `READY_FOR_REVIEW` | The assigned scope and required verification are complete enough for Orchestrator review |
+| `STOPPED` | The Worker is ending without a reviewable result or must hand the work back |
+
+Use this compact payload:
+
+```text
+WORKER_SIGNAL
+- State: BLOCKED | PR_OPENED | READY_FOR_REVIEW | STOPPED
+- Issue: #<number>
+- Branch: <branch>
+- Commit: <sha or none>
+- PR: <URL or none>
+- Verification: <passed, failed, pending, or not run>
+- Hotset: <owned files/components>
+- Blocker/next action: <concise request or handoff>
+```
+
+Do not include secrets, raw traces, user content, or local paths. Put detailed
+test output and evidence in the Worker task or authorized PR artifacts.
+
+## Delivery and fallback
+
+1. Use native visible-task messaging, such as `send_message_to_thread`, to send
+   the payload to the callback target. Omit model and reasoning overrides.
+2. If reverse messaging is unavailable, write the full final or blocked report
+   in the Worker task and stop cleanly. Do not create a duplicate Orchestrator
+   task or substitute a subagent channel.
+3. Update GitHub only within the Worker's existing authority. Do not add Issue
+   comments merely to emulate task messaging unless the dispatch authorized it.
+4. Do not treat callback delivery failure as permission to merge, close,
+   unassign, or start another GitHub work item.
+
+## Orchestrator responsibilities
+
+- Poll visible tasks and GitHub because reverse delivery can fail or arrive
+  late. Use task status/unread state, task reads, assignees, PRs, and CI.
+- Verify every signal against the Worker task and GitHub before changing
+  lifecycle state, merging, or releasing capacity.
+- Send revisions and decisions back to the same visible task.
+- Decide whether a `BLOCKED` or `STOPPED` task releases its capacity and whether
+  its GitHub claim remains. The Worker does not decide this implicitly.
+- Recompute the ready frontier after a verified completion, merge, blocker
+  change, or released slot. Keep no separate orchestration database.

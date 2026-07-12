@@ -54,6 +54,8 @@ state. Read [references/model-profiles.md](references/model-profiles.md) before
 selecting a worker model. Read
 [references/worker-contract.md](references/worker-contract.md) before creating
 or messaging a worker task. Read
+[references/communication.md](references/communication.md) before dispatching,
+steering, or monitoring visible tasks. Read
 [references/reconciliation.md](references/reconciliation.md) before
 standardizing Issues or applying drift repairs.
 
@@ -148,6 +150,8 @@ Dispatch only after explicit authorization.
 5. Apply the selected model and reasoning level. If task creation cannot honor
    the binding, stop and report the mismatch.
 6. Send the Worker Contract plus the Issue URL and repository-specific rules.
+   Include the Orchestrator task as the callback target and require the signals
+   in the Worker communication protocol.
 
 If visible-task creation tools are unavailable, stop after the GitHub preflight.
 Do not fall back to a subagent as the work-item Worker, a hidden process, or a
@@ -164,6 +168,12 @@ follows:
 - human wait: `ready-for-human`;
 - information wait: `needs-info`;
 - complete: closed Issue after its intended merge and verification.
+
+Require Workers to signal `BLOCKED`, `PR_OPENED`, `READY_FOR_REVIEW`, or
+`STOPPED` to the Orchestrator through native task messaging when available.
+Treat signals as prompts to verify, not as authoritative lifecycle changes.
+Reverse delivery is not guaranteed, so poll visible tasks and GitHub as the
+fallback. Keep callback task IDs out of GitHub.
 
 When a Worker reports completion:
 

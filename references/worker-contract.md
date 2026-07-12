@@ -34,6 +34,8 @@ Include:
 6. Known dependencies and required integration parent.
 7. Targeted and full verification commands.
 8. Required PR target and closing semantics.
+9. The Orchestrator callback task and the required Worker signals from the
+   [communication protocol](communication.md).
 
 Require the Worker to post a short implementation or investigation plan before
 editing. A plan must identify expected writes and flag collisions.
@@ -53,6 +55,14 @@ editing. A plan must identify expected writes and flag collisions.
   the model binding is unavailable, or required authority is missing.
 - For investigations, keep production behavior unchanged unless implementation
   was explicitly assigned.
+
+## Worker signals
+
+Send `BLOCKED`, `PR_OPENED`, `READY_FOR_REVIEW`, and `STOPPED` signals to the
+Orchestrator as defined in [communication.md](communication.md). Use native
+visible-task messaging when available and keep the current model settings.
+Always leave the full evidence in this visible task; a callback is only a
+concise notification.
 
 ## Completion report
 
