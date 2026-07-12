@@ -104,16 +104,28 @@ client-side ID or creates a worktree but no real task/rollout materializes:
 2. If the same task fails again before producing a meaningful response, stop
    retrying that session. Use a native visible-task fork or handoff to create
    one successor on the same worktree/branch when supported.
-3. Archive or otherwise stop the failed predecessor before the successor edits.
-   Verify that exactly one visible task remains active for the Issue.
-4. Tell the successor to inspect `git status` and the current diff before
+3. Before archiving any task that is the sole durable owner of uncommitted
+   work, protect that work from client cleanup. A same-directory fork is not a
+   durable backup when archiving either task may remove the shared worktree.
+   While every Worker is idle and no concurrent edit can occur, create a
+   scoped checkpoint commit on the existing feature branch, verify it contains
+   no transient or sensitive artifacts, and push it to the existing remote
+   branch. If the effective permissions or network cannot create and verify
+   that checkpoint, do not archive or clean up the task; stop and report the
+   recovery requirement.
+4. Archive or otherwise stop the failed predecessor only after the worktree is
+   clean or the remote checkpoint is verified. Then allow the successor to
+   edit and verify that exactly one visible task remains active for the Issue.
+5. Tell the successor to inspect `git status` and the current diff before
    continuing so interrupted staged or unstaged work is preserved and reviewed.
-5. Keep the existing Issue claim, branch, PR, callback, model profile, and
+6. Keep the existing Issue claim, branch, PR, callback, model profile, and
    authority boundaries. Do not publish task IDs or host errors to GitHub.
 
-If same-worktree succession is unavailable or unsafe, preserve the branch
-remotely and create one replacement worktree from that branch only after the
-predecessor is inactive. Never run two Workers against one worktree.
+If same-worktree succession is unavailable or unsafe, or if its inherited
+permission profile is too narrow, preserve and verify the branch remotely
+before archiving the sole worktree owner. Create one replacement worktree from
+that branch only after the predecessor is inactive. Never run two Workers
+against one worktree.
 
 ## Orchestrator responsibilities
 
