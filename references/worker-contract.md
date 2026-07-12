@@ -40,6 +40,24 @@ Include:
 Require the Worker to post a short implementation or investigation plan before
 editing. A plan must identify expected writes and flag collisions.
 
+## Task-host permission preflight
+
+Treat permissions as task-host state, not as authority that a Worker prompt can
+grant. Before editing, publishing, or running an expensive suite:
+
+1. Report the effective sandbox and approval profile exposed to the task.
+2. Run `git status --short --branch` in the assigned worktree.
+3. When GitHub access is required, run one read-only identity or repository
+   query such as `gh api user` or `gh repo view`.
+4. Continue only when these commands run without an approval prompt and the
+   effective profile satisfies the dispatch contract. Otherwise send one
+   `BLOCKED` signal and stop before doing work.
+
+Do not use destructive commands, credential changes, or writes outside the
+worktree merely to prove that a broad permission profile exists. If the task
+creation API has no permission field, inherit the user's current project or
+environment setting and verify it through this preflight.
+
 ## Worker behavior
 
 - Preserve unrelated and pre-existing changes.

@@ -149,7 +149,11 @@ Dispatch only after explicit authorization.
    `[#<number>] <issue title>`.
 5. Apply the selected model and reasoning level. If task creation cannot honor
    the binding, stop and report the mismatch.
-6. Send the Worker Contract plus the Issue URL and repository-specific rules.
+6. Require the user-configured task host to provide the requested permission
+   profile. When task creation exposes no permission argument, do not pretend a
+   prompt can grant it; run the Worker Contract's permission preflight and stop
+   if the effective profile is narrower or requests approval.
+7. Send the Worker Contract plus the Issue URL and repository-specific rules.
    Include the Orchestrator task as the callback target and require the signals
    in the Worker communication protocol.
 

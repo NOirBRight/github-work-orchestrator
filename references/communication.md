@@ -23,7 +23,7 @@ materially changes.
 
 | Signal | Send when |
 |---|---|
-| `BLOCKED` | Progress requires an Orchestrator decision, new authority, a proven required upstream merge, missing evidence, or resolution of a merge-base-confirmed write-set collision |
+| `BLOCKED` | Progress requires an Orchestrator decision, new authority, a broader task-host permission profile, a proven required upstream merge, missing evidence, or resolution of a merge-base-confirmed write-set collision |
 | `PR_OPENED` | The branch is pushed and a PR exists; checks may still be running |
 | `READY_FOR_REVIEW` | The assigned scope and required verification are complete enough for Orchestrator review |
 | `STOPPED` | The Worker is ending without a reviewable result or must hand the work back |
