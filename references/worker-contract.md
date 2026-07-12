@@ -48,7 +48,25 @@ editing. A plan must identify expected writes and flag collisions.
 - Stay inside the assigned Issue and worktree.
 - Keep all subagent work subordinate to this task's Issue, branch, worktree, and
   final review. Do not delegate a second GitHub work item through a subagent.
-- Rebase after required upstream seams merge.
+- Rebase or merge an upstream seam only when the assigned work semantically
+  depends on it or a merge-base comparison proves a real write-set collision.
+  An advanced integration branch by itself is not a blocker; evidence work may
+  intentionally preserve its pinned base when the PR remains mergeable.
+- Before reporting an upstream write-set collision, compute one common base and
+  compare each side independently:
+
+  ```text
+  git merge-base HEAD origin/<integration-branch>
+  git diff --name-only <merge-base>..HEAD
+  git diff --cached --name-only
+  git diff --name-only
+  git diff --name-only <merge-base>..origin/<integration-branch>
+  ```
+
+  The Worker-side set is the union of committed, staged, and unstaged paths.
+  Intersect that set with the upstream-only set. Never use
+  `HEAD..origin/<integration-branch>` or a two-branch aggregate diff as proof
+  that independently added files overlap.
 - Use report-only quality gates as reports when repository policy says they are
   non-blocking.
 - Stop and report when acceptance criteria conflict, a blocker is discovered,

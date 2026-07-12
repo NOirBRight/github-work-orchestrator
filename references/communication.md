@@ -23,7 +23,7 @@ materially changes.
 
 | Signal | Send when |
 |---|---|
-| `BLOCKED` | Progress requires an Orchestrator decision, new authority, an upstream merge, missing evidence, or resolution of a write-set collision |
+| `BLOCKED` | Progress requires an Orchestrator decision, new authority, a proven required upstream merge, missing evidence, or resolution of a merge-base-confirmed write-set collision |
 | `PR_OPENED` | The branch is pushed and a PR exists; checks may still be running |
 | `READY_FOR_REVIEW` | The assigned scope and required verification are complete enough for Orchestrator review |
 | `STOPPED` | The Worker is ending without a reviewable result or must hand the work back |
@@ -44,6 +44,12 @@ WORKER_SIGNAL
 
 Do not include secrets, raw traces, user content, or local paths. Put detailed
 test output and evidence in the Worker task or authorized PR artifacts.
+
+For a claimed upstream collision, the Worker task must retain the merge-base,
+the Worker-side path set (committed plus staged plus unstaged), the upstream-only
+path set, and their exact intersection. If the intersection is empty, continue
+without a `BLOCKED` signal unless the work has a separate semantic dependency
+on the upstream change.
 
 ## Delivery and fallback
 
