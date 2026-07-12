@@ -1,6 +1,6 @@
 ---
 name: github-work-orchestrator
-description: Standardize, reconcile, and orchestrate GitHub Issues into safe parallel, sidebar-visible Codex tasks backed by isolated worktrees. Use when Codex needs to normalize an issue backlog, repair labels or native dependencies, correct orchestration drift, compute the ready frontier, bind model profiles, dispatch visible worker tasks with explicit subagent boundaries, monitor issue/PR progress, or refill execution capacity across one or more repositories.
+description: Align project direction, surface architecture decisions, standardize, reconcile, and orchestrate GitHub Issues into safe parallel, sidebar-visible Codex tasks backed by isolated worktrees. Use when Codex needs to run a long-lived execution campaign, discuss gray areas or architecture guardrails, normalize an issue backlog, repair labels or native dependencies, correct orchestration drift, compute the ready frontier, bind model profiles, dispatch visible worker tasks with explicit subagent boundaries, monitor issue/PR progress, or refill execution capacity across one or more repositories.
 ---
 
 # GitHub Work Orchestrator
@@ -37,6 +37,9 @@ assignees, linked PRs, repository instructions, and visible Codex tasks.
 - Use read-only preflight for inspect, plan, review, or audit requests.
 - Treat start, dispatch, continue, run, orchestrate, standardize, reconcile, or
   repair requests as authorization to apply in-scope GitHub corrections.
+- Keep project direction, durable architecture, compatibility policy, and
+  irreversible choices in a human-visible discussion loop. Workers may decide
+  local reversible implementation details, not silently set project policy.
 
 ## Load project policy
 
@@ -52,12 +55,34 @@ Before querying work:
 Read [references/lifecycle.md](references/lifecycle.md) before changing Issue
 state. Read [references/model-profiles.md](references/model-profiles.md) before
 selecting a worker model. Read
+[references/decision-gates.md](references/decision-gates.md) before starting a
+new long-running campaign or resolving a direction or architecture gray area.
+Read
 [references/worker-contract.md](references/worker-contract.md) before creating
 or messaging a worker task. Read
 [references/communication.md](references/communication.md) before dispatching,
 steering, or monitoring visible tasks. Read
 [references/reconciliation.md](references/reconciliation.md) before
 standardizing Issues or applying drift repairs.
+
+## Align direction before sustained execution
+
+At the start of a project, a new Milestone, or a resumed campaign whose prior
+direction is missing or stale, run the direction checkpoint in
+[references/decision-gates.md](references/decision-gates.md). Present the
+maintainer with a concise execution charter and the material unresolved choices
+before the first new scheduling refill. Reuse accepted direction instead of
+asking again on every turn.
+
+Open a discussion gate when a choice would change product direction, a durable
+architecture seam, a public or persisted contract, compatibility policy,
+security posture, or multiple downstream work items. Do not open one for an
+ordinary reversible implementation detail inside a clear Issue contract.
+
+Pause only the affected hotset. Continue independent, already-clear work while
+the discussion is resolved. Record accepted durable decisions in the project's
+existing authoritative Issue, Milestone, domain document, or ADR; do not create
+a second project ledger.
 
 ## Reconcile before scheduling
 
@@ -143,6 +168,7 @@ Dispatch only after explicit authorization.
    - canonical base branch and SHA;
    - proposed feature branch;
    - owned components or hot files;
+   - accepted architecture invariants and decision references;
    - required verification;
    - known blockers and integration parent.
 4. Create one sidebar-visible Codex task with an isolated worktree. Title it
@@ -173,8 +199,9 @@ follows:
 - information wait: `needs-info`;
 - complete: closed Issue after its intended merge and verification.
 
-Require Workers to signal `BLOCKED`, `PR_OPENED`, `READY_FOR_REVIEW`, or
-`STOPPED` to the Orchestrator through native task messaging when available.
+Require Workers to signal `DISCUSSION_REQUIRED`, `BLOCKED`, `PR_OPENED`,
+`READY_FOR_REVIEW`, or `STOPPED` to the Orchestrator through native task
+messaging when available.
 Treat signals as prompts to verify, not as authoritative lifecycle changes.
 Reverse delivery is not guaranteed, so poll visible tasks and GitHub as the
 fallback. Keep callback task IDs out of GitHub.
@@ -187,6 +214,11 @@ When a Worker reports completion:
 4. Recompute the frontier after every merge, blocker change, or released slot.
 5. Start the highest-priority ready non-conflicting task when authorized to
    continue dispatching.
+
+When a Worker reports `DISCUSSION_REQUIRED`, verify that the trigger is
+material, consolidate related choices into one discussion packet, and route it
+through the decision gate. Do not turn routine progress updates into discussion
+traffic.
 
 Never close an Issue merely because a local commit exists. Prefer PR closing
 keywords when the PR fully resolves the Issue.

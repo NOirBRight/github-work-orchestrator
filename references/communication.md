@@ -23,6 +23,7 @@ materially changes.
 
 | Signal | Send when |
 |---|---|
+| `DISCUSSION_REQUIRED` | A material product-direction, architecture, compatibility, security, migration, or cross-Issue choice exceeds the Worker's accepted authority |
 | `BLOCKED` | Progress requires an Orchestrator decision, new authority, a broader task-host permission profile, a proven required upstream merge, missing evidence, or resolution of a merge-base-confirmed write-set collision |
 | `PR_OPENED` | The branch is pushed and a PR exists; checks may still be running |
 | `READY_FOR_REVIEW` | The assigned scope and required verification are complete enough for Orchestrator review |
@@ -32,7 +33,7 @@ Use this compact payload:
 
 ```text
 WORKER_SIGNAL
-- State: BLOCKED | PR_OPENED | READY_FOR_REVIEW | STOPPED
+- State: DISCUSSION_REQUIRED | BLOCKED | PR_OPENED | READY_FOR_REVIEW | STOPPED
 - Issue: #<number>
 - Branch: <branch>
 - Commit: <sha or none>
@@ -41,6 +42,19 @@ WORKER_SIGNAL
 - Hotset: <owned files/components>
 - Blocker/next action: <concise request or handoff>
 ```
+
+For `DISCUSSION_REQUIRED`, replace the final line with:
+
+```text
+- Decision: <one precise choice>
+- Options: <A/B/C with tradeoffs>
+- Recommendation: <preferred path and why>
+- Safe work: <what may continue while waiting>
+```
+
+Use this signal only after checking the accepted Issue, Milestone, domain docs,
+and ADRs. Bundle related choices, recommend a path, and send it once. Do not use
+it for routine implementation details or status updates.
 
 Do not include secrets, raw traces, user content, or local paths. Put detailed
 test output and evidence in the Worker task or authorized PR artifacts.
@@ -91,6 +105,9 @@ predecessor is inactive. Never run two Workers against one worktree.
 - Verify every signal against the Worker task and GitHub before changing
   lifecycle state, merging, or releasing capacity.
 - Send revisions and decisions back to the same visible task.
+- Consolidate related `DISCUSSION_REQUIRED` signals into one maintainer packet,
+  record the accepted decision in the authoritative GitHub or architecture
+  source, and update affected Worker contracts before resuming.
 - Decide whether a `BLOCKED` or `STOPPED` task releases its capacity and whether
   its GitHub claim remains. The Worker does not decide this implicitly.
 - Recompute the ready frontier after a verified completion, merge, blocker

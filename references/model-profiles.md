@@ -7,7 +7,7 @@ changed centrally without relabeling Issues.
 
 | Profile | Default binding | Use for |
 |---|---|---|
-| `orchestrator` | `gpt-5.6-sol / max` | Dependency planning, dispatch, cross-task arbitration, and the most important integration decisions |
+| `orchestrator` | `gpt-5.6-sol / max` | Direction charters, architecture discussion, dependency planning, dispatch, cross-task arbitration, and the most important integration decisions |
 | `core` | `gpt-5.6-terra / max` | Cross-cutting architecture, security, risky core behavior, difficult integration |
 | `evidence` | `gpt-5.6-terra / max` | Protocol research, runtime traces, hard diagnosis, reconciliation |
 | `standard` | `gpt-5.6-luna / max` | Isolated feature or bug implementation with clear acceptance criteria |
@@ -20,6 +20,10 @@ effective tiers: Luna XHigh, Luna Max, Terra Max, and Sol Max. Do not select Sol
 below Max, Terra below Max, or Luna below XHigh by default. Select the
 lowest-cost profile that safely handles the work and escalate only when evidence
 shows that it cannot complete the task.
+
+Keep final synthesis of a direction or architecture discussion on the
+Orchestrator profile. Core Workers and research subagents may prepare evidence
+or options, but they do not silently establish project policy.
 
 Reserve Sol Max for orchestration, maintainer-designated critical work, or an
 explicit escalation after Terra Max fails. Prefer Luna Max for ordinary coding

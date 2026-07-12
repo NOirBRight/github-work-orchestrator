@@ -70,6 +70,20 @@ Dispatch
 Do not publish local worktree paths, Codex task IDs, secrets, credentials, or
 private machine details.
 
+## Decision gates
+
+Keep short, immediately resolved discussion in the visible task. When a
+material direction or architecture gate persists, add one Issue comment with
+the decision packet and replace `ready-for-agent` with `needs-info` for a
+missing policy, evidence, or choice, or with `ready-for-human` for a
+maintainer-only action or approval. The assignee may remain while the visible
+Worker waits, but the Issue is not part of the ready frontier.
+
+After the decision is recorded, update the Issue contract and dependencies,
+restore the appropriate canonical status, and explicitly resume or replace the
+visible Worker. Pause only the affected Issue or hotset; unrelated ready work
+continues. Do not create a discussion-specific label or control Issue.
+
 ## Completion
 
 Use `Closes #<n>` only when the PR satisfies the full Issue. Use `Refs #<n>` for

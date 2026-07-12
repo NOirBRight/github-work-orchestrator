@@ -31,14 +31,17 @@ Include:
 3. Selected model profile and concrete binding.
 4. Base branch/SHA and branch name.
 5. Owned components, expected files, and prohibited hotsets.
-6. Known dependencies and required integration parent.
-7. Targeted and full verification commands.
-8. Required PR target and closing semantics.
-9. The Orchestrator callback task and the required Worker signals from the
+6. Accepted direction, architecture invariants, decision references, and the
+   Worker's local decision authority.
+7. Known dependencies and required integration parent.
+8. Targeted and full verification commands.
+9. Required PR target and closing semantics.
+10. The Orchestrator callback task and the required Worker signals from the
    [communication protocol](communication.md).
 
 Require the Worker to post a short implementation or investigation plan before
-editing. A plan must identify expected writes and flag collisions.
+editing. A plan must identify expected writes, flag collisions, and state
+whether any material decision gate is already visible.
 
 ## Task-host permission preflight
 
@@ -87,6 +90,10 @@ environment setting and verify it through this preflight.
   that independently added files overlap.
 - Use report-only quality gates as reports when repository policy says they are
   non-blocking.
+- Decide reversible local implementation details inside the accepted contract.
+  Do not silently choose project direction, redefine a durable architecture
+  seam, or change public compatibility, security, or migration policy. Send
+  `DISCUSSION_REQUIRED` with a decision packet when those choices arise.
 - Stop and report when acceptance criteria conflict, a blocker is discovered,
   the model binding is unavailable, or required authority is missing.
 - For investigations, keep production behavior unchanged unless implementation
@@ -94,11 +101,11 @@ environment setting and verify it through this preflight.
 
 ## Worker signals
 
-Send `BLOCKED`, `PR_OPENED`, `READY_FOR_REVIEW`, and `STOPPED` signals to the
-Orchestrator as defined in [communication.md](communication.md). Use native
-visible-task messaging when available and keep the current model settings.
-Always leave the full evidence in this visible task; a callback is only a
-concise notification.
+Send `DISCUSSION_REQUIRED`, `BLOCKED`, `PR_OPENED`, `READY_FOR_REVIEW`, and
+`STOPPED` signals to the Orchestrator as defined in
+[communication.md](communication.md). Use native visible-task messaging when
+available and keep the current model settings. Always leave the full evidence
+in this visible task; a callback is only a concise notification.
 
 ## Completion report
 
