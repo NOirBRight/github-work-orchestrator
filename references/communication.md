@@ -63,6 +63,27 @@ on the upstream change.
 4. Do not treat callback delivery failure as permission to merge, close,
    unassign, or start another GitHub work item.
 
+## Task-host recovery
+
+A task-level `systemError`, host disconnect, or failed continuation does not
+change the GitHub claim and is not a repository blocker.
+
+1. Read the task and GitHub state, then attempt one normal continuation when
+   the branch/worktree remains intact.
+2. If the same task fails again before producing a meaningful response, stop
+   retrying that session. Use a native visible-task fork or handoff to create
+   one successor on the same worktree/branch when supported.
+3. Archive or otherwise stop the failed predecessor before the successor edits.
+   Verify that exactly one visible task remains active for the Issue.
+4. Tell the successor to inspect `git status` and the current diff before
+   continuing so interrupted staged or unstaged work is preserved and reviewed.
+5. Keep the existing Issue claim, branch, PR, callback, model profile, and
+   authority boundaries. Do not publish task IDs or host errors to GitHub.
+
+If same-worktree succession is unavailable or unsafe, preserve the branch
+remotely and create one replacement worktree from that branch only after the
+predecessor is inactive. Never run two Workers against one worktree.
+
 ## Orchestrator responsibilities
 
 - Poll visible tasks and GitHub because reverse delivery can fail or arrive
