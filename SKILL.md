@@ -1,6 +1,6 @@
 ---
 name: github-work-orchestrator
-description: Orchestrate GitHub Issues into safe parallel, sidebar-visible Codex tasks backed by isolated worktrees. Use when Codex needs to inspect or validate an issue queue, compute the ready frontier, classify work and bind model profiles, dispatch visible worker tasks without subagents, monitor issue/PR progress, or refill execution capacity across one or more repositories.
+description: Standardize, reconcile, and orchestrate GitHub Issues into safe parallel, sidebar-visible Codex tasks backed by isolated worktrees. Use when Codex needs to normalize an issue backlog, repair labels or native dependencies, correct orchestration drift, compute the ready frontier, bind model profiles, dispatch visible worker tasks without subagents, monitor issue/PR progress, or refill execution capacity across one or more repositories.
 ---
 
 # GitHub Work Orchestrator
@@ -17,12 +17,13 @@ assignees, linked PRs, repository instructions, and visible Codex tasks.
 - Keep Skill source and releases outside the target repository.
 - Do not create an orchestration database, control Issue, duplicate status
   ledger, dashboard, MCP server, or background daemon.
-- Do not add labels or modify repository policy unless the user explicitly
-  authorizes it.
+- Reuse the repository's canonical labels. Do not create new label vocabulary
+  or modify repository policy unless the user explicitly authorizes it.
 - Preserve dirty working trees. Create new worktrees from the repository's
   documented canonical integration branch and SHA.
-- Use read-only preflight unless the user explicitly asks to start, dispatch,
-  continue, or run work.
+- Use read-only preflight for inspect, plan, review, or audit requests.
+- Treat start, dispatch, continue, run, orchestrate, standardize, reconcile, or
+  repair requests as authorization to apply in-scope GitHub corrections.
 
 ## Load project policy
 
@@ -39,9 +40,11 @@ Read [references/lifecycle.md](references/lifecycle.md) before changing Issue
 state. Read [references/model-profiles.md](references/model-profiles.md) before
 selecting a worker model. Read
 [references/worker-contract.md](references/worker-contract.md) before creating
-or messaging a worker task.
+or messaging a worker task. Read
+[references/reconciliation.md](references/reconciliation.md) before
+standardizing Issues or applying drift repairs.
 
-## Run preflight
+## Reconcile before scheduling
 
 Run the state validator:
 
@@ -57,6 +60,29 @@ python <skill>/scripts/ready_frontier.py --cwd <repository> --json
 
 Both scripts are read-only. Report contradictory state before dispatch. Do not
 silently reinterpret an invalid Issue.
+
+On an authorized orchestration run:
+
+1. Infer the intended dependency graph and Issue contract from Issue bodies,
+   native sub-issues, repository policy, accepted plans, and maintainer
+   instructions.
+2. Build an ephemeral reconciliation command. Do not store another state file
+   in the target repository.
+3. Preview deterministic corrections:
+
+```text
+python <skill>/scripts/reconcile_issue_state.py --cwd <repository> \
+  --repair-safe <explicit status and dependency arguments>
+```
+
+4. Review the preview for semantic ambiguity or destructive edits.
+5. Re-run with `--apply` for unambiguous corrections.
+6. Re-run the validator and frontier. Continue only when there are no errors.
+
+Automatically repeat reconciliation before every scheduling refill. Apply
+safe, idempotent corrections without requesting confirmation again during an
+already-authorized orchestration run. Route ambiguity to `needs-triage` or
+`needs-info`; never conceal it.
 
 For each ready candidate:
 
@@ -94,7 +120,7 @@ evidence but must send it to that owner.
 
 Dispatch only after explicit authorization.
 
-1. Re-run preflight immediately before the first write.
+1. Re-run reconciliation immediately before the dispatch claim.
 2. Claim the Issue using its assignee field. Keep `ready-for-agent` while it is
    active unless repository policy defines another transition.
 3. Post one concise dispatch comment containing:

@@ -14,9 +14,7 @@ from ready_frontier import (
     GhError,
     fetch_issues,
     label_names,
-    native_open_blocker_counts,
     resolve_repo,
-    textual_blockers,
 )
 
 
@@ -46,16 +44,6 @@ def validate(
 ) -> dict[str, Any]:
     resolved_repo = resolve_repo(repo, cwd)
     issues = fetch_issues(resolved_repo, cwd, state="all", limit=limit)
-    states = {int(issue["number"]): str(issue["state"]).upper() for issue in issues}
-    ready_numbers = [
-        int(issue["number"])
-        for issue in issues
-        if str(issue["state"]).upper() == "OPEN"
-        and "ready-for-agent" in label_names(issue)
-    ]
-    native_counts = native_open_blocker_counts(
-        resolved_repo, ready_numbers, cwd
-    )
     findings: list[dict[str, Any]] = []
 
     for issue in issues:
@@ -100,38 +88,6 @@ def validate(
                     f"closed Issue retains active labels: {', '.join(stale)}",
                 )
             )
-
-        if state == "OPEN" and "ready-for-agent" in labels:
-            native_count = native_counts[int(issue["number"])]
-            unresolved_body_refs = (
-                [
-                    ref
-                    for ref in textual_blockers(issue.get("body") or "")
-                    if states.get(ref, "UNKNOWN") != "CLOSED"
-                ]
-                if native_count is None
-                else []
-            )
-            blocker_count = (
-                native_count
-                if native_count is not None
-                else len(unresolved_body_refs)
-            )
-            if blocker_count:
-                if native_count is not None:
-                    detail = f"{native_count} native"
-                else:
-                    detail = "textual " + ", ".join(
-                        f"#{ref}" for ref in unresolved_body_refs
-                    )
-                findings.append(
-                    finding(
-                        "warning",
-                        issue,
-                        "ready-with-blocker",
-                        "ready-for-agent has open blockers: " + detail,
-                    )
-                )
 
     findings.sort(key=lambda item: (item["number"], item["severity"], item["code"]))
     return {

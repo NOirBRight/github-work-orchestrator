@@ -1,4 +1,4 @@
 interface:
   display_name: "GitHub Work Orchestrator"
-  short_description: "Dispatch GitHub issues into safe parallel Codex tasks"
-  default_prompt: "Use $github-work-orchestrator to compute the ready frontier and safely dispatch visible Codex tasks."
+  short_description: "Reconcile and dispatch GitHub Issues as parallel Codex tasks"
+  default_prompt: "Use $github-work-orchestrator to repair Issue drift, compute the ready frontier, and dispatch visible Codex tasks."

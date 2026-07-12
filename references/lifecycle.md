@@ -32,6 +32,10 @@ default. Use native fields:
 Use native issue dependencies for hard blocking edges. A candidate is ready
 only when all blockers are closed.
 
+`ready-for-agent` means the Issue is fully specified; it may still have an open
+native blocker. The frontier excludes it until that blocker closes. Do not
+replace `ready-for-agent` with `needs-info` merely because a dependency is open.
+
 Use sub-issues for real decomposition, not ordinary checklists. Keep a tracking
 Issue open until its required children and decision gates are complete.
 
@@ -78,6 +82,5 @@ Stop dispatch and report:
 - multiple canonical status labels on one open Issue;
 - `ready-for-agent` combined with `needs-info`, `ready-for-human`, or
   `wontfix`;
-- a ready Issue with unresolved blockers;
 - duplicate active workers for one Issue;
 - a closed Issue still presented as ready work.
