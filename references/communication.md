@@ -82,6 +82,23 @@ on the upstream change.
 A task-level `systemError`, host disconnect, or failed continuation does not
 change the GitHub claim and is not a repository blocker.
 
+Creation failure happens before a Worker exists. When task creation returns a
+client-side ID or creates a worktree but no real task/rollout materializes:
+
+1. Confirm absence through the native task list; do not infer success from the
+   worktree alone and do not mark the Issue active.
+2. Preserve the client-side ID privately for diagnosis. Never publish it or a
+   local worktree path to GitHub.
+3. Stop after the first failure and identify a concrete host-startup cause.
+   Make at most one bounded replacement attempt after the cause is removed or
+   isolated, using the bootstrap flow in `worker-contract.md`.
+4. Clean up failed stubs only through a supported native client action, such as
+   the Task archive API or `codex delete`. If both reject a stub because no
+   real session exists, record the client cleanup defect and do not edit
+   Codex's internal databases or claim cleanup.
+5. Ensure the replacement is renamed only after materialization so exactly one
+   canonical `[#<number>] <issue title>` task is active.
+
 1. Read the task and GitHub state, then attempt one normal continuation when
    the branch/worktree remains intact.
 2. If the same task fails again before producing a meaningful response, stop

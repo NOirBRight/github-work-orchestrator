@@ -171,10 +171,14 @@ Dispatch only after explicit authorization.
    - accepted architecture invariants and decision references;
    - required verification;
    - known blockers and integration parent.
-4. Create one sidebar-visible Codex task with an isolated worktree. Title it
-   `[#<number>] <issue title>`.
-5. Apply the selected model and reasoning level. If task creation cannot honor
-   the binding, stop and report the mismatch.
+4. Create one sidebar-visible Codex task with an isolated worktree, using the
+   [reliable materialization flow](references/worker-contract.md#reliable-task-materialization).
+   Do not send the full Worker Contract until a real task ID exists. Title the
+   materialized task `[#<number>] <issue title>`.
+5. Apply the selected Worker model and reasoning level to the first full
+   contract turn. A cheaper bootstrap model is only a host-startup probe and is
+   not the Issue's recorded binding. If the full turn cannot honor the binding,
+   stop and report the mismatch.
 6. Require the user-configured task host to provide the requested permission
    profile. When task creation exposes no permission argument, do not pretend a
    prompt can grant it; run the Worker Contract's permission preflight and stop
@@ -186,6 +190,10 @@ Dispatch only after explicit authorization.
 If visible-task creation tools are unavailable, stop after the GitHub preflight.
 Do not fall back to a subagent as the work-item Worker, a hidden process, or a
 shared working directory. Research assistance does not satisfy dispatch.
+
+If creation returns only a client-side ID and never materializes, do not claim
+the Issue active and do not retry blindly. Follow the communication protocol's
+failed-creation rules before making one bounded replacement attempt.
 
 ## Monitor and refill
 

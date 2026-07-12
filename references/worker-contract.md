@@ -22,6 +22,30 @@ Orchestrator for a new visible task instead of assigning it to a subagent.
 - Target: repository integration branch, not the release branch
 - Scope: one Issue or one explicitly approved tightly coupled unit
 
+## Reliable task materialization
+
+Use two stages when the task host can create a worktree before its conversation
+or rollout is ready:
+
+1. Create the isolated-worktree task at the exact base using a fast,
+   low-cost, verified bootstrap model. Send only
+   `[#<number>] Bootstrap only. Reply exactly READY. Do not use tools.`
+2. Wait for a real task ID to appear in the native task list and for the
+   bootstrap turn to complete. A client-side creation ID or a created worktree
+   alone is not a Worker.
+3. Rename the materialized task to `[#<number>] <issue title>`.
+4. Send the full Worker Contract to that same task with the selected Worker
+   model and reasoning level. This first full turn establishes the recorded
+   binding.
+5. Run the permission preflight before any repository work.
+
+Keep the bootstrap prompt intentionally short and uniquely issue-scoped. Do
+not put the full Issue title or contract in the creation request: a failed
+client stub can otherwise look like a duplicate Worker. If optional startup
+services are suspected of delaying materialization, use a bounded A/B test and
+disable only a proven, non-required service through an authorized, reversible
+configuration change.
+
 ## Initial Worker message
 
 Include:
