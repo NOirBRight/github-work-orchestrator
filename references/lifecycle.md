@@ -44,6 +44,10 @@ top of the Issue body. The frontier script recognizes this fallback.
 
 ## Claim and dispatch
 
+Each claimed work item maps to exactly one sidebar-visible Codex task. Internal
+subagents may assist that task, but they are not claims, workers of record, or
+substitutes for a visible task.
+
 The first orchestration write is the claim:
 
 ```text
@@ -55,7 +59,7 @@ Post one dispatch comment after claiming. Suggested shape:
 ```text
 Dispatch
 - Profile: evidence
-- Model: gpt-5.6-terra / xhigh
+- Model: gpt-5.6-terra / max
 - Base: origin/dev@<sha>
 - Branch: codex/issue-<n>-<slug>
 - Ownership: <components or hot files>

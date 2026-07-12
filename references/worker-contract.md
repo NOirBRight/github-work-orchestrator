@@ -1,7 +1,17 @@
 # Visible Worker Contract
 
 Create one sidebar-visible Codex task per work item in an isolated worktree.
-Never use a subagent as a Worker.
+Never use a subagent as the Worker or dispatch target for a real GitHub work
+item. The visible task is the auditable owner of the Issue, branch, PR, and
+completion evidence.
+
+The visible Worker may use subagents internally for bounded implementation
+slices, research, parallel review, test analysis, or independent verification
+within the same assigned Issue and worktree. The visible Worker partitions
+write sets, integrates and reviews all results, and remains the only Worker of
+record. Subagents do not own GitHub work items or create a separate lifecycle.
+If discovered work is itself a distinct GitHub Issue, return it to the
+Orchestrator for a new visible task instead of assigning it to a subagent.
 
 ## Required task identity
 
@@ -34,6 +44,8 @@ editing. A plan must identify expected writes and flag collisions.
 - Do not merge, reset, force-push, publish, or change Issue state without
   explicit authority.
 - Stay inside the assigned Issue and worktree.
+- Keep all subagent work subordinate to this task's Issue, branch, worktree, and
+  final review. Do not delegate a second GitHub work item through a subagent.
 - Rebase after required upstream seams merge.
 - Use report-only quality gates as reports when repository policy says they are
   non-blocking.

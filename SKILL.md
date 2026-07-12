@@ -1,6 +1,6 @@
 ---
 name: github-work-orchestrator
-description: Standardize, reconcile, and orchestrate GitHub Issues into safe parallel, sidebar-visible Codex tasks backed by isolated worktrees. Use when Codex needs to normalize an issue backlog, repair labels or native dependencies, correct orchestration drift, compute the ready frontier, bind model profiles, dispatch visible worker tasks without subagents, monitor issue/PR progress, or refill execution capacity across one or more repositories.
+description: Standardize, reconcile, and orchestrate GitHub Issues into safe parallel, sidebar-visible Codex tasks backed by isolated worktrees. Use when Codex needs to normalize an issue backlog, repair labels or native dependencies, correct orchestration drift, compute the ready frontier, bind model profiles, dispatch visible worker tasks with explicit subagent boundaries, monitor issue/PR progress, or refill execution capacity across one or more repositories.
 ---
 
 # GitHub Work Orchestrator
@@ -11,7 +11,20 @@ assignees, linked PRs, repository instructions, and visible Codex tasks.
 
 ## Operating boundaries
 
-- Use visible Codex tasks in isolated worktrees. Never substitute subagents.
+- Use one visible Codex task in an isolated worktree for every dispatched or
+  claimed GitHub work item. Never substitute a subagent for that task's
+  identity, ownership, branch, PR, or lifecycle state.
+- The Orchestrator may use subagents for bounded research, inventory,
+  dependency analysis, or model classification that is not itself a claimed
+  GitHub work item. Keep this assistance read-only by default; an explicitly
+  scoped research artifact remains owned and reviewed by the Orchestrator. A
+  research subagent must not claim, mutate lifecycle state, or execute a real
+  GitHub work item.
+- A visible Worker may use subagents internally for bounded implementation
+  slices, research, review, test analysis, or independent checks inside the
+  same assigned Issue and worktree. The visible Worker owns write-set
+  partitioning, integration, and final review, and must not turn a subagent into
+  a hidden implementation stream for another GitHub Issue.
 - Treat Issues, implementation tasks, bugs, investigations, reviews, incidents,
   and releases as work items.
 - Keep Skill source and releases outside the target repository.
@@ -137,7 +150,8 @@ Dispatch only after explicit authorization.
 6. Send the Worker Contract plus the Issue URL and repository-specific rules.
 
 If visible-task creation tools are unavailable, stop after the GitHub preflight.
-Do not fall back to a subagent, hidden process, or shared working directory.
+Do not fall back to a subagent as the work-item Worker, a hidden process, or a
+shared working directory. Research assistance does not satisfy dispatch.
 
 ## Monitor and refill
 
