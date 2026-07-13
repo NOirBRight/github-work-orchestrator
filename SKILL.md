@@ -155,12 +155,10 @@ Before creating or claiming a Worker, follow the authoritative
 activation, and claim order, and
 [task-host recovery](references/communication.md#task-host-recovery).
 
-A dispatch completes only when reconciliation passes; one real task has
-completed the documented materialization/preflight handoff; the GitHub claim
-and dispatch comment have been written; and the Worker has the documented
-branch, hotset, verification, and callback boundaries. If that state is not
-reached, complete the reference's release/rollback path before considering a
-replacement.
+A dispatch completes only when reconciliation passes and the
+[Worker Contract's activation completion criterion](references/worker-contract.md#worker-activation-handoff)
+is met. If it is not met, complete that Contract's release, recovery, or
+safe-stop path before considering a replacement.
 
 ## Monitor and refill
 

@@ -17,7 +17,10 @@ Orchestrator for a new visible task instead of assigning it to a subagent.
 
 - [Required task identity](#required-task-identity)
 - [Reliable task materialization](#reliable-task-materialization)
+- [Replacement gate](#replacement-gate)
 - [Worker activation handoff](#worker-activation-handoff)
+- [Claimed-Worker recovery handoff](#claimed-worker-recovery-handoff)
+- [Claimed-Worker succession handoff](#claimed-worker-succession-handoff)
 - [Initial Worker message](#initial-worker-message)
 - [Task-host permission preflight](#task-host-permission-preflight)
 - [Worker behavior](#worker-behavior)
@@ -36,11 +39,12 @@ Orchestrator for a new visible task instead of assigning it to a subagent.
 ## Reliable task materialization
 
 This section is the single authority for queued-request creation, bootstrap
-eligibility, and no-real-task discovery. Normal materialization enters the
+eligibility, no-real-task discovery, and replacement admission. Record one
+private materialization record that distinguishes the exact original queued
+request from every later recovery candidate Task or request. Never publish
+those identities or any local path to GitHub. Normal materialization enters the
 shared [Worker activation handoff](#worker-activation-handoff) only after a
-real Task passes its bootstrap gate. A real unclaimed Task sent back from
-Existing Worker failure enters that handoff as a fresh no-edit recovery gate;
-it never treats a prior failed bootstrap as passed. Read
+real Task passes its bootstrap gate. Read
 [creation-failure recovery](communication.md#creation-failure-no-worker-exists)
 for orphan-worktree diagnosis, reuse, and cleanup after a creation failure.
 
@@ -63,19 +67,19 @@ placeholder for a queued client request.
    and that maximum. Do not infer a hidden universal timeout or extend the
    recorded bound or read schedule.
 4. Create the isolated-worktree task at that exact base with the recorded
-   eligible bootstrap binding. Send only
+   eligible bootstrap binding and record its exact queued-request identity as
+   the original request. Send only
    `[#<number>] Bootstrap only. Reply exactly READY. Do not use tools.`
-5. Read only at that recorded schedule for a real task ID in the native task
-   list. A client-side creation ID or a created worktree alone is only
-   diagnostic evidence, not a Worker. Do not title an unmaterialized stub.
-6. If no real Task appears before the discovery bound expires, exit only to
-   Creation failure: do not add the assignee or dispatch comment, and preserve
-   the client ID privately. Before that branch may adopt, reuse, clean, or
-   replace its worktree, it must obtain a supported native cancellation or
-   terminal-failure result for that exact queued request and then verify that no
-   real Task appeared. Without that proof, classify ownership as ambiguous and
-   leave the path untouched; a late materialization must remain the only
-   possible editor.
+5. Read only at that recorded schedule for a real Task belonging to the exact
+   original request. A client-side creation ID or a created worktree alone is
+   only diagnostic evidence, not a Worker. Do not title an unmaterialized stub.
+6. If no real Task for the original request appears before the discovery bound
+   expires, exit only to Creation failure: do not add the assignee or dispatch
+   comment, and preserve the original-request identity privately. That branch
+   must prove the original request terminal or cancelled and then prove no real
+   Task for it exists before it touches an orphan. Without that proof, classify
+   ownership as ambiguous and leave the path untouched; a late materialization
+   must remain the only possible editor.
 7. When a real Task appears, record a distinct post-materialization
    bootstrap-turn bound before reading its completion: an absolute UTC deadline
    or maximum number of native turn-state/content checks, plus exact UTC read
@@ -85,74 +89,185 @@ placeholder for a queued client request.
    without error, emit the exact `READY` reply, and leave the real Task idle.
    Do not rename or send a full contract while the turn is pending, errors, or
    omits that exact reply.
-9. If a real Task's bootstrap turn errors, omits `READY`, or does not reach
-   idle before the post-materialization bound expires, leave the Issue
-   unclaimed and exit only to Existing Worker failure.
+9. If the original Task's bootstrap turn errors, omits `READY`, or does not
+   reach idle before the post-materialization bound expires, leave the Issue
+   unclaimed and exit only to Existing Worker failure. Its next safe transition
+   is governed solely by the activation handoff.
 10. Only after the successful bootstrap gate, rename the real task to
     `[#<number>] <issue title>` and enter the shared
     [Worker activation handoff](#worker-activation-handoff).
 
-Before the single permitted replacement, record in the visible Orchestrator
-task the failed observation, the hypothesized startup cause, the authorized
-reversible isolation or remediation, and a named post-remediation probe with
-the result that proves the cause removed or isolated. Do not attempt the
-replacement until that probe produces its recorded proving result. This is a
-procedural gate; the executable alternate-model guard remains residual AC4.
+## Replacement gate
+
+This is the sole authority for a replacement after an original request produced
+no real Task. It applies to every replacement for that dispatch and Issue,
+including one proposed on a fresh worktree path.
+
+1. Before the one permitted replacement, record in the visible Orchestrator
+   task the failed observation, hypothesized startup cause, authorized
+   reversible isolation or remediation, and a named post-remediation probe with
+   the result that proves the cause removed or isolated. Do not attempt a
+   replacement until that probe produces its recorded proving result.
+2. Immediately before every replacement attempt, re-read the supported native
+   terminal or cancelled result for the exact original request and the native
+   task list for a real Task belonging to that original request. Append both
+   exact results to the private materialization record. This request-wide gate
+   applies regardless of the proposed replacement path.
+3. If either result is absent, ambiguous, or no longer terminal, or if the
+   original request has materialized a real Task, make no replacement anywhere.
+   Leave every affected path untouched and route the real Task through the
+   applicable recovery or safe-stop path; never race it with a second editor.
+4. A replacement that passes these gates still must pass normal materialization
+   before it can be a Worker. A failed or completed replacement consumes the
+   one permitted attempt; do not retry the same dispatch path again.
 
 ## Worker activation handoff
 
 This is the sole authority for activating either a normally materialized Task
-or an admitted recovery Task. An unclaimed Task returning after a failed
-bootstrap, full-contract, or preflight gate starts this fresh no-edit
-full-contract/preflight gate; only the final claim-confirmation continuation
+or an admitted recovery Task. Record the activation mode and exact Task,
+branch, base, worktree, and write-boundary identities privately before entry.
+The modes are normal materialization, admitted recovery Task, and one fresh
+unclaimed re-entry. Only the final successful claim-confirmation continuation
 authorizes editing.
 
-1. Record a distinct, concrete full-contract/preflight-turn bound in the
+1. For an unclaimed re-entry, require the prior failed turn to be terminal and
+   the exact Task to be native-idle before entering. Record one fresh no-edit
+   re-entry for that real Task privately. A Task with a recorded re-entry may
+   never re-enter this handoff after another failure.
+2. Record a distinct, concrete full-contract/preflight-turn bound in the
    visible Orchestrator task before sending the contract: an absolute UTC
    deadline or a maximum number of native turn-state checks, plus exact UTC
    read times or a stated cadence and that maximum. Do not extend it or its
    schedule. Its expiration exits only to Existing Worker failure.
-2. Send the full Initial Worker message and Worker Contract to the exact
+3. Send the full Initial Worker message and Worker Contract to the exact
    sidebar-visible Task with the selected model binding and reasoning level.
    For a recovery Task, make the adopted absolute path its only write boundary
    and require the permission/repository preflight to run from that path.
-3. Require a preflight-only turn: the Task runs no edits and emits the exact
+4. Require a preflight-only turn: the Task runs no edits and emits the exact
    marker `PREFLIGHT_READY` only after the required preflight succeeds; it then
    becomes idle. If it cannot run the full contract or preflight, it reports
    the failure without the marker and without editing.
-4. Within the full-contract/preflight-turn bound and its schedule, wait for
+5. Within the full-contract/preflight-turn bound and its schedule, wait for
    native idle/turn completion, then make one authoritative content read to
    confirm the marker and required preflight. An earlier read is not this
    completion read and does not consume it or deadlock activation.
-5. Immediately before the first GitHub lifecycle write, re-run/re-read the
+6. Immediately before the first GitHub lifecycle write, re-run/re-read the
    Issue, the native Task, and worktree ownership. Require the Issue to remain
    open, `ready-for-agent`, unblocked, and unassigned; the exact idle,
    preflight-passed Task to be its unique visible mapping; and the recorded
    branch, base SHA, worktree, and write boundary to be unchanged.
-6. Only after that revalidation, add the GitHub assignee claim. Immediately
-   re-read the Issue and verify that the exact intended assignee is the only
-   claim and that no other pre-claim condition drifted before posting one
-   concise dispatch comment or sending a `CLAIM_CONFIRMED` continuation with
-   the branch, hotset, verification, callback, and write boundaries. Only this
-   continuation authorizes scoped edits.
+7. Only after that revalidation, add the GitHub assignee claim.
+8. Immediately after the claim, re-read and verify all of the following before
+   any dispatch comment: the Issue is still open, ready, unblocked, and claimed
+   only by the intended assignee; the exact native Task still has the recorded
+   completed non-error preflight turn, is idle, and has no conflicting active
+   turn; and the exact worktree, branch, base SHA, write boundary, and unique
+   ownership are unchanged. This is the post-claim full-state verification.
+9. Only after post-claim full-state verification succeeds, write one concise
+   dispatch comment. Record the returned durable comment identity privately,
+   then immediately re-read that exact record to verify the write and its
+   dispatch contents. A write response alone is not success.
+10. Only after that comment readback succeeds, send the exact
+    `CLAIM_CONFIRMED` continuation with the branch, hotset, verification,
+    callback, and write boundaries. Require its native delivery receipt to
+    identify the exact Task. Only this final successful continuation authorizes
+    scoped edits.
 
 If the full-contract/preflight-turn bound expires, the turn errors, the marker
 is absent, or the Task does not become idle, leave the Issue unclaimed and exit
-only to Existing Worker failure. Do not post a dispatch comment. On any
-pre-claim drift, make no GitHub write. On a post-claim race or failed
-verification, re-read the Issue and remove only the exact assignee added by this
-dispatch when that removal is unambiguous and cannot disturb another owner;
-verify the release. Otherwise stop for maintainer review. In every race outcome,
-do not post a dispatch comment, send `CLAIM_CONFIRMED`, or authorize editing.
+to Existing Worker failure. A consumed unclaimed re-entry instead exits to the
+unclaimed safe stop: do not re-enter, authorize no edits, and use a supported
+native deactivation only when it can preserve the exact worktree safely;
+otherwise leave the worktree intact and the Issue unclaimed. On pre-claim drift,
+make no GitHub write and take the same failure exit. On post-claim Task or
+worktree drift before the comment, remove only this dispatch's exact assignee
+when that release is unambiguous, verify the release, and then take the same
+failure exit; otherwise stop for maintainer review.
+
+For dispatch-comment failure, make one authoritative determination of whether
+the exact durable dispatch record exists. If it does not, roll back only this
+dispatch's unambiguous claim and verify the release. If it does, amend that same
+record—not a second comment—to state `DISPATCH_ABORTED: claim released; no
+edits authorized`, verify its readback, then roll back only this dispatch's
+unambiguous claim and verify the release. If the record, reconciliation, or
+release is ambiguous or fails, stop for maintainer review with edits
+unauthorized. For a failed `CLAIM_CONFIRMED` continuation, first determine
+whether its native delivery receipt identifies the exact Task. If it
+definitively does not, perform the same exact-comment abort and claim-release
+path. If the outcome is ambiguous or any reconciliation fails, stop for
+maintainer review; never send a duplicate continuation or authorize edits. If
+Task or worktree drift is found after comment readback or during confirmation,
+use that same exact-comment abort and claim-release path; on any ambiguity,
+stop for maintainer review.
 
 Activation is complete only when one real Worker has the full contract, has
 sent `PREFLIGHT_READY` and become idle, has passed the authoritative preflight
-read and the pre/post-claim race checks, and has received the
+read and the pre/post-claim full-state checks, has a successfully written and
+read-back dispatch comment, and has received the successful
 `CLAIM_CONFIRMED` continuation and exact work boundaries. Never leave a queued
-ID or failed preflight as an Active claim.
+request or failed preflight as an Active claim.
 Keep the bootstrap prompt short and uniquely Issue-scoped. If an optional
 startup service is suspected, use a bounded A/B test and disable it only after
 proof and separate authorization for a reversible change.
+
+## Claimed-Worker recovery handoff
+
+This is the sole authority for resuming the already-claimed Worker before it
+edits again. The recovery evidence and WIP disposition it consumes are defined
+in [Existing Worker failure](communication.md#existing-worker-failure-a-real-worker-exists).
+
+1. Record a distinct recovery-validation bound and scheduled native reads in
+   the visible Orchestrator task before one no-edit recovery continuation.
+2. Require the Worker to record its recovery evidence observable during that
+   turn and emit the literal `RECOVERY_READY`. The marker is not an assertion
+   that the Task will later be idle.
+3. At the scheduled post-turn read, independently verify the exact recovery
+   turn completed without error, the exact marker and evidence are present, and
+   the native Task is then idle. Re-read the Issue claim and exact Task,
+   worktree, branch, and write-boundary ownership before proceeding.
+4. Only after that read succeeds, send `RECOVERY_CONFIRMED` and require its
+   native delivery receipt to identify the same Task. Only that successful
+   continuation authorizes the claimed Worker to resume edits.
+5. If any bound, marker, evidence, Task state, ownership check, or continuation
+   fails, leave edits unauthorized and enter the
+   [Claimed-Worker succession handoff](#claimed-worker-succession-handoff).
+
+## Claimed-Worker succession handoff
+
+This is the sole authority for a successor after a claimed Worker cannot resume.
+It preserves the existing Issue claim; it does not create a second claim or
+dispatch comment. A failed succession handoff ends in a safe stop with edits
+unauthorized.
+
+1. Record a concrete succession-handoff bound and scheduled native reads before
+   taking action. Require the predecessor's latest turn to be terminal, the
+   predecessor to be inactive and unable to edit, and the verified WIP
+   disposition from the recovery evidence before creating or activating a
+   successor.
+2. Establish exactly one successor sidebar-visible Task and worktree owner. It
+   must own no other GitHub work item, branch, PR, or write boundary, and no
+   second successor or editor may remain. Preserve the exact path boundary when
+   the worktree is reused; otherwise preserve and verify the branch before the
+   successor receives its new exact path.
+3. Send that successor the preserved full contract: original model/reasoning
+   binding, Issue claim, callback, hotset, branch, base SHA, PR target, and
+   exact worktree/write boundary. It first runs permission and repository
+   preflight without edits.
+4. During that preflight-only turn, require the successor to record the
+   observable recovery evidence and emit the literal `SUCCESSOR_READY`. The
+   marker does not assert a future idle state.
+5. At the scheduled post-turn read, independently verify the exact successor
+   turn completed without error, its marker and evidence, native idle state,
+   predecessor inactivity, the Issue claim's unique mapping to this successor,
+   and exact Task/worktree/write ownership.
+6. Only after that read succeeds, send `RECOVERY_CONFIRMED` and require its
+   native delivery receipt to identify the successor. Only this final
+   continuation authorizes successor edits.
+
+If any gate fails, do not authorize edits, create another successor, or change
+the Issue claim implicitly. Preserve or leave the worktree according to its
+verified WIP disposition and stop safely for maintainer review when a supported
+deactivation cannot complete.
 
 ## Initial Worker message
 
@@ -171,8 +286,8 @@ Include:
 10. The Orchestrator callback task and the required Worker signals from the
    [communication protocol](communication.md).
 11. During activation, the recorded full-contract/preflight-turn bound and the
-    preflight-only `PREFLIGHT_READY`/idle handshake; editing begins only after
-    the `CLAIM_CONFIRMED` continuation.
+    preflight-only handshake; editing begins only after the activation
+    handoff's final successful continuation.
 
 Require the Worker to post a short implementation or investigation plan before
 editing. A plan must identify expected writes, flag collisions, and state

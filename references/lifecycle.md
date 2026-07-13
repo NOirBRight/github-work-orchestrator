@@ -59,11 +59,15 @@ substitutes for a visible task.
 
 The [Worker Contract](worker-contract.md) is the single authority for task
 creation and preflight ordering. Its
-[materialization flow](worker-contract.md#reliable-task-materialization) owns
-queued-request terminality and no-real-task discovery; its
-[activation handoff](worker-contract.md#worker-activation-handoff) owns all
-real-Worker activation and claim-race checks. It is the only authority for
-dispatch writing and edit authorization; do not recreate or shortcut it here.
+[materialization flow](worker-contract.md#reliable-task-materialization) and
+[replacement gate](worker-contract.md#replacement-gate) own queued-request
+terminality, no-real-task discovery, and replacement admission. Its
+[activation handoff](worker-contract.md#worker-activation-handoff),
+[recovery handoff](worker-contract.md#claimed-worker-recovery-handoff), and
+[succession handoff](worker-contract.md#claimed-worker-succession-handoff) own
+all real-Worker activation, claim-race, recovery, and succession checks. It is
+the only authority for dispatch writing and edit authorization; do not recreate
+or shortcut it here.
 
 Only after the activation handoff authorizes its dispatch comment, use this
 shape:
