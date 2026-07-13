@@ -15,14 +15,16 @@ Orchestrator's scheduling loop. GitHub is the only persistent state source.
 2. Read the shared Issue contract's
    [required content](references/shared/issue-contract.md#required-content) and
    [readiness classification](references/shared/issue-contract.md#readiness-classification).
-3. Read lifecycle [role ownership](references/shared/lifecycle.md#role-ownership)
+3. Read the shared [verification policy](references/shared/verification-policy.md)
+   before assigning an execution class or verification commands.
+4. Read lifecycle [role ownership](references/shared/lifecycle.md#role-ownership)
    before any GitHub write.
-4. When diagnosis requires a code checkout or GitHub tools, read the shared
+5. When diagnosis requires a code checkout or GitHub tools, read the shared
    [permission preflight](references/shared/github-state-rules.md#permission-and-repository-preflight)
    before using them.
-5. Infer the repository from the current checkout or require an explicit
+6. Infer the repository from the current checkout or require an explicit
    repository when no checkout identifies it.
-6. Preserve reporter evidence while excluding credentials, private machine
+7. Preserve reporter evidence while excluding credentials, private machine
    paths, task IDs, and unnecessary personal data.
 
 Intake owns diagnosis, deduplication, contract quality, publication, and
@@ -47,6 +49,24 @@ ambiguity as `DISCUSSION_REQUIRED` instead of deciding it here.
 
 Diagnosis is complete when a fresh Worker can locate the failure boundary or
 the exact missing evidence is named.
+
+## Classify verification without adding acceptance
+
+For every new or materially rewritten Issue, add the v2 execution fields from
+the shared Issue contract. Propose the highest applicable `fast`, `standard`,
+or `strict` class and copy verification commands from repository policy. Do not
+turn model choice, timing targets, or report-only tools into product acceptance.
+
+Compare problem, scope, non-goals, acceptance, hotset, and verification before
+publication. If they conflict, or if the work chooses a public/persisted
+contract, shared architecture seam, security/privacy posture, or migration
+policy, set `Architecture-Decision: discussion-required`, emit
+`DISCUSSION_REQUIRED`, and keep the Issue out of `ready-for-agent`. Intake does
+not resolve the decision itself.
+
+Classification is complete when every required verification is traceable to
+repository policy or an explicit Issue acceptance item and no hidden gate was
+invented.
 
 ## Search before drafting
 

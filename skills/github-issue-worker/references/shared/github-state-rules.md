@@ -18,8 +18,10 @@ Map each claimed GitHub work item to exactly one sidebar-visible Codex task and
 one isolated worktree. The task is the auditable owner of the Issue, branch,
 PR, callback, and completion evidence.
 
-An Orchestrator or Worker may use subagents for bounded research, review, test
-analysis, or implementation slices inside the same owned Issue. A subagent is
+An Orchestrator or Worker may use subagents for bounded research, implementation
+critique, test analysis, or implementation slices inside the same owned Issue.
+Worker assistance is not the formal Standards/Spec review, which remains owned
+by the Orchestrator under the verification policy. A subagent is
 never the visible owner, dispatch target, lifecycle record, or hidden Worker for
 another GitHub work item. Discovered independent work returns to Intake or the
 Orchestrator for its own Issue and visible task.
@@ -68,6 +70,12 @@ editing, publishing, or running an expensive suite:
    query such as `gh api user` or `gh repo view`.
 4. Continue only when the commands require no approval prompt and the effective
    profile satisfies the dispatch contract.
+
+The Worker should use its packaged deterministic preflight script when
+available, passing the task-host's effective permission metadata plus the
+pinned base, integration ref, and assigned branch. The script validates and
+records state; it cannot infer or grant permissions. The Orchestrator validates
+the normalized v2 dispatch contract separately before activation.
 
 On a narrower profile or approval request, send one `BLOCKED` signal and stop
 before work. Do not use destructive commands, credential changes, or writes

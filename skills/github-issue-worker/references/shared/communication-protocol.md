@@ -86,7 +86,12 @@ WORKER_SIGNAL
 - Branch: <branch>
 - Commit: <sha or none>
 - PR: <URL or none>
+- Verification-Class: fast | standard | strict
 - Verification: <passed, failed, pending, or not run>
+- Phase-Timings: plan=<duration>; implementation=<duration>; verification=<duration>; waiting=<duration>
+- Full-Suite-Runs: <count>
+- Review-Runs: 0
+- Scope-Delta: none | <new boundary requiring approval>
 - Hotset: <owned files/components>
 - Blocker/next action: <concise request or handoff>
 ```
@@ -112,6 +117,11 @@ Use:
 
 Do not include secrets, raw private traces, user content, or local paths. Keep
 detailed output in the sender task or authorized PR artifacts.
+
+`Review-Runs` is always `0` in a Worker signal because formal review belongs to
+the Orchestrator. The Orchestrator records its own review count when verifying
+or integrating the PR. Do not repeat unchanged timing or verification data in
+routine chatter.
 
 ## Orchestrator verification
 

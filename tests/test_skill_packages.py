@@ -142,6 +142,45 @@ class SkillPackageTests(unittest.TestCase):
             self.assertIn(required, state_rules)
         self.assertIn("at least ten minutes", communication)
 
+    def test_verification_policy_has_one_review_owner_and_tiered_gates(self) -> None:
+        policy = (ROOT / "shared" / "verification-policy.md").read_text(
+            encoding="utf-8"
+        )
+        worker = (ROOT / "skills/github-issue-worker/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        orchestrator = (
+            ROOT / "skills/github-work-orchestrator/SKILL.md"
+        ).read_text(encoding="utf-8")
+        for verification_class in ("fast", "standard", "strict"):
+            self.assertIn(f"`{verification_class}`", policy)
+        self.assertIn("Review-Owner: orchestrator", policy)
+        self.assertIn("must not run", policy)
+        self.assertIn("Do not invoke the generic `code-review` Skill", worker)
+        self.assertIn("exactly one Orchestrator-owned", orchestrator)
+
+    def test_worker_signal_includes_execution_metrics(self) -> None:
+        protocol = (ROOT / "shared" / "communication-protocol.md").read_text(
+            encoding="utf-8"
+        )
+        for field in (
+            "Verification-Class",
+            "Phase-Timings",
+            "Full-Suite-Runs",
+            "Review-Runs",
+            "Scope-Delta",
+        ):
+            self.assertIn(field, protocol)
+
+    def test_routine_profiles_do_not_default_to_sol_or_max(self) -> None:
+        profiles = (ROOT / "shared" / "model-profiles.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("| `orchestrator` | `gpt-5.6-terra / high`", profiles)
+        self.assertIn("| `architecture` | `gpt-5.6-sol / max`", profiles)
+        self.assertIn("| `standard` | `gpt-5.6-luna / high`", profiles)
+        self.assertIn("Max reasoning is not a routine default", profiles)
+
 
 if __name__ == "__main__":
     unittest.main()

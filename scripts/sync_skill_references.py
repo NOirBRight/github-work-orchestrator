@@ -14,18 +14,21 @@ PACKAGES = {
         "issue-contract.md",
         "lifecycle.md",
         "model-profiles.md",
+        "verification-policy.md",
     ),
     "github-issue-intake": (
         "communication-protocol.md",
         "github-state-rules.md",
         "issue-contract.md",
         "lifecycle.md",
+        "verification-policy.md",
     ),
     "github-issue-worker": (
         "communication-protocol.md",
         "github-state-rules.md",
         "lifecycle.md",
         "model-profiles.md",
+        "verification-policy.md",
     ),
 }
 

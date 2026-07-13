@@ -19,10 +19,18 @@ Before planning or writing:
    [lifecycle](references/shared/lifecycle.md).
 3. Read [model profiles](references/shared/model-profiles.md) before selecting
    a model.
-4. Read [communication protocol](references/shared/communication-protocol.md)
+4. Read [verification policy](references/shared/verification-policy.md) before
+   classifying work, dispatching, or reviewing a PR.
+5. Read [communication protocol](references/shared/communication-protocol.md)
    before dispatching, steering, or monitoring a visible task.
-5. Read [issue contract](references/shared/issue-contract.md) and
+6. Read [issue contract](references/shared/issue-contract.md) and
    [reconciliation](references/reconciliation.md) before repairing Issue state.
+
+Read the detailed [Worker contract](references/worker-contract.md) only when
+materializing, activating, recovering, or replacing a Worker. Read detailed
+[task-host recovery](references/communication.md) only when a Task-host failure
+actually occurs. Do not load these low-frequency references for inventory,
+frontier computation, or routine PR review.
 
 Repository policy overrides this Skill's defaults. The control plane is loaded
 when the repository, integration branch, label vocabulary, and authority
@@ -83,22 +91,34 @@ decision, blocker change, Worker failure, or released slot.
 
 For each candidate, confirm blockers are closed, the Issue is unassigned, the
 contract is fresh-worker-ready, the expected hotset is compatible with active
-ownership, and the model profile is explicit.
+ownership, the v2 verification class/commands are explicit, architecture is
+resolved, and the model profile is explicit. Legacy active work may migrate
+incrementally without restarting.
 
 The frontier is safe when it contains only unassigned, fully specified Issues
 whose blockers are closed and whose expected write sets can run concurrently.
 
 ## Dispatch visible Workers
 
-1. Reconcile immediately before the claim.
-2. Claim the Issue through its assignee field and post one dispatch comment
-   with profile/model, base branch and SHA, feature branch, ownership/hotset,
-   decisions, verification, blockers, and PR target.
-3. Materialize one isolated-worktree task using the two-stage flow in
-   [GitHub state rules](references/shared/github-state-rules.md#reliable-task-materialization).
-4. Send the full assigned-Issue contract only after a real task ID exists.
-   Require `github-issue-worker`, the selected binding, permission preflight,
-   and the exact Orchestrator callback task ID.
+1. Reconcile while the Issue remains unassigned and validate the normalized
+   dispatch payload:
+
+   ```text
+   python <skill>/scripts/validate_execution_contract.py --input <json-file>
+   ```
+
+2. Follow the detailed
+   [Worker contract](references/worker-contract.md) for exact materialization,
+   preflight, claim, dispatch-comment, and edit-authorization order. Do not
+   shorten that safety sequence in prose.
+3. The dispatch payload includes verification class/commands, manual evidence,
+   architecture decision, `Review-Owner: orchestrator`, profile/model, base
+   branch and SHA, feature branch, ownership/hotset, blockers, callback, and PR
+   target.
+4. Materialize one isolated-worktree task using the two-stage flow. Send the
+   full assigned-Issue contract only after a real task ID exists, and require
+   `github-issue-worker`, the selected binding, its deterministic permission
+   preflight, and the exact Orchestrator callback task ID.
 5. Require the Worker to complete the shared
    [delivery handshake](references/shared/communication-protocol.md#delivery-handshake)
    before its final response.
@@ -121,11 +141,19 @@ missing.
 
 When a Worker is ready:
 
-1. Verify scope, base, diff, tests, PR target, and accepted decisions.
-2. Route revisions to the same visible task.
-3. Serialize integration through declared hotsets.
-4. Recompute the frontier after every material event.
-5. Refill the highest-priority non-conflicting lane while authorization remains
+1. Verify scope, base, diff, tests, PR target, accepted decisions, verification
+   class, full-suite count, and the Worker's `Review-Runs: 0` report.
+2. For `fast`, perform one direct scope/acceptance review without a review
+   subagent. For `standard` or `strict`, run exactly one Orchestrator-owned
+   parallel Standards/Spec review using the review model profiles. Treat an
+   already completed in-flight formal review as that one review; do not repeat
+   it solely because this policy was adopted mid-task.
+3. Route revisions to the same visible task. After fixes, review only the
+   changed delta and require targeted checks plus CI. Require another local
+   full suite only when the fix crosses a new repository verification boundary.
+4. Serialize integration through declared hotsets.
+5. Recompute the frontier after every material event.
+6. Refill the highest-priority non-conflicting lane while authorization remains
    active.
 
 Review and refill are complete when every received signal is verified once,

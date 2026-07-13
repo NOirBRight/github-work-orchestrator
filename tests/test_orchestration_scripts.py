@@ -24,6 +24,7 @@ def load_module(name: str):
 
 ready_frontier = load_module("ready_frontier")
 reconcile_issue_state = load_module("reconcile_issue_state")
+validate_issue_state = load_module("validate_issue_state")
 
 
 def issue(
@@ -78,6 +79,42 @@ class ReconciliationParserTests(unittest.TestCase):
     def test_dependency_rejects_self_edge(self) -> None:
         with self.assertRaises(argparse.ArgumentTypeError):
             reconcile_issue_state.parse_edge("12=12")
+
+
+class ExecutionContractParserTests(unittest.TestCase):
+    def test_v2_ready_contract_is_accepted(self) -> None:
+        candidate = issue(
+            6,
+            body="""Execution-Contract: v2
+Verification-Class: fast
+Verification-Commands: python -m pytest tests/unit -q
+Manual-Evidence: none
+Architecture-Decision: resolved
+Review-Owner: orchestrator
+""",
+        )
+        self.assertEqual(
+            [], validate_issue_state.execution_contract_findings(candidate)
+        )
+
+    def test_legacy_contract_is_a_migration_warning(self) -> None:
+        findings = validate_issue_state.execution_contract_findings(issue(7))
+        self.assertEqual(["legacy-execution-contract"], [f["code"] for f in findings])
+        self.assertEqual("warning", findings[0]["severity"])
+
+    def test_open_architecture_decision_is_not_ready(self) -> None:
+        candidate = issue(
+            8,
+            body="""Execution-Contract: v2
+Verification-Class: strict
+Verification-Commands: python -m pytest -q
+Manual-Evidence: none
+Architecture-Decision: discussion-required
+Review-Owner: orchestrator
+""",
+        )
+        findings = validate_issue_state.execution_contract_findings(candidate)
+        self.assertIn("open-architecture-decision", [f["code"] for f in findings])
 
 
 if __name__ == "__main__":

@@ -60,9 +60,13 @@ Milestone, merge, or close without explicit authorization.
 
 ## Claim, branch, PR, and completion
 
-The first dispatch write is the assignee claim. Post one concise dispatch
-comment with profile/model, base SHA, branch, hotset, verification, blockers,
-and PR target. Keep private task IDs and local paths out of GitHub.
+Keep a candidate unassigned while task materialization and permission/repository
+preflight run. The first lifecycle write after successful activation
+revalidation is the assignee claim. Post one concise dispatch comment only
+after the claim readback succeeds, with execution-contract version,
+verification class/commands, manual evidence, architecture decision, review
+owner, profile/model, base SHA, branch, hotset, blockers, and PR target. Keep
+private task IDs and local paths out of GitHub.
 
 One claimed Issue maps to one visible Worker task and isolated worktree. The
 Worker commits and pushes its assigned branch and opens or updates a PR against

@@ -19,10 +19,13 @@ Read the Orchestrator message and identify:
 4. Exact base branch/SHA, feature branch, and PR target.
 5. Owned components/hotset and prohibited writes.
 6. Accepted decisions and local decision authority.
-7. Dependencies, verification commands, closing semantics, and callback task.
+7. Verification class/commands, manual evidence, architecture decision,
+   `Review-Owner: orchestrator`, and dependencies.
+8. Closing semantics and callback task.
 
-Read lifecycle [role ownership](references/shared/lifecycle.md#role-ownership)
-and the model-profile [selection order](references/shared/model-profiles.md#selection-order).
+Read lifecycle [role ownership](references/shared/lifecycle.md#role-ownership),
+the model-profile [selection order](references/shared/model-profiles.md#selection-order),
+and the shared [verification policy](references/shared/verification-policy.md).
 
 Stop with `BLOCKED` when the assignment is missing a required identity or when
 the requested model, permissions, base, branch, or worktree cannot be honored.
@@ -42,6 +45,20 @@ linked PR state, and the base diff. Post a short plan naming expected writes,
 verification, and collision evidence before editing. Read
 [recovery and WIP preservation](references/shared/github-state-rules.md#recovery-and-wip-preservation)
 only when task-host failure or succession makes that branch relevant.
+
+When the packaged preflight script is available, run it instead of manually
+reconstructing the same Git/GitHub checks:
+
+```text
+python <skill>/scripts/preflight.py --cwd <worktree> \
+  --expected-base <sha> --integration-ref origin/<branch> \
+  --expected-branch <feature-branch> \
+  --filesystem <effective-value> --network <effective-value> \
+  --approval <effective-value> --require-github
+```
+
+Permission values come from task-host metadata; the script validates and
+records them but cannot grant a broader profile.
 
 Preflight is complete when effective permissions are sufficient, GitHub access
 works without approval prompts, the branch matches the assigned base, and the
@@ -66,13 +83,24 @@ reported failure without relying on private implementation details.
 ## Implement and verify the assigned scope
 
 Make the smallest coherent change that satisfies the Issue. Keep subagent
-work bounded to this Issue and integrate every result in this visible task.
+work bounded to research or test analysis inside this Issue and integrate every
+result in this visible task. Do not invoke the generic `code-review` Skill or
+create Standards/Spec review subagents; the Orchestrator owns the one formal
+review.
 Compare upstream changes from the merge base before claiming a collision; an
 advanced integration branch alone is not a blocker.
 
-Run targeted verification during implementation and the full required suite at
-the end. Review the final diff for hotset, generated artifacts, credentials,
-private task IDs, local paths, and unrelated changes.
+Run targeted verification during implementation. Apply the shared class:
+
+- `fast`: targeted checks and diff hygiene; no local full suite.
+- `standard`: one repository-defined relevant full suite at the candidate.
+- `strict`: one relevant full suite plus only the Issue's explicit harness or
+  manual evidence.
+
+After review fixes, run affected targeted checks and rely on CI. Repeat a local
+full suite only when the fix crosses a new repository verification boundary.
+Review the final diff for hotset, generated artifacts, credentials, private
+task IDs, local paths, and unrelated changes.
 
 Implementation is complete when acceptance criteria pass, required checks are
 recorded, and the final diff contains only authorized work.
@@ -93,3 +121,9 @@ to the exact Orchestrator callback.
 Worker completion requires a clean or intentionally preserved worktree, a
 reviewable remote commit/PR when publication was assigned, complete evidence,
 and a recorded callback delivery outcome.
+
+Every material signal records verification class, phase timings, full-suite
+count, `Review-Runs: 0`, and scope delta. The 30-minute `fast` and 90-minute
+`standard` targets diagnose friction; they do not authorize skipped acceptance
+or an automatic stop. If scope crosses a new public/shared boundary, send
+`DISCUSSION_REQUIRED` before expanding.
