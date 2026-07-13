@@ -83,15 +83,12 @@ decision, blocker change, Worker failure, or released slot.
 
 For each candidate, confirm blockers are closed, the Issue is unassigned, the
 contract is fresh-worker-ready, the expected hotset is compatible with active
-ownership, and the model profile is explicit. Return a proposal without writes
-for planning, inspection, review, or preflight requests.
+ownership, and the model profile is explicit.
 
 The frontier is safe when it contains only unassigned, fully specified Issues
 whose blockers are closed and whose expected write sets can run concurrently.
 
 ## Dispatch visible Workers
-
-Dispatch only after authorization:
 
 1. Reconcile immediately before the claim.
 2. Claim the Issue through its assignee field and post one dispatch comment

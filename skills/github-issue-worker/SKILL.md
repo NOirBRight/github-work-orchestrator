@@ -21,10 +21,8 @@ Read the Orchestrator message and identify:
 6. Accepted decisions and local decision authority.
 7. Dependencies, verification commands, closing semantics, and callback task.
 
-Read [GitHub state rules](references/shared/github-state-rules.md),
-[lifecycle](references/shared/lifecycle.md),
-[model profiles](references/shared/model-profiles.md), and
-[communication protocol](references/shared/communication-protocol.md).
+Read lifecycle [role ownership](references/shared/lifecycle.md#role-ownership)
+and the model-profile [selection order](references/shared/model-profiles.md#selection-order).
 
 Stop with `BLOCKED` when the assignment is missing a required identity or when
 the requested model, permissions, base, branch, or worktree cannot be honored.
@@ -35,13 +33,15 @@ and the task owns exactly one Issue.
 
 ## Pass preflight before edits
 
-Run the permission and repository preflight in the shared GitHub state rules.
-Then read applicable `AGENTS.md`, domain context, ADRs, the Issue and comments,
+Run the shared
+[permission and repository preflight](references/shared/github-state-rules.md#permission-and-repository-preflight),
+then apply its [visible ownership](references/shared/github-state-rules.md#visible-ownership)
+and [collision evidence](references/shared/github-state-rules.md#branch-and-collision-evidence)
+rules. Read applicable `AGENTS.md`, domain context, ADRs, the Issue and comments,
 linked PR state, and the base diff. Post a short plan naming expected writes,
-verification, and collision evidence before editing.
-
-Preserve unrelated user work. If the worktree or branch contains unexpected
-changes, stop before cleanup and report the exact ownership conflict.
+verification, and collision evidence before editing. Read
+[recovery and WIP preservation](references/shared/github-state-rules.md#recovery-and-wip-preservation)
+only when task-host failure or succession makes that branch relevant.
 
 Preflight is complete when effective permissions are sufficient, GitHub access
 works without approval prompts, the branch matches the assigned base, and the
@@ -79,11 +79,10 @@ recorded, and the final diff contains only authorized work.
 
 ## Publish and signal
 
-Commit intentionally, push the assigned branch without rewriting protected
-history, and open or update the PR against the documented integration branch.
-Use closing keywords only when the PR satisfies the whole Issue. Do not merge,
-close or relabel the Issue, reprioritize, or alter the Milestone without
-authorization.
+Commit, push, and open or update the PR under lifecycle
+[role ownership](references/shared/lifecycle.md#role-ownership) and
+[completion](references/shared/lifecycle.md#claim-branch-pr-and-completion)
+rules.
 
 Before the final response, emit the applicable shared
 [Worker signals](references/shared/communication-protocol.md#worker-signals)

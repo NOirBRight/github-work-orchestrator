@@ -12,13 +12,17 @@ Orchestrator's scheduling loop. GitHub is the only persistent state source.
 
 1. Read every applicable `AGENTS.md` and the repository's issue, label,
    security, and contribution policy.
-2. Read [lifecycle](references/shared/lifecycle.md),
-   [issue contract](references/shared/issue-contract.md),
-   [GitHub state rules](references/shared/github-state-rules.md), and
-   [communication protocol](references/shared/communication-protocol.md).
-3. Infer the repository from the current checkout or require an explicit
+2. Read the shared Issue contract's
+   [required content](references/shared/issue-contract.md#required-content) and
+   [readiness classification](references/shared/issue-contract.md#readiness-classification).
+3. Read lifecycle [role ownership](references/shared/lifecycle.md#role-ownership)
+   before any GitHub write.
+4. When diagnosis requires a code checkout or GitHub tools, read the shared
+   [permission preflight](references/shared/github-state-rules.md#permission-and-repository-preflight)
+   before using them.
+5. Infer the repository from the current checkout or require an explicit
    repository when no checkout identifies it.
-4. Preserve reporter evidence while excluding credentials, private machine
+6. Preserve reporter evidence while excluding credentials, private machine
    paths, task IDs, and unnecessary personal data.
 
 Intake owns diagnosis, deduplication, contract quality, publication, and
@@ -32,8 +36,8 @@ writes, and prohibited orchestration decisions are explicit.
 ## Diagnose only to the failure boundary
 
 Reproduce or inspect enough to identify the failing surface, expected versus
-actual behavior, affected versions, and evidence needed for verification. Use
-read-only inspection by default. A bounded diagnostic edit may live only in a
+actual behavior, affected versions, and evidence needed for verification. A
+bounded diagnostic edit may live only in a
 throwaway harness; it is not a production fix or PR.
 
 Ask for missing information only when it blocks an honest contract. Keep the
@@ -62,15 +66,9 @@ related, or unrelated with evidence.
 
 ## Publish a Worker-ready contract
 
-Draft against the shared Issue contract. Preserve the reporter's original
-facts; separate facts, inferences, and proposed acceptance criteria. Use
-exactly one canonical lifecycle label and exactly one existing repository type
-label. Add native dependencies only when the edge is unambiguous.
-
-Immediately before writing, re-read the current Issue and labels. Create or
-update the Issue, then read it back and validate title, body, labels,
-dependencies, and URL. Do not change priority, Milestone, assignee, capacity,
-or merge ordering.
+Draft and publish under the shared Issue contract's
+[safe-update rules](references/shared/issue-contract.md#safe-updates) and the
+lifecycle [role boundary](references/shared/lifecycle.md#role-ownership).
 
 Publication is complete only when every condition in the shared Issue
 contract's [readback gate](references/shared/issue-contract.md#readback-gate)
