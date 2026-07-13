@@ -31,6 +31,7 @@ PACKAGES = {
 }
 PACKAGE_VERSION = "2.0.0"
 PACKAGE_MANIFEST = ".skill-package.json"
+TEXT_SUFFIXES = {".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
 
 
 def targets(root: Path):
@@ -80,6 +81,10 @@ def package_digest(package: Path) -> str:
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
         content = path.read_bytes()
+        if path.suffix.lower() in TEXT_SUFFIXES:
+            # Git may materialize the same tracked text as LF or CRLF. Hash the
+            # repository content, not the host checkout convention.
+            content = content.replace(b"\r\n", b"\n")
         digest.update(len(content).to_bytes(8, "big"))
         digest.update(content)
     return digest.hexdigest()
