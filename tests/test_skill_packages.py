@@ -8,18 +8,6 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILLS = (
-    "github-work-orchestrator",
-    "github-issue-intake",
-    "github-issue-worker",
-)
-SHARED_REFERENCES = (
-    "communication-protocol.md",
-    "github-state-rules.md",
-    "issue-contract.md",
-    "lifecycle.md",
-    "model-profiles.md",
-)
 
 
 def load_sync_module():
@@ -33,6 +21,10 @@ def load_sync_module():
     return module
 
 
+SYNC = load_sync_module()
+SKILLS = tuple(SYNC.PACKAGES)
+
+
 class SkillPackageTests(unittest.TestCase):
     def test_three_self_contained_skill_packages_exist(self) -> None:
         for name in SKILLS:
@@ -42,8 +34,15 @@ class SkillPackageTests(unittest.TestCase):
                 self.assertTrue((skill / "agents" / "openai.yaml").is_file())
 
     def test_shared_references_are_synchronized_into_every_skill(self) -> None:
-        for name in SKILLS:
-            for filename in SHARED_REFERENCES:
+        for name, filenames in SYNC.PACKAGES.items():
+            packaged_names = {
+                path.name
+                for path in (
+                    ROOT / "skills" / name / "references" / "shared"
+                ).glob("*.md")
+            }
+            self.assertEqual(set(filenames), packaged_names)
+            for filename in filenames:
                 source = ROOT / "shared" / filename
                 packaged = (
                     ROOT / "skills" / name / "references" / "shared" / filename
@@ -52,8 +51,17 @@ class SkillPackageTests(unittest.TestCase):
                     self.assertEqual(source.read_bytes(), packaged.read_bytes())
 
     def test_sync_check_accepts_committed_packages(self) -> None:
-        sync = load_sync_module()
-        self.assertEqual([], sync.find_drift(ROOT))
+        self.assertEqual([], SYNC.find_drift(ROOT))
+
+    def test_legacy_root_install_loads_the_packaged_orchestrator(self) -> None:
+        wrapper = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "skills/github-work-orchestrator/SKILL.md", wrapper
+        )
+        self.assertEqual(
+            (ROOT / "skills/github-work-orchestrator/agents/openai.yaml").read_bytes(),
+            (ROOT / "agents/openai.yaml").read_bytes(),
+        )
 
     def test_trigger_descriptions_are_role_specific(self) -> None:
         descriptions = {}
@@ -101,6 +109,23 @@ class SkillPackageTests(unittest.TestCase):
         self.assertIn("send_message_to_thread", protocol)
         self.assertIn("SIGNAL_RECEIVED", protocol)
         self.assertIn("CALLBACK_DELIVERY_FAILED", protocol)
+        worker = (ROOT / "skills/github-issue-worker/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        orchestrator = (
+            ROOT / "skills/github-work-orchestrator/SKILL.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "communication-protocol.md#delivery-handshake", worker
+        )
+        self.assertIn("exact Orchestrator callback", worker)
+        self.assertIn(
+            "communication-protocol.md#delivery-handshake", orchestrator
+        )
+        self.assertIn("exact Orchestrator callback task ID", orchestrator)
+        self.assertIn(
+            "communication-protocol.md#signal-driven-monitoring", orchestrator
+        )
 
     def test_shared_protocol_preserves_reliability_guards(self) -> None:
         state_rules = (ROOT / "shared" / "github-state-rules.md").read_text(

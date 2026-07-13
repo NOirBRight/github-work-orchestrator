@@ -85,15 +85,11 @@ Use closing keywords only when the PR satisfies the whole Issue. Do not merge,
 close or relabel the Issue, reprioritize, or alter the Milestone without
 authorization.
 
-Before the final response, call native `send_message_to_thread` to the exact
-Orchestrator callback with `PR_OPENED` after publication and
-`READY_FOR_REVIEW` after required verification. A final answer in this Worker
-task is not callback delivery. Reuse the same `Signal-ID` for the one permitted
-transport retry; record `CALLBACK_DELIVERY_FAILED` if the retry fails.
-
-Use `BLOCKED`, `DISCUSSION_REQUIRED`, or `STOPPED` for incomplete outcomes.
-Include Issue, branch, commit, PR, verification, hotset, blocker, and next
-action as defined by the shared protocol.
+Before the final response, emit the applicable shared
+[Worker signals](references/shared/communication-protocol.md#worker-signals)
+and complete the shared
+[delivery handshake](references/shared/communication-protocol.md#delivery-handshake)
+to the exact Orchestrator callback.
 
 Worker completion requires a clean or intentionally preserved worktree, a
 reviewable remote commit/PR when publication was assigned, complete evidence,

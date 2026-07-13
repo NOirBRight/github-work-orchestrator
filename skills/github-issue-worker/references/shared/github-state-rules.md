@@ -4,6 +4,14 @@ GitHub Issues, native dependencies, assignees, linked PRs, and repository policy
 are the only persistent work-state source. Codex tasks provide visible runtime
 ownership; they are not a second project ledger.
 
+## Contents
+
+- [Visible ownership](#visible-ownership)
+- [Reliable task materialization](#reliable-task-materialization)
+- [Permission and repository preflight](#permission-and-repository-preflight)
+- [Branch and collision evidence](#branch-and-collision-evidence)
+- [Recovery and WIP preservation](#recovery-and-wip-preservation)
+
 ## Visible ownership
 
 Map each claimed GitHub work item to exactly one sidebar-visible Codex task and

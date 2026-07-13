@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Work Orchestrator"
+  short_description: "Plan, dispatch, review, and refill GitHub work"
+  default_prompt: "Use $github-work-orchestrator to reconcile the project plan, dispatch safe visible Workers, review results, and refill capacity."

@@ -1,6 +1,6 @@
 ---
 name: github-issue-intake
-description: Intake GitHub bug reports, enhancement requests, screenshots, logs, and rough ideas by performing bounded diagnosis, searching open and closed Issues for duplicates, standardizing a fresh-worker-ready Issue, publishing or updating it, and emitting one material signal. Use when the user reports a problem or asks to file, deduplicate, refine, or prepare an Issue.
+description: Intake GitHub bug reports, enhancement requests, screenshots, logs, and rough ideas by performing bounded diagnosis, searching open and closed Issues for duplicates, standardizing a fresh-worker-ready Issue, publishing or updating it, and emitting one material signal. Use in a dedicated Issue Intake task or when the user asks to create, deduplicate, standardize, or publish a GitHub Issue.
 ---
 
 # GitHub Issue Intake
@@ -72,20 +72,17 @@ update the Issue, then read it back and validate title, body, labels,
 dependencies, and URL. Do not change priority, Milestone, assignee, capacity,
 or merge ordering.
 
-Publication is complete only when the readback contains the problem/outcome,
-scope and non-goals, acceptance criteria, verification/evidence, expected
-hotset when known, dependencies, and the exact label pair.
+Publication is complete only when every condition in the shared Issue
+contract's [readback gate](references/shared/issue-contract.md#readback-gate)
+passes.
 
 ## Emit one material signal
 
-Use the Intake envelope in the shared communication protocol and call native
-`send_message_to_thread` when an Orchestrator callback is available. A final
-answer in the Intake task is not callback delivery. Emit exactly one outcome:
-
-- `ISSUE_READY #<number>`
-- `DUPLICATE #<existing-number>`
-- `NEEDS_INFO #<number-or-draft>`
-- `DISCUSSION_REQUIRED #<number-or-topic>`
+Emit exactly one shared
+[Intake signal](references/shared/communication-protocol.md#intake-signals),
+then complete the shared
+[delivery handshake](references/shared/communication-protocol.md#delivery-handshake)
+when an Orchestrator callback is available.
 
 Routine search and drafting updates remain in this task. If no callback was
 provided, return the signal to the user without creating or guessing an

@@ -11,9 +11,11 @@ and first publication belong to `github-issue-intake` when it is available.
 
 ## Reconciliation authority
 
-During an authorized orchestration run, repair priority, labels, contracts, and
-native dependencies after intake when intent is unambiguous. Preserve reporter
-evidence and re-read each Issue immediately before an edit.
+During an authorized orchestration run, repair priority, labels, and native
+dependencies after intake when intent is unambiguous. Return an incomplete body
+to Intake; edit its contract here only when the maintainer explicitly delegates
+that Intake work. Preserve reporter evidence and re-read each Issue immediately
+before an edit.
 
 Use `needs-triage` when scope or ownership is ambiguous, `needs-info` for a
 named missing fact/policy/decision, `ready-for-human` for a maintainer-only
@@ -31,8 +33,6 @@ Apply only unambiguous, idempotent corrections:
 | Accepted plan names an unambiguous dependency | Add the native edge |
 | Open Issue has no lifecycle label | Classify from its contract; use `needs-triage` if ambiguous |
 | Open Issue has conflicting lifecycle labels | Keep the semantic one; use `needs-triage` if ambiguous |
-| Required contract section is derivable | Add it while preserving current content |
-| Tracking Issue names concrete missing children | Create standard children and native sub-issue links |
 | Issue lacks an unambiguous existing type label | Add the existing repository type |
 | Orchestrator-owned claim has no live task or PR | Preserve evidence, then release the claim |
 
@@ -82,6 +82,5 @@ decisions. If GitHub changes between preview and apply, rebuild the plan.
 
 Rerun the validator and frontier. Reconciliation is complete when there are no
 invalid lifecycle combinations, every intended hard blocker has one native or
-documented edge, each candidate passes the shared Issue contract, and every
-remaining ambiguity is visible in `needs-triage`, `needs-info`, or a discussion
-gate.
+documented edge, incomplete contracts are routed to Intake, and every remaining
+ambiguity is visible in `needs-triage`, `needs-info`, or a discussion gate.

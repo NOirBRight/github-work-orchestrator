@@ -1,6 +1,6 @@
 ---
 name: github-work-orchestrator
-description: Orchestrate GitHub execution campaigns by aligning direction and architecture, reconciling priority, labels, and native dependencies after intake, computing the ready frontier, binding models, dispatching sidebar-visible Workers, reviewing PRs, and refilling capacity. Use for project planning, scheduling, dispatch, cross-Issue arbitration, Worker or PR review, and signal-driven campaign monitoring.
+description: Orchestrate GitHub execution campaigns by aligning direction and architecture, reconciling priority, labels, and native dependencies after intake, computing the ready frontier, binding models, dispatching sidebar-visible Workers, reviewing PRs, and refilling capacity. Use when Codex must run a multi-Issue GitHub campaign, compute or refill its ready frontier, dispatch visible Workers, or arbitrate their integration.
 ---
 
 # GitHub Work Orchestrator
@@ -35,8 +35,9 @@ ideas to a persistent task using `github-issue-intake` when it is available.
 Consume only its material signals; routine drafting and duplicate-search
 updates stay in the Intake task.
 
-The Orchestrator may reconcile priority, labels, contracts, and native
-dependencies after intake. It does not implement production Issues. Every
+The Orchestrator may reconcile priority, labels, and native dependencies after
+intake. Return incomplete Issue bodies to Intake instead of publishing routine
+contract edits here. The Orchestrator does not implement production Issues. Every
 claimed Issue executes in one sidebar-visible Worker task using
 `github-issue-worker`; bounded subagents may assist analysis or review but do
 not own a GitHub work item.
@@ -101,9 +102,9 @@ Dispatch only after authorization:
 4. Send the full assigned-Issue contract only after a real task ID exists.
    Require `github-issue-worker`, the selected binding, permission preflight,
    and the exact Orchestrator callback task ID.
-5. Require the Worker to call native `send_message_to_thread` with the shared
-   signal envelope before its final response. A final answer in the Worker task
-   is not callback delivery.
+5. Require the Worker to complete the shared
+   [delivery handshake](references/shared/communication-protocol.md#delivery-handshake)
+   before its final response.
 
 If task materialization or permission preflight fails, follow the shared
 recovery rules. A subagent, hidden process, or shared directory is not a Worker
@@ -114,16 +115,12 @@ worktree, branch, callback, model binding, and verification contract.
 
 ## Review signals and refill
 
-Treat `ISSUE_READY`, `DUPLICATE`, `NEEDS_INFO`, `DISCUSSION_REQUIRED`,
-`BLOCKED`, `PR_OPENED`, `READY_FOR_REVIEW`, and `STOPPED` as prompts to verify,
-not as authoritative state changes. Deduplicate by `Signal-ID`, verify against
-the sender task and GitHub, then act inside the Orchestrator's authority.
-
-Use signal-driven monitoring. After materialization and permission preflight,
-fallback reads of the same active Worker remain at least ten minutes apart
-unless a signal, explicit maintainer request, declared deadline, recovery
-operation, or GitHub state transition permits one immediate read. A PR/check
-transition is a valid fallback event when callback delivery is missing.
+Process material Intake and Worker states with the shared
+[Orchestrator verification](references/shared/communication-protocol.md#orchestrator-verification)
+rules. Follow the shared
+[signal-driven monitoring](references/shared/communication-protocol.md#signal-driven-monitoring)
+cadence, including its GitHub-event recovery path when callback delivery is
+missing.
 
 When a Worker is ready:
 

@@ -3,6 +3,15 @@
 Use native Codex task messaging for material transitions and GitHub for durable
 work state. A callback is a wake-up signal, not a second project ledger.
 
+## Contents
+
+- [Addressing](#addressing)
+- [Delivery handshake](#delivery-handshake)
+- [Intake signals](#intake-signals)
+- [Worker signals](#worker-signals)
+- [Orchestrator verification](#orchestrator-verification)
+- [Signal-driven monitoring](#signal-driven-monitoring)
+
 ## Addressing
 
 The Orchestrator supplies its exact task ID privately in every Intake or Worker
