@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Issue Intake"
+  short_description: "Diagnose, deduplicate, and publish ready Issues"
+  default_prompt: "Use $github-issue-intake to turn this report into a deduplicated, fresh-worker-ready GitHub Issue."

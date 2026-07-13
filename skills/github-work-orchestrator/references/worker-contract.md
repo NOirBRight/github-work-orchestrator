@@ -6,10 +6,11 @@ item. The visible task is the auditable owner of the Issue, branch, PR, and
 completion evidence.
 
 The visible Worker may use subagents internally for bounded implementation
-slices, research, parallel review, test analysis, or independent verification
-within the same assigned Issue and worktree. The visible Worker partitions
-write sets, integrates and reviews all results, and remains the only Worker of
-record. Subagents do not own GitHub work items or create a separate lifecycle.
+slices, research, implementation critique, test analysis, or independent
+verification within the same assigned Issue and worktree. The visible Worker
+partitions write sets and integrates all results, while the Orchestrator owns
+the one formal Standards/Spec review. The visible task remains the only Worker
+of record. Subagents do not own GitHub work items or create a separate lifecycle.
 If discovered work is itself a distinct GitHub Issue, return it to the
 Orchestrator for a new visible task instead of assigning it to a subagent.
 
@@ -55,7 +56,7 @@ placeholder for a queued client request.
 1. Reconcile the candidate and record its exact base SHA, branch, hotset, and
    expected verification while it remains unassigned.
 2. Select the bootstrap binding through the
-   [model-profile selection order](model-profiles.md#selection-order). Before
+   [model-profile selection order](shared/model-profiles.md#selection-order). Before
    queueing it, record the exact model and reasoning effort plus one concrete
    eligibility observation: the task-host catalog or creation API lists that
    model/effort as supported, or the same host completed an exact `READY`
@@ -296,7 +297,9 @@ Include:
 6. Accepted direction, architecture invariants, decision references, and the
    Worker's local decision authority.
 7. Known dependencies and required integration parent.
-8. Targeted and full verification commands.
+8. Execution-contract version, verification class/commands, manual evidence,
+   architecture decision, `Review-Owner: orchestrator`, requested model,
+   `model_binding_status: verified`, and sanitized effective-binding evidence.
 9. Required PR target and closing semantics.
 10. The Orchestrator callback task and the required Worker signals from the
    [communication protocol](communication.md).
@@ -321,6 +324,10 @@ grant. Before editing, publishing, or running an expensive suite:
    effective profile satisfies the dispatch contract. Otherwise send one
    `BLOCKED` signal and stop before doing work.
 
+Prefer the packaged Worker `scripts/preflight.py` for these repeatable checks.
+Pass task-host permission metadata explicitly; the script validates it but
+cannot grant or infer a broader profile.
+
 Do not use destructive commands, credential changes, or writes outside the
 worktree merely to prove that a broad permission profile exists. If the task
 creation API has no permission field, inherit the user's current project or
@@ -333,7 +340,9 @@ environment setting and verify it through this preflight.
   explicit authority.
 - Stay inside the assigned Issue and worktree.
 - Keep all subagent work subordinate to this task's Issue, branch, worktree, and
-  final review. Do not delegate a second GitHub work item through a subagent.
+  evidence. Do not delegate a second GitHub work item through a subagent, invoke
+  the generic `code-review` Skill, or create Standards/Spec review subagents;
+  the Orchestrator owns the one formal review.
 - Rebase or merge an upstream seam only when the assigned work semantically
   depends on it or a merge-base comparison proves a real write-set collision.
   An advanced integration branch by itself is not a blocker; evidence work may
@@ -363,6 +372,9 @@ environment setting and verify it through this preflight.
   the model binding is unavailable, or required authority is missing.
 - For investigations, keep production behavior unchanged unless implementation
   was explicitly assigned.
+- Follow the sole class and post-review rules in
+  [the shared verification policy](shared/verification-policy.md); do not
+  restate or extend them in the dispatch.
 
 ## Worker signals
 
@@ -379,7 +391,8 @@ Return:
 - outcome and remaining gaps;
 - changed files and important decisions;
 - commits and PR URL, if created;
-- targeted and full verification with exact results;
+- verification class, phase timings, targeted/full verification with exact
+  results, full-suite count, `Review-Runs: 0`, and scope delta;
 - newly discovered blockers, follow-up Issues, and hot-file ownership;
 - whether the Issue can close.
 

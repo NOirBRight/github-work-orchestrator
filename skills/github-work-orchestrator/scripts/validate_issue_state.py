@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,74 @@ ACTIVE_LABELS = {
     "ready-for-agent",
     "ready-for-human",
 }
+CONTRACT_FIELDS = (
+    "Execution-Contract",
+    "Verification-Class",
+    "Verification-Commands",
+    "Manual-Evidence",
+    "Architecture-Decision",
+    "Review-Owner",
+)
+
+
+def parse_contract_fields(body: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for name in CONTRACT_FIELDS:
+        match = re.search(rf"(?im)^\s*{re.escape(name)}\s*:\s*(.+?)\s*$", body)
+        if match:
+            fields[name] = match.group(1).strip()
+    return fields
+
+
+def execution_contract_findings(issue: dict[str, Any]) -> list[dict[str, Any]]:
+    fields = parse_contract_fields(issue.get("body") or "")
+    if not fields:
+        return [
+            finding(
+                "warning",
+                issue,
+                "legacy-execution-contract",
+                "ready Issue has no Execution-Contract: v2 metadata",
+            )
+        ]
+    findings: list[dict[str, Any]] = []
+    expected = {
+        "Execution-Contract": {"v2"},
+        "Verification-Class": {"fast", "standard", "strict"},
+        "Architecture-Decision": {"resolved", "discussion-required"},
+        "Review-Owner": {"orchestrator"},
+    }
+    for name in CONTRACT_FIELDS:
+        if not fields.get(name):
+            findings.append(
+                finding(
+                    "error",
+                    issue,
+                    "missing-execution-field",
+                    f"v2 execution contract is missing {name}",
+                )
+            )
+    for name, allowed in expected.items():
+        value = fields.get(name)
+        if value and value not in allowed:
+            findings.append(
+                finding(
+                    "error",
+                    issue,
+                    "invalid-execution-field",
+                    f"{name} has unsupported value {value!r}",
+                )
+            )
+    if fields.get("Architecture-Decision") == "discussion-required":
+        findings.append(
+            finding(
+                "error",
+                issue,
+                "open-architecture-decision",
+                "ready Issue still requires an architecture decision",
+            )
+        )
+    return findings
 
 
 def finding(
@@ -78,6 +147,8 @@ def validate(
                     "wontfix Issue remains open",
                 )
             )
+        if state == "OPEN" and statuses == ["ready-for-agent"]:
+            findings.extend(execution_contract_findings(issue))
         stale = sorted(labels & ACTIVE_LABELS) if state == "CLOSED" else []
         if stale:
             findings.append(

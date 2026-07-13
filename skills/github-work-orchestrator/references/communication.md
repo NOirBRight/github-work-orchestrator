@@ -28,46 +28,12 @@ explicit Worker signals with the conditional fallback in
 
 ## Required signals
 
-Send each signal once per meaningful transition. Re-send only when its payload
-materially changes.
-
-| Signal | Send when |
-|---|---|
-| `DISCUSSION_REQUIRED` | A material product-direction, architecture, compatibility, security, migration, or cross-Issue choice exceeds the Worker's accepted authority |
-| `BLOCKED` | Progress requires an Orchestrator decision, new authority, a broader task-host permission profile, a proven required upstream merge, missing evidence, or resolution of a merge-base-confirmed write-set collision |
-| `PR_OPENED` | The branch is pushed and a PR exists; checks may still be running |
-| `READY_FOR_REVIEW` | The assigned scope and required verification are complete enough for Orchestrator review |
-| `STOPPED` | The Worker is ending without a reviewable result or must hand the work back |
-
-Use this compact payload:
-
-```text
-WORKER_SIGNAL
-- State: DISCUSSION_REQUIRED | BLOCKED | PR_OPENED | READY_FOR_REVIEW | STOPPED
-- Issue: #<number>
-- Branch: <branch>
-- Commit: <sha or none>
-- PR: <URL or none>
-- Verification: <passed, failed, pending, or not run>
-- Hotset: <owned files/components>
-- Blocker/next action: <concise request or handoff>
-```
-
-For `DISCUSSION_REQUIRED`, replace the final line with:
-
-```text
-- Decision: <one precise choice>
-- Options: <A/B/C with tradeoffs>
-- Recommendation: <preferred path and why>
-- Safe work: <what may continue while waiting>
-```
-
-Use this signal only after checking the accepted Issue, Milestone, domain docs,
-and ADRs. Bundle related choices, recommend a path, and send it once. Do not use
-it for routine implementation details or status updates.
-
-Do not include secrets, raw traces, user content, or local paths. Put detailed
-test output and evidence in the Worker task or authorized PR artifacts.
+Use the shared
+[Worker signal contract](shared/communication-protocol.md#worker-signals) as the
+single payload and delivery authority. This recovery reference does not define
+a second signal shape. Send a transition once and include its verification
+class, phase timings, full-suite count, zero Worker review runs, and scope
+delta.
 
 For a claimed upstream collision, the Worker task must retain the merge-base,
 the Worker-side path set (committed plus staged plus unstaged), the upstream-only
@@ -196,8 +162,9 @@ and authority boundaries; no other continuation authorizes edits.
 
 ## Orchestrator responsibilities
 
-- Follow [Monitoring cadence](#monitoring-cadence) for all task and GitHub
-  reads; it is the sole authority for signals, events, and fallback polling.
+- Follow the shared
+  [signal-driven monitoring authority](shared/communication-protocol.md#signal-driven-monitoring)
+  for all task and GitHub reads.
 - Verify every signal against the Worker task and GitHub before changing
   lifecycle state, merging, or releasing capacity.
 - Send revisions and decisions back to the same visible task.
@@ -211,36 +178,8 @@ and authority boundaries; no other continuation authorizes edits.
 
 ## Monitoring cadence
 
-This section governs Orchestrator monitoring of a real, preflight-passed
-Worker. It is not a generic permission to poll a quiet task or to replace the
-creation and recovery branches above.
-
-- Prefer Worker signals and GitHub events. During materialization, follow the
-  [materialization flow](worker-contract.md#reliable-task-materialization),
-  including its bootstrap gate. Only after that flow routes a real Task to the
-  [Worker activation handoff](worker-contract.md#worker-activation-handoff)
-  does the authoritative preflight handshake begin.
-- Once preflight passes, do not read the same Worker for ordinary progress just
-  because no new event has arrived. A missing progress event alone is not
-  evidence that reverse callback delivery is unavailable.
-- Use a fallback read no more often than every ten minutes only after one
-  observable reverse-delivery trigger: the host reports callback capability is
-  unsupported, a native delivery call returns an error, the callback target is
-  confirmed absent or inactive, or the Worker records a delivery failure.
-  A missing progress event or general suspicion is not a trigger. Otherwise
-  wait for a material signal or GitHub event.
-- The bootstrap-materialization and claimed-Worker-recovery exceptions require
-  their pre-recorded deadline or maximum check count and their exact next-read
-  schedule: either stated UTC read times or a stated cadence plus the maximum
-  check count. Read only on that schedule and take the bound's documented exit
-  when it expires; never turn either exception into a busy poll.
-- One immediate verification read is permitted after a Worker signal, explicit
-  maintainer status request, declared command/test deadline, recovery action,
-  or a GitHub PR, check, push, or merge transition.
-- Report only material transitions. Do not relay routine reasoning, file edits,
-  unchanged active status, or minute-by-minute test progress. A user-facing
-  progress update may use the last verified state.
-
-The ten-minute floor does not apply to a scheduled short bootstrap read, a
-scheduled bounded recovery read, or one verification read triggered by a new
-signal or GitHub event.
+The shared
+[signal-driven monitoring section](shared/communication-protocol.md#signal-driven-monitoring)
+is the sole authority. The materialization and claimed-Worker recovery flows in
+this package may define their bounded bootstrap/recovery read schedules, but
+they do not redefine ordinary monitoring or fallback cadence.
