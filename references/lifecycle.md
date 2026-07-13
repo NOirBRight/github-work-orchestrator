@@ -3,6 +3,15 @@
 GitHub is the only persistent state store. Reconstruct orchestration state on
 every run; do not maintain a second ledger.
 
+## Contents
+
+- [Canonical status labels](#canonical-status-labels)
+- [Dependencies and decomposition](#dependencies-and-decomposition)
+- [Claim and dispatch](#claim-and-dispatch)
+- [Decision gates](#decision-gates)
+- [Completion](#completion)
+- [Invalid states](#invalid-states)
+
 ## Canonical status labels
 
 Use the repository's documented label mapping. When none exists, use:
@@ -48,13 +57,20 @@ Each claimed work item maps to exactly one sidebar-visible Codex task. Internal
 subagents may assist that task, but they are not claims, workers of record, or
 substitutes for a visible task.
 
-The first orchestration write is the claim:
+The [Worker Contract](worker-contract.md) is the single authority for task
+creation and preflight ordering. Its
+[materialization flow](worker-contract.md#reliable-task-materialization) and
+[replacement gate](worker-contract.md#replacement-gate) own queued-request
+terminality, no-real-task discovery, and replacement admission. Its
+[activation handoff](worker-contract.md#worker-activation-handoff),
+[recovery handoff](worker-contract.md#claimed-worker-recovery-handoff), and
+[succession handoff](worker-contract.md#claimed-worker-succession-handoff) own
+all real-Worker activation, claim-race, recovery, and succession checks. It is
+the only authority for dispatch writing and edit authorization; do not recreate
+or shortcut it here.
 
-```text
-gh issue edit <number> --add-assignee @me
-```
-
-Post one dispatch comment after claiming. Suggested shape:
+Only after the activation handoff authorizes its dispatch comment, use this
+shape:
 
 ```text
 Dispatch
