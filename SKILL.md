@@ -11,20 +11,10 @@ assignees, linked PRs, repository instructions, and visible Codex tasks.
 
 ## Operating boundaries
 
-- Use one visible Codex task in an isolated worktree for every dispatched or
-  claimed GitHub work item. Never substitute a subagent for that task's
-  identity, ownership, branch, PR, or lifecycle state.
-- The Orchestrator may use subagents for bounded research, inventory,
-  dependency analysis, or model classification that is not itself a claimed
-  GitHub work item. Keep this assistance read-only by default; an explicitly
-  scoped research artifact remains owned and reviewed by the Orchestrator. A
-  research subagent must not claim, mutate lifecycle state, or execute a real
-  GitHub work item.
-- A visible Worker may use subagents internally for bounded implementation
-  slices, research, review, test analysis, or independent checks inside the
-  same assigned Issue and worktree. The visible Worker owns write-set
-  partitioning, integration, and final review, and must not turn a subagent into
-  a hidden implementation stream for another GitHub Issue.
+- Map each claimed GitHub work item to one visible Codex task in one isolated
+  worktree. Use subagents only for bounded, non-owning assistance: pre-claim
+  research or work inside the parent Worker's Issue. Never give a subagent a
+  GitHub work item, branch/PR/lifecycle identity, or separate Worker role.
 - Treat Issues, implementation tasks, bugs, investigations, reviews, incidents,
   and releases as work items.
 - Keep Skill source and releases outside the target repository.
@@ -163,26 +153,20 @@ Dispatch only after explicit authorization.
 Before creating or claiming a Worker, follow the authoritative
 [materialization and claim order](references/worker-contract.md#reliable-task-materialization)
 and [task-host recovery](references/communication.md#task-host-recovery).
-Those references own the two-stage bootstrap, full-contract/preflight, exact
-claim rollback, orphan-worktree, and retry rules. A queued client ID, created
-worktree, or bootstrap reply is not a Worker and must not make an Issue Active.
 
 A dispatch completes only when reconciliation passes; one real task has
-received the full contract and passed its permission preflight; the exact
-GitHub claim and dispatch comment have been written; and the Worker has the
-documented branch, hotset, verification, and callback boundaries. If that
-state is not reached, complete the reference's release/rollback path before
-considering a replacement. Do not substitute a subagent, hidden process, or
-shared working directory for the visible Worker.
+completed the documented materialization/preflight handoff; the GitHub claim
+and dispatch comment have been written; and the Worker has the documented
+branch, hotset, verification, and callback boundaries. If that state is not
+reached, complete the reference's release/rollback path before considering a
+replacement.
 
 ## Monitor and refill
 
 Use [communication.md](references/communication.md#monitoring-cadence) as the
 authoritative monitoring cadence and
 [task-host recovery](references/communication.md#task-host-recovery) for
-failure handling. The ten-minute fallback applies only when reverse callback
-delivery is absent or suspected unavailable; an ordinary lack of progress
-events is not permission to poll.
+failure handling.
 
 On a material Worker signal, verify the visible task and GitHub state before an
 integration action. Monitoring completes when the reported transition has been

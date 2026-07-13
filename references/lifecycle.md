@@ -48,7 +48,10 @@ Each claimed work item maps to exactly one sidebar-visible Codex task. Internal
 subagents may assist that task, but they are not claims, workers of record, or
 substitutes for a visible task.
 
-The first orchestration write is the claim:
+The [materialization flow](worker-contract.md#reliable-task-materialization)
+is the single authority for task creation and preflight ordering. After that
+flow has materialized a real Worker and completed its preflight gate, the first
+GitHub lifecycle write is the claim:
 
 ```text
 gh issue edit <number> --add-assignee @me

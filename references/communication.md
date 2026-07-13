@@ -2,7 +2,8 @@
 
 Treat a visible Worker as an independent user-owned Codex task. Do not assume
 that its final answer is automatically returned to the Orchestrator. Combine
-explicit Worker signals with Orchestrator polling.
+explicit Worker signals with the conditional fallback in
+[Monitoring cadence](#monitoring-cadence).
 
 ## Dispatch setup
 
@@ -82,6 +83,12 @@ on the upstream change.
 A task-level `systemError`, host disconnect, or failed continuation does not
 change the GitHub claim and is not a repository blocker.
 
+Before waiting in either recovery branch, record one concrete, per-run recovery
+bound in the visible Orchestrator task: an absolute UTC deadline or a maximum
+number of native reads/continuations. Do not infer a hidden universal timeout
+or extend the recorded bound. When it expires, take the branch's safe
+stop/replacement action.
+
 ### Creation failure: no Worker exists
 
 This branch applies only when native task discovery confirms that no real task
@@ -103,10 +110,18 @@ created worktree does not create an Active Worker.
 3. If the directory is dirty, wrong-base, missing, or ambiguously owned, stop
    safely. Do not reuse, clean, infer another path, or retry the same creation
    path from that evidence.
-4. Reuse is permitted only after every check passes and the recovery Task is
-   explicitly given that exact absolute path as its write boundary. A branch
-   name, parent directory, client ID, or inferred worktree location is not a
-   write boundary.
+4. Admit a recovery Task before it adopts the path. Immediately before
+   adoption, re-read the native Task and GitHub ownership. The positive gate
+   must prove that the Task is real and sidebar-visible; idle and not editing;
+   owns no other GitHub work item, branch, PR, or write boundary; has no
+   worktree binding other than the exact orphan path or none; and can become
+   the unique editor under the Orchestrator's explicit recovery contract. That
+   contract names the exact absolute path as its only write boundary. A branch
+   name, parent directory, client ID, or inferred location is not a boundary.
+   The admitted Task reruns the
+   [permission/repository preflight](worker-contract.md#task-host-permission-preflight)
+   with that exact path as its working directory before editing. Any failed or
+   ambiguous admission fact stops without reassignment.
 5. Clean a rejected orphan only after the same checks prove it is clean and
    uniquely owned by the failed creation and no recovery Task has adopted it.
    Invoke a supported native task/worktree cleanup action against that literal
@@ -118,15 +133,16 @@ created worktree does not create an Active Worker.
    a second canonical `[#<number>] <issue title>` Worker.
 
 This branch completes only when either a real Worker resumes the materialization
-flow and reaches its preflight gate, or the unclaimed dispatch is safely stopped
-with the orphan explicitly adopted, cleaned, or left untouched because a safety
-check failed. In either outcome, no queued client ID is an Active claim.
+flow and reaches its preflight gate; an admitted recovery Task has passed its
+exact-path preflight and become the unique editor; or the unclaimed dispatch is
+safely stopped with the orphan cleaned or left untouched because a safety check
+failed. In every outcome, no queued client ID is an Active claim.
 
 ### Existing Worker failure: a real Worker exists
 
 This branch applies only after native discovery identifies the real visible
 Worker. Read its task and GitHub state, then attempt one normal continuation
-while its branch and worktree remain intact.
+within the recorded recovery bound while its branch and worktree remain intact.
 
 1. If the same task fails again before a meaningful response, stop retrying
    that session. Use one supported native visible-task fork or handoff on the
@@ -151,8 +167,8 @@ it leaves the Issue unclaimed instead of leaving a false Active Issue.
 
 ## Orchestrator responsibilities
 
-- Poll visible tasks and GitHub because reverse delivery can fail or arrive
-  late. Use task status/unread state, task reads, assignees, PRs, and CI.
+- Follow [Monitoring cadence](#monitoring-cadence) for all task and GitHub
+  reads; it is the sole authority for signals, events, and fallback polling.
 - Verify every signal against the Worker task and GitHub before changing
   lifecycle state, merging, or releasing capacity.
 - Send revisions and decisions back to the same visible task.
@@ -170,9 +186,9 @@ This maintainer-requested addendum governs Orchestrator monitoring of a real,
 preflight-passed Worker. It is not a generic permission to poll a quiet task or
 to replace the creation and recovery branches above.
 
-- Prefer Worker signals and GitHub events. During materialization, read only
-  enough to distinguish a real task and completed bootstrap, plus one
-  post-contract preflight verification read.
+- Prefer Worker signals and GitHub events. During materialization, follow the
+  recorded bound and authoritative preflight handshake in
+  [worker-contract.md](worker-contract.md#reliable-task-materialization).
 - Once preflight passes, do not read the same Worker for ordinary progress just
   because no new event has arrived. A missing progress event alone is not
   evidence that reverse callback delivery is unavailable.

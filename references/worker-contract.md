@@ -34,27 +34,35 @@ placeholder for a queued client request.
 
 1. Reconcile the candidate and record its exact base SHA, branch, hotset, and
    expected verification while it remains unassigned.
-2. Create the isolated-worktree task at that exact base with a fast, low-cost,
+2. Record one concrete, per-run materialization bound in the visible
+   Orchestrator task before waiting: an absolute UTC deadline or a maximum
+   number of native discovery checks. Do not infer a hidden universal timeout
+   or extend the recorded bound.
+3. Create the isolated-worktree task at that exact base with a fast, low-cost,
    verified bootstrap binding. Send only
    `[#<number>] Bootstrap only. Reply exactly READY. Do not use tools.`
-3. Wait boundedly for a real task ID in the native task list and a completed
-   bootstrap turn. A client-side creation ID or a created worktree alone is
-   only diagnostic evidence, not a Worker. Do not title an unmaterialized stub.
-4. Rename the real task to `[#<number>] <issue title>`, then send the full
+4. Wait only within that recorded bound for a real task ID in the native task
+   list and a completed bootstrap turn. A client-side creation ID or a created
+   worktree alone is only diagnostic evidence, not a Worker. Do not title an
+   unmaterialized stub.
+5. Rename the real task to `[#<number>] <issue title>`, then send the full
    Worker Contract to that same task with the selected Worker model and
    reasoning level. This first full turn establishes the recorded binding.
-   It may perform only the permission preflight and must wait for claim
-   confirmation before editing.
-5. Use the one permitted post-contract read to confirm that the real task
-   completed the preflight with the required permissions. Only then add the
-   assignee claim, post one concise dispatch comment, and tell that Worker it
-   may begin scoped work. The comment records the binding, base/branch, hotset,
-   verification, blockers, and PR target without private task IDs or paths.
+   It may perform only the permission preflight, end with the exact marker
+   `PREFLIGHT_READY`, and become idle without editing.
+6. Wait for native idle/turn completion, then make one authoritative content
+   read to confirm the marker and required preflight. An earlier read is not
+   the completion read and does not consume it or deadlock dispatch. Only then
+   add the assignee claim, post one concise dispatch comment, and send a
+   continuation that confirms the claim and authorizes scoped edits. The
+   comment records the binding, base/branch, hotset, verification, blockers,
+   and PR target without private task IDs or paths.
 
-If bootstrap or materialization fails before a real task exists, do not add the
-assignee or dispatch comment; preserve the client ID privately and follow the
-linked creation-failure branch. If a full-contract or preflight turn fails
-after a real task exists, leave the Issue unclaimed and follow the
+If the recorded materialization bound expires, or bootstrap or materialization
+fails before a real task exists, do not add the assignee or dispatch comment;
+preserve the client ID privately and follow the linked creation-failure branch.
+If a full-contract/preflight turn fails, omits `PREFLIGHT_READY`, or does not
+reach idle after a real task exists, leave the Issue unclaimed and follow the
 existing-Worker failure branch. Make at most one replacement attempt only after
 a concrete startup cause has been removed or isolated.
 
@@ -66,7 +74,9 @@ maintainer review. Verify the release before another attempt; never leave a
 queued ID or failed preflight as an Active claim.
 
 Materialization is complete only when one real Worker has the full contract,
-has passed preflight, and has received the exact claim and work boundaries.
+has sent `PREFLIGHT_READY` and become idle, has passed the authoritative
+preflight read, and has received the claim-confirmation continuation and exact
+work boundaries.
 Keep the bootstrap prompt short and uniquely Issue-scoped. If an optional
 startup service is suspected, use a bounded A/B test and disable it only after
 proof and separate authorization for a reversible change.
@@ -87,6 +97,9 @@ Include:
 9. Required PR target and closing semantics.
 10. The Orchestrator callback task and the required Worker signals from the
    [communication protocol](communication.md).
+11. During materialization, the recorded per-run bound and the preflight-only
+    `PREFLIGHT_READY`/idle handshake; editing begins only after the claim
+    confirmation continuation.
 
 Require the Worker to post a short implementation or investigation plan before
 editing. A plan must identify expected writes, flag collisions, and state
