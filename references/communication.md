@@ -92,78 +92,105 @@ on the upstream change.
 A task-level `systemError`, host disconnect, or failed continuation does not
 change the GitHub claim and is not a repository blocker.
 
+The [Worker Contract](worker-contract.md) is the sole authority for queued
+materialization, bootstrap gates, and activation. This section owns recovery
+evidence, safe orphan handling, and succession; it does not recreate the
+activation sequence.
+
 ### Creation failure: no Worker exists
 
-This branch applies only when native task discovery confirms that no real task
-exists. Use [the materialization flow](worker-contract.md#reliable-task-materialization)
-for claim ordering and release; a returned client ID, a bootstrap request, or a
-created worktree does not create an Active Worker.
+This branch begins only when the materialization flow routes a no-real-Task
+outcome here. Absence from the native task list is not terminal ownership of a
+queued request, a worktree, or a replacement path.
 
-1. Confirm the absence through the native task list and keep the client ID and
-   local path private. If a real task exists but its full-contract or preflight
-   turn failed, use the existing-Worker branch below; it remains unclaimed
-   under the materialization order.
-2. Diagnose an orphan worktree only from its recorded literal path and expected
-   base SHA. Resolve the path, then measure whether the exact directory exists;
-   whether its resolved path matches the literal absolute path; actual `HEAD`;
-   the exact `git status --porcelain` result; the matching `git worktree list
-   --porcelain` repository entry; and native/GitHub ownership facts. Record
-   those measured values privately in the visible Orchestrator task: literal
-   and resolved absolute paths, expected base SHA, actual HEAD, exact
-   cleanliness/status result, worktree-list entry, and ownership/admission
-   evidence. Record `missing` or a command error as the measured value when
-   applicable; never publish this evidence or local paths to GitHub. Reuse or
-   cleanup requires the directory to exist, paths to match, actual HEAD to
-   equal the expected base, status to be empty, the worktree entry to identify
-   the expected repository, and ownership to be unambiguous.
-3. If the directory is dirty, wrong-base, missing, or ambiguously owned, stop
-   safely. Do not reuse, clean, infer another path, or retry the same creation
-   path from that evidence.
-4. Admit a recovery Task before it adopts the path. Immediately before
-   adoption, re-read the native Task and GitHub ownership. The positive gate
-   must prove that the Task is real and sidebar-visible; idle and not editing;
-   owns no other GitHub work item, branch, PR, or write boundary; has no
-   worktree binding other than the exact orphan path or none; and can become
-   the unique editor under the Orchestrator's explicit recovery contract. That
-   contract names the exact absolute path as its only write boundary. A branch
-   name, parent directory, client ID, or inferred location is not a boundary.
-   Append that immediate native Task and GitHub ownership/admission evidence to
-   the private Orchestrator-task record from step 2.
-   Route the admitted Task through the shared
-   [Worker activation handoff](worker-contract.md#worker-activation-handoff),
-   the sole authority for its activation. The recovery Task may not edit before
-   the `CLAIM_CONFIRMED` continuation described there. Any failed or ambiguous
-   admission fact stops without reassignment.
-5. Clean a rejected orphan only after the same checks prove it is clean and
-   uniquely owned by the failed creation and no recovery Task has adopted it.
-   Invoke a supported native task/worktree cleanup action against that literal
-   absolute path only; never use a glob, parent path, or Codex internal
-   database. If native cleanup is unavailable, record the defect and leave the
-   directory untouched.
-6. Make at most one replacement attempt after a concrete startup cause has
-   been removed or isolated. Rename only a materialized task so there is never
-   a second canonical `[#<number>] <issue title>` Worker.
+1. Obtain a supported native cancellation or terminal-failure result for the
+   exact queued request/client ID, then immediately verify that no real Task
+   appeared. Keep the ID and result private. If either fact cannot be proven,
+   record ownership as ambiguous, leave the worktree untouched, and prohibit
+   adoption, reuse, cleanup, or a replacement on that path. Never bind a
+   recovery Task to or remove an ambiguous path: a late materialization must not
+   create a second editor or inherit a removed worktree.
+2. Record the exact terminal/cancelled result and the no-Task read privately in
+   the visible Orchestrator task with the orphan evidence: literal and resolved
+   absolute paths, expected base SHA, actual `HEAD`, exact `git status
+   --porcelain` result, matching `git worktree list --porcelain` repository
+   entry, and native/GitHub ownership and admission facts. Record `missing` or
+   a command error as the measured value. Never publish client IDs, this
+   evidence, or local paths to GitHub.
+3. Diagnose an orphan only from that recorded literal path and expected base.
+   Reuse or cleanup requires the directory to exist, paths to match, actual
+   `HEAD` to equal the expected base, status to be empty, the worktree entry to
+   identify the expected repository, and ownership to be unambiguous. A dirty,
+   wrong-base, missing, or ambiguous directory stops safely without inferred
+   paths or retries on that path.
+4. Immediately before any adoption, reuse, cleanup, or replacement on that
+   path, re-read the exact queued request's terminal/cancelled result and the
+   native task list, and append the exact terminal result and no-Task result to
+   the private record. If the request is no longer terminal, the result is
+   absent or ambiguous, or any real Task now appears, leave the path untouched
+   and stop that action.
+5. Admit a recovery Task only after step 4 passes. Immediately before adoption,
+   re-read its native Task and GitHub ownership. The positive gate must prove
+   that the Task is real and sidebar-visible; idle and not editing; owns no
+   other GitHub work item, branch, PR, or write boundary; has no worktree
+   binding other than the exact orphan path or none; and can become the unique
+   editor under the Orchestrator's explicit recovery contract. That contract
+   names the exact absolute path as its only write boundary. A branch name,
+   parent directory, client ID, or inferred location is not a boundary. Append
+   that immediate ownership/admission evidence to the private record, then
+   route the Task to the shared
+   [Worker activation handoff](worker-contract.md#worker-activation-handoff).
+   Any failed or ambiguous fact stops without reassignment.
+6. Clean a rejected orphan only after the step-4 recheck and the same exact
+   path, base, cleanliness, worktree, and ownership checks pass. Invoke a
+   supported native task/worktree cleanup action against that literal absolute
+   path only; never use a glob, parent path, or Codex internal database. If
+   native cleanup is unavailable, record the defect and leave the directory
+   untouched.
+7. Make at most one replacement attempt only under the materialization flow's
+   recorded cause/remediation/probe gate. Rename only a materialized task so
+   there is never a second canonical `[#<number>] <issue title>` Worker.
 
-This branch completes only when either a real Worker resumes the materialization
-flow and completes the shared activation handoff; an admitted recovery Task has
-received `CLAIM_CONFIRMED` and become the unique editor; or the unclaimed
-dispatch is safely stopped with the orphan cleaned or left untouched because a
-safety check failed. In every outcome, no queued client ID is an Active claim.
+This branch completes only when the authoritative
+[Worker activation handoff](worker-contract.md#worker-activation-handoff)
+reaches its own completion criteria for a real Worker, or when the unclaimed
+dispatch safely leaves the orphan untouched or cleans it after all terminality
+checks. Do not declare completion from `CLAIM_CONFIRMED` or a local
+unique-editor assertion alone.
 
 ### Existing Worker failure: a real Worker exists
 
-This branch applies only after native discovery identifies the real visible
-Worker. Before one normal continuation, record a distinct, concrete
-recovery-continuation bound in the visible Orchestrator task: an absolute UTC
-deadline or a maximum number of native turn-state checks. Do not extend it. A
-meaningful recovery response is a completed, non-error native turn that
-acknowledges the recovery contract and leaves the Task idle.
+This branch applies after native discovery identifies a real visible Task.
 
-1. If the continuation does not yield that response before its bound expires,
-   stop retrying that session. Use one supported native visible-task fork or
-   handoff on the same worktree/branch only when it preserves a single editing
-   owner.
-2. Treat WIP as useful only when `git status --porcelain` contains staged or
+1. If that Task is real but unclaimed because its bootstrap, full-contract, or
+   preflight gate failed, send it back to the
+   [Worker activation handoff](worker-contract.md#worker-activation-handoff).
+   It may not edit until that handoff completes its normal
+   `CLAIM_CONFIRMED` continuation. Do not use the claimed-Worker recovery path
+   for this case.
+2. For an already-claimed Worker, record a distinct recovery-validation bound
+   in the visible Orchestrator task before one recovery continuation: an
+   absolute UTC deadline or a maximum number of native turn-state/content
+   checks, plus exact UTC read times or a stated cadence and that maximum. Do
+   not extend the bound or schedule.
+3. Require the literal `RECOVERY_READY` marker in a completed, non-error native
+   turn only after the Worker records this private evidence checklist:
+   - exact visible Task identity and an idle state after that turn;
+   - the Issue's current claim state still matches the already-claimed Worker;
+   - branch, exact worktree, and write-boundary ownership;
+   - actual `HEAD`, exact status, and a no-WIP or preserved-WIP remote-SHA
+     disposition;
+   - the effective task-host permission result; and
+   - the original model/reasoning binding, callback, hotset, and authority
+     boundaries still preserved.
+4. At the recorded read, verify that marker and every evidence item, then send
+   an explicit `RECOVERY_CONFIRMED` continuation. Only that continuation
+   authorizes the already-claimed Worker to resume edits.
+5. If the bound expires, the turn errors, the marker/evidence is incomplete, or
+   the Task is not idle, do not authorize edits. Stop retrying that session and
+   use one supported native visible-task fork or handoff on the same
+   worktree/branch only when it preserves a single editing owner.
+6. Treat WIP as useful only when `git status --porcelain` contains staged or
    unstaged changes, or when a commit is not present on the verified remote
    branch. Before archiving, record one disposition: no WIP (clean status and
    remote SHA verified), or preserved WIP (a scoped checkpoint is pushed and
@@ -171,20 +198,19 @@ acknowledges the recovery contract and leaves the Task idle.
    and verify the checkpoint has no transient or sensitive artifacts. If no
    disposition can be verified, leave the task and worktree intact and report
    the recovery requirement.
-3. Archive or stop the predecessor only after the worktree is clean or the
+7. Archive or stop the predecessor only after the worktree is clean or the
    remote checkpoint is verified. Tell the successor to inspect `git status`
    and the current diff before editing. Keep the Issue claim, branch, PR,
-   callback, model profile, and authority boundaries intact.
-4. When same-worktree succession is unsafe or unavailable, preserve and verify
-   the branch remotely, deactivate the predecessor, then create one replacement
-   worktree from that branch. Never run two Workers against one worktree.
+   callback, model profile, and authority boundaries intact. When same-worktree
+   succession is unsafe or unavailable, preserve and verify the branch remotely,
+   deactivate the predecessor, then create one replacement worktree from that
+   branch. Never run two Workers against one worktree.
 
-This branch completes only when one visible Worker has revalidated its branch,
-worktree, permissions, and ownership; its recovery turn has the observable
-acknowledgement above; and WIP has a verified no-WIP or preserved-WIP remote
-SHA disposition. A failed initial full-contract/preflight turn is an
-Existing Worker failure, but it leaves the Issue unclaimed instead of leaving a
-false Active Issue.
+An already-claimed Worker resumes only after the validated `RECOVERY_READY`
+marker and `RECOVERY_CONFIRMED` continuation. A real but unclaimed Task reaches
+an editing state only through the linked activation handoff. Otherwise this
+branch ends through the safe stop/succession path with WIP preserved or the
+worktree left intact.
 
 ## Orchestrator responsibilities
 
@@ -203,21 +229,30 @@ false Active Issue.
 
 ## Monitoring cadence
 
-This maintainer-requested addendum governs Orchestrator monitoring of a real,
-preflight-passed Worker. It is not a generic permission to poll a quiet task or
-to replace the creation and recovery branches above.
+This section governs Orchestrator monitoring of a real, preflight-passed
+Worker. It is not a generic permission to poll a quiet task or to replace the
+creation and recovery branches above.
 
 - Prefer Worker signals and GitHub events. During materialization, follow the
-  recorded discovery bound in the
-  [materialization flow](worker-contract.md#reliable-task-materialization) and,
-  once a real Task exists, the authoritative preflight handshake in the
-  [Worker activation handoff](worker-contract.md#worker-activation-handoff).
+  [materialization flow](worker-contract.md#reliable-task-materialization),
+  including its bootstrap gate. Only after that flow routes a real Task to the
+  [Worker activation handoff](worker-contract.md#worker-activation-handoff)
+  does the authoritative preflight handshake begin.
 - Once preflight passes, do not read the same Worker for ordinary progress just
   because no new event has arrived. A missing progress event alone is not
   evidence that reverse callback delivery is unavailable.
-- Use a fallback read no more often than every ten minutes only when reverse
-  callback delivery is absent, has failed, or is reasonably suspected to be
-  unavailable. Otherwise wait for a material signal or GitHub event.
+- Use a fallback read no more often than every ten minutes only after one
+  observable reverse-delivery trigger: the host reports callback capability is
+  unsupported, a native delivery call returns an error, the callback target is
+  confirmed absent or inactive, or the Worker records a delivery failure.
+  A missing progress event or general suspicion is not a trigger. Otherwise
+  wait for a material signal or GitHub event.
+- The bootstrap-materialization and claimed-Worker-recovery exceptions require
+  their pre-recorded deadline or maximum check count and their exact next-read
+  schedule: either stated UTC read times or a stated cadence plus the maximum
+  check count. Read only on that schedule and take the bound's documented exit
+  when it expires; never turn either exception into a busy poll. Executable AC2
+  polling remains residual work.
 - One immediate verification read is permitted after a Worker signal, explicit
   maintainer status request, declared command/test deadline, recovery action,
   or a GitHub PR, check, push, or merge transition.
@@ -225,6 +260,6 @@ to replace the creation and recovery branches above.
   unchanged active status, or minute-by-minute test progress. A user-facing
   progress update may use the last verified state.
 
-The ten-minute floor does not apply to short bootstrap materialization, one
-bounded recovery wait, or a verification read triggered by a new signal or
-GitHub event.
+The ten-minute floor does not apply to a scheduled short bootstrap read, a
+scheduled bounded recovery read, or one verification read triggered by a new
+signal or GitHub event.

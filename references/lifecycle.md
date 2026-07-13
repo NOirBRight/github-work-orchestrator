@@ -58,18 +58,15 @@ subagents may assist that task, but they are not claims, workers of record, or
 substitutes for a visible task.
 
 The [Worker Contract](worker-contract.md) is the single authority for task
-creation and preflight ordering: its
+creation and preflight ordering. Its
 [materialization flow](worker-contract.md#reliable-task-materialization) owns
-no-real-task discovery, and its
-[activation handoff](worker-contract.md#worker-activation-handoff) owns the
-real-Worker preflight gate. After a real Worker completes that gate, the first
-GitHub lifecycle write is the claim:
+queued-request terminality and no-real-task discovery; its
+[activation handoff](worker-contract.md#worker-activation-handoff) owns all
+real-Worker activation and claim-race checks. It is the only authority for
+dispatch writing and edit authorization; do not recreate or shortcut it here.
 
-```text
-gh issue edit <number> --add-assignee @me
-```
-
-Post one dispatch comment after claiming. Suggested shape:
+Only after the activation handoff authorizes its dispatch comment, use this
+shape:
 
 ```text
 Dispatch
