@@ -1,251 +1,139 @@
 ---
 name: github-work-orchestrator
-description: Align project direction, surface architecture decisions, standardize, reconcile, and orchestrate GitHub Issues into safe parallel, sidebar-visible Codex tasks backed by isolated worktrees. Use when Codex needs to run a long-lived execution campaign, discuss gray areas or architecture guardrails, normalize an issue backlog, repair labels or native dependencies, correct orchestration drift, compute the ready frontier, bind model profiles, dispatch visible worker tasks with explicit subagent boundaries, monitor issue/PR progress, or refill execution capacity across one or more repositories.
+description: Orchestrate GitHub execution campaigns by aligning direction and architecture, reconciling priority, labels, and native dependencies after intake, computing the ready frontier, binding models, dispatching sidebar-visible Workers, reviewing PRs, and refilling capacity. Use for project planning, scheduling, dispatch, cross-Issue arbitration, Worker or PR review, and signal-driven campaign monitoring.
 ---
 
 # GitHub Work Orchestrator
 
-Use GitHub as the only persistent work-state source. Keep orchestration
-stateless: reconstruct the current plan from Issues, native dependencies,
-assignees, linked PRs, repository instructions, and visible Codex tasks.
+Keep GitHub as the only persistent work-state source. Reconstruct the current
+plan from Issues, native dependencies, assignees, linked PRs, repository policy,
+and visible Codex tasks.
 
-## Operating boundaries
+## Load the control plane
 
-- Use one visible Codex task in an isolated worktree for every dispatched or
-  claimed GitHub work item. Never substitute a subagent for that task's
-  identity, ownership, branch, PR, or lifecycle state.
-- The Orchestrator may use subagents for bounded research, inventory,
-  dependency analysis, or model classification that is not itself a claimed
-  GitHub work item. Keep this assistance read-only by default; an explicitly
-  scoped research artifact remains owned and reviewed by the Orchestrator. A
-  research subagent must not claim, mutate lifecycle state, or execute a real
-  GitHub work item.
-- A visible Worker may use subagents internally for bounded implementation
-  slices, research, review, test analysis, or independent checks inside the
-  same assigned Issue and worktree. The visible Worker owns write-set
-  partitioning, integration, and final review, and must not turn a subagent into
-  a hidden implementation stream for another GitHub Issue.
-- Treat Issues, implementation tasks, bugs, investigations, reviews, incidents,
-  and releases as work items.
-- Keep Skill source and releases outside the target repository.
-- Do not create an orchestration database, control Issue, duplicate status
-  ledger, dashboard, MCP server, or background daemon.
-- Reuse the repository's canonical labels. Do not create new label vocabulary
-  or modify repository policy unless the user explicitly authorizes it.
-- Preserve dirty working trees. Create new worktrees from the repository's
-  documented canonical integration branch and SHA.
-- Use read-only preflight for inspect, plan, review, or audit requests.
-- Treat start, dispatch, continue, run, orchestrate, standardize, reconcile, or
-  repair requests as authorization to apply in-scope GitHub corrections.
-- Keep project direction, durable architecture, compatibility policy, and
-  irreversible choices in a human-visible discussion loop. Workers may decide
-  local reversible implementation details, not silently set project policy.
+Before planning or writing:
 
-## Load project policy
+1. Read every applicable `AGENTS.md` and the repository's issue-tracker,
+   label, Git-flow, testing, and release instructions.
+2. Read [GitHub state rules](references/shared/github-state-rules.md) and
+   [lifecycle](references/shared/lifecycle.md).
+3. Read [model profiles](references/shared/model-profiles.md) before selecting
+   a model.
+4. Read [communication protocol](references/shared/communication-protocol.md)
+   before dispatching, steering, or monitoring a visible task.
+5. Read [issue contract](references/shared/issue-contract.md) and
+   [reconciliation](references/reconciliation.md) before repairing Issue state.
 
-Before querying work:
+Repository policy overrides this Skill's defaults. The control plane is loaded
+when the repository, integration branch, label vocabulary, and authority
+envelope are explicit.
 
-1. Read every applicable `AGENTS.md`.
-2. Read the repository's issue-tracker, label, Git-flow, testing, and release
-   instructions when present.
-3. Infer the GitHub repository from `git remote`; use `--repo` only when the
-   target differs from the current checkout.
-4. Treat repository policy as an override of this Skill's defaults.
+## Keep intake and execution separate
 
-Read [references/lifecycle.md](references/lifecycle.md) before changing Issue
-state. Read [references/model-profiles.md](references/model-profiles.md) before
-selecting a worker model. Read
-[references/decision-gates.md](references/decision-gates.md) before starting a
-new long-running campaign or resolving a direction or architecture gray area.
-Read
-[references/worker-contract.md](references/worker-contract.md) before creating
-or messaging a worker task. Read
-[references/communication.md](references/communication.md) before dispatching,
-steering, or monitoring visible tasks. Read
-[references/reconciliation.md](references/reconciliation.md) before
-standardizing Issues or applying drift repairs.
+Send routine bug reports, enhancement requests, screenshots, logs, and rough
+ideas to a persistent task using `github-issue-intake` when it is available.
+Consume only its material signals; routine drafting and duplicate-search
+updates stay in the Intake task.
 
-## Align direction before sustained execution
+The Orchestrator may reconcile priority, labels, contracts, and native
+dependencies after intake. It does not implement production Issues. Every
+claimed Issue executes in one sidebar-visible Worker task using
+`github-issue-worker`; bounded subagents may assist analysis or review but do
+not own a GitHub work item.
 
-At the start of a project, a new Milestone, or a resumed campaign whose prior
-direction is missing or stale, run the direction checkpoint in
-[references/decision-gates.md](references/decision-gates.md). Present the
-maintainer with a concise execution charter and the material unresolved choices
-before the first new scheduling refill. Reuse accepted direction instead of
-asking again on every turn.
+This boundary is complete when every active work item has exactly one visible
+owner and routine intake is outside the Orchestrator task.
 
-Open a discussion gate when a choice would change product direction, a durable
-architecture seam, a public or persisted contract, compatibility policy,
-security posture, or multiple downstream work items. Do not open one for an
-ordinary reversible implementation detail inside a clear Issue contract.
+## Align direction
 
-Pause only the affected hotset. Continue independent, already-clear work while
-the discussion is resolved. Record accepted durable decisions in the project's
-existing authoritative Issue, Milestone, domain document, or ADR; do not create
-a second project ledger.
+Read [decision gates](references/decision-gates.md) at the start of a project,
+a new Milestone, or a campaign whose accepted direction is stale. Present an
+execution charter and material unresolved choices before the first refill.
 
-## Reconcile before scheduling
+Open a discussion gate for product direction, durable architecture, public or
+persisted contracts, compatibility, security, irreversible migrations, or a
+choice that changes multiple downstream work items. Pause only the affected
+hotset and record the accepted decision in the project's existing
+authoritative source.
 
-Run the state validator:
+Direction is aligned when the target outcome, non-goals, architecture
+invariants, authority envelope, and every material open choice are visible.
+
+## Reconcile and compute the frontier
+
+Run the read-only checks:
 
 ```text
 python <skill>/scripts/validate_issue_state.py --cwd <repository>
-```
-
-Run the ready-frontier query:
-
-```text
 python <skill>/scripts/ready_frontier.py --cwd <repository> --json
 ```
 
-Both scripts are read-only. Report contradictory state before dispatch. Do not
-silently reinterpret an invalid Issue.
-
-On an authorized orchestration run:
-
-1. Infer the intended dependency graph and Issue contract from Issue bodies,
-   native sub-issues, repository policy, accepted plans, and maintainer
-   instructions.
-2. Build an ephemeral reconciliation command. Do not store another state file
-   in the target repository.
-3. Preview deterministic corrections:
+For an authorized orchestration run, preview deterministic corrections before
+applying them:
 
 ```text
 python <skill>/scripts/reconcile_issue_state.py --cwd <repository> \
   --repair-safe <explicit status and dependency arguments>
 ```
 
-4. Review the preview for semantic ambiguity or destructive edits.
-5. Re-run with `--apply` for unambiguous corrections.
-6. Re-run the validator and frontier. Continue only when there are no errors.
+Review the preview, add `--apply` only for unambiguous corrections, then rerun
+the validator and frontier. Reconcile again after every merge, accepted
+decision, blocker change, Worker failure, or released slot.
 
-Automatically repeat reconciliation before every scheduling refill. Apply
-safe, idempotent corrections without requesting confirmation again during an
-already-authorized orchestration run. Route ambiguity to `needs-triage` or
-`needs-info`; never conceal it.
+For each candidate, confirm blockers are closed, the Issue is unassigned, the
+contract is fresh-worker-ready, the expected hotset is compatible with active
+ownership, and the model profile is explicit. Return a proposal without writes
+for planning, inspection, review, or preflight requests.
 
-For each ready candidate:
+The frontier is safe when it contains only unassigned, fully specified Issues
+whose blockers are closed and whose expected write sets can run concurrently.
 
-1. Confirm every native or textual blocker is closed.
-2. Confirm the Issue is unassigned.
-3. Extract acceptance criteria, verification commands, affected components, and
-   likely hot files.
-4. Classify it as orchestration, core, evidence, standard, mechanical, or
-   light work.
-5. Select a model profile.
-6. Check it against active worktree ownership and the integration queue.
+## Dispatch visible Workers
 
-Return a proposed frontier without writes when the request is planning,
-inspection, review, or preflight only.
+Dispatch only after authorization:
 
-## Select parallel work
+1. Reconcile immediately before the claim.
+2. Claim the Issue through its assignee field and post one dispatch comment
+   with profile/model, base branch and SHA, feature branch, ownership/hotset,
+   decisions, verification, blockers, and PR target.
+3. Materialize one isolated-worktree task using the two-stage flow in
+   [GitHub state rules](references/shared/github-state-rules.md#reliable-task-materialization).
+4. Send the full assigned-Issue contract only after a real task ID exists.
+   Require `github-issue-worker`, the selected binding, permission preflight,
+   and the exact Orchestrator callback task ID.
+5. Require the Worker to call native `send_message_to_thread` with the shared
+   signal envelope before its final response. A final answer in the Worker task
+   is not callback delivery.
 
-Prefer independent tasks whose expected write sets do not overlap. Default
-capacity, unless repository policy overrides it:
+If task materialization or permission preflight fails, follow the shared
+recovery rules. A subagent, hidden process, or shared directory is not a Worker
+fallback.
 
-- one Orchestrator;
-- up to three production-code workers;
-- up to two evidence-only workers;
-- one serialized queue for each shared integration hotset.
+Dispatch is complete when one materialized visible task owns the Issue,
+worktree, branch, callback, model binding, and verification contract.
 
-Evidence-only workers may exceed code capacity only when they do not modify
-production routes or shared handlers. A blocked or human-waiting task releases
-its capacity.
+## Review signals and refill
 
-For bugs and incidents, assign one Debug Owner. Do not launch duplicate
-investigations for the same symptom. Other tasks may reproduce or collect
-evidence but must send it to that owner.
+Treat `ISSUE_READY`, `DUPLICATE`, `NEEDS_INFO`, `DISCUSSION_REQUIRED`,
+`BLOCKED`, `PR_OPENED`, `READY_FOR_REVIEW`, and `STOPPED` as prompts to verify,
+not as authoritative state changes. Deduplicate by `Signal-ID`, verify against
+the sender task and GitHub, then act inside the Orchestrator's authority.
 
-## Dispatch work
+Use signal-driven monitoring. After materialization and permission preflight,
+fallback reads of the same active Worker remain at least ten minutes apart
+unless a signal, explicit maintainer request, declared deadline, recovery
+operation, or GitHub state transition permits one immediate read. A PR/check
+transition is a valid fallback event when callback delivery is missing.
 
-Dispatch only after explicit authorization.
+When a Worker is ready:
 
-1. Re-run reconciliation immediately before the dispatch claim.
-2. Claim the Issue using its assignee field. Keep `ready-for-agent` while it is
-   active unless repository policy defines another transition.
-3. Post one concise dispatch comment containing:
-   - selected profile and concrete model;
-   - canonical base branch and SHA;
-   - proposed feature branch;
-   - owned components or hot files;
-   - accepted architecture invariants and decision references;
-   - required verification;
-   - known blockers and integration parent.
-4. Create one sidebar-visible Codex task with an isolated worktree, using the
-   [reliable materialization flow](references/worker-contract.md#reliable-task-materialization).
-   Do not send the full Worker Contract until a real task ID exists. Title the
-   materialized task `[#<number>] <issue title>`.
-5. Apply the selected Worker model and reasoning level to the first full
-   contract turn. A cheaper bootstrap model is only a host-startup probe and is
-   not the Issue's recorded binding. If the full turn cannot honor the binding,
-   stop and report the mismatch.
-6. Require the user-configured task host to provide the requested permission
-   profile. When task creation exposes no permission argument, do not pretend a
-   prompt can grant it; run the Worker Contract's permission preflight and stop
-   if the effective profile is narrower or requests approval.
-7. Send the Worker Contract plus the Issue URL and repository-specific rules.
-   Include the Orchestrator task as the callback target and require the signals
-   in the Worker communication protocol.
+1. Verify scope, base, diff, tests, PR target, and accepted decisions.
+2. Route revisions to the same visible task.
+3. Serialize integration through declared hotsets.
+4. Recompute the frontier after every material event.
+5. Refill the highest-priority non-conflicting lane while authorization remains
+   active.
 
-If visible-task creation tools are unavailable, stop after the GitHub preflight.
-Do not fall back to a subagent as the work-item Worker, a hidden process, or a
-shared working directory. Research assistance does not satisfy dispatch.
-
-If creation returns only a client-side ID and never materializes, do not claim
-the Issue active and do not retry blindly. Follow the communication protocol's
-failed-creation rules before making one bounded replacement attempt.
-
-## Monitor and refill
-
-Use native visible-task tools to list and read active workers. Derive state as
-follows:
-
-- ready: `ready-for-agent`, unassigned, and no open blocker;
-- active: `ready-for-agent` and assigned;
-- review/integration: linked open PR;
-- human wait: `ready-for-human`;
-- information wait: `needs-info`;
-- complete: closed Issue after its intended merge and verification.
-
-Require Workers to signal `DISCUSSION_REQUIRED`, `BLOCKED`, `PR_OPENED`,
-`READY_FOR_REVIEW`, or `STOPPED` to the Orchestrator through native task
-messaging when available.
-Treat signals as prompts to verify, not as authoritative lifecycle changes.
-Reverse delivery is not guaranteed, so poll visible tasks and GitHub as the
-fallback. Keep callback task IDs out of GitHub.
-
-Use signal-driven monitoring by default. After bootstrap materialization and
-the permission preflight are verified, do not poll an active Worker for
-ordinary progress. In the absence of a Worker signal, an explicit maintainer
-status request, a declared completion deadline, or a GitHub state transition,
-wait at least ten minutes before reading the same Worker again. Read once per
-event and do not narrate unchanged intermediate reasoning. See
-[references/communication.md](references/communication.md) for the cadence and
-its narrow startup/recovery exceptions.
-
-When a Worker reports completion:
-
-1. Verify scope, diff, tests, base, and PR target.
-2. Route revisions back to the same visible task.
-3. Serialize merges through declared hotsets.
-4. Recompute the frontier after every merge, blocker change, or released slot.
-5. Start the highest-priority ready non-conflicting task when authorized to
-   continue dispatching.
-
-When a Worker reports `DISCUSSION_REQUIRED`, verify that the trigger is
-material, consolidate related choices into one discussion packet, and route it
-through the decision gate. Do not turn routine progress updates into discussion
-traffic.
-
-Never close an Issue merely because a local commit exists. Prefer PR closing
-keywords when the PR fully resolves the Issue.
-
-## Model changes
-
-Keep profile names stable. Change concrete bindings in
-[references/model-profiles.md](references/model-profiles.md), not on every
-Issue. Record the exact binding in the dispatch comment for auditability.
-
-Promote third-party models gradually through shadow, evidence, mechanical,
-standard, core, and finally Orchestrator eligibility. Fall back to the profile's
-verified default when a candidate is unavailable or unstable.
+Review and refill are complete when every received signal is verified once,
+every integration collision is serialized, and all free authorized capacity is
+either filled from the safe frontier or explained.

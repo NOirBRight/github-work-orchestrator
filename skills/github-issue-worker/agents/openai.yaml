@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Issue Worker"
+  short_description: "Execute one assigned Issue in an isolated worktree"
+  default_prompt: "Use $github-issue-worker to execute this assigned GitHub Issue exactly within its branch, hotset, verification, and PR contract."
