@@ -112,9 +112,9 @@ whose blockers are closed and whose expected write sets can run concurrently.
    preflight, claim, dispatch-comment, and edit-authorization order. Do not
    shorten that safety sequence in prose.
 3. The dispatch payload includes verification class/commands, manual evidence,
-   architecture decision, `Review-Owner: orchestrator`, profile/model, base
-   branch and SHA, feature branch, ownership/hotset, blockers, callback, and PR
-   target.
+   architecture decision, `Review-Owner: orchestrator`, requested model,
+   verified effective-binding evidence/status, base branch and SHA, feature
+   branch, ownership/hotset, blockers, callback, and PR target.
 4. Materialize one isolated-worktree task using the two-stage flow. Send the
    full assigned-Issue contract only after a real task ID exists, and require
    `github-issue-worker`, the selected binding, its deterministic permission

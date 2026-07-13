@@ -298,7 +298,8 @@ Include:
    Worker's local decision authority.
 7. Known dependencies and required integration parent.
 8. Execution-contract version, verification class/commands, manual evidence,
-   architecture decision, and `Review-Owner: orchestrator`.
+   architecture decision, `Review-Owner: orchestrator`, requested model,
+   `model_binding_status: verified`, and sanitized effective-binding evidence.
 9. Required PR target and closing semantics.
 10. The Orchestrator callback task and the required Worker signals from the
    [communication protocol](communication.md).
@@ -371,10 +372,9 @@ environment setting and verify it through this preflight.
   the model binding is unavailable, or required authority is missing.
 - For investigations, keep production behavior unchanged unless implementation
   was explicitly assigned.
-- Follow the shared verification class: targeted-only for `fast`, one relevant
-  local full suite for `standard`, and one relevant full suite plus explicitly
-  required evidence for `strict`. After review fixes, rerun targeted checks and
-  CI unless the delta crosses a new repository verification boundary.
+- Follow the sole class and post-review rules in
+  [the shared verification policy](shared/verification-policy.md); do not
+  restate or extend them in the dispatch.
 
 ## Worker signals
 

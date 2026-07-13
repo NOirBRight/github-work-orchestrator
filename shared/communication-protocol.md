@@ -50,7 +50,9 @@ the execution contract explicitly authorized that comment.
 
 ## Intake signals
 
-Send exactly one signal after a material intake outcome:
+Use the Intake package's `scripts/intake_signal.py` to validate the payload and
+generate a retry-stable `Signal-ID`. Send exactly one signal after a material
+intake outcome; the following is the script's canonical output:
 
 ```text
 INTAKE_SIGNAL
@@ -75,8 +77,10 @@ Routine search, drafting, and diagnostic progress remains in the Intake task.
 
 ## Worker signals
 
-Send each state once per material transition. Reuse a state only when its
-payload materially changes, and then use a new `Signal-ID`.
+Use the Worker package's `scripts/worker_signal.py` to validate metrics and
+generate a retry-stable `Signal-ID`. Send each state once per material
+transition. Reuse a state only when its payload materially changes; the script
+then generates a new ID. The following is its canonical output:
 
 ```text
 WORKER_SIGNAL

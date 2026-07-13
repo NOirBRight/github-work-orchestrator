@@ -18,10 +18,13 @@ Review-Owner: orchestrator
 ```
 
 The dispatch contract repeats these fields and adds the pinned repository,
-base SHA, branch, hotset, model binding, permission profile, callback, and PR
-target. A `discussion-required` contract is not dispatchable. Existing active
-work may migrate incrementally; do not restart or discard useful WIP merely to
-add v2 metadata.
+base SHA, branch, hotset, requested model binding, `model_binding_status`,
+sanitized `model_binding_evidence`, permission profile, callback, and PR target.
+`model_binding_status` must be `verified`; a requested UI/API value alone is
+not effective-runtime evidence. An unverified binding or a
+`discussion-required` contract is not dispatchable. Existing active work may
+migrate incrementally; do not restart or discard useful WIP merely to add v2
+metadata.
 
 ## Verification classes
 

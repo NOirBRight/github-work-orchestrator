@@ -21,6 +21,7 @@ REQUIRED_TEXT = (
     "manual_evidence",
     "model_profile",
     "model_binding",
+    "model_binding_evidence",
     "callback_task",
     "pr_target",
 )
@@ -41,6 +42,7 @@ def nonempty_text_list(value: Any) -> bool:
 def verification_plan(
     verification_class: str,
     *,
+    manual_evidence: str = "none",
     phase: str = "candidate",
     boundary_changed: bool = False,
 ) -> dict[str, Any]:
@@ -52,7 +54,7 @@ def verification_plan(
         return {
             "targeted_checks": True,
             "local_full_suite": verification_class in {"standard", "strict"},
-            "manual_evidence": verification_class == "strict",
+            "manual_evidence": manual_evidence.strip().lower() != "none",
             "worker_review_runs": 0,
             "orchestrator_review": (
                 "direct" if verification_class == "fast" else "standards-spec"
@@ -99,6 +101,8 @@ def validate_contract(contract: Any) -> dict[str, Any]:
         errors.append("invalid-architecture-decision")
     if contract.get("review_owner") != "orchestrator":
         errors.append("review-owner-must-be-orchestrator")
+    if contract.get("model_binding_status") != "verified":
+        errors.append("model-binding-must-be-verified")
     base_sha = contract.get("base_sha")
     if not isinstance(base_sha, str) or not SHA_RE.fullmatch(base_sha):
         errors.append("base-sha-must-be-lowercase-40-hex")
@@ -121,7 +125,10 @@ def validate_contract(contract: Any) -> dict[str, Any]:
         "dispatchable": not errors,
         "verification_class": verification_class,
         "verification_plan": (
-            verification_plan(verification_class)
+            verification_plan(
+                verification_class,
+                manual_evidence=contract["manual_evidence"],
+            )
             if verification_class in VERIFICATION_CLASSES
             else None
         ),

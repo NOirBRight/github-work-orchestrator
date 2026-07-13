@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -52,6 +55,30 @@ class SkillPackageTests(unittest.TestCase):
 
     def test_sync_check_accepts_committed_packages(self) -> None:
         self.assertEqual([], SYNC.find_drift(ROOT))
+
+    def test_package_manifests_pin_version_and_content_digest(self) -> None:
+        for name in SKILLS:
+            package = ROOT / "skills" / name
+            manifest = json.loads(
+                (package / SYNC.PACKAGE_MANIFEST).read_text(encoding="utf-8")
+            )
+            with self.subTest(skill=name):
+                self.assertEqual(SYNC.PACKAGE_VERSION, manifest["version"])
+                self.assertEqual(name, manifest["skill"])
+                self.assertEqual(
+                    SYNC.package_digest(package), manifest["content_sha256"]
+                )
+
+    def test_installed_skill_digest_detects_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            install_root = Path(temporary)
+            for name in SKILLS:
+                shutil.copytree(ROOT / "skills" / name, install_root / name)
+            self.assertEqual([], SYNC.find_install_drift(ROOT, install_root))
+            (install_root / SKILLS[0] / "SKILL.md").write_text(
+                "drift", encoding="utf-8"
+            )
+            self.assertTrue(SYNC.find_install_drift(ROOT, install_root))
 
     def test_legacy_root_install_loads_the_packaged_orchestrator(self) -> None:
         wrapper = (ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -116,7 +143,7 @@ class SkillPackageTests(unittest.TestCase):
             ROOT / "skills/github-work-orchestrator/SKILL.md"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            "communication-protocol.md#delivery-handshake", worker
+            "worker-execution.md#publish-and-callback", worker
         )
         self.assertIn("exact Orchestrator callback", worker)
         self.assertIn(

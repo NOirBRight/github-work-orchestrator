@@ -18,13 +18,20 @@ NETWORK_FULL = {"enabled", "full", "true", "unrestricted"}
 class CommandError(RuntimeError):
     """A required read-only command failed."""
 
-    def __init__(self, name: str, returncode: int):
-        super().__init__(f"{name} failed with exit code {returncode}")
+    def __init__(self, name: str, returncode: int, reason: str = "failed"):
+        super().__init__(f"{name} {reason} with exit code {returncode}")
         self.name = name
         self.returncode = returncode
+        self.reason = reason
 
 
-def run_command(cwd: Path, name: str, arguments: list[str]) -> str:
+def run_command(
+    cwd: Path,
+    name: str,
+    arguments: list[str],
+    *,
+    timeout_seconds: float,
+) -> str:
     try:
         result = subprocess.run(
             arguments,
@@ -33,9 +40,12 @@ def run_command(cwd: Path, name: str, arguments: list[str]) -> str:
             capture_output=True,
             text=True,
             encoding="utf-8",
+            timeout=timeout_seconds,
         )
     except FileNotFoundError as exc:
         raise CommandError(name, 127) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CommandError(name, 124, "timed-out") from exc
     if result.returncode:
         raise CommandError(name, result.returncode)
     return result.stdout.strip()
@@ -88,22 +98,37 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     if not cwd.is_dir():
         raise CommandError("cwd", 2)
     observed: dict[str, Any] = {
-        "head": run_command(cwd, "git-head", ["git", "rev-parse", "HEAD"]),
+        "head": run_command(
+            cwd,
+            "git-head",
+            ["git", "rev-parse", "HEAD"],
+            timeout_seconds=args.command_timeout_seconds,
+        ),
         "branch": run_command(
-            cwd, "git-branch", ["git", "branch", "--show-current"]
+            cwd,
+            "git-branch",
+            ["git", "branch", "--show-current"],
+            timeout_seconds=args.command_timeout_seconds,
         ),
         "integration_head": run_command(
             cwd,
             "git-integration-ref",
             ["git", "rev-parse", args.integration_ref],
+            timeout_seconds=args.command_timeout_seconds,
         ),
         "status": run_command(
-            cwd, "git-status", ["git", "status", "--porcelain=v1"]
+            cwd,
+            "git-status",
+            ["git", "status", "--porcelain=v1"],
+            timeout_seconds=args.command_timeout_seconds,
         ),
     }
     if args.require_github:
         observed["github_login"] = run_command(
-            cwd, "github-identity", ["gh", "api", "user", "--jq", ".login"]
+            cwd,
+            "github-identity",
+            ["gh", "api", "user", "--jq", ".login"],
+            timeout_seconds=args.command_timeout_seconds,
         )
         observed["github_repository"] = run_command(
             cwd,
@@ -117,6 +142,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
                 "--jq",
                 ".nameWithOwner",
             ],
+            timeout_seconds=args.command_timeout_seconds,
         )
     return observed
 
@@ -131,11 +157,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--network", required=True)
     parser.add_argument("--approval", required=True)
     parser.add_argument("--require-github", action="store_true")
+    parser.add_argument(
+        "--command-timeout-seconds",
+        type=float,
+        default=15.0,
+        help="per-command read-only timeout; defaults to 15 seconds",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.command_timeout_seconds <= 0:
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "error",
+                    "command": "configuration",
+                    "returncode": 2,
+                    "reason": "invalid-timeout",
+                },
+                indent=2,
+            )
+        )
+        return 2
     try:
         observed = collect(args)
     except CommandError as exc:
@@ -146,6 +192,7 @@ def main() -> int:
                     "status": "error",
                     "command": exc.name,
                     "returncode": exc.returncode,
+                    "reason": exc.reason,
                 },
                 indent=2,
             )

@@ -26,16 +26,9 @@ paths, raw private traces, and unnecessary personal data.
 ## Execution contract v2
 
 Use the shared [verification policy](verification-policy.md#execution-contract)
-as the authority. Include these exact fields without creating labels for them:
-
-```text
-Execution-Contract: v2
-Verification-Class: fast | standard | strict
-Verification-Commands: <commands or explicit not-applicable reason>
-Manual-Evidence: none | <one explicit requirement>
-Architecture-Decision: resolved | discussion-required
-Review-Owner: orchestrator
-```
+as the sole authority for the exact fields and allowed values. Copy that
+template into the Issue without creating labels for it; do not maintain a
+second field definition here.
 
 The Issue owns product acceptance. The repository owns its verification
 matrix. Intake proposes the class but does not invent additional acceptance or

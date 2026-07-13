@@ -21,11 +21,11 @@ Read the Orchestrator message and identify:
 6. Accepted decisions and local decision authority.
 7. Verification class/commands, manual evidence, architecture decision,
    `Review-Owner: orchestrator`, and dependencies.
-8. Closing semantics and callback task.
+8. Requested model plus `model_binding_status: verified` and sanitized
+   effective-binding evidence.
+9. Closing semantics and callback task.
 
-Read lifecycle [role ownership](references/shared/lifecycle.md#role-ownership),
-the model-profile [selection order](references/shared/model-profiles.md#selection-order),
-and the shared [verification policy](references/shared/verification-policy.md).
+Read the compact [Worker execution core](references/shared/worker-execution.md).
 
 Stop with `BLOCKED` when the assignment is missing a required identity or when
 the requested model, permissions, base, branch, or worktree cannot be honored.
@@ -36,15 +36,13 @@ and the task owns exactly one Issue.
 
 ## Pass preflight before edits
 
-Run the shared
-[permission and repository preflight](references/shared/github-state-rules.md#permission-and-repository-preflight),
-then apply its [visible ownership](references/shared/github-state-rules.md#visible-ownership)
-and [collision evidence](references/shared/github-state-rules.md#branch-and-collision-evidence)
-rules. Read applicable `AGENTS.md`, domain context, ADRs, the Issue and comments,
+Apply the compact core's
+[deterministic preflight](references/shared/worker-execution.md#deterministic-preflight).
+Read applicable `AGENTS.md`, domain context, ADRs, the Issue and comments,
 linked PR state, and the base diff. Post a short plan naming expected writes,
-verification, and collision evidence before editing. Read
-[recovery and WIP preservation](references/shared/github-state-rules.md#recovery-and-wip-preservation)
-only when task-host failure or succession makes that branch relevant.
+verification, and collision evidence before editing. Read the recovery paragraph
+in the same compact reference only when task-host failure or succession makes
+that branch relevant.
 
 When the packaged preflight script is available, run it instead of manually
 reconstructing the same Git/GitHub checks:
@@ -90,7 +88,8 @@ review.
 Compare upstream changes from the merge base before claiming a collision; an
 advanced integration branch alone is not a blocker.
 
-Run targeted verification during implementation. Apply the shared class:
+Run targeted verification during implementation. Apply only the assigned row
+in the compact [verification-class table](references/shared/worker-execution.md#assigned-verification-class):
 
 - `fast`: targeted checks and diff hygiene; no local full suite.
 - `standard`: one repository-defined relevant full suite at the candidate.
@@ -107,15 +106,12 @@ recorded, and the final diff contains only authorized work.
 
 ## Publish and signal
 
-Commit, push, and open or update the PR under lifecycle
-[role ownership](references/shared/lifecycle.md#role-ownership) and
-[completion](references/shared/lifecycle.md#claim-branch-pr-and-completion)
-rules.
+Commit, push, and open or update only the assigned PR under the compact
+[publication rules](references/shared/worker-execution.md#publish-and-callback).
 
-Before the final response, emit the applicable shared
-[Worker signals](references/shared/communication-protocol.md#worker-signals)
-and complete the shared
-[delivery handshake](references/shared/communication-protocol.md#delivery-handshake)
+Before the final response, build the canonical signal with
+`scripts/worker_signal.py` and complete the compact
+[callback handshake](references/shared/worker-execution.md#publish-and-callback)
 to the exact Orchestrator callback.
 
 Worker completion requires a clean or intentionally preserved worktree, a

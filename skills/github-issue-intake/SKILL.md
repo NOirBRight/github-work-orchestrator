@@ -96,7 +96,8 @@ passes.
 
 ## Emit one material signal
 
-Emit exactly one shared
+Build the canonical envelope with `scripts/intake_signal.py`, then emit exactly
+one shared
 [Intake signal](references/shared/communication-protocol.md#intake-signals),
 then complete the shared
 [delivery handshake](references/shared/communication-protocol.md#delivery-handshake)

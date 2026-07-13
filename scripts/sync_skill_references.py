@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 from pathlib import Path
 
 
@@ -24,13 +26,11 @@ PACKAGES = {
         "verification-policy.md",
     ),
     "github-issue-worker": (
-        "communication-protocol.md",
-        "github-state-rules.md",
-        "lifecycle.md",
-        "model-profiles.md",
-        "verification-policy.md",
+        "worker-execution.md",
     ),
 }
+PACKAGE_VERSION = "2.0.0"
+PACKAGE_MANIFEST = ".skill-package.json"
 
 
 def targets(root: Path):
@@ -65,6 +65,36 @@ def compatibility_files(root: Path):
     yield source.read_bytes(), root / "agents" / "openai.yaml"
 
 
+def package_digest(package: Path) -> str:
+    digest = hashlib.sha256()
+    files = sorted(
+        path
+        for path in package.rglob("*")
+        if path.is_file()
+        and path.name != PACKAGE_MANIFEST
+        and "__pycache__" not in path.parts
+        and path.suffix != ".pyc"
+    )
+    for path in files:
+        relative = path.relative_to(package).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        content = path.read_bytes()
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def package_manifest(root: Path, skill: str) -> bytes:
+    payload = {
+        "schema_version": 1,
+        "skill": skill,
+        "version": PACKAGE_VERSION,
+        "content_sha256": package_digest(root / "skills" / skill),
+    }
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
 def find_drift(root: Path) -> list[str]:
     drift: list[str] = []
     for source, target in targets(root):
@@ -79,6 +109,43 @@ def find_drift(root: Path) -> list[str]:
             drift.append(f"missing compatibility file: {target.relative_to(root)}")
         elif expected != target.read_bytes():
             drift.append(f"stale compatibility file: {target.relative_to(root)}")
+    for skill, filenames in PACKAGES.items():
+        destination = root / "skills" / skill / "references" / "shared"
+        packaged = {path.name for path in destination.glob("*") if path.is_file()}
+        for stale in sorted(packaged - set(filenames)):
+            drift.append(
+                f"unexpected package copy: {(destination / stale).relative_to(root)}"
+            )
+        manifest = root / "skills" / skill / PACKAGE_MANIFEST
+        expected = package_manifest(root, skill)
+        if not manifest.is_file():
+            drift.append(f"missing package manifest: {manifest.relative_to(root)}")
+        elif manifest.read_bytes() != expected:
+            drift.append(f"stale package manifest: {manifest.relative_to(root)}")
+    return drift
+
+
+def find_install_drift(root: Path, install_root: Path) -> list[str]:
+    drift: list[str] = []
+    for skill in PACKAGES:
+        source = root / "skills" / skill
+        installed = install_root / skill
+        if not installed.is_dir():
+            drift.append(f"missing installed Skill: {installed}")
+            continue
+        source_manifest = source / PACKAGE_MANIFEST
+        installed_manifest = installed / PACKAGE_MANIFEST
+        if not installed_manifest.is_file():
+            drift.append(f"missing installed manifest: {installed_manifest}")
+            continue
+        if source_manifest.read_bytes() != installed_manifest.read_bytes():
+            drift.append(f"installed manifest mismatch: {installed_manifest}")
+            continue
+        expected_digest = json.loads(source_manifest.read_text(encoding="utf-8"))[
+            "content_sha256"
+        ]
+        if package_digest(installed) != expected_digest:
+            drift.append(f"installed content mismatch: {installed}")
     return drift
 
 
@@ -87,7 +154,9 @@ def synchronize(root: Path) -> None:
         destination = root / "skills" / skill / "references" / "shared"
         expected = set(filenames)
         if destination.is_dir():
-            for packaged in destination.glob("*.md"):
+            for packaged in destination.glob("*"):
+                if not packaged.is_file():
+                    continue
                 if packaged.name not in expected:
                     packaged.unlink()
     for source, target in targets(root):
@@ -96,6 +165,9 @@ def synchronize(root: Path) -> None:
     for content, target in compatibility_files(root):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
+    for skill in PACKAGES:
+        manifest = root / "skills" / skill / PACKAGE_MANIFEST
+        manifest.write_bytes(package_manifest(root, skill))
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,6 +177,13 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(__file__).resolve().parents[1],
         help="repository root",
+    )
+    parser.add_argument(
+        "--install-root",
+        action="append",
+        type=Path,
+        default=[],
+        help="optional Codex skills directory whose package digests must match",
     )
     parser.add_argument(
         "--check",
@@ -120,6 +199,8 @@ def main() -> int:
     if not args.check:
         synchronize(root)
     drift = find_drift(root)
+    for install_root in args.install_root:
+        drift.extend(find_install_drift(root, install_root.resolve()))
     if drift:
         for finding in drift:
             print(f"error: {finding}")

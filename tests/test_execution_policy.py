@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +33,14 @@ PREFLIGHT = load_module(
     "worker_preflight",
     ROOT / "skills" / "github-issue-worker" / "scripts" / "preflight.py",
 )
+WORKER_SIGNAL = load_module(
+    "worker_signal",
+    ROOT / "skills" / "github-issue-worker" / "scripts" / "worker_signal.py",
+)
+INTAKE_SIGNAL = load_module(
+    "intake_signal",
+    ROOT / "skills" / "github-issue-intake" / "scripts" / "intake_signal.py",
+)
 
 
 def contract(**overrides):
@@ -49,6 +59,8 @@ def contract(**overrides):
         "hotset": ["src/example.py"],
         "model_profile": "standard",
         "model_binding": "gpt-5.6-luna / high",
+        "model_binding_status": "verified",
+        "model_binding_evidence": "native-runtime-readback:example",
         "permission_profile": {
             "filesystem": "unrestricted",
             "network": "enabled",
@@ -99,6 +111,30 @@ class ExecutionContractTests(unittest.TestCase):
                 self.assertTrue(plan["local_full_suite"])
                 self.assertEqual("standards-spec", plan["orchestrator_review"])
                 self.assertEqual(1, plan["formal_review_round_limit"])
+
+    def test_manual_evidence_comes_only_from_contract_field(self) -> None:
+        strict_none = CONTRACT.validate_contract(
+            contract(verification_class="strict", manual_evidence="none")
+        )
+        standard_explicit = CONTRACT.validate_contract(
+            contract(manual_evidence="one isolated Desktop replay")
+        )
+        self.assertFalse(strict_none["verification_plan"]["manual_evidence"])
+        self.assertTrue(
+            standard_explicit["verification_plan"]["manual_evidence"]
+        )
+
+    def test_unverified_model_binding_fails_closed(self) -> None:
+        report = CONTRACT.validate_contract(
+            contract(model_binding_status="unverified")
+        )
+        self.assertFalse(report["dispatchable"])
+        self.assertIn("model-binding-must-be-verified", report["errors"])
+
+    def test_missing_model_binding_evidence_fails_closed(self) -> None:
+        report = CONTRACT.validate_contract(contract(model_binding_evidence=""))
+        self.assertFalse(report["dispatchable"])
+        self.assertIn("missing-or-empty:model_binding_evidence", report["errors"])
 
     def test_review_fix_is_delta_only_unless_boundary_changes(self) -> None:
         ordinary = CONTRACT.verification_plan("strict", phase="review-fix")
@@ -151,6 +187,69 @@ class WorkerPreflightTests(unittest.TestCase):
         self.assertIn("network_enabled", report["failures"])
         self.assertIn("approval_never", report["failures"])
         self.assertIn("head_matches_base", report["failures"])
+
+    def test_command_timeout_is_bounded_and_classified(self) -> None:
+        with patch.object(
+            PREFLIGHT.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["gh", "api", "user"], 0.1),
+        ):
+            with self.assertRaises(PREFLIGHT.CommandError) as raised:
+                PREFLIGHT.run_command(
+                    ROOT,
+                    "github-identity",
+                    ["gh", "api", "user"],
+                    timeout_seconds=0.1,
+                )
+        self.assertEqual(124, raised.exception.returncode)
+        self.assertEqual("timed-out", raised.exception.reason)
+
+
+class SignalFormatterTests(unittest.TestCase):
+    def worker_payload(self):
+        return {
+            "state": "READY_FOR_REVIEW",
+            "issue": "#7",
+            "branch": "codex/issue-7-example",
+            "commit": "a" * 40,
+            "pr": "https://example.test/pull/8",
+            "verification_class": "standard",
+            "verification": "passed",
+            "phase_timings": {
+                "plan": "2m",
+                "implementation": "12m",
+                "verification": "4m",
+                "waiting": "1m",
+            },
+            "full_suite_runs": 1,
+            "review_runs": 0,
+            "scope_delta": "none",
+            "hotset": ["src/example.py"],
+            "blocker_next_action": "Orchestrator review",
+        }
+
+    def test_worker_signal_is_stable_and_rejects_worker_review(self) -> None:
+        payload = self.worker_payload()
+        first = WORKER_SIGNAL.render_signal(payload)
+        self.assertEqual(first, WORKER_SIGNAL.render_signal(payload))
+        self.assertIn("Review-Runs: 0", first)
+        payload["review_runs"] = 1
+        self.assertIn(
+            "worker-review-runs-must-be-zero",
+            WORKER_SIGNAL.validate_signal(payload),
+        )
+
+    def test_intake_signal_is_stable(self) -> None:
+        payload = {
+            "state": "ISSUE_READY",
+            "issue_topic": "#9",
+            "repository": "owner/repo",
+            "evidence": "readback passed",
+            "next_action": "reconcile frontier",
+        }
+        first = INTAKE_SIGNAL.render_signal(payload)
+        self.assertEqual(first, INTAKE_SIGNAL.render_signal(payload))
+        self.assertIn("INTAKE_SIGNAL", first)
 
 
 if __name__ == "__main__":

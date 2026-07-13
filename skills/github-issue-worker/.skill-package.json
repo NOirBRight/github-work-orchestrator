@@ -1,0 +1,6 @@
+{
+  "content_sha256": "0a9cce2b181ab685572925aab56cdcf81e56c8b89055b8f4ad743f08d7692304",
+  "schema_version": 1,
+  "skill": "github-issue-worker",
+  "version": "2.0.0"
+}
