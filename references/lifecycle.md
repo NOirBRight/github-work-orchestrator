@@ -3,6 +3,15 @@
 GitHub is the only persistent state store. Reconstruct orchestration state on
 every run; do not maintain a second ledger.
 
+## Contents
+
+- [Canonical status labels](#canonical-status-labels)
+- [Dependencies and decomposition](#dependencies-and-decomposition)
+- [Claim and dispatch](#claim-and-dispatch)
+- [Decision gates](#decision-gates)
+- [Completion](#completion)
+- [Invalid states](#invalid-states)
+
 ## Canonical status labels
 
 Use the repository's documented label mapping. When none exists, use:
@@ -48,9 +57,12 @@ Each claimed work item maps to exactly one sidebar-visible Codex task. Internal
 subagents may assist that task, but they are not claims, workers of record, or
 substitutes for a visible task.
 
-The [materialization flow](worker-contract.md#reliable-task-materialization)
-is the single authority for task creation and preflight ordering. After that
-flow has materialized a real Worker and completed its preflight gate, the first
+The [Worker Contract](worker-contract.md) is the single authority for task
+creation and preflight ordering: its
+[materialization flow](worker-contract.md#reliable-task-materialization) owns
+no-real-task discovery, and its
+[activation handoff](worker-contract.md#worker-activation-handoff) owns the
+real-Worker preflight gate. After a real Worker completes that gate, the first
 GitHub lifecycle write is the claim:
 
 ```text

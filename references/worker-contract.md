@@ -13,6 +13,17 @@ record. Subagents do not own GitHub work items or create a separate lifecycle.
 If discovered work is itself a distinct GitHub Issue, return it to the
 Orchestrator for a new visible task instead of assigning it to a subagent.
 
+## Contents
+
+- [Required task identity](#required-task-identity)
+- [Reliable task materialization](#reliable-task-materialization)
+- [Worker activation handoff](#worker-activation-handoff)
+- [Initial Worker message](#initial-worker-message)
+- [Task-host permission preflight](#task-host-permission-preflight)
+- [Worker behavior](#worker-behavior)
+- [Worker signals](#worker-signals)
+- [Completion report](#completion-report)
+
 ## Required task identity
 
 - Title: `[#<number>] <issue title>`
@@ -24,8 +35,10 @@ Orchestrator for a new visible task instead of assigning it to a subagent.
 
 ## Reliable task materialization
 
-This section is authoritative for creation, materialization, preflight, and
-claim ordering. Read [creation-failure recovery](communication.md#creation-failure-no-worker-exists)
+This section is authoritative for no-real-task discovery. The shared
+[Worker activation handoff](#worker-activation-handoff) is authoritative after
+a real Task exists. Read
+[creation-failure recovery](communication.md#creation-failure-no-worker-exists)
 for orphan-worktree diagnosis, reuse, and cleanup after a creation failure.
 
 Keep the candidate unassigned until a real Worker has passed preflight. That
@@ -34,7 +47,7 @@ placeholder for a queued client request.
 
 1. Reconcile the candidate and record its exact base SHA, branch, hotset, and
    expected verification while it remains unassigned.
-2. Record one concrete, per-run materialization bound in the visible
+2. Record one concrete, per-run discovery/bootstrap bound in the visible
    Orchestrator task before waiting: an absolute UTC deadline or a maximum
    number of native discovery checks. Do not infer a hidden universal timeout
    or extend the recorded bound.
@@ -45,38 +58,56 @@ placeholder for a queued client request.
    list and a completed bootstrap turn. A client-side creation ID or a created
    worktree alone is only diagnostic evidence, not a Worker. Do not title an
    unmaterialized stub.
-5. Rename the real task to `[#<number>] <issue title>`, then send the full
-   Worker Contract to that same task with the selected Worker model and
-   reasoning level. This first full turn establishes the recorded binding.
-   It may perform only the permission preflight, end with the exact marker
-   `PREFLIGHT_READY`, and become idle without editing.
-6. Wait for native idle/turn completion, then make one authoritative content
-   read to confirm the marker and required preflight. An earlier read is not
-   the completion read and does not consume it or deadlock dispatch. Only then
-   add the assignee claim, post one concise dispatch comment, and send a
-   continuation that confirms the claim and authorizes scoped edits. The
-   comment records the binding, base/branch, hotset, verification, blockers,
-   and PR target without private task IDs or paths.
+5. If that discovery/bootstrap bound expires before a real Task exists, exit
+   only to Creation failure: do not add the assignee or dispatch comment,
+   preserve the client ID privately, and follow the linked recovery branch.
+6. When a real Task exists, rename it to `[#<number>] <issue title>` and enter
+   the shared [Worker activation handoff](#worker-activation-handoff).
 
-If the recorded materialization bound expires, or bootstrap or materialization
-fails before a real task exists, do not add the assignee or dispatch comment;
-preserve the client ID privately and follow the linked creation-failure branch.
-If a full-contract/preflight turn fails, omits `PREFLIGHT_READY`, or does not
-reach idle after a real task exists, leave the Issue unclaimed and follow the
-existing-Worker failure branch. Make at most one replacement attempt only after
-a concrete startup cause has been removed or isolated.
+Never use the discovery/bootstrap bound to evaluate a real Task's full contract
+or preflight turn. Make at most one replacement attempt only after a concrete
+startup cause has been removed or isolated.
 
-If an interrupted dispatch ever leaves its newly written assignee claim without
-a real, preflight-passed Worker, immediately re-read the Issue and roll back
-only the assignee added by that dispatch. The candidate was required to be
-unassigned, so any changed ownership or other ambiguity stops the rollback for
-maintainer review. Verify the release before another attempt; never leave a
-queued ID or failed preflight as an Active claim.
+## Worker activation handoff
 
-Materialization is complete only when one real Worker has the full contract,
-has sent `PREFLIGHT_READY` and become idle, has passed the authoritative
-preflight read, and has received the claim-confirmation continuation and exact
-work boundaries.
+This is the sole authority for activating either a newly materialized Task or
+an admitted recovery Task. Only the final claim-confirmation continuation
+authorizes editing.
+
+1. Record a distinct, concrete full-contract/preflight-turn bound in the
+   visible Orchestrator task before sending the contract: an absolute UTC
+   deadline or a maximum number of native turn-state checks. Do not extend it.
+   Its expiration exits only to Existing Worker failure.
+2. Send the full Initial Worker message and Worker Contract to the exact
+   sidebar-visible Task with the selected model binding and reasoning level.
+   For a recovery Task, make the adopted absolute path its only write boundary
+   and require the permission/repository preflight to run from that path.
+3. Require a preflight-only turn: the Task runs no edits and emits the exact
+   marker `PREFLIGHT_READY` only after the required preflight succeeds; it then
+   becomes idle. If it cannot run the full contract or preflight, it reports
+   the failure without the marker and without editing.
+4. Within the full-contract/preflight-turn bound, wait for native idle/turn
+   completion, then make one authoritative content read to confirm the marker
+   and required preflight. An earlier read is not this completion read and does
+   not consume it or deadlock activation.
+5. Only after that read succeeds, add the GitHub assignee claim, post one
+   concise dispatch comment, and send a `CLAIM_CONFIRMED` continuation with the
+   branch, hotset, verification, callback, and write boundaries. Only this
+   continuation authorizes scoped edits.
+
+If the full-contract/preflight-turn bound expires, the turn errors, the marker
+is absent, or the Task does not become idle, leave the Issue unclaimed and exit
+only to Existing Worker failure. Do not post a dispatch comment. If an
+interrupted dispatch ever leaves its newly written assignee claim without a
+successful handoff, immediately re-read the Issue and roll back only the
+assignee added by that dispatch. The candidate was required to be unassigned,
+so changed ownership or other ambiguity stops the rollback for maintainer
+review. Verify the release before another attempt.
+
+Activation is complete only when one real Worker has the full contract, has
+sent `PREFLIGHT_READY` and become idle, has passed the authoritative preflight
+read, and has received the `CLAIM_CONFIRMED` continuation and exact work
+boundaries. Never leave a queued ID or failed preflight as an Active claim.
 Keep the bootstrap prompt short and uniquely Issue-scoped. If an optional
 startup service is suspected, use a bounded A/B test and disable it only after
 proof and separate authorization for a reversible change.
@@ -97,9 +128,9 @@ Include:
 9. Required PR target and closing semantics.
 10. The Orchestrator callback task and the required Worker signals from the
    [communication protocol](communication.md).
-11. During materialization, the recorded per-run bound and the preflight-only
-    `PREFLIGHT_READY`/idle handshake; editing begins only after the claim
-    confirmation continuation.
+11. During activation, the recorded full-contract/preflight-turn bound and the
+    preflight-only `PREFLIGHT_READY`/idle handshake; editing begins only after
+    the `CLAIM_CONFIRMED` continuation.
 
 Require the Worker to post a short implementation or investigation plan before
 editing. A plan must identify expected writes, flag collisions, and state

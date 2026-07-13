@@ -151,8 +151,9 @@ evidence but must send it to that owner.
 Dispatch only after explicit authorization.
 
 Before creating or claiming a Worker, follow the authoritative
-[materialization and claim order](references/worker-contract.md#reliable-task-materialization)
-and [task-host recovery](references/communication.md#task-host-recovery).
+[Worker Contract](references/worker-contract.md) for materialization,
+activation, and claim order, and
+[task-host recovery](references/communication.md#task-host-recovery).
 
 A dispatch completes only when reconciliation passes; one real task has
 completed the documented materialization/preflight handoff; the GitHub claim
