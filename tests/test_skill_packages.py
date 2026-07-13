@@ -89,6 +89,15 @@ class SkillPackageTests(unittest.TestCase):
             source.write_bytes(b"---\r\nname: example\r\n---\r\n")
             self.assertEqual(lf_digest, SYNC.package_digest(package))
 
+    def test_installed_manifest_readback_ignores_json_line_endings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            install_root = Path(temporary)
+            for name in SKILLS:
+                shutil.copytree(ROOT / "skills" / name, install_root / name)
+                manifest = install_root / name / SYNC.PACKAGE_MANIFEST
+                manifest.write_bytes(manifest.read_bytes().replace(b"\n", b"\r\n"))
+            self.assertEqual([], SYNC.find_install_drift(ROOT, install_root))
+
     def test_legacy_root_install_loads_the_packaged_orchestrator(self) -> None:
         wrapper = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn(

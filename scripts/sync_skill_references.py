@@ -100,6 +100,10 @@ def package_manifest(root: Path, skill: str) -> bytes:
     return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
+def read_manifest(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def find_drift(root: Path) -> list[str]:
     drift: list[str] = []
     for source, target in targets(root):
@@ -122,10 +126,10 @@ def find_drift(root: Path) -> list[str]:
                 f"unexpected package copy: {(destination / stale).relative_to(root)}"
             )
         manifest = root / "skills" / skill / PACKAGE_MANIFEST
-        expected = package_manifest(root, skill)
+        expected = json.loads(package_manifest(root, skill))
         if not manifest.is_file():
             drift.append(f"missing package manifest: {manifest.relative_to(root)}")
-        elif manifest.read_bytes() != expected:
+        elif read_manifest(manifest) != expected:
             drift.append(f"stale package manifest: {manifest.relative_to(root)}")
     return drift
 
@@ -143,12 +147,10 @@ def find_install_drift(root: Path, install_root: Path) -> list[str]:
         if not installed_manifest.is_file():
             drift.append(f"missing installed manifest: {installed_manifest}")
             continue
-        if source_manifest.read_bytes() != installed_manifest.read_bytes():
+        if read_manifest(source_manifest) != read_manifest(installed_manifest):
             drift.append(f"installed manifest mismatch: {installed_manifest}")
             continue
-        expected_digest = json.loads(source_manifest.read_text(encoding="utf-8"))[
-            "content_sha256"
-        ]
+        expected_digest = read_manifest(source_manifest)["content_sha256"]
         if package_digest(installed) != expected_digest:
             drift.append(f"installed content mismatch: {installed}")
     return drift
