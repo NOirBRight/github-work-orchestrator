@@ -24,27 +24,52 @@ Orchestrator for a new visible task instead of assigning it to a subagent.
 
 ## Reliable task materialization
 
-Use two stages when the task host can create a worktree before its conversation
-or rollout is ready:
+This section is authoritative for creation, materialization, preflight, and
+claim ordering. Read [creation-failure recovery](communication.md#creation-failure-no-worker-exists)
+for orphan-worktree diagnosis, reuse, and cleanup after a creation failure.
 
-1. Create the isolated-worktree task at the exact base using a fast,
-   low-cost, verified bootstrap model. Send only
+Keep the candidate unassigned until a real Worker has passed preflight. That
+makes the lifecycle's assignee-derived Active state truthful rather than a
+placeholder for a queued client request.
+
+1. Reconcile the candidate and record its exact base SHA, branch, hotset, and
+   expected verification while it remains unassigned.
+2. Create the isolated-worktree task at that exact base with a fast, low-cost,
+   verified bootstrap binding. Send only
    `[#<number>] Bootstrap only. Reply exactly READY. Do not use tools.`
-2. Wait for a real task ID to appear in the native task list and for the
-   bootstrap turn to complete. A client-side creation ID or a created worktree
-   alone is not a Worker.
-3. Rename the materialized task to `[#<number>] <issue title>`.
-4. Send the full Worker Contract to that same task with the selected Worker
-   model and reasoning level. This first full turn establishes the recorded
-   binding.
-5. Run the permission preflight before any repository work.
+3. Wait boundedly for a real task ID in the native task list and a completed
+   bootstrap turn. A client-side creation ID or a created worktree alone is
+   only diagnostic evidence, not a Worker. Do not title an unmaterialized stub.
+4. Rename the real task to `[#<number>] <issue title>`, then send the full
+   Worker Contract to that same task with the selected Worker model and
+   reasoning level. This first full turn establishes the recorded binding.
+   It may perform only the permission preflight and must wait for claim
+   confirmation before editing.
+5. Use the one permitted post-contract read to confirm that the real task
+   completed the preflight with the required permissions. Only then add the
+   assignee claim, post one concise dispatch comment, and tell that Worker it
+   may begin scoped work. The comment records the binding, base/branch, hotset,
+   verification, blockers, and PR target without private task IDs or paths.
 
-Keep the bootstrap prompt intentionally short and uniquely issue-scoped. Do
-not put the full Issue title or contract in the creation request: a failed
-client stub can otherwise look like a duplicate Worker. If optional startup
-services are suspected of delaying materialization, use a bounded A/B test and
-disable only a proven, non-required service through an authorized, reversible
-configuration change.
+If bootstrap or materialization fails before a real task exists, do not add the
+assignee or dispatch comment; preserve the client ID privately and follow the
+linked creation-failure branch. If a full-contract or preflight turn fails
+after a real task exists, leave the Issue unclaimed and follow the
+existing-Worker failure branch. Make at most one replacement attempt only after
+a concrete startup cause has been removed or isolated.
+
+If an interrupted dispatch ever leaves its newly written assignee claim without
+a real, preflight-passed Worker, immediately re-read the Issue and roll back
+only the assignee added by that dispatch. The candidate was required to be
+unassigned, so any changed ownership or other ambiguity stops the rollback for
+maintainer review. Verify the release before another attempt; never leave a
+queued ID or failed preflight as an Active claim.
+
+Materialization is complete only when one real Worker has the full contract,
+has passed preflight, and has received the exact claim and work boundaries.
+Keep the bootstrap prompt short and uniquely Issue-scoped. If an optional
+startup service is suspected, use a bounded A/B test and disable it only after
+proof and separate authorization for a reversible change.
 
 ## Initial Worker message
 

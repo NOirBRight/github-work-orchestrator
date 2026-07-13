@@ -160,85 +160,36 @@ evidence but must send it to that owner.
 
 Dispatch only after explicit authorization.
 
-1. Re-run reconciliation immediately before the dispatch claim.
-2. Claim the Issue using its assignee field. Keep `ready-for-agent` while it is
-   active unless repository policy defines another transition.
-3. Post one concise dispatch comment containing:
-   - selected profile and concrete model;
-   - canonical base branch and SHA;
-   - proposed feature branch;
-   - owned components or hot files;
-   - accepted architecture invariants and decision references;
-   - required verification;
-   - known blockers and integration parent.
-4. Create one sidebar-visible Codex task with an isolated worktree, using the
-   [reliable materialization flow](references/worker-contract.md#reliable-task-materialization).
-   Do not send the full Worker Contract until a real task ID exists. Title the
-   materialized task `[#<number>] <issue title>`.
-5. Apply the selected Worker model and reasoning level to the first full
-   contract turn. A cheaper bootstrap model is only a host-startup probe and is
-   not the Issue's recorded binding. If the full turn cannot honor the binding,
-   stop and report the mismatch.
-6. Require the user-configured task host to provide the requested permission
-   profile. When task creation exposes no permission argument, do not pretend a
-   prompt can grant it; run the Worker Contract's permission preflight and stop
-   if the effective profile is narrower or requests approval.
-7. Send the Worker Contract plus the Issue URL and repository-specific rules.
-   Include the Orchestrator task as the callback target and require the signals
-   in the Worker communication protocol.
+Before creating or claiming a Worker, follow the authoritative
+[materialization and claim order](references/worker-contract.md#reliable-task-materialization)
+and [task-host recovery](references/communication.md#task-host-recovery).
+Those references own the two-stage bootstrap, full-contract/preflight, exact
+claim rollback, orphan-worktree, and retry rules. A queued client ID, created
+worktree, or bootstrap reply is not a Worker and must not make an Issue Active.
 
-If visible-task creation tools are unavailable, stop after the GitHub preflight.
-Do not fall back to a subagent as the work-item Worker, a hidden process, or a
-shared working directory. Research assistance does not satisfy dispatch.
-
-If creation returns only a client-side ID and never materializes, do not claim
-the Issue active and do not retry blindly. Follow the communication protocol's
-failed-creation rules before making one bounded replacement attempt.
+A dispatch completes only when reconciliation passes; one real task has
+received the full contract and passed its permission preflight; the exact
+GitHub claim and dispatch comment have been written; and the Worker has the
+documented branch, hotset, verification, and callback boundaries. If that
+state is not reached, complete the reference's release/rollback path before
+considering a replacement. Do not substitute a subagent, hidden process, or
+shared working directory for the visible Worker.
 
 ## Monitor and refill
 
-Use native visible-task tools to list and read active workers. Derive state as
-follows:
+Use [communication.md](references/communication.md#monitoring-cadence) as the
+authoritative monitoring cadence and
+[task-host recovery](references/communication.md#task-host-recovery) for
+failure handling. The ten-minute fallback applies only when reverse callback
+delivery is absent or suspected unavailable; an ordinary lack of progress
+events is not permission to poll.
 
-- ready: `ready-for-agent`, unassigned, and no open blocker;
-- active: `ready-for-agent` and assigned;
-- review/integration: linked open PR;
-- human wait: `ready-for-human`;
-- information wait: `needs-info`;
-- complete: closed Issue after its intended merge and verification.
-
-Require Workers to signal `DISCUSSION_REQUIRED`, `BLOCKED`, `PR_OPENED`,
-`READY_FOR_REVIEW`, or `STOPPED` to the Orchestrator through native task
-messaging when available.
-Treat signals as prompts to verify, not as authoritative lifecycle changes.
-Reverse delivery is not guaranteed, so poll visible tasks and GitHub as the
-fallback. Keep callback task IDs out of GitHub.
-
-Use signal-driven monitoring by default. After bootstrap materialization and
-the permission preflight are verified, do not poll an active Worker for
-ordinary progress. In the absence of a Worker signal, an explicit maintainer
-status request, a declared completion deadline, or a GitHub state transition,
-wait at least ten minutes before reading the same Worker again. Read once per
-event and do not narrate unchanged intermediate reasoning. See
-[references/communication.md](references/communication.md) for the cadence and
-its narrow startup/recovery exceptions.
-
-When a Worker reports completion:
-
-1. Verify scope, diff, tests, base, and PR target.
-2. Route revisions back to the same visible task.
-3. Serialize merges through declared hotsets.
-4. Recompute the frontier after every merge, blocker change, or released slot.
-5. Start the highest-priority ready non-conflicting task when authorized to
-   continue dispatching.
-
-When a Worker reports `DISCUSSION_REQUIRED`, verify that the trigger is
-material, consolidate related choices into one discussion packet, and route it
-through the decision gate. Do not turn routine progress updates into discussion
-traffic.
-
-Never close an Issue merely because a local commit exists. Prefer PR closing
-keywords when the PR fully resolves the Issue.
+On a material Worker signal, verify the visible task and GitHub state before an
+integration action. Monitoring completes when the reported transition has been
+verified, revisions have been routed to the same Worker when needed, and the
+frontier has been recomputed after a merge, blocker change, or released slot.
+Do not close an Issue merely because a local commit exists; use closing keywords
+only for a PR that fully resolves it.
 
 ## Model changes
 
