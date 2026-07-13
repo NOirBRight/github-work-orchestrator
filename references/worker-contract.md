@@ -39,7 +39,7 @@ Orchestrator for a new visible task instead of assigning it to a subagent.
 ## Reliable task materialization
 
 This section is the single authority for queued-request creation, bootstrap
-eligibility, no-real-task discovery, and replacement admission. Record one
+eligibility, and no-real-task discovery. Record one
 private materialization record that distinguishes the exact original queued
 request from every later recovery candidate Task or request. Never publish
 those identities or any local path to GitHub. Normal materialization enters the
@@ -184,21 +184,36 @@ worktree drift before the comment, remove only this dispatch's exact assignee
 when that release is unambiguous, verify the release, and then take the same
 failure exit; otherwise stop for maintainer review.
 
-For dispatch-comment failure, make one authoritative determination of whether
-the exact durable dispatch record exists. If it does not, roll back only this
-dispatch's unambiguous claim and verify the release. If it does, amend that same
-record—not a second comment—to state `DISPATCH_ABORTED: claim released; no
-edits authorized`, verify its readback, then roll back only this dispatch's
-unambiguous claim and verify the release. If the record, reconciliation, or
-release is ambiguous or fails, stop for maintainer review with edits
-unauthorized. For a failed `CLAIM_CONFIRMED` continuation, first determine
-whether its native delivery receipt identifies the exact Task. If it
-definitively does not, perform the same exact-comment abort and claim-release
-path. If the outcome is ambiguous or any reconciliation fails, stop for
-maintainer review; never send a duplicate continuation or authorize edits. If
-Task or worktree drift is found after comment readback or during confirmation,
-use that same exact-comment abort and claim-release path; on any ambiguity,
-stop for maintainer review.
+For a dispatch-comment write/readback failure with an exact durable record, a
+definitively undelivered `CLAIM_CONFIRMED` continuation, or Task/worktree drift
+after comment readback, use this one shared abort routine. Never add a second
+comment:
+
+1. Amend that same exact record to `DISPATCH_ABORTED: claim release pending; no
+   edits authorized` and verify its readback.
+2. Only after that verified pending record, remove this dispatch's exact
+   assignee when unambiguous and verify the Issue release.
+3. Only after verified release, amend that same record to
+   `DISPATCH_ABORTED: claim released; no edits authorized` and verify its
+   readback.
+
+If assignee removal or release verification fails, do not state that the claim
+was released. Keep the verified pending record, or reconcile that same record to
+`DISPATCH_ABORTED: claim release failed; maintainer reconciliation required; no
+edits authorized`, then stop for maintainer review. If pending-comment
+reconciliation is ambiguous or fails, do not remove the assignee, add a second
+comment, or authorize edits; stop for maintainer review. If release succeeds
+but final-comment reconciliation fails, leave the verified pending record rather
+than claiming release, add no second comment, authorize no edits, and stop for
+maintainer review.
+
+For a dispatch-comment failure with no exact durable record, roll back only this
+dispatch's unambiguous claim and verify the release; on ambiguity or failure,
+stop for maintainer review with edits unauthorized. For a failed
+`CLAIM_CONFIRMED` continuation, first determine whether its native delivery
+receipt identifies the exact Task. If it definitively does not, use the shared
+abort routine above; if the result is ambiguous, stop for maintainer review
+without a duplicate continuation or edit authorization.
 
 Activation is complete only when one real Worker has the full contract, has
 sent `PREFLIGHT_READY` and become idle, has passed the authoritative preflight
