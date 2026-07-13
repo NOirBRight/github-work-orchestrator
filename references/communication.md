@@ -141,3 +141,32 @@ against one worktree.
   its GitHub claim remains. The Worker does not decide this implicitly.
 - Recompute the ready frontier after a verified completion, merge, blocker
   change, or released slot. Keep no separate orchestration database.
+
+## Monitoring cadence
+
+Prefer Worker signals over polling. Monitoring is a recovery fallback, not a
+live transcript of a Worker's implementation steps.
+
+- During reliable task materialization, poll only as needed to distinguish a
+  real task ID and completed bootstrap from a client-side stub. After sending
+  the full contract, allow one read to verify the permission preflight.
+- Once preflight passes, do not read the same active Worker again for ordinary
+  progress until it sends a material signal. If reverse delivery is suspected
+  to be unavailable, wait at least ten minutes between fallback reads.
+- Treat an explicit maintainer status request, a Worker signal, a declared
+  command/test completion deadline, a CI state transition, or a handoff/task
+  recovery operation as an event that permits one immediate verification read.
+- When a Worker states that a long test suite or CI run is in progress, wait for
+  its signal or the stated/normal completion window. Do not poll its reasoning
+  stream, commentary, file edits, or unchanged active status minute by minute.
+- Report only material transitions: permission preflight passed/failed,
+  discussion required, blocker, checkpoint/PR publication, review readiness,
+  CI failure/root cause, merge, or stopped work. Do not relay routine internal
+  hypotheses or every test command to the maintainer.
+- A user-facing progress update does not require another Worker read. Use the
+  last verified state and clearly label it as such.
+
+The ten-minute floor does not apply to the short bootstrap materialization
+check, a bounded handoff status wait, or verification immediately triggered by
+a new signal. It also does not require waiting when GitHub itself has already
+recorded a new PR/check/merge transition.

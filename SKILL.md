@@ -214,6 +214,15 @@ Treat signals as prompts to verify, not as authoritative lifecycle changes.
 Reverse delivery is not guaranteed, so poll visible tasks and GitHub as the
 fallback. Keep callback task IDs out of GitHub.
 
+Use signal-driven monitoring by default. After bootstrap materialization and
+the permission preflight are verified, do not poll an active Worker for
+ordinary progress. In the absence of a Worker signal, an explicit maintainer
+status request, a declared completion deadline, or a GitHub state transition,
+wait at least ten minutes before reading the same Worker again. Read once per
+event and do not narrate unchanged intermediate reasoning. See
+[references/communication.md](references/communication.md) for the cadence and
+its narrow startup/recovery exceptions.
+
 When a Worker reports completion:
 
 1. Verify scope, diff, tests, base, and PR target.
