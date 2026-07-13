@@ -80,6 +80,15 @@ class SkillPackageTests(unittest.TestCase):
             )
             self.assertTrue(SYNC.find_install_drift(ROOT, install_root))
 
+    def test_package_digest_ignores_platform_line_endings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary)
+            source = package / "SKILL.md"
+            source.write_bytes(b"---\nname: example\n---\n")
+            lf_digest = SYNC.package_digest(package)
+            source.write_bytes(b"---\r\nname: example\r\n---\r\n")
+            self.assertEqual(lf_digest, SYNC.package_digest(package))
+
     def test_legacy_root_install_loads_the_packaged_orchestrator(self) -> None:
         wrapper = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn(
