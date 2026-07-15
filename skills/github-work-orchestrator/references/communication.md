@@ -65,9 +65,25 @@ monitoring; it does not recreate an activation or succession sequence.
 
 ### Creation failure: no Worker exists
 
-This branch begins only when the materialization flow routes the exact original
-queued request to a no-real-Task outcome. Absence from a general native task
+This branch begins only when the materialization flow routes either the exact
+original queued request, or its exact admitted `invoking` lease before a native
+receipt exists, to a no-real-Task outcome. Absence from a general native task
 list is not terminal ownership of that request, an orphan, or a replacement.
+
+When a queued client request has no authoritative terminal outcome, set the
+host-wide creation lease to `creation-unknown` and stop. A host exit during the
+native call may instead leave it at `invoking` before any request receipt
+exists. Lease expiration does not change either classification and cannot
+authorize a replacement. After a Codex host restart, reconcile only with the
+original owner token and a private evidence reference covering the full native
+Task inventory and literal worktree path/status/readback. When a receipt exists,
+use `task_creation_lease.py reconcile --request-id <exact-original-id>`; a
+different or missing identity fails closed. With no receipt, omit `--request-id`
+and use only `no-receipt-terminal` or `no-receipt-materialized` after proving
+the exact no-Task/Task and worktree disposition. Any ambiguity leaves the lease
+and all paths untouched. A reconciled real Task returns to
+`task-materialized`; a proven terminal/no-Task result reaches `failed` or
+`cancelled` and may then be released by its owner.
 
 1. Record the exact original queued-request identity privately. Obtain a
    supported native cancellation or terminal-failure result for that original

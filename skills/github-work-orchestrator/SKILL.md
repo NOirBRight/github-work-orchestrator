@@ -107,19 +107,33 @@ whose blockers are closed and whose expected write sets can run concurrently.
    python <skill>/scripts/validate_execution_contract.py --input <json-file>
    ```
 
-2. Follow the detailed
+2. Before any native action that can create a Worker Task, reserve the
+   host-wide creation singleflight:
+
+   ```text
+   python <skill>/scripts/task_creation_lease.py reserve \
+     --repository <owner/repository> --issue <number> --branch <feature-branch>
+   ```
+
+   Keep the returned owner token and lease identity private. Call the native
+   Task-creation API only when this fresh reservation returns
+   `creation_authorized: true`, and transition the lease to `invoking` before
+   that call; an idempotent read is not a second admission. If reservation is
+   refused, do not retry or switch projects to evade the lease. Follow the
+   lease state and recovery rules in the detailed Worker contract.
+3. Follow the detailed
    [Worker contract](references/worker-contract.md) for exact materialization,
    preflight, claim, dispatch-comment, and edit-authorization order. Do not
    shorten that safety sequence in prose.
-3. The dispatch payload includes verification class/commands, manual evidence,
+4. The dispatch payload includes verification class/commands, manual evidence,
    architecture decision, `Review-Owner: orchestrator`, requested model,
    verified effective-binding evidence/status, base branch and SHA, feature
    branch, ownership/hotset, blockers, callback, and PR target.
-4. Materialize one isolated-worktree task using the two-stage flow. Send the
+5. Materialize one isolated-worktree task using the two-stage flow. Send the
    full assigned-Issue contract only after a real task ID exists, and require
    `github-issue-worker`, the selected binding, its deterministic permission
    preflight, and the exact Orchestrator callback task ID.
-5. Require the Worker to complete the shared
+6. Require the Worker to complete the shared
    [delivery handshake](references/shared/communication-protocol.md#delivery-handshake)
    before its final response.
 

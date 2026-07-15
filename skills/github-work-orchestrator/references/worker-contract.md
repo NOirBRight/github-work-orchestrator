@@ -17,6 +17,7 @@ Orchestrator for a new visible task instead of assigning it to a subagent.
 ## Contents
 
 - [Required task identity](#required-task-identity)
+- [Host-wide Task-creation lease](#host-wide-task-creation-lease)
 - [Reliable task materialization](#reliable-task-materialization)
 - [Replacement gate](#replacement-gate)
 - [Worker activation handoff](#worker-activation-handoff)
@@ -36,6 +37,73 @@ Orchestrator for a new visible task instead of assigning it to a subagent.
   `codex/issue-<number>-<short-slug>`
 - Target: repository integration branch, not the release branch
 - Scope: one Issue or one explicitly approved tightly coupled unit
+
+## Host-wide Task-creation lease
+
+Serialize every native action that can create a sidebar-visible Worker Task,
+including initial materialization, a replacement, or a successor. The lease is
+host-wide across repositories, Codex windows, projects, and alternate
+`CODEX_HOME` profiles for the same OS user. It is an ephemeral admission guard,
+not a second project ledger.
+
+This guard prevents the Orchestrator from issuing concurrent native creation
+calls. It does not patch the Codex Desktop binary or prove that unrelated
+client crashes are eliminated; report that boundary truthfully in every
+incident or acceptance result.
+
+Before calling `create_thread`, a worktree `fork_thread`, or an equivalent
+creation surface, run:
+
+```text
+python <skill>/scripts/task_creation_lease.py reserve \
+  --repository <owner/repository> --issue <number> --branch <feature-branch>
+```
+
+The idempotency key is exactly normalized `repository + issue + branch`. Keep
+the returned owner token, lease ID, key, and any queued request identity only
+in the private materialization record. Call the native creation surface only
+when a fresh reservation returns `creation_authorized: true`. A repeat by the
+same owner and key returns `creation_authorized: false`; it is a read of the
+existing lease, not permission for a second native call. Any other active
+lease, transaction-lock conflict, or expired lease is a fail-closed stop: do
+not call the creation surface, wait-and-retry, create from another
+project/window, or substitute a different Issue. Use the default OS-user host
+state location; `--state-dir` exists only for deterministic tests and must not
+partition production admission.
+
+Advance the lease after each observed boundary with
+`task_creation_lease.py transition --state <state>`. Use this ordered state
+vocabulary:
+
+```text
+reserved -> invoking -> queued -> worktree-creating -> task-materialized
+                    -> bootstrap-ready -> preflight-ready -> activated
+```
+
+Each valid observed-progress transition renews the bounded inactivity interval;
+ordinary time passage without a transition does not.
+
+Transition from `reserved` to `invoking` immediately before the one admitted
+native creation call. This closes the crash window before a client request ID
+exists. On a returned receipt, transition to `queued` with that exact ID; the
+lease stores its digest and requires the same identity during reconciliation.
+The direct `queued -> task-materialized` path is allowed when no separate
+worktree-creating observation exists. `queued` is not a real Task. If the call
+has no response or its native ownership becomes uncertain, leave `invoking` for
+post-restart reconciliation or transition a still-running owner to
+`creation-unknown`. Do not issue a replacement, auto-adopt a later Task, or
+release the lease from either uncertain state.
+
+Only the exact owner token may transition or release a lease. Release requires
+one terminal state: `activated`, `failed`, or `cancelled`. Mark `activated` only
+after the successful `CLAIM_CONFIRMED` delivery that completes activation, then
+release. Mark `failed` or `cancelled` only from authoritative terminal evidence,
+then release. Expiration blocks every nonterminal transition, including an
+attempt to manufacture a terminal result; it never makes a lease stealable.
+A terminal state established before expiry is immutable and may still be
+released only by its original owner. Otherwise use the Task-host reconciliation
+below after restart and exact request/Task/worktree readback; successful
+reconciliation opens one new bounded lease interval.
 
 ## Reliable task materialization
 
@@ -67,9 +135,11 @@ placeholder for a queued client request.
    discovery checks, plus either the exact UTC read times or a stated cadence
    and that maximum. Do not infer a hidden universal timeout or extend the
    recorded bound or read schedule.
-4. Create the isolated-worktree task at that exact base with the recorded
-   eligible bootstrap binding and record its exact queued-request identity as
-   the original request. Send only
+4. Transition the host-wide lease to `invoking`, then create the
+   isolated-worktree task at that exact base with the recorded eligible
+   bootstrap binding. On a returned receipt, record its exact queued-request
+   identity as the original request and transition the lease to `queued` with
+   that identity. Send only
    `[#<number>] Bootstrap only. Reply exactly READY. Do not use tools.`
 5. Read only at that recorded schedule for a real Task belonging to the exact
    original request. A client-side creation ID or a created worktree alone is
@@ -82,21 +152,25 @@ placeholder for a queued client request.
    ownership as ambiguous and leave the path untouched; a late materialization
    must remain the only possible editor.
 7. When a real Task appears, record a distinct post-materialization
-   bootstrap-turn bound before reading its completion: an absolute UTC deadline
-   or maximum number of native turn-state/content checks, plus exact UTC read
-   times or a stated cadence and that maximum. Do not extend it or reuse the
-   discovery bound.
+   bootstrap-turn bound and transition the lease to `task-materialized` before
+   reading its completion: an absolute UTC deadline or maximum number of native
+   turn-state/content checks, plus exact UTC read times or a stated cadence and
+   that maximum. Do not extend it or reuse the discovery bound.
 8. Within that bound and schedule, require the bootstrap turn to complete
    without error, emit the exact `READY` reply, and leave the real Task idle.
-   Do not rename or send a full contract while the turn is pending, errors, or
-   omits that exact reply.
+   Transition to `bootstrap-ready` only after those facts are verified. Do not
+   rename or send a full contract while the turn is pending, errors, or omits
+   that exact reply.
 9. If the original Task's bootstrap turn errors, omits `READY`, or does not
    reach idle before the post-materialization bound expires, leave the Issue
    unclaimed and exit only to Existing Worker failure. Its next safe transition
    is governed solely by the activation handoff.
 10. Only after the successful bootstrap gate, rename the real task to
-    `[#<number>] <issue title>` and enter the shared
-    [Worker activation handoff](#worker-activation-handoff).
+    `[#<number>] <issue title>`. A normal or replacement dispatch enters the
+    shared [Worker activation handoff](#worker-activation-handoff). A newly
+    created claimed-Worker successor keeps the same creation lease at
+    `bootstrap-ready` and enters the
+    [succession handoff](#claimed-worker-succession-handoff) instead.
 
 ## Replacement gate
 
@@ -150,8 +224,13 @@ authorizes editing.
    the failure without the marker and without editing.
 5. Within the full-contract/preflight-turn bound and its schedule, wait for
    native idle/turn completion, then make one authoritative content read to
-   confirm the marker and required preflight. An earlier read is not this
-   completion read and does not consume it or deadlock activation.
+   confirm the marker and required preflight. For a creation-backed activation,
+   transition its lease to `preflight-ready`: normal materialization advances
+   from `bootstrap-ready`; an admitted/reconciled Task or the one fresh
+   unclaimed re-entry may advance from `task-materialized` only with the
+   explicit `--recovery-path` guard. A pre-existing Task with no creation lease
+   records that fact and invents no lease transition. An earlier read is not
+   this completion read and does not consume it or deadlock activation.
 6. Immediately before the first GitHub lifecycle write, re-run/re-read the
    Issue, the native Task, and worktree ownership. Require the Issue to remain
    open, `ready-for-agent`, unblocked, and unassigned; the exact idle,
@@ -172,7 +251,9 @@ authorizes editing.
     `CLAIM_CONFIRMED` continuation with the branch, hotset, verification,
     callback, and write boundaries. Require its native delivery receipt to
     identify the exact Task. Only this final successful continuation authorizes
-    scoped edits.
+    scoped edits. For a creation-backed activation, transition its lease to
+    `activated` and release it with the same owner token only after that receipt
+    succeeds; a pre-existing Task with no creation lease performs no release.
 
 If the full-contract/preflight-turn bound expires, the turn errors, the marker
 is absent, or the Task does not become idle, leave the Issue unclaimed and exit
@@ -264,21 +345,35 @@ unauthorized.
    must own no other GitHub work item, branch, PR, or write boundary, and no
    second successor or editor may remain. Preserve the exact path boundary when
    the worktree is reused; otherwise preserve and verify the branch before the
-   successor receives its new exact path.
+   successor receives its new exact path. If this step creates a new Task,
+   reserve the host-wide lease and reuse the normal creation/bootstrap gates
+   through `bootstrap-ready` while preserving the existing Issue claim; do not
+   enter ordinary activation. An admitted pre-existing successor either retains
+   its reconciled originating lease at `task-materialized` or records that it
+   has no creation lease; never invent a lease after the fact.
 3. Send that successor the preserved full contract: original model/reasoning
    binding, Issue claim, callback, hotset, branch, base SHA, PR target, and
    exact worktree/write boundary. It first runs permission and repository
    preflight without edits.
 4. During that preflight-only turn, require the successor to record the
    observable recovery evidence and emit the literal `SUCCESSOR_READY`. The
-   marker does not assert a future idle state.
+   marker does not assert a future idle state. After its authoritative
+   completion read, transition a newly created successor lease from
+   `bootstrap-ready` to `preflight-ready`. Transition a pre-existing successor's
+   retained lease from `task-materialized` to `preflight-ready` only with the
+   explicit `--recovery-path` guard. A pre-existing successor with no lease
+   performs no transition.
 5. At the scheduled post-turn read, independently verify the exact successor
    turn completed without error, its marker and evidence, native idle state,
    predecessor inactivity, the Issue claim's unique mapping to this successor,
    and exact Task/worktree/write ownership.
 6. Only after that read succeeds, send `RECOVERY_CONFIRMED` and require its
    native delivery receipt to identify the successor. Only this final
-   continuation authorizes successor edits.
+   continuation authorizes successor edits. For either a newly created
+   successor or a pre-existing successor with a retained lease, transition to
+   `activated` and release the lease with its original owner token only after
+   that receipt succeeds. A lease-free successor performs no transition or
+   release.
 
 If any gate fails, do not authorize edits, create another successor, or change
 the Issue claim implicitly. Preserve or leave the worktree according to its

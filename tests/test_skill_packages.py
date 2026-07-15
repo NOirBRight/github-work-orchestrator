@@ -187,6 +187,29 @@ class SkillPackageTests(unittest.TestCase):
             self.assertIn(required, state_rules)
         self.assertIn("at least ten minutes", communication)
 
+    def test_orchestrator_serializes_task_creation_across_windows(self) -> None:
+        package = ROOT / "skills/github-work-orchestrator"
+        orchestrator = (package / "SKILL.md").read_text(encoding="utf-8")
+        worker_contract = (package / "references/worker-contract.md").read_text(
+            encoding="utf-8"
+        )
+        recovery = (package / "references/communication.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertTrue((package / "scripts/task_creation_lease.py").is_file())
+        self.assertIn("host-wide creation singleflight", orchestrator)
+        self.assertIn("repository + issue + branch", worker_contract)
+        self.assertIn("creation_authorized: true", worker_contract)
+        self.assertIn("creation_authorized: false", worker_contract)
+        self.assertIn("reserved -> invoking -> queued", worker_contract)
+        self.assertIn("retained lease from `task-materialized`", worker_contract)
+        self.assertIn("lease-free successor", worker_contract)
+        self.assertIn("exact admitted `invoking` lease", recovery)
+        self.assertIn("does not patch the Codex Desktop binary", worker_contract)
+        self.assertIn("creation-unknown", worker_contract)
+        self.assertIn("never makes a lease stealable", worker_contract)
+        self.assertIn("Codex host restart", recovery)
+
     def test_verification_policy_has_one_review_owner_and_tiered_gates(self) -> None:
         policy = (ROOT / "shared" / "verification-policy.md").read_text(
             encoding="utf-8"
