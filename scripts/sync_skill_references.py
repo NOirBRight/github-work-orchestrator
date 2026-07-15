@@ -29,7 +29,7 @@ PACKAGES = {
         "worker-execution.md",
     ),
 }
-PACKAGE_VERSION = "2.1.0"
+PACKAGE_VERSION = "2.2.0"
 PACKAGE_MANIFEST = ".skill-package.json"
 TEXT_SUFFIXES = {".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
 

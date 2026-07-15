@@ -69,6 +69,17 @@ This branch begins only when the materialization flow routes the exact original
 queued request to a no-real-Task outcome. Absence from a general native task
 list is not terminal ownership of that request, an orphan, or a replacement.
 
+When a queued client request has no authoritative terminal outcome, set the
+host-wide creation lease to `creation-unknown` and stop. Lease expiration does
+not change that classification and cannot authorize a replacement. After a
+Codex host restart, reconcile only with the original owner token and a private
+evidence reference covering all three boundaries: the exact request's native
+status, the exact real-Task read, and the literal worktree path/status/readback.
+Use `task_creation_lease.py reconcile`; ambiguous evidence leaves the lease and
+all paths untouched. A reconciled real Task returns to `task-materialized`; a
+proven terminal request with no real Task reaches `failed` or `cancelled` and
+may then be released by its owner.
+
 1. Record the exact original queued-request identity privately. Obtain a
    supported native cancellation or terminal-failure result for that original
    request, then immediately verify that no real Task belonging to it appeared.
