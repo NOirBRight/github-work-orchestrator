@@ -62,6 +62,34 @@ subsystem must send `DISCUSSION_REQUIRED` before expanding.
   and a retry requires a new hypothesis or materially changed environment.
 - CI remains the final automated gate. Report-only tools remain non-blocking.
 
+## Candidate-first integration pipeline
+
+Use this pipeline for every locally testable change, including a small delta
+inside a `standard` or `strict` Issue. Risk class controls verification depth;
+it does not require serial waiting between independent gates.
+
+1. Finish the affected local checks before the first candidate publication.
+   Do not push intermediate WIP merely to obtain CI. A recovery checkpoint or
+   an explicitly remote-only verification seam is the exception.
+2. Publish one locally green candidate commit and start one CI run for that
+   candidate. Send `PR_OPENED` immediately after publication; do not wait for
+   CI before notifying the Orchestrator.
+3. Run CI, the one Orchestrator review, and any safe candidate artifact/manual
+   evidence in parallel. Manual evidence named by the Issue normally runs
+   pre-merge so a red behavior gate does not enter the integration branch.
+4. Merge only after every applicable gate is green. A review or manual-gate
+   correction keeps the existing full-suite and formal-review counts; run
+   affected local checks and publish one replacement candidate.
+5. After merge, compare the candidate and integrated Git trees. Carry forward
+   behavioral evidence when the trees are identical. Rebuild or repeat the
+   gate only when the trees differ, repository policy requires integrated
+   revision identity, or the final release artifact itself is the acceptance
+   object.
+
+One candidate may still require a replacement when CI finds a platform-only
+failure or evidence disproves the implementation. The policy forbids avoidable
+publication/CI churn; it does not hide a materially changed candidate.
+
 ## Model selection
 
 Verification class and model profile are independent. Use the lowest qualified
@@ -74,6 +102,9 @@ research, or review.
 
 Targets are diagnostic rather than hard timeouts:
 
+- same-boundary review or manual-gate correction: locally green replacement
+  candidate within 15 minutes after a clear reproduction, excluding remote CI
+  and explicit human wait;
 - `fast`: candidate PR within 30 minutes;
 - `standard`: candidate PR within 90 minutes;
 - `strict`: milestone checkpoints with a named hypothesis and next gate.

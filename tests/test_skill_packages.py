@@ -204,6 +204,28 @@ class SkillPackageTests(unittest.TestCase):
         self.assertIn("Do not invoke the generic `code-review` Skill", worker)
         self.assertIn("exactly one Orchestrator-owned", orchestrator)
 
+    def test_candidate_pipeline_prevents_serial_ci_and_redundant_rebuilds(self) -> None:
+        policy = (ROOT / "shared" / "verification-policy.md").read_text(
+            encoding="utf-8"
+        )
+        worker = (ROOT / "skills/github-issue-worker/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        orchestrator = (
+            ROOT / "skills/github-work-orchestrator/SKILL.md"
+        ).read_text(encoding="utf-8")
+        protocol = (ROOT / "shared/communication-protocol.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Candidate-first integration pipeline", policy)
+        self.assertIn("one locally green candidate", policy)
+        self.assertIn("within 15 minutes", policy)
+        self.assertIn("candidate and integrated Git trees", policy)
+        self.assertIn("when the trees are identical", policy)
+        self.assertIn("Do not wait for CI", worker)
+        self.assertIn("run in parallel", protocol)
+        self.assertIn("integrated Git trees", orchestrator)
+
     def test_worker_signal_includes_execution_metrics(self) -> None:
         protocol = (ROOT / "shared" / "communication-protocol.md").read_text(
             encoding="utf-8"

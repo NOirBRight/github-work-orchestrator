@@ -44,6 +44,24 @@ the generic `code-review` Skill or create Standards/Spec review subagents.
 Manual/live evidence is required when and only when `Manual-Evidence` is not
 `none`; the verification class alone never creates it.
 
+## Candidate publication loop
+
+Complete the assigned local candidate verification before the first push. Do
+not publish intermediate WIP only to start CI; a scoped recovery checkpoint or
+an explicitly remote-only gate is the exception. Publish one locally green
+candidate, open/update its PR, and send `PR_OPENED` immediately without waiting
+for CI.
+
+The Orchestrator runs CI observation, formal review, and safe candidate
+artifact/manual evidence concurrently. After a review or manual-gate fix,
+preserve the prior full-suite count, run affected checks, and publish one new
+candidate. Do not wait for one independent gate before starting another.
+
+Manual behavior evidence normally runs before merge. After merge, repeat a
+build or behavior gate only when the integrated Git tree differs from the
+accepted candidate, repository policy requires integrated revision identity,
+or the release artifact itself is the acceptance object.
+
 ## Direction and scope
 
 Implement the smallest coherent accepted scope. Send `DISCUSSION_REQUIRED`
@@ -54,9 +72,11 @@ reprioritize, or broaden hotsets without authority.
 
 ## Publish and callback
 
-Commit, push, and open/update only the assigned PR target. Before the final
-response, build the canonical signal with `scripts/worker_signal.py`, then send
-that exact envelope to the Orchestrator callback through native Task messaging.
+Commit, push, and open/update only the assigned PR target. Send `PR_OPENED`
+immediately after the locally green candidate exists so integration gates can
+run in parallel. Before the final response, build the canonical signal with
+`scripts/worker_signal.py`, then send that exact envelope to the Orchestrator
+callback through native Task messaging.
 A successful native tool result is the receipt. On transport error retry once
 with the identical envelope and stable generated Signal-ID; after a second
 failure record `CALLBACK_DELIVERY_FAILED` and stop. GitHub comments are not a
@@ -64,5 +84,7 @@ hidden callback channel.
 
 Every material signal includes verification class, phase timings,
 full-suite count, `Review-Runs: 0`, scope delta, verification, hotset, and next
-action. The 30-minute `fast` and 90-minute `standard` targets diagnose friction;
-they never authorize skipped acceptance.
+action. A same-boundary review/manual correction targets a locally green
+replacement candidate within 15 minutes, excluding remote CI and explicit
+human wait. The 30-minute `fast` and 90-minute `standard` targets diagnose
+friction; they never authorize skipped acceptance.

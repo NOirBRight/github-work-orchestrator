@@ -101,6 +101,13 @@ full suite only when the fix crosses a new repository verification boundary.
 Review the final diff for hotset, generated artifacts, credentials, private
 task IDs, local paths, and unrelated changes.
 
+Finish the affected local checks before the first candidate push. Do not push
+intermediate WIP merely to obtain CI unless preserving recovery WIP or using an
+explicitly remote-only gate. Publish one locally green candidate and send
+`PR_OPENED` immediately; CI, Orchestrator review, and safe candidate artifact
+or manual evidence then run in parallel. Preserve previous full-suite and
+review counts for a same-boundary correction.
+
 Implementation is complete when acceptance criteria pass, required checks are
 recorded, and the final diff contains only authorized work.
 
@@ -108,6 +115,8 @@ recorded, and the final diff contains only authorized work.
 
 Commit, push, and open or update only the assigned PR under the compact
 [publication rules](references/shared/worker-execution.md#publish-and-callback).
+Do not wait for CI before sending the locally green candidate's `PR_OPENED`
+signal.
 
 Before the final response, build the canonical signal with
 `scripts/worker_signal.py` and complete the compact

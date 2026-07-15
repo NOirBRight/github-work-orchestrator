@@ -115,7 +115,7 @@ Use:
 |---|---|
 | `DISCUSSION_REQUIRED` | A decision exceeds the Worker's accepted authority |
 | `BLOCKED` | Progress requires new authority, permissions, evidence, an upstream merge, or resolution of a proven write-set collision |
-| `PR_OPENED` | The branch is pushed and a PR exists; checks may still run |
+| `PR_OPENED` | One locally green candidate is pushed and a PR exists; send immediately so CI, review, and candidate evidence can run in parallel |
 | `READY_FOR_REVIEW` | Assigned scope and required verification are ready for Orchestrator review |
 | `STOPPED` | The Worker ends without a reviewable result or hands ownership back |
 

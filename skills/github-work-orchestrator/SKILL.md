@@ -141,19 +141,28 @@ missing.
 
 When a Worker is ready:
 
-1. Verify scope, base, diff, tests, PR target, accepted decisions, verification
-   class, full-suite count, and the Worker's `Review-Runs: 0` report.
+1. On a locally green `PR_OPENED`, verify scope, base, diff, tests, PR target,
+   accepted decisions, verification class, full-suite count, and the Worker's
+   `Review-Runs: 0` report. Start eligible gates immediately; do not wait for
+   `READY_FOR_REVIEW` merely to serialize independent work.
 2. For `fast`, perform one direct scope/acceptance review without a review
    subagent. For `standard` or `strict`, run exactly one Orchestrator-owned
    parallel Standards/Spec review using the review model profiles. Treat an
    already completed in-flight formal review as that one review; do not repeat
    it solely because this policy was adopted mid-task.
-3. Route revisions to the same visible task. After fixes, review only the
+3. Run CI observation, the one review, and safe candidate artifact/manual
+   evidence concurrently. Prefer pre-merge manual evidence so a red behavior
+   gate does not enter the integration branch.
+4. Route revisions to the same visible task. After fixes, review only the
    changed delta and require targeted checks plus CI. Require another local
    full suite only when the fix crosses a new repository verification boundary.
-4. Serialize integration through declared hotsets.
-5. Recompute the frontier after every material event.
-6. Refill the highest-priority non-conflicting lane while authorization remains
+5. Merge only after every applicable gate is green. Compare candidate and
+   integrated Git trees after merge; rebuild or repeat behavioral evidence only
+   for a tree delta, an explicit integrated-revision requirement, or a release
+   artifact acceptance gate.
+6. Serialize integration through declared hotsets.
+7. Recompute the frontier after every material event.
+8. Refill the highest-priority non-conflicting lane while authorization remains
    active.
 
 Review and refill are complete when every received signal is verified once,
