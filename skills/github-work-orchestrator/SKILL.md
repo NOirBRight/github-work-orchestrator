@@ -115,10 +115,12 @@ whose blockers are closed and whose expected write sets can run concurrently.
      --repository <owner/repository> --issue <number> --branch <feature-branch>
    ```
 
-   Keep the returned owner token and lease identity private. If reservation is
-   refused, do not call the Task-creation API, retry, or switch projects to
-   evade the lease. Follow the lease state and recovery rules in the detailed
-   Worker contract.
+   Keep the returned owner token and lease identity private. Call the native
+   Task-creation API only when this fresh reservation returns
+   `creation_authorized: true`, and transition the lease to `invoking` before
+   that call; an idempotent read is not a second admission. If reservation is
+   refused, do not retry or switch projects to evade the lease. Follow the
+   lease state and recovery rules in the detailed Worker contract.
 3. Follow the detailed
    [Worker contract](references/worker-contract.md) for exact materialization,
    preflight, claim, dispatch-comment, and edit-authorization order. Do not

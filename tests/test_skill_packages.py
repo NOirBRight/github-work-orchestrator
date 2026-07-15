@@ -199,8 +199,13 @@ class SkillPackageTests(unittest.TestCase):
         self.assertTrue((package / "scripts/task_creation_lease.py").is_file())
         self.assertIn("host-wide creation singleflight", orchestrator)
         self.assertIn("repository + issue + branch", worker_contract)
+        self.assertIn("creation_authorized: true", worker_contract)
+        self.assertIn("creation_authorized: false", worker_contract)
+        self.assertIn("reserved -> invoking -> queued", worker_contract)
+        self.assertIn("creation-backed successor", worker_contract)
+        self.assertIn("does not patch the Codex Desktop binary", worker_contract)
         self.assertIn("creation-unknown", worker_contract)
-        self.assertIn("Expiration never makes a lease stealable", worker_contract)
+        self.assertIn("never makes a lease stealable", worker_contract)
         self.assertIn("Codex host restart", recovery)
 
     def test_verification_policy_has_one_review_owner_and_tiered_gates(self) -> None:
