@@ -349,8 +349,8 @@ unauthorized.
    reserve the host-wide lease and reuse the normal creation/bootstrap gates
    through `bootstrap-ready` while preserving the existing Issue claim; do not
    enter ordinary activation. An admitted pre-existing successor either retains
-   its reconciled originating lease or records that it has no creation lease;
-   never invent a lease after the fact.
+   its reconciled originating lease at `task-materialized` or records that it
+   has no creation lease; never invent a lease after the fact.
 3. Send that successor the preserved full contract: original model/reasoning
    binding, Issue claim, callback, hotset, branch, base SHA, PR target, and
    exact worktree/write boundary. It first runs permission and repository
@@ -358,18 +358,22 @@ unauthorized.
 4. During that preflight-only turn, require the successor to record the
    observable recovery evidence and emit the literal `SUCCESSOR_READY`. The
    marker does not assert a future idle state. After its authoritative
-   completion read, transition a creation-backed successor lease from
-   `bootstrap-ready` to `preflight-ready`; a pre-existing successor performs no
-   lease transition.
+   completion read, transition a newly created successor lease from
+   `bootstrap-ready` to `preflight-ready`. Transition a pre-existing successor's
+   retained lease from `task-materialized` to `preflight-ready` only with the
+   explicit `--recovery-path` guard. A pre-existing successor with no lease
+   performs no transition.
 5. At the scheduled post-turn read, independently verify the exact successor
    turn completed without error, its marker and evidence, native idle state,
    predecessor inactivity, the Issue claim's unique mapping to this successor,
    and exact Task/worktree/write ownership.
 6. Only after that read succeeds, send `RECOVERY_CONFIRMED` and require its
    native delivery receipt to identify the successor. Only this final
-   continuation authorizes successor edits. For a creation-backed successor,
-   transition to `activated` and release the lease with its original owner
-   token only after that receipt succeeds.
+   continuation authorizes successor edits. For either a newly created
+   successor or a pre-existing successor with a retained lease, transition to
+   `activated` and release the lease with its original owner token only after
+   that receipt succeeds. A lease-free successor performs no transition or
+   release.
 
 If any gate fails, do not authorize edits, create another successor, or change
 the Issue claim implicitly. Preserve or leave the worktree according to its

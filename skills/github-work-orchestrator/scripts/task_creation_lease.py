@@ -318,6 +318,15 @@ class LeaseStore:
         with self._locked():
             active = self._read()
             if active is not None:
+                if (
+                    active["state"] in TERMINAL_STATES
+                    and current_time >= float(active["expires_at"])
+                ):
+                    raise LeaseError(
+                        "TERMINAL_LEASE_REQUIRES_OWNER_RELEASE",
+                        "the expired terminal lease is immutable and must be "
+                        "released by its original owner",
+                    )
                 self._require_unexpired(active, current_time)
                 if (
                     active["idempotency_key"] == key
@@ -497,6 +506,12 @@ class LeaseStore:
                 request_state == "no-receipt-materialized"
                 and stored_request_digest is None
             ):
+                if record["state"] not in {"invoking", "creation-unknown"}:
+                    raise LeaseError(
+                        "RECONCILIATION_EVIDENCE_REQUIRED",
+                        "no-receipt Task adoption requires a prior admitted "
+                        "native invocation",
+                    )
                 if task_state != "materialized" or worktree_state != "owned":
                     raise LeaseError(
                         "RECONCILIATION_EVIDENCE_REQUIRED",

@@ -65,8 +65,9 @@ monitoring; it does not recreate an activation or succession sequence.
 
 ### Creation failure: no Worker exists
 
-This branch begins only when the materialization flow routes the exact original
-queued request to a no-real-Task outcome. Absence from a general native task
+This branch begins only when the materialization flow routes either the exact
+original queued request, or its exact admitted `invoking` lease before a native
+receipt exists, to a no-real-Task outcome. Absence from a general native task
 list is not terminal ownership of that request, an orphan, or a replacement.
 
 When a queued client request has no authoritative terminal outcome, set the

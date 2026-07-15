@@ -416,6 +416,16 @@ raise SystemExit(completed.returncode)
             ),
         )
         self.assert_lease_error(
+            "TERMINAL_LEASE_REQUIRES_OWNER_RELEASE",
+            lambda: store.reserve(
+                repository="NOirBRight/AYASpace2",
+                issue=9,
+                branch="codex/issue-9",
+                owner_token="owner-two",
+                now=1000,
+            ),
+        )
+        self.assert_lease_error(
             "OWNER_MISMATCH", lambda: store.release("owner-two", now=1000)
         )
         released = store.release("owner-one", now=1000)
@@ -559,6 +569,58 @@ raise SystemExit(completed.returncode)
         )
         self.assertEqual("failed", reconciled["state"])
         store.release("owner-one", now=103)
+
+    def test_expired_reserved_lease_cannot_adopt_a_materialized_task(self) -> None:
+        store = self.store()
+        store.reserve(
+            repository="NOirBRight/CodexHub",
+            issue=140,
+            branch="codex/issue-140-native-responses-tools",
+            owner_token="owner-one",
+            ttl_seconds=5,
+            now=100,
+        )
+        self.assert_lease_error(
+            "RECONCILIATION_EVIDENCE_REQUIRED",
+            lambda: store.reconcile(
+                "owner-one",
+                host_restarted=True,
+                request_id=None,
+                request_state="no-receipt-materialized",
+                task_state="materialized",
+                worktree_state="owned",
+                evidence="post-restart-full-inventory",
+                now=106,
+            ),
+        )
+
+    def test_admitted_no_receipt_creation_can_adopt_its_materialized_task(self) -> None:
+        for uncertain_state in ("invoking", "creation-unknown"):
+            with self.subTest(uncertain_state=uncertain_state):
+                store = task_creation_lease.LeaseStore(
+                    self.state_dir / uncertain_state
+                )
+                store.reserve(
+                    repository="NOirBRight/CodexHub",
+                    issue=140,
+                    branch="codex/issue-140-native-responses-tools",
+                    owner_token="owner-one",
+                    now=100,
+                )
+                store.transition("owner-one", "invoking", now=101)
+                if uncertain_state == "creation-unknown":
+                    store.transition("owner-one", "creation-unknown", now=102)
+                reconciled = store.reconcile(
+                    "owner-one",
+                    host_restarted=True,
+                    request_id=None,
+                    request_state="no-receipt-materialized",
+                    task_state="materialized",
+                    worktree_state="owned",
+                    evidence="post-restart-full-inventory",
+                    now=103,
+                )
+                self.assertEqual("task-materialized", reconciled["state"])
 
     def test_task_materialized_recovery_path_is_explicit(self) -> None:
         store = self.store()
