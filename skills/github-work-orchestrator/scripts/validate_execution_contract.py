@@ -50,24 +50,44 @@ def verification_plan(
         raise ValueError("invalid verification class")
     if phase not in {"candidate", "review-fix"}:
         raise ValueError("invalid phase")
+    pipeline = {
+        "local_green_before_ci": True,
+        "ci_run_mode": "one-per-locally-green-candidate",
+        "integration_gates": "parallel",
+        "post_merge_rebuild": "tree-delta-or-repository-requirement-only",
+    }
     if phase == "candidate":
         return {
             "targeted_checks": True,
             "local_full_suite": verification_class in {"standard", "strict"},
             "manual_evidence": manual_evidence.strip().lower() != "none",
+            "manual_evidence_timing": (
+                "pre-merge"
+                if manual_evidence.strip().lower() != "none"
+                else "not-required"
+            ),
             "worker_review_runs": 0,
             "orchestrator_review": (
                 "direct" if verification_class == "fast" else "standards-spec"
             ),
             "formal_review_round_limit": 1,
+            "candidate_target_minutes": (
+                30
+                if verification_class == "fast"
+                else 90 if verification_class == "standard" else None
+            ),
+            **pipeline,
         }
     return {
         "targeted_checks": True,
         "local_full_suite": boundary_changed,
         "manual_evidence": False,
+        "manual_evidence_timing": "pre-merge-if-affected",
         "worker_review_runs": 0,
         "orchestrator_review": "delta-only",
         "formal_review_round_limit": 1,
+        "candidate_target_minutes": 15,
+        **pipeline,
     }
 
 

@@ -112,6 +112,30 @@ class ExecutionContractTests(unittest.TestCase):
                 self.assertEqual("standards-spec", plan["orchestrator_review"])
                 self.assertEqual(1, plan["formal_review_round_limit"])
 
+    def test_candidate_pipeline_is_local_first_single_ci_and_parallel(self) -> None:
+        plan = CONTRACT.verification_plan(
+            "strict", manual_evidence="one packaged behavior check"
+        )
+        self.assertTrue(plan["local_green_before_ci"])
+        self.assertEqual(
+            "one-per-locally-green-candidate", plan["ci_run_mode"]
+        )
+        self.assertEqual("parallel", plan["integration_gates"])
+        self.assertEqual("pre-merge", plan["manual_evidence_timing"])
+        self.assertEqual(
+            "tree-delta-or-repository-requirement-only",
+            plan["post_merge_rebuild"],
+        )
+
+    def test_same_boundary_delta_preserves_suite_and_parallel_pipeline(self) -> None:
+        plan = CONTRACT.verification_plan("strict", phase="review-fix")
+        self.assertFalse(plan["local_full_suite"])
+        self.assertEqual("delta-only", plan["orchestrator_review"])
+        self.assertTrue(plan["local_green_before_ci"])
+        self.assertEqual("parallel", plan["integration_gates"])
+        self.assertEqual("pre-merge-if-affected", plan["manual_evidence_timing"])
+        self.assertEqual(15, plan["candidate_target_minutes"])
+
     def test_manual_evidence_comes_only_from_contract_field(self) -> None:
         strict_none = CONTRACT.validate_contract(
             contract(verification_class="strict", manual_evidence="none")
