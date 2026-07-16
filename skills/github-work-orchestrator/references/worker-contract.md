@@ -62,14 +62,20 @@ guard. Never steal an owner token or edit Codex SQLite.
 1. Reconcile the unassigned Issue and pin base, branch, hotset, verification,
    permission, callback, and model contract.
 2. Reserve the creation guard with the caller-owned token.
-3. Create one worktree Task with the complete private contract and explicit
-   `ollama-cloud/glm-5.2` binding plus reasoning `max`.
+3. Create one worktree Task with the complete private contract, explicit
+   execution-only absolute CWD, and `ollama-cloud/glm-5.2` binding plus
+   reasoning `max`. The supported native contract must not save or register
+   the worktree as a Codex project.
 4. Record a returned client request receipt. Wait event-first for native Task
    discovery; do not poll every few seconds.
 5. When the exact Task/worktree materializes, release the guard. Rename only
    this real Task.
 
 A rejected GLM binding fails closed. Do not retry with GPT.
+If the native surface cannot use the assigned CWD without persisting it as a
+Saved Project or Saved Workspace, fail the Visible Worker lane with a sanitized
+platform limitation. Do not register the path, switch projects, install a Skill
+there, or edit Codex private state as a workaround.
 
 ## Activate with one full turn
 

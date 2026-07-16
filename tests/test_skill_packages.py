@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import re
@@ -107,6 +108,213 @@ class SkillPackageTests(unittest.TestCase):
             (ROOT / "skills/github-work-orchestrator/agents/openai.yaml").read_bytes(),
             (ROOT / "agents/openai.yaml").read_bytes(),
         )
+
+    def test_execution_worktrees_are_not_saved_projects_or_skill_roots(self) -> None:
+        package_documents = {
+            "orchestrator": (
+                ROOT / "skills/github-work-orchestrator/SKILL.md",
+                ROOT
+                / "skills/github-work-orchestrator/references/shared/github-state-rules.md",
+                ROOT / "skills/github-work-orchestrator/references/worker-contract.md",
+            ),
+            "worker": (
+                ROOT / "skills/github-issue-worker/SKILL.md",
+                ROOT
+                / "skills/github-issue-worker/references/shared/worker-execution.md",
+            ),
+        }
+        required = (
+            "execution-only CWD",
+            "Codex Saved Project",
+            ".codex-global-state.json",
+            "electron-saved-workspace-roots",
+            "Codex SQLite",
+            "junction",
+            "symlink",
+            "dynamic `SKILL.md`",
+            "sanitized platform limitation",
+            "exactly one repository-documented canonical installation",
+        )
+        for role, documents in package_documents.items():
+            text = "\n".join(
+                document.read_text(encoding="utf-8") for document in documents
+            )
+            normalized = " ".join(text.split())
+            for phrase in required:
+                with self.subTest(role=role, phrase=phrase):
+                    self.assertIn(phrase, normalized)
+
+        state_rules = (ROOT / "shared/github-state-rules.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("GitHub Issue and the native Task contract", state_rules)
+        self.assertIn("not additional runtime Skill installations", state_rules)
+
+    def test_packaged_scripts_do_not_mutate_workspace_or_skill_topology(self) -> None:
+        forbidden_targets = (
+            ".codex-global-state.json",
+            "electron-saved-workspace-roots",
+            "saved-workspace-roots",
+            "state.vscdb",
+            "globalstorage",
+            "codex sqlite",
+            "sqlite3",
+            "skills/list",
+            "skill.md",
+            ".codex/skills",
+            "codex_home/skills",
+        )
+        filesystem_mutators = {
+            "chmod",
+            "chown",
+            "copy",
+            "copy2",
+            "copyfile",
+            "copytree",
+            "fdopen",
+            "hardlink_to",
+            "link",
+            "makedirs",
+            "mkdtemp",
+            "mkdir",
+            "mkfifo",
+            "mkstemp",
+            "mknod",
+            "move",
+            "NamedTemporaryFile",
+            "open",
+            "remove",
+            "removedirs",
+            "rename",
+            "renames",
+            "replace",
+            "rmdir",
+            "rmtree",
+            "symlink",
+            "symlink_to",
+            "TemporaryDirectory",
+            "TemporaryFile",
+            "touch",
+            "truncate",
+            "unlink",
+            "write",
+            "write_bytes",
+            "write_text",
+            "writelines",
+        }
+        allowed_mutators = {
+            Path(
+                "skills/github-work-orchestrator/scripts/install_worker_agent.py"
+            ): {"fdopen", "mkdir", "mkstemp", "replace", "unlink", "write"},
+            Path(
+                "skills/github-work-orchestrator/scripts/task_creation_lease.py"
+            ): {
+                "fdopen",
+                "mkdir",
+                "mkstemp",
+                "open",
+                "replace",
+                "unlink",
+                "write",
+            },
+        }
+        process_calls = {
+            "os.popen",
+            "os.system",
+            "subprocess.Popen",
+            "subprocess.call",
+            "subprocess.check_call",
+            "subprocess.check_output",
+            "subprocess.run",
+        }
+        allowed_process_scripts = {
+            Path("skills/github-issue-worker/scripts/preflight.py"),
+            Path("skills/github-work-orchestrator/scripts/ready_frontier.py"),
+            Path(
+                "skills/github-work-orchestrator/scripts/reconcile_issue_state.py"
+            ),
+        }
+
+        def call_name(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Name):
+                return node.id
+            if isinstance(node, ast.Attribute):
+                prefix = call_name(node.value)
+                return f"{prefix}.{node.attr}" if prefix else node.attr
+            return None
+
+        def static_string(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                left = static_string(node.left)
+                right = static_string(node.right)
+                return (
+                    left + right
+                    if left is not None and right is not None
+                    else None
+                )
+            if isinstance(node, ast.JoinedStr):
+                parts: list[str] = []
+                for value in node.values:
+                    part = (
+                        static_string(value.value)
+                        if isinstance(value, ast.FormattedValue)
+                        else static_string(value)
+                    )
+                    if part is None:
+                        return None
+                    parts.append(part)
+                return "".join(parts)
+            return None
+
+        scripts = sorted(
+            path
+            for name in SKILLS
+            for path in (ROOT / "skills" / name / "scripts").rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts
+        )
+        self.assertTrue(scripts)
+        for script in scripts:
+            relative = script.relative_to(ROOT)
+            with self.subTest(script=relative):
+                self.assertEqual(
+                    ".py",
+                    script.suffix.lower(),
+                    "new packaged script types require an explicit policy audit",
+                )
+                source = script.read_text(encoding="utf-8")
+                tree = ast.parse(source, filename=str(relative))
+                static_values = [source]
+                static_values.extend(
+                    value
+                    for node in ast.walk(tree)
+                    if (value := static_string(node)) is not None
+                )
+                normalized = "\n".join(static_values).lower().replace("\\", "/")
+                for marker in forbidden_targets:
+                    self.assertNotIn(marker, normalized)
+
+                calls = {
+                    name
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Call)
+                    if (name := call_name(node.func)) is not None
+                }
+                observed_mutators = {
+                    name.rsplit(".", 1)[-1]
+                    for name in calls
+                    if name.rsplit(".", 1)[-1] in filesystem_mutators
+                }
+                unexpected_mutators = observed_mutators - allowed_mutators.get(
+                    relative, set()
+                )
+                self.assertFalse(
+                    unexpected_mutators,
+                    f"unaudited filesystem mutators: {sorted(unexpected_mutators)}",
+                )
+                if calls & process_calls:
+                    self.assertIn(relative, allowed_process_scripts)
 
     def test_trigger_descriptions_are_role_specific(self) -> None:
         descriptions = {}
