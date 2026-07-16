@@ -1,5 +1,5 @@
 {
-  "content_sha256": "9125b874eef97225779d52a249eaf4887216a48094560c5e2fe570922511202c",
+  "content_sha256": "997c41ed85d48d91284917371103c142efcf9089aa240e899221cc04ee58a8e3",
   "schema_version": 1,
   "skill": "github-issue-intake",
   "version": "2.3.0"

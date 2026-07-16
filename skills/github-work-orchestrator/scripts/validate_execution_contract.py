@@ -21,7 +21,21 @@ MODEL_BINDING_STATUSES = {
     "unknown",
 }
 IMPLEMENTATION_WORKER_BINDING = "ollama-cloud/glm-5.2"
+IMPLEMENTATION_WORKER_PROFILES = {
+    "core",
+    "debug",
+    "evidence",
+    "standard",
+    "mechanical",
+    "light",
+}
+INLINE_PROFILE = "orchestrator"
+INLINE_BINDING = "gpt-5.6-terra"
+INLINE_REASONING = "high"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+TASK_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 REQUIRED_TEXT = (
     "issue",
     "repository",
@@ -134,10 +148,12 @@ def validate_contract(contract: Any) -> dict[str, Any]:
     execution_lane = contract.get("execution_lane")
     if execution_lane not in EXECUTION_LANES:
         errors.append("invalid-execution-lane")
-    if execution_lane == "visible-worker" and not nonempty_text(
-        contract.get("callback_task")
-    ):
-        errors.append("visible-worker-requires-callback-task")
+    if execution_lane == "visible-worker":
+        callback_task = contract.get("callback_task")
+        if not nonempty_text(callback_task):
+            errors.append("visible-worker-requires-callback-task")
+        elif not TASK_ID_RE.fullmatch(callback_task):
+            errors.append("visible-worker-callback-task-invalid")
 
     binding_requirement = contract.get("model_binding_requirement")
     if binding_requirement not in MODEL_BINDING_REQUIREMENTS:
@@ -161,17 +177,22 @@ def validate_contract(contract: Any) -> dict[str, Any]:
         errors.append("best-effort-binding-not-accepted")
 
     model_binding = contract.get("model_binding")
+    model_profile = contract.get("model_profile")
     reasoning = contract.get("model_reasoning_effort")
     if execution_lane in {"subagent", "visible-worker"}:
+        if model_profile not in IMPLEMENTATION_WORKER_PROFILES:
+            errors.append("invalid-implementation-worker-profile")
         if model_binding != IMPLEMENTATION_WORKER_BINDING:
             errors.append("implementation-worker-must-use-glm-5.2")
         if reasoning != "max":
             errors.append("glm-reasoning-must-be-max")
     elif execution_lane == "inline":
-        if not isinstance(model_binding, str) or not model_binding.startswith("gpt-"):
+        if model_profile != INLINE_PROFILE:
+            errors.append("inline-lane-must-use-orchestrator-profile")
+        if model_binding != INLINE_BINDING:
             errors.append("inline-lane-must-keep-orchestrator-gpt")
-        if not nonempty_text(reasoning):
-            errors.append("inline-gpt-reasoning-required")
+        if reasoning != INLINE_REASONING:
+            errors.append("inline-lane-must-keep-orchestrator-reasoning")
     base_sha = contract.get("base_sha")
     if not isinstance(base_sha, str) or not SHA_RE.fullmatch(base_sha):
         errors.append("base-sha-must-be-lowercase-40-hex")

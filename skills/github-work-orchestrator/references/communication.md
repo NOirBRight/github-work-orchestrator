@@ -37,8 +37,9 @@ base, cleanliness, Issue claim, and editor ownership.
 
 - A corrected contract may be sent once to the same real idle Task when no
   preflight/repository write began.
-- Otherwise retire the Task through a supported action after releasing any
-  unambiguous claim and preserving the exact worktree.
+- Otherwise preserve the exact Task identity and report it for human-owned
+  archive after releasing any unambiguous claim and preserving the worktree.
+  Never invoke the native archive action automatically.
 - Inline/Subagent fallback is allowed only when the router independently
   selects that lane and no competing editor exists.
 - Permission denial, dirty/WIP state, wrong base, real ownership collision,

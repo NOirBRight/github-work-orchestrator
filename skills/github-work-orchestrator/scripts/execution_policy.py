@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
+import re
 from typing import Any
 
 
@@ -13,6 +15,9 @@ MAX_VISIBLE_ORCHESTRATORS_PER_ACTIVITY = 1
 MAX_VISIBLE_WORKERS_GLOBAL = 3
 MAX_SUBAGENTS_PER_ORCHESTRATOR = 4
 CLEANUP_DEADLINE_SECONDS = 5 * 60
+TASK_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 
 def _nonnegative(name: str, value: int | float) -> None:
@@ -111,6 +116,9 @@ def cleanup_plan(
     *,
     event: str,
     seconds_since_event: int,
+    worktree: str,
+    branch: str | None,
+    visible_task_id: str | None,
     worktree_clean: bool,
     durable: bool,
     ownership_unambiguous: bool,
@@ -123,6 +131,15 @@ def cleanup_plan(
     if event not in {"merged", "stopped"}:
         raise ValueError("event must be merged or stopped")
     _nonnegative("seconds_since_event", seconds_since_event)
+    if not worktree.strip() or not Path(worktree).is_absolute():
+        raise ValueError("worktree must be an absolute path")
+    if branch_merged and (not isinstance(branch, str) or not branch.strip()):
+        raise ValueError("merged branch cleanup requires an exact branch")
+    if visible_worker and (
+        not isinstance(visible_task_id, str)
+        or not TASK_ID_RE.fullmatch(visible_task_id)
+    ):
+        raise ValueError("visible Worker cleanup requires an exact Task ID")
     blockers = []
     if not worktree_clean:
         blockers.append("worktree-not-clean")
@@ -133,13 +150,20 @@ def cleanup_plan(
     if active_editor:
         blockers.append("active-editor")
 
-    actions: list[str] = []
+    actions: list[dict[str, str]] = []
     if not blockers:
-        actions.append("remove-worktree")
+        actions.append({"action": "remove-worktree", "target": worktree})
         if branch_merged:
-            actions.append("delete-merged-local-branch")
+            actions.append(
+                {"action": "delete-merged-local-branch", "target": branch}
+            )
         if visible_worker:
-            actions.append("request-human-visible-task-archive")
+            actions.append(
+                {
+                    "action": "request-human-visible-task-archive",
+                    "target": visible_task_id,
+                }
+            )
     overdue = seconds_since_event > CLEANUP_DEADLINE_SECONDS
     return {
         "schema_version": 1,
@@ -174,6 +198,9 @@ def _parser() -> argparse.ArgumentParser:
     cleanup = subparsers.add_parser("cleanup-plan")
     cleanup.add_argument("--event", choices=("merged", "stopped"), required=True)
     cleanup.add_argument("--seconds-since-event", type=int, required=True)
+    cleanup.add_argument("--worktree", required=True)
+    cleanup.add_argument("--branch")
+    cleanup.add_argument("--visible-task-id")
     cleanup.add_argument("--worktree-clean", action="store_true")
     cleanup.add_argument("--durable", action="store_true")
     cleanup.add_argument("--ownership-unambiguous", action="store_true")
@@ -206,6 +233,9 @@ def main() -> int:
             report = cleanup_plan(
                 event=arguments.event,
                 seconds_since_event=arguments.seconds_since_event,
+                worktree=arguments.worktree,
+                branch=arguments.branch,
+                visible_task_id=arguments.visible_task_id,
                 worktree_clean=arguments.worktree_clean,
                 durable=arguments.durable,
                 ownership_unambiguous=arguments.ownership_unambiguous,

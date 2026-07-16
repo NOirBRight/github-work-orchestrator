@@ -7,17 +7,23 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
 
-STATES = {
+ACTIVATION_STATES = {"WORKER_BOOTED", "PREFLIGHT_READY"}
+MATERIAL_STATES = {
     "DISCUSSION_REQUIRED",
     "BLOCKED",
     "PR_OPENED",
     "READY_FOR_REVIEW",
     "STOPPED",
 }
+STATES = ACTIVATION_STATES | MATERIAL_STATES
+TASK_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 VERIFICATION_CLASSES = {"fast", "standard", "strict"}
 BASE_FIELDS = (
     "state",
@@ -43,6 +49,20 @@ def validate_signal(payload: Any) -> list[str]:
     if not isinstance(payload, dict):
         return ["signal-must-be-object"]
     errors: list[str] = []
+    state = payload.get("state")
+    if state in ACTIVATION_STATES:
+        for field in ("issue", "task_id", "callback_task", "evidence"):
+            if not _text(payload.get(field)):
+                errors.append(f"missing-or-empty:{field}")
+        if _text(payload.get("task_id")) and not TASK_ID_RE.fullmatch(
+            payload["task_id"]
+        ):
+            errors.append("invalid-task-id")
+        if _text(payload.get("callback_task")) and not TASK_ID_RE.fullmatch(
+            payload["callback_task"]
+        ):
+            errors.append("invalid-callback-task")
+        return sorted(set(errors))
     for field in BASE_FIELDS:
         if field not in payload:
             errors.append(f"missing:{field}")
@@ -90,6 +110,18 @@ def render_signal(payload: dict[str, Any]) -> str:
     errors = validate_signal(payload)
     if errors:
         raise ValueError(",".join(errors))
+    if payload["state"] in ACTIVATION_STATES:
+        return "\n".join(
+            [
+                "WORKER_SIGNAL",
+                f"- Signal-ID: {stable_signal_id(payload)}",
+                f"- State: {payload['state']}",
+                f"- Issue: {payload['issue']}",
+                f"- Task-ID: {payload['task_id']}",
+                f"- Callback-Task: {payload['callback_task']}",
+                f"- Evidence: {payload['evidence']}",
+            ]
+        )
     timings = payload["phase_timings"]
     lines = [
         "WORKER_SIGNAL",

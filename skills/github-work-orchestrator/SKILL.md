@@ -142,7 +142,8 @@ do not narrate or poll unchanged state.
 Merge and stop events trigger cleanup; complete eligible cleanup within five minutes.
 The deadline is event-triggered, not a five-minute polling loop.
 
-Run `execution_policy.py cleanup-plan`, then:
+Run `execution_policy.py cleanup-plan` with the exact absolute worktree path,
+merged branch name when applicable, and exact Visible Worker Task ID. Then:
 
 1. verify the editor is idle, the worktree is clean, ownership is unambiguous,
    and work is pushed or integrated;

@@ -108,8 +108,10 @@ safe deletion from age alone.
 After a verified merge or stop, trigger cleanup immediately; complete it within
 five minutes. This is a deadline, not a polling interval.
 
-Use the execution policy cleanup plan. Remove an isolated worktree only when it
-is clean, durable (pushed or integrated), inactive, and unambiguously owned.
+Use the execution policy cleanup plan with the exact absolute worktree, merged
+branch when applicable, and Visible Worker Task ID. Remove an isolated worktree
+only when it is clean, durable (pushed or integrated), inactive, and
+unambiguously owned.
 Delete a local branch only when merged. Task archiving is human-owned: report
 the exact corresponding Visible Worker as ready for archive, but never call the
 native archive action automatically because descendant cleanup can cross a
