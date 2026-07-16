@@ -1,7 +1,7 @@
 # GitHub-native lifecycle
 
 Reconstruct lifecycle state from GitHub on every run. Keep no control Issue,
-database, duplicate status ledger, or model label.
+database, duplicate status ledger, model label, or execution-lane label.
 
 ## Canonical labels
 
@@ -11,33 +11,26 @@ Use the repository's documented mapping. When none exists, use exactly one:
 |---|---|
 | `needs-triage` | Scope or ownership is not ready |
 | `needs-info` | A named fact, policy, or decision is missing |
-| `ready-for-agent` | The contract is fully specified for agent execution |
+| `ready-for-agent` | The contract is fully specified for execution |
 | `ready-for-human` | A maintainer-only action or decision is required |
 | `wontfix` | The work is intentionally not scheduled |
 
-Represent runtime states with native fields:
+Represent runtime state with native fields:
 
 | Derived state | GitHub representation |
 |---|---|
 | Ready | `ready-for-agent`, unassigned, no open blocker |
-| Active | `ready-for-agent` plus assignee |
+| Active | `ready-for-agent` plus assignee and one execution owner |
 | Blocked | Open native dependency, or `needs-info` |
 | Human gate | `ready-for-human` |
 | Review/integration | Linked open PR |
 | Complete | Closed Issue after intended merge and verification |
 
-Do not invent `active`, `review`, `merge-queued`, `blocked`, discussion, or
-model labels by default.
-
 ## Dependencies and frontier
 
-Use native blocked-by edges for hard dependencies and native sub-issues for
-real decomposition. A fully specified Issue may remain `ready-for-agent` while
-a blocker is open; the frontier excludes it until every blocker closes.
-
-When native dependencies are unavailable, put
-`Blocked by: #<n>, #<n>` near the top of the body. Keep tracking Issues open
-until required children and decision gates are complete.
+Use native blocked-by edges for hard dependencies and sub-issues for real
+decomposition. When native dependencies are unavailable, put
+`Blocked by: #<n>, #<n>` near the top of the body.
 
 A candidate belongs to the ready frontier only when it is open, has exactly
 `ready-for-agent`, is unassigned, has no open blocker, and does not collide with
@@ -45,49 +38,55 @@ active hotset ownership.
 
 ## Role ownership
 
-Issue Intake may create or update a report, select exactly one canonical
-lifecycle label and one existing repository type label, and add an unambiguous
-native dependency. It leaves priority, Milestone, assignee, capacity, and merge
-order unchanged.
+Issue Intake may create/update a report, choose one canonical lifecycle label
+and one repository type label, and add an unambiguous dependency. It leaves
+priority, Milestone, assignee, capacity, and merge order unchanged.
 
-The Orchestrator may reconcile Issue contracts, priority, labels, dependencies,
-claims, dispatch comments, and integration order within an authorized campaign.
-It verifies delivery before closing or releasing ownership.
+The Orchestrator reconciles contracts, priority, labels, dependencies, claims,
+lane selection, publication, review, integration, and cleanup within an
+authorized campaign. Inline and Subagent lanes remain owned visibly by the
+Orchestrator; a Subagent does not create a second lifecycle.
 
-The Worker owns only its assigned branch, PR, implementation, and evidence. It
-does not claim another Issue, change lifecycle state or priority, alter a
-Milestone, merge, or close without explicit authorization.
+A Visible Worker owns only its assigned execution, branch, PR, and evidence. It
+does not claim another Issue, merge, close, reprioritize, or broaden scope.
 
-## Claim, branch, PR, and completion
+## Claim, lane, branch, and PR
 
-Keep a candidate unassigned while task materialization and permission/repository
-preflight run. The first lifecycle write after successful activation
-revalidation is the assignee claim. Post one concise dispatch comment only
-after the claim readback succeeds, with execution-contract version,
-verification class/commands, manual evidence, architecture decision, review
-owner, profile/model, base SHA, branch, hotset, blockers, and PR target. Keep
-private task IDs and local paths out of GitHub.
+Keep a candidate unassigned while lane eligibility, exact-base worktree,
+permissions, model request, and single-editor ownership are validated. Then add
+the intended assignee and read it back before edits.
 
-One claimed Issue maps to one visible Worker task and isolated worktree. The
-Worker commits and pushes its assigned branch and opens or updates a PR against
-the documented integration branch. Use `Closes #<n>` only when the PR satisfies
-the entire Issue; use `Refs #<n>` for partial delivery.
+One claimed Issue maps to one lane and one isolated worktree:
 
-Merge only within explicit authority and serialized hotset order. Close an
-Issue after the fixing commit reaches its intended branch and acceptance
-criteria are verified. When work is abandoned or handed back, preserve useful
-evidence before releasing the claim.
+- Inline: the Orchestrator edits directly.
+- Subagent: the Orchestrator dispatches one bounded write set and integrates it.
+- Visible Worker: one materialized Task receives `START` after claim and
+  preflight.
 
-## Decision gates and invalid states
+Public comments contain only sanitized execution contract and evidence; keep
+Task IDs, Subagent IDs, owner tokens, local paths, and private receipts out of
+GitHub. Open/update one PR against the documented integration branch. Use
+`Closes #<n>` only for the full Issue and `Refs #<n>` for partial delivery.
 
-For a persistent decision, use `needs-info` when policy/evidence/choice is
-missing or `ready-for-human` for a maintainer-only action. Restore the canonical
-status only after the decision is recorded and the contract is updated.
+## Completion and cleanup
 
-Stop dispatch and report:
+Merge only within explicit authority and serialized hotset order. Close after
+the fixing commit reaches its intended branch and acceptance passes. On merge
+or stop, preserve useful evidence, release the claim as appropriate, and
+trigger safe cleanup within five minutes. Delete only merged local branches;
+remove only clean durable inactive worktrees; and report the exact corresponding
+Visible Worker for human-owned archive. Never invoke native Task archive
+automatically or edit Codex SQLite. The five-minute deadline covers eligible
+repository cleanup and surfacing the archive request, not the human action.
 
-- multiple canonical labels on one open Issue;
-- `ready-for-agent` combined with `needs-info`, `ready-for-human`, or `wontfix`;
-- duplicate visible owners for one Issue or worktree;
+## Invalid states
+
+Stop and report:
+
+- multiple canonical lifecycle labels;
+- ready combined with needs-info, ready-for-human, or wontfix;
+- two editors for one Issue/worktree;
+- more than one visible Orchestrator for one repository/activity;
+- more than three visible Workers globally;
 - a closed Issue presented as ready work; or
-- a Worker branch or PR whose target differs from its dispatch contract.
+- a branch/PR target that differs from its execution contract.

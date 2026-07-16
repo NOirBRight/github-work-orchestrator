@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed host-wide singleflight for sidebar Task creation."""
+"""Minimal fail-closed singleflight for sidebar-visible Task creation."""
 
 from __future__ import annotations
 
@@ -17,12 +17,13 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 1
-DEFAULT_TTL_SECONDS = 15 * 60
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
+DEFAULT_TTL_SECONDS = 5 * 60
 ACTIVE_FILE = "active-task-creation.json"
 LOCK_FILE = "task-creation.lock"
-
-STATES = {
+STATES = {"creating", "uncertain"}
+LEGACY_STATES = {
     "reserved",
     "invoking",
     "queued",
@@ -35,30 +36,10 @@ STATES = {
     "failed",
     "cancelled",
 }
-TERMINAL_STATES = {"activated", "failed", "cancelled"}
-TRANSITIONS = {
-    "reserved": {"invoking", "failed", "cancelled"},
-    "invoking": {"queued", "creation-unknown", "failed", "cancelled"},
-    "queued": {
-        "worktree-creating",
-        "task-materialized",
-        "creation-unknown",
-        "failed",
-        "cancelled",
-    },
-    "worktree-creating": {
-        "task-materialized",
-        "creation-unknown",
-        "failed",
-        "cancelled",
-    },
-    "task-materialized": {"bootstrap-ready", "failed", "cancelled"},
-    "bootstrap-ready": {"preflight-ready", "failed", "cancelled"},
-    "preflight-ready": {"activated", "failed", "cancelled"},
-    "activated": set(),
-    "creation-unknown": set(),
-    "failed": set(),
-    "cancelled": set(),
+OUTCOMES = {
+    "task-materialized",
+    "terminal-no-task",
+    "cancelled-before-invoke",
 }
 
 
@@ -74,6 +55,12 @@ def _token_digest(token: str) -> str:
     if not token or not token.strip():
         raise LeaseError("OWNER_TOKEN_REQUIRED", "owner token must be non-empty")
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _identity_digest(value: str) -> str:
+    if not value or not value.strip():
+        raise LeaseError("IDENTITY_REQUIRED", "identity must be non-empty")
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _normalize_repository(repository: str) -> str:
@@ -132,7 +119,7 @@ def _default_state_dir() -> Path:
 
 
 class LeaseStore:
-    """One active Task-creation lease for the whole local Codex host."""
+    """One visible-Task creation admission record for the local OS user."""
 
     def __init__(self, state_dir: Path | str | None = None):
         self.state_dir = Path(state_dir) if state_dir else _default_state_dir()
@@ -148,21 +135,26 @@ class LeaseStore:
             if handle.tell() == 0:
                 handle.write(b"\0")
                 handle.flush()
-            handle.seek(0)
-            try:
-                if os.name == "nt":
-                    import msvcrt
+            deadline = time.monotonic() + 2.0
+            while True:
+                handle.seek(0)
+                try:
+                    if os.name == "nt":
+                        import msvcrt
 
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
 
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as error:
-                raise LeaseError(
-                    "HOST_SINGLEFLIGHT_BUSY",
-                    "another process is updating the host Task-creation lease",
-                ) from error
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as error:
+                    if time.monotonic() >= deadline:
+                        raise LeaseError(
+                            "HOST_SINGLEFLIGHT_BUSY",
+                            "another process is updating the Task-creation guard",
+                        ) from error
+                    time.sleep(0.01)
             try:
                 yield
             finally:
@@ -186,17 +178,19 @@ class LeaseStore:
         except (OSError, json.JSONDecodeError) as error:
             raise LeaseError(
                 "LEASE_STATE_UNREADABLE",
-                "the host Task-creation lease is unreadable; reconcile manually",
+                "the Task-creation guard is unreadable; reconcile without rewriting it",
             ) from error
-        if record.get("schema_version") != SCHEMA_VERSION:
+        schema = record.get("schema_version")
+        if schema not in {SCHEMA_VERSION, LEGACY_SCHEMA_VERSION}:
             raise LeaseError(
                 "LEASE_STATE_UNSUPPORTED",
-                "the host Task-creation lease schema is unsupported",
+                "the Task-creation guard schema is unsupported",
             )
-        if record.get("state") not in STATES:
+        valid_states = STATES if schema == SCHEMA_VERSION else LEGACY_STATES
+        if record.get("state") not in valid_states:
             raise LeaseError(
                 "LEASE_STATE_UNREADABLE",
-                "the host Task-creation lease has an invalid state",
+                "the Task-creation guard has an invalid state",
             )
         required = {
             "lease_id",
@@ -211,40 +205,33 @@ class LeaseStore:
             "expires_at",
             "ttl_seconds",
         }
-        if not required.issubset(record) or any(
-            not isinstance(record[key], str)
-            or not record[key]
-            for key in (
-                "lease_id",
-                "idempotency_key",
-                "repository",
-                "issue",
-                "branch",
-                "owner_token_sha256",
+        if not required.issubset(record):
+            raise LeaseError(
+                "LEASE_STATE_UNREADABLE",
+                "the Task-creation guard is missing required identity fields",
             )
+        for key in (
+            "lease_id",
+            "idempotency_key",
+            "repository",
+            "issue",
+            "branch",
+            "owner_token_sha256",
         ):
-            raise LeaseError(
-                "LEASE_STATE_UNREADABLE",
-                "the host Task-creation lease is missing required identity fields",
-            )
+            if not isinstance(record[key], str) or not record[key]:
+                raise LeaseError(
+                    "LEASE_STATE_UNREADABLE",
+                    "the Task-creation guard has an invalid identity field",
+                )
         if not isinstance(record["revision"], int) or record["revision"] < 1:
-            raise LeaseError(
-                "LEASE_STATE_UNREADABLE",
-                "the host Task-creation lease has an invalid revision",
-            )
+            raise LeaseError("LEASE_STATE_UNREADABLE", "invalid guard revision")
         if not isinstance(record["ttl_seconds"], int) or record["ttl_seconds"] <= 0:
-            raise LeaseError(
-                "LEASE_STATE_UNREADABLE",
-                "the host Task-creation lease has an invalid ttl",
-            )
+            raise LeaseError("LEASE_STATE_UNREADABLE", "invalid guard ttl")
         try:
             for key in ("created_at", "updated_at", "expires_at"):
                 float(record[key])
         except (TypeError, ValueError) as error:
-            raise LeaseError(
-                "LEASE_STATE_UNREADABLE",
-                "the host Task-creation lease has invalid timestamps",
-            ) from error
+            raise LeaseError("LEASE_STATE_UNREADABLE", "invalid guard timestamp") from error
         return record
 
     def _write(self, record: dict) -> None:
@@ -273,14 +260,18 @@ class LeaseStore:
         idempotent: bool = False,
         creation_authorized: bool = False,
     ) -> dict:
-        return {
+        result = {
             key: value
             for key, value in record.items()
             if key != "owner_token_sha256"
-        } | {
-            "idempotent": idempotent,
-            "creation_authorized": creation_authorized,
         }
+        result.update(
+            idempotent=idempotent,
+            creation_authorized=creation_authorized,
+        )
+        if record.get("schema_version") == LEGACY_SCHEMA_VERSION:
+            result["legacy"] = True
+        return result
 
     @staticmethod
     def _require_owner(record: dict, owner_token: str) -> None:
@@ -288,17 +279,78 @@ class LeaseStore:
             record["owner_token_sha256"], _token_digest(owner_token)
         ):
             raise LeaseError(
-                "OWNER_MISMATCH", "owner token does not own the active lease"
+                "OWNER_MISMATCH", "owner token does not own the active guard"
             )
 
     @staticmethod
-    def _require_unexpired(record: dict, current_time: float) -> None:
-        if current_time >= float(record["expires_at"]):
+    def _request_digest(record: dict, request_id: str | None) -> str | None:
+        supplied = _identity_digest(request_id) if request_id else None
+        stored = record.get("request_id_sha256")
+        if stored is not None and supplied is None:
             raise LeaseError(
-                "EXPIRED_CREATION_REQUIRES_RECONCILIATION",
-                "the active lease expired; restart and reconcile the exact "
-                "request, Task, and worktree before any mutation",
+                "REQUEST_ID_REQUIRED",
+                "the exact original native request identity is required",
             )
+        if stored is None and supplied is not None:
+            raise LeaseError(
+                "REQUEST_ID_MISMATCH",
+                "the active creation has no request receipt to match",
+            )
+        if stored is not None and not secrets.compare_digest(stored, supplied):
+            raise LeaseError(
+                "REQUEST_ID_MISMATCH",
+                "request identity does not match the active creation",
+            )
+        return supplied
+
+    @staticmethod
+    def _validate_disposition(
+        record: dict,
+        *,
+        outcome: str,
+        task_id: str | None,
+        worktree_state: str,
+        evidence: str,
+    ) -> dict:
+        if outcome not in OUTCOMES:
+            raise LeaseError("INVALID_OUTCOME", f"unsupported outcome: {outcome}")
+        if not evidence or not evidence.strip():
+            raise LeaseError(
+                "RECONCILIATION_EVIDENCE_REQUIRED",
+                "a private exact Task/worktree evidence reference is required",
+            )
+        if outcome == "task-materialized":
+            if not task_id or worktree_state != "owned":
+                raise LeaseError(
+                    "RECONCILIATION_EVIDENCE_REQUIRED",
+                    "materialization requires one exact Task and its owned worktree",
+                )
+        elif outcome == "terminal-no-task":
+            if task_id or worktree_state not in {"absent", "clean-orphan"}:
+                raise LeaseError(
+                    "RECONCILIATION_EVIDENCE_REQUIRED",
+                    "terminal no-Task evidence requires no Task and a safe worktree",
+                )
+        else:
+            if (
+                record.get("schema_version") != SCHEMA_VERSION
+                or record.get("state") != "creating"
+                or record.get("request_id_sha256") is not None
+                or task_id
+                or worktree_state not in {"absent", "clean-orphan"}
+            ):
+                raise LeaseError(
+                    "RECONCILIATION_EVIDENCE_REQUIRED",
+                    "pre-invocation cancellation requires no request, Task, or WIP",
+                )
+        result = {
+            "outcome": outcome,
+            "worktree_state": worktree_state,
+            "evidence_sha256": hashlib.sha256(evidence.encode("utf-8")).hexdigest(),
+        }
+        if task_id:
+            result["task_id_sha256"] = _identity_digest(task_id)
+        return result
 
     def reserve(
         self,
@@ -318,35 +370,40 @@ class LeaseStore:
         with self._locked():
             active = self._read()
             if active is not None:
-                if (
-                    active["state"] in TERMINAL_STATES
-                    and current_time >= float(active["expires_at"])
-                ):
-                    raise LeaseError(
-                        "TERMINAL_LEASE_REQUIRES_OWNER_RELEASE",
-                        "the expired terminal lease is immutable and must be "
-                        "released by its original owner",
-                    )
-                self._require_unexpired(active, current_time)
-                if (
+                same_owner_and_key = (
                     active["idempotency_key"] == key
                     and secrets.compare_digest(
                         active["owner_token_sha256"], owner_digest
                     )
+                )
+                expired = current_time >= float(active["expires_at"])
+                if (
+                    active.get("schema_version") == SCHEMA_VERSION
+                    and active["state"] == "creating"
+                    and not expired
+                    and same_owner_and_key
                 ):
                     return self._public(active, idempotent=True)
+                if (
+                    active.get("schema_version") == LEGACY_SCHEMA_VERSION
+                    or active["state"] == "uncertain"
+                    or expired
+                ):
+                    raise LeaseError(
+                        "RECONCILIATION_REQUIRED",
+                        "the prior visible-Task creation must be reconciled; other lanes remain available",
+                    )
                 raise LeaseError(
                     "ACTIVE_CREATION_EXISTS",
-                    "another Task creation owns the host-wide singleflight lease",
+                    "another visible-Task creation owns the host singleflight",
                 )
-
             record = {
                 "schema_version": SCHEMA_VERSION,
                 "lease_id": uuid.uuid4().hex,
                 "idempotency_key": key,
                 **identity,
                 "owner_token_sha256": owner_digest,
-                "state": "reserved",
+                "state": "creating",
                 "revision": 1,
                 "created_at": current_time,
                 "updated_at": current_time,
@@ -361,88 +418,67 @@ class LeaseStore:
             record = self._read()
             return None if record is None else self._public(record)
 
-    def transition(
+    def record_request(
+        self, owner_token: str, request_id: str, *, now: float | None = None
+    ) -> dict:
+        current_time = time.time() if now is None else float(now)
+        request_digest = _identity_digest(request_id)
+        with self._locked():
+            record = self._read()
+            if record is None:
+                raise LeaseError("NO_ACTIVE_LEASE", "no Task-creation guard exists")
+            self._require_owner(record, owner_token)
+            if record.get("schema_version") != SCHEMA_VERSION:
+                raise LeaseError("RECONCILIATION_REQUIRED", "legacy guard must be reconciled")
+            if record["state"] != "creating":
+                raise LeaseError("RECONCILIATION_REQUIRED", "uncertain creation must be reconciled")
+            existing = record.get("request_id_sha256")
+            if existing and not secrets.compare_digest(existing, request_digest):
+                raise LeaseError("REQUEST_ID_MISMATCH", "request identity changed")
+            if existing:
+                return self._public(record, idempotent=True)
+            record["request_id_sha256"] = request_digest
+            record["revision"] += 1
+            record["updated_at"] = current_time
+            self._write(record)
+            return self._public(record)
+
+    def mark_uncertain(
         self,
         owner_token: str,
-        new_state: str,
         *,
-        expected_state: str | None = None,
         request_id: str | None = None,
-        recovery_path: bool = False,
         now: float | None = None,
     ) -> dict:
-        if new_state not in STATES:
-            raise LeaseError("INVALID_STATE", f"unknown state: {new_state}")
         current_time = time.time() if now is None else float(now)
         with self._locked():
             record = self._read()
             if record is None:
-                raise LeaseError("NO_ACTIVE_LEASE", "no Task-creation lease exists")
+                raise LeaseError("NO_ACTIVE_LEASE", "no Task-creation guard exists")
             self._require_owner(record, owner_token)
-            self._require_unexpired(record, current_time)
-            current_state = record["state"]
-            request_digest = None
+            if record.get("schema_version") != SCHEMA_VERSION:
+                raise LeaseError("RECONCILIATION_REQUIRED", "legacy guard must be reconciled")
             if request_id:
-                request_digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
-            if new_state == "queued" and request_digest is None:
-                raise LeaseError(
-                    "REQUEST_ID_REQUIRED",
-                    "queued state requires the exact native client request identity",
-                )
-            existing_request_digest = record.get("request_id_sha256")
-            if (
-                request_digest is not None
-                and existing_request_digest is not None
-                and not secrets.compare_digest(
-                    existing_request_digest, request_digest
-                )
-            ):
-                raise LeaseError(
-                    "REQUEST_ID_MISMATCH",
-                    "request identity does not match the active creation",
-                )
-            if expected_state is not None and current_state != expected_state:
-                raise LeaseError(
-                    "STATE_MISMATCH",
-                    f"expected {expected_state}, found {current_state}",
-                )
-            if current_state == new_state:
-                return self._public(record, idempotent=True)
-            recovery_transition = (
-                current_state == "task-materialized"
-                and new_state == "preflight-ready"
-            )
-            if recovery_path and not recovery_transition:
-                raise LeaseError(
-                    "INVALID_RECOVERY_TRANSITION",
-                    "recovery_path is limited to task-materialized -> preflight-ready",
-                )
-            if new_state not in TRANSITIONS[current_state] and not (
-                recovery_transition and recovery_path
-            ):
-                raise LeaseError(
-                    "INVALID_TRANSITION",
-                    f"cannot transition from {current_state} to {new_state}",
-                )
-            record["state"] = new_state
-            record["updated_at"] = current_time
-            record["expires_at"] = current_time + record["ttl_seconds"]
-            record["revision"] += 1
-            if new_state == "queued":
+                request_digest = _identity_digest(request_id)
+                existing = record.get("request_id_sha256")
+                if existing and not secrets.compare_digest(existing, request_digest):
+                    raise LeaseError("REQUEST_ID_MISMATCH", "request identity changed")
                 record["request_id_sha256"] = request_digest
-            if recovery_transition:
-                record["recovery_path"] = True
+            if record["state"] == "uncertain":
+                return self._public(record, idempotent=True)
+            record["state"] = "uncertain"
+            record["revision"] += 1
+            record["updated_at"] = current_time
             self._write(record)
             return self._public(record)
 
-    def reconcile(
+    def release(
         self,
-        owner_token: str,
+        owner_token: str | None,
         *,
-        host_restarted: bool,
-        request_id: str | None,
-        request_state: str,
-        task_state: str,
+        request_id: str | None = None,
+        outcome: str,
+        task_id: str | None,
         worktree_state: str,
         evidence: str,
         now: float | None = None,
@@ -451,145 +487,131 @@ class LeaseStore:
         with self._locked():
             record = self._read()
             if record is None:
-                raise LeaseError("NO_ACTIVE_LEASE", "no Task-creation lease exists")
-            self._require_owner(record, owner_token)
-            if record["state"] in TERMINAL_STATES:
-                raise LeaseError(
-                    "RECONCILIATION_NOT_REQUIRED",
-                    "terminal leases are immutable and may only be released by their owner",
-                )
-            expired = current_time >= float(record["expires_at"])
-            if record["state"] not in {"invoking", "creation-unknown"} and not expired:
-                raise LeaseError(
-                    "RECONCILIATION_NOT_REQUIRED",
-                    "only invoking, creation-unknown, or expired leases may be reconciled",
-                )
-            if not host_restarted or not evidence.strip():
-                raise LeaseError(
-                    "RECONCILIATION_EVIDENCE_REQUIRED",
-                    "restart confirmation and a private evidence reference are required",
-                )
-            stored_request_digest = record.get("request_id_sha256")
-            if stored_request_digest is not None:
+                raise LeaseError("NO_ACTIVE_LEASE", "no Task-creation guard exists")
+            request_authenticated = False
+            if owner_token:
+                self._require_owner(record, owner_token)
+                if request_id is not None:
+                    self._request_digest(record, request_id)
+                if (
+                    record.get("schema_version") != SCHEMA_VERSION
+                    or record["state"] == "uncertain"
+                    or current_time >= float(record["expires_at"])
+                ):
+                    raise LeaseError(
+                        "RECONCILIATION_REQUIRED",
+                        "uncertain, expired, or legacy creation requires one post-restart reconciliation",
+                    )
+            else:
+                if outcome != "task-materialized":
+                    raise LeaseError(
+                        "OWNER_TOKEN_REQUIRED",
+                        "only an exact recorded native request can release a materialized Task without the owner token",
+                    )
+                if record.get("schema_version") != SCHEMA_VERSION:
+                    raise LeaseError(
+                        "OWNER_TOKEN_REQUIRED",
+                        "legacy creation recovery still requires the original owner token",
+                    )
                 if not request_id:
                     raise LeaseError(
                         "REQUEST_ID_REQUIRED",
-                        "reconciliation requires the exact original request identity",
+                        "the exact original native request identity is required",
                     )
-                request_digest = hashlib.sha256(
-                    request_id.encode("utf-8")
-                ).hexdigest()
-                if not secrets.compare_digest(stored_request_digest, request_digest):
-                    raise LeaseError(
-                        "REQUEST_ID_MISMATCH",
-                        "reconciliation request does not match the active creation",
-                    )
-            elif request_id:
-                raise LeaseError(
-                    "REQUEST_ID_MISMATCH",
-                    "the active creation has no native request receipt to match",
-                )
+                self._request_digest(record, request_id)
+                request_authenticated = True
+            disposition = self._validate_disposition(
+                record,
+                outcome=outcome,
+                task_id=task_id,
+                worktree_state=worktree_state,
+                evidence=evidence,
+            )
+            result = self._public(record) | disposition | {"released_at": current_time}
+            if request_authenticated:
+                result["request_authenticated"] = True
+            self.active_path.unlink()
+            return result
 
-            terminal_request_states = {"cancelled", "failed", "terminal-no-task"}
-            if request_state == "no-receipt-terminal" and stored_request_digest is None:
-                if task_state != "absent" or worktree_state not in {
-                    "absent",
-                    "clean-orphan",
-                }:
-                    raise LeaseError(
-                        "RECONCILIATION_EVIDENCE_REQUIRED",
-                        "no-receipt terminal recovery requires no Task and an "
-                        "absent or clean orphan worktree",
-                    )
-                reconciled_state = "failed"
-            elif (
-                request_state == "no-receipt-materialized"
-                and stored_request_digest is None
-            ):
-                if record["state"] not in {"invoking", "creation-unknown"}:
-                    raise LeaseError(
-                        "RECONCILIATION_EVIDENCE_REQUIRED",
-                        "no-receipt Task adoption requires a prior admitted "
-                        "native invocation",
-                    )
-                if task_state != "materialized" or worktree_state != "owned":
-                    raise LeaseError(
-                        "RECONCILIATION_EVIDENCE_REQUIRED",
-                        "no-receipt recovery requires one exact real Task and owned worktree",
-                    )
-                reconciled_state = "task-materialized"
-            elif request_state in terminal_request_states and stored_request_digest:
-                if task_state != "absent" or worktree_state not in {
-                    "absent",
-                    "clean-orphan",
-                }:
-                    raise LeaseError(
-                        "RECONCILIATION_EVIDENCE_REQUIRED",
-                        "terminal recovery requires no real Task and an absent "
-                        "or clean orphan worktree",
-                    )
-                reconciled_state = (
-                    "cancelled" if request_state == "cancelled" else "failed"
-                )
-            elif request_state == "materialized" and stored_request_digest:
-                if task_state != "materialized" or worktree_state != "owned":
-                    raise LeaseError(
-                        "RECONCILIATION_EVIDENCE_REQUIRED",
-                        "materialized recovery requires the exact real Task and owned worktree",
-                    )
-                reconciled_state = "task-materialized"
-            else:
-                raise LeaseError(
-                    "RECONCILIATION_EVIDENCE_REQUIRED",
-                    "ambiguous request, Task, or worktree state cannot clear the lease",
-                )
-
-            record["state"] = reconciled_state
-            record["updated_at"] = current_time
-            record["expires_at"] = current_time + record["ttl_seconds"]
-            record["revision"] += 1
-            record["reconciliation"] = {
-                "host_restarted": True,
-                "request_state": request_state,
-                "task_state": task_state,
-                "worktree_state": worktree_state,
-                "evidence_sha256": hashlib.sha256(
-                    evidence.encode("utf-8")
-                ).hexdigest(),
-            }
-            self._write(record)
-            return self._public(record)
-
-    def release(self, owner_token: str, *, now: float | None = None) -> dict:
+    def reconcile(
+        self,
+        owner_token: str,
+        *,
+        host_restarted: bool,
+        request_id: str | None,
+        outcome: str,
+        task_id: str | None,
+        worktree_state: str,
+        evidence: str,
+        now: float | None = None,
+    ) -> dict:
         current_time = time.time() if now is None else float(now)
         with self._locked():
             record = self._read()
             if record is None:
-                raise LeaseError("NO_ACTIVE_LEASE", "no Task-creation lease exists")
+                raise LeaseError("NO_ACTIVE_LEASE", "no Task-creation guard exists")
             self._require_owner(record, owner_token)
-            if record["state"] not in TERMINAL_STATES:
-                self._require_unexpired(record, current_time)
+            expired = current_time >= float(record["expires_at"])
+            if not host_restarted or not evidence or not evidence.strip():
                 raise LeaseError(
-                    "NON_TERMINAL_LEASE",
-                    "release requires activated, failed, or cancelled state",
+                    "RECONCILIATION_EVIDENCE_REQUIRED",
+                    "one host restart and private exact evidence are required",
                 )
-            record["released_at"] = current_time
+            if (
+                record.get("schema_version") == SCHEMA_VERSION
+                and record["state"] != "uncertain"
+                and not expired
+            ):
+                raise LeaseError(
+                    "RECONCILIATION_NOT_REQUIRED",
+                    "a nonexpired creating guard can finish through normal release",
+                )
+            self._request_digest(record, request_id)
+            if outcome == "cancelled-before-invoke":
+                raise LeaseError(
+                    "INVALID_OUTCOME",
+                    "post-restart reconciliation must prove Task materialization or terminal no-Task",
+                )
+            disposition = self._validate_disposition(
+                record,
+                outcome=outcome,
+                task_id=task_id,
+                worktree_state=worktree_state,
+                evidence=evidence,
+            )
+            result = self._public(record) | disposition | {
+                "released_at": current_time,
+                "reconciled_after_restart": True,
+            }
             self.active_path.unlink()
-            return self._public(record)
+            return result
 
 
-def _owner_token(arguments: argparse.Namespace, *, generate: bool = False) -> str:
+def _owner_token(
+    arguments: argparse.Namespace, *, required: bool = True
+) -> str | None:
     token = arguments.owner_token or os.environ.get(
         "GITHUB_WORK_ORCHESTRATOR_CREATION_OWNER_TOKEN"
     )
     if token:
         return token
-    if generate:
-        return secrets.token_urlsafe(24)
+    if not required:
+        return None
     raise LeaseError(
         "OWNER_TOKEN_REQUIRED",
-        "set --owner-token or GITHUB_WORK_ORCHESTRATOR_CREATION_OWNER_TOKEN",
+        "generate and retain an owner token before reserve, then pass --owner-token",
     )
+
+
+def _add_owner(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--owner-token")
+
+
+def _add_disposition(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--outcome", choices=sorted(OUTCOMES), required=True)
+    parser.add_argument("--task-id")
+    parser.add_argument("--worktree-state", required=True)
+    parser.add_argument("--evidence", required=True)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -601,27 +623,27 @@ def _parser() -> argparse.ArgumentParser:
     reserve.add_argument("--repository", required=True)
     reserve.add_argument("--issue", required=True)
     reserve.add_argument("--branch", required=True)
-    reserve.add_argument("--owner-token")
+    _add_owner(reserve)
     reserve.add_argument("--ttl-seconds", type=int, default=DEFAULT_TTL_SECONDS)
 
-    transition = subparsers.add_parser("transition")
-    transition.add_argument("--owner-token")
-    transition.add_argument("--state", choices=sorted(STATES), required=True)
-    transition.add_argument("--expected-state", choices=sorted(STATES))
-    transition.add_argument("--request-id")
-    transition.add_argument("--recovery-path", action="store_true")
+    request = subparsers.add_parser("record-request")
+    _add_owner(request)
+    request.add_argument("--request-id", required=True)
 
-    reconcile = subparsers.add_parser("reconcile")
-    reconcile.add_argument("--owner-token")
-    reconcile.add_argument("--host-restarted", action="store_true")
-    reconcile.add_argument("--request-id")
-    reconcile.add_argument("--request-state", required=True)
-    reconcile.add_argument("--task-state", required=True)
-    reconcile.add_argument("--worktree-state", required=True)
-    reconcile.add_argument("--evidence", required=True)
+    uncertain = subparsers.add_parser("uncertain")
+    _add_owner(uncertain)
+    uncertain.add_argument("--request-id")
 
     release = subparsers.add_parser("release")
-    release.add_argument("--owner-token")
+    _add_owner(release)
+    release.add_argument("--request-id")
+    _add_disposition(release)
+
+    reconcile = subparsers.add_parser("reconcile")
+    _add_owner(reconcile)
+    reconcile.add_argument("--host-restarted", action="store_true")
+    reconcile.add_argument("--request-id")
+    _add_disposition(reconcile)
 
     subparsers.add_parser("inspect")
     return parser
@@ -632,35 +654,40 @@ def main() -> int:
     store = LeaseStore(arguments.state_dir)
     try:
         if arguments.command == "reserve":
-            token = _owner_token(arguments, generate=True)
             result = store.reserve(
                 repository=arguments.repository,
                 issue=arguments.issue,
                 branch=arguments.branch,
-                owner_token=token,
+                owner_token=_owner_token(arguments),
                 ttl_seconds=arguments.ttl_seconds,
             )
-            result["owner_token"] = token
-        elif arguments.command == "transition":
-            result = store.transition(
-                _owner_token(arguments),
-                arguments.state,
-                expected_state=arguments.expected_state,
+        elif arguments.command == "record-request":
+            result = store.record_request(
+                _owner_token(arguments), arguments.request_id
+            )
+        elif arguments.command == "uncertain":
+            result = store.mark_uncertain(
+                _owner_token(arguments), request_id=arguments.request_id
+            )
+        elif arguments.command == "release":
+            result = store.release(
+                _owner_token(arguments, required=False),
                 request_id=arguments.request_id,
-                recovery_path=arguments.recovery_path,
+                outcome=arguments.outcome,
+                task_id=arguments.task_id,
+                worktree_state=arguments.worktree_state,
+                evidence=arguments.evidence,
             )
         elif arguments.command == "reconcile":
             result = store.reconcile(
                 _owner_token(arguments),
                 host_restarted=arguments.host_restarted,
                 request_id=arguments.request_id,
-                request_state=arguments.request_state,
-                task_state=arguments.task_state,
+                outcome=arguments.outcome,
+                task_id=arguments.task_id,
                 worktree_state=arguments.worktree_state,
                 evidence=arguments.evidence,
             )
-        elif arguments.command == "release":
-            result = store.release(_owner_token(arguments))
         else:
             result = store.inspect()
         print(json.dumps({"ok": True, "lease": result}, sort_keys=True))

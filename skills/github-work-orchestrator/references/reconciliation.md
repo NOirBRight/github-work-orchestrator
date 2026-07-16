@@ -34,7 +34,7 @@ Apply only unambiguous, idempotent corrections:
 | Open Issue has no lifecycle label | Classify from its contract; use `needs-triage` if ambiguous |
 | Open Issue has conflicting lifecycle labels | Keep the semantic one; use `needs-triage` if ambiguous |
 | Issue lacks an unambiguous existing type label | Add the existing repository type |
-| Orchestrator-owned claim has no live task or PR | Preserve evidence, then release the claim |
+| Orchestrator-owned claim has no live execution lane, editor, or PR | Preserve evidence, then release the claim |
 
 Require a decision before removing a native dependency without an exact desired
 graph, unassigning a human or foreign claim, deleting reporter evidence,
@@ -81,6 +81,8 @@ decisions. If GitHub changes between preview and apply, rebuild the plan.
 ## Completion gate
 
 Rerun the validator and frontier. Reconciliation is complete when there are no
-invalid lifecycle combinations, every intended hard blocker has one native or
-documented edge, incomplete contracts are routed to Intake, and every remaining
-ambiguity is visible in `needs-triage`, `needs-info`, or a discussion gate.
+invalid lifecycle combinations, every active item has one lane/worktree/editor,
+capacity is within the 1/3/4 bounds, every intended hard blocker has one native
+or documented edge, incomplete contracts are routed to Intake, and every
+remaining ambiguity is visible in `needs-triage`, `needs-info`, or a discussion
+gate.

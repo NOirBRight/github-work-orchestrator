@@ -9,7 +9,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -66,7 +65,6 @@ class ReadyFrontierTests(unittest.TestCase):
             {9: "OPEN"},
             {1: 0, 2: 0, 3: None, 4: 0},
         )
-
         self.assertEqual([1], [item["number"] for item in result["ready"]])
         self.assertEqual([2], [item["number"] for item in result["claimed"]])
         self.assertEqual([3], [item["number"] for item in result["blocked"]])
@@ -135,6 +133,16 @@ class TaskCreationLeaseTests(unittest.TestCase):
     def store(self):
         return task_creation_lease.LeaseStore(self.state_dir)
 
+    def reserve(self, *, owner: str = "owner-a", now: float = 0.0):
+        return self.store().reserve(
+            repository="owner/repo",
+            issue=17,
+            branch="codex/issue-17-example",
+            owner_token=owner,
+            ttl_seconds=10,
+            now=now,
+        )
+
     def assert_lease_error(self, code: str, operation) -> None:
         with self.assertRaises(task_creation_lease.LeaseError) as raised:
             operation()
@@ -143,554 +151,243 @@ class TaskCreationLeaseTests(unittest.TestCase):
     def test_host_singleflight_blocks_parallel_cross_project_creation(self) -> None:
         barrier = threading.Barrier(2)
 
-        def reserve(repository: str, issue_number: int, owner: str):
-            barrier.wait()
+        def reserve(repository, issue_number, branch, token):
+            barrier.wait(timeout=5)
             try:
-                lease = self.store().reserve(
+                result = self.store().reserve(
                     repository=repository,
                     issue=issue_number,
-                    branch=f"codex/issue-{issue_number}",
-                    owner_token=owner,
-                    ttl_seconds=30,
+                    branch=branch,
+                    owner_token=token,
+                    now=100.0,
                 )
-                return ("reserved", lease["idempotency_key"])
+                return ("ok", result)
             except task_creation_lease.LeaseError as error:
-                return (error.code, None)
+                return ("error", error.code)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             results = list(
                 executor.map(
-                    lambda arguments: reserve(*arguments),
-                    (
-                        ("NOirBRight/CodexHub", 140, "owner-codexhub"),
-                        ("NOirBRight/AYASpace2", 9, "owner-ayaspace"),
-                    ),
+                    lambda args: reserve(*args),
+                    [
+                        ("owner/one", 1, "codex/issue-1-one", "token-one"),
+                        ("owner/two", 2, "codex/issue-2-two", "token-two"),
+                    ],
                 )
             )
-
-        self.assertEqual(1, sum(result[0] == "reserved" for result in results))
+        self.assertEqual(1, sum(status == "ok" for status, _ in results))
         self.assertEqual(
-            1,
-            sum(
-                result[0]
-                in {"ACTIVE_CREATION_EXISTS", "HOST_SINGLEFLIGHT_BUSY"}
-                for result in results
-            ),
+            ["ACTIVE_CREATION_EXISTS"],
+            [value for status, value in results if status == "error"],
         )
 
-    def test_two_processes_receive_one_creation_authorization(self) -> None:
-        script = SCRIPT_DIR / "task_creation_lease.py"
-        gate = self.state_dir / "start-gate"
-        ready = (self.state_dir / "ready-one", self.state_dir / "ready-two")
-        barrier_wrapper = """
-import os
-import subprocess
-import sys
-import time
-
-ready_path, gate_path, *command = sys.argv[1:]
-open(ready_path, "x", encoding="utf-8").close()
-deadline = time.monotonic() + 10
-while not os.path.exists(gate_path):
-    if time.monotonic() >= deadline:
-        raise SystemExit(124)
-    time.sleep(0.005)
-completed = subprocess.run(command, capture_output=True, text=True)
-sys.stdout.write(completed.stdout)
-sys.stderr.write(completed.stderr)
-raise SystemExit(completed.returncode)
-"""
-
-        def command(repository: str, issue_number: int, owner: str) -> list[str]:
-            return [
-                sys.executable,
-                str(script),
-                "--state-dir",
-                str(self.state_dir),
-                "reserve",
-                "--repository",
-                repository,
-                "--issue",
-                str(issue_number),
-                "--branch",
-                f"codex/issue-{issue_number}",
-                "--owner-token",
-                owner,
-            ]
-
-        first = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                barrier_wrapper,
-                str(ready[0]),
-                str(gate),
-                *command("NOirBRight/CodexHub", 140, "owner-codexhub"),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=os.environ | {"CODEX_HOME": "C:/isolated-a"},
-        )
-        second = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                barrier_wrapper,
-                str(ready[1]),
-                str(gate),
-                *command("NOirBRight/AYASpace2", 9, "owner-ayaspace"),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=os.environ | {"CODEX_HOME": "C:/isolated-b"},
-        )
-        processes = (first, second)
-        deadline = time.monotonic() + 10
-        while not all(path.is_file() for path in ready):
-            if time.monotonic() >= deadline:
-                for process in processes:
-                    process.kill()
-                self.fail("subprocess creation race did not reach the start barrier")
-            time.sleep(0.005)
-        gate.touch()
-        outputs = [process.communicate(timeout=10) for process in processes]
-
-        self.assertEqual([0, 2], sorted(process.returncode for process in processes))
-        authorized = [
-            json.loads(stdout)["lease"]
-            for process, (stdout, _stderr) in zip(processes, outputs)
-            if process.returncode == 0
-        ]
-        refused = [
-            json.loads(stderr)
-            for process, (_stdout, stderr) in zip(processes, outputs)
-            if process.returncode == 2
-        ]
-        self.assertEqual([True], [lease["creation_authorized"] for lease in authorized])
-        self.assertIn(
-            refused[0]["error"],
-            {"ACTIVE_CREATION_EXISTS", "HOST_SINGLEFLIGHT_BUSY"},
-        )
-
-    def test_default_lease_location_is_shared_across_codex_homes(self) -> None:
-        local_state = self.state_dir / "host-local-state"
-        state_environment = {}
-        if os.name == "nt":
-            state_environment["LOCALAPPDATA"] = str(local_state)
-        elif sys.platform != "darwin":
-            state_environment["XDG_STATE_HOME"] = str(local_state)
-        with mock.patch.dict(
-            os.environ,
-            state_environment | {"CODEX_HOME": "C:/isolated-a"},
-            clear=False,
+    def test_new_record_uses_only_minimal_creation_states(self) -> None:
+        lease = self.reserve()
+        self.assertEqual(2, lease["schema_version"])
+        self.assertEqual("creating", lease["state"])
+        self.assertTrue(lease["creation_authorized"])
+        for forbidden in (
+            "bootstrap-ready",
+            "preflight-ready",
+            "activated",
+            "worktree-creating",
         ):
-            first = task_creation_lease._default_state_dir()
-        with mock.patch.dict(
-            os.environ,
-            state_environment | {"CODEX_HOME": "C:/isolated-b"},
-            clear=False,
-        ):
-            second = task_creation_lease._default_state_dir()
-        self.assertEqual(first, second)
-        if state_environment:
-            self.assertTrue(first.is_relative_to(local_state))
+            self.assertNotIn(forbidden, json.dumps(lease))
 
-    def test_same_owner_and_idempotency_key_reuses_one_lease(self) -> None:
-        first = self.store().reserve(
-            repository="NOirBRight/CodexHub",
-            issue=140,
-            branch="codex/issue-140-native-responses-tools",
-            owner_token="owner-one",
-        )
-        second = self.store().reserve(
-            repository="noirbright/codexhub",
-            issue="140",
-            branch="codex/issue-140-native-responses-tools",
-            owner_token="owner-one",
-        )
+    def test_same_owner_and_key_is_idempotent_without_second_authorization(self) -> None:
+        first = self.reserve()
+        second = self.reserve(now=1.0)
         self.assertEqual(first["lease_id"], second["lease_id"])
         self.assertTrue(first["creation_authorized"])
         self.assertFalse(second["creation_authorized"])
         self.assertTrue(second["idempotent"])
 
-        self.assert_lease_error(
-            "ACTIVE_CREATION_EXISTS",
-            lambda: self.store().reserve(
-                repository="NOirBRight/CodexHub",
-                issue=140,
-                branch="codex/issue-140-native-responses-tools",
-                owner_token="owner-two",
-            ),
-        )
-
-    def test_creation_unknown_and_expiry_never_allow_automatic_steal(self) -> None:
+    def test_real_task_identity_releases_creation_guard_immediately(self) -> None:
         store = self.store()
-        store.reserve(
-            repository="NOirBRight/CodexHub",
-            issue=140,
-            branch="codex/issue-140-native-responses-tools",
-            owner_token="owner-one",
-            ttl_seconds=5,
-            now=100,
+        self.reserve()
+        store.record_request("owner-a", "client-17", now=1.0)
+        released = store.release(
+            "owner-a",
+            outcome="task-materialized",
+            task_id="019f0000-0000-7000-8000-000000000017",
+            worktree_state="owned",
+            evidence="exact-task-and-worktree-readback",
+            now=2.0,
         )
-        store.transition("owner-one", "invoking", now=100.5)
-        store.transition(
-            "owner-one", "queued", request_id="queued-request-one", now=101
-        )
-        store.transition("owner-one", "creation-unknown", now=102)
-
-        self.assert_lease_error(
-            "EXPIRED_CREATION_REQUIRES_RECONCILIATION",
-            lambda: store.reserve(
-                repository="NOirBRight/AYASpace2",
-                issue=9,
-                branch="codex/issue-9",
-                owner_token="owner-two",
-                now=1000,
-            ),
-        )
-        self.assert_lease_error(
-            "EXPIRED_CREATION_REQUIRES_RECONCILIATION",
-            lambda: store.release("owner-one", now=1000),
-        )
-
-    def test_expired_owner_cannot_mutate_or_release_without_reconciliation(self) -> None:
-        store = self.store()
-        store.reserve(
-            repository="NOirBRight/CodexHub",
-            issue=140,
-            branch="codex/issue-140-native-responses-tools",
-            owner_token="owner-one",
-            ttl_seconds=5,
-            now=100,
-        )
-        store.transition("owner-one", "invoking", now=100.5)
-        store.transition(
-            "owner-one", "queued", request_id="queued-request-one", now=101
-        )
-        self.assert_lease_error(
-            "EXPIRED_CREATION_REQUIRES_RECONCILIATION",
-            lambda: store.transition("owner-one", "failed", now=106),
-        )
-        self.assert_lease_error(
-            "EXPIRED_CREATION_REQUIRES_RECONCILIATION",
-            lambda: store.release("owner-one", now=106),
-        )
-        reconciled = store.reconcile(
-            "owner-one",
-            host_restarted=True,
-            request_id="queued-request-one",
-            request_state="cancelled",
-            task_state="absent",
-            worktree_state="absent",
-            evidence="readback-after-restart",
-            now=107,
-        )
-        self.assertEqual("cancelled", reconciled["state"])
-        store.release("owner-one", now=107)
-
-    def test_expired_terminal_lease_can_only_be_released_by_its_owner(self) -> None:
-        store = self.store()
-        store.reserve(
-            repository="NOirBRight/CodexHub",
-            issue=140,
-            branch="codex/issue-140-native-responses-tools",
-            owner_token="owner-one",
-            ttl_seconds=5,
-            now=100,
-        )
-        store.transition("owner-one", "failed", now=101)
-        self.assert_lease_error(
-            "RECONCILIATION_NOT_REQUIRED",
-            lambda: store.reconcile(
-                "owner-one",
-                host_restarted=True,
-                request_id=None,
-                request_state="no-receipt-terminal",
-                task_state="absent",
-                worktree_state="absent",
-                evidence="terminal-record",
-                now=1000,
-            ),
-        )
-        self.assert_lease_error(
-            "TERMINAL_LEASE_REQUIRES_OWNER_RELEASE",
-            lambda: store.reserve(
-                repository="NOirBRight/AYASpace2",
-                issue=9,
-                branch="codex/issue-9",
-                owner_token="owner-two",
-                now=1000,
-            ),
-        )
-        self.assert_lease_error(
-            "OWNER_MISMATCH", lambda: store.release("owner-two", now=1000)
-        )
-        released = store.release("owner-one", now=1000)
-        self.assertEqual("failed", released["state"])
-
-    def test_observed_progress_renews_the_bounded_lease_interval(self) -> None:
-        store = self.store()
-        store.reserve(
-            repository="NOirBRight/CodexHub",
-            issue=140,
-            branch="codex/issue-140-native-responses-tools",
-            owner_token="owner-one",
-            ttl_seconds=5,
-            now=100,
-        )
-        store.transition("owner-one", "invoking", now=102)
-        queued = store.transition(
-            "owner-one", "queued", request_id="queued-request-one", now=104
-        )
-        self.assertEqual(109, queued["expires_at"])
-        materialized = store.transition("owner-one", "task-materialized", now=108)
-        self.assertEqual(113, materialized["expires_at"])
-        store.transition("owner-one", "bootstrap-ready", now=112)
-
-    def test_malformed_persistent_state_fails_closed(self) -> None:
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        (self.state_dir / task_creation_lease.ACTIVE_FILE).write_text(
-            '{"schema_version": 1, "state": "reserved"}', encoding="utf-8"
-        )
-        self.assert_lease_error(
-            "LEASE_STATE_UNREADABLE", lambda: self.store().inspect()
-        )
-
-    def test_reconciliation_requires_restart_task_and_worktree_evidence(self) -> None:
-        store = self.store()
-        store.reserve(
-            repository="NOirBRight/CodexHub",
-            issue=140,
-            branch="codex/issue-140-native-responses-tools",
-            owner_token="owner-one",
-            now=100,
-        )
-        store.transition("owner-one", "invoking", now=100.5)
-        store.transition(
-            "owner-one", "queued", request_id="queued-request-one", now=101
-        )
-        store.transition("owner-one", "creation-unknown", now=102)
-
-        self.assert_lease_error(
-            "OWNER_MISMATCH",
-            lambda: store.reconcile(
-                "owner-two",
-                host_restarted=True,
-                request_id="queued-request-one",
-                request_state="cancelled",
-                task_state="absent",
-                worktree_state="clean-orphan",
-                evidence="readback-1",
-                now=103,
-            ),
-        )
-        self.assert_lease_error(
-            "RECONCILIATION_EVIDENCE_REQUIRED",
-            lambda: store.reconcile(
-                "owner-one",
-                host_restarted=False,
-                request_id="queued-request-one",
-                request_state="cancelled",
-                task_state="absent",
-                worktree_state="clean-orphan",
-                evidence="readback-1",
-                now=103,
-            ),
-        )
-        reconciled = store.reconcile(
-            "owner-one",
-            host_restarted=True,
-            request_id="queued-request-one",
-            request_state="cancelled",
-            task_state="absent",
-            worktree_state="clean-orphan",
-            evidence="readback-1",
-            now=104,
-        )
-        self.assertEqual("cancelled", reconciled["state"])
-        store.release("owner-one", now=105)
+        self.assertEqual("task-materialized", released["outcome"])
         self.assertIsNone(store.inspect())
 
-    def test_queued_and_reconciliation_require_the_exact_request_identity(self) -> None:
+    def test_exact_request_releases_materialized_task_after_owner_turn_loss(self) -> None:
         store = self.store()
-        store.reserve(
-            repository="NOirBRight/CodexHub",
-            issue=140,
-            branch="codex/issue-140-native-responses-tools",
-            owner_token="owner-one",
-            now=100,
-        )
+        self.reserve()
+        store.record_request("owner-a", "client-17", now=1.0)
+
         self.assert_lease_error(
-            "REQUEST_ID_REQUIRED",
-            lambda: store.transition("owner-one", "queued", now=101),
+            "REQUEST_ID_MISMATCH",
+            lambda: store.release(
+                None,
+                request_id="wrong-client",
+                outcome="task-materialized",
+                task_id="019f0000-0000-7000-8000-000000000017",
+                worktree_state="owned",
+                evidence="exact-task-and-worktree-readback",
+                now=20.0,
+            ),
         )
-        store.transition("owner-one", "invoking", now=100.5)
-        store.transition(
-            "owner-one", "queued", request_id="queued-request-one", now=101
+        released = store.release(
+            None,
+            request_id="client-17",
+            outcome="task-materialized",
+            task_id="019f0000-0000-7000-8000-000000000017",
+            worktree_state="owned",
+            evidence="exact-task-and-worktree-readback",
+            now=20.0,
         )
-        store.transition("owner-one", "creation-unknown", now=102)
+        self.assertEqual("task-materialized", released["outcome"])
+        self.assertTrue(released["request_authenticated"])
+        self.assertIsNone(store.inspect())
+
+    def test_uncertain_creation_blocks_reentry_even_after_expiry(self) -> None:
+        store = self.store()
+        self.reserve()
+        store.mark_uncertain("owner-a", request_id="client-17", now=1.0)
+        self.assert_lease_error(
+            "RECONCILIATION_REQUIRED",
+            lambda: store.reserve(
+                repository="other/repo",
+                issue=18,
+                branch="codex/issue-18-example",
+                owner_token="owner-b",
+                now=20.0,
+            ),
+        )
+
+    def test_reconciliation_requires_restart_owner_and_exact_evidence(self) -> None:
+        store = self.store()
+        self.reserve()
+        store.mark_uncertain("owner-a", request_id="client-17", now=1.0)
+        kwargs = {
+            "request_id": "client-17",
+            "outcome": "task-materialized",
+            "task_id": "019f0000-0000-7000-8000-000000000017",
+            "worktree_state": "owned",
+            "evidence": "exact-readback",
+            "now": 20.0,
+        }
+        self.assert_lease_error(
+            "RECONCILIATION_EVIDENCE_REQUIRED",
+            lambda: store.reconcile("owner-a", host_restarted=False, **kwargs),
+        )
         self.assert_lease_error(
             "REQUEST_ID_MISMATCH",
             lambda: store.reconcile(
-                "owner-one",
+                "owner-a",
                 host_restarted=True,
-                request_id="different-request",
-                request_state="cancelled",
-                task_state="absent",
-                worktree_state="absent",
-                evidence="readback-2",
-                now=103,
+                **(kwargs | {"request_id": "wrong-client"}),
             ),
         )
-
-    def test_crash_during_native_create_reconciles_without_a_request_receipt(self) -> None:
-        store = self.store()
-        store.reserve(
-            repository="NOirBRight/CodexHub",
-            issue=140,
-            branch="codex/issue-140-native-responses-tools",
-            owner_token="owner-one",
-            now=100,
-        )
-        invoking = store.transition("owner-one", "invoking", now=101)
-        self.assertEqual("invoking", invoking["state"])
-        reconciled = store.reconcile(
-            "owner-one",
-            host_restarted=True,
-            request_id=None,
-            request_state="no-receipt-terminal",
-            task_state="absent",
-            worktree_state="absent",
-            evidence="post-restart-full-inventory",
-            now=102,
-        )
-        self.assertEqual("failed", reconciled["state"])
-        store.release("owner-one", now=103)
-
-    def test_expired_reserved_lease_cannot_adopt_a_materialized_task(self) -> None:
-        store = self.store()
-        store.reserve(
-            repository="NOirBRight/CodexHub",
-            issue=140,
-            branch="codex/issue-140-native-responses-tools",
-            owner_token="owner-one",
-            ttl_seconds=5,
-            now=100,
-        )
-        self.assert_lease_error(
-            "RECONCILIATION_EVIDENCE_REQUIRED",
-            lambda: store.reconcile(
-                "owner-one",
-                host_restarted=True,
-                request_id=None,
-                request_state="no-receipt-materialized",
-                task_state="materialized",
-                worktree_state="owned",
-                evidence="post-restart-full-inventory",
-                now=106,
-            ),
-        )
-
-    def test_admitted_no_receipt_creation_can_adopt_its_materialized_task(self) -> None:
-        for uncertain_state in ("invoking", "creation-unknown"):
-            with self.subTest(uncertain_state=uncertain_state):
-                store = task_creation_lease.LeaseStore(
-                    self.state_dir / uncertain_state
-                )
-                store.reserve(
-                    repository="NOirBRight/CodexHub",
-                    issue=140,
-                    branch="codex/issue-140-native-responses-tools",
-                    owner_token="owner-one",
-                    now=100,
-                )
-                store.transition("owner-one", "invoking", now=101)
-                if uncertain_state == "creation-unknown":
-                    store.transition("owner-one", "creation-unknown", now=102)
-                reconciled = store.reconcile(
-                    "owner-one",
-                    host_restarted=True,
-                    request_id=None,
-                    request_state="no-receipt-materialized",
-                    task_state="materialized",
-                    worktree_state="owned",
-                    evidence="post-restart-full-inventory",
-                    now=103,
-                )
-                self.assertEqual("task-materialized", reconciled["state"])
-
-    def test_task_materialized_recovery_path_is_explicit(self) -> None:
-        store = self.store()
-        store.reserve(
-            repository="NOirBRight/CodexHub",
-            issue=140,
-            branch="codex/issue-140-native-responses-tools",
-            owner_token="owner-one",
-        )
-        store.transition("owner-one", "invoking")
-        store.transition(
-            "owner-one", "queued", request_id="queued-request-one"
-        )
-        store.transition("owner-one", "task-materialized")
-        self.assert_lease_error(
-            "INVALID_TRANSITION",
-            lambda: store.transition("owner-one", "preflight-ready"),
-        )
-        recovered = store.transition(
-            "owner-one", "preflight-ready", recovery_path=True
-        )
-        self.assertTrue(recovered["recovery_path"])
-        store.transition("owner-one", "activated")
-        store.release("owner-one")
-
-    def test_release_requires_owner_and_terminal_state(self) -> None:
-        store = self.store()
-        store.reserve(
-            repository="NOirBRight/CodexHub",
-            issue=140,
-            branch="codex/issue-140-native-responses-tools",
-            owner_token="owner-one",
-        )
-        for state in (
-            "invoking",
-            "queued",
-            "worktree-creating",
-            "task-materialized",
-            "bootstrap-ready",
-            "preflight-ready",
-            "activated",
-        ):
-            store.transition(
-                "owner-one",
-                state,
-                request_id="queued-request-one" if state == "queued" else None,
-            )
-
-        self.assert_lease_error(
-            "OWNER_MISMATCH", lambda: store.release("owner-two")
-        )
-        released = store.release("owner-one")
-        self.assertEqual("activated", released["state"])
+        result = store.reconcile("owner-a", host_restarted=True, **kwargs)
+        self.assertEqual("task-materialized", result["outcome"])
         self.assertIsNone(store.inspect())
 
-    def test_cli_reserve_transition_and_release_round_trip(self) -> None:
+    def test_terminal_no_task_releases_only_with_safe_worktree(self) -> None:
+        store = self.store()
+        self.reserve()
+        self.assert_lease_error(
+            "RECONCILIATION_EVIDENCE_REQUIRED",
+            lambda: store.release(
+                "owner-a",
+                outcome="terminal-no-task",
+                task_id=None,
+                worktree_state="dirty",
+                evidence="native-terminal-readback",
+                now=1.0,
+            ),
+        )
+        result = store.release(
+            "owner-a",
+            outcome="terminal-no-task",
+            task_id=None,
+            worktree_state="clean-orphan",
+            evidence="native-terminal-readback",
+            now=1.0,
+        )
+        self.assertEqual("terminal-no-task", result["outcome"])
+
+    def test_legacy_schema_is_readable_and_drainable(self) -> None:
+        store = self.store()
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "schema_version": 1,
+            "lease_id": "legacy-lease",
+            "idempotency_key": "f" * 64,
+            "repository": "owner/repo",
+            "issue": "17",
+            "branch": "codex/issue-17-example",
+            "owner_token_sha256": task_creation_lease._token_digest("owner-a"),
+            "state": "preflight-ready",
+            "revision": 4,
+            "created_at": 0.0,
+            "updated_at": 1.0,
+            "expires_at": 2.0,
+            "ttl_seconds": 10,
+        }
+        store.active_path.write_text(json.dumps(record), encoding="utf-8")
+        self.assertTrue(store.inspect()["legacy"])
+        result = store.reconcile(
+            "owner-a",
+            host_restarted=True,
+            request_id=None,
+            outcome="terminal-no-task",
+            task_id=None,
+            worktree_state="absent",
+            evidence="full-native-and-worktree-readback",
+            now=20.0,
+        )
+        self.assertTrue(result["legacy"])
+        self.assertIsNone(store.inspect())
+
+    def test_default_location_is_shared_across_codex_homes(self) -> None:
+        common = {
+            "LOCALAPPDATA": str(self.state_dir / "local-app-data"),
+            "USERPROFILE": str(self.state_dir / "profile"),
+            "HOME": str(self.state_dir / "profile"),
+        }
+        with mock.patch.dict(
+            os.environ,
+            common | {"CODEX_HOME": str(self.state_dir / "codex-a")},
+            clear=True,
+        ):
+            first = task_creation_lease._default_state_dir()
+        with mock.patch.dict(
+            os.environ,
+            common | {"CODEX_HOME": str(self.state_dir / "codex-b")},
+            clear=True,
+        ):
+            second = task_creation_lease._default_state_dir()
+        self.assertEqual(first, second)
+
+    def test_malformed_state_fails_closed(self) -> None:
+        store = self.store()
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        store.active_path.write_text("{broken", encoding="utf-8")
+        self.assert_lease_error("LEASE_STATE_UNREADABLE", store.inspect)
+
+    def test_cli_round_trip_requires_caller_owned_token(self) -> None:
         script = SCRIPT_DIR / "task_creation_lease.py"
-        state_arguments = ["--state-dir", str(self.state_dir)]
-        reserved = subprocess.run(
+        state_arguments = ["--state-dir", str(self.state_dir / "cli")]
+        reserve = subprocess.run(
             [
                 sys.executable,
                 str(script),
                 *state_arguments,
                 "reserve",
                 "--repository",
-                "NOirBRight/CodexHub",
+                "owner/repo",
                 "--issue",
-                "140",
+                "50",
                 "--branch",
-                "codex/issue-140-native-responses-tools",
+                "codex/issue-50-example",
                 "--owner-token",
                 "owner-cli",
             ],
@@ -698,19 +395,32 @@ raise SystemExit(completed.returncode)
             capture_output=True,
             text=True,
         )
-        self.assertEqual("reserved", json.loads(reserved.stdout)["lease"]["state"])
-
-        for command in (
-            ("transition", "--state", "failed", "--owner-token", "owner-cli"),
-            ("release", "--owner-token", "owner-cli"),
-        ):
-            completed = subprocess.run(
-                [sys.executable, str(script), *state_arguments, *command],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            self.assertTrue(json.loads(completed.stdout)["ok"])
+        payload = json.loads(reserve.stdout)
+        self.assertTrue(payload["lease"]["creation_authorized"])
+        self.assertNotIn("owner_token", payload["lease"])
+        release = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                *state_arguments,
+                "release",
+                "--owner-token",
+                "owner-cli",
+                "--outcome",
+                "cancelled-before-invoke",
+                "--worktree-state",
+                "absent",
+                "--evidence",
+                "no-native-call-made",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            "cancelled-before-invoke",
+            json.loads(release.stdout)["lease"]["outcome"],
+        )
 
 
 if __name__ == "__main__":

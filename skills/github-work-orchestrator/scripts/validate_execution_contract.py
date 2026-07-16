@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate one normalized v2 GitHub Worker dispatch contract."""
+"""Validate one normalized v2 GitHub execution-lane contract."""
 
 from __future__ import annotations
 
@@ -12,6 +12,15 @@ from typing import Any
 
 
 VERIFICATION_CLASSES = {"fast", "standard", "strict"}
+EXECUTION_LANES = {"inline", "subagent", "visible-worker"}
+MODEL_BINDING_REQUIREMENTS = {"best-effort", "exact-runtime"}
+MODEL_BINDING_STATUSES = {
+    "request-accepted",
+    "runtime-verified",
+    "rejected",
+    "unknown",
+}
+IMPLEMENTATION_WORKER_BINDING = "ollama-cloud/glm-5.2"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 REQUIRED_TEXT = (
     "issue",
@@ -19,10 +28,11 @@ REQUIRED_TEXT = (
     "base_branch",
     "feature_branch",
     "manual_evidence",
+    "execution_lane",
     "model_profile",
     "model_binding",
+    "model_binding_requirement",
     "model_binding_evidence",
-    "callback_task",
     "pr_target",
 )
 
@@ -121,8 +131,47 @@ def validate_contract(contract: Any) -> dict[str, Any]:
         errors.append("invalid-architecture-decision")
     if contract.get("review_owner") != "orchestrator":
         errors.append("review-owner-must-be-orchestrator")
-    if contract.get("model_binding_status") != "verified":
-        errors.append("model-binding-must-be-verified")
+    execution_lane = contract.get("execution_lane")
+    if execution_lane not in EXECUTION_LANES:
+        errors.append("invalid-execution-lane")
+    if execution_lane == "visible-worker" and not nonempty_text(
+        contract.get("callback_task")
+    ):
+        errors.append("visible-worker-requires-callback-task")
+
+    binding_requirement = contract.get("model_binding_requirement")
+    if binding_requirement not in MODEL_BINDING_REQUIREMENTS:
+        errors.append("invalid-model-binding-requirement")
+    binding_status = contract.get("model_binding_status")
+    if binding_status not in MODEL_BINDING_STATUSES:
+        errors.append("invalid-model-binding-status")
+    elif binding_status == "rejected":
+        errors.append("model-binding-rejected")
+    elif binding_status == "unknown":
+        errors.append("model-binding-unknown")
+    if (
+        binding_requirement == "exact-runtime"
+        and binding_status != "runtime-verified"
+    ):
+        errors.append("exact-runtime-binding-not-verified")
+    if (
+        binding_requirement == "best-effort"
+        and binding_status not in {"request-accepted", "runtime-verified"}
+    ):
+        errors.append("best-effort-binding-not-accepted")
+
+    model_binding = contract.get("model_binding")
+    reasoning = contract.get("model_reasoning_effort")
+    if execution_lane in {"subagent", "visible-worker"}:
+        if model_binding != IMPLEMENTATION_WORKER_BINDING:
+            errors.append("implementation-worker-must-use-glm-5.2")
+        if reasoning != "max":
+            errors.append("glm-reasoning-must-be-max")
+    elif execution_lane == "inline":
+        if not isinstance(model_binding, str) or not model_binding.startswith("gpt-"):
+            errors.append("inline-lane-must-keep-orchestrator-gpt")
+        if not nonempty_text(reasoning):
+            errors.append("inline-gpt-reasoning-required")
     base_sha = contract.get("base_sha")
     if not isinstance(base_sha, str) or not SHA_RE.fullmatch(base_sha):
         errors.append("base-sha-must-be-lowercase-40-hex")
@@ -143,6 +192,7 @@ def validate_contract(contract: Any) -> dict[str, Any]:
         "schema_version": 1,
         "status": "valid" if not errors else "invalid",
         "dispatchable": not errors,
+        "execution_lane": execution_lane,
         "verification_class": verification_class,
         "verification_plan": (
             verification_plan(

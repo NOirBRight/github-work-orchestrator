@@ -1,6 +1,6 @@
 ---
 name: github-work-orchestrator
-description: Orchestrate GitHub execution campaigns by aligning direction and architecture, reconciling priority, labels, and native dependencies after intake, computing the ready frontier, binding models, dispatching sidebar-visible Workers, reviewing PRs, and refilling capacity. Use when Codex must run a multi-Issue GitHub campaign, compute or refill its ready frontier, dispatch visible Workers, or arbitrate their integration.
+description: Orchestrate GitHub execution campaigns by aligning direction, reconciling Issues and dependencies, routing work across Inline, Subagent, or Visible Worker lanes, binding implementation Workers, reviewing PRs, integrating results, and cleaning completed work. Use when Codex must run a GitHub campaign, compute/refill a ready frontier, dispatch implementation, or arbitrate integration.
 ---
 
 # Compatibility entry point

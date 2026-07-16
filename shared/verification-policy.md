@@ -1,9 +1,9 @@
 # Risk-tiered verification policy
 
-Product acceptance comes only from the GitHub Issue and explicitly accepted
-decision records. Repository verification commands come only from the target
-repository's documented verification policy. Skills select and execute those
-requirements; they do not invent additional product acceptance.
+Product acceptance comes only from the GitHub Issue and accepted decision
+records. Repository verification commands come only from the target
+repository's documented policy. Execution lane, model, and verification class
+are separate choices.
 
 ## Execution contract
 
@@ -17,100 +17,82 @@ Architecture-Decision: resolved | discussion-required
 Review-Owner: orchestrator
 ```
 
-The dispatch contract repeats these fields and adds the pinned repository,
-base SHA, branch, hotset, requested model binding, `model_binding_status`,
-sanitized `model_binding_evidence`, permission profile, callback, and PR target.
-`model_binding_status` must be `verified`; a requested UI/API value alone is
-not effective-runtime evidence. An unverified binding or a
-`discussion-required` contract is not dispatchable. Existing active work may
-migrate incrementally; do not restart or discard useful WIP merely to add v2
-metadata.
+The private execution contract adds:
+
+```text
+execution_lane: inline | subagent | visible-worker
+model_profile: <stable profile>
+model_binding: <concrete model>
+model_reasoning_effort: <supported value, none, or omitted>
+model_binding_requirement: best-effort | exact-runtime
+model_binding_status: request-accepted | runtime-verified | rejected | unknown
+model_binding_evidence: <sanitized evidence or limitation>
+```
+
+It also carries the pinned repository/base SHA, branch, isolated worktree,
+hotset, permission profile, PR target, and callback only when the selected lane
+requires one. `best-effort + request-accepted` is allowed when effective
+readback is unavailable. `exact-runtime` requires `runtime-verified`. Rejected,
+unknown, contradictory, omitted, or silently substituted bindings fail closed.
 
 ## Verification classes
 
-| Class | Use when | Worker verification | Integration review |
+| Class | Use when | Candidate verification | Integration review |
 |---|---|---|---|
-| `fast` | Documentation, copy, isolated UI, metadata, or small deterministic logic with no shared lifecycle or public contract | Targeted checks and diff hygiene; no local full suite | One lightweight Orchestrator scope/acceptance check; no review subagent |
-| `standard` | A reversible feature or bug contained to a clear local boundary | Targeted checks during implementation, then one repository-defined relevant full suite for the candidate | One Orchestrator-owned Standards/Spec review |
-| `strict` | Protocol, routing, transport, auth, permissions, persistence, migration, release/update, security/privacy, concurrency/cancellation, or nondeterministic production evidence | Targeted checks, one repository-defined relevant full suite, and only the Issue's explicit harness/manual evidence | One Orchestrator-owned Standards/Spec review; later review is delta-only |
+| `fast` | Documentation, copy, isolated UI, metadata, or small deterministic logic with no shared lifecycle or public contract | Targeted checks and diff hygiene; no local full suite | Direct Orchestrator scope/acceptance check |
+| `standard` | A reversible feature or bug contained to a clear local boundary | Targeted checks, then one repository-defined relevant full suite | One Orchestrator-owned Standards/Spec review |
+| `strict` | Protocol, routing, auth, persistence, release, security, concurrency, or nondeterministic production evidence | Targeted checks, one relevant full suite, and only explicit manual evidence | One Orchestrator-owned Standards/Spec review; later review is delta-only |
 
-Classify the highest applicable risk. Upgrade before broadening scope when a
-change crosses a public or persisted contract, shared lifecycle, security
-boundary, or additional subsystem. Do not downgrade a mandatory strict trigger
-without an accepted maintainer decision recorded in the Issue.
-
-File count is a diagnostic, not an acceptance rule. A purported `fast` task
-that introduces a shared abstraction, lifecycle policy, public API, or a second
-subsystem must send `DISCUSSION_REQUIRED` before expanding.
+Classify the highest applicable risk. File count is a diagnostic, not an
+acceptance rule. Upgrade before crossing a public/persisted contract, shared
+lifecycle, security boundary, or additional subsystem.
 
 ## Execution limits
 
 - Repeat targeted tests as needed while implementing.
-- For `standard` and `strict`, run the relevant local full suite once at the
-  candidate commit. Do not run every language suite unless repository policy
-  maps the changed boundary to each one.
-- After review fixes, run affected targeted checks and rely on CI. Repeat a
-  local full suite only when the fix crosses a new boundary or changes the
-  repository-defined full-suite mapping.
-- The Worker performs diff hygiene and acceptance self-checks. It must not run
-  the generic `code-review` Skill or create Standards/Spec review subagents.
-- The Orchestrator owns the only formal review. Review `fast` work directly;
-  use one parallel Standards/Spec pass for `standard` and `strict`. Re-review
-  only the changed delta.
-- Manual or live evidence is required only when the Issue names behavior that
-  deterministic checks cannot prove. A clean run does not create a new gate,
-  and a retry requires a new hypothesis or materially changed environment.
+- Run the relevant local full suite once at the candidate for `standard` and
+  `strict`; do not run unrelated language suites.
+- After same-boundary review fixes, run affected checks and rely on replacement
+  CI. Repeat a local full suite only after a new verification boundary.
+- The implementation lane performs diff hygiene and self-checks but must not run
+  the generic formal review. The Orchestrator owns that review.
+- Manual/live evidence is required only when the Issue names behavior that
+  deterministic checks cannot prove.
 - CI remains the final automated gate. Report-only tools remain non-blocking.
 
 ## Candidate-first integration pipeline
 
-Use this pipeline for every locally testable change, including a small delta
-inside a `standard` or `strict` Issue. Risk class controls verification depth;
-it does not require serial waiting between independent gates.
+1. Finish affected local checks before publishing the first candidate. Do not
+   push intermediate WIP merely to obtain CI; a recovery checkpoint or truly
+   remote-only seam is the exception.
+2. Publish one locally green candidate and start one CI run. Notify the
+   Orchestrator immediately.
+3. Run CI, the one Orchestrator review, and safe candidate manual evidence in
+   parallel.
+4. Merge only after every applicable gate is green. A same-boundary correction
+   preserves full-suite and formal-review counts.
+5. Compare candidate and integrated Git trees after merge; when the trees are identical,
+   carry forward evidence. Rebuild only for a tree delta, repository
+   identity requirement, or release-artifact acceptance.
 
-1. Finish the affected local checks before the first candidate publication.
-   Do not push intermediate WIP merely to obtain CI. A recovery checkpoint or
-   an explicitly remote-only verification seam is the exception.
-2. Publish one locally green candidate commit and start one CI run for that
-   candidate. Send `PR_OPENED` immediately after publication; do not wait for
-   CI before notifying the Orchestrator.
-3. Run CI, the one Orchestrator review, and any safe candidate artifact/manual
-   evidence in parallel. Manual evidence named by the Issue normally runs
-   pre-merge so a red behavior gate does not enter the integration branch.
-4. Merge only after every applicable gate is green. A review or manual-gate
-   correction keeps the existing full-suite and formal-review counts; run
-   affected local checks and publish one replacement candidate.
-5. After merge, compare the candidate and integrated Git trees. Carry forward
-   behavioral evidence when the trees are identical. Rebuild or repeat the
-   gate only when the trees differ, repository policy requires integrated
-   revision identity, or the final release artifact itself is the acceptance
-   object.
+## Lane-independent guarantees
 
-One candidate may still require a replacement when CI finds a platform-only
-failure or evidence disproves the implementation. The policy forbids avoidable
-publication/CI churn; it does not hide a materially changed candidate.
-
-## Model selection
-
-Verification class and model profile are independent. Use the lowest qualified
-binding that can safely execute the work. A qualified third-party model may
-replace Luna or Terra centrally; retain an official fallback. Reserve Sol Max
-for an explicit architecture/direction escalation, not routine execution,
-research, or review.
+Inline, Subagent, and Visible Worker lanes all require an exact base, isolated
+worktree, one editor, explicit hotset, applicable permissions, scoped
+publication, and durable evidence. The lane changes context persistence and
+coordination cost; it never weakens safety or verification.
 
 ## Time and scope signals
 
-Targets are diagnostic rather than hard timeouts:
+Targets diagnose friction rather than authorize skipped checks:
 
-- same-boundary review or manual-gate correction: locally green replacement
-  candidate within 15 minutes after a clear reproduction, excluding remote CI
-  and explicit human wait;
-- `fast`: candidate PR within 30 minutes;
-- `standard`: candidate PR within 90 minutes;
-- `strict`: milestone checkpoints with a named hypothesis and next gate.
+- Inline same-boundary candidate: about 15 minutes.
+- `fast`: candidate PR within 30 minutes.
+- `standard`: candidate PR within 90 minutes.
+- Same-boundary review/manual correction: locally green replacement within 15 minutes,
+  excluding remote CI and human wait.
 
-When a target is exceeded, report the measured phase and concrete blocker; do
-not add speculative verification. Worker material signals include:
+Visible Worker signals retain:
 
 ```text
 Verification-Class: <class>
@@ -120,6 +102,5 @@ Review-Runs: 0
 Scope-Delta: none | <new boundary requiring approval>
 ```
 
-The Orchestrator records its formal review count separately. Success means no
-duplicate full-suite run, no duplicate formal review, no acceptance drift, and
-no regression hidden by the faster path.
+Inline and Subagent results report the equivalent evidence directly in the
+Orchestrator. Success means no duplicate suite, review, CI, or manual gate.
