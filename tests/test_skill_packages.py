@@ -108,6 +108,76 @@ class SkillPackageTests(unittest.TestCase):
             (ROOT / "agents/openai.yaml").read_bytes(),
         )
 
+    def test_execution_worktrees_are_not_saved_projects_or_skill_roots(self) -> None:
+        package_documents = {
+            "orchestrator": (
+                ROOT / "skills/github-work-orchestrator/SKILL.md",
+                ROOT
+                / "skills/github-work-orchestrator/references/shared/github-state-rules.md",
+                ROOT / "skills/github-work-orchestrator/references/worker-contract.md",
+            ),
+            "worker": (
+                ROOT / "skills/github-issue-worker/SKILL.md",
+                ROOT
+                / "skills/github-issue-worker/references/shared/worker-execution.md",
+            ),
+        }
+        required = (
+            "execution-only CWD",
+            "Codex Saved Project",
+            ".codex-global-state.json",
+            "electron-saved-workspace-roots",
+            "Codex SQLite",
+            "junction",
+            "symlink",
+            "dynamic `SKILL.md`",
+            "sanitized platform limitation",
+            "exactly one repository-documented canonical installation",
+        )
+        for role, documents in package_documents.items():
+            text = "\n".join(
+                document.read_text(encoding="utf-8") for document in documents
+            )
+            normalized = " ".join(text.split())
+            for phrase in required:
+                with self.subTest(role=role, phrase=phrase):
+                    self.assertIn(phrase, normalized)
+
+        state_rules = (ROOT / "shared/github-state-rules.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("GitHub Issue and the native Task contract", state_rules)
+        self.assertIn("not additional runtime Skill installations", state_rules)
+
+    def test_packaged_scripts_do_not_mutate_workspace_or_skill_topology(self) -> None:
+        private_state_markers = (
+            ".codex-global-state.json",
+            "electron-saved-workspace-roots",
+            "codex sqlite",
+            "sqlite3.connect",
+        )
+        skill_targets = ("skill.md", ".codex/skills", "codex_home/skills")
+        write_markers = (
+            "write_text(",
+            "write_bytes(",
+            "copytree(",
+            "copy2(",
+            "symlink(",
+            "symlink_to(",
+            "junction",
+            "mklink",
+        )
+        for script in (ROOT / "skills").glob("*/scripts/*.py"):
+            text = script.read_text(encoding="utf-8").lower()
+            with self.subTest(script=script.relative_to(ROOT)):
+                for marker in private_state_markers:
+                    self.assertNotIn(marker, text)
+                targets_skill_install = any(
+                    marker in text for marker in skill_targets
+                )
+                mutates_filesystem = any(marker in text for marker in write_markers)
+                self.assertFalse(targets_skill_install and mutates_filesystem)
+
     def test_trigger_descriptions_are_role_specific(self) -> None:
         descriptions = {}
         for name in SKILLS:

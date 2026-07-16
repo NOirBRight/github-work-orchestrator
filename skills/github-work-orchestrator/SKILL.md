@@ -101,6 +101,26 @@ publish independently; the Orchestrator integrates and verifies its result.
 
 If a Subagent cannot use GLM-5.2, report the rejection. Do not reroute it to GPT.
 
+## Keep worktrees execution-only
+
+Treat every Inline, Subagent, and Visible Worker worktree as an execution-only
+CWD. Never open, switch to, or persist it as a Codex Saved Project or Saved
+Workspace, and never use a repository or worktree as a Skill installation root.
+Pass the exact absolute CWD only through the supported native execution
+contract.
+
+If a lane cannot run at that CWD without saving or registering the path as a
+project, fail it with a sanitized platform limitation. Do not change projects
+or edit private desktop state as a workaround. Another lane may proceed only
+when the router independently selects it and no competing editor exists.
+
+Follow the canonical [workspace and Skill topology rules](references/shared/github-state-rules.md#execution-cwd-and-skill-installation-topology).
+Never read-modify-write `.codex-global-state.json`,
+`electron-saved-workspace-roots`, Codex SQLite, or equivalent private state.
+Never copy, install, junction, symlink, or generate a role Skill inside a
+repository/worktree, and never turn per-Issue state into a dynamic `SKILL.md`,
+plugin, or project-local Skill.
+
 ## Create a Visible Worker
 
 Before the one native creation call, reserve the host-wide creation singleflight

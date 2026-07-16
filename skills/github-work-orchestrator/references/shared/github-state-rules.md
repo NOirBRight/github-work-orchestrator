@@ -7,6 +7,7 @@ execution surfaces, not a second project ledger. Never edit Codex SQLite.
 ## Contents
 
 - [Execution ownership](#execution-ownership)
+- [Execution CWD and Skill installation topology](#execution-cwd-and-skill-installation-topology)
 - [Reliable task materialization](#reliable-task-materialization)
 - [Permission and repository preflight](#permission-and-repository-preflight)
 - [Branch and collision evidence](#branch-and-collision-evidence)
@@ -29,6 +30,38 @@ Discovered independent work returns to Intake or the frontier.
 
 Preserve dirty working trees and unrelated user work. Never use a shared
 working directory or two simultaneous editors as a fallback.
+
+## Execution CWD and Skill installation topology
+
+Every isolated worktree is an execution-only CWD. It is not a Codex Saved
+Project, Saved Workspace, or Skill installation root. The Orchestrator,
+Subagent, and Visible Worker must never open, switch to, or persist an execution
+worktree as a saved project. Pass the exact absolute CWD only through a
+supported native execution contract.
+
+If a lane cannot materialize at the assigned CWD without saving or registering
+that path as a project, fail that lane with a sanitized platform limitation. Do
+not add the worktree to another project or Saved Workspace as a workaround. A
+different lane may proceed only when the router independently selects it and
+single-editor ownership remains proven.
+
+Never read-modify-write `.codex-global-state.json`,
+`electron-saved-workspace-roots`, Codex SQLite, or equivalent private desktop
+state during dispatch, recovery, or cleanup. Do not bypass a creation or
+ownership guard through another project, window, state directory, hidden Task,
+or private-state edit.
+
+Each role Skill resolves from exactly one repository-documented canonical
+installation. Never copy, install, junction, symlink, or generate a Skill under
+a repository or execution worktree, and never encode per-Issue or per-Worker
+state in a dynamic `SKILL.md`, plugin, or project-local Skill. Keep that runtime
+state in the GitHub Issue and the native Task contract.
+
+Version-controlled package sources and lazy `references/`, `scripts/`, and
+`assets/` are package contents, not additional runtime Skill installations.
+The compatibility policy that selects a canonical install target is a separate
+maintainer decision; cloning this repository alone does not create an active
+Skill installation.
 
 ## Reliable task materialization
 

@@ -45,6 +45,24 @@ Send `PREFLIGHT_READY` and become idle. Do not create a branch, edit source,
 write GitHub, commit, push, or open a PR until the Orchestrator sends literal
 `START` and its native receipt identifies this Task.
 
+## Keep the worktree execution-only
+
+The assigned worktree is an execution-only CWD, not a Codex Saved Project,
+Saved Workspace, or Skill installation root. Use only its exact absolute path
+from the native execution contract. Never open or register it as a project,
+switch projects, or persist it as a workaround. If the platform cannot use that
+CWD without persistence, send a sanitized platform limitation in a `BLOCKED`
+signal before edits.
+
+Follow the packaged
+[execution-only CWD rules](references/shared/worker-execution.md#execution-only-cwd).
+Do not read-modify-write `.codex-global-state.json`,
+`electron-saved-workspace-roots`, Codex SQLite, or equivalent private state.
+Never copy, install, junction, symlink, or generate a Skill in the repository
+or worktree, and never create a dynamic `SKILL.md`, plugin, or project-local
+Skill for runtime state. Each role Skill resolves from exactly one
+repository-documented canonical installation.
+
 ## Implement the assigned scope
 
 After `START`, post a short plan naming expected writes, verification, and

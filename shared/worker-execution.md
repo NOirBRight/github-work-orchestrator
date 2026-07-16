@@ -33,6 +33,25 @@ After preflight, send `PREFLIGHT_READY` and become idle. The Orchestrator claims
 and reads back the Issue, verifies one editor, then sends `START`. Only that
 receipt authorizes implementation.
 
+## Execution-only CWD
+
+Treat the assigned worktree as an execution-only CWD, never as a Codex Saved
+Project, Saved Workspace, or Skill installation root. Use the exact absolute
+path supplied by the supported native execution contract. Never open or
+register the worktree as a project, switch projects, or persist it as a
+workaround. If the native lane cannot use the assigned CWD without persistence,
+send one sanitized platform limitation in a `BLOCKED` signal before edits.
+
+Do not read-modify-write `.codex-global-state.json`,
+`electron-saved-workspace-roots`, Codex SQLite, or equivalent private desktop
+state. Never copy, install, junction, symlink, or generate a Skill in the
+repository or worktree, and never create a dynamic `SKILL.md`, plugin, or
+project-local Skill for execution state. GitHub and the native Task contract
+remain the only execution-state carriers. Each role Skill resolves from exactly
+one repository-documented canonical installation. Version-controlled package
+sources and lazy `references/`, `scripts/`, and `assets/` are not extra runtime
+Skill installations.
+
 ## Assigned verification class
 
 | Class | Candidate verification | Formal review |
