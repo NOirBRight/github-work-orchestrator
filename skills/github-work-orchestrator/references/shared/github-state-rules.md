@@ -1,94 +1,79 @@
-# GitHub and visible-task state rules
+# GitHub and execution-owner state rules
 
 GitHub Issues, native dependencies, assignees, linked PRs, and repository policy
-are the only persistent work-state source. Codex tasks provide visible runtime
-ownership; they are not a second project ledger.
+are the only persistent work-state source. Codex tasks and Subagents are runtime
+execution surfaces, not a second project ledger. Never edit Codex SQLite.
 
 ## Contents
 
-- [Visible ownership](#visible-ownership)
+- [Execution ownership](#execution-ownership)
 - [Reliable task materialization](#reliable-task-materialization)
 - [Permission and repository preflight](#permission-and-repository-preflight)
 - [Branch and collision evidence](#branch-and-collision-evidence)
 - [Recovery and WIP preservation](#recovery-and-wip-preservation)
+- [Event-triggered cleanup](#event-triggered-cleanup)
 
-## Visible ownership
+## Execution ownership
 
-Map each claimed GitHub work item to exactly one sidebar-visible Codex task and
-one isolated worktree. The task is the auditable owner of the Issue, branch,
-PR, callback, and completion evidence.
+Keep one visible Orchestrator per repository/activity. Every active work item has
+one isolated worktree, one exact editor, and one execution lane:
 
-An Orchestrator or Worker may use subagents for bounded research, implementation
-critique, test analysis, or implementation slices inside the same owned Issue.
-Worker assistance is not the formal Standards/Spec review, which remains owned
-by the Orchestrator under the verification policy. A subagent is
-never the visible owner, dispatch target, lifecycle record, or hidden Worker for
-another GitHub work item. Discovered independent work returns to Intake or the
-Orchestrator for its own Issue and visible task.
+- Inline: the Orchestrator is the editor and evidence owner.
+- Subagent: the Orchestrator remains the GitHub/evidence owner; one bounded
+  Subagent edits only its assigned worktree/write set and returns the result.
+- Visible Worker: one sidebar-visible Task owns execution and callback evidence.
 
-Preserve dirty working trees and unrelated user work. Create a Worker from the
-documented integration branch and exact assigned SHA. Never use a shared
-working directory as a dispatch fallback.
+A Subagent is not a persistent project owner and does not claim another Issue,
+branch, PR, or lifecycle. The Orchestrator publishes and integrates its work.
+Discovered independent work returns to Intake or the frontier.
+
+Preserve dirty working trees and unrelated user work. Never use a shared
+working directory or two simultaneous editors as a fallback.
 
 ## Reliable task materialization
 
-Use two stages when the task host can create a worktree before its conversation
-or rollout is ready:
+This section applies only to the Visible Worker lane. Reserve the host-wide
+creation singleflight immediately before the native Task-creation call. Keep
+only `creating` or `uncertain` state. A queued client receipt is not a Task.
 
-1. Create the isolated-worktree task at the exact base using a fast, verified,
-   low-cost bootstrap binding. Send only
-   `[#<number>] Bootstrap only. Reply exactly READY. Do not use tools.`
-2. Wait for a real task ID in the native task list and for the bootstrap turn
-   to complete. A client-side creation ID or created worktree alone is not a
-   Worker.
-3. Rename the materialized task to `[#<number>] <issue title>`.
-4. Send the full `github-issue-worker` contract to that same task with the
-   selected Worker model and reasoning level. This first full turn establishes
-   the recorded binding.
-5. Run permission preflight before repository work.
+Release the creation guard as soon as native discovery identifies the exact real
+Task and its worktree. Prefer the retained owner token. If its caller turn was
+lost after a queued receipt, the exact recorded native request identity may
+authenticate only a `task-materialized` release with the exact Task and owned
+worktree; it cannot prove terminal no-Task or cancellation. The Task, assignee,
+worktree, branch, and PR then carry runtime ownership. If the call outcome is
+ambiguous, mark it `uncertain`, issue no second creation call, and use at most
+one evidence-backed reconciliation.
 
-Keep the bootstrap uniquely Issue-scoped but omit the full Issue title and
-contract so a failed stub cannot masquerade as a second Worker. If startup
-services are suspected, use a bounded A/B test and disable only a proven,
-non-required service through an authorized reversible change.
-
-If creation returns only a client ID or worktree, confirm absence through the
-native task list, keep IDs private, identify a concrete startup cause, and make
-at most one replacement attempt after that cause is removed or isolated. Clean
-failed stubs only through a supported native archive/delete action; do not edit
-Codex internal databases.
+A creation conflict blocks only the Visible Worker lane. Inline or Subagent
+work may continue only when the router independently selects that lane and no
+competing editor exists. Never bypass the guard through another project,
+window, state directory, or hidden Task.
 
 ## Permission and repository preflight
 
-Treat permissions as task-host state, not authority granted by a prompt. Before
-editing, publishing, or running an expensive suite:
+Before editing, publishing, or running an expensive suite:
 
-1. Report the effective filesystem sandbox, approval policy, and network
-   profile exposed to the task.
-2. Run `git status --short --branch` in the assigned worktree.
-3. When GitHub access is required, run one read-only identity or repository
-   query such as `gh api user` or `gh repo view`.
-4. Continue only when the commands require no approval prompt and the effective
-   profile satisfies the dispatch contract.
+1. Report the effective filesystem, network, and approval profile.
+2. Verify exact base SHA and integration ref.
+3. Verify the isolated worktree is clean and the assigned branch/write set has
+   no conflicting owner.
+4. When GitHub access is required, run one read-only identity/repository query.
+5. Continue only when commands require no approval prompt and match the
+   execution contract.
 
-The Worker should use its packaged deterministic preflight script when
-available, passing the task-host's effective permission metadata plus the
-pinned base, integration ref, and assigned branch. The script validates and
-records state; it cannot infer or grant permissions. The Orchestrator validates
-the normalized v2 dispatch contract separately before activation.
-
-On a narrower profile or approval request, send one `BLOCKED` signal and stop
-before work. Do not use destructive commands, credential changes, or writes
-outside the worktree to prove permissions.
+Use the packaged deterministic Worker preflight where applicable. A narrower
+profile or unexpected approval fails before edits. Do not change credentials,
+permissions, or external state merely to prove access.
 
 ## Branch and collision evidence
 
 Use the repository branch convention, defaulting to
 `codex/issue-<number>-<slug>`, and target the documented integration branch.
-Rebase or merge upstream only when the work semantically depends on it or a
-merge-base comparison proves a write-set collision.
+Rebase or merge upstream only for a semantic dependency or proven write-set
+collision.
 
-Before reporting a collision, capture:
+Capture:
 
 ```text
 git merge-base HEAD origin/<integration-branch>
@@ -98,39 +83,37 @@ git diff --name-only
 git diff --name-only <merge-base>..origin/<integration-branch>
 ```
 
-The Worker-side set is committed plus staged plus unstaged paths. Intersect it
-with the upstream-only set. An empty intersection is not a collision unless a
-separate semantic dependency exists.
+The local set is committed plus staged plus unstaged paths. Intersect it with
+the upstream-only set. An empty intersection is not a collision without a
+separate semantic dependency.
 
 ## Recovery and WIP preservation
 
-A task-level `systemError`, disconnect, or failed continuation does not change
-the GitHub claim. Attempt one normal continuation while branch and worktree
-remain intact. If the same task fails again before a meaningful response, use
-one native visible-task fork or handoff on the same branch/worktree when
-supported.
+A Task or Subagent error does not change the GitHub claim. Before replacing an
+editor or removing a worktree:
 
-Before archiving the sole durable owner of uncommitted work:
+1. Prove the editor is idle/terminal.
+2. Inspect exact status and branch ownership.
+3. If useful WIP exists, create one scoped checkpoint, verify it contains no
+   transient/sensitive artifacts, push it, and verify the remote SHA.
+4. Activate a successor only after the predecessor cannot edit and ownership is
+   unambiguous.
 
-1. Ensure every Worker on that worktree is idle so concurrent edits cannot
-   occur.
-2. Create a scoped checkpoint commit on the existing feature branch.
-3. Verify the checkpoint contains no transient or sensitive artifacts.
-4. Push it to the existing remote branch and verify the remote SHA.
-5. Archive or clean the predecessor only after the worktree is clean or the
-   remote checkpoint is verified.
+If evidence, permission, or network access is insufficient, leave the Task and
+worktree intact and report the requirement. Never reset, force-clean, or infer
+safe deletion from age alone.
 
-A same-directory fork is not a durable WIP backup when archiving either task
-may remove the shared worktree. If checkpoint permission or network access is
-insufficient, leave the task/worktree intact and report the recovery
-requirement.
+## Event-triggered cleanup
 
-Tell the successor to inspect status and the current diff before editing. Keep
-the Issue claim, branch, PR, callback, model profile, and authority boundaries.
-Exactly one visible task may edit a worktree. When same-worktree succession is
-unsafe, preserve and verify the branch remotely, deactivate the predecessor,
-then create one replacement worktree from that branch.
+After a verified merge or stop, trigger cleanup immediately; complete it within
+five minutes. This is a deadline, not a polling interval.
 
-Recovery is complete when useful WIP is durable, only one visible owner remains,
-and the replacement has revalidated identity, permissions, and repository
-state.
+Use the execution policy cleanup plan with the exact absolute worktree, merged
+branch when applicable, and Visible Worker Task ID. Remove an isolated worktree
+only when it is clean, durable (pushed or integrated), inactive, and
+unambiguously owned.
+Delete a local branch only when merged. Task archiving is human-owned: report
+the exact corresponding Visible Worker as ready for archive, but never call the
+native archive action automatically because descendant cleanup can cross a
+delegation boundary. Preserve and report dirty, unpushed, ambiguous, active, or
+externally owned state.

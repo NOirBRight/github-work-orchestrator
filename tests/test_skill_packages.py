@@ -198,17 +198,15 @@ class SkillPackageTests(unittest.TestCase):
         )
         self.assertTrue((package / "scripts/task_creation_lease.py").is_file())
         self.assertIn("host-wide creation singleflight", orchestrator)
-        self.assertIn("repository + issue + branch", worker_contract)
+        self.assertIn("visible-Task creation only", worker_contract)
         self.assertIn("creation_authorized: true", worker_contract)
         self.assertIn("creation_authorized: false", worker_contract)
-        self.assertIn("reserved -> invoking -> queued", worker_contract)
-        self.assertIn("retained lease from `task-materialized`", worker_contract)
-        self.assertIn("lease-free successor", worker_contract)
-        self.assertIn("exact admitted `invoking` lease", recovery)
+        self.assertIn("`creating` and `uncertain`", worker_contract)
+        self.assertIn("exact real Task identity", " ".join(worker_contract.split()))
+        self.assertIn("blocks only the visible-Worker lane", worker_contract)
+        self.assertIn("one post-restart reconciliation", recovery)
         self.assertIn("does not patch the Codex Desktop binary", worker_contract)
-        self.assertIn("creation-unknown", worker_contract)
-        self.assertIn("never makes a lease stealable", worker_contract)
-        self.assertIn("Codex host restart", recovery)
+        self.assertIn("never steal", recovery)
 
     def test_verification_policy_has_one_review_owner_and_tiered_gates(self) -> None:
         policy = (ROOT / "shared" / "verification-policy.md").read_text(
@@ -262,14 +260,40 @@ class SkillPackageTests(unittest.TestCase):
         ):
             self.assertIn(field, protocol)
 
-    def test_routine_profiles_do_not_default_to_sol_or_max(self) -> None:
+    def test_worker_profiles_use_glm_without_silent_gpt_fallback(self) -> None:
         profiles = (ROOT / "shared" / "model-profiles.md").read_text(
             encoding="utf-8"
         )
         self.assertIn("| `orchestrator` | `gpt-5.6-terra / high`", profiles)
         self.assertIn("| `architecture` | `gpt-5.6-sol / max`", profiles)
-        self.assertIn("| `standard` | `gpt-5.6-luna / high`", profiles)
-        self.assertIn("Max reasoning is not a routine default", profiles)
+        self.assertIn("| `standard` | `ollama-cloud/glm-5.2`", profiles)
+        self.assertIn("No silent GPT fallback", profiles)
+        self.assertIn("explicit `max`", profiles)
+
+    def test_orchestrator_declares_tiered_lanes_capacity_and_cleanup(self) -> None:
+        orchestrator = (
+            ROOT / "skills/github-work-orchestrator/SKILL.md"
+        ).read_text(encoding="utf-8")
+        for lane in ("Inline", "Subagent", "Visible Worker"):
+            self.assertIn(lane, orchestrator)
+        self.assertIn("three visible Workers globally", orchestrator)
+        self.assertIn("four implementation Subagents", orchestrator)
+        self.assertIn("within five minutes", orchestrator)
+        self.assertIn("event-triggered", orchestrator)
+        self.assertIn("human-owned", orchestrator)
+        self.assertIn("Never call the native Task archive action", orchestrator)
+
+    def test_canonical_glm_worker_agent_and_installer_are_packaged(self) -> None:
+        package = ROOT / "skills/github-work-orchestrator"
+        template = package / "assets/worker.toml"
+        installer = package / "scripts/install_worker_agent.py"
+        self.assertTrue(template.is_file())
+        self.assertTrue(installer.is_file())
+        text = template.read_text(encoding="utf-8")
+        self.assertIn('name = "worker"', text)
+        self.assertIn('model = "ollama-cloud/glm-5.2"', text)
+        self.assertIn('model_reasoning_effort = "max"', text)
+        self.assertNotIn("model_reasoning_effort = \"high\"", text)
 
 
 if __name__ == "__main__":

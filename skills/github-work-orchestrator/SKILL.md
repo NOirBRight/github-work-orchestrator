@@ -1,184 +1,160 @@
 ---
 name: github-work-orchestrator
-description: Orchestrate GitHub execution campaigns by aligning direction and architecture, reconciling priority, labels, and native dependencies after intake, computing the ready frontier, binding models, dispatching sidebar-visible Workers, reviewing PRs, and refilling capacity. Use when Codex must run a multi-Issue GitHub campaign, compute or refill its ready frontier, dispatch visible Workers, or arbitrate their integration.
+description: Orchestrate GitHub execution campaigns by aligning direction, reconciling Issues and dependencies, routing work across Inline, Subagent, or Visible Worker lanes, binding implementation Workers, reviewing PRs, integrating results, and cleaning completed work. Use when Codex must run a GitHub campaign, compute/refill a ready frontier, dispatch implementation, or arbitrate integration.
 ---
 
 # GitHub Work Orchestrator
 
-Keep GitHub as the only persistent work-state source. Reconstruct the current
-plan from Issues, native dependencies, assignees, linked PRs, repository policy,
-and visible Codex tasks.
+Keep GitHub as the persistent work-state source. Keep one visible Orchestrator
+per repository/activity and use the lightest safe implementation lane.
 
 ## Load the control plane
 
 Before planning or writing:
 
-1. Read every applicable `AGENTS.md` and the repository's issue-tracker,
-   label, Git-flow, testing, and release instructions.
-2. Read [GitHub state rules](references/shared/github-state-rules.md) and
-   [lifecycle](references/shared/lifecycle.md).
-3. Read [model profiles](references/shared/model-profiles.md) before selecting
-   a model.
-4. Read [verification policy](references/shared/verification-policy.md) before
-   classifying work, dispatching, or reviewing a PR.
-5. Read [communication protocol](references/shared/communication-protocol.md)
-   before dispatching, steering, or monitoring a visible task.
-6. Read [issue contract](references/shared/issue-contract.md) and
-   [reconciliation](references/reconciliation.md) before repairing Issue state.
+1. Read applicable `AGENTS.md` and repository issue, Git-flow, testing, and
+   release instructions.
+2. Read [GitHub state rules](references/shared/github-state-rules.md),
+   [lifecycle](references/shared/lifecycle.md), and
+   [model profiles](references/shared/model-profiles.md).
+3. Read [verification policy](references/shared/verification-policy.md),
+   [communication protocol](references/shared/communication-protocol.md),
+   [issue contract](references/shared/issue-contract.md), and
+   [reconciliation](references/reconciliation.md).
+4. Load [Visible Worker contract](references/worker-contract.md) only after the
+   router selects Visible Worker. Load detailed
+   [Visible Worker recovery](references/communication.md) only after a failure.
 
-Read the detailed [Worker contract](references/worker-contract.md) only when
-materializing, activating, recovering, or replacing a Worker. Read detailed
-[task-host recovery](references/communication.md) only when a Task-host failure
-actually occurs. Do not load these low-frequency references for inventory,
-frontier computation, or routine PR review.
+Repository policy overrides defaults. Do not edit Codex SQLite.
 
-Repository policy overrides this Skill's defaults. The control plane is loaded
-when the repository, integration branch, label vocabulary, and authority
-envelope are explicit.
+## Separate intake and execution
 
-## Keep intake and execution separate
+Route ordinary reports, screenshots, and rough ideas to `github-issue-intake`
+when available. The Orchestrator reconciles priority, labels, dependencies,
+direction, capacity, and integration. It may implement through Inline or a
+bounded Subagent; it no longer creates a visible Task merely because an Issue
+exists.
 
-Send routine bug reports, enhancement requests, screenshots, logs, and rough
-ideas to a persistent task using `github-issue-intake` when it is available.
-Consume only its material signals; routine drafting and duplicate-search
-updates stay in the Intake task.
+## Reconcile the frontier
 
-The Orchestrator may reconcile priority, labels, and native dependencies after
-intake. Return incomplete Issue bodies to Intake instead of publishing routine
-contract edits here. The Orchestrator does not implement production Issues. Every
-claimed Issue executes in one sidebar-visible Worker task using
-`github-issue-worker`; bounded subagents may assist analysis or review but do
-not own a GitHub work item.
-
-This boundary is complete when every active work item has exactly one visible
-owner and routine intake is outside the Orchestrator task.
-
-## Align direction
-
-Read [decision gates](references/decision-gates.md) at the start of a project,
-a new Milestone, or a campaign whose accepted direction is stale. Present an
-execution charter and material unresolved choices before the first refill.
-
-Open a discussion gate for product direction, durable architecture, public or
-persisted contracts, compatibility, security, irreversible migrations, or a
-choice that changes multiple downstream work items. Pause only the affected
-hotset and record the accepted decision in the project's existing
-authoritative source.
-
-Direction is aligned when the target outcome, non-goals, architecture
-invariants, authority envelope, and every material open choice are visible.
-
-## Reconcile and compute the frontier
-
-Run the read-only checks:
+Run:
 
 ```text
 python <skill>/scripts/validate_issue_state.py --cwd <repository>
 python <skill>/scripts/ready_frontier.py --cwd <repository> --json
 ```
 
-For an authorized orchestration run, preview deterministic corrections before
-applying them:
+Preview deterministic corrections with `reconcile_issue_state.py`, apply only
+unambiguous authorized changes, then revalidate. Recompute after merge, stop,
+accepted decision, blocker change, or released capacity.
+
+## Route the execution lane
+
+Use the deterministic router:
 
 ```text
-python <skill>/scripts/reconcile_issue_state.py --cwd <repository> \
-  --repair-safe <explicit status and dependency arguments>
+python <skill>/scripts/execution_policy.py lane \
+  --expected-minutes <n> [--same-boundary] \
+  [--restart-persistence] [--manual-ui-or-login] \
+  [--prolonged-observation] [--independent-visible-context]
 ```
 
-Review the preview, add `--apply` only for unambiguous corrections, then rerun
-the validator and frontier. Reconcile again after every merge, accepted
-decision, blocker change, Worker failure, or released slot.
+- **Inline** — small same-boundary work expected in about 15 minutes. The
+  Orchestrator keeps its GPT binding and works in an isolated worktree.
+- **Subagent** — default bounded implementation. The Orchestrator owns the
+  Issue, branch, publication, evidence, and review; one Subagent receives a
+  non-overlapping worktree/write set and returns its result.
+- **Visible Worker** — only for restart persistence, manual UI/login, prolonged
+  observation, or independently visible context.
 
-For each candidate, confirm blockers are closed, the Issue is unassigned, the
-contract is fresh-worker-ready, the expected hotset is compatible with active
-ownership, the v2 verification class/commands are explicit, architecture is
-resolved, and the model profile is explicit. Legacy active work may migrate
-incrementally without restarting.
+Every lane preserves exact base, isolated worktree, one editor, permissions,
+hotset, verification, and durable evidence. Do not turn exhausted Subagent
+capacity into a Visible Worker unless a Visible criterion independently holds.
 
-The frontier is safe when it contains only unassigned, fully specified Issues
-whose blockers are closed and whose expected write sets can run concurrently.
+## Enforce host capacity
 
-## Dispatch visible Workers
+Keep one visible Orchestrator per repository/activity, three visible Workers globally
+at most, and four implementation Subagents per Orchestrator at most, further
+bounded by actual host slots. The normal visible-Worker count is zero.
 
-1. Reconcile while the Issue remains unassigned and validate the normalized
-   dispatch payload:
+Use `execution_policy.py capacity` before admission. Recompute on material
+events only; do not poll for capacity.
 
-   ```text
-   python <skill>/scripts/validate_execution_contract.py --input <json-file>
-   ```
+All independently bound implementation Subagents and Visible Workers use
+`ollama-cloud/glm-5.2` with explicit reasoning `max`. No silent GPT
+fallback is allowed. Validate/install the canonical custom `worker` agent with:
 
-2. Before any native action that can create a Worker Task, reserve the
-   host-wide creation singleflight:
+```text
+python <skill>/scripts/install_worker_agent.py --check
+python <skill>/scripts/install_worker_agent.py --install
+```
 
-   ```text
-   python <skill>/scripts/task_creation_lease.py reserve \
-     --repository <owner/repository> --issue <number> --branch <feature-branch>
-   ```
+A binding rejection stops that lane for an explicit maintainer decision.
 
-   Keep the returned owner token and lease identity private. Call the native
-   Task-creation API only when this fresh reservation returns
-   `creation_authorized: true`, and transition the lease to `invoking` before
-   that call; an idempotent read is not a second admission. If reservation is
-   refused, do not retry or switch projects to evade the lease. Follow the
-   lease state and recovery rules in the detailed Worker contract.
-3. Follow the detailed
-   [Worker contract](references/worker-contract.md) for exact materialization,
-   preflight, claim, dispatch-comment, and edit-authorization order. Do not
-   shorten that safety sequence in prose.
-4. The dispatch payload includes verification class/commands, manual evidence,
-   architecture decision, `Review-Owner: orchestrator`, requested model,
-   verified effective-binding evidence/status, base branch and SHA, feature
-   branch, ownership/hotset, blockers, callback, and PR target.
-5. Materialize one isolated-worktree task using the two-stage flow. Send the
-   full assigned-Issue contract only after a real task ID exists, and require
-   `github-issue-worker`, the selected binding, its deterministic permission
-   preflight, and the exact Orchestrator callback task ID.
-6. Require the Worker to complete the shared
-   [delivery handshake](references/shared/communication-protocol.md#delivery-handshake)
-   before its final response.
+## Execute Inline or Subagent work
 
-If task materialization or permission preflight fails, follow the shared
-recovery rules. A subagent, hidden process, or shared directory is not a Worker
-fallback.
+Create one isolated worktree at the pinned base. Claim and read back the Issue
+before edits. For Inline, implement directly. For Subagent, provide one bounded
+task containing exact worktree, branch, hotset, acceptance, verification, model
+binding, and return format. The Subagent does not own GitHub lifecycle or
+publish independently; the Orchestrator integrates and verifies its result.
 
-Dispatch is complete when one materialized visible task owns the Issue,
-worktree, branch, callback, model binding, and verification contract.
+If a Subagent cannot use GLM-5.2, report the rejection. Do not reroute it to GPT.
 
-## Review signals and refill
+## Create a Visible Worker
 
-Process material Intake and Worker states with the shared
-[Orchestrator verification](references/shared/communication-protocol.md#orchestrator-verification)
-rules. Follow the shared
-[signal-driven monitoring](references/shared/communication-protocol.md#signal-driven-monitoring)
-cadence, including its GitHub-event recovery path when callback delivery is
-missing.
+Before the one native creation call, reserve the host-wide creation singleflight
+with a caller-generated private owner token:
 
-When a Worker is ready:
+```text
+python <skill>/scripts/task_creation_lease.py reserve \
+  --repository <owner/repository> --issue <number> --branch <feature-branch> \
+  --owner-token <private-token>
+```
 
-1. On a locally green `PR_OPENED`, verify scope, base, diff, tests, PR target,
-   accepted decisions, verification class, full-suite count, and the Worker's
-   `Review-Runs: 0` report. Start eligible gates immediately; do not wait for
-   `READY_FOR_REVIEW` merely to serialize independent work.
-2. For `fast`, perform one direct scope/acceptance review without a review
-   subagent. For `standard` or `strict`, run exactly one Orchestrator-owned
-   parallel Standards/Spec review using the review model profiles. Treat an
-   already completed in-flight formal review as that one review; do not repeat
-   it solely because this policy was adopted mid-task.
-3. Run CI observation, the one review, and safe candidate artifact/manual
-   evidence concurrently. Prefer pre-merge manual evidence so a red behavior
-   gate does not enter the integration branch.
-4. Route revisions to the same visible task. After fixes, review only the
-   changed delta and require targeted checks plus CI. Require another local
-   full suite only when the fix crosses a new repository verification boundary.
-5. Merge only after every applicable gate is green. Compare candidate and
-   integrated Git trees after merge; rebuild or repeat behavioral evidence only
-   for a tree delta, an explicit integrated-revision requirement, or a release
-   artifact acceptance gate.
-6. Serialize integration through declared hotsets.
-7. Recompute the frontier after every material event.
-8. Refill the highest-priority non-conflicting lane while authorization remains
-   active.
+Follow the [Visible Worker contract](references/worker-contract.md). Persist only
+`creating`/`uncertain`; release the guard after exact real Task identity is
+established. Prefer the owner token; after a recorded queued receipt, its exact
+native request identity is the narrow recovery capability for a materialized
+Task only. A guard failure blocks only Visible Worker creation. Inline or
+Subagent may proceed only when the router independently selects it and no other
+editor exists.
 
-Review and refill are complete when every received signal is verified once,
-every integration collision is serialized, and all free authorized capacity is
-either filled from the safe frontier or explained.
+Require the exact Orchestrator callback task ID and the
+[delivery handshake](references/shared/communication-protocol.md#delivery-handshake).
+
+## Review and integrate
+
+On a locally green candidate, start CI, review, and safe manual evidence in
+parallel. For `fast`, review directly. For `standard` or `strict`, run exactly one Orchestrator-owned
+parallel Standards/Spec review. Route revisions to the
+same owner and review only the changed delta.
+
+Merge only when applicable gates pass. Compare candidate and integrated Git trees;
+repeat evidence only for a tree delta, repository identity requirement,
+or release-artifact acceptance. Recompute the frontier after integration.
+
+Follow [signal-driven monitoring](references/shared/communication-protocol.md#signal-driven-monitoring);
+do not narrate or poll unchanged state.
+
+## Clean completed work
+
+Merge and stop events trigger cleanup; complete eligible cleanup within five minutes.
+The deadline is event-triggered, not a five-minute polling loop.
+
+Run `execution_policy.py cleanup-plan` with the exact absolute worktree path,
+merged branch name when applicable, and exact Visible Worker Task ID. Then:
+
+1. verify the editor is idle, the worktree is clean, ownership is unambiguous,
+   and work is pushed or integrated;
+2. remove the exact isolated worktree;
+3. delete only a merged local branch; and
+4. report the exact Visible Worker Task as ready for human archive.
+
+Task archiving is human-owned. Never call the native Task archive action from
+the Orchestrator: native descendant cleanup can cross a delegation boundary.
+The five-minute deadline covers eligible worktree/branch cleanup and surfacing
+the archive request, not completion of the human action.
+
+Preserve and report dirty, unpushed, ambiguous, active, or externally owned
+state. Never force-clean or modify Codex's database.

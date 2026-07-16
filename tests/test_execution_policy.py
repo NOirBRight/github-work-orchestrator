@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -28,6 +29,22 @@ CONTRACT = load_module(
     / "github-work-orchestrator"
     / "scripts"
     / "validate_execution_contract.py",
+)
+POLICY = load_module(
+    "execution_policy",
+    ROOT
+    / "skills"
+    / "github-work-orchestrator"
+    / "scripts"
+    / "execution_policy.py",
+)
+AGENT_INSTALLER = load_module(
+    "install_worker_agent",
+    ROOT
+    / "skills"
+    / "github-work-orchestrator"
+    / "scripts"
+    / "install_worker_agent.py",
 )
 PREFLIGHT = load_module(
     "worker_preflight",
@@ -57,16 +74,19 @@ def contract(**overrides):
         "base_sha": "a" * 40,
         "feature_branch": "codex/issue-7-example",
         "hotset": ["src/example.py"],
+        "execution_lane": "subagent",
         "model_profile": "standard",
-        "model_binding": "gpt-5.6-luna / high",
-        "model_binding_status": "verified",
-        "model_binding_evidence": "native-runtime-readback:example",
+        "model_binding": "ollama-cloud/glm-5.2",
+        "model_reasoning_effort": "max",
+        "model_binding_requirement": "best-effort",
+        "model_binding_status": "request-accepted",
+        "model_binding_evidence": "native-request-accepted:no-readback",
         "permission_profile": {
             "filesystem": "unrestricted",
             "network": "enabled",
             "approval": "never",
         },
-        "callback_task": "private-callback",
+        "callback_task": "019f0000-0000-7000-8000-000000000001",
         "pr_target": "dev",
     }
     value.update(overrides)
@@ -148,12 +168,82 @@ class ExecutionContractTests(unittest.TestCase):
             standard_explicit["verification_plan"]["manual_evidence"]
         )
 
-    def test_unverified_model_binding_fails_closed(self) -> None:
+    def test_rejected_model_binding_fails_closed(self) -> None:
         report = CONTRACT.validate_contract(
-            contract(model_binding_status="unverified")
+            contract(model_binding_status="rejected")
         )
         self.assertFalse(report["dispatchable"])
-        self.assertIn("model-binding-must-be-verified", report["errors"])
+        self.assertIn("model-binding-rejected", report["errors"])
+
+    def test_exact_runtime_requires_runtime_verified_binding(self) -> None:
+        report = CONTRACT.validate_contract(
+            contract(model_binding_requirement="exact-runtime")
+        )
+        self.assertFalse(report["dispatchable"])
+        self.assertIn("exact-runtime-binding-not-verified", report["errors"])
+
+    def test_implementation_worker_cannot_silently_fall_back_to_gpt(self) -> None:
+        report = CONTRACT.validate_contract(
+            contract(
+                model_binding="gpt-5.6-terra",
+                model_reasoning_effort="high",
+            )
+        )
+        self.assertFalse(report["dispatchable"])
+        self.assertIn("implementation-worker-must-use-glm-5.2", report["errors"])
+
+    def test_glm_reasoning_must_be_explicit_max(self) -> None:
+        omitted = contract()
+        omitted.pop("model_reasoning_effort")
+        explicit_none = contract(model_reasoning_effort="none")
+        explicit_max = contract(model_reasoning_effort="max")
+        omitted_report = CONTRACT.validate_contract(omitted)
+        self.assertFalse(omitted_report["dispatchable"])
+        self.assertIn("glm-reasoning-must-be-max", omitted_report["errors"])
+        self.assertFalse(
+            CONTRACT.validate_contract(explicit_none)["dispatchable"]
+        )
+        self.assertTrue(CONTRACT.validate_contract(explicit_max)["dispatchable"])
+
+    def test_inline_lane_keeps_the_orchestrator_gpt_binding(self) -> None:
+        report = CONTRACT.validate_contract(
+            contract(
+                execution_lane="inline",
+                model_profile="orchestrator",
+                model_binding="gpt-5.6-terra",
+                model_reasoning_effort="high",
+                model_binding_status="runtime-verified",
+            )
+        )
+        self.assertTrue(report["dispatchable"], report["errors"])
+
+    def test_lane_profile_and_visible_callback_must_match_policy(self) -> None:
+        wrong_worker_profile = CONTRACT.validate_contract(
+            contract(model_profile="orchestrator")
+        )
+        wrong_inline_profile = CONTRACT.validate_contract(
+            contract(
+                execution_lane="inline",
+                model_profile="architecture",
+                model_binding="gpt-5.6-sol",
+                model_reasoning_effort="max",
+                model_binding_status="runtime-verified",
+            )
+        )
+        invalid_callback = CONTRACT.validate_contract(
+            contract(execution_lane="visible-worker", callback_task="not-a-task-id")
+        )
+        self.assertIn(
+            "invalid-implementation-worker-profile",
+            wrong_worker_profile["errors"],
+        )
+        self.assertIn("inline-lane-must-use-orchestrator-profile", wrong_inline_profile["errors"])
+        self.assertIn("inline-lane-must-keep-orchestrator-gpt", wrong_inline_profile["errors"])
+        self.assertIn(
+            "inline-lane-must-keep-orchestrator-reasoning",
+            wrong_inline_profile["errors"],
+        )
+        self.assertIn("visible-worker-callback-task-invalid", invalid_callback["errors"])
 
     def test_missing_model_binding_evidence_fails_closed(self) -> None:
         report = CONTRACT.validate_contract(contract(model_binding_evidence=""))
@@ -168,6 +258,156 @@ class ExecutionContractTests(unittest.TestCase):
         self.assertFalse(ordinary["local_full_suite"])
         self.assertTrue(boundary["local_full_suite"])
         self.assertEqual("delta-only", ordinary["orchestrator_review"])
+
+
+class ExecutionLanePolicyTests(unittest.TestCase):
+    def test_small_same_boundary_change_routes_inline(self) -> None:
+        report = POLICY.classify_execution_lane(
+            expected_minutes=15,
+            same_boundary=True,
+        )
+        self.assertEqual("inline", report["lane"])
+
+    def test_bounded_implementation_defaults_to_subagent(self) -> None:
+        report = POLICY.classify_execution_lane(
+            expected_minutes=45,
+            same_boundary=False,
+        )
+        self.assertEqual("subagent", report["lane"])
+
+    def test_persistent_or_human_work_routes_visible(self) -> None:
+        cases = (
+            {"restart_persistence": True},
+            {"manual_ui_or_login": True},
+            {"prolonged_observation": True},
+            {"independent_visible_context": True},
+        )
+        for requirement in cases:
+            with self.subTest(requirement=requirement):
+                report = POLICY.classify_execution_lane(
+                    expected_minutes=5,
+                    same_boundary=True,
+                    **requirement,
+                )
+                self.assertEqual("visible-worker", report["lane"])
+
+    def test_capacity_enforces_one_three_four_and_host_slots(self) -> None:
+        report = POLICY.capacity_report(
+            visible_orchestrators_for_activity=1,
+            visible_workers_global=3,
+            active_subagents=2,
+            host_subagent_slots=3,
+        )
+        self.assertFalse(report["can_add_orchestrator"])
+        self.assertFalse(report["can_add_visible_worker"])
+        self.assertTrue(report["can_add_subagent"])
+        self.assertEqual(1, report["subagent_slots_remaining"])
+        capped = POLICY.capacity_report(
+            visible_orchestrators_for_activity=0,
+            visible_workers_global=0,
+            active_subagents=4,
+            host_subagent_slots=20,
+        )
+        self.assertFalse(capped["can_add_subagent"])
+        self.assertEqual(4, capped["effective_subagent_limit"])
+
+    def test_cleanup_is_event_triggered_and_fail_closed(self) -> None:
+        worktree = str((ROOT / "task-worktree").resolve())
+        task_id = "019f0000-0000-7000-8000-000000000007"
+        eligible = POLICY.cleanup_plan(
+            event="merged",
+            seconds_since_event=120,
+            worktree=worktree,
+            branch="codex/issue-7-example",
+            visible_task_id=task_id,
+            worktree_clean=True,
+            durable=True,
+            ownership_unambiguous=True,
+            active_editor=False,
+            branch_merged=True,
+            visible_worker=True,
+        )
+        self.assertEqual("eligible", eligible["status"])
+        self.assertEqual(300, eligible["deadline_seconds"])
+        self.assertEqual(
+            [
+                {"action": "remove-worktree", "target": worktree},
+                {
+                    "action": "delete-merged-local-branch",
+                    "target": "codex/issue-7-example",
+                },
+                {
+                    "action": "request-human-visible-task-archive",
+                    "target": task_id,
+                },
+            ],
+            eligible["actions"],
+        )
+        self.assertEqual(
+            eligible,
+            POLICY.cleanup_plan(
+                event="merged",
+                seconds_since_event=120,
+                worktree=worktree,
+                branch="codex/issue-7-example",
+                visible_task_id=task_id,
+                worktree_clean=True,
+                durable=True,
+                ownership_unambiguous=True,
+                active_editor=False,
+                branch_merged=True,
+                visible_worker=True,
+            ),
+        )
+        self.assertNotIn(
+            "archive-visible-task",
+            [action["action"] for action in eligible["actions"]],
+        )
+        self.assertFalse(eligible["automatic_task_archive"])
+        protected = POLICY.cleanup_plan(
+            event="stopped",
+            seconds_since_event=301,
+            worktree=worktree,
+            branch=None,
+            visible_task_id=task_id,
+            worktree_clean=False,
+            durable=False,
+            ownership_unambiguous=True,
+            active_editor=False,
+            branch_merged=False,
+            visible_worker=True,
+        )
+        self.assertEqual("protected", protected["status"])
+        self.assertIn("worktree-not-clean", protected["blockers"])
+        self.assertIn("work-not-durable", protected["blockers"])
+        with self.assertRaisesRegex(ValueError, "absolute path"):
+            POLICY.cleanup_plan(
+                event="merged",
+                seconds_since_event=0,
+                worktree="relative-worktree",
+                branch=None,
+                visible_task_id=None,
+                worktree_clean=True,
+                durable=True,
+                ownership_unambiguous=True,
+                active_editor=False,
+                branch_merged=False,
+                visible_worker=False,
+            )
+        with self.assertRaisesRegex(ValueError, "exact Task ID"):
+            POLICY.cleanup_plan(
+                event="merged",
+                seconds_since_event=0,
+                worktree=worktree,
+                branch=None,
+                visible_task_id="not-a-task-id",
+                worktree_clean=True,
+                durable=True,
+                ownership_unambiguous=True,
+                active_editor=False,
+                branch_merged=False,
+                visible_worker=True,
+            )
 
 
 class WorkerPreflightTests(unittest.TestCase):
@@ -229,6 +469,34 @@ class WorkerPreflightTests(unittest.TestCase):
         self.assertEqual("timed-out", raised.exception.reason)
 
 
+class WorkerAgentInstallerTests(unittest.TestCase):
+    def test_template_installs_idempotently_with_qualified_max(self) -> None:
+        report = AGENT_INSTALLER.validate_agent(AGENT_INSTALLER.template_path())
+        self.assertEqual("worker", report["name"])
+        self.assertEqual("ollama-cloud/glm-5.2", report["model"])
+        self.assertEqual("max", report["reasoning"])
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "agents"
+            installed = AGENT_INSTALLER.install_agent(
+                AGENT_INSTALLER.template_path(), target
+            )
+            repeated = AGENT_INSTALLER.install_agent(
+                AGENT_INSTALLER.template_path(), target
+            )
+            self.assertEqual("installed", installed["status"])
+            self.assertEqual("already-current", repeated["status"])
+
+    def test_existing_different_worker_requires_explicit_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "agents"
+            target.mkdir()
+            (target / "worker.toml").write_text("name = 'different'\n", encoding="utf-8")
+            with self.assertRaises(AGENT_INSTALLER.AgentConfigError):
+                AGENT_INSTALLER.install_agent(
+                    AGENT_INSTALLER.template_path(), target
+                )
+
+
 class SignalFormatterTests(unittest.TestCase):
     def worker_payload(self):
         return {
@@ -262,6 +530,23 @@ class SignalFormatterTests(unittest.TestCase):
             "worker-review-runs-must-be-zero",
             WORKER_SIGNAL.validate_signal(payload),
         )
+
+    def test_activation_signals_are_supported_with_exact_task_ids(self) -> None:
+        payload = {
+            "state": "WORKER_BOOTED",
+            "issue": "#7",
+            "task_id": "019f0000-0000-7000-8000-000000000007",
+            "callback_task": "019f0000-0000-7000-8000-000000000001",
+            "evidence": "native Task identity read back",
+        }
+        rendered = WORKER_SIGNAL.render_signal(payload)
+        self.assertIn("State: WORKER_BOOTED", rendered)
+        self.assertEqual([], WORKER_SIGNAL.validate_signal(payload))
+        payload["state"] = "PREFLIGHT_READY"
+        payload["evidence"] = "read-only preflight passed"
+        self.assertIn("State: PREFLIGHT_READY", WORKER_SIGNAL.render_signal(payload))
+        payload["callback_task"] = "not-a-task-id"
+        self.assertIn("invalid-callback-task", WORKER_SIGNAL.validate_signal(payload))
 
     def test_intake_signal_is_stable(self) -> None:
         payload = {

@@ -1,58 +1,28 @@
 # Cross-role communication protocol
 
-Use native Codex task messaging for material transitions and GitHub for durable
-work state. A callback is a wake-up signal, not a second project ledger.
-
-## Contents
-
-- [Addressing](#addressing)
-- [Delivery handshake](#delivery-handshake)
-- [Intake signals](#intake-signals)
-- [Worker signals](#worker-signals)
-- [Orchestrator verification](#orchestrator-verification)
-- [Signal-driven monitoring](#signal-driven-monitoring)
-
-## Addressing
-
-The Orchestrator supplies its exact task ID privately in every Intake or Worker
-contract. Keep callback IDs, sender task IDs, local worktree paths, credentials,
-and private machine details out of GitHub.
-
-The sender keeps its current model and reasoning settings when messaging the
-callback. It does not create a replacement Orchestrator task when the callback
-is unavailable.
+Use native Codex messaging for material Visible Worker transitions and GitHub
+for durable work state. Inline work stays in the Orchestrator. Subagents return
+through the parent collaboration channel and do not create a project ledger.
 
 ## Delivery handshake
 
-Every material signal uses a stable `Signal-ID` and this sequence:
+Every Visible Worker signal uses a stable `Signal-ID`:
 
-1. Build the complete role-specific envelope below.
-2. Call native `send_message_to_thread` with the exact callback task ID before
-   writing the sender's final response.
-3. A final answer in the Worker task is not callback delivery. The same rule
-   applies to an Intake task; writing signal words only in its own final answer
-   does not wake the Orchestrator.
-4. Treat a successful native tool result as the transport receipt
-   `SIGNAL_RECEIVED <Signal-ID>`. Do not resend after success.
-5. On a transport error, make at most one retry with the same `Signal-ID` and
-   identical material state. If that retry fails, write
-   `CALLBACK_DELIVERY_FAILED <Signal-ID>` in the sender's final response and
-   leave the full evidence in the visible task and authorized GitHub artifacts.
+1. Build the complete envelope below.
+2. Call native `send_message_to_thread` with the exact Orchestrator callback
+   before the sender's final response.
+3. A final answer in the Worker task is not callback delivery.
+4. A successful tool result is the receipt `SIGNAL_RECEIVED <Signal-ID>`; do
+   not resend it.
+5. On transport error, retry once with the identical envelope. After another
+   failure, record `CALLBACK_DELIVERY_FAILED <Signal-ID>` and stop cleanly.
 
-The Orchestrator deduplicates by `Signal-ID`, verifies the signal against the
-sender task and GitHub, and processes it once. A transport receipt proves only
-that the callback was queued; it does not authorize lifecycle, merge, or
-scheduling changes.
-
-If native reverse messaging is unavailable, record the delivery failure and
-stop cleanly. Do not use an Issue comment as a hidden callback channel unless
-the execution contract explicitly authorized that comment.
+Keep callback IDs, Task/Subagent IDs, worktree paths, owner tokens, credentials,
+and private machine details out of GitHub.
 
 ## Intake signals
 
-Use the Intake package's `scripts/intake_signal.py` to validate the payload and
-generate a retry-stable `Signal-ID`. Send exactly one signal after a material
-intake outcome; the following is the script's canonical output:
+Use the Intake package's signal formatter and send one material state:
 
 ```text
 INTAKE_SIGNAL
@@ -64,23 +34,11 @@ INTAKE_SIGNAL
 - Next action: <concise Orchestrator or maintainer action>
 ```
 
-Use:
+Routine search, drafting, and progress remain in the Intake task.
 
-| State | Material outcome |
-|---|---|
-| `ISSUE_READY` | A published Issue passed readback and is ready for orchestration reconciliation |
-| `DUPLICATE` | An existing Issue owns the same outcome and scope |
-| `NEEDS_INFO` | A named missing fact prevents a truthful ready contract |
-| `DISCUSSION_REQUIRED` | Direction, durable architecture, compatibility, security/privacy, or priority ambiguity requires an owner |
+## Visible Worker signals
 
-Routine search, drafting, and diagnostic progress remains in the Intake task.
-
-## Worker signals
-
-Use the Worker package's `scripts/worker_signal.py` to validate metrics and
-generate a retry-stable `Signal-ID`. Send each state once per material
-transition. Reuse a state only when its payload materially changes; the script
-then generates a new ID. The following is its canonical output:
+Use the Worker package's formatter:
 
 ```text
 WORKER_SIGNAL
@@ -100,64 +58,46 @@ WORKER_SIGNAL
 - Blocker/next action: <concise request or handoff>
 ```
 
-For `DISCUSSION_REQUIRED`, replace the last line with:
+For `DISCUSSION_REQUIRED`, provide one decision, options, recommendation, and
+safe work. `PR_OPENED` follows the locally green candidate immediately so CI,
+formal review, and safe candidate evidence can run in parallel.
 
-```text
-- Decision: <one precise choice>
-- Options: <A/B/C with concrete tradeoffs>
-- Recommendation: <preferred path and why>
-- Safe work: <what may continue while waiting>
-```
+`Review-Runs` stays zero because formal review belongs to the Orchestrator.
 
-Use:
+## Inline and Subagent results
 
-| State | Material transition |
-|---|---|
-| `DISCUSSION_REQUIRED` | A decision exceeds the Worker's accepted authority |
-| `BLOCKED` | Progress requires new authority, permissions, evidence, an upstream merge, or resolution of a proven write-set collision |
-| `PR_OPENED` | One locally green candidate is pushed and a PR exists; send immediately so CI, review, and candidate evidence can run in parallel |
-| `READY_FOR_REVIEW` | Assigned scope and required verification are ready for Orchestrator review |
-| `STOPPED` | The Worker ends without a reviewable result or hands ownership back |
-
-Do not include secrets, raw private traces, user content, or local paths. Keep
-detailed output in the sender task or authorized PR artifacts.
-
-`Review-Runs` is always `0` in a Worker signal because formal review belongs to
-the Orchestrator. The Orchestrator records its own review count when verifying
-or integrating the PR. Do not repeat unchanged timing or verification data in
-routine chatter.
+Inline work records candidate evidence directly. A Subagent receives one
+bounded prompt with exact worktree/write boundaries and returns outcome,
+changed paths, checks, and blockers to its parent. The Orchestrator verifies and
+publishes the result. Do not use a GitHub comment as a hidden Subagent callback
+or let a Subagent spawn a second work item.
 
 ## Orchestrator verification
 
-On a new signal:
+On a material result:
 
-1. Read the sender task once.
-2. Verify the Issue, assignee, branch, commit, PR, checks, and hotset in GitHub.
-3. Apply only changes within the Orchestrator's authority.
-4. Send revisions or accepted decisions back to the same visible task.
-5. Recompute the frontier after completion, merge, blocker change, or released
-   capacity.
+1. Verify the Issue, owner, branch, commit, PR, checks, and hotset.
+2. Apply only changes within Orchestrator authority.
+3. Send revisions to the same lane owner.
+4. Recompute capacity after completion, merge, stop, blocker change, or released
+   slot.
+5. Trigger safe cleanup after merge/stop.
 
-Signal delivery never implies permission to merge, close, unassign, reprioritize,
-or start another work item.
+Delivery never implies permission to merge, close, unassign, reprioritize, or
+start another work item.
 
 ## Signal-driven monitoring
 
-Prefer signals and GitHub events over polling. After reliable task
-materialization and permission preflight:
+Prefer callbacks and GitHub events over polling:
 
-- Read the same active Worker for ordinary progress only after a material
-  signal.
-- When reverse delivery is absent, keep fallback reads at least ten minutes
-  apart.
-- Permit one immediate verification read after an explicit maintainer status
-  request, declared command/test deadline, recovery operation, or GitHub state
-  transition such as a new PR, check completion, push, or merge.
-- During two-stage materialization, poll only enough to distinguish a real task
-  and completed bootstrap from a client-side stub. Allow one read after the
-  full contract to verify permission preflight.
-- Report only material transitions; do not relay unchanged reasoning, file
-  edits, or minute-by-minute test status.
+- Obtain at most one normalized Task-list snapshot per material event.
+- Read an individual Visible Worker after a signal, relevant GitHub transition,
+  declared deadline, recovery action, or explicit maintainer request.
+- When reverse delivery is unavailable, keep ordinary fallback reads at least ten minutes apart.
+- Permit one bounded creation/recovery read only where the Visible Worker
+  contract requires it.
+- Report material transitions only; do not relay unchanged status or verbose
+  tool output.
 
-The ten-minute floor does not apply to bootstrap materialization, one bounded
-recovery wait, or verification triggered by a new signal or GitHub event.
+The five-minute cleanup deadline is event-triggered and does not authorize a
+new polling loop.
