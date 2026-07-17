@@ -11,7 +11,7 @@ from typing import Any
 
 
 ROLE_CATEGORIES = {"impl", "ui", "research", "planning", "audit"}
-SELECTOR_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*/[^/\s]+$", re.IGNORECASE)
+SELECTOR_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*/\S+$", re.IGNORECASE)
 
 
 class ProviderPolicyError(RuntimeError):
@@ -51,7 +51,7 @@ def resolve_provider(
         raise ProviderPolicyError(f"no provider configured for role category {role_category}")
 
     if not SELECTOR_RE.fullmatch(selector):
-        raise ProviderPolicyError("provider selector must be <provider>/<model>")
+        raise ProviderPolicyError("provider selector must be <provider>/<model-id>")
     provider = selector.split("/", 1)[0]
     if provider not in available_providers:
         raise ProviderPolicyError(f"configured provider is unavailable: {provider}")

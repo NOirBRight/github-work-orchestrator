@@ -251,10 +251,10 @@ class ProviderPolicyTests(unittest.TestCase):
     def test_role_preference_is_resolved_without_hardcoded_provider(self) -> None:
         report = PROVIDERS.resolve_provider(
             role_category="impl",
-            preferences={"providers": {"impl": "provider-a/model-x"}},
+            preferences={"providers": {"impl": "provider-a/namespace/model-x"}},
             available_providers={"provider-a", "provider-b"},
         )
-        self.assertEqual("provider-a/model-x", report["selector"])
+        self.assertEqual("provider-a/namespace/model-x", report["selector"])
         self.assertEqual("orchestration-preferences", report["source"])
 
     def test_explicit_override_wins_and_unavailable_provider_fails(self) -> None:
