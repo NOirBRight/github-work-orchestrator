@@ -11,7 +11,7 @@ from typing import Any
 
 
 ROLE_CATEGORIES = {"impl", "ui", "research", "planning", "audit"}
-SELECTOR_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*/\S+$", re.IGNORECASE)
+SELECTOR_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*/[^/\s]+(?:/[^/\s]+)*$", re.IGNORECASE)
 
 
 class ProviderPolicyError(RuntimeError):

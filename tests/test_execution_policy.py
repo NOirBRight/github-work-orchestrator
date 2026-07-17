@@ -280,6 +280,23 @@ class ProviderPolicyTests(unittest.TestCase):
                 available_providers={"provider-a"},
             )
 
+    def test_malformed_selectors_fail_closed(self) -> None:
+        malformed = [
+            "provider-a",
+            "provider-a/",
+            "provider-a/model x",
+            "provider-a//model-x",
+            "provider-a/ns/model-x/",
+        ]
+        for selector in malformed:
+            with self.subTest(selector=selector):
+                with self.assertRaisesRegex(PROVIDERS.ProviderPolicyError, "must be"):
+                    PROVIDERS.resolve_provider(
+                        role_category="impl",
+                        preferences={"providers": {"impl": selector}},
+                        available_providers={"provider-a"},
+                    )
+
 
 class FakeRoomRunner:
     def __init__(self):
