@@ -27,12 +27,24 @@ ACTIVE_LABELS = {
 }
 CONTRACT_FIELDS = (
     "Execution-Contract",
+    "Execution-Mode",
+    "Agent-Role",
+    "Role-Category",
+    "Integration-Branch",
+    "Done-When",
     "Verification-Class",
     "Verification-Commands",
     "Manual-Evidence",
     "Architecture-Decision",
     "Review-Owner",
 )
+ROLE_CATEGORIES = {
+    "orchestrator": {"planning"},
+    "intake": {"research"},
+    "implementation": {"impl", "ui"},
+    "review": {"audit"},
+    "monitor": {"audit"},
+}
 
 
 def parse_contract_fields(body: str) -> dict[str, str]:
@@ -52,12 +64,16 @@ def execution_contract_findings(issue: dict[str, Any]) -> list[dict[str, Any]]:
                 "warning",
                 issue,
                 "legacy-execution-contract",
-                "ready Issue has no Execution-Contract: v2 metadata",
+                "ready Issue has no Execution-Contract: v3 metadata",
             )
         ]
     findings: list[dict[str, Any]] = []
     expected = {
-        "Execution-Contract": {"v2"},
+        "Execution-Contract": {"v3"},
+        "Execution-Mode": {"inline", "paseo-agent"},
+        "Agent-Role": {"orchestrator", "intake", "implementation", "review", "monitor"},
+        "Role-Category": {"planning", "research", "impl", "ui", "audit"},
+        "Integration-Branch": {"dev"},
         "Verification-Class": {"fast", "standard", "strict"},
         "Architecture-Decision": {"resolved", "discussion-required"},
         "Review-Owner": {"orchestrator"},
@@ -69,7 +85,7 @@ def execution_contract_findings(issue: dict[str, Any]) -> list[dict[str, Any]]:
                     "error",
                     issue,
                     "missing-execution-field",
-                    f"v2 execution contract is missing {name}",
+                    f"v3 execution contract is missing {name}",
                 )
             )
     for name, allowed in expected.items():
@@ -83,6 +99,17 @@ def execution_contract_findings(issue: dict[str, Any]) -> list[dict[str, Any]]:
                     f"{name} has unsupported value {value!r}",
                 )
             )
+    role = fields.get("Agent-Role")
+    category = fields.get("Role-Category")
+    if role in ROLE_CATEGORIES and category not in ROLE_CATEGORIES[role]:
+        findings.append(
+            finding(
+                "error",
+                issue,
+                "role-category-mismatch",
+                f"Role-Category {category!r} is invalid for Agent-Role {role!r}",
+            )
+        )
     if fields.get("Architecture-Decision") == "discussion-required":
         findings.append(
             finding(

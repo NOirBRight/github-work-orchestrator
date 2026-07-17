@@ -1,6 +1,6 @@
 ---
 name: github-work-orchestrator
-description: Orchestrate GitHub execution campaigns by aligning direction, reconciling Issues and dependencies, routing work across Inline, Subagent, or Visible Worker lanes, binding implementation Workers, reviewing PRs, integrating results, and cleaning completed work. Use when Codex must run a GitHub campaign, compute/refill a ready frontier, dispatch implementation, or arbitrate integration.
+description: Orchestrate GitHub execution campaigns through provider-neutral Paseo Agents, campaign rooms, isolated worktrees, review, integration, recovery, and cleanup. Use when an agent must reconcile a GitHub frontier, dispatch implementation, coordinate cross-provider work, or arbitrate integration.
 ---
 
 # Compatibility entry point

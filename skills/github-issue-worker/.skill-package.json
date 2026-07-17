@@ -1,6 +1,6 @@
 {
-  "content_sha256": "b0210ab5d5e0ddebbd38c64aa7ea8d79e9b5d51c6e0bc1e3101cddde875d3bff",
+  "content_sha256": "1e748276db44eea04535a74d59f83cd8e9ab70804fd0b618502620b2af384d07",
   "schema_version": 1,
   "skill": "github-issue-worker",
-  "version": "2.3.0"
+  "version": "3.0.0"
 }

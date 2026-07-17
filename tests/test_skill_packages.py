@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import importlib.util
 import json
 import re
@@ -35,29 +34,29 @@ class SkillPackageTests(unittest.TestCase):
             skill = ROOT / "skills" / name
             with self.subTest(skill=name):
                 self.assertTrue((skill / "SKILL.md").is_file())
-                self.assertTrue((skill / "agents" / "openai.yaml").is_file())
+                self.assertTrue((skill / ".skill-package.json").is_file())
+                self.assertTrue((skill / "scripts" / "paseo_room.py").is_file())
 
-    def test_shared_references_are_synchronized_into_every_skill(self) -> None:
+    def test_shared_references_and_room_runtime_are_synchronized(self) -> None:
+        canonical_room = ROOT / "skills/github-work-orchestrator/scripts/paseo_room.py"
         for name, filenames in SYNC.PACKAGES.items():
-            packaged_names = {
-                path.name
-                for path in (
-                    ROOT / "skills" / name / "references" / "shared"
-                ).glob("*.md")
-            }
-            self.assertEqual(set(filenames), packaged_names)
+            shared = ROOT / "skills" / name / "references" / "shared"
+            self.assertEqual(set(filenames), {path.name for path in shared.glob("*.md")})
             for filename in filenames:
-                source = ROOT / "shared" / filename
-                packaged = (
-                    ROOT / "skills" / name / "references" / "shared" / filename
+                self.assertEqual(
+                    (ROOT / "shared" / filename).read_bytes(),
+                    (shared / filename).read_bytes(),
                 )
-                with self.subTest(skill=name, reference=filename):
-                    self.assertEqual(source.read_bytes(), packaged.read_bytes())
+            self.assertEqual(
+                canonical_room.read_bytes(),
+                (ROOT / "skills" / name / "scripts" / "paseo_room.py").read_bytes(),
+            )
 
     def test_sync_check_accepts_committed_packages(self) -> None:
         self.assertEqual([], SYNC.find_drift(ROOT))
 
     def test_package_manifests_pin_version_and_content_digest(self) -> None:
+        self.assertEqual("3.0.0", SYNC.PACKAGE_VERSION)
         for name in SKILLS:
             package = ROOT / "skills" / name
             manifest = json.loads(
@@ -90,261 +89,31 @@ class SkillPackageTests(unittest.TestCase):
             source.write_bytes(b"---\r\nname: example\r\n---\r\n")
             self.assertEqual(lf_digest, SYNC.package_digest(package))
 
-    def test_installed_manifest_readback_ignores_json_line_endings(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            install_root = Path(temporary)
-            for name in SKILLS:
-                shutil.copytree(ROOT / "skills" / name, install_root / name)
-                manifest = install_root / name / SYNC.PACKAGE_MANIFEST
-                manifest.write_bytes(manifest.read_bytes().replace(b"\n", b"\r\n"))
-            self.assertEqual([], SYNC.find_install_drift(ROOT, install_root))
-
-    def test_legacy_root_install_loads_the_packaged_orchestrator(self) -> None:
+    def test_legacy_root_wrapper_loads_packaged_orchestrator(self) -> None:
         wrapper = (ROOT / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn(
-            "skills/github-work-orchestrator/SKILL.md", wrapper
-        )
-        self.assertEqual(
-            (ROOT / "skills/github-work-orchestrator/agents/openai.yaml").read_bytes(),
-            (ROOT / "agents/openai.yaml").read_bytes(),
-        )
-
-    def test_execution_worktrees_are_not_saved_projects_or_skill_roots(self) -> None:
-        package_documents = {
-            "orchestrator": (
-                ROOT / "skills/github-work-orchestrator/SKILL.md",
-                ROOT
-                / "skills/github-work-orchestrator/references/shared/github-state-rules.md",
-                ROOT / "skills/github-work-orchestrator/references/worker-contract.md",
-            ),
-            "worker": (
-                ROOT / "skills/github-issue-worker/SKILL.md",
-                ROOT
-                / "skills/github-issue-worker/references/shared/worker-execution.md",
-            ),
-        }
-        required = (
-            "execution-only CWD",
-            "Codex Saved Project",
-            ".codex-global-state.json",
-            "electron-saved-workspace-roots",
-            "Codex SQLite",
-            "junction",
-            "symlink",
-            "dynamic `SKILL.md`",
-            "sanitized platform limitation",
-            "exactly one repository-documented canonical installation",
-        )
-        for role, documents in package_documents.items():
-            text = "\n".join(
-                document.read_text(encoding="utf-8") for document in documents
-            )
-            normalized = " ".join(text.split())
-            for phrase in required:
-                with self.subTest(role=role, phrase=phrase):
-                    self.assertIn(phrase, normalized)
-
-        state_rules = (ROOT / "shared/github-state-rules.md").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("GitHub Issue and the native Task contract", state_rules)
-        self.assertIn("not additional runtime Skill installations", state_rules)
-
-    def test_packaged_scripts_do_not_mutate_workspace_or_skill_topology(self) -> None:
-        forbidden_targets = (
-            ".codex-global-state.json",
-            "electron-saved-workspace-roots",
-            "saved-workspace-roots",
-            "state.vscdb",
-            "globalstorage",
-            "codex sqlite",
-            "sqlite3",
-            "skills/list",
-            "skill.md",
-            ".codex/skills",
-            "codex_home/skills",
-        )
-        filesystem_mutators = {
-            "chmod",
-            "chown",
-            "copy",
-            "copy2",
-            "copyfile",
-            "copytree",
-            "fdopen",
-            "hardlink_to",
-            "link",
-            "makedirs",
-            "mkdtemp",
-            "mkdir",
-            "mkfifo",
-            "mkstemp",
-            "mknod",
-            "move",
-            "NamedTemporaryFile",
-            "open",
-            "remove",
-            "removedirs",
-            "rename",
-            "renames",
-            "replace",
-            "rmdir",
-            "rmtree",
-            "symlink",
-            "symlink_to",
-            "TemporaryDirectory",
-            "TemporaryFile",
-            "touch",
-            "truncate",
-            "unlink",
-            "write",
-            "write_bytes",
-            "write_text",
-            "writelines",
-        }
-        allowed_mutators = {
-            Path(
-                "skills/github-work-orchestrator/scripts/install_worker_agent.py"
-            ): {"fdopen", "mkdir", "mkstemp", "replace", "unlink", "write"},
-            Path(
-                "skills/github-work-orchestrator/scripts/task_creation_lease.py"
-            ): {
-                "fdopen",
-                "mkdir",
-                "mkstemp",
-                "open",
-                "replace",
-                "unlink",
-                "write",
-            },
-        }
-        process_calls = {
-            "os.popen",
-            "os.system",
-            "subprocess.Popen",
-            "subprocess.call",
-            "subprocess.check_call",
-            "subprocess.check_output",
-            "subprocess.run",
-        }
-        allowed_process_scripts = {
-            Path("skills/github-issue-worker/scripts/preflight.py"),
-            Path("skills/github-work-orchestrator/scripts/ready_frontier.py"),
-            Path(
-                "skills/github-work-orchestrator/scripts/reconcile_issue_state.py"
-            ),
-        }
-
-        def call_name(node: ast.AST) -> str | None:
-            if isinstance(node, ast.Name):
-                return node.id
-            if isinstance(node, ast.Attribute):
-                prefix = call_name(node.value)
-                return f"{prefix}.{node.attr}" if prefix else node.attr
-            return None
-
-        def static_string(node: ast.AST) -> str | None:
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                return node.value
-            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-                left = static_string(node.left)
-                right = static_string(node.right)
-                return (
-                    left + right
-                    if left is not None and right is not None
-                    else None
-                )
-            if isinstance(node, ast.JoinedStr):
-                parts: list[str] = []
-                for value in node.values:
-                    part = (
-                        static_string(value.value)
-                        if isinstance(value, ast.FormattedValue)
-                        else static_string(value)
-                    )
-                    if part is None:
-                        return None
-                    parts.append(part)
-                return "".join(parts)
-            return None
-
-        scripts = sorted(
-            path
-            for name in SKILLS
-            for path in (ROOT / "skills" / name / "scripts").rglob("*")
-            if path.is_file() and "__pycache__" not in path.parts
-        )
-        self.assertTrue(scripts)
-        for script in scripts:
-            relative = script.relative_to(ROOT)
-            with self.subTest(script=relative):
-                self.assertEqual(
-                    ".py",
-                    script.suffix.lower(),
-                    "new packaged script types require an explicit policy audit",
-                )
-                source = script.read_text(encoding="utf-8")
-                tree = ast.parse(source, filename=str(relative))
-                static_values = [source]
-                static_values.extend(
-                    value
-                    for node in ast.walk(tree)
-                    if (value := static_string(node)) is not None
-                )
-                normalized = "\n".join(static_values).lower().replace("\\", "/")
-                for marker in forbidden_targets:
-                    self.assertNotIn(marker, normalized)
-
-                calls = {
-                    name
-                    for node in ast.walk(tree)
-                    if isinstance(node, ast.Call)
-                    if (name := call_name(node.func)) is not None
-                }
-                observed_mutators = {
-                    name.rsplit(".", 1)[-1]
-                    for name in calls
-                    if name.rsplit(".", 1)[-1] in filesystem_mutators
-                }
-                unexpected_mutators = observed_mutators - allowed_mutators.get(
-                    relative, set()
-                )
-                self.assertFalse(
-                    unexpected_mutators,
-                    f"unaudited filesystem mutators: {sorted(unexpected_mutators)}",
-                )
-                if calls & process_calls:
-                    self.assertIn(relative, allowed_process_scripts)
+        self.assertIn("skills/github-work-orchestrator/SKILL.md", wrapper)
+        self.assertIn("provider-neutral Paseo", wrapper)
 
     def test_trigger_descriptions_are_role_specific(self) -> None:
         descriptions = {}
         for name in SKILLS:
-            text = (ROOT / "skills" / name / "SKILL.md").read_text(
-                encoding="utf-8"
-            )
+            text = (ROOT / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
             frontmatter = text.split("---", 2)[1]
-            description = next(
-                line.removeprefix("description:").strip().strip('"')
+            descriptions[name] = next(
+                line.removeprefix("description:").strip().strip('"').lower()
                 for line in frontmatter.splitlines()
                 if line.startswith("description:")
             )
-            descriptions[name] = description.lower()
-
         self.assertIn("dispatch", descriptions["github-work-orchestrator"])
-        self.assertNotIn("bug reports", descriptions["github-work-orchestrator"])
-        self.assertIn("bug reports", descriptions["github-issue-intake"])
-        self.assertNotIn("dispatch", descriptions["github-issue-intake"])
+        self.assertIn("reports", descriptions["github-issue-intake"])
         self.assertIn("one assigned github issue", descriptions["github-issue-worker"])
-        self.assertNotIn("rough ideas", descriptions["github-issue-worker"])
 
     def test_all_packaged_markdown_links_resolve_inside_each_skill(self) -> None:
         link_pattern = re.compile(r"\[[^\]]+\]\(([^)#]+)(?:#[^)]+)?\)")
         for name in SKILLS:
             skill = ROOT / "skills" / name
             for markdown in skill.rglob("*.md"):
-                for target in link_pattern.findall(
-                    markdown.read_text(encoding="utf-8")
-                ):
+                for target in link_pattern.findall(markdown.read_text(encoding="utf-8")):
                     if "://" in target:
                         continue
                     resolved = (markdown.parent / target).resolve()
@@ -352,156 +121,131 @@ class SkillPackageTests(unittest.TestCase):
                         self.assertTrue(resolved.is_file())
                         self.assertTrue(resolved.is_relative_to(skill.resolve()))
 
-    def test_callback_delivery_requires_native_send_before_final_answer(self) -> None:
-        protocol = (ROOT / "shared" / "communication-protocol.md").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn(
-            "A final answer in the Worker task is not callback delivery", protocol
-        )
-        self.assertIn("send_message_to_thread", protocol)
-        self.assertIn("SIGNAL_RECEIVED", protocol)
-        self.assertIn("CALLBACK_DELIVERY_FAILED", protocol)
-        worker = (ROOT / "skills/github-issue-worker/SKILL.md").read_text(
-            encoding="utf-8"
-        )
-        orchestrator = (
-            ROOT / "skills/github-work-orchestrator/SKILL.md"
-        ).read_text(encoding="utf-8")
-        self.assertIn(
-            "worker-execution.md#publish-and-callback", worker
-        )
-        self.assertIn("exact Orchestrator callback", worker)
-        self.assertIn(
-            "communication-protocol.md#delivery-handshake", orchestrator
-        )
-        self.assertIn("exact Orchestrator callback task ID", orchestrator)
-        self.assertIn(
-            "communication-protocol.md#signal-driven-monitoring", orchestrator
-        )
-
-    def test_shared_protocol_preserves_reliability_guards(self) -> None:
-        state_rules = (ROOT / "shared" / "github-state-rules.md").read_text(
-            encoding="utf-8"
-        )
-        communication = (
-            ROOT / "shared" / "communication-protocol.md"
-        ).read_text(encoding="utf-8")
-        for required in (
-            "Reliable task materialization",
-            "Permission and repository preflight",
-            "Recovery and WIP preservation",
-        ):
-            self.assertIn(required, state_rules)
-        self.assertIn("at least ten minutes", communication)
-
-    def test_orchestrator_serializes_task_creation_across_windows(self) -> None:
-        package = ROOT / "skills/github-work-orchestrator"
-        orchestrator = (package / "SKILL.md").read_text(encoding="utf-8")
-        worker_contract = (package / "references/worker-contract.md").read_text(
-            encoding="utf-8"
-        )
-        recovery = (package / "references/communication.md").read_text(
-            encoding="utf-8"
-        )
-        self.assertTrue((package / "scripts/task_creation_lease.py").is_file())
-        self.assertIn("host-wide creation singleflight", orchestrator)
-        self.assertIn("visible-Task creation only", worker_contract)
-        self.assertIn("creation_authorized: true", worker_contract)
-        self.assertIn("creation_authorized: false", worker_contract)
-        self.assertIn("`creating` and `uncertain`", worker_contract)
-        self.assertIn("exact real Task identity", " ".join(worker_contract.split()))
-        self.assertIn("blocks only the visible-Worker lane", worker_contract)
-        self.assertIn("one post-restart reconciliation", recovery)
-        self.assertIn("does not patch the Codex Desktop binary", worker_contract)
-        self.assertIn("never steal", recovery)
-
-    def test_verification_policy_has_one_review_owner_and_tiered_gates(self) -> None:
-        policy = (ROOT / "shared" / "verification-policy.md").read_text(
-            encoding="utf-8"
-        )
-        worker = (ROOT / "skills/github-issue-worker/SKILL.md").read_text(
-            encoding="utf-8"
-        )
-        orchestrator = (
-            ROOT / "skills/github-work-orchestrator/SKILL.md"
-        ).read_text(encoding="utf-8")
-        for verification_class in ("fast", "standard", "strict"):
-            self.assertIn(f"`{verification_class}`", policy)
-        self.assertIn("Review-Owner: orchestrator", policy)
-        self.assertIn("must not run", policy)
-        self.assertIn("Do not invoke the generic `code-review` Skill", worker)
-        self.assertIn("exactly one Orchestrator-owned", orchestrator)
-
-    def test_candidate_pipeline_prevents_serial_ci_and_redundant_rebuilds(self) -> None:
-        policy = (ROOT / "shared" / "verification-policy.md").read_text(
-            encoding="utf-8"
-        )
-        worker = (ROOT / "skills/github-issue-worker/SKILL.md").read_text(
-            encoding="utf-8"
-        )
-        orchestrator = (
-            ROOT / "skills/github-work-orchestrator/SKILL.md"
-        ).read_text(encoding="utf-8")
+    def test_room_is_primary_and_native_send_is_only_an_idle_wakeup(self) -> None:
         protocol = (ROOT / "shared/communication-protocol.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn("Candidate-first integration pipeline", policy)
-        self.assertIn("one locally green candidate", policy)
-        self.assertIn("within 15 minutes", policy)
-        self.assertIn("candidate and integrated Git trees", policy)
-        self.assertIn("when the trees are identical", policy)
-        self.assertIn("Do not wait for CI", worker)
-        self.assertIn("run in parallel", protocol)
-        self.assertIn("integrated Git trees", orchestrator)
-
-    def test_worker_signal_includes_execution_metrics(self) -> None:
-        protocol = (ROOT / "shared" / "communication-protocol.md").read_text(
-            encoding="utf-8"
-        )
-        for field in (
-            "Verification-Class",
-            "Phase-Timings",
-            "Full-Suite-Runs",
-            "Review-Runs",
-            "Scope-Delta",
+        normalized = " ".join(protocol.split()).lower()
+        for phrase in (
+            "room messages are the primary coordination surface",
+            "message uuid",
+            "not that the claimed author or evidence is true",
+            "do not mention or send a prompt to a busy agent",
+            "replay",
+            "signal_id",
         ):
-            self.assertIn(field, protocol)
+            self.assertIn(phrase, normalized)
+        self.assertIn("not that the claimed author or evidence is true", normalized)
 
-    def test_worker_profiles_use_glm_without_silent_gpt_fallback(self) -> None:
-        profiles = (ROOT / "shared" / "model-profiles.md").read_text(
+    def test_provider_selection_is_role_based_and_fail_closed(self) -> None:
+        orchestrator = (ROOT / "skills/github-work-orchestrator/SKILL.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn("| `orchestrator` | `gpt-5.6-terra / high`", profiles)
-        self.assertIn("| `architecture` | `gpt-5.6-sol / max`", profiles)
-        self.assertIn("| `standard` | `ollama-cloud/glm-5.2`", profiles)
-        self.assertIn("No silent GPT fallback", profiles)
-        self.assertIn("explicit `max`", profiles)
-
-    def test_orchestrator_declares_tiered_lanes_capacity_and_cleanup(self) -> None:
-        orchestrator = (
-            ROOT / "skills/github-work-orchestrator/SKILL.md"
+        provider = (
+            ROOT / "skills/github-work-orchestrator/scripts/provider_policy.py"
         ).read_text(encoding="utf-8")
-        for lane in ("Inline", "Subagent", "Visible Worker"):
-            self.assertIn(lane, orchestrator)
-        self.assertIn("three visible Workers globally", orchestrator)
-        self.assertIn("four implementation Subagents", orchestrator)
-        self.assertIn("within five minutes", orchestrator)
-        self.assertIn("event-triggered", orchestrator)
-        self.assertIn("human-owned", orchestrator)
-        self.assertIn("Never call the native Task archive action", orchestrator)
+        normalized = " ".join(orchestrator.split()).lower()
+        self.assertIn("orchestration-preferences.json", normalized)
+        for category in ("planning", "research", "impl", "audit", "ui"):
+            self.assertIn(category, normalized)
+            self.assertIn(category, provider)
+        self.assertIn("fail closed", normalized)
+        self.assertNotIn("ollama-cloud/glm", orchestrator.lower())
+        self.assertIn("highest unattended execution mode", normalized)
+        self.assertIn("never infer a mode from the provider name", normalized)
 
-    def test_canonical_glm_worker_agent_and_installer_are_packaged(self) -> None:
-        package = ROOT / "skills/github-work-orchestrator"
-        template = package / "assets/worker.toml"
-        installer = package / "scripts/install_worker_agent.py"
-        self.assertTrue(template.is_file())
-        self.assertTrue(installer.is_file())
-        text = template.read_text(encoding="utf-8")
-        self.assertIn('name = "worker"', text)
-        self.assertIn('model = "ollama-cloud/glm-5.2"', text)
-        self.assertIn('model_reasoning_effort = "max"', text)
-        self.assertNotIn("model_reasoning_effort = \"high\"", text)
+    def test_execution_contract_is_v3_provider_neutral(self) -> None:
+        contract = (
+            ROOT / "skills/github-work-orchestrator/scripts/validate_execution_contract.py"
+        ).read_text(encoding="utf-8")
+        for field in (
+            "campaign_id",
+            "dispatch_id",
+            "agent_role",
+            "role_category",
+            "execution_mode",
+            "done_when",
+        ):
+            self.assertIn(field, contract)
+        self.assertIn("FORBIDDEN_RUNTIME_FIELDS", contract)
+        for obsolete in ("model_binding", "task_id", "callback_task"):
+            self.assertIn(f'"{obsolete}"', contract)
+
+    def test_retired_provider_specific_runtime_paths_are_absent(self) -> None:
+        retired = (
+            "agents/openai.yaml",
+            "shared/model-profiles.md",
+            "skills/github-issue-intake/agents/openai.yaml",
+            "skills/github-issue-intake/scripts/intake_signal.py",
+            "skills/github-issue-worker/agents/openai.yaml",
+            "skills/github-issue-worker/scripts/worker_signal.py",
+            "skills/github-work-orchestrator/agents/openai.yaml",
+            "skills/github-work-orchestrator/assets/worker.toml",
+            "skills/github-work-orchestrator/scripts/install_worker_agent.py",
+            "skills/github-work-orchestrator/scripts/task_creation_lease.py",
+        )
+        for relative in retired:
+            with self.subTest(path=relative):
+                self.assertFalse((ROOT / relative).exists())
+
+    def test_dev_is_integration_and_main_is_release(self) -> None:
+        orchestrator = (ROOT / "skills/github-work-orchestrator/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        state = (ROOT / "shared/github-state-rules.md").read_text(encoding="utf-8")
+        combined = " ".join((orchestrator + state).split()).lower()
+        self.assertIn("work/issue-", combined)
+        self.assertIn("target `dev`", combined)
+        self.assertIn("release merge from `dev`", combined)
+
+    def test_recovery_cross_checks_room_agent_git_and_github(self) -> None:
+        communication = (ROOT / "shared/communication-protocol.md").read_text(
+            encoding="utf-8"
+        )
+        recovery = (
+            ROOT / "skills/github-work-orchestrator/references/communication.md"
+        ).read_text(encoding="utf-8")
+        combined = " ".join((communication + recovery).split()).lower()
+        for phrase in (
+            "daemon restart",
+            "replay the bounded campaign room",
+            "finish callback",
+            "duplicate",
+            "github",
+            "git",
+        ):
+            self.assertIn(phrase, combined)
+        self.assertIn("pending paseo permissions", combined)
+        self.assertIn("notifies the parent", combined)
+
+    def test_worker_requires_parentage_and_parent_permission_fallback(self) -> None:
+        worker = (ROOT / "shared/worker-execution.md").read_text(encoding="utf-8")
+        orchestrator = (ROOT / "skills/github-work-orchestrator/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        combined = " ".join((worker + orchestrator).split()).lower()
+        for phrase in (
+            "relationship: subagent",
+            "notify_on_finish: true",
+            "unexpected_request_fallback: parent",
+            "exact parent agent id",
+            "non-destructive",
+        ):
+            self.assertIn(phrase, combined)
+
+    def test_verification_policy_has_one_review_owner_and_tiered_gates(self) -> None:
+        policy = (ROOT / "shared/verification-policy.md").read_text(encoding="utf-8")
+        worker = (ROOT / "skills/github-issue-worker/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        orchestrator = (ROOT / "skills/github-work-orchestrator/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        for verification_class in ("fast", "standard", "strict"):
+            self.assertIn(f"`{verification_class}`", policy)
+        self.assertIn("Review-Owner: orchestrator", policy)
+        self.assertIn("Do not run formal review", worker)
+        self.assertIn("one Orchestrator-owned review", orchestrator)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,6 @@ PACKAGES = {
         "github-state-rules.md",
         "issue-contract.md",
         "lifecycle.md",
-        "model-profiles.md",
         "verification-policy.md",
     ),
     "github-issue-intake": (
@@ -29,7 +28,9 @@ PACKAGES = {
         "worker-execution.md",
     ),
 }
-PACKAGE_VERSION = "2.3.0"
+RUNTIME_SCRIPT_TARGETS = ("github-issue-intake", "github-issue-worker")
+RUNTIME_SCRIPTS = ("paseo_room.py",)
+PACKAGE_VERSION = "3.0.0"
 PACKAGE_MANIFEST = ".skill-package.json"
 TEXT_SUFFIXES = {".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
 
@@ -39,6 +40,14 @@ def targets(root: Path):
         for filename in filenames:
             source = root / "shared" / filename
             target = root / "skills" / skill / "references" / "shared" / filename
+            yield source, target
+
+
+def runtime_script_targets(root: Path):
+    for skill in RUNTIME_SCRIPT_TARGETS:
+        for filename in RUNTIME_SCRIPTS:
+            source = root / "skills" / "github-work-orchestrator" / "scripts" / filename
+            target = root / "skills" / skill / "scripts" / filename
             yield source, target
 
 
@@ -62,8 +71,6 @@ and resolve every reference and script from that directory.
 
 def compatibility_files(root: Path):
     yield compatibility_skill(root), root / "SKILL.md"
-    source = root / "skills" / "github-work-orchestrator" / "agents" / "openai.yaml"
-    yield source.read_bytes(), root / "agents" / "openai.yaml"
 
 
 def package_digest(package: Path) -> str:
@@ -113,6 +120,13 @@ def find_drift(root: Path) -> list[str]:
             drift.append(f"missing package copy: {target.relative_to(root)}")
         elif source.read_bytes() != target.read_bytes():
             drift.append(f"stale package copy: {target.relative_to(root)}")
+    for source, target in runtime_script_targets(root):
+        if not source.is_file():
+            drift.append(f"missing runtime script: {source.relative_to(root)}")
+        elif not target.is_file():
+            drift.append(f"missing packaged runtime script: {target.relative_to(root)}")
+        elif source.read_bytes() != target.read_bytes():
+            drift.append(f"stale packaged runtime script: {target.relative_to(root)}")
     for expected, target in compatibility_files(root):
         if not target.is_file():
             drift.append(f"missing compatibility file: {target.relative_to(root)}")
@@ -169,6 +183,9 @@ def synchronize(root: Path) -> None:
     for source, target in targets(root):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source.read_bytes())
+    for source, target in runtime_script_targets(root):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
     for content, target in compatibility_files(root):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
@@ -190,7 +207,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         type=Path,
         default=[],
-        help="optional Codex skills directory whose package digests must match",
+        help="optional Agent Skills directory whose package digests must match",
     )
     parser.add_argument(
         "--check",

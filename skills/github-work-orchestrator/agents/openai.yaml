@@ -1,4 +1,0 @@
-interface:
-  display_name: "GitHub Work Orchestrator"
-  short_description: "Route, review, integrate, and clean GitHub work"
-  default_prompt: "Use $github-work-orchestrator to reconcile the frontier, route work through Inline, Subagent, or Visible Worker lanes, review and integrate results, and clean completed work."

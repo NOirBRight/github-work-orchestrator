@@ -81,8 +81,8 @@ decisions. If GitHub changes between preview and apply, rebuild the plan.
 ## Completion gate
 
 Rerun the validator and frontier. Reconciliation is complete when there are no
-invalid lifecycle combinations, every active item has one lane/worktree/editor,
-capacity is within the 1/3/4 bounds, every intended hard blocker has one native
+invalid lifecycle combinations, every active item has one dispatch/Agent/worktree/editor,
+capacity is within the one-Orchestrator/four-Agent bounds, every intended hard blocker has one native
 or documented edge, incomplete contracts are routed to Intake, and every
 remaining ambiguity is visible in `needs-triage`, `needs-info`, or a discussion
 gate.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compute a read-only GitHub Issue frontier for Codex orchestration."""
+"""Compute a read-only GitHub Issue frontier for Paseo orchestration."""
 
 from __future__ import annotations
 

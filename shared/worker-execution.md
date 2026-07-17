@@ -1,93 +1,57 @@
-# Visible Worker execution core
+# Paseo Worker execution core
 
-Load this compact reference only for an assigned sidebar-visible Worker. The
-GitHub Issue owns product acceptance; the repository owns verification
-commands; the Orchestrator owns review and lifecycle.
+Load this reference only for one assigned Paseo implementation Agent. The Issue
+owns acceptance, the repository owns verification, and the Orchestrator owns
+claim, review, integration, and cleanup.
 
 ## Contract gate
 
-Accept exactly one Issue, Task, isolated worktree, future branch, PR target,
-callback, and hotset. Require the v2 verification fields, pinned base SHA,
-permission profile, and explicit model contract:
+Require one valid v3 contract with exact Issue/repository, `dev` base SHA,
+`work/issue-...` branch, worktree, campaign/dispatch IDs, room, hotset,
+permissions, verification, and `done_when`. Stop before edits when any field,
+ownership, permission, or architecture decision is unresolved.
+
+Also require `relationship: subagent`, exact `parent_agent_id`,
+`notify_on_finish: true`, and the dynamically resolved `runtime_mode_id`. The
+permission profile uses `approval: never` and
+`unexpected_request_fallback: parent`. Before `AGENT_READY`, inspect the live
+Agent and fail closed unless parentage and mode match exactly.
+
+## Room preflight and activation
+
+Run the packaged repository preflight and:
 
 ```text
-execution_lane: visible-worker
-model_binding: ollama-cloud/glm-5.2
-model_reasoning_effort: max
-model_binding_requirement: best-effort | exact-runtime
-model_binding_status: request-accepted | runtime-verified
+python <skill>/scripts/paseo_room.py preflight \
+  --room <gwo-campaign-id> --require-agent-identity
 ```
 
-Do not silently switch to GPT. A rejection, unknown status, contradictory
-evidence, missing identity, open architecture choice, or insufficient authority
-produces one `BLOCKED` signal before edits.
+Post `AGENT_READY`, then wait. Begin only after a valid room `START` event for
+the same dispatch. The initial prompt may contain the contract, but the room is
+the campaign communication record.
 
-## Activation and preflight
+## Execution
 
-The initial full turn sends `WORKER_BOOTED` before repository writes. Run the
-packaged read-only preflight against the exact base and permissions. Keep the
-worktree clean and make no branch, source, GitHub, or PR write before the
-Orchestrator's literal `START` continuation.
+Stay in the assigned worktree and hotset. At safe phase boundaries replay the
+room. Do not use mentions for routine updates or send prompts to busy Agents.
+Post `DISCUSSION_REQUIRED` before durable architecture, compatibility,
+security/privacy, migration, or cross-Issue decisions.
 
-After preflight, send `PREFLIGHT_READY` and become idle. The Orchestrator claims
-and reads back the Issue, verifies one editor, then sends `START`. Only that
-receipt authorizes implementation.
+Implement the smallest accepted vertical change. Run targeted checks, then the
+required suite/manual evidence exactly once per locally green candidate. The
+Worker does not spawn another work item or perform formal review.
 
-## Execution-only CWD
+## Publication
 
-Treat the assigned worktree as an execution-only CWD, never as a Codex Saved
-Project, Saved Workspace, or Skill installation root. Use the exact absolute
-path supplied by the supported native execution contract. Never open or
-register the worktree as a project, switch projects, or persist it as a
-workaround. If the native lane cannot use the assigned CWD without persistence,
-send one sanitized platform limitation in a `BLOCKED` signal before edits.
+Commit and push the assigned branch, open/update the PR against `dev`, and post
+`PR_OPENED` followed by `READY_FOR_REVIEW` or `COMPLETED` with exact evidence.
+The Orchestrator verifies room, Agent, Git, GitHub, and test state before merge.
 
-Do not read-modify-write `.codex-global-state.json`,
-`electron-saved-workspace-roots`, Codex SQLite, or equivalent private desktop
-state. Never copy, install, junction, symlink, or generate a Skill in the
-repository or worktree, and never create a dynamic `SKILL.md`, plugin, or
-project-local Skill for execution state. GitHub and the native Task contract
-remain the only execution-state carriers. Each role Skill resolves from exactly
-one repository-documented canonical installation. Version-controlled package
-sources and lazy `references/`, `scripts/`, and `assets/` are not extra runtime
-Skill installations.
+The high-autonomy mode prevents routine prompts. If a Provider still requests
+permission, pause without retrying: Paseo notifies the parent. The parent may
+approve only non-destructive work already covered by the v3 permissions and
+hotset; otherwise it denies and records `BLOCKED` for human direction.
 
-## Assigned verification class
-
-| Class | Candidate verification | Formal review |
-|---|---|---|
-| `fast` | Targeted checks and diff hygiene; no local full suite | Worker runs none; Orchestrator checks directly |
-| `standard` | Targeted checks, then one relevant full suite | Worker runs none; Orchestrator owns one Standards/Spec pass |
-| `strict` | Targeted checks, one relevant full suite, and explicit manual evidence only | Worker runs none; Orchestrator owns one Standards/Spec pass |
-
-After same-boundary review fixes, run affected checks and CI. Repeat a full
-suite only after a new verification boundary. Never invoke the generic formal
-review from the Worker.
-
-## Direction and scope
-
-Implement the smallest accepted scope. Stay inside the assigned worktree and
-hotset. Send `DISCUSSION_REQUIRED` before choosing durable architecture, public
-compatibility, security/privacy policy, migration, or cross-Issue scope. Do not
-merge, close, unassign, reprioritize, or create another Task.
-
-## Publish and callback
-
-Finish local candidate checks before the first push. Commit and push the one
-assigned branch, open/update the assigned PR, and send `PR_OPENED` immediately.
-CI, Orchestrator review, and safe evidence then run in parallel.
-
-Build the canonical signal with `scripts/worker_signal.py`, then send it through
-native Task messaging to the exact Orchestrator callback. Retry one transport
-failure with the same Signal-ID; after a second failure record
-`CALLBACK_DELIVERY_FAILED` and stop.
-
-Every material report includes verification class, timings, full-suite count,
-`Review-Runs: 0`, scope delta, changed paths, and next action.
-
-## Recovery
-
-On Task-host failure, stop editing. Preserve useful WIP through one scoped
-checkpoint and verified remote SHA when possible. Never reset, force-clean, or
-activate a second editor. The Orchestrator loads its detailed Visible Worker
-recovery reference only after this failure.
+On host or permission failure, stop editing, preserve useful WIP durably when
+possible, post `BLOCKED` or `STOPPED`, and keep the worktree intact. Never reset,
+force-clean, or activate a successor yourself.

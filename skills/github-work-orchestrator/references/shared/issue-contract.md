@@ -16,14 +16,14 @@ Include:
 6. **Dependencies** — native blocked-by edges and sub-issues when unambiguous.
 7. **Taxonomy** — exactly one canonical lifecycle label and exactly one
    existing repository type label.
-8. **Execution contract** — for new or materially rewritten work, the v2
+8. **Execution contract** — for new or materially rewritten work, the v3
    verification fields defined below.
 
 Preserve reporter facts, logs, screenshots, prior decisions, and relevant
 discussion. Separate facts from inference. Exclude credentials, task IDs, local
 paths, raw private traces, and unnecessary personal data.
 
-## Execution contract v2
+## Execution contract v3
 
 Use the shared [verification policy](verification-policy.md#execution-contract)
 as the sole authority for the exact fields and allowed values. Copy that
@@ -66,6 +66,6 @@ hard, unambiguous blocking edges.
 
 After every create or update, read the Issue from GitHub and verify title, body,
 labels, dependency edges, state, and URL. The contract is ready only when every
-required content item is present, the label pair is exact, every v2 field is
+required content item is present, the label pair is exact, every v3 field is
 valid, `Architecture-Decision` is `resolved`, and no write changed priority,
 Milestone, assignee, or merge order outside the role's authority.
