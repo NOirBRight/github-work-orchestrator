@@ -51,5 +51,5 @@ preserved.
 The Campaign Orchestrator never archives itself. After `CAMPAIGN_CLOSED`, the
 Repository Coordinator may archive that direct child only after terminal Agent,
 room, Git, and GitHub readback. `CAMPAIGN_CLOSED` never archives the Repository
-Coordinator. Retiring the Repository Coordinator requires an external
-supervisor and a durable repository-level handoff.
+Coordinator. Retiring the Repository Coordinator requires a human operator
+using the existing Paseo UI or CLI and a durable repository-level handoff.

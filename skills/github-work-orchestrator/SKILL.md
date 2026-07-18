@@ -25,9 +25,8 @@ Before dispatch:
    advertised modes and choose the highest unattended execution mode. Never
    infer a mode from the Provider name.
 4. Read [Paseo Worker contract](references/worker-contract.md) before delegated
-   work, [runtime archive contract](references/runtime-archive-contract.md)
-   before cleanup, and [recovery](references/communication.md) only after a
-   failure.
+   work, [cleanup safety policy](references/cleanup-safety-policy.md) before
+   cleanup, and [recovery](references/communication.md) only after a failure.
 
 Role categories are fixed: Orchestrator `planning`, Intake `research`, Worker
 `impl` (or `ui` for UI-only work), and Review/Monitor `audit`.
@@ -38,8 +37,8 @@ The Repository Coordinator is the repository-resident root Agent in a dedicated
 `dev` control worktree. Read back its repository/coordinator labels and confirm
 that no second Coordinator exists. Unlabeled root Agents are foreign and must
 not be adopted, edited, or archived. If two Coordinators exist, stop admission
-and integration and ask an external supervisor to select one canonical Agent
-after durable handoff.
+and integration and ask a human operator to select one canonical Agent through
+the existing Paseo UI or CLI after durable handoff.
 
 The Campaign Orchestrator is a direct `subagent` of the Repository Coordinator
 and owns exactly one `campaign_id`. Its Provider Binding is resolved per
@@ -135,23 +134,24 @@ After missed callback or restart, replay the room, find Agents by campaign,
 dispatch and `paseo.parent-agent-id`, inspect lifecycle, then reconcile GitHub
 and worktrees. Never create a replacement without terminal predecessor proof.
 
-Use `execution_policy.py cleanup-plan` with the runtime-observed caller identity
-and a separately trusted absolute path for the Repository Coordinator's control
-worktree. Archive only an idle Agent with clean, durable, unambiguously owned
-work. The Campaign Orchestrator may target only its direct children; after
-durable `CAMPAIGN_CLOSED`, the Repository Coordinator may target that direct
-Campaign child. Neither may archive itself, a root/sibling Agent, or either the
-repository control worktree or its own control worktree.
+Use `execution_policy.py cleanup-plan` with caller, parentage, lifecycle,
+worktree binding, and Repository Coordinator control-worktree evidence read
+back through the existing Paseo Skill. Archive only an idle Agent with clean,
+durable, unambiguously owned work. The Campaign Orchestrator may target only its
+direct children; after durable `CAMPAIGN_CLOSED`, the Repository Coordinator may
+target that direct Campaign child. Neither may archive itself, a root/sibling
+Agent, or either the repository control worktree or its own control worktree.
 
 Delegated cleanup is two-phase. The first eligible plan contains only the Agent
-archive. Execute it externally, read back that the Agent is archived and the
-worktree has no Agent binding, then call `cleanup-plan` again before considering
-the worktree or merged branch actions. Never treat a planned Agent archive as
-proof that its worktree binding is gone.
+archive. Execute it through the existing Paseo operations, read back that the
+Agent is archived and the worktree has no Agent binding, then call
+`cleanup-plan` again before considering the worktree or merged branch actions.
+Never treat a planned Agent archive as proof that its worktree binding is gone.
 
-`cleanup-plan` v4 returns `automatic_execution: false` until the Paseo daemon
-implements the runtime archive contract. Surface candidate actions to an
-external supervisor instead of executing them. Delete completed rooms only
-after readback; retain blocked/handoff rooms and preserve dirty, unpushed,
-active, ambiguous, or foreign state. `CAMPAIGN_CLOSED` never archives the
-Repository Coordinator.
+The package v4.1 `cleanup-plan` keeps output `schema_version: 2` and returns
+`automatic_execution: true` only for an eligible, nonempty action list. Execute
+exactly those actions in order through the existing Paseo Skill and read back
+each mutation. A protected plan always returns false with no actions. Delete
+completed rooms only after readback; retain blocked/handoff rooms and preserve
+dirty, unpushed, active, ambiguous, or foreign state. `CAMPAIGN_CLOSED` never
+archives the Repository Coordinator.

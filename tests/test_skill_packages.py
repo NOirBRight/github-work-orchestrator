@@ -56,7 +56,7 @@ class SkillPackageTests(unittest.TestCase):
         self.assertEqual([], SYNC.find_drift(ROOT))
 
     def test_package_manifests_pin_version_and_content_digest(self) -> None:
-        self.assertEqual("4.0.0", SYNC.PACKAGE_VERSION)
+        self.assertEqual("4.1.0", SYNC.PACKAGE_VERSION)
         for name in SKILLS:
             package = ROOT / "skills" / name
             manifest = json.loads(
@@ -230,17 +230,32 @@ class SkillPackageTests(unittest.TestCase):
         ):
             self.assertIn(phrase, combined)
 
-    def test_paseo_runtime_archive_contract_is_fail_closed(self) -> None:
+    def test_cleanup_safety_is_owned_by_the_portable_gwo_skill(self) -> None:
+        skill = ROOT / "skills/github-work-orchestrator/SKILL.md"
         contract = (
             ROOT
+            / "skills/github-work-orchestrator/references/cleanup-safety-policy.md"
+        )
+        guard = ROOT / "skills/github-work-orchestrator/scripts/archive_policy.py"
+        retired = (
+            ROOT
             / "skills/github-work-orchestrator/references/runtime-archive-contract.md"
-        ).read_text(encoding="utf-8")
-        normalized = " ".join(contract.split()).lower()
+        )
+        self.assertTrue(contract.is_file())
+        self.assertFalse(retired.exists())
+        normalized = " ".join(
+            (
+                skill.read_text(encoding="utf-8")
+                + contract.read_text(encoding="utf-8")
+                + guard.read_text(encoding="utf-8")
+            ).split()
+        ).lower()
         for phrase in (
-            "agent-scoped caller context",
+            "gwo owns cleanup authorization",
+            "existing paseo operations",
+            "schema_version: 2",
             "direct idle child",
-            "external supervisor",
-            "no partial side effects",
+            "two-phase",
             "self_archive_forbidden",
             "root_archive_requires_supervisor",
             "archive_target_not_direct_child",
@@ -249,6 +264,8 @@ class SkillPackageTests(unittest.TestCase):
             "removal of its worktree binding",
         ):
             self.assertIn(phrase, normalized)
+        for forbidden in ("codexhub", "daemon-side", "until the paseo daemon"):
+            self.assertNotIn(forbidden, normalized)
 
     def test_recovery_cross_checks_room_agent_git_and_github(self) -> None:
         communication = (ROOT / "shared/communication-protocol.md").read_text(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provider-neutral authorization contract for Paseo archive operations."""
+"""GWO-internal, provider-neutral cleanup authorization helpers."""
 
 from __future__ import annotations
 

@@ -19,9 +19,9 @@ then the `planning` preference, and is runtime evidence rather than GitHub work
 state.
 
 If more than one Repository Coordinator is observed, stop new dispatch and
-integration. Preserve both Agents and require an external supervisor to select
-one canonical Coordinator after durable handoff; neither Coordinator may
-archive the other.
+integration. Preserve both Agents and require a human operator to select one
+canonical Coordinator through the existing Paseo UI or CLI after durable
+handoff; neither Coordinator may archive the other.
 
 ## One owner per work item
 
@@ -92,5 +92,6 @@ readback. No Agent archives itself, a root Agent, a sibling, the Repository
 Coordinator's trusted control worktree, or its own control worktree. Delegated
 cleanup archives the child first, reads back both its archived state and removal
 of the worktree binding, and only then evaluates worktree and branch cleanup in
-a second authorization pass. `CAMPAIGN_CLOSED` never archives the Repository
-Coordinator.
+a second authorization pass. GWO automatically executes only a nonempty
+eligible plan through existing Paseo operations; every protected plan has no
+actions. `CAMPAIGN_CLOSED` never archives the Repository Coordinator.

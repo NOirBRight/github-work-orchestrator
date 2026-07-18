@@ -476,11 +476,13 @@ class ExecutionPolicyTests(unittest.TestCase):
                     "worktree": str(root),
                     "branch": "dev",
                     "bound_agent_ids": ["agent-orchestrator"],
+                    "branch_merged": True,
                 },
                 protected_control_worktree=str(root),
             )
 
         self.assertEqual("protected", report["status"])
+        self.assertFalse(report["automatic_execution"])
         self.assertEqual([], report["actions"])
         for blocker in (
             "self-archive-forbidden",
@@ -501,7 +503,7 @@ class ExecutionPolicyTests(unittest.TestCase):
             )
 
         self.assertEqual("eligible", report["status"])
-        self.assertFalse(report["automatic_execution"])
+        self.assertTrue(report["automatic_execution"])
         self.assertEqual(
             ["archive-paseo-agent"],
             [item["action"] for item in report["actions"]],
@@ -522,6 +524,7 @@ class ExecutionPolicyTests(unittest.TestCase):
             )
 
         self.assertEqual("eligible", report["status"])
+        self.assertTrue(report["automatic_execution"])
         self.assertEqual(
             ["archive-paseo-worktree", "delete-merged-remote-branch"],
             [item["action"] for item in report["actions"]],
@@ -552,6 +555,7 @@ class ExecutionPolicyTests(unittest.TestCase):
             )
 
         self.assertEqual("eligible", report["status"])
+        self.assertTrue(report["automatic_execution"])
         self.assertEqual(
             "archive-paseo-agent", report["actions"][0]["action"]
         )
@@ -774,6 +778,7 @@ class ExecutionPolicyTests(unittest.TestCase):
             )
 
         self.assertEqual("eligible", report["status"])
+        self.assertTrue(report["automatic_execution"])
         self.assertEqual(
             ["archive-paseo-worktree", "delete-merged-remote-branch"],
             [item["action"] for item in report["actions"]],
@@ -893,6 +898,7 @@ class ExecutionPolicyTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertTrue(payload["ok"])
         self.assertEqual("eligible", payload["policy"]["status"])
+        self.assertTrue(payload["policy"]["automatic_execution"])
 
     def test_concurrency_cli_reports_the_repository_merge_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -41,3 +41,8 @@ _Avoid_: Merge lock
 The Repository Coordinator's persistent integration context, which is never a
 Campaign cleanup target.
 _Avoid_: Father worktree, execution worktree
+
+**Cleanup Guard**:
+The GWO-owned policy that authorizes exact cleanup actions from observed Paseo,
+Git, and worktree evidence without requiring host or runtime source changes.
+_Avoid_: Daemon guard, host cleanup service

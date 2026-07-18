@@ -381,7 +381,7 @@ def cleanup_plan(
         "schema_version": 2,
         "status": "protected" if blockers else "eligible",
         "event_triggered": True,
-        "automatic_execution": False,
+        "automatic_execution": not blockers and bool(actions),
         "deadline_seconds": CLEANUP_DEADLINE_SECONDS,
         "overdue": seconds_since_event > CLEANUP_DEADLINE_SECONDS,
         "actions": actions,
