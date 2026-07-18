@@ -6,7 +6,8 @@ description: Orchestrate GitHub execution campaigns through provider-neutral Pas
 # GitHub Work Orchestrator
 
 Keep GitHub as durable work state and Paseo as the only Agent runtime. Keep one
-Orchestrator per repository/activity. Never hardcode a Provider or model.
+Repository Coordinator per repository and one Campaign Orchestrator per
+Campaign. Never hardcode a Provider or model.
 
 ## Load the control plane
 
@@ -24,10 +25,27 @@ Before dispatch:
    advertised modes and choose the highest unattended execution mode. Never
    infer a mode from the Provider name.
 4. Read [Paseo Worker contract](references/worker-contract.md) before delegated
-   work and [recovery](references/communication.md) only after a failure.
+   work, [runtime archive contract](references/runtime-archive-contract.md)
+   before cleanup, and [recovery](references/communication.md) only after a
+   failure.
 
 Role categories are fixed: Orchestrator `planning`, Intake `research`, Worker
 `impl` (or `ui` for UI-only work), and Review/Monitor `audit`.
+
+## Establish the two-tier control plane
+
+The Repository Coordinator is the repository-resident root Agent in a dedicated
+`dev` control worktree. Read back its repository/coordinator labels and confirm
+that no second Coordinator exists. Unlabeled root Agents are foreign and must
+not be adopted, edited, or archived. If two Coordinators exist, stop admission
+and integration and ask an external supervisor to select one canonical Agent
+after durable handoff.
+
+The Campaign Orchestrator is a direct `subagent` of the Repository Coordinator
+and owns exactly one `campaign_id`. Its Provider Binding is resolved per
+Campaign: explicit Campaign override first, then the `planning` preference.
+Different Campaigns may therefore use different Providers and models without
+changing repository policy.
 
 ## Reconcile the frontier
 
@@ -38,8 +56,21 @@ revalidate. A ready item must have a complete v3 execution contract.
 ## Route and admit work
 
 Use `execution_policy.py mode`. Small same-boundary work may remain inline;
-other implementation uses a Paseo Agent. Keep at most four active delegated
-Agents per campaign by default, with every role sharing the budget.
+other implementation uses a Paseo Agent. Inline work still uses an isolated
+`work/issue-*` worktree; the Repository Coordinator must not author feature
+commits directly on `dev`.
+
+Use `execution_policy.py capacity` for the target Campaign and actual host-wide
+capacity. Keep one Campaign Orchestrator per Campaign and at most four Campaign
+Agents including that Orchestrator by default. Different Campaigns may execute
+concurrently when their Hotsets do not overlap.
+
+Use `execution_policy.py concurrency` against all active Hotsets and the current
+repository-scoped Integration Lease. A Hotset conflict waits without creating
+another editor. Record Hotsets as canonical repository-relative paths; absolute
+paths, empty components, `.` and `..` fail closed. Only the lease holder may
+integrate; if `dev` advanced, refresh its pinned `dev` base and rerun
+verification affected by the delta.
 
 Pin dispatch to exact `dev` SHA. Claim and read back the Issue. Use
 `work/issue-<number>-<slug>`, an isolated Paseo worktree, and PR target `dev`.
@@ -59,12 +90,17 @@ dispatch IDs, exact worktree/branch, hotset, permissions, verification, and
 
 ## Create and coordinate Paseo Agents
 
-Create campaign-owned work with `relationship: { kind: "subagent" }`,
-`notifyOnFinish: true`, the resolved high-autonomy `modeId`, and a Paseo
-worktree from the pinned `dev` base. Add campaign, dispatch, role, repository,
-Issue, and branch labels. Read back exact parent Agent ID, mode, worktree, and
-labels before `START`; fail closed on mismatch. Use `detached` only for an
-explicit handoff whose lifetime must outlive this campaign.
+The Repository Coordinator creates the Campaign Orchestrator with relationship
+`{ kind: "subagent" }`, role `orchestrator`, category `planning`, the
+Campaign-local Provider Binding, and exact Campaign labels. The Campaign
+Orchestrator creates campaign-owned Workers as its own direct `subagent`
+children with `notifyOnFinish: true`, the resolved high-autonomy `modeId`, and a
+Paseo worktree from the pinned `dev` base.
+
+Add campaign, dispatch, role, repository, Issue, and branch labels. Read back
+exact parent Agent ID, mode, worktree, Provider Binding, and labels before
+`START`; fail closed on mismatch. Use `detached` only for an explicit handoff
+whose lifetime must outlive its parent.
 
 Paseo returns an unexpected permission request to the parent. Inspect the
 request and child timeline. Allow only non-destructive work already authorized
@@ -88,7 +124,9 @@ parallel after a locally green candidate. `fast` is reviewed directly;
 `standard`/`strict` use one Review Agent with role category `audit`. Send fixes
 to the same idle owner and review only the delta.
 
-Merge the feature PR into `dev` only when all gates pass. `main` accepts only an
+The Campaign Orchestrator returns the verified candidate. The Repository
+Coordinator acquires the Integration Lease, reads back the current `dev` SHA,
+and merges the feature PR only when all gates still pass. `main` accepts only an
 explicit verified release merge from `dev`.
 
 ## Recover and clean
@@ -97,7 +135,23 @@ After missed callback or restart, replay the room, find Agents by campaign,
 dispatch and `paseo.parent-agent-id`, inspect lifecycle, then reconcile GitHub
 and worktrees. Never create a replacement without terminal predecessor proof.
 
-Use `execution_policy.py cleanup-plan`. Archive only an idle Agent with clean,
-durable, unambiguously owned work. Write/read back the GitHub summary before
-`CAMPAIGN_CLOSED`; delete completed rooms, but retain blocked/handoff rooms.
-Preserve dirty, unpushed, active, ambiguous, or foreign state.
+Use `execution_policy.py cleanup-plan` with the runtime-observed caller identity
+and a separately trusted absolute path for the Repository Coordinator's control
+worktree. Archive only an idle Agent with clean, durable, unambiguously owned
+work. The Campaign Orchestrator may target only its direct children; after
+durable `CAMPAIGN_CLOSED`, the Repository Coordinator may target that direct
+Campaign child. Neither may archive itself, a root/sibling Agent, or either the
+repository control worktree or its own control worktree.
+
+Delegated cleanup is two-phase. The first eligible plan contains only the Agent
+archive. Execute it externally, read back that the Agent is archived and the
+worktree has no Agent binding, then call `cleanup-plan` again before considering
+the worktree or merged branch actions. Never treat a planned Agent archive as
+proof that its worktree binding is gone.
+
+`cleanup-plan` v4 returns `automatic_execution: false` until the Paseo daemon
+implements the runtime archive contract. Surface candidate actions to an
+external supervisor instead of executing them. Delete completed rooms only
+after readback; retain blocked/handoff rooms and preserve dirty, unpushed,
+active, ambiguous, or foreign state. `CAMPAIGN_CLOSED` never archives the
+Repository Coordinator.

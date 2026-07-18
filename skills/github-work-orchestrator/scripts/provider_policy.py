@@ -63,6 +63,30 @@ def resolve_provider(
     }
 
 
+def resolve_campaign_orchestrator_provider(
+    *,
+    campaign_id: str,
+    preferences: dict[str, Any],
+    available_providers: set[str],
+    explicit_override: str | None = None,
+) -> dict[str, str]:
+    """Resolve an auditable, Campaign-local Orchestrator Provider Binding."""
+
+    if not isinstance(campaign_id, str) or not campaign_id.strip():
+        raise ProviderPolicyError("campaign_id must be exact")
+    binding = resolve_provider(
+        role_category="planning",
+        preferences=preferences,
+        available_providers=available_providers,
+        explicit_override=explicit_override,
+    )
+    return {
+        "campaign_id": campaign_id.strip(),
+        "agent_role": "orchestrator",
+        **binding,
+    }
+
+
 def resolve_highest_permission_mode(
     available_modes: list[dict[str, Any]],
 ) -> dict[str, str]:
@@ -120,6 +144,7 @@ def resolve_highest_permission_mode(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role-category", choices=sorted(ROLE_CATEGORIES), required=True)
+    parser.add_argument("--campaign-id")
     parser.add_argument(
         "--preferences",
         type=Path,
@@ -138,12 +163,26 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     arguments = parse_args()
     try:
-        result = resolve_provider(
-            role_category=arguments.role_category,
-            preferences=load_preferences(arguments.preferences),
-            available_providers=set(arguments.available_provider),
-            explicit_override=arguments.explicit,
-        )
+        preferences = load_preferences(arguments.preferences)
+        available_providers = set(arguments.available_provider)
+        if arguments.campaign_id is not None:
+            if arguments.role_category != "planning":
+                raise ProviderPolicyError(
+                    "campaign_id is valid only for a planning Provider Binding"
+                )
+            result = resolve_campaign_orchestrator_provider(
+                campaign_id=arguments.campaign_id,
+                preferences=preferences,
+                available_providers=available_providers,
+                explicit_override=arguments.explicit,
+            )
+        else:
+            result = resolve_provider(
+                role_category=arguments.role_category,
+                preferences=preferences,
+                available_providers=available_providers,
+                explicit_override=arguments.explicit,
+            )
         mode = None
         if arguments.available_modes_json:
             mode = resolve_highest_permission_mode(

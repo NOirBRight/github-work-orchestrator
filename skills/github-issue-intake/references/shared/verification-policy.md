@@ -51,3 +51,9 @@ state, parent Agent ID, runtime mode, pending permissions, worktree, branch,
 base SHA, terminal event, commit/PR, and command results. Provider identity is
 diagnostic evidence, not an acceptance gate. Missing or contradictory runtime
 evidence fails closed.
+
+For a Campaign Orchestrator, additionally verify its direct Repository
+Coordinator parent, unique `campaign_id`, `planning` role category, Campaign
+Provider Binding receipt, admitted Hotset, campaign/global capacity, and the
+current repository Integration Lease. A changed `dev` SHA invalidates merge
+admission until the Campaign refreshes its base and reruns affected evidence.

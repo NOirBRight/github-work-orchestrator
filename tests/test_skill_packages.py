@@ -56,7 +56,7 @@ class SkillPackageTests(unittest.TestCase):
         self.assertEqual([], SYNC.find_drift(ROOT))
 
     def test_package_manifests_pin_version_and_content_digest(self) -> None:
-        self.assertEqual("3.0.0", SYNC.PACKAGE_VERSION)
+        self.assertEqual("4.0.0", SYNC.PACKAGE_VERSION)
         for name in SKILLS:
             package = ROOT / "skills" / name
             manifest = json.loads(
@@ -197,6 +197,58 @@ class SkillPackageTests(unittest.TestCase):
         self.assertIn("work/issue-", combined)
         self.assertIn("target `dev`", combined)
         self.assertIn("release merge from `dev`", combined)
+
+    def test_two_tier_orchestration_keeps_repository_ownership_singular(self) -> None:
+        orchestrator = (ROOT / "skills/github-work-orchestrator/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        state = (ROOT / "shared/github-state-rules.md").read_text(encoding="utf-8")
+        lifecycle = (ROOT / "shared/lifecycle.md").read_text(encoding="utf-8")
+        combined = " ".join((orchestrator + state + lifecycle).split()).lower()
+        for phrase in (
+            "repository coordinator is the repository-resident root agent",
+            "dedicated `dev` control worktree",
+            "campaign orchestrator is a direct `subagent`",
+            "provider binding is resolved per campaign",
+            "must not author feature commits directly on `dev`",
+            "`campaign_closed` never archives the repository coordinator",
+            "unlabeled root agents are foreign",
+        ):
+            self.assertIn(phrase, combined)
+
+    def test_concurrent_campaigns_use_hotsets_and_one_integration_lease(self) -> None:
+        orchestrator = (ROOT / "skills/github-work-orchestrator/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        state = (ROOT / "shared/github-state-rules.md").read_text(encoding="utf-8")
+        combined = " ".join((orchestrator + state).split()).lower()
+        for phrase in (
+            "different campaigns may execute concurrently",
+            "hotsets do not overlap",
+            "repository-scoped integration lease",
+            "refresh its pinned `dev` base",
+        ):
+            self.assertIn(phrase, combined)
+
+    def test_paseo_runtime_archive_contract_is_fail_closed(self) -> None:
+        contract = (
+            ROOT
+            / "skills/github-work-orchestrator/references/runtime-archive-contract.md"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(contract.split()).lower()
+        for phrase in (
+            "agent-scoped caller context",
+            "direct idle child",
+            "external supervisor",
+            "no partial side effects",
+            "self_archive_forbidden",
+            "root_archive_requires_supervisor",
+            "archive_target_not_direct_child",
+            "worktree_in_use",
+            "trusted protected control worktree",
+            "removal of its worktree binding",
+        ):
+            self.assertIn(phrase, normalized)
 
     def test_recovery_cross_checks_room_agent_git_and_github(self) -> None:
         communication = (ROOT / "shared/communication-protocol.md").read_text(
