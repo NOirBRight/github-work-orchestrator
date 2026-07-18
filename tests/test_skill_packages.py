@@ -4,6 +4,7 @@ import importlib.util
 import json
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -55,8 +56,18 @@ class SkillPackageTests(unittest.TestCase):
     def test_sync_check_accepts_committed_packages(self) -> None:
         self.assertEqual([], SYNC.find_drift(ROOT))
 
+    def test_quick_validation_accepts_committed_packages(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "quick_validate.py")],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
     def test_package_manifests_pin_version_and_content_digest(self) -> None:
-        self.assertEqual("4.1.0", SYNC.PACKAGE_VERSION)
+        self.assertEqual("4.2.0", SYNC.PACKAGE_VERSION)
         for name in SKILLS:
             package = ROOT / "skills" / name
             manifest = json.loads(
@@ -131,6 +142,10 @@ class SkillPackageTests(unittest.TestCase):
             "message uuid",
             "not that the claimed author or evidence is true",
             "do not mention or send a prompt to a busy agent",
+            "--identity-receipts",
+            "paseo_agent_id",
+            "chat author",
+            "already accepted ask",
             "replay",
             "signal_id",
         ):
@@ -151,8 +166,9 @@ class SkillPackageTests(unittest.TestCase):
             self.assertIn(category, provider)
         self.assertIn("fail closed", normalized)
         self.assertNotIn("ollama-cloud/glm", orchestrator.lower())
-        self.assertIn("highest unattended execution mode", normalized)
-        self.assertIn("never infer a mode from the provider name", normalized)
+        self.assertIn("unambiguous `isunattended: true` mode", normalized)
+        self.assertIn("never infer unattended execution", normalized)
+        self.assertIn("never infer unattended execution from provider name", normalized)
 
     def test_execution_contract_is_v3_provider_neutral(self) -> None:
         contract = (
@@ -227,6 +243,55 @@ class SkillPackageTests(unittest.TestCase):
             "hotsets do not overlap",
             "repository-scoped integration lease",
             "refresh its pinned `dev` base",
+        ):
+            self.assertIn(phrase, combined)
+
+    def test_coordinator_loop_is_event_driven_and_plans_full_waves(self) -> None:
+        skill = (ROOT / "skills/github-work-orchestrator/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        loop = (
+            ROOT / "skills/github-work-orchestrator/references/coordinator-loop.md"
+        ).read_text(encoding="utf-8")
+        combined = " ".join((skill + loop).split()).lower()
+        for phrase in (
+            "campaign_scheduler.py plan-wave",
+            "whole eligible worker wave",
+            "without waiting for another worker to finish",
+            "heartbeat is worker liveness, never orchestrator polling",
+            "wait at most 60 seconds",
+            "15 minutes",
+            "silence alone",
+            "attempt four is never automatic",
+        ):
+            self.assertIn(phrase, combined)
+        self.assertNotIn("create recurring paseo heartbeats by default", skill.lower())
+
+    def test_worker_reports_heartbeat_and_worker_done_but_not_completion(self) -> None:
+        worker = (ROOT / "skills/github-issue-worker/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = " ".join(worker.split()).lower()
+        self.assertIn("five minutes", normalized)
+        self.assertIn("`heartbeat`", normalized)
+        self.assertIn("`worker_done`", normalized)
+        self.assertIn("campaign orchestrator alone", normalized)
+
+    def test_room_terminal_and_cleanup_evidence_are_distinct(self) -> None:
+        protocol = (ROOT / "shared/communication-protocol.md").read_text(
+            encoding="utf-8"
+        )
+        cleanup = (
+            ROOT
+            / "skills/github-work-orchestrator/references/cleanup-safety-policy.md"
+        ).read_text(encoding="utf-8")
+        combined = " ".join((protocol + cleanup).split()).lower()
+        for phrase in (
+            "worker_done",
+            "never authorizes completion",
+            "heartbeat, checkpoint, and worker_done are never terminal cleanup evidence",
+            "event=merged",
+            "branch_merged: true",
         ):
             self.assertIn(phrase, combined)
 

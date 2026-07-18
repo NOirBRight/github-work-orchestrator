@@ -97,6 +97,78 @@ def event(**overrides):
     return payload
 
 
+def identity_receipt(
+    *,
+    agent_id: str = "agent-worker-7",
+    campaign_id: str = "campaign-20260718",
+    dispatch_id: str = "dispatch-issue-7",
+    role: str = "implementation",
+    parent_agent_id: str | None = "agent-orchestrator",
+    relationship: str = "subagent",
+    authority_kind: str | None = None,
+    authority_subject_agent_id: str | None = None,
+):
+    labels = {
+        "repository": "owner/repo",
+        "role": role,
+    }
+    if role in ROOM.WORKER_ROLES:
+        labels.update({"campaign_id": campaign_id, "dispatch_id": dispatch_id})
+        authority_kind = authority_kind or "dispatch-owner"
+        subject_agent_id = agent_id
+        subject_parent_agent_id = parent_agent_id
+        subject_relationship = relationship
+        subject_labels = labels
+    elif role == "orchestrator":
+        labels["campaign_id"] = campaign_id
+        authority_kind = authority_kind or "direct-child-dispatch"
+        if authority_kind == "campaign-control":
+            subject_agent_id = agent_id
+            subject_parent_agent_id = parent_agent_id
+            subject_relationship = relationship
+            subject_labels = labels
+        else:
+            subject_agent_id = authority_subject_agent_id or "agent-worker-7"
+            subject_parent_agent_id = agent_id
+            subject_relationship = "subagent"
+            subject_labels = {
+                "repository": "owner/repo",
+                "campaign_id": campaign_id,
+                "dispatch_id": dispatch_id,
+                "role": "implementation",
+            }
+    else:
+        authority_kind = authority_kind or "admitted-campaign"
+        subject_agent_id = "agent-orchestrator"
+        subject_parent_agent_id = agent_id
+        subject_relationship = "subagent"
+        subject_labels = {
+            "repository": "owner/repo",
+            "campaign_id": campaign_id,
+            "role": "orchestrator",
+        }
+    return {
+        "agent_id": agent_id,
+        "campaign_id": campaign_id,
+        "dispatch_id": dispatch_id,
+        "role": role,
+        "parent_agent_id": parent_agent_id,
+        "relationship": relationship,
+        "labels": labels,
+        "authority": {
+            "kind": authority_kind,
+            "campaign_id": campaign_id,
+            "dispatch_id": dispatch_id,
+            "subject_agent_id": subject_agent_id,
+            "subject_parent_agent_id": subject_parent_agent_id,
+            "subject_relationship": subject_relationship,
+            "subject_labels": subject_labels,
+            "read_back": True,
+        },
+        "read_back": True,
+    }
+
+
 _DEFAULT_CLEANUP_TARGET = object()
 
 
@@ -116,6 +188,9 @@ def cleanup_report(
         "agent_id": "agent-orchestrator",
         "role": "orchestrator",
         "worktree": str(root / "control"),
+        "repository": "owner/repo",
+        "campaign_id": "campaign-20260718",
+        "dispatch_id": "dispatch-issue-7",
     }
     actor.update(actor_overrides or {})
     if target is _DEFAULT_CLEANUP_TARGET:
@@ -126,9 +201,23 @@ def cleanup_report(
             "role": "implementation",
             "idle": True,
             "archived": False,
+            "repository": "owner/repo",
+            "campaign_id": "campaign-20260718",
+            "dispatch_id": "dispatch-issue-7",
         }
     if target is not None:
         target = {**target, **(target_overrides or {})}
+    if target is not None and target.get("role") == "orchestrator":
+        terminal_event = "CAMPAIGN_CLOSED"
+        terminal_sender = target["agent_id"]
+    elif event == "stopped":
+        terminal_event = "STOPPED"
+        terminal_sender = (
+            target["agent_id"] if target is not None else actor["agent_id"]
+        )
+    else:
+        terminal_event = "COMPLETED"
+        terminal_sender = actor["agent_id"]
     execution = {
         "worktree": str(root / "issue-7"),
         "branch": "work/issue-7-example",
@@ -136,6 +225,19 @@ def cleanup_report(
         "durable": True,
         "bound_agent_ids": ["agent-worker-7"],
         "branch_merged": False,
+        "agent_only": False,
+        "repository": "owner/repo",
+        "campaign_id": "campaign-20260718",
+        "dispatch_id": "dispatch-issue-7",
+        "terminal_receipt": {
+            "event_type": terminal_event,
+            "signal_id": "terminal-issue-7",
+            "sender_agent_id": terminal_sender,
+            "repository": "owner/repo",
+            "campaign_id": "campaign-20260718",
+            "dispatch_id": "dispatch-issue-7",
+            "read_back": True,
+        },
     }
     execution.update(execution_overrides or {})
     return POLICY.cleanup_plan(
@@ -209,13 +311,17 @@ class ExecutionContractTests(unittest.TestCase):
 
     def test_paseo_parentage_and_notifications_are_required(self) -> None:
         report = CONTRACT.validate_contract(
-            contract(relationship="detached", parent_agent_id="", notify_on_finish=False)
+            contract(
+                relationship="detached", parent_agent_id="", notify_on_finish=False
+            )
         )
         self.assertIn("relationship-must-be-subagent", report["errors"])
         self.assertIn("missing-or-empty:parent_agent_id", report["errors"])
         self.assertIn("notify-on-finish-must-be-true", report["errors"])
 
-    def test_campaign_orchestrator_is_a_subagent_of_the_repository_coordinator(self) -> None:
+    def test_campaign_orchestrator_is_a_subagent_of_the_repository_coordinator(
+        self,
+    ) -> None:
         report = CONTRACT.validate_contract(
             contract(
                 agent_role="orchestrator",
@@ -332,10 +438,25 @@ class ExecutionPolicyTests(unittest.TestCase):
             "max_active_agents_global": 6,
         }
         cases = (
-            ({"active_agents_for_campaign": 3, "active_agents_global": 2}, "campaign count"),
-            ({"active_agents_for_campaign": 1, "active_agents_global": 1}, "combined count"),
-            ({"campaign_orchestrators_for_campaign": 2, "active_agents_for_campaign": 1}, "orchestrator count"),
-            ({"repository_coordinators": 3, "active_agents_global": 2}, "coordinator count"),
+            (
+                {"active_agents_for_campaign": 3, "active_agents_global": 2},
+                "campaign count",
+            ),
+            (
+                {"active_agents_for_campaign": 1, "active_agents_global": 1},
+                "combined count",
+            ),
+            (
+                {
+                    "campaign_orchestrators_for_campaign": 2,
+                    "active_agents_for_campaign": 1,
+                },
+                "orchestrator count",
+            ),
+            (
+                {"repository_coordinators": 3, "active_agents_global": 2},
+                "coordinator count",
+            ),
             ({"active_agents_global": 7}, "global limit"),
             ({"active_agents_for_campaign": 5}, "campaign limit"),
             (
@@ -360,6 +481,7 @@ class ExecutionPolicyTests(unittest.TestCase):
             integration_lease_holder="campaign-a",
             pinned_dev_sha=current_dev,
             current_dev_sha=current_dev,
+            case_sensitive_paths=True,
         )
         campaign_b = POLICY.campaign_concurrency_report(
             campaign_id="campaign-b",
@@ -368,6 +490,7 @@ class ExecutionPolicyTests(unittest.TestCase):
             integration_lease_holder="campaign-a",
             pinned_dev_sha=current_dev,
             current_dev_sha=current_dev,
+            case_sensitive_paths=True,
         )
 
         self.assertTrue(campaign_a["can_execute"])
@@ -385,6 +508,7 @@ class ExecutionPolicyTests(unittest.TestCase):
             integration_lease_holder=None,
             pinned_dev_sha=dev_sha,
             current_dev_sha=dev_sha,
+            case_sensitive_paths=True,
         )
 
         self.assertFalse(report["can_execute"])
@@ -414,13 +538,45 @@ class ExecutionPolicyTests(unittest.TestCase):
                         integration_lease_holder="campaign-b",
                         pinned_dev_sha=dev_sha,
                         current_dev_sha=dev_sha,
+                        case_sensitive_paths=True,
                     )
+
+    def test_hotsets_preserve_case_on_case_sensitive_repositories(self) -> None:
+        self.assertEqual("Src/API.py", POLICY.normalize_hotset_entry("Src/API.py"))
+        report = POLICY.campaign_concurrency_report(
+            campaign_id="campaign-a",
+            requested_hotset=["Src/API.py"],
+            active_hotsets={"campaign-b": ["src/api.py"]},
+            integration_lease_holder="campaign-a",
+            pinned_dev_sha="a" * 40,
+            current_dev_sha="a" * 40,
+            case_sensitive_paths=True,
+        )
+        self.assertTrue(report["can_execute"])
+        insensitive = POLICY.campaign_concurrency_report(
+            campaign_id="campaign-a",
+            requested_hotset=["Src/API.py"],
+            active_hotsets={"campaign-b": ["src/api.py"]},
+            integration_lease_holder="campaign-a",
+            pinned_dev_sha="a" * 40,
+            current_dev_sha="a" * 40,
+            case_sensitive_paths=False,
+        )
+        self.assertFalse(insensitive["can_execute"])
+
+        with self.assertRaisesRegex(ValueError, "readback"):
+            POLICY.campaign_concurrency_report(
+                campaign_id="campaign-a",
+                requested_hotset=["Src/API.py"],
+                active_hotsets={},
+                integration_lease_holder="campaign-a",
+                pinned_dev_sha="a" * 40,
+                current_dev_sha="a" * 40,
+            )
 
     def test_hotset_traversal_cannot_bypass_an_existing_claim(self) -> None:
         dev_sha = "a" * 40
-        with self.assertRaisesRegex(
-            ValueError, "canonical repository-relative path"
-        ):
+        with self.assertRaisesRegex(ValueError, "canonical repository-relative path"):
             POLICY.campaign_concurrency_report(
                 campaign_id="campaign-b",
                 requested_hotset=["src/shared"],
@@ -428,6 +584,7 @@ class ExecutionPolicyTests(unittest.TestCase):
                 integration_lease_holder="campaign-b",
                 pinned_dev_sha=dev_sha,
                 current_dev_sha=dev_sha,
+                case_sensitive_paths=True,
             )
 
     def test_dev_advancing_requires_base_refresh_before_merge(self) -> None:
@@ -438,6 +595,7 @@ class ExecutionPolicyTests(unittest.TestCase):
             integration_lease_holder="campaign-b",
             pinned_dev_sha="a" * 40,
             current_dev_sha="b" * 40,
+            case_sensitive_paths=True,
         )
 
         self.assertTrue(report["can_execute"])
@@ -454,6 +612,7 @@ class ExecutionPolicyTests(unittest.TestCase):
             integration_lease_holder=None,
             pinned_dev_sha=dev_sha,
             current_dev_sha=dev_sha,
+            case_sensitive_paths=True,
         )
 
         self.assertTrue(report["can_execute"])
@@ -466,7 +625,10 @@ class ExecutionPolicyTests(unittest.TestCase):
             root = Path(temporary).resolve()
             report = cleanup_report(
                 root,
-                actor_overrides={"role": "repository-coordinator", "worktree": str(root)},
+                actor_overrides={
+                    "role": "repository-coordinator",
+                    "worktree": str(root),
+                },
                 target_overrides={
                     "agent_id": "agent-orchestrator",
                     "parent_agent_id": None,
@@ -513,7 +675,53 @@ class ExecutionPolicyTests(unittest.TestCase):
             report["next_required_readback"],
         )
 
-    def test_delegated_cleanup_waits_for_archive_readback_before_worktree_cleanup(self) -> None:
+    def test_cleanup_requires_exact_identity_and_terminal_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            missing = cleanup_report(
+                root,
+                execution_overrides={"terminal_receipt": None},
+            )
+            mismatch = cleanup_report(
+                root,
+                target_overrides={"campaign_id": "campaign-other"},
+            )
+            heartbeat = cleanup_report(
+                root,
+                execution_overrides={
+                    "terminal_receipt": {
+                        "event_type": "HEARTBEAT",
+                        "signal_id": "heartbeat-7",
+                        "sender_agent_id": "agent-worker-7",
+                        "repository": "owner/repo",
+                        "campaign_id": "campaign-20260718",
+                        "dispatch_id": "dispatch-issue-7",
+                        "read_back": True,
+                    }
+                },
+            )
+
+        self.assertIn("terminal-receipt-missing", missing["blockers"])
+        self.assertIn("cleanup-identity-mismatch", mismatch["blockers"])
+        self.assertIn("terminal-receipt-invalid", heartbeat["blockers"])
+        for report in (missing, mismatch, heartbeat):
+            self.assertEqual("protected", report["status"])
+            self.assertEqual([], report["actions"])
+
+    def test_merged_event_requires_branch_merge_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = cleanup_report(
+                Path(temporary).resolve(),
+                event="merged",
+                execution_overrides={"branch_merged": False},
+            )
+
+        self.assertEqual("protected", report["status"])
+        self.assertIn("merged-event-without-merged-branch", report["blockers"])
+
+    def test_delegated_cleanup_waits_for_archive_readback_before_worktree_cleanup(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             report = cleanup_report(
@@ -531,12 +739,14 @@ class ExecutionPolicyTests(unittest.TestCase):
         )
         self.assertIsNone(report["next_required_readback"])
 
-    def test_repository_coordinator_can_cleanup_a_terminal_campaign_orchestrator(self) -> None:
+    def test_repository_coordinator_can_cleanup_a_terminal_campaign_orchestrator(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             report = cleanup_report(
                 root,
-                event="merged",
+                event="campaign-closed",
                 actor_overrides={
                     "agent_id": "agent-repository-coordinator",
                     "role": "repository-coordinator",
@@ -547,18 +757,48 @@ class ExecutionPolicyTests(unittest.TestCase):
                     "role": "orchestrator",
                 },
                 execution_overrides={
-                    "worktree": str(root / "campaign-a"),
-                    "branch": "work/issue-14-campaign-a",
-                    "bound_agent_ids": ["agent-campaign-a"],
-                    "branch_merged": True,
+                    "worktree": None,
+                    "branch": None,
+                    "bound_agent_ids": [],
+                    "agent_only": True,
                 },
             )
 
         self.assertEqual("eligible", report["status"])
         self.assertTrue(report["automatic_execution"])
-        self.assertEqual(
-            "archive-paseo-agent", report["actions"][0]["action"]
-        )
+        self.assertEqual("archive-paseo-agent", report["actions"][0]["action"])
+        self.assertEqual("target-agent-archived", report["next_required_readback"])
+
+    def test_campaign_orchestrator_cleanup_completes_without_a_fake_worktree(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            report = cleanup_report(
+                root,
+                event="campaign-closed",
+                actor_overrides={
+                    "agent_id": "agent-repository-coordinator",
+                    "role": "repository-coordinator",
+                },
+                target_overrides={
+                    "agent_id": "agent-campaign-a",
+                    "parent_agent_id": "agent-repository-coordinator",
+                    "role": "orchestrator",
+                    "archived": True,
+                },
+                execution_overrides={
+                    "worktree": None,
+                    "branch": None,
+                    "bound_agent_ids": [],
+                    "agent_only": True,
+                },
+            )
+
+        self.assertEqual("eligible", report["status"])
+        self.assertTrue(report["cleanup_complete"])
+        self.assertFalse(report["automatic_execution"])
+        self.assertEqual([], report["actions"])
 
     def test_cleanup_rejects_a_sibling_or_foreign_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -644,7 +884,9 @@ class ExecutionPolicyTests(unittest.TestCase):
         self.assertEqual([], report["actions"])
         self.assertIn("execution-branch-not-work-issue", report["blockers"])
 
-    def test_campaign_orchestrator_cannot_delete_repository_control_worktree(self) -> None:
+    def test_campaign_orchestrator_cannot_delete_repository_control_worktree(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             control_worktree = str(root / "repository-control")
@@ -784,6 +1026,27 @@ class ExecutionPolicyTests(unittest.TestCase):
             [item["action"] for item in report["actions"]],
         )
 
+    def test_stopped_inline_cleanup_accepts_a_stopped_actor_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            report = cleanup_report(
+                root,
+                event="stopped",
+                execution_mode="inline",
+                target=None,
+                execution_overrides={
+                    "worktree": str(root / "issue-10"),
+                    "branch": "work/issue-10-inline",
+                    "bound_agent_ids": [],
+                    "branch_merged": False,
+                },
+            )
+
+        self.assertEqual("eligible", report["status"])
+        self.assertEqual(
+            ["archive-paseo-worktree"], [a["action"] for a in report["actions"]]
+        )
+
     def test_delegated_cleanup_requires_an_exact_agent_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -868,6 +1131,12 @@ class ExecutionPolicyTests(unittest.TestCase):
                     "orchestrator",
                     "--actor-worktree",
                     str(root / "control"),
+                    "--actor-repository",
+                    "owner/repo",
+                    "--actor-campaign-id",
+                    "campaign-20260718",
+                    "--actor-dispatch-id",
+                    "dispatch-issue-7",
                     "--protected-control-worktree",
                     str(root / "control"),
                     "--target-agent-id",
@@ -878,11 +1147,36 @@ class ExecutionPolicyTests(unittest.TestCase):
                     "subagent",
                     "--target-role",
                     "implementation",
+                    "--target-repository",
+                    "owner/repo",
+                    "--target-campaign-id",
+                    "campaign-20260718",
+                    "--target-dispatch-id",
+                    "dispatch-issue-7",
                     "--target-agent-idle",
                     "--target-worktree",
                     str(root / "issue-7"),
                     "--branch",
                     "work/issue-7-example",
+                    "--execution-repository",
+                    "owner/repo",
+                    "--execution-campaign-id",
+                    "campaign-20260718",
+                    "--execution-dispatch-id",
+                    "dispatch-issue-7",
+                    "--terminal-event",
+                    "COMPLETED",
+                    "--terminal-signal-id",
+                    "terminal-issue-7",
+                    "--terminal-sender-agent-id",
+                    "agent-orchestrator",
+                    "--terminal-repository",
+                    "owner/repo",
+                    "--terminal-campaign-id",
+                    "campaign-20260718",
+                    "--terminal-dispatch-id",
+                    "dispatch-issue-7",
+                    "--terminal-read-back",
                     "--worktree-agent-id",
                     "agent-worker-7",
                     "--worktree-clean",
@@ -899,6 +1193,86 @@ class ExecutionPolicyTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual("eligible", payload["policy"]["status"])
         self.assertTrue(payload["policy"]["automatic_execution"])
+
+    def test_cleanup_cli_retires_campaign_agent_without_feature_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ORCHESTRATOR_SCRIPTS / "execution_policy.py"),
+                    "cleanup-plan",
+                    "--event",
+                    "campaign-closed",
+                    "--seconds-since-event",
+                    "20",
+                    "--execution-mode",
+                    "paseo-agent",
+                    "--actor-agent-id",
+                    "agent-repository-coordinator",
+                    "--actor-role",
+                    "repository-coordinator",
+                    "--actor-worktree",
+                    str(root / "control"),
+                    "--actor-repository",
+                    "owner/repo",
+                    "--actor-campaign-id",
+                    "campaign-20260718",
+                    "--actor-dispatch-id",
+                    "campaign-control-1",
+                    "--protected-control-worktree",
+                    str(root / "control"),
+                    "--target-agent-id",
+                    "agent-campaign",
+                    "--target-parent-agent-id",
+                    "agent-repository-coordinator",
+                    "--target-relationship",
+                    "subagent",
+                    "--target-role",
+                    "orchestrator",
+                    "--target-repository",
+                    "owner/repo",
+                    "--target-campaign-id",
+                    "campaign-20260718",
+                    "--target-dispatch-id",
+                    "campaign-control-1",
+                    "--target-agent-idle",
+                    "--execution-repository",
+                    "owner/repo",
+                    "--execution-campaign-id",
+                    "campaign-20260718",
+                    "--execution-dispatch-id",
+                    "campaign-control-1",
+                    "--terminal-event",
+                    "CAMPAIGN_CLOSED",
+                    "--terminal-signal-id",
+                    "campaign-closed-1",
+                    "--terminal-sender-agent-id",
+                    "agent-campaign",
+                    "--terminal-repository",
+                    "owner/repo",
+                    "--terminal-campaign-id",
+                    "campaign-20260718",
+                    "--terminal-dispatch-id",
+                    "campaign-control-1",
+                    "--terminal-read-back",
+                    "--work-durable",
+                    "--agent-only",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            [{"action": "archive-paseo-agent", "target": "agent-campaign"}],
+            payload["policy"]["actions"],
+        )
+        self.assertEqual(
+            "target-agent-archived", payload["policy"]["next_required_readback"]
+        )
 
     def test_concurrency_cli_reports_the_repository_merge_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -923,6 +1297,7 @@ class ExecutionPolicyTests(unittest.TestCase):
                     "a" * 40,
                     "--current-dev-sha",
                     "a" * 40,
+                    "--case-sensitive-paths",
                 ],
                 capture_output=True,
                 text=True,
@@ -933,9 +1308,7 @@ class ExecutionPolicyTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertTrue(payload["policy"]["can_execute"])
         self.assertFalse(payload["policy"]["can_merge_dev"])
-        self.assertIn(
-            "integration-lease-held-by-other", payload["policy"]["blockers"]
-        )
+        self.assertIn("integration-lease-held-by-other", payload["policy"]["blockers"])
 
     def test_capacity_cli_admits_an_orchestrator_for_a_second_campaign(self) -> None:
         result = subprocess.run(
@@ -1114,18 +1487,81 @@ class ProviderPolicyTests(unittest.TestCase):
         result = PROVIDERS.resolve_highest_permission_mode(
             [
                 {"id": "plan-x", "label": "Plan", "description": "read only"},
-                {"id": "ask-x", "label": "Always Ask", "description": "prompts for permission"},
-                {"id": "auto-x", "label": "Auto mode", "description": "automatic approval"},
-                {"id": "power-x", "label": "Unrestricted", "description": "skip all permission prompts"},
+                {
+                    "id": "ask-x",
+                    "label": "Always Ask",
+                    "description": "prompts for permission",
+                },
+                {
+                    "id": "power-x",
+                    "label": "Unrestricted",
+                    "description": "skip all permission prompts",
+                    "isUnattended": True,
+                },
             ]
         )
         self.assertEqual("power-x", result["runtime_mode_id"])
-        self.assertEqual("advertised-unattended-full-access", result["evidence"])
+        self.assertEqual("advertised-is-unattended", result["evidence"])
+
+    def test_generic_execution_description_is_not_unattended_evidence(self) -> None:
+        with self.assertRaisesRegex(PROVIDERS.ProviderPolicyError, "unattended"):
+            PROVIDERS.resolve_highest_permission_mode(
+                [
+                    {
+                        "id": "build",
+                        "label": "Build",
+                        "description": "Tools require confirmation for every action",
+                    }
+                ]
+            )
+
+    def test_configured_unattended_mode_must_exist_and_wins(self) -> None:
+        modes = [
+            {"id": "auto", "label": "Default Permissions"},
+            {"id": "full-access", "label": "Full Access"},
+        ]
+        selected = PROVIDERS.resolve_highest_permission_mode(
+            modes, configured_mode_id="full-access"
+        )
+        self.assertEqual("full-access", selected["runtime_mode_id"])
+        self.assertEqual("configured-unattended-mode", selected["evidence"])
+        with self.assertRaisesRegex(PROVIDERS.ProviderPolicyError, "unavailable"):
+            PROVIDERS.resolve_highest_permission_mode(
+                modes, configured_mode_id="missing"
+            )
+
+    def test_configured_interactive_mode_is_still_rejected(self) -> None:
+        with self.assertRaisesRegex(PROVIDERS.ProviderPolicyError, "interactive"):
+            PROVIDERS.resolve_highest_permission_mode(
+                [
+                    {
+                        "id": "ask",
+                        "label": "Always Ask",
+                        "description": "prompts for permission",
+                    }
+                ],
+                configured_mode_id="ask",
+            )
+
+    def test_duplicate_mode_ids_fail_closed(self) -> None:
+        with self.assertRaisesRegex(PROVIDERS.ProviderPolicyError, "duplicate"):
+            PROVIDERS.resolve_highest_permission_mode(
+                [
+                    {"id": "full", "isUnattended": True},
+                    {"id": "full", "isUnattended": True},
+                ]
+            )
 
     def test_missing_unattended_mode_fails_closed(self) -> None:
         with self.assertRaisesRegex(PROVIDERS.ProviderPolicyError, "unattended"):
             PROVIDERS.resolve_highest_permission_mode(
-                [{"id": "ask", "label": "Always Ask", "description": "prompts for permission"}]
+                [
+                    {
+                        "id": "ask",
+                        "label": "Always Ask",
+                        "description": "prompts for permission",
+                    }
+                ]
             )
 
     def test_role_preference_is_resolved_without_hardcoded_provider(self) -> None:
@@ -1294,6 +1730,12 @@ class PaseoRoomProtocolTests(unittest.TestCase):
                 self.protocol.post("gwo-campaign-20260718", event())
         self.assertEqual([], self.runner.messages)
 
+    def test_missing_runtime_agent_identity_fails_before_publish(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ROOM.RoomProtocolError, "PASEO_AGENT_ID"):
+                self.protocol.post("gwo-campaign-20260718", event())
+        self.assertEqual([], self.runner.messages)
+
     def test_replay_deduplicates_and_rejects_conflicts(self) -> None:
         original = event()
         duplicate = event()
@@ -1301,21 +1743,461 @@ class PaseoRoomProtocolTests(unittest.TestCase):
         invalid = {"id": "message-4", "body": "human note", "author": "manual"}
         for index, payload in enumerate((original, duplicate, conflict), start=1):
             self.runner.messages.append(
-                {"id": f"message-{index}", "body": json.dumps(payload), "author": "a"}
+                {
+                    "id": f"message-{index}",
+                    "body": json.dumps(payload),
+                    "author": "agent-worker-7",
+                }
             )
         self.runner.messages.append(invalid)
-        replay = self.protocol.replay("gwo-campaign-20260718")
-        self.assertEqual(1, len(replay["events"]))
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718", identity_receipts=[identity_receipt()]
+        )
+        self.assertEqual([], replay["events"])
+        self.assertEqual(["dispatch-issue-7"], replay["blocked_dispatches"])
         self.assertEqual(
             ["duplicate-signal-conflict", "event-must-be-object"],
             [item["reason"] for item in replay["rejected"]],
         )
+        self.assertEqual("dispatch-issue-7", replay["rejected"][0]["dispatch_id"])
+
+    def test_replay_rejects_a_foreign_campaign_event(self) -> None:
+        self.runner.messages.append(
+            {
+                "id": "message-1",
+                "body": json.dumps(
+                    event(campaign_id="campaign-foreign", signal_id="foreign-1")
+                ),
+                "author": "agent-worker-7",
+            }
+        )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718", identity_receipts=[identity_receipt()]
+        )
+
+        self.assertEqual([], replay["events"])
+        self.assertEqual("room-campaign-mismatch", replay["rejected"][0]["reason"])
+
+    def test_replay_rejects_nonmonotonic_sender_dispatch_sequence(self) -> None:
+        first = event(signal_id="progress-2", sequence=2, event_type="PROGRESS")
+        stale = event(signal_id="progress-1", sequence=1, event_type="PROGRESS")
+        for index, payload in enumerate((first, stale), start=1):
+            self.runner.messages.append(
+                {
+                    "id": f"message-{index}",
+                    "body": json.dumps(payload),
+                    "author": "agent-worker-7",
+                }
+            )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718", identity_receipts=[identity_receipt()]
+        )
+
+        self.assertEqual([], replay["events"])
+        self.assertEqual("nonmonotonic-sequence", replay["rejected"][0]["reason"])
+        self.assertEqual(["dispatch-issue-7"], replay["blocked_dispatches"])
+
+    def test_heartbeat_payload_and_terminal_order_are_enforced(self) -> None:
+        heartbeat = event(
+            signal_id="heartbeat-1",
+            sequence=2,
+            event_type="HEARTBEAT",
+            evidence={
+                "phase": "implementation",
+                "last_completed_step": "updated policy",
+                "next_step": "run tests",
+                "head_sha": None,
+                "worktree_dirty": True,
+                "blocking": False,
+            },
+        )
+        done = event(
+            signal_id="done-1",
+            sequence=3,
+            event_type="WORKER_DONE",
+            evidence={
+                "head_sha": "a" * 40,
+                "verification": ["pytest: passed"],
+                "changed_paths": ["src/policy.py"],
+                "pr": "https://example.test/pr/7",
+            },
+        )
+        late = event(
+            signal_id="heartbeat-2",
+            sequence=4,
+            event_type="HEARTBEAT",
+            evidence=heartbeat["evidence"],
+        )
+        for index, payload in enumerate((heartbeat, done, late), start=1):
+            self.runner.messages.append(
+                {
+                    "id": f"message-{index}",
+                    "body": json.dumps(payload),
+                    "author": "agent-worker-7",
+                }
+            )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718", identity_receipts=[identity_receipt()]
+        )
+
+        self.assertEqual(
+            ["HEARTBEAT", "WORKER_DONE"], [e["event_type"] for e in replay["events"]]
+        )
+        self.assertEqual("heartbeat-after-terminal", replay["rejected"][0]["reason"])
+
+    def test_invalid_heartbeat_and_uncorrelated_reply_fail_validation(self) -> None:
+        heartbeat_errors = ROOM.validate_event(
+            event(event_type="HEARTBEAT", evidence="still working")
+        )
+        reply_errors = ROOM.validate_event(
+            event(event_type="REPLY", evidence={"answer": "continue"})
+        )
+
+        self.assertIn("invalid-heartbeat-evidence", heartbeat_errors)
+        self.assertIn("reply-requires-in-reply-to", reply_errors)
+
+    def test_replay_requires_exact_runtime_identity_receipts(self) -> None:
+        self.runner.messages.append(
+            {
+                "id": "message-1",
+                "body": json.dumps(event()),
+                "author": "agent-worker-7",
+            }
+        )
+
+        missing = self.protocol.replay("gwo-campaign-20260718")
+        mismatched = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=[identity_receipt(dispatch_id="dispatch-other")],
+        )
+
+        self.assertEqual([], missing["events"])
+        self.assertEqual("identity-receipt-missing", missing["rejected"][0]["reason"])
+        self.assertEqual([], mismatched["events"])
+        self.assertEqual(
+            "identity-receipt-missing", mismatched["rejected"][0]["reason"]
+        )
+
+    def test_replay_rejects_message_author_spoofing(self) -> None:
+        self.runner.messages.append(
+            {"id": "message-1", "body": json.dumps(event()), "author": "other-agent"}
+        )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718", identity_receipts=[identity_receipt()]
+        )
+
+        self.assertEqual([], replay["events"])
+        self.assertEqual("message-author-mismatch", replay["rejected"][0]["reason"])
+
+    def test_reply_must_correlate_to_the_accepted_ask(self) -> None:
+        ask = event(
+            signal_id="ask-1",
+            event_type="ASK",
+            evidence={"question": "Which API?", "blocking": True},
+        )
+        reply = event(
+            signal_id="reply-1",
+            sender_agent_id="agent-orchestrator",
+            recipient_agent_id="agent-worker-7",
+            event_type="REPLY",
+            in_reply_to="ask-1",
+            evidence={"answer": "Use v2"},
+        )
+        for index, payload in enumerate((ask, reply), start=1):
+            self.runner.messages.append(
+                {
+                    "id": f"message-{index}",
+                    "body": json.dumps(payload),
+                    "author": payload["sender_agent_id"],
+                }
+            )
+        receipts = [
+            identity_receipt(),
+            identity_receipt(
+                agent_id="agent-orchestrator",
+                role="orchestrator",
+                parent_agent_id="agent-repository-coordinator",
+            ),
+        ]
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718", identity_receipts=receipts
+        )
+
+        self.assertEqual(
+            ["ASK", "REPLY"], [item["event_type"] for item in replay["events"]]
+        )
+        self.assertEqual([], replay["blocked_dispatches"])
+
+    def test_uncorrelated_reply_blocks_the_dispatch(self) -> None:
+        reply = event(
+            signal_id="reply-1",
+            sender_agent_id="agent-orchestrator",
+            recipient_agent_id="agent-worker-7",
+            event_type="REPLY",
+            in_reply_to="missing-ask",
+            evidence={"answer": "Use v2"},
+        )
+        self.runner.messages.append(
+            {
+                "id": "message-1",
+                "body": json.dumps(reply),
+                "author": "agent-orchestrator",
+            }
+        )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=[
+                identity_receipt(
+                    agent_id="agent-orchestrator",
+                    role="orchestrator",
+                    parent_agent_id="agent-repository-coordinator",
+                )
+            ],
+        )
+
+        self.assertEqual([], replay["events"])
+        self.assertEqual("reply-correlation-invalid", replay["rejected"][0]["reason"])
+        self.assertEqual(["dispatch-issue-7"], replay["blocked_dispatches"])
+
+    def test_room_event_authority_is_role_enforced(self) -> None:
+        worker_checkpoint = event(
+            signal_id="checkpoint-1",
+            event_type="CHECKPOINT",
+            evidence={"cursor": "message-1"},
+        )
+        coordinator_heartbeat = event(
+            signal_id="heartbeat-1",
+            sender_agent_id="agent-orchestrator",
+            event_type="HEARTBEAT",
+            evidence={
+                "phase": "implementation",
+                "last_completed_step": "reviewed status",
+                "next_step": "wait",
+                "head_sha": None,
+                "worktree_dirty": False,
+                "blocking": False,
+            },
+        )
+        intake_heartbeat = event(
+            signal_id="heartbeat-intake-1",
+            sender_agent_id="agent-intake",
+            event_type="HEARTBEAT",
+            evidence={
+                "phase": "analysis",
+                "last_completed_step": "published intake",
+                "next_step": "return result",
+                "head_sha": None,
+                "worktree_dirty": False,
+                "blocking": False,
+            },
+        )
+        for index, payload in enumerate(
+            (worker_checkpoint, coordinator_heartbeat, intake_heartbeat), start=1
+        ):
+            self.runner.messages.append(
+                {
+                    "id": f"message-{index}",
+                    "body": json.dumps(payload),
+                    "author": payload["sender_agent_id"],
+                }
+            )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=[
+                identity_receipt(),
+                identity_receipt(
+                    agent_id="agent-orchestrator",
+                    role="orchestrator",
+                    parent_agent_id="agent-repository-coordinator",
+                ),
+                identity_receipt(
+                    agent_id="agent-intake",
+                    role="intake",
+                    parent_agent_id="agent-orchestrator",
+                ),
+            ],
+        )
+
+        self.assertEqual([], replay["events"])
+        self.assertEqual(
+            [
+                "event-role-not-authorized",
+                "event-role-not-authorized",
+                "event-role-not-authorized",
+            ],
+            [item["reason"] for item in replay["rejected"]],
+        )
+
+    def test_orchestrator_identity_is_static_across_child_dispatches(self) -> None:
+        start = event(
+            signal_id="start-8",
+            dispatch_id="dispatch-issue-8",
+            issue="#8",
+            sender_agent_id="agent-orchestrator",
+            recipient_agent_id="agent-worker-8",
+            event_type="START",
+            evidence={"base_sha": "a" * 40},
+        )
+        self.runner.messages.append(
+            {
+                "id": "message-1",
+                "body": json.dumps(start),
+                "author": "agent-orchestrator",
+            }
+        )
+        receipt = identity_receipt(
+            agent_id="agent-orchestrator",
+            dispatch_id="dispatch-issue-8",
+            role="orchestrator",
+            parent_agent_id="agent-repository-coordinator",
+            authority_subject_agent_id="agent-worker-8",
+        )
+        self.assertNotIn("dispatch_id", receipt["labels"])
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718", identity_receipts=[receipt]
+        )
+
+        self.assertEqual(["START"], [item["event_type"] for item in replay["events"]])
+        self.assertEqual([], replay["blocked_dispatches"])
+
+    def test_coordinator_control_authority_does_not_mutate_static_labels(self) -> None:
+        opened = event(
+            signal_id="campaign-opened-1",
+            dispatch_id="campaign-control-1",
+            issue="campaign",
+            sender_agent_id="agent-repository-coordinator",
+            recipient_agent_id="agent-orchestrator",
+            event_type="CAMPAIGN_OPENED",
+            evidence={"admission": "read-back"},
+        )
+        checkpoint = event(
+            signal_id="checkpoint-1",
+            dispatch_id="campaign-control-1",
+            issue="campaign",
+            sender_agent_id="agent-orchestrator",
+            recipient_agent_id="agent-repository-coordinator",
+            event_type="CHECKPOINT",
+            evidence={"cursor": "campaign-opened-1"},
+        )
+        for index, payload in enumerate((opened, checkpoint), start=1):
+            self.runner.messages.append(
+                {
+                    "id": f"message-{index}",
+                    "body": json.dumps(payload),
+                    "author": payload["sender_agent_id"],
+                }
+            )
+        root_receipt = identity_receipt(
+            agent_id="agent-repository-coordinator",
+            dispatch_id="campaign-control-1",
+            role="repository-coordinator",
+            parent_agent_id=None,
+            relationship="root",
+        )
+        orchestrator_receipt = identity_receipt(
+            agent_id="agent-orchestrator",
+            dispatch_id="campaign-control-1",
+            role="orchestrator",
+            parent_agent_id="agent-repository-coordinator",
+            authority_kind="campaign-control",
+        )
+        self.assertNotIn("campaign_id", root_receipt["labels"])
+        self.assertNotIn("dispatch_id", root_receipt["labels"])
+        self.assertNotIn("dispatch_id", orchestrator_receipt["labels"])
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=[root_receipt, orchestrator_receipt],
+        )
+
+        self.assertEqual(
+            ["CAMPAIGN_OPENED", "CHECKPOINT"],
+            [item["event_type"] for item in replay["events"]],
+        )
+
+    def test_repository_coordinator_cannot_start_a_campaign_worker(self) -> None:
+        start = event(
+            signal_id="root-start-worker-1",
+            sender_agent_id="agent-repository-coordinator",
+            recipient_agent_id="agent-worker-7",
+            event_type="START",
+            evidence={"base_sha": "a" * 40},
+        )
+        self.runner.messages.append(
+            {
+                "id": "message-1",
+                "body": json.dumps(start),
+                "author": "agent-repository-coordinator",
+            }
+        )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=[
+                identity_receipt(
+                    agent_id="agent-repository-coordinator",
+                    role="repository-coordinator",
+                    parent_agent_id=None,
+                    relationship="root",
+                )
+            ],
+        )
+
+        self.assertEqual([], replay["events"])
+        self.assertIn(
+            "identity-receipt-authority-recipient-mismatch",
+            replay["rejected"][0]["reason"],
+        )
+
+    def test_decision_gate_requires_durable_github_receipt(self) -> None:
+        invalid = ROOM.validate_event(
+            event(
+                event_type="DECISION_GATE",
+                evidence={
+                    "decision": "choose option A",
+                    "github_state": "ready-for-human",
+                },
+            )
+        )
+        valid = ROOM.validate_event(
+            event(
+                event_type="DECISION_GATE",
+                evidence={
+                    "decision": "choose option A",
+                    "github_state": "ready-for-human",
+                    "github_url": "https://github.com/owner/repo/issues/7#issuecomment-1",
+                },
+            )
+        )
+
+        self.assertIn("invalid-decision-gate-evidence", invalid)
+        self.assertEqual([], valid)
+
+    def test_wait_rejects_more_than_sixty_seconds(self) -> None:
+        with self.assertRaisesRegex(ROOM.RoomProtocolError, "60 seconds"):
+            self.protocol.wait("gwo-campaign-20260718", timeout="61s")
 
     def test_wait_always_replays_room_after_wakeup(self) -> None:
         self.runner.messages.append(
-            {"id": "message-1", "body": json.dumps(event()), "author": "a"}
+            {
+                "id": "message-1",
+                "body": json.dumps(event()),
+                "author": "agent-worker-7",
+            }
         )
-        result = self.protocol.wait("gwo-campaign-20260718", timeout="10s")
+        result = self.protocol.wait(
+            "gwo-campaign-20260718",
+            timeout="10s",
+            identity_receipts=[identity_receipt()],
+        )
         self.assertEqual(1, len(result["events"]))
         self.assertEqual(["wait", "read"], [call[1] for call in self.runner.calls])
 

@@ -22,6 +22,19 @@ ACTIVE -> RESULT_POSTED -> VERIFIED -> WAITING_INTEGRATION -> MERGED -> ARCHIVED
 ACTIVE -> BLOCKED | STOPPED -> durable handoff
 ```
 
+While ACTIVE, the Campaign Orchestrator runs an event-driven loop:
+
+```text
+RECONCILE_CAMPAIGN -> PLAN_WAVE -> DISPATCH_WAVE -> WAIT_WORKERS
+WAIT_WORKERS -> VERIFY_RESULTS -> REVIEW -> RETURN_CANDIDATE
+RETURN_CANDIDATE -> WAITING_INTEGRATION
+```
+
+`chat wait` is bounded to 60 seconds. A timeout replays the room but does not
+poll running Agents. A valid `HEARTBEAT` refreshes runtime visibility without
+changing lifecycle. Fifteen minutes of silence permits one recovery inspection,
+not cancellation or replacement.
+
 Every transition needs readback from its owning system. Room messages announce
 transitions but do not authorize them.
 
@@ -38,6 +51,11 @@ Different Campaign Orchestrators may run concurrently with independent Provider
 Bindings when admitted Hotsets do not overlap. Only the Campaign holding the
 repository Integration Lease enters integration.
 
+Within one Campaign, plan the whole ready wave. Start all selected Workers
+without waiting for the first to complete. Dispatch IDs are stable per attempt;
+after three terminal failures the Issue moves to `ready-for-human` and no
+fourth automatic attempt is allowed.
+
 ## Completion and cleanup
 
 Completion requires accepted Issue behavior, locally green evidence, applicable
@@ -50,6 +68,8 @@ preserved.
 
 The Campaign Orchestrator never archives itself. After `CAMPAIGN_CLOSED`, the
 Repository Coordinator may archive that direct child only after terminal Agent,
-room, Git, and GitHub readback. `CAMPAIGN_CLOSED` never archives the Repository
-Coordinator. Retiring the Repository Coordinator requires a human operator
-using the existing Paseo UI or CLI and a durable repository-level handoff.
+room, Git, and GitHub readback. This is Agent-only retirement; it does not
+require or delete a fabricated feature worktree. `CAMPAIGN_CLOSED` never
+archives the Repository Coordinator. Retiring the Repository Coordinator
+requires a human operator using the existing Paseo UI or CLI and a durable
+repository-level handoff.

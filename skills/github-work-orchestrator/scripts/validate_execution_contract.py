@@ -10,16 +10,8 @@ import re
 import sys
 from typing import Any
 
+from contract_schema import EXECUTION_MODES, ROLE_CATEGORIES, VERIFICATION_CLASSES
 
-VERIFICATION_CLASSES = {"fast", "standard", "strict"}
-EXECUTION_MODES = {"inline", "paseo-agent"}
-ROLE_CATEGORIES = {
-    "orchestrator": {"planning"},
-    "intake": {"research"},
-    "implementation": {"impl", "ui"},
-    "review": {"audit"},
-    "monitor": {"audit"},
-}
 FORBIDDEN_RUNTIME_FIELDS = {
     "callback_task",
     "execution_lane",

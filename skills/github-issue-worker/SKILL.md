@@ -30,16 +30,23 @@ or finish callback as authorization.
 ## Execute and report
 
 Stay inside the assigned hotset. Replay the room at safe checkpoints. Do not
-send prompts or mentions to busy Agents. Post `DISCUSSION_REQUIRED` before
-durable architecture, compatibility, security/privacy, migration, or
-cross-Issue choices.
+send prompts or mentions to busy Agents. Post one blocking `ASK` before durable
+architecture, compatibility, security/privacy, migration, or cross-Issue
+choices, then wait for a correlated `REPLY` after durable decision readback.
 
 Implement the smallest accepted change. Run targeted checks and the required
 suite/manual evidence. Do not run formal review.
 
+Post `HEARTBEAT` after investigation, at independent implementation phase
+boundaries, and before/after long verification. During a long phase, target one
+after five minutes without `PROGRESS` or `HEARTBEAT`, but never interrupt a
+running command merely to meet the target. Use the required structured payload;
+HEARTBEAT is liveness only and stops after a terminal event.
+
 Commit and push the assigned branch, open/update the PR against `dev`, then post
-`PR_OPENED` and `READY_FOR_REVIEW` or `COMPLETED` with commit, changed paths,
-checks, timings, scope delta, blockers, and next action.
+`PR_OPENED` and `WORKER_DONE` with commit, changed paths, checks, timings, scope
+delta, blockers, and next action. The Campaign Orchestrator alone verifies and
+posts `READY_FOR_REVIEW` or `COMPLETED`.
 
 On failure, preserve useful WIP, post `BLOCKED` or `STOPPED`, and leave Agent,
 branch, and worktree intact. Never merge, close/reprioritize the Issue, reset,

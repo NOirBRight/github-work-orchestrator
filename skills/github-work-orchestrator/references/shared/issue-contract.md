@@ -40,6 +40,20 @@ resolved. A public/persisted contract or durable architecture gray area uses
 Legacy Issues may migrate when they are next materially rewritten. Active work
 must not be restarted only to add these fields.
 
+For deterministic parallel admission, new or materially rewritten Issues use
+this exact machine-readable section:
+
+```text
+## Expected hotset
+- `src/component`
+- `tests/component`
+```
+
+Each bullet contains one backticked canonical repository-relative path. Reject
+absolute paths, empty segments, `.` and `..`. A legacy Issue without a valid
+section may still execute, but its Dispatch claims the repository exclusively
+and therefore cannot be automatically parallelized.
+
 ## Readiness classification
 
 - Use `needs-triage` when scope or ownership remains ambiguous.

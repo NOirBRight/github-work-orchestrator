@@ -48,7 +48,13 @@ worktree.
 
 Different Campaigns may execute concurrently when their Hotsets do not overlap.
 Hotset entries are canonical repository-relative paths; reject absolute paths,
-empty components, `.` and `..` instead of guessing their targets.
+empty components, `.` and `..` instead of guessing their targets. Preserve the
+repository path's original case. Record the worktree's case-sensitivity in the
+scheduler snapshot: comparison folds case only for a case-insensitive
+worktree, so the stored/published path itself is never rewritten. Derive this
+from the actual worktree's Git `core.ignorecase` readback (invert it for
+`case_sensitive_paths`); missing or ambiguous evidence blocks automatic
+parallel admission instead of falling back to the host operating system.
 The Repository Coordinator admits Hotsets and holds one repository-scoped
 Integration Lease, so only one Campaign may update `dev` at a time. Before
 integration, a Campaign whose base SHA is no longer current must refresh its
@@ -77,6 +83,19 @@ reported by Paseo. This includes the Repository Coordinator. Reject
 contradictory or already-over-limit counts rather than admitting around them.
 Recompute after material dispatch, terminal event, merge, stop, recovery, or
 explicit operator request.
+
+The three child slots are shared by implementation, review, and monitoring.
+Fast-only work may use all three for implementation. If any ready or active
+Dispatch is `standard` or `strict` and no Review Agent exists, reserve one child
+slot, so at most two new implementation Workers enter that wave. Reuse one
+Campaign Review Agent across candidates. If the existing reviewer is not
+reusable, block and reconcile it instead of reserving a second reviewer; never
+exceed capacity to create one.
+
+The Repository Coordinator admits every already-planned Campaign whose Hotset
+and host capacity allow in the same admission wave. A Campaign Orchestrator
+likewise dispatches the whole eligible Issue wave. The Integration Lease limits
+only updates to `dev`; waiting for it does not consume an editing conflict.
 
 ## Safe cleanup
 

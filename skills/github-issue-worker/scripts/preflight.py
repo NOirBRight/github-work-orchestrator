@@ -7,7 +7,6 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
-import sys
 from typing import Any
 
 

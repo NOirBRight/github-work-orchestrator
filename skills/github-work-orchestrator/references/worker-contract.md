@@ -10,9 +10,10 @@ hotset, acceptance, verification, room, and return evidence. It contains no
 fixed Provider, model, native Task ID, or callback thread.
 
 Resolve the Provider at dispatch time from the explicit override or Paseo
-orchestration preferences, then validate availability. Resolve the highest
-unattended execution mode from advertised mode metadata; never use a
-Provider-name lookup table. Create with relationship `subagent`,
+orchestration preferences, then validate availability. Resolve mode by explicit
+Campaign override, `unattended_modes[provider]`, then exactly one advertised
+`isUnattended: true` mode. Generic words such as build, execute, auto, or tools
+are not unattended evidence. Create with relationship `subagent`,
 `notifyOnFinish: true`, that mode, an isolated worktree from `dev`, and
 campaign/dispatch/Issue labels. Read back the parent Agent ID and mode before
 publishing `START`.
@@ -30,3 +31,8 @@ authorization evidence.
 Do not send a follow-up to a busy Agent. When idle, wake the same Agent with a
 pointer to the exact room message UUID. Create a successor only after terminal
 proof, durable WIP, and released ownership.
+
+The Worker posts HEARTBEAT only at safe boundaries, with a five-minute target
+during long phases. A long command may miss the target. It posts WORKER_DONE,
+not COMPLETED, after publishing its candidate; the Campaign Orchestrator owns
+verification and completion.

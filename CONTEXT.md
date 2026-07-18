@@ -37,6 +37,16 @@ The repository-scoped exclusive right for one Campaign to update the integration
 branch.
 _Avoid_: Merge lock
 
+**Coordinator Loop**:
+The event-driven Repository/Campaign reconciliation cycle that rebuilds state,
+plans a ready wave, waits on Paseo signals, verifies evidence, and integrates.
+_Avoid_: Poller, daemon, watchdog service
+
+**Heartbeat**:
+A best-effort Worker room signal at safe execution boundaries with a five-minute
+target. It reports liveness only and cannot authorize completion or cleanup.
+_Avoid_: Orchestrator poll, timer SLA, terminal receipt
+
 **Control Worktree**:
 The Repository Coordinator's persistent integration context, which is never a
 Campaign cleanup target.

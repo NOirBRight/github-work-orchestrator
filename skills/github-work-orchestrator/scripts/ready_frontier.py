@@ -4,14 +4,14 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import json
 import re
-import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any
+
+from github_client import GhError, resolve_repo, run_gh
+from hotset_policy import normalize_hotset_entry
 
 
 CANONICAL_LABELS = {
@@ -21,84 +21,30 @@ CANONICAL_LABELS = {
     "ready-for-human",
     "wontfix",
 }
-BLOCKED_BY_RE = re.compile(r"(?im)^\s*blocked\s+by\s*:\s*(.+)$")
-ISSUE_REF_RE = re.compile(r"#(\d+)")
-RETRYABLE_GH_ERRORS = (
-    "connection",
-    "dial tcp",
-    "eof",
-    "http 502",
-    "http 503",
-    "http 504",
-    "stream error",
-    "timed out",
-    "timeout",
-    "tls handshake",
-)
-
-
-class GhError(RuntimeError):
-    """Raised when the GitHub CLI cannot return the requested state."""
-
-
-def run_gh(arguments: list[str], cwd: Path | None = None) -> str:
-    command = ["gh", *arguments]
-    for attempt in range(3):
-        try:
-            result = subprocess.run(
-                command,
-                cwd=str(cwd) if cwd else None,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-            )
-        except FileNotFoundError as exc:
-            raise GhError("GitHub CLI `gh` is not installed or not on PATH") from exc
-        if result.returncode == 0:
-            return result.stdout
-        detail = result.stderr.strip() or result.stdout.strip()
-        retryable = any(token in detail.lower() for token in RETRYABLE_GH_ERRORS)
-        if not retryable or attempt == 2:
-            raise GhError(f"`{' '.join(command)}` failed: {detail}")
-        time.sleep(0.5 * (2**attempt))
-    raise AssertionError("unreachable")
-
-
-def resolve_repo(repo: str | None, cwd: Path | None) -> str:
-    if repo:
-        return repo
-    return run_gh(
-        ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
-        cwd,
-    ).strip()
-
-
-def fetch_issues(
-    repo: str,
-    cwd: Path | None,
-    *,
-    state: str = "open",
-    label: str | None = None,
-    limit: int = 1000,
-) -> list[dict[str, Any]]:
-    fields = "number,title,url,state,body,assignees,labels"
-    arguments = [
-        "issue",
-        "list",
-        "--repo",
-        repo,
-        "--state",
-        state,
-        "--limit",
-        str(limit),
-        "--json",
-        fields,
-    ]
-    if label:
-        arguments.extend(["--label", label])
-    payload = json.loads(run_gh(arguments, cwd) or "[]")
-    return sorted(payload, key=lambda issue: int(issue["number"]))
+HOTSET_HEADING_RE = re.compile(r"^\s*#{2,6}\s+expected\s+hotset\s*$", re.IGNORECASE)
+HOTSET_BULLET_RE = re.compile(r"^\s*[-*]\s+`([^`]+)`\s*$")
+ISSUE_SNAPSHOT_QUERY = """
+query($owner: String!, $name: String!, $cursor: String, $pageSize: Int!) {
+  repository(owner: $owner, name: $name) {
+    issues(first: $pageSize, after: $cursor, orderBy: {field: CREATED_AT, direction: ASC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        title
+        url
+        state
+        body
+        assignees(first: 100) { nodes { login } }
+        labels(first: 100) { nodes { name } }
+        blockedBy(first: 100) {
+          pageInfo { hasNextPage }
+          nodes { number state }
+        }
+      }
+    }
+  }
+}
+""".strip()
 
 
 def label_names(issue: dict[str, Any]) -> set[str]:
@@ -109,52 +55,117 @@ def label_names(issue: dict[str, Any]) -> set[str]:
     }
 
 
-def textual_blockers(body: str) -> list[int]:
-    blockers: set[int] = set()
-    for match in BLOCKED_BY_RE.finditer(body or ""):
-        blockers.update(int(number) for number in ISSUE_REF_RE.findall(match.group(1)))
-    return sorted(blockers)
-
-
-def native_open_blocker_count(
-    repo: str, number: int, cwd: Path | None
-) -> int | None:
-    payload = json.loads(run_gh(["api", f"repos/{repo}/issues/{number}"], cwd))
-    summary = payload.get("issue_dependencies_summary")
-    if not isinstance(summary, dict) or "blocked_by" not in summary:
+def expected_hotset(body: str) -> list[str] | None:
+    """Parse strict backticked bullets from the Expected hotset section."""
+    lines = (body or "").splitlines()
+    start = next(
+        (
+            index + 1
+            for index, line in enumerate(lines)
+            if HOTSET_HEADING_RE.fullmatch(line)
+        ),
+        None,
+    )
+    if start is None:
         return None
-    blocked_by = summary["blocked_by"]
-    if isinstance(blocked_by, int):
-        return blocked_by
-    if isinstance(blocked_by, dict):
-        for key in ("total_count", "open", "open_count"):
-            value = blocked_by.get(key)
-            if isinstance(value, int):
-                return value
-    return None
+    entries: list[str] = []
+    for line in lines[start:]:
+        if re.match(r"^\s*#{1,6}\s+", line):
+            break
+        if not line.strip():
+            continue
+        match = HOTSET_BULLET_RE.fullmatch(line)
+        if not match:
+            return None
+        try:
+            entries.append(normalize_hotset_entry(match.group(1)))
+        except ValueError:
+            return None
+    return sorted(set(entries)) or None
 
 
-def native_open_blocker_counts(
+def fetch_issue_snapshot(
     repo: str,
-    numbers: list[int],
     cwd: Path | None,
     *,
-    workers: int = 4,
-) -> dict[int, int | None]:
-    if not numbers:
-        return {}
-    worker_count = min(max(workers, 1), len(numbers))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        counts = executor.map(
-            lambda number: native_open_blocker_count(repo, number, cwd), numbers
-        )
-        return dict(zip(numbers, counts, strict=True))
+    limit: int,
+    runner=run_gh,
+) -> list[dict[str, Any]]:
+    """Read Issue state and dependency edges through paginated GraphQL."""
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    try:
+        owner, name = repo.split("/", 1)
+    except ValueError as error:
+        raise GhError("repository must be owner/name") from error
+    if not owner or not name:
+        raise GhError("repository must be owner/name")
+    cursor: str | None = None
+    issues: list[dict[str, Any]] = []
+    while len(issues) < limit:
+        page_size = min(100, limit - len(issues))
+        arguments = [
+            "api",
+            "graphql",
+            "-f",
+            f"query={ISSUE_SNAPSHOT_QUERY}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"pageSize={page_size}",
+        ]
+        if cursor is not None:
+            arguments.extend(["-F", f"cursor={cursor}"])
+        payload = json.loads(runner(arguments, cwd) or "{}")
+        repository = payload.get("data", {}).get("repository")
+        connection = repository.get("issues") if isinstance(repository, dict) else None
+        if not isinstance(connection, dict) or not isinstance(
+            connection.get("nodes"), list
+        ):
+            raise GhError("GitHub GraphQL response omitted repository Issues")
+        for node in connection["nodes"]:
+            if not isinstance(node, dict):
+                raise GhError("GitHub GraphQL returned an invalid Issue node")
+            blocked_by = node.get("blockedBy")
+            blocked_nodes = (
+                blocked_by.get("nodes", []) if isinstance(blocked_by, dict) else []
+            )
+            blocked_page = (
+                blocked_by.get("pageInfo", {}) if isinstance(blocked_by, dict) else {}
+            )
+            issues.append(
+                {
+                    "number": node.get("number"),
+                    "title": node.get("title"),
+                    "url": node.get("url"),
+                    "state": node.get("state"),
+                    "body": node.get("body") or "",
+                    "assignees": node.get("assignees", {}).get("nodes", []),
+                    "labels": node.get("labels", {}).get("nodes", []),
+                    "open_dependencies": sorted(
+                        int(dependency["number"])
+                        for dependency in blocked_nodes
+                        if isinstance(dependency, dict)
+                        and dependency.get("state") == "OPEN"
+                        and isinstance(dependency.get("number"), int)
+                    ),
+                    "dependencies_complete": blocked_page.get("hasNextPage") is False,
+                }
+            )
+        page_info = connection.get("pageInfo")
+        if not isinstance(page_info, dict) or page_info.get("hasNextPage") is not True:
+            break
+        next_cursor = page_info.get("endCursor")
+        if not isinstance(next_cursor, str) or not next_cursor:
+            raise GhError("GitHub GraphQL pagination cursor is missing")
+        cursor = next_cursor
+    return sorted(issues, key=lambda issue: int(issue["number"]))
 
 
 def classify_frontier(
     issues: list[dict[str, Any]],
-    all_issue_states: dict[int, str],
-    native_counts: dict[int, int | None],
 ) -> dict[str, list[dict[str, Any]]]:
     result: dict[str, list[dict[str, Any]]] = {
         "ready": [],
@@ -176,27 +187,30 @@ def classify_frontier(
                 if isinstance(assignee, dict) and assignee.get("login")
             ),
             "status_labels": statuses,
+            "expected_hotset": expected_hotset(issue.get("body") or "") or [],
         }
+        item["hotset_evidence"] = (
+            "strict" if item["expected_hotset"] else "missing-or-invalid"
+        )
         if statuses != ["ready-for-agent"]:
             item["reason"] = "ready-for-agent is combined with another status label"
             result["invalid"].append(item)
             continue
 
-        native_count = native_counts[number]
-        body_refs = textual_blockers(issue.get("body") or "")
-        if native_count is None:
-            item["dependency_check"] = "body-fallback"
-            unresolved_body_refs = [
-                ref
-                for ref in body_refs
-                if all_issue_states.get(ref, "UNKNOWN") != "CLOSED"
-            ]
-            item["open_blocker_count"] = len(unresolved_body_refs)
-            if unresolved_body_refs:
-                item["unresolved_textual_blockers"] = unresolved_body_refs
-        else:
-            item["dependency_check"] = "native"
-            item["open_blocker_count"] = native_count
+        dependencies = issue.get("open_dependencies")
+        if not isinstance(dependencies, list) or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in dependencies
+        ):
+            item["reason"] = "native dependency evidence is invalid"
+            result["invalid"].append(item)
+            continue
+        item["dependency_check"] = "native-graphql"
+        item["open_dependencies"] = sorted(set(dependencies))
+        item["open_blocker_count"] = len(item["open_dependencies"])
+        if issue.get("dependencies_complete") is not True:
+            item["dependency_check"] = "native-graphql-incomplete"
+            item["open_blocker_count"] = max(1, item["open_blocker_count"])
 
         if item["assignees"]:
             item["reason"] = "assigned"
@@ -216,16 +230,13 @@ def build_frontier(
     limit: int,
 ) -> dict[str, Any]:
     resolved_repo = resolve_repo(repo, cwd)
-    candidates = fetch_issues(
-        resolved_repo, cwd, state="open", label=label, limit=limit
-    )
-    all_issues = fetch_issues(resolved_repo, cwd, state="all", limit=limit)
-    states = {int(issue["number"]): str(issue["state"]).upper() for issue in all_issues}
-    candidate_numbers = [int(issue["number"]) for issue in candidates]
-    native_counts = native_open_blocker_counts(
-        resolved_repo, candidate_numbers, cwd
-    )
-    classified = classify_frontier(candidates, states, native_counts)
+    all_issues = fetch_issue_snapshot(resolved_repo, cwd, limit=limit)
+    candidates = [
+        issue
+        for issue in all_issues
+        if str(issue.get("state")).upper() == "OPEN" and label in label_names(issue)
+    ]
+    classified = classify_frontier(candidates)
     return {
         "repository": resolved_repo,
         "query_label": label,
@@ -245,7 +256,9 @@ def print_human(frontier: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", help="GitHub owner/repository; infer from cwd by default")
+    parser.add_argument(
+        "--repo", help="GitHub owner/repository; infer from cwd by default"
+    )
     parser.add_argument("--cwd", type=Path, help="Repository working directory")
     parser.add_argument("--label", default="ready-for-agent")
     parser.add_argument("--limit", type=int, default=1000)
@@ -257,7 +270,7 @@ def main() -> int:
     args = parse_args()
     try:
         frontier = build_frontier(args.repo, args.cwd, args.label, args.limit)
-    except (GhError, json.JSONDecodeError) as exc:
+    except (GhError, json.JSONDecodeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if args.as_json:

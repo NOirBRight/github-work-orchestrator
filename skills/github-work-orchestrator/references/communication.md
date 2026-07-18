@@ -15,3 +15,10 @@ restart, or ambiguous create response.
 Finish notification and mention delivery are best effort and may be lost across
 restart. A chat message is durable but its claimed author is not authentication.
 Never infer terminal state from age, silence, or a missing UI row.
+
+HEARTBEAT is a Worker room event, not Coordinator polling. A normal 60-second
+`chat wait` timeout causes room replay only. At 15 minutes without a valid
+runtime signal, use `coordinator_loop.py` for one state/timeline inspection; do
+not inspect again for 15 minutes without new evidence. Leave a running Agent
+alone, prompt an idle non-terminal Agent once, preserve error/closed WIP, and
+escalate ambiguous identity. Silence never authorizes a successor.

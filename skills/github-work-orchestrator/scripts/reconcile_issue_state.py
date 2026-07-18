@@ -5,21 +5,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from ready_frontier import (
-    CANONICAL_LABELS,
-    GhError,
-    fetch_issues,
-    label_names,
-    resolve_repo,
-    run_gh,
-    textual_blockers,
-)
+from github_client import GhError, fetch_issues, resolve_repo, run_gh
+from ready_frontier import CANONICAL_LABELS, label_names
+
+
+BLOCKED_BY_RE = re.compile(r"(?im)^\s*blocked\s+by\s*:\s*(.+)$")
+ISSUE_REF_RE = re.compile(r"#(\d+)")
+
+
+def textual_blockers(body: str) -> list[int]:
+    blockers: set[int] = set()
+    for match in BLOCKED_BY_RE.finditer(body or ""):
+        blockers.update(int(number) for number in ISSUE_REF_RE.findall(match.group(1)))
+    return sorted(blockers)
 
 
 def parse_assignment(value: str, name: str) -> tuple[int, str]:
@@ -57,9 +62,7 @@ def parse_exact(value: str) -> tuple[int, set[int]]:
     try:
         issue = int(issue_text)
         blockers = {
-            int(number.strip())
-            for number in blocker_text.split(",")
-            if number.strip()
+            int(number.strip()) for number in blocker_text.split(",") if number.strip()
         }
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
@@ -149,7 +152,9 @@ def build_actions(
             raise GhError(f"unsupported lifecycle label: {status}")
         issue = require_issue(issue_number)
         if str(issue["state"]).upper() != "OPEN":
-            raise GhError(f"cannot set lifecycle status on closed Issue #{issue_number}")
+            raise GhError(
+                f"cannot set lifecycle status on closed Issue #{issue_number}"
+            )
         previous = normalized_statuses.setdefault(issue_number, status)
         if previous != status:
             raise GhError(f"conflicting desired statuses for Issue #{issue_number}")
@@ -390,10 +395,7 @@ def print_human(repo: str, mode: str, actions: list[dict[str, Any]]) -> None:
     print(f"Actions ({len(actions)}):")
     for action in actions:
         target = action.get("label", f"#{action.get('blocker')}")
-        print(
-            f"  #{action['issue']} {action['action']} {target} "
-            f"— {action['reason']}"
-        )
+        print(f"  #{action['issue']} {action['action']} {target} — {action['reason']}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -451,16 +453,12 @@ def main() -> int:
     try:
         repo = resolve_repo(args.repo, args.cwd)
         statuses = [parse_assignment(value, "status") for value in args.status]
-        add_labels = [
-            parse_assignment(value, "add-label") for value in args.add_label
-        ]
+        add_labels = [parse_assignment(value, "add-label") for value in args.add_label]
         remove_labels = [
             parse_assignment(value, "remove-label") for value in args.remove_label
         ]
         dependencies = [parse_edge(value) for value in args.dependency]
-        exact_dependencies = [
-            parse_exact(value) for value in args.exact_dependencies
-        ]
+        exact_dependencies = [parse_exact(value) for value in args.exact_dependencies]
         actions, _ = build_actions(
             repo,
             args.cwd,

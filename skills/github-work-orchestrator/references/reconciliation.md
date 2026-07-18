@@ -78,6 +78,18 @@ Options:
 The script performs deterministic writes; the Orchestrator supplies semantic
 decisions. If GitHub changes between preview and apply, rebuild the plan.
 
+## Frontier and wave projection
+
+`ready_frontier.py` reads Issues, assignees, bodies, and `blockedBy` edges from
+one paginated GraphQL snapshot instead of one REST request per candidate. It
+returns exact open dependency IDs plus strict Expected Hotset evidence. Feed the
+candidate projection, live Dispatches, external Campaign Hotsets, Review Agent
+state, and observed capacity to `campaign_scheduler.py plan-wave`.
+
+The planner is pure and idempotent. It returns the entire eligible wave and a
+blocker list for every deferred Issue. Execute only a nonempty plan with no
+global blockers, re-read every claim before create, then read back every Agent.
+
 ## Completion gate
 
 Rerun the validator and frontier. Reconciliation is complete when there are no
@@ -85,4 +97,4 @@ invalid lifecycle combinations, every active item has one dispatch/Agent/worktre
 capacity is within the one-Orchestrator/four-Agent bounds, every intended hard blocker has one native
 or documented edge, incomplete contracts are routed to Intake, and every
 remaining ambiguity is visible in `needs-triage`, `needs-info`, or a discussion
-gate.
+gate. Missing Hotset evidence remains ready but is repository-exclusive.

@@ -18,7 +18,11 @@ def load_module(name: str):
         raise AssertionError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    spec.loader.exec_module(module)
+    sys.path.insert(0, str(SCRIPT_DIR))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
     return module
 
 
@@ -33,6 +37,8 @@ def issue(
     labels: tuple[str, ...] = ("ready-for-agent",),
     assignees: tuple[str, ...] = (),
     body: str = "",
+    open_dependencies: tuple[int, ...] = (),
+    dependencies_complete: bool = True,
 ):
     return {
         "number": number,
@@ -41,6 +47,8 @@ def issue(
         "labels": [{"name": label} for label in labels],
         "assignees": [{"login": login} for login in assignees],
         "body": body,
+        "open_dependencies": list(open_dependencies),
+        "dependencies_complete": dependencies_complete,
     }
 
 
@@ -64,26 +72,77 @@ class ReadyFrontierTests(unittest.TestCase):
         issues = [
             issue(1, body=v3_contract()),
             issue(2, assignees=("worker",), body=v3_contract()),
-            issue(3, body="Blocked by: #9\n" + v3_contract()),
+            issue(3, body=v3_contract(), open_dependencies=(9,)),
             issue(4, labels=("ready-for-agent", "needs-info"), body=v3_contract()),
         ]
-        result = ready_frontier.classify_frontier(
-            issues,
-            {9: "OPEN"},
-            {1: 0, 2: 0, 3: None, 4: 0},
-        )
+        result = ready_frontier.classify_frontier(issues)
         self.assertEqual([1], [item["number"] for item in result["ready"]])
         self.assertEqual([2], [item["number"] for item in result["claimed"]])
         self.assertEqual([3], [item["number"] for item in result["blocked"]])
         self.assertEqual([4], [item["number"] for item in result["invalid"]])
 
-    def test_closed_textual_blocker_does_not_block_fallback(self) -> None:
+    def test_incomplete_native_dependency_readback_fails_closed(self) -> None:
         result = ready_frontier.classify_frontier(
-            [issue(5, body="Blocked by: #9\n" + v3_contract())],
-            {9: "CLOSED"},
-            {5: None},
+            [issue(5, body=v3_contract(), dependencies_complete=False)]
         )
-        self.assertEqual([5], [item["number"] for item in result["ready"]])
+        self.assertEqual([5], [item["number"] for item in result["blocked"]])
+        self.assertEqual(
+            "native-graphql-incomplete", result["blocked"][0]["dependency_check"]
+        )
+
+    def test_expected_hotset_uses_strict_repository_relative_bullets(self) -> None:
+        body = """## Expected hotset
+- `src/api`
+- `tests/api`
+
+## Acceptance criteria
+- done
+"""
+        self.assertEqual(["src/api", "tests/api"], ready_frontier.expected_hotset(body))
+        self.assertIsNone(
+            ready_frontier.expected_hotset("## Expected hotset\n- `../outside`")
+        )
+
+    def test_graphql_snapshot_exposes_dependency_ids_without_per_issue_rest(
+        self,
+    ) -> None:
+        response = {
+            "data": {
+                "repository": {
+                    "issues": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [
+                            {
+                                "number": 7,
+                                "title": "Issue 7",
+                                "url": "https://example.test/issues/7",
+                                "state": "OPEN",
+                                "body": v3_contract(),
+                                "assignees": {"nodes": []},
+                                "labels": {"nodes": [{"name": "ready-for-agent"}]},
+                                "blockedBy": {
+                                    "pageInfo": {"hasNextPage": False},
+                                    "nodes": [{"number": 3, "state": "OPEN"}],
+                                },
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+        calls = []
+
+        def runner(arguments, cwd=None):
+            calls.append(arguments)
+            return __import__("json").dumps(response)
+
+        issues = ready_frontier.fetch_issue_snapshot(
+            "owner/repo", None, limit=100, runner=runner
+        )
+
+        self.assertEqual([3], issues[0]["open_dependencies"])
+        self.assertEqual(1, len(calls))
+        self.assertEqual(["api", "graphql"], calls[0][:2])
 
 
 class ReconciliationParserTests(unittest.TestCase):
@@ -98,19 +157,25 @@ class ReconciliationParserTests(unittest.TestCase):
 class ExecutionContractParserTests(unittest.TestCase):
     def test_v3_ready_contract_is_accepted(self) -> None:
         candidate = issue(6, body=v3_contract())
-        self.assertEqual([], validate_issue_state.execution_contract_findings(candidate))
+        self.assertEqual(
+            [], validate_issue_state.execution_contract_findings(candidate)
+        )
 
     def test_v2_contract_is_rejected(self) -> None:
         candidate = issue(
             7,
-            body=v3_contract().replace("Execution-Contract: v3", "Execution-Contract: v2"),
+            body=v3_contract().replace(
+                "Execution-Contract: v3", "Execution-Contract: v2"
+            ),
         )
         findings = validate_issue_state.execution_contract_findings(candidate)
         self.assertIn("invalid-execution-field", [item["code"] for item in findings])
 
     def test_missing_contract_is_a_migration_warning(self) -> None:
         findings = validate_issue_state.execution_contract_findings(issue(8))
-        self.assertEqual(["legacy-execution-contract"], [item["code"] for item in findings])
+        self.assertEqual(
+            ["legacy-execution-contract"], [item["code"] for item in findings]
+        )
         self.assertEqual("warning", findings[0]["severity"])
 
     def test_open_architecture_decision_is_not_ready(self) -> None:
@@ -121,7 +186,12 @@ class ExecutionContractParserTests(unittest.TestCase):
 
     def test_role_category_pair_must_match(self) -> None:
         findings = validate_issue_state.execution_contract_findings(
-            issue(10, body=v3_contract().replace("Role-Category: impl", "Role-Category: audit"))
+            issue(
+                10,
+                body=v3_contract().replace(
+                    "Role-Category: impl", "Role-Category: audit"
+                ),
+            )
         )
         self.assertIn("role-category-mismatch", [item["code"] for item in findings])
 

@@ -30,22 +30,37 @@ Post `AGENT_READY`, then wait. Begin only after a valid room `START` event for
 the same dispatch. The initial prompt may contain the contract, but the room is
 the campaign communication record.
 
+Replay/wait with `--identity-receipts <json-file>`, using the current exact
+Paseo Agent/parent/relationship/role, labels, and role-aware event authority
+readback supplied by the Orchestrator. A Worker receipt owns only its assigned
+Dispatch. Missing receipts make room events non-actionable. Do not construct
+identity receipts from fields claimed inside the room.
+
 ## Execution
 
 Stay in the assigned worktree and hotset. At safe phase boundaries replay the
 room. Do not use mentions for routine updates or send prompts to busy Agents.
-Post `DISCUSSION_REQUIRED` before durable architecture, compatibility,
-security/privacy, migration, or cross-Issue decisions.
+Post one blocking `ASK` before durable architecture, compatibility,
+security/privacy, migration, or cross-Issue decisions. Resume only after a
+correlated `REPLY` backed by durable GitHub decision readback.
 
 Implement the smallest accepted vertical change. Run targeted checks, then the
 required suite/manual evidence exactly once per locally green candidate. The
 Worker does not spawn another work item or perform formal review.
 
+Post `HEARTBEAT` after investigation, after each independent implementation
+phase, before and after long verification, and at the next safe boundary when
+five minutes passed without a runtime signal. The five-minute target is not an
+SLA: do not interrupt a running command merely to post. Use `PROGRESS` instead
+when evidence materially changed. HEARTBEAT never advances lifecycle and stops
+after `WORKER_DONE`, `BLOCKED`, or `STOPPED`.
+
 ## Publication
 
 Commit and push the assigned branch, open/update the PR against `dev`, and post
-`PR_OPENED` followed by `READY_FOR_REVIEW` or `COMPLETED` with exact evidence.
-The Orchestrator verifies room, Agent, Git, GitHub, and test state before merge.
+`PR_OPENED` followed by `WORKER_DONE` with exact evidence. The Orchestrator
+verifies room, Agent, Git, GitHub, and test state before it posts
+`READY_FOR_REVIEW` or `COMPLETED` and before any merge.
 
 The high-autonomy mode prevents routine prompts. If a Provider still requests
 permission, pause without retrying: Paseo notifies the parent. The parent may

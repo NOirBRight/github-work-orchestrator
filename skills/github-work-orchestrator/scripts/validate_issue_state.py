@@ -10,13 +10,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ready_frontier import (
-    CANONICAL_LABELS,
-    GhError,
-    fetch_issues,
-    label_names,
-    resolve_repo,
-)
+from contract_schema import ROLE_CATEGORIES
+from github_client import GhError, fetch_issues, resolve_repo
+from ready_frontier import CANONICAL_LABELS, label_names
 
 
 ACTIVE_LABELS = {
@@ -38,13 +34,6 @@ CONTRACT_FIELDS = (
     "Architecture-Decision",
     "Review-Owner",
 )
-ROLE_CATEGORIES = {
-    "orchestrator": {"planning"},
-    "intake": {"research"},
-    "implementation": {"impl", "ui"},
-    "review": {"audit"},
-    "monitor": {"audit"},
-}
 
 
 def parse_contract_fields(body: str) -> dict[str, str]:
@@ -135,9 +124,7 @@ def finding(
     }
 
 
-def validate(
-    repo: str | None, cwd: Path | None, limit: int
-) -> dict[str, Any]:
+def validate(repo: str | None, cwd: Path | None, limit: int) -> dict[str, Any]:
     resolved_repo = resolve_repo(repo, cwd)
     issues = fetch_issues(resolved_repo, cwd, state="all", limit=limit)
     findings: list[dict[str, Any]] = []
@@ -212,7 +199,9 @@ def print_human(report: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", help="GitHub owner/repository; infer from cwd by default")
+    parser.add_argument(
+        "--repo", help="GitHub owner/repository; infer from cwd by default"
+    )
     parser.add_argument("--cwd", type=Path, help="Repository working directory")
     parser.add_argument("--limit", type=int, default=1000)
     parser.add_argument("--json", action="store_true", dest="as_json")

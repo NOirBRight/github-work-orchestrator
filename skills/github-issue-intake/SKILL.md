@@ -15,6 +15,11 @@ Preserve reporter facts and separate them from inference. Establish problem or
 outcome, scope/non-goals, acceptance, verification/manual evidence, expected
 hotset, dependencies, and exactly one lifecycle/type label.
 
+For new or materially rewritten work, format Expected Hotset as one or more
+backticked canonical repository-relative path bullets under the exact
+`## Expected hotset` heading. A missing or invalid legacy Hotset forces
+repository-exclusive execution and prevents automatic parallel admission.
+
 For new or materially rewritten work, include the v3 fields from
 [verification policy](references/shared/verification-policy.md). Use
 `Execution-Mode: paseo-agent`, role `implementation`, category `impl` or `ui`,

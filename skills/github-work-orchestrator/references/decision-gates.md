@@ -78,7 +78,7 @@ can first remove uncertainty.
 
 - Pause writes and integration only for the affected decision boundary.
 - Continue safe investigation, reversible preparation, and unrelated lanes.
-- Send one `DISCUSSION_REQUIRED` signal per material gate; do not send progress
+- Send one `ASK` and one `DECISION_GATE` per material gate; do not send progress
   chatter or repeat an unchanged packet.
 - If the gate persists beyond the immediate exchange, reflect it in GitHub:
   use `needs-info` for missing policy/evidence/choice, or `ready-for-human` for
@@ -97,3 +97,7 @@ Record the outcome where future work will find it:
 
 At review, verify the diff against the accepted decision as well as the Issue.
 Reopen the gate if implementation evidence contradicts the chosen assumptions.
+
+Publish `REPLY` only after durable GitHub readback and reference the original
+ASK Signal-ID through `in_reply_to`. The same idle owner continues the Dispatch;
+do not create a replacement merely because the decision took time.

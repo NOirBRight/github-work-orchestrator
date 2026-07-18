@@ -36,6 +36,13 @@ Workers never run the formal review. The locally green candidate starts CI,
 review, and safe manual evidence in parallel. Review fixes are delta-only unless
 the accepted boundary changed.
 
+Keep at most one Review Agent per Campaign and reuse it sequentially for later
+candidates. When a `standard` or `strict` wave has no Review Agent, reserve one
+of the Campaign's three child slots before implementation dispatch. If a Review
+Agent exists but cannot be safely reused, stop new Dispatches and reconcile that
+Agent; never reserve or create a second reviewer. Never silently downgrade
+review because implementation filled the Campaign.
+
 ## Candidate-first integration pipeline
 
 Produce one locally green candidate before the first push. Do not serialize CI,

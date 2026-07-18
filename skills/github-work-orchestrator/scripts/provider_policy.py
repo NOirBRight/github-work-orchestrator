@@ -89,51 +89,61 @@ def resolve_campaign_orchestrator_provider(
 
 def resolve_highest_permission_mode(
     available_modes: list[dict[str, Any]],
+    *,
+    configured_mode_id: str | None = None,
+    explicit_mode_id: str | None = None,
 ) -> dict[str, str]:
-    """Choose the most autonomous advertised mode without provider-name rules."""
-    ranked: list[tuple[int, int, dict[str, Any], str]] = []
-    for index, mode in enumerate(available_modes):
-        if not isinstance(mode, dict):
-            continue
-        mode_id = mode.get("id")
-        label = mode.get("label")
-        description = mode.get("description", "")
-        if not isinstance(mode_id, str) or not mode_id.strip():
-            continue
-        text = " ".join(
-            value for value in (mode_id, label, description) if isinstance(value, str)
-        ).lower()
-        if any(marker in text for marker in ("plan", "read-only", "read only")):
-            continue
-        if any(marker in text for marker in ("always ask", "prompts for permission")):
-            continue
-        if any(
-            marker in text
+    """Resolve an explicitly trusted unattended mode; never infer from prose."""
+    advertised_modes = [
+        mode
+        for mode in available_modes
+        if isinstance(mode, dict)
+        and isinstance(mode.get("id"), str)
+        and mode["id"].strip()
+    ]
+    mode_ids = [mode["id"].strip() for mode in advertised_modes]
+    if len(mode_ids) != len(set(mode_ids)):
+        raise ProviderPolicyError("provider advertises duplicate runtime mode IDs")
+    modes = {mode_id: mode for mode_id, mode in zip(mode_ids, advertised_modes, strict=True)}
+    preferred = (
+        explicit_mode_id if explicit_mode_id is not None else configured_mode_id
+    )
+    if preferred is not None:
+        if not isinstance(preferred, str) or not preferred.strip():
+            raise ProviderPolicyError("unattended mode override must be nonempty text")
+        preferred = preferred.strip()
+        if preferred not in modes:
+            raise ProviderPolicyError(f"configured unattended mode is unavailable: {preferred}")
+        selected = modes[preferred]
+        selected_text = " ".join(
+            str(selected.get(field, "")) for field in ("id", "label", "description")
+        ).casefold()
+        if selected.get("isUnattended") is False or any(
+            marker in selected_text
             for marker in (
-                "bypass",
-                "yolo",
-                "full access",
-                "unrestricted",
-                "skip all permission",
+                "always ask",
+                "prompts for permission",
+                "read-only",
+                "read only",
+                "plan mode",
             )
         ):
-            score = 100
-            evidence = "advertised-unattended-full-access"
-        elif any(
-            marker in text
-            for marker in ("auto approve", "automatically approves", "auto mode")
-        ):
-            score = 80
-            evidence = "advertised-automatic-approval"
-        elif any(marker in text for marker in ("build", "execute", "tools")):
-            score = 60
-            evidence = "advertised-execution-mode"
-        else:
-            continue
-        ranked.append((score, -index, mode, evidence))
-    if not ranked:
-        raise ProviderPolicyError("provider advertises no unattended execution mode")
-    _, _, selected, evidence = max(ranked, key=lambda item: (item[0], item[1]))
+            raise ProviderPolicyError("configured mode is explicitly interactive")
+        evidence = (
+            "explicit-unattended-mode"
+            if explicit_mode_id is not None
+            else "configured-unattended-mode"
+        )
+    else:
+        advertised = [mode for mode in modes.values() if mode.get("isUnattended") is True]
+        if not advertised:
+            raise ProviderPolicyError("provider advertises no unattended execution mode")
+        if len(advertised) > 1:
+            raise ProviderPolicyError(
+                "provider advertises multiple unattended modes; configure one explicitly"
+            )
+        selected = advertised[0]
+        evidence = "advertised-is-unattended"
     return {
         "runtime_mode_id": selected["id"].strip(),
         "runtime_mode_label": str(selected.get("label", selected["id"])).strip(),
@@ -152,6 +162,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--available-provider", action="append", required=True)
     parser.add_argument("--explicit")
+    parser.add_argument("--explicit-mode")
     parser.add_argument(
         "--available-modes-json",
         type=Path,
@@ -185,8 +196,16 @@ def main() -> int:
             )
         mode = None
         if arguments.available_modes_json:
+            unattended_modes = preferences.get("unattended_modes", {})
+            if not isinstance(unattended_modes, dict):
+                raise ProviderPolicyError("unattended_modes must be an object")
+            configured_mode = unattended_modes.get(result["provider"])
+            if configured_mode is not None and not isinstance(configured_mode, str):
+                raise ProviderPolicyError("configured unattended mode must be text")
             mode = resolve_highest_permission_mode(
-                json.loads(arguments.available_modes_json.read_text(encoding="utf-8"))
+                json.loads(arguments.available_modes_json.read_text(encoding="utf-8")),
+                configured_mode_id=configured_mode,
+                explicit_mode_id=arguments.explicit_mode,
             )
     except (ProviderPolicyError, OSError, json.JSONDecodeError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))
