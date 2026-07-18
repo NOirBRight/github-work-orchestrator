@@ -5,6 +5,30 @@ commits, checks, and repository decisions remain the durable business truth.
 Agent finish and permission notifications are wake-up accelerators, never
 proof. Do not use recurring Paseo heartbeats for normal Campaign correctness.
 
+## Repository Room
+
+Use one repository mailbox named `gwo-repo-<slug>-<digest>` with schema v1; the
+digest prevents slug collisions between repositories:
+
+```text
+schema_version, repository, signal_id, sequence, event_type,
+sender_agent_id, sender_role, in_reply_to, payload
+```
+
+Allowed events are `OPERATOR_REQUEST`, `REQUEST_ACCEPTED`, and
+`REQUEST_REJECTED`. Operator Relay publishes the request; only the Repository
+Coordinator replies with exact `in_reply_to`. Request payload contains a
+sanitized summary of at most 500 characters and SHA-256 of the original message,
+not the full message. Reject credentials, private prompts, absolute paths,
+unknown payload fields, author/label mismatch, conflicting Signal-ID, and
+non-monotonic sequence. A conflicting request poisons its Signal-ID: correlated
+responses are filtered whether they arrived before or after the conflict.
+
+The Repository Room is a persistent mailbox, not business truth. A Relay posts
+once, reads Coordinator state once, wakes only an idle Coordinator using the
+Signal-ID alone, and then idles. The Coordinator replays at startup, before
+waiting, and before ending its turn so a busy/idle race cannot lose a request.
+
 ## Campaign room
 
 Create exactly one room named `gwo-<campaign-id>` before dispatch. Every
@@ -25,7 +49,11 @@ event whose Campaign does not match the `gwo-<campaign-id>` room.
 
 Agent-authored post fails when `PASEO_AGENT_ID` is absent or differs from
 `sender_agent_id`. Before replay/wait, build an identity-receipt JSON array from
-Paseo readback, not from room claims. Each receipt separates the Agent's static
+Paseo readback, not from room claims. Use `paseo_room.py identity-plan` with an
+explicit `authority_scope` of `worker-dispatch`, `review-dispatch`,
+`campaign-control`, or `campaign-admission`; never infer control authority from
+Dispatch-ID spelling and do not hand-author `authority` fields. Each
+receipt separates the Agent's static
 identity from its event authority. Worker labels own one exact campaign and
 Dispatch (`authority.kind: dispatch-owner`). A Campaign Orchestrator keeps one
 static Campaign identity and supplies read-backed `campaign-control` or
@@ -40,6 +68,15 @@ blocks its Dispatch.
 Reuse receipts across ordinary wait timeouts; refresh them on Agent creation,
 runtime notification, recovery, or an unknown sender so waiting does not become
 polling.
+
+A Worker always passes `--consumer-role worker --dispatch-id
+<its-exact-dispatch>` to replay/wait.
+Events for Repository/Campaign lifecycle or sibling Dispatches are ignored
+before receipt lookup, so unrelated historical senders cannot block Worker
+activation. `REVIEW_RESULT` is also excluded from the Worker consumer view;
+formal review aggregation belongs to the Campaign and cannot poison Worker
+review-fix replay when the Worker has no review-lock file. The Campaign performs
+unscoped reconciliation and therefore owns the larger receipt set.
 
 The top-level campaign/Dispatch is the authority lookup key, not a demand to
 mutate Coordinator labels. A Worker receipt has this shape:
@@ -80,6 +117,21 @@ Repository Coordinator likewise keeps only repository/role labels and uses
 For `START`, the event recipient must be that authority subject: the Repository
 Coordinator may activate its direct Campaign Orchestrator, while only the
 Campaign Orchestrator may activate one of its direct Workers.
+
+Reusable Reviewers likewise omit `dispatch_id` from static labels. A
+`review-dispatch` identity plan requires exactly one read-backed assignment for
+each fixed axis. The assignment binds Agent, Campaign parent, axis, full
+candidate lock, and current Dispatch; its authority kind is
+`reusable-reviewer`. The Campaign's direct-child authority may contain both
+assigned Reviewers, so a shared review Dispatch never requires relabeling or
+hand-authored duplicate Campaign receipts. The named parent must itself appear
+as a read-backed same-repository/same-Campaign Orchestrator; matching child and
+assignment strings without that parent receipt are invalid. Worker-dispatch
+identity compilation applies the same parent rule.
+
+`campaign-control` scope also requires the Campaign's exact parent to appear as
+a read-backed root `repository-coordinator` for the same repository. A Campaign
+label plus an arbitrary parent string cannot mint lifecycle/CHECKPOINT authority.
 
 The chat message UUID is a publish receipt. It proves that the daemon stored a
 message, not that the claimed author or evidence is true. Re-read Agent state,
@@ -135,6 +187,18 @@ results. It never authorizes completion. The Campaign Orchestrator cross-checks
 Paseo, Git, worktree, GitHub, and the execution contract before posting
 `READY_FOR_REVIEW` or `COMPLETED`.
 
+`REVIEW_RESULT` is Review-role-only and includes `axis: spec|quality`, candidate
+and base SHA, diff and acceptance SHA-256, review round, `full|delta` scope,
+previous candidate SHA, pass/fail verdict, and findings. A Review identity
+receipt has a static `review_axis` label matching the payload. Both axes for one
+round must have an identical lock. Missing one axis remains incomplete;
+duplicate axes, different locks, forged/cross-Campaign evidence, or conflicting
+Signal-IDs block the Dispatch. Matching Reviewer claims do not authorize their
+own lock: replay also requires a read-backed Campaign-issued
+`campaign-verified-candidate` lock receipt for that campaign, Dispatch, and
+round. Delta receipts require the prior round's receipt and exact prior
+candidate lineage. REVIEW_RESULT never authorizes cleanup.
+
 `CHECKPOINT` is Orchestrator-owned recovery metadata: replay cursor, active
 Dispatch IDs, and pending Signal-IDs. It is not Agent liveness or business
 truth. `ESCALATION` records retry exhaustion or ambiguous recovery.
@@ -142,6 +206,12 @@ truth. `ESCALATION` records retry exhaustion or ambiguous recovery.
 Worker terminal evidence includes branch, commit/PR, verification class,
 commands and outcomes, phase timings, changed paths, scope delta, blockers, and
 next action. Formal review remains Orchestrator-owned.
+
+A direct user message to a Worker first becomes one `ASK`. The Campaign may
+reply only within the existing contract. Scope, architecture, Hotset,
+compatibility, security, or integration changes use a durable GitHub decision
+gate. Cross-Campaign/Integration/`dev` instructions received by a Campaign are
+relayed to the Repository Coordinator.
 
 ## Recovery
 
@@ -164,4 +234,4 @@ second stale inspection unless new evidence arrives.
 Write the durable result to GitHub before posting `CAMPAIGN_CLOSED`. Delete a
 completed room only after that readback succeeds. Preserve rooms for blocked or
 handed-off campaigns. Never place credentials, provider tokens, local paths, or
-private prompts in room or GitHub messages.
+private prompts in either room or GitHub messages.

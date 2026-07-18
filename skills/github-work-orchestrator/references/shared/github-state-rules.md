@@ -1,116 +1,110 @@
 # GitHub and Paseo state rules
 
 GitHub owns Issue lifecycle, dependencies, claims, PRs, checks, decisions, and
-completion. Paseo owns runtime Agent sessions, parentage, labels, workspaces,
-worktrees, and campaign rooms. Neither is a substitute for the other.
+completion. Paseo owns runtime Agent sessions, parentage, labels, Workspaces,
+worktrees, notifications, permissions, and rooms. Neither substitutes for the
+other.
 
-## Two-tier ownership
+## Supervision and Workspace ownership
 
-The Repository Coordinator is the repository-resident root Agent. Keep exactly
-one per repository in a dedicated `dev` control worktree and label it with the
-repository and the repository-coordinator role. Unlabeled root Agents are
-foreign and protected; never adopt or archive them by inference.
+Keep one Repository Coordinator per repository. It is the single root Agent
+with repository/role labels and survives every Campaign. Its Coordinator Home
+Workspace stores the long-lived conversation; it need not itself be clean or on
+`dev`. Select an Integration Control Worktree separately and pass its exact path
+to integration Git commands.
 
-Each Campaign has exactly one Campaign Orchestrator. The Campaign Orchestrator
-is a direct `subagent` of the Repository Coordinator, carries the exact
-`campaign_id`, and may use a Provider Binding different from every other
-Campaign. A Provider Binding is resolved per Campaign by explicit override,
-then the `planning` preference, and is runtime evidence rather than GitHub work
-state.
+Each Campaign has one coordinating Paseo Agent, user-visible as
+`Campaign · <id> · <purpose>` and internally labeled role `orchestrator`. It is
+a direct `subagent` of the Coordinator and may use its own Provider Binding.
+Every new v4.3 Campaign receives a dedicated local Campaign Control Workspace
+on `gwo/campaign/<id>`. Its branch is not pushed, has no PR, and carries no
+feature commit. Legacy active Campaigns without one are not migrated.
 
-If more than one Repository Coordinator is observed, stop new dispatch and
-integration. Preserve both Agents and require a human operator to select one
-canonical Coordinator through the existing Paseo UI or CLI after durable
-handoff; neither Coordinator may archive the other.
+If duplicate Coordinators exist, stop admission/integration, preserve both, and
+require human durable handoff/adjudication. Unlabeled root Agents are foreign
+and protected.
 
-## One owner per work item
+## Entry and Repository mailbox
 
-One claimed Issue maps to one `dispatch_id`, one Paseo-managed Agent, one
-`work/issue-<number>-<slug>` branch, one isolated worktree, and one editor.
-Record `campaign_id`, `dispatch_id`, role, repository, Issue, and branch as
-Agent labels. Provider-native subagent timelines are read-only evidence and
-cannot own a dispatch.
+Before GitHub reconciliation, run the entry policy. A stable root repository
+Agent may become the Coordinator in place even when its home is dirty/non-dev.
+Issue, Campaign, or Dispatch worktrees cannot be promoted. With an existing
+Coordinator, an ordinary Task becomes a bounded Operator Relay: it posts one
+sanitized request to the Repository Room, reads status once, wakes only an idle
+Coordinator by Signal-ID, records a receipt, and idles. It does not read the
+frontier, worktrees, or Campaign rooms.
 
-Claim and read back the Issue before dispatch. Agent creation success is not a
-GitHub claim; an assignee or room message is not proof that an Agent exists.
-Validate all three surfaces before edits.
+The Repository Room is a persistent mailbox, not business truth. The
+Coordinator replays it at startup, before wait, and before ending a turn.
 
-## Integration flow
+## One editor per Issue
 
-Pin every dispatch to an exact `dev` SHA. Feature branches use the `work/issue-`
-prefix and PRs target `dev`. `main` accepts only an explicit verified release
-merge from `dev`.
+One claimed Issue maps to one `dispatch_id`, Paseo Worker, `work/issue-*`
+branch, isolated worktree, and editor. Record repository/campaign/dispatch,
+role, Issue, and branch labels. Provider-native subagent timelines are
+read-only host evidence and cannot own a GWO Dispatch. GWO-owned Agents never
+create Provider-native Agent/Task/Swarm children.
 
-The Repository Coordinator must not author feature commits directly on `dev`.
-Inline implementation still uses an isolated `work/issue-*` worktree. Campaign
-Orchestrators and their children never use the control worktree as an execution
-worktree.
+Claim and read back the Issue before create; read back exact parent, Provider,
+mode, labels, Workspace, branch, and worktree before START.
 
-Different Campaigns may execute concurrently when their Hotsets do not overlap.
-Hotset entries are canonical repository-relative paths; reject absolute paths,
-empty components, `.` and `..` instead of guessing their targets. Preserve the
-repository path's original case. Record the worktree's case-sensitivity in the
-scheduler snapshot: comparison folds case only for a case-insensitive
-worktree, so the stored/published path itself is never rewritten. Derive this
-from the actual worktree's Git `core.ignorecase` readback (invert it for
-`case_sensitive_paths`); missing or ambiguous evidence blocks automatic
-parallel admission instead of falling back to the host operating system.
-The Repository Coordinator admits Hotsets and holds one repository-scoped
-Integration Lease, so only one Campaign may update `dev` at a time. Before
-integration, a Campaign whose base SHA is no longer current must refresh its
-pinned `dev` base and rerun verification affected by that delta.
+## Execution and integration
 
-## Runtime state and recovery
+Pin each Dispatch to exact `dev` SHA; PRs target `dev`. `main` receives only an
+explicit verified release merge from `dev`. Coordinator/Campaign control
+branches never carry feature commits; inline feature work also uses an isolated
+`work/issue-*` worktree.
 
-The campaign room is a replayable runtime mailbox, not an authorization ledger.
-Chat authorship can be supplied by a client and must be verified against Agent
-labels, lifecycle, Git state, and GitHub evidence.
+Different Campaigns execute concurrently only when canonical repository-relative
+Hotsets do not overlap. Reject absolute paths, empty components, `.`/`..`, and
+missing case-sensitivity evidence. One repository-scoped Integration Lease
+serializes updates to `dev`, not implementation.
 
-On missing callback, parent restart, or daemon restart:
-
-1. replay the bounded room and deduplicate Signal-IDs;
-2. list and inspect campaign Agents;
-3. verify exact branch/worktree/Issue ownership;
-4. continue the existing idle Agent or preserve an active/ambiguous one; and
-5. create a successor only after terminal proof and durable WIP evidence.
+Require a clean Integration Control Worktree only at integration. Dirty/missing
+control state holds candidates in `WAITING_INTEGRATION`, preserves user WIP,
+and never triggers stash/reset/force-clean. If `dev` advanced, refresh the
+pinned base and rerun affected evidence.
 
 ## Capacity
 
-Keep one Repository Coordinator per repository and one Campaign Orchestrator per
-Campaign. At most four active Agents per Campaign, including its Orchestrator,
-are allowed by default; every Agent also counts against the host-wide capacity
-reported by Paseo. This includes the Repository Coordinator. Reject
-contradictory or already-over-limit counts rather than admitting around them.
-Recompute after material dispatch, terminal event, merge, stop, recovery, or
-explicit operator request.
+Defaults are one Campaign + three dedicated Worker slots + two dedicated Review
+slots = six active Agents per Campaign. The global default is thirteen, exactly
+two full Campaigns plus one Coordinator. Worker and Review slots are independent;
+standard/strict work never reduces Worker parallelism below three. Foreign
+active Paseo Agents consume global capacity. Empty UI drafts, archived Agents,
+and terminal idle Relays do not.
+Missing Reviewers retain their dedicated share of Campaign/global capacity;
+foreign load may therefore shrink a standard/strict Worker wave without
+reclassifying Review slots as Worker slots.
 
-The three child slots are shared by implementation, review, and monitoring.
-Fast-only work may use all three for implementation. If any ready or active
-Dispatch is `standard` or `strict` and no Review Agent exists, reserve one child
-slot, so at most two new implementation Workers enter that wave. Reuse one
-Campaign Review Agent across candidates. If the existing reviewer is not
-reusable, block and reconcile it instead of reserving a second reviewer; never
-exceed capacity to create one.
+Plan and create the whole eligible Worker wave. Use one reusable Spec Reviewer
+and one reusable Quality Reviewer per Campaign. They review one candidate at a
+time; later verified candidates queue by ready time then Issue number. Partial
+pair creation retains the successful axis. Re-read capacity before creating
+each missing Reviewer and persist/read back the complete Candidate lock before
+dispatching either review axis.
 
-The Repository Coordinator admits every already-planned Campaign whose Hotset
-and host capacity allow in the same admission wave. A Campaign Orchestrator
-likewise dispatches the whole eligible Issue wave. The Integration Lease limits
-only updates to `dev`; waiting for it does not consume an editing conflict.
+## Runtime and recovery
 
-## Safe cleanup
+Campaign rooms and the Repository Room are replayable mailboxes, not authority
+ledgers. Verify chat author against Paseo identity/parentage/labels and GitHub/Git
+evidence. Reconcile on lost callback/restart; continue exact idle Agents,
+preserve active/ambiguous WIP, and create successors only after terminal proof.
+Silence and HEARTBEAT never authorize completion, replacement, or cleanup.
 
-Cleanup is event-triggered with a five-minute target. Archive an Agent and its
-Paseo worktree only when the Agent is idle, work is committed/pushed or safely
-integrated, the worktree is clean, ownership is unambiguous, and the branch is
-merged when applicable. Preserve dirty, unpushed, active, ambiguous, or foreign
-work. Never reset or force-clean useful WIP.
+## Typed cleanup
 
-A Campaign Orchestrator may clean only its direct child Agents. The Repository
-Coordinator may clean a terminal Campaign Orchestrator after durable Campaign
-readback. No Agent archives itself, a root Agent, a sibling, the Repository
-Coordinator's trusted control worktree, or its own control worktree. Delegated
-cleanup archives the child first, reads back both its archived state and removal
-of the worktree binding, and only then evaluates worktree and branch cleanup in
-a second authorization pass. GWO automatically executes only a nonempty
-eligible plan through existing Paseo operations; every protected plan has no
-actions. `CAMPAIGN_CLOSED` never archives the Repository Coordinator.
+Cleanup is event-triggered and fail closed. A Campaign cleans only its direct
+Workers/Reviewers. After they are gone and `CAMPAIGN_CLOSED` is durable, the
+Coordinator may archive that direct Campaign child only after an explicitly
+read-backed empty direct-child enumeration. New Campaign cleanup then requires
+its exact control worktree identity, unbound/clean state, zero unique commits,
+and local-only branch before separately read-backed Workspace and branch
+removal. Legacy Campaign cleanup is
+explicitly Agent-only.
+
+Never archive self/root/sibling/detached/foreign Agents, Coordinator Home,
+Integration Control, actor control worktree, or dirty/active/ambiguous state.
+Archive Agent first, read back archived + unbound, then authorize resource
+actions. Protected plans contain no actions; `CAMPAIGN_CLOSED` never archives
+the Coordinator.

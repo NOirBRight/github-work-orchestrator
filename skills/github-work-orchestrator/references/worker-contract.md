@@ -9,6 +9,11 @@ Agent role/category, exact base/worktree/branch/PR target, permission profile,
 hotset, acceptance, verification, room, and return evidence. It contains no
 fixed Provider, model, native Task ID, or callback thread.
 
+Create only a Paseo Agent through the installed `paseo` Skill. A GWO-owned
+Worker never invokes a Provider-native Agent, Task, Swarm, or subagent feature.
+If the operator explicitly wants a native orchestration Skill, route it to a
+separate non-GWO top-level Task instead of nesting it in this Dispatch.
+
 Resolve the Provider at dispatch time from the explicit override or Paseo
 orchestration preferences, then validate availability. Resolve mode by explicit
 Campaign override, `unattended_modes[provider]`, then exactly one advertised
@@ -36,3 +41,9 @@ The Worker posts HEARTBEAT only at safe boundaries, with a five-minute target
 during long phases. A long command may miss the target. It posts WORKER_DONE,
 not COMPLETED, after publishing its candidate; the Campaign Orchestrator owns
 verification and completion.
+
+If the Worker receives a direct user instruction, post one blocking `ASK`
+before acting. The Campaign may reply only to a clarification inside the exact
+contract. Scope, architecture, Hotset, compatibility, security, or integration
+changes require the durable GitHub decision gate; the Worker never silently
+widens its own authority.

@@ -107,12 +107,41 @@ def identity_receipt(
     relationship: str = "subagent",
     authority_kind: str | None = None,
     authority_subject_agent_id: str | None = None,
+    review_axis: str | None = None,
 ):
     labels = {
         "repository": "owner/repo",
         "role": role,
     }
-    if role in ROOM.WORKER_ROLES:
+    assignment = None
+    if role == "review":
+        if review_axis is None:
+            raise ValueError("review_axis is required for review receipts")
+        labels.update({"campaign_id": campaign_id, "review_axis": review_axis})
+        assignment = {
+            "agent_id": agent_id,
+            "campaign_id": campaign_id,
+            "review_axis": review_axis,
+            "campaign_parent_agent_id": parent_agent_id,
+            "lock": {
+                "dispatch_id": dispatch_id,
+                "candidate_sha": "b" * 40,
+                "base_sha": "a" * 40,
+                "diff_sha256": "c" * 64,
+                "acceptance_sha256": "d" * 64,
+                "review_round": 1,
+                "scope": "full",
+                "previous_candidate_sha": None,
+            },
+            "review_lock_read_back": True,
+            "read_back": True,
+        }
+        authority_kind = authority_kind or "reusable-reviewer"
+        subject_agent_id = agent_id
+        subject_parent_agent_id = parent_agent_id
+        subject_relationship = relationship
+        subject_labels = labels
+    elif role in ROOM.WORKER_ROLES:
         labels.update({"campaign_id": campaign_id, "dispatch_id": dispatch_id})
         authority_kind = authority_kind or "dispatch-owner"
         subject_agent_id = agent_id
@@ -147,7 +176,7 @@ def identity_receipt(
             "campaign_id": campaign_id,
             "role": "orchestrator",
         }
-    return {
+    receipt = {
         "agent_id": agent_id,
         "campaign_id": campaign_id,
         "dispatch_id": dispatch_id,
@@ -167,6 +196,77 @@ def identity_receipt(
         },
         "read_back": True,
     }
+    if role == "review":
+        receipt["assignment"] = assignment
+        receipt["authority"].update(
+            {
+                "campaign_parent_agent_id": parent_agent_id,
+                "review_axis": review_axis,
+                "assignment": assignment,
+            }
+        )
+    return receipt
+
+
+def review_lock_receipt(
+    *,
+    dispatch_id: str = "dispatch-issue-7",
+    candidate_sha: str = "b" * 40,
+    base_sha: str = "a" * 40,
+    diff_sha256: str = "c" * 64,
+    acceptance_sha256: str = "d" * 64,
+    review_round: int = 1,
+    scope: str = "full",
+    previous_candidate_sha: str | None = None,
+) -> dict:
+    return {
+        "campaign_id": "campaign-20260718",
+        "dispatch_id": dispatch_id,
+        "candidate_sha": candidate_sha,
+        "base_sha": base_sha,
+        "diff_sha256": diff_sha256,
+        "acceptance_sha256": acceptance_sha256,
+        "review_round": review_round,
+        "scope": scope,
+        "previous_candidate_sha": previous_candidate_sha,
+        "previous_review_round": review_round - 1 if scope == "delta" else None,
+        "previous_lock_read_back": scope != "delta" or review_round > 1,
+        "source": "campaign-verified-candidate",
+        "read_back": True,
+    }
+
+
+def review_identity_receipts(*axes: str | tuple[str, str]) -> list[dict]:
+    reviewers = [
+        identity_receipt(
+            agent_id=(item[0] if isinstance(item, tuple) else f"agent-{item}-reviewer"),
+            role="review",
+            review_axis=(item[1] if isinstance(item, tuple) else item),
+        )
+        for item in axes
+    ]
+    parent = identity_receipt(
+        agent_id="agent-orchestrator",
+        role="orchestrator",
+        parent_agent_id="agent-repository-coordinator",
+    )
+    parent["authority"] = {
+        "kind": "direct-child-dispatch",
+        "campaign_id": "campaign-20260718",
+        "dispatch_id": "dispatch-issue-7",
+        "subjects": [
+            {
+                "agent_id": receipt["agent_id"],
+                "parent_agent_id": "agent-orchestrator",
+                "relationship": "subagent",
+                "labels": receipt["labels"],
+                "assignment": receipt["assignment"],
+            }
+            for receipt in reviewers
+        ],
+        "read_back": True,
+    }
+    return [*reviewers, parent]
 
 
 _DEFAULT_CLEANUP_TARGET = object()
@@ -183,6 +283,8 @@ def cleanup_report(
     target_overrides: dict | None = None,
     execution_overrides: dict | None = None,
     protected_control_worktree: str | None = None,
+    target_kind: str | None = None,
+    resource_kind: str | None = None,
 ):
     actor = {
         "agent_id": "agent-orchestrator",
@@ -204,9 +306,21 @@ def cleanup_report(
             "repository": "owner/repo",
             "campaign_id": "campaign-20260718",
             "dispatch_id": "dispatch-issue-7",
+            "campaign_control_expected": False,
+            "campaign_generation": None,
+            "campaign_generation_read_back": False,
+            "labels": {"repository": "owner/repo"},
+            "labels_read_back": True,
+            "result_captured": False,
+            "result_captured_read_back": False,
         }
     if target is not None:
         target = {**target, **(target_overrides or {})}
+        if target.get("role") == "orchestrator" and target.get("campaign_generation") is None:
+            target["campaign_generation"] = (
+                "v4.3" if target.get("campaign_control_expected") else "legacy-v4.2"
+            )
+            target["campaign_generation_read_back"] = True
     if target is not None and target.get("role") == "orchestrator":
         terminal_event = "CAMPAIGN_CLOSED"
         terminal_sender = target["agent_id"]
@@ -226,6 +340,18 @@ def cleanup_report(
         "bound_agent_ids": ["agent-worker-7"],
         "branch_merged": False,
         "agent_only": False,
+        "unique_commits": 0,
+        "branch_local_only": False,
+        "remaining_child_agent_ids": [],
+        "children_read_back": True,
+        "children_repository": "owner/repo",
+        "children_campaign_id": "campaign-20260718",
+        "children_scope": "direct-subagent",
+        "no_worktree_read_back": False,
+        "resource_identity_read_back": False,
+        "worktree_slug": None,
+        "resource_archived": False,
+        "branch_deleted": False,
         "repository": "owner/repo",
         "campaign_id": "campaign-20260718",
         "dispatch_id": "dispatch-issue-7",
@@ -240,6 +366,24 @@ def cleanup_report(
         },
     }
     execution.update(execution_overrides or {})
+    if target_kind is None:
+        target_kind = (
+            "campaign"
+            if target is not None and target.get("role") == "orchestrator"
+            else "worker"
+        )
+    if resource_kind is None:
+        if target_kind == "campaign":
+            resource_kind = "none" if execution.get("agent_only") else "campaign-control"
+        elif execution.get("agent_only"):
+            resource_kind = "none"
+        else:
+            resource_kind = "issue-worktree"
+    if resource_kind == "campaign-control":
+        if "resource_identity_read_back" not in (execution_overrides or {}):
+            execution["resource_identity_read_back"] = True
+        if "worktree_slug" not in (execution_overrides or {}):
+            execution["worktree_slug"] = Path(execution["worktree"]).name
     return POLICY.cleanup_plan(
         event=event,
         seconds_since_event=seconds_since_event,
@@ -250,6 +394,8 @@ def cleanup_report(
         actor=actor,
         target=target,
         execution=execution,
+        target_kind=target_kind,
+        resource_kind=resource_kind,
     )
 
 
@@ -362,9 +508,9 @@ class ExecutionPolicyTests(unittest.TestCase):
             campaign_id="campaign-full",
             repository_coordinators=1,
             campaign_orchestrators_for_campaign=1,
-            active_agents_for_campaign=4,
-            active_agents_global=5,
-            max_active_agents_global=6,
+            active_agents_for_campaign=6,
+            active_agents_global=7,
+            max_active_agents_global=7,
         )
         conflict = POLICY.capacity_report(
             campaign_id="campaign-conflict",
@@ -482,6 +628,8 @@ class ExecutionPolicyTests(unittest.TestCase):
             pinned_dev_sha=current_dev,
             current_dev_sha=current_dev,
             case_sensitive_paths=True,
+            integration_control_available=True,
+            integration_control_clean=True,
         )
         campaign_b = POLICY.campaign_concurrency_report(
             campaign_id="campaign-b",
@@ -491,6 +639,8 @@ class ExecutionPolicyTests(unittest.TestCase):
             pinned_dev_sha=current_dev,
             current_dev_sha=current_dev,
             case_sensitive_paths=True,
+            integration_control_available=True,
+            integration_control_clean=True,
         )
 
         self.assertTrue(campaign_a["can_execute"])
@@ -509,6 +659,8 @@ class ExecutionPolicyTests(unittest.TestCase):
             pinned_dev_sha=dev_sha,
             current_dev_sha=dev_sha,
             case_sensitive_paths=True,
+            integration_control_available=True,
+            integration_control_clean=True,
         )
 
         self.assertFalse(report["can_execute"])
@@ -539,6 +691,8 @@ class ExecutionPolicyTests(unittest.TestCase):
                         pinned_dev_sha=dev_sha,
                         current_dev_sha=dev_sha,
                         case_sensitive_paths=True,
+                        integration_control_available=True,
+                        integration_control_clean=True,
                     )
 
     def test_hotsets_preserve_case_on_case_sensitive_repositories(self) -> None:
@@ -551,6 +705,8 @@ class ExecutionPolicyTests(unittest.TestCase):
             pinned_dev_sha="a" * 40,
             current_dev_sha="a" * 40,
             case_sensitive_paths=True,
+            integration_control_available=True,
+            integration_control_clean=True,
         )
         self.assertTrue(report["can_execute"])
         insensitive = POLICY.campaign_concurrency_report(
@@ -561,6 +717,8 @@ class ExecutionPolicyTests(unittest.TestCase):
             pinned_dev_sha="a" * 40,
             current_dev_sha="a" * 40,
             case_sensitive_paths=False,
+            integration_control_available=True,
+            integration_control_clean=True,
         )
         self.assertFalse(insensitive["can_execute"])
 
@@ -585,6 +743,8 @@ class ExecutionPolicyTests(unittest.TestCase):
                 pinned_dev_sha=dev_sha,
                 current_dev_sha=dev_sha,
                 case_sensitive_paths=True,
+                integration_control_available=True,
+                integration_control_clean=True,
             )
 
     def test_dev_advancing_requires_base_refresh_before_merge(self) -> None:
@@ -596,6 +756,8 @@ class ExecutionPolicyTests(unittest.TestCase):
             pinned_dev_sha="a" * 40,
             current_dev_sha="b" * 40,
             case_sensitive_paths=True,
+            integration_control_available=True,
+            integration_control_clean=True,
         )
 
         self.assertTrue(report["can_execute"])
@@ -613,12 +775,48 @@ class ExecutionPolicyTests(unittest.TestCase):
             pinned_dev_sha=dev_sha,
             current_dev_sha=dev_sha,
             case_sensitive_paths=True,
+            integration_control_available=True,
+            integration_control_clean=True,
         )
 
         self.assertTrue(report["can_execute"])
         self.assertFalse(report["can_merge_dev"])
         self.assertFalse(report["integration_lease_held"])
         self.assertIn("integration-lease-not-held", report["blockers"])
+
+    def test_dirty_or_missing_integration_control_waits_without_mutating_user_wip(self) -> None:
+        dev_sha = "a" * 40
+        dirty = POLICY.campaign_concurrency_report(
+            campaign_id="campaign-b",
+            requested_hotset=["src/campaign-b"],
+            active_hotsets={},
+            integration_lease_holder="campaign-b",
+            pinned_dev_sha=dev_sha,
+            current_dev_sha=dev_sha,
+            case_sensitive_paths=True,
+            integration_control_available=True,
+            integration_control_clean=False,
+        )
+        missing = POLICY.campaign_concurrency_report(
+            campaign_id="campaign-b",
+            requested_hotset=["src/campaign-b"],
+            active_hotsets={},
+            integration_lease_holder="campaign-b",
+            pinned_dev_sha=dev_sha,
+            current_dev_sha=dev_sha,
+            case_sensitive_paths=True,
+            integration_control_available=False,
+            integration_control_clean=False,
+        )
+
+        for report in (dirty, missing):
+            self.assertTrue(report["can_execute"])
+            self.assertFalse(report["can_merge_dev"])
+            self.assertEqual("WAITING_INTEGRATION", report["candidate_state"])
+            self.assertEqual([], report["recovery_actions"])
+            self.assertTrue(report["preserve_user_wip"])
+        self.assertIn("integration-control-worktree-dirty", dirty["blockers"])
+        self.assertIn("integration-control-worktree-unavailable", missing["blockers"])
 
     def test_cleanup_protects_the_root_coordinator_and_control_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -800,6 +998,325 @@ class ExecutionPolicyTests(unittest.TestCase):
         self.assertFalse(report["automatic_execution"])
         self.assertEqual([], report["actions"])
 
+    def test_new_campaign_cleanup_archives_agent_before_control_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            report = cleanup_report(
+                root,
+                event="campaign-closed",
+                target_kind="campaign",
+                resource_kind="campaign-control",
+                actor_overrides={
+                    "agent_id": "agent-repository-coordinator",
+                    "role": "repository-coordinator",
+                },
+                target_overrides={
+                    "agent_id": "agent-campaign-a",
+                    "parent_agent_id": "agent-repository-coordinator",
+                    "role": "orchestrator",
+                    "campaign_control_expected": True,
+                },
+                execution_overrides={
+                    "worktree": str(root / "campaign-campaign-20260718"),
+                    "branch": "gwo/campaign/campaign-20260718",
+                    "bound_agent_ids": ["agent-campaign-a"],
+                    "agent_only": False,
+                    "clean": True,
+                    "unique_commits": 0,
+                    "branch_local_only": True,
+                    "remaining_child_agent_ids": [],
+                },
+            )
+
+        self.assertEqual("eligible", report["status"])
+        self.assertEqual("campaign", report["target_kind"])
+        self.assertEqual("campaign-control", report["resource_kind"])
+        self.assertEqual(["archive-paseo-agent"], [item["action"] for item in report["actions"]])
+        self.assertEqual(
+            "target-agent-archived-and-worktree-unbound",
+            report["next_required_readback"],
+        )
+
+    def test_archived_campaign_agent_only_authorizes_control_worktree_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            report = cleanup_report(
+                root,
+                event="campaign-closed",
+                target_kind="campaign",
+                resource_kind="campaign-control",
+                actor_overrides={
+                    "agent_id": "agent-repository-coordinator",
+                    "role": "repository-coordinator",
+                },
+                target_overrides={
+                    "agent_id": "agent-campaign-a",
+                    "parent_agent_id": "agent-repository-coordinator",
+                    "role": "orchestrator",
+                    "archived": True,
+                    "campaign_control_expected": True,
+                },
+                execution_overrides={
+                    "worktree": str(root / "campaign-campaign-20260718"),
+                    "branch": "gwo/campaign/campaign-20260718",
+                    "bound_agent_ids": [],
+                    "agent_only": False,
+                    "clean": True,
+                    "unique_commits": 0,
+                    "branch_local_only": True,
+                    "remaining_child_agent_ids": [],
+                },
+            )
+
+        self.assertEqual(
+            ["archive-paseo-worktree"],
+            [item["action"] for item in report["actions"]],
+        )
+        self.assertEqual(
+            "campaign-control-worktree-absent",
+            report["next_required_readback"],
+        )
+
+    def test_absent_campaign_control_worktree_then_authorizes_local_branch_delete(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            report = cleanup_report(
+                root,
+                event="campaign-closed",
+                target_kind="campaign",
+                resource_kind="campaign-control",
+                actor_overrides={
+                    "agent_id": "agent-repository-coordinator",
+                    "role": "repository-coordinator",
+                },
+                target_overrides={
+                    "agent_id": "agent-campaign-a",
+                    "parent_agent_id": "agent-repository-coordinator",
+                    "role": "orchestrator",
+                    "archived": True,
+                    "campaign_control_expected": True,
+                },
+                execution_overrides={
+                    "worktree": str(root / "campaign-campaign-20260718"),
+                    "branch": "gwo/campaign/campaign-20260718",
+                    "bound_agent_ids": [],
+                    "agent_only": False,
+                    "clean": True,
+                    "unique_commits": 0,
+                    "branch_local_only": True,
+                    "resource_archived": True,
+                    "branch_deleted": False,
+                },
+            )
+
+        self.assertEqual(
+            ["delete-local-control-branch"],
+            [item["action"] for item in report["actions"]],
+        )
+        self.assertEqual("campaign-control-branch-absent", report["next_required_readback"])
+
+    def test_campaign_control_cleanup_fails_closed_on_children_changes_or_commits(self) -> None:
+        cases = (
+            ({"remaining_child_agent_ids": ["agent-spec-reviewer"]}, "campaign-children-not-cleaned"),
+            ({"children_read_back": False}, "campaign-children-not-read-back"),
+            ({"clean": False}, "worktree-not-clean"),
+            ({"unique_commits": 1}, "campaign-control-has-unique-commits"),
+            ({"branch_local_only": False}, "campaign-control-branch-not-local-only"),
+        )
+        for overrides, blocker in cases:
+            with self.subTest(blocker=blocker), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                report = cleanup_report(
+                    root,
+                    event="campaign-closed",
+                    target_kind="campaign",
+                    resource_kind="campaign-control",
+                    actor_overrides={
+                        "agent_id": "agent-repository-coordinator",
+                        "role": "repository-coordinator",
+                    },
+                    target_overrides={
+                        "agent_id": "agent-campaign-a",
+                        "parent_agent_id": "agent-repository-coordinator",
+                        "role": "orchestrator",
+                        "campaign_control_expected": True,
+                    },
+                    execution_overrides={
+                        "worktree": str(root / "campaign-campaign-20260718"),
+                        "branch": "gwo/campaign/campaign-20260718",
+                        "bound_agent_ids": ["agent-campaign-a"],
+                        "agent_only": False,
+                        "clean": True,
+                        "unique_commits": 0,
+                        "branch_local_only": True,
+                        "remaining_child_agent_ids": [],
+                        **overrides,
+                    },
+                )
+            self.assertEqual("protected", report["status"])
+            self.assertIn(blocker, report["blockers"])
+
+    def test_campaign_control_resource_identity_must_match_campaign(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            report = cleanup_report(
+                root,
+                event="campaign-closed",
+                target_kind="campaign",
+                resource_kind="campaign-control",
+                actor_overrides={
+                    "agent_id": "agent-repository-coordinator",
+                    "role": "repository-coordinator",
+                },
+                target_overrides={
+                    "agent_id": "agent-campaign-a",
+                    "parent_agent_id": "agent-repository-coordinator",
+                    "role": "orchestrator",
+                    "campaign_control_expected": True,
+                },
+                execution_overrides={
+                    "worktree": str(root / "campaign-campaign-other"),
+                    "worktree_slug": "campaign-campaign-other",
+                    "branch": "gwo/campaign/campaign-other",
+                    "bound_agent_ids": ["agent-campaign-a"],
+                    "agent_only": False,
+                    "clean": True,
+                    "unique_commits": 0,
+                    "branch_local_only": True,
+                    "resource_identity_read_back": True,
+                },
+            )
+
+        self.assertEqual("protected", report["status"])
+        self.assertIn("campaign-control-branch-invalid", report["blockers"])
+        self.assertIn("campaign-control-worktree-identity-invalid", report["blockers"])
+
+    def test_campaign_generation_readback_prevents_new_campaign_legacy_downgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            report = cleanup_report(
+                root,
+                event="campaign-closed",
+                target_kind="campaign",
+                resource_kind="none",
+                actor_overrides={
+                    "agent_id": "agent-repository-coordinator",
+                    "role": "repository-coordinator",
+                },
+                target_overrides={
+                    "agent_id": "agent-campaign-a",
+                    "parent_agent_id": "agent-repository-coordinator",
+                    "role": "orchestrator",
+                    "campaign_control_expected": False,
+                    "campaign_generation": "v4.3",
+                    "campaign_generation_read_back": True,
+                },
+                execution_overrides={
+                    "worktree": None,
+                    "branch": None,
+                    "bound_agent_ids": [],
+                    "agent_only": True,
+                },
+            )
+
+        self.assertEqual("protected", report["status"])
+        self.assertIn("campaign-generation-resource-mismatch", report["blockers"])
+
+    def test_review_agent_uses_agent_only_worker_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            report = cleanup_report(
+                root,
+                event="stopped",
+                target_kind="worker",
+                resource_kind="none",
+                target_overrides={"role": "review"},
+                execution_overrides={
+                    "worktree": None,
+                    "branch": None,
+                    "bound_agent_ids": [],
+                    "agent_only": True,
+                },
+            )
+
+        self.assertEqual("eligible", report["status"])
+        self.assertEqual(["archive-paseo-agent"], [item["action"] for item in report["actions"]])
+
+    def test_ephemeral_probe_requires_explicit_lifecycle_and_captured_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            valid = cleanup_report(
+                root,
+                event="stopped",
+                target_kind="ephemeral",
+                resource_kind="none",
+                target_overrides={
+                    "role": "monitor",
+                    "labels": {
+                        "repository": "owner/repo",
+                        "gwo.lifecycle": "ephemeral",
+                    },
+                    "result_captured": True,
+                    "result_captured_read_back": True,
+                },
+                execution_overrides={
+                    "worktree": None,
+                    "branch": None,
+                    "bound_agent_ids": [],
+                    "agent_only": True,
+                    "no_worktree_read_back": True,
+                },
+            )
+            missing_label = cleanup_report(
+                root,
+                event="stopped",
+                target_kind="ephemeral",
+                resource_kind="none",
+                target_overrides={
+                    "role": "monitor",
+                    "labels": {"repository": "owner/repo"},
+                    "result_captured": True,
+                    "result_captured_read_back": True,
+                },
+                execution_overrides={
+                    "worktree": None,
+                    "branch": None,
+                    "bound_agent_ids": [],
+                    "agent_only": True,
+                    "no_worktree_read_back": True,
+                },
+            )
+            missing_workspace_proof = cleanup_report(
+                root,
+                event="stopped",
+                target_kind="ephemeral",
+                resource_kind="none",
+                target_overrides={
+                    "role": "monitor",
+                    "labels": {
+                        "repository": "owner/repo",
+                        "gwo.lifecycle": "ephemeral",
+                    },
+                    "result_captured": True,
+                    "result_captured_read_back": True,
+                },
+                execution_overrides={
+                    "worktree": None,
+                    "branch": None,
+                    "bound_agent_ids": [],
+                    "agent_only": True,
+                    "no_worktree_read_back": False,
+                },
+            )
+
+        self.assertEqual("eligible", valid["status"])
+        self.assertIn("ephemeral-lifecycle-label-missing", missing_label["blockers"])
+        self.assertIn(
+            "ephemeral-no-worktree-not-read-back", missing_workspace_proof["blockers"]
+        )
+
     def test_cleanup_rejects_a_sibling_or_foreign_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -819,6 +1336,60 @@ class ExecutionPolicyTests(unittest.TestCase):
         self.assertEqual("protected", report["status"])
         self.assertEqual([], report["actions"])
         self.assertIn("target-not-direct-subagent", report["blockers"])
+
+    def test_repository_coordinator_cannot_bypass_campaign_to_clean_a_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            report = cleanup_report(
+                root,
+                target_kind="worker",
+                actor_overrides={
+                    "agent_id": "agent-repository-coordinator",
+                    "role": "repository-coordinator",
+                },
+                target_overrides={
+                    "parent_agent_id": "agent-repository-coordinator",
+                },
+            )
+
+        self.assertEqual("protected", report["status"])
+        self.assertIn("actor-role-not-cleanup-owner", report["blockers"])
+
+    def test_campaign_orchestrator_cannot_be_disguised_as_ephemeral(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            report = cleanup_report(
+                root,
+                event="stopped",
+                target_kind="ephemeral",
+                resource_kind="none",
+                actor_overrides={
+                    "agent_id": "agent-repository-coordinator",
+                    "role": "repository-coordinator",
+                },
+                target_overrides={
+                    "agent_id": "agent-campaign-a",
+                    "parent_agent_id": "agent-repository-coordinator",
+                    "role": "orchestrator",
+                    "labels": {
+                        "repository": "owner/repo",
+                        "gwo.lifecycle": "ephemeral",
+                    },
+                    "result_captured": True,
+                    "result_captured_read_back": True,
+                },
+                execution_overrides={
+                    "worktree": None,
+                    "branch": None,
+                    "bound_agent_ids": [],
+                    "agent_only": True,
+                    "no_worktree_read_back": True,
+                },
+            )
+
+        self.assertEqual("protected", report["status"])
+        self.assertIn("ephemeral-target-role-invalid", report["blockers"])
+        self.assertIn("target-role-not-cleanable", report["blockers"])
 
     def test_cleanup_requires_an_orchestrator_actor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1125,6 +1696,10 @@ class ExecutionPolicyTests(unittest.TestCase):
                     "20",
                     "--execution-mode",
                     "paseo-agent",
+                    "--target-kind",
+                    "worker",
+                    "--resource-kind",
+                    "issue-worktree",
                     "--actor-agent-id",
                     "agent-orchestrator",
                     "--actor-role",
@@ -1182,6 +1757,8 @@ class ExecutionPolicyTests(unittest.TestCase):
                     "--worktree-clean",
                     "--work-durable",
                     "--branch-merged",
+                    "--unique-commits",
+                    "0",
                 ],
                 capture_output=True,
                 text=True,
@@ -1208,6 +1785,10 @@ class ExecutionPolicyTests(unittest.TestCase):
                     "20",
                     "--execution-mode",
                     "paseo-agent",
+                    "--target-kind",
+                    "campaign",
+                    "--resource-kind",
+                    "none",
                     "--actor-agent-id",
                     "agent-repository-coordinator",
                     "--actor-role",
@@ -1237,6 +1818,9 @@ class ExecutionPolicyTests(unittest.TestCase):
                     "--target-dispatch-id",
                     "campaign-control-1",
                     "--target-agent-idle",
+                    "--campaign-generation",
+                    "legacy-v4.2",
+                    "--campaign-generation-read-back",
                     "--execution-repository",
                     "owner/repo",
                     "--execution-campaign-id",
@@ -1258,6 +1842,15 @@ class ExecutionPolicyTests(unittest.TestCase):
                     "--terminal-read-back",
                     "--work-durable",
                     "--agent-only",
+                    "--children-read-back",
+                    "--children-repository",
+                    "owner/repo",
+                    "--children-campaign-id",
+                    "campaign-20260718",
+                    "--children-scope",
+                    "direct-subagent",
+                    "--unique-commits",
+                    "0",
                 ],
                 capture_output=True,
                 text=True,
@@ -1298,6 +1891,8 @@ class ExecutionPolicyTests(unittest.TestCase):
                     "--current-dev-sha",
                     "a" * 40,
                     "--case-sensitive-paths",
+                    "--integration-control-available",
+                    "--integration-control-clean",
                 ],
                 capture_output=True,
                 text=True,
@@ -1859,6 +2454,215 @@ class PaseoRoomProtocolTests(unittest.TestCase):
         self.assertIn("invalid-heartbeat-evidence", heartbeat_errors)
         self.assertIn("reply-requires-in-reply-to", reply_errors)
 
+    def review_result(
+        self,
+        *,
+        axis: str,
+        sender: str,
+        signal_id: str,
+        candidate_sha: str = "b" * 40,
+        base_sha: str = "a" * 40,
+        diff_sha256: str = "c" * 64,
+        acceptance_sha256: str = "d" * 64,
+        review_round: int = 1,
+        scope: str = "full",
+        previous_candidate_sha: str | None = None,
+        sequence: int = 1,
+    ) -> dict:
+        return event(
+            signal_id=signal_id,
+            sequence=sequence,
+            event_type="REVIEW_RESULT",
+            sender_agent_id=sender,
+            evidence={
+                "axis": axis,
+                "candidate_sha": candidate_sha,
+                "base_sha": base_sha,
+                "diff_sha256": diff_sha256,
+                "acceptance_sha256": acceptance_sha256,
+                "review_round": review_round,
+                "scope": scope,
+                "previous_candidate_sha": previous_candidate_sha,
+                "verdict": "pass",
+                "findings": [],
+            },
+            next_action="return verdict to Campaign",
+        )
+
+    def test_review_result_requires_locked_axis_sha_diff_and_acceptance(self) -> None:
+        valid = self.review_result(
+            axis="spec", sender="agent-spec-reviewer", signal_id="review-spec-1"
+        )
+        invalid = self.review_result(
+            axis="spec", sender="agent-spec-reviewer", signal_id="review-spec-2"
+        )
+        invalid["evidence"].pop("acceptance_sha256")
+
+        self.assertEqual([], ROOM.validate_event(valid))
+        self.assertIn("invalid-review-result-evidence", ROOM.validate_event(invalid))
+
+    def test_two_review_axes_complete_only_for_the_same_locked_candidate(self) -> None:
+        spec = self.review_result(
+            axis="spec", sender="agent-spec-reviewer", signal_id="review-spec-1"
+        )
+        quality = self.review_result(
+            axis="quality",
+            sender="agent-quality-reviewer",
+            signal_id="review-quality-1",
+        )
+        for index, payload in enumerate((spec, quality), start=1):
+            self.runner.messages.append(
+                {
+                    "id": f"message-{index}",
+                    "body": json.dumps(payload),
+                    "author": payload["sender_agent_id"],
+                }
+            )
+        receipts = review_identity_receipts("spec", "quality")
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=receipts,
+            review_locks=[review_lock_receipt()],
+        )
+
+        self.assertEqual([], replay["blocked_dispatches"])
+        self.assertEqual("complete", replay["review_pairs"]["dispatch-issue-7"]["status"])
+        self.assertEqual("b" * 40, replay["review_pairs"]["dispatch-issue-7"]["candidate_sha"])
+
+    def test_review_pair_mismatch_or_duplicate_axis_blocks_final_verdict(self) -> None:
+        spec = self.review_result(
+            axis="spec", sender="agent-spec-reviewer", signal_id="review-spec-1"
+        )
+        duplicate_spec = self.review_result(
+            axis="spec",
+            sender="agent-spec-reviewer",
+            signal_id="review-spec-duplicate",
+            sequence=2,
+        )
+        quality = self.review_result(
+            axis="quality",
+            sender="agent-quality-reviewer",
+            signal_id="review-quality-1",
+            candidate_sha="e" * 40,
+        )
+        for index, payload in enumerate((spec, duplicate_spec, quality), start=1):
+            self.runner.messages.append(
+                {
+                    "id": f"message-{index}",
+                    "body": json.dumps(payload),
+                    "author": payload["sender_agent_id"],
+                }
+            )
+        receipts = review_identity_receipts("spec", "quality")
+        receipts[1]["assignment"]["lock"]["candidate_sha"] = "e" * 40
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=receipts,
+            review_locks=[review_lock_receipt()],
+        )
+
+        reasons = ",".join(item["reason"] for item in replay["rejected"])
+        self.assertIn("duplicate-review-axis", reasons)
+        self.assertIn("review-lock-receipt-mismatch", reasons)
+        self.assertEqual(["dispatch-issue-7"], replay["blocked_dispatches"])
+
+    def test_review_receipt_axis_must_match_runtime_label(self) -> None:
+        spec = self.review_result(
+            axis="spec", sender="agent-spec-reviewer", signal_id="review-spec-1"
+        )
+        self.runner.messages.append(
+            {
+                "id": "message-1",
+                "body": json.dumps(spec),
+                "author": "agent-spec-reviewer",
+            }
+        )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=review_identity_receipts(
+                ("agent-spec-reviewer", "quality")
+            ),
+            review_locks=[review_lock_receipt()],
+        )
+
+        self.assertEqual([], replay["events"])
+        self.assertIn("identity-receipt-review-axis-mismatch", replay["rejected"][0]["reason"])
+
+    def test_review_pair_cannot_self_authorize_a_forged_shared_lock(self) -> None:
+        spec = self.review_result(
+            axis="spec",
+            sender="agent-spec-reviewer",
+            signal_id="review-spec-forged",
+            candidate_sha="e" * 40,
+        )
+        quality = self.review_result(
+            axis="quality",
+            sender="agent-quality-reviewer",
+            signal_id="review-quality-forged",
+            candidate_sha="e" * 40,
+        )
+        for index, payload in enumerate((spec, quality), start=1):
+            self.runner.messages.append(
+                {
+                    "id": f"message-{index}",
+                    "body": json.dumps(payload),
+                    "author": payload["sender_agent_id"],
+                }
+            )
+
+        receipts = review_identity_receipts("spec", "quality")
+        for receipt in receipts:
+            if receipt["role"] != "review":
+                continue
+            receipt["assignment"]["lock"]["candidate_sha"] = "e" * 40
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=receipts,
+            review_locks=[review_lock_receipt(candidate_sha="b" * 40)],
+        )
+
+        self.assertEqual([], replay["events"])
+        self.assertEqual(["dispatch-issue-7"], replay["blocked_dispatches"])
+        self.assertTrue(
+            all("review-lock-receipt-mismatch" in item["reason"] for item in replay["rejected"])
+        )
+
+    def test_delta_review_requires_prior_candidate_and_both_axes(self) -> None:
+        invalid = self.review_result(
+            axis="spec",
+            sender="agent-spec-reviewer",
+            signal_id="review-spec-delta",
+            review_round=2,
+            scope="delta",
+        )
+        valid = self.review_result(
+            axis="spec",
+            sender="agent-spec-reviewer",
+            signal_id="review-spec-delta-valid",
+            review_round=2,
+            scope="delta",
+            previous_candidate_sha="9" * 40,
+        )
+
+        self.assertIn("invalid-review-result-evidence", ROOM.validate_event(invalid))
+        self.assertEqual([], ROOM.validate_event(valid))
+
+    def test_delta_review_lock_requires_the_exact_prior_readback(self) -> None:
+        current = review_lock_receipt(
+            candidate_sha="e" * 40,
+            review_round=2,
+            scope="delta",
+            previous_candidate_sha="b" * 40,
+        )
+        with self.assertRaisesRegex(ROOM.RoomProtocolError, "lineage"):
+            ROOM._review_lock_lookup([current])
+
+        lookup = ROOM._review_lock_lookup([review_lock_receipt(), current])
+
+        self.assertEqual(2, len(lookup))
+
     def test_replay_requires_exact_runtime_identity_receipts(self) -> None:
         self.runner.messages.append(
             {
@@ -1880,6 +2684,404 @@ class PaseoRoomProtocolTests(unittest.TestCase):
         self.assertEqual(
             "identity-receipt-missing", mismatched["rejected"][0]["reason"]
         )
+
+    def test_worker_scoped_replay_ignores_control_history_and_compiles_receipts(
+        self,
+    ) -> None:
+        unrelated = event(
+            signal_id="campaign-checkpoint-1",
+            campaign_id="campaign-20260718",
+            dispatch_id="campaign-20260718",
+            event_type="CHECKPOINT",
+            sender_agent_id="agent-repository-coordinator",
+            sequence=1,
+        )
+        legacy_unrelated = {
+            "campaign_id": "campaign-20260718",
+            "dispatch_id": "campaign-20260718",
+            "event_type": "CHECKPOINT",
+            "sender_agent_id": "legacy-coordinator",
+        }
+        start = event(
+            signal_id="start-worker-7",
+            event_type="START",
+            sender_agent_id="agent-orchestrator",
+            recipient_agent_id="agent-worker-7",
+            sequence=1,
+        )
+        review_result = self.review_result(
+            axis="spec",
+            sender="agent-spec-reviewer",
+            signal_id="review-spec-worker-view",
+        )
+        review_fix = event(
+            signal_id="start-review-fix-worker-7",
+            event_type="START",
+            sender_agent_id="agent-orchestrator",
+            recipient_agent_id="agent-worker-7",
+            sequence=2,
+        )
+        for index, payload in enumerate(
+            (unrelated, legacy_unrelated, start, review_result, review_fix), start=1
+        ):
+            self.runner.messages.append(
+                {
+                    "id": f"message-{index}",
+                    "body": json.dumps(payload),
+                    "author": payload["sender_agent_id"],
+                }
+            )
+        plan = ROOM.identity_receipt_plan(
+            {
+                "schema_version": 1,
+                "repository": "owner/repo",
+                "campaign_id": "campaign-20260718",
+                "dispatch_id": "dispatch-issue-7",
+                "authority_scope": "worker-dispatch",
+                "agent_readbacks": [
+                    {
+                        "agent_id": "agent-orchestrator",
+                        "parent_agent_id": "agent-repository-coordinator",
+                        "relationship": "subagent",
+                        "labels": {
+                            "repository": "owner/repo",
+                            "campaign_id": "campaign-20260718",
+                            "role": "orchestrator",
+                        },
+                        "read_back": True,
+                    },
+                    {
+                        "agent_id": "agent-worker-7",
+                        "parent_agent_id": "agent-orchestrator",
+                        "relationship": "subagent",
+                        "labels": {
+                            "repository": "owner/repo",
+                            "campaign_id": "campaign-20260718",
+                            "dispatch_id": "dispatch-issue-7",
+                            "role": "implementation",
+                        },
+                        "read_back": True,
+                    },
+                ],
+            }
+        )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=plan["receipts"],
+            dispatch_id="dispatch-issue-7",
+            consumer_role="worker",
+        )
+
+        self.assertEqual(
+            ["START", "START"], [item["event_type"] for item in replay["events"]]
+        )
+        self.assertEqual([], replay["rejected"])
+        self.assertEqual([], replay["blocked_dispatches"])
+
+        with self.assertRaisesRegex(ROOM.RoomProtocolError, "Campaign parent"):
+            ROOM.identity_receipt_plan(
+                {
+                    "schema_version": 1,
+                    "repository": "owner/repo",
+                    "campaign_id": "campaign-20260718",
+                    "dispatch_id": "dispatch-issue-7",
+                    "authority_scope": "worker-dispatch",
+                    "agent_readbacks": [
+                        {
+                            "agent_id": "agent-worker-7",
+                            "parent_agent_id": "foreign-parent",
+                            "relationship": "subagent",
+                            "labels": {
+                                "repository": "owner/repo",
+                                "campaign_id": "campaign-20260718",
+                                "dispatch_id": "dispatch-issue-7",
+                                "role": "implementation",
+                            },
+                            "read_back": True,
+                        }
+                    ],
+                }
+            )
+
+    def test_identity_plan_cli_writes_a_replay_ready_receipt_array(self) -> None:
+        snapshot = {
+            "schema_version": 1,
+            "repository": "owner/repo",
+            "campaign_id": "campaign-20260718",
+            "dispatch_id": "dispatch-issue-7",
+            "authority_scope": "worker-dispatch",
+            "agent_readbacks": [
+                {
+                    "agent_id": "agent-orchestrator",
+                    "parent_agent_id": "agent-repository-coordinator",
+                    "relationship": "subagent",
+                    "labels": {
+                        "repository": "owner/repo",
+                        "campaign_id": "campaign-20260718",
+                        "role": "orchestrator",
+                    },
+                    "read_back": True,
+                },
+                {
+                    "agent_id": "agent-worker-7",
+                    "parent_agent_id": "agent-orchestrator",
+                    "relationship": "subagent",
+                    "labels": {
+                        "repository": "owner/repo",
+                        "campaign_id": "campaign-20260718",
+                        "dispatch_id": "dispatch-issue-7",
+                        "role": "implementation",
+                    },
+                    "read_back": True,
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "readbacks.json"
+            output = Path(temporary) / "receipts.json"
+            source.write_text(json.dumps(snapshot), encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ORCHESTRATOR_SCRIPTS / "paseo_room.py"),
+                    "identity-plan",
+                    "--snapshot",
+                    str(source),
+                    "--receipts-output",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            receipts = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertIsInstance(receipts, list)
+        self.assertEqual(
+            {"agent-orchestrator", "agent-worker-7"},
+            {item["agent_id"] for item in receipts},
+        )
+
+    def test_identity_plan_supports_the_fixed_reusable_review_pair(self) -> None:
+        lock = {
+            "dispatch_id": "dispatch-issue-7",
+            "candidate_sha": "b" * 40,
+            "base_sha": "a" * 40,
+            "diff_sha256": "c" * 64,
+            "acceptance_sha256": "d" * 64,
+            "review_round": 1,
+            "scope": "full",
+            "previous_candidate_sha": None,
+        }
+        readbacks = [
+            {
+                "agent_id": "agent-orchestrator",
+                "parent_agent_id": "agent-repository-coordinator",
+                "relationship": "subagent",
+                "labels": {
+                    "repository": "owner/repo",
+                    "campaign_id": "campaign-20260718",
+                    "role": "orchestrator",
+                },
+                "read_back": True,
+            },
+            *[
+                {
+                    "agent_id": f"agent-{axis}-reviewer",
+                    "parent_agent_id": "agent-orchestrator",
+                    "relationship": "subagent",
+                    "labels": {
+                        "repository": "owner/repo",
+                        "campaign_id": "campaign-20260718",
+                        "role": "review",
+                        "review_axis": axis,
+                    },
+                    "read_back": True,
+                }
+                for axis in ("spec", "quality")
+            ],
+        ]
+        assignments = [
+            {
+                "agent_id": f"agent-{axis}-reviewer",
+                "campaign_id": "campaign-20260718",
+                "review_axis": axis,
+                "campaign_parent_agent_id": "agent-orchestrator",
+                "lock": lock,
+                "review_lock_read_back": True,
+                "read_back": True,
+            }
+            for axis in ("spec", "quality")
+        ]
+        plan = ROOM.identity_receipt_plan(
+            {
+                "schema_version": 1,
+                "repository": "owner/repo",
+                "campaign_id": "campaign-20260718",
+                "dispatch_id": "dispatch-issue-7",
+                "authority_scope": "review-dispatch",
+                "agent_readbacks": readbacks,
+                "review_assignments": assignments,
+            }
+        )
+        for axis in ("spec", "quality"):
+            payload = self.review_result(
+                axis=axis,
+                sender=f"agent-{axis}-reviewer",
+                signal_id=f"review-{axis}-identity-plan",
+            )
+            self.runner.messages.append(
+                {
+                    "id": f"message-{axis}",
+                    "body": json.dumps(payload),
+                    "author": payload["sender_agent_id"],
+                }
+            )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=plan["receipts"],
+            review_locks=[review_lock_receipt()],
+        )
+
+        reviewer_receipts = [
+            item for item in plan["receipts"] if item["role"] == "review"
+        ]
+        self.assertEqual(2, len(reviewer_receipts))
+        self.assertTrue(
+            all("dispatch_id" not in item["labels"] for item in reviewer_receipts)
+        )
+        self.assertEqual("complete", replay["review_pairs"]["dispatch-issue-7"]["status"])
+        self.assertEqual([], replay["blocked_dispatches"])
+
+        poisoned = {**assignments[0], "campaign_parent_agent_id": "foreign-parent"}
+        with self.assertRaisesRegex(ROOM.RoomProtocolError, "review assignment"):
+            ROOM.identity_receipt_plan(
+                {
+                    "schema_version": 1,
+                    "repository": "owner/repo",
+                    "campaign_id": "campaign-20260718",
+                    "dispatch_id": "dispatch-issue-7",
+                    "authority_scope": "review-dispatch",
+                    "agent_readbacks": readbacks,
+                    "review_assignments": [poisoned, assignments[1]],
+                }
+            )
+        wrong_axis = {**assignments[0], "review_axis": "quality"}
+        with self.assertRaisesRegex(ROOM.RoomProtocolError, "review assignment"):
+            ROOM.identity_receipt_plan(
+                {
+                    "schema_version": 1,
+                    "repository": "owner/repo",
+                    "campaign_id": "campaign-20260718",
+                    "dispatch_id": "dispatch-issue-7",
+                    "authority_scope": "review-dispatch",
+                    "agent_readbacks": readbacks,
+                    "review_assignments": [wrong_axis, assignments[1]],
+                }
+            )
+        orphan_readbacks = json.loads(json.dumps(readbacks[1:]))
+        for item in orphan_readbacks:
+            item["parent_agent_id"] = "foreign-parent"
+        orphan_assignments = json.loads(json.dumps(assignments))
+        for item in orphan_assignments:
+            item["campaign_parent_agent_id"] = "foreign-parent"
+        with self.assertRaisesRegex(ROOM.RoomProtocolError, "review assignment"):
+            ROOM.identity_receipt_plan(
+                {
+                    "schema_version": 1,
+                    "repository": "owner/repo",
+                    "campaign_id": "campaign-20260718",
+                    "dispatch_id": "dispatch-issue-7",
+                    "authority_scope": "review-dispatch",
+                    "agent_readbacks": orphan_readbacks,
+                    "review_assignments": orphan_assignments,
+                }
+            )
+
+    def test_identity_plan_uses_explicit_campaign_control_scope(self) -> None:
+        plan = ROOM.identity_receipt_plan(
+            {
+                "schema_version": 1,
+                "repository": "owner/repo",
+                "campaign_id": "campaign-20260718",
+                "dispatch_id": "campaign-control-1",
+                "authority_scope": "campaign-control",
+                "agent_readbacks": [
+                    {
+                        "agent_id": "agent-repository-coordinator",
+                        "parent_agent_id": None,
+                        "relationship": "root",
+                        "labels": {
+                            "repository": "owner/repo",
+                            "role": "repository-coordinator",
+                        },
+                        "read_back": True,
+                    },
+                    {
+                        "agent_id": "agent-orchestrator",
+                        "parent_agent_id": "agent-repository-coordinator",
+                        "relationship": "subagent",
+                        "labels": {
+                            "repository": "owner/repo",
+                            "campaign_id": "campaign-20260718",
+                            "role": "orchestrator",
+                        },
+                        "read_back": True,
+                    },
+                ],
+            }
+        )
+        checkpoint = event(
+            signal_id="campaign-checkpoint-control-1",
+            dispatch_id="campaign-control-1",
+            event_type="CHECKPOINT",
+            sender_agent_id="agent-orchestrator",
+        )
+        self.runner.messages.append(
+            {
+                "id": "message-control",
+                "body": json.dumps(checkpoint),
+                "author": "agent-orchestrator",
+            }
+        )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718", identity_receipts=plan["receipts"]
+        )
+
+        orchestrator_receipt = next(
+            item for item in plan["receipts"] if item["role"] == "orchestrator"
+        )
+        self.assertEqual("campaign-control", orchestrator_receipt["authority"]["kind"])
+        self.assertEqual(["CHECKPOINT"], [item["event_type"] for item in replay["events"]])
+
+        with self.assertRaisesRegex(ROOM.RoomProtocolError, "root Coordinator parent"):
+            ROOM.identity_receipt_plan(
+                {
+                    "schema_version": 1,
+                    "repository": "owner/repo",
+                    "campaign_id": "campaign-20260718",
+                    "dispatch_id": "campaign-control-1",
+                    "authority_scope": "campaign-control",
+                    "agent_readbacks": [
+                        {
+                            "agent_id": "agent-orchestrator",
+                            "parent_agent_id": "foreign-parent",
+                            "relationship": "subagent",
+                            "labels": {
+                                "repository": "owner/repo",
+                                "campaign_id": "campaign-20260718",
+                                "role": "orchestrator",
+                            },
+                            "read_back": True,
+                        }
+                    ],
+                }
+            )
 
     def test_replay_rejects_message_author_spoofing(self) -> None:
         self.runner.messages.append(

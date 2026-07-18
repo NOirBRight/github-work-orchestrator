@@ -67,7 +67,7 @@ class SkillPackageTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
     def test_package_manifests_pin_version_and_content_digest(self) -> None:
-        self.assertEqual("4.2.0", SYNC.PACKAGE_VERSION)
+        self.assertEqual("4.3.0", SYNC.PACKAGE_VERSION)
         for name in SKILLS:
             package = ROOT / "skills" / name
             manifest = json.loads(
@@ -164,11 +164,10 @@ class SkillPackageTests(unittest.TestCase):
         for category in ("planning", "research", "impl", "audit", "ui"):
             self.assertIn(category, normalized)
             self.assertIn(category, provider)
-        self.assertIn("fail closed", normalized)
+        self.assertIn("fails closed", normalized)
         self.assertNotIn("ollama-cloud/glm", orchestrator.lower())
-        self.assertIn("unambiguous `isunattended: true` mode", normalized)
-        self.assertIn("never infer unattended execution", normalized)
-        self.assertIn("never infer unattended execution from provider name", normalized)
+        self.assertIn("exactly one advertised `isunattended: true` mode", normalized)
+        self.assertIn("never infer it from names or prose", normalized)
 
     def test_execution_contract_is_v3_provider_neutral(self) -> None:
         contract = (
@@ -222,12 +221,13 @@ class SkillPackageTests(unittest.TestCase):
         lifecycle = (ROOT / "shared/lifecycle.md").read_text(encoding="utf-8")
         combined = " ".join((orchestrator + state + lifecycle).split()).lower()
         for phrase in (
-            "repository coordinator is the repository-resident root agent",
-            "dedicated `dev` control worktree",
-            "campaign orchestrator is a direct `subagent`",
-            "provider binding is resolved per campaign",
-            "must not author feature commits directly on `dev`",
-            "`campaign_closed` never archives the repository coordinator",
+            "keep one repository coordinator per repository",
+            "coordinator home workspace",
+            "integration control worktree",
+            "direct `subagent` of the coordinator",
+            "provider binding",
+            "carries no feature commit",
+            "`campaign_closed` never archives the coordinator",
             "unlabeled root agents are foreign",
         ):
             self.assertIn(phrase, combined)
@@ -239,10 +239,10 @@ class SkillPackageTests(unittest.TestCase):
         state = (ROOT / "shared/github-state-rules.md").read_text(encoding="utf-8")
         combined = " ".join((orchestrator + state).split()).lower()
         for phrase in (
-            "different campaigns may execute concurrently",
+            "different campaigns execute concurrently",
             "hotsets do not overlap",
             "repository-scoped integration lease",
-            "refresh its pinned `dev` base",
+            "refresh an advanced `dev` base",
         ):
             self.assertIn(phrase, combined)
 
@@ -256,10 +256,10 @@ class SkillPackageTests(unittest.TestCase):
         combined = " ".join((skill + loop).split()).lower()
         for phrase in (
             "campaign_scheduler.py plan-wave",
-            "whole eligible worker wave",
-            "without waiting for another worker to finish",
-            "heartbeat is worker liveness, never orchestrator polling",
-            "wait at most 60 seconds",
+            "complete worker wave",
+            "do not wait for another worker",
+            "heartbeat is worker liveness, never coordinator polling",
+            "`chat wait` at most 60 seconds",
             "15 minutes",
             "silence alone",
             "attempt four is never automatic",
@@ -289,7 +289,7 @@ class SkillPackageTests(unittest.TestCase):
         for phrase in (
             "worker_done",
             "never authorizes completion",
-            "heartbeat, checkpoint, and worker_done are never terminal cleanup evidence",
+            "heartbeat, checkpoint, worker_done, and review_result are never terminal cleanup evidence",
             "event=merged",
             "branch_merged: true",
         ):
@@ -320,13 +320,13 @@ class SkillPackageTests(unittest.TestCase):
             "existing paseo operations",
             "schema_version: 2",
             "direct idle child",
-            "two-phase",
+            "cleanup remains staged",
             "self_archive_forbidden",
             "root_archive_requires_supervisor",
             "archive_target_not_direct_child",
             "worktree_in_use",
-            "trusted protected control worktree",
-            "removal of its worktree binding",
+            "integration control",
+            "removal of all worktree bindings",
         ):
             self.assertIn(phrase, normalized)
         for forbidden in ("codexhub", "daemon-side", "until the paseo daemon"):
@@ -362,12 +362,12 @@ class SkillPackageTests(unittest.TestCase):
             "relationship: subagent",
             "notify_on_finish: true",
             "unexpected_request_fallback: parent",
-            "exact parent agent id",
+            "exact `parent_agent_id`",
             "non-destructive",
         ):
             self.assertIn(phrase, combined)
 
-    def test_verification_policy_has_one_review_owner_and_tiered_gates(self) -> None:
+    def test_verification_policy_has_independent_review_axes_and_tiered_gates(self) -> None:
         policy = (ROOT / "shared/verification-policy.md").read_text(encoding="utf-8")
         worker = (ROOT / "skills/github-issue-worker/SKILL.md").read_text(
             encoding="utf-8"
@@ -379,7 +379,49 @@ class SkillPackageTests(unittest.TestCase):
             self.assertIn(f"`{verification_class}`", policy)
         self.assertIn("Review-Owner: orchestrator", policy)
         self.assertIn("Do not run formal review", worker)
-        self.assertIn("one Orchestrator-owned review", orchestrator)
+        self.assertIn("one `Spec Reviewer` and one `Quality Reviewer`", orchestrator)
+        self.assertIn("Both receive the same candidate SHA", orchestrator)
+
+    def test_v43_workspace_relay_capacity_and_review_model_is_explicit(self) -> None:
+        skill = (ROOT / "skills/github-work-orchestrator/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = " ".join(skill.split()).lower()
+        for phrase in (
+            "relay · <repo> → coordinator",
+            "repository room",
+            "campaign control workspace",
+            "three worker slots",
+            "two review slots",
+            "spec reviewer",
+            "quality reviewer",
+            "provider-native agent/task/swarm",
+            "waiting_integration",
+        ):
+            self.assertIn(phrase, normalized)
+
+    def test_no_new_skill_or_host_runtime_dependency_was_added(self) -> None:
+        self.assertEqual(
+            {"github-work-orchestrator", "github-issue-intake", "github-issue-worker"},
+            set(SKILLS),
+        )
+        combined = " ".join(
+            (
+                ROOT / "skills/github-work-orchestrator/SKILL.md"
+            ).read_text(encoding="utf-8").split()
+        ).lower()
+        for phrase in ("do not modify or depend on paseo", "do not add another skill"):
+            self.assertIn(phrase, combined)
+        self.assertNotIn("paseo-orchestration", combined)
+
+    def test_upstream_ui_evidence_is_prepared_but_not_published(self) -> None:
+        for name in (
+            "paseo-empty-new-agent-draft-tab.md",
+            "paseo-provider-native-zombie-subagent.md",
+        ):
+            evidence = (ROOT / "docs" / "evidence" / name).read_text(encoding="utf-8")
+            self.assertIn("not published", evidence.lower())
+            self.assertIn("## Acceptance", evidence)
 
 
 if __name__ == "__main__":

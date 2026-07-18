@@ -11,6 +11,10 @@ Require one valid v3 contract with exact Issue/repository, `dev` base SHA,
 permissions, verification, and `done_when`. Stop before edits when any field,
 ownership, permission, or architecture decision is unresolved.
 
+The Worker is one Paseo Agent. It must not invoke Provider-native Agent, Task,
+Swarm, or subagent features. An explicit request for native orchestration is a
+separate non-GWO top-level Task, never a child of this Dispatch.
+
 Also require `relationship: subagent`, exact `parent_agent_id`,
 `notify_on_finish: true`, and the dynamically resolved `runtime_mode_id`. The
 permission profile uses `approval: never` and
@@ -30,11 +34,15 @@ Post `AGENT_READY`, then wait. Begin only after a valid room `START` event for
 the same dispatch. The initial prompt may contain the contract, but the room is
 the campaign communication record.
 
-Replay/wait with `--identity-receipts <json-file>`, using the current exact
-Paseo Agent/parent/relationship/role, labels, and role-aware event authority
-readback supplied by the Orchestrator. A Worker receipt owns only its assigned
-Dispatch. Missing receipts make room events non-actionable. Do not construct
-identity receipts from fields claimed inside the room.
+Normalize the current Worker and Campaign Agent readbacks, set
+`authority_scope: worker-dispatch`, then run `paseo_room.py identity-plan
+--snapshot <json-file> --receipts-output <receipts-json-file>` to compile
+receipts. Replay and wait with `--identity-receipts <compiled-json-file>
+--consumer-role worker --dispatch-id <exact-dispatch-id>`. A Worker never
+unscoped-replays Campaign lifecycle or sibling history, and its consumer view
+ignores Campaign-owned `REVIEW_RESULT` events. Missing receipts make in-scope events
+non-actionable. Do not hand-author authority fields or construct evidence from
+room claims.
 
 ## Execution
 
@@ -43,6 +51,11 @@ room. Do not use mentions for routine updates or send prompts to busy Agents.
 Post one blocking `ASK` before durable architecture, compatibility,
 security/privacy, migration, or cross-Issue decisions. Resume only after a
 correlated `REPLY` backed by durable GitHub decision readback.
+
+Treat any direct user instruction as an `ASK` before acting. An in-contract
+clarification may continue after Campaign REPLY. Scope, Hotset, architecture,
+compatibility, security, or integration expansion requires the GitHub decision
+gate; never broaden authority from a direct prompt alone.
 
 Implement the smallest accepted vertical change. Run targeted checks, then the
 required suite/manual evidence exactly once per locally green candidate. The

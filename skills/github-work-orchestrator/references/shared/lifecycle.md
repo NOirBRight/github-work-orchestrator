@@ -2,27 +2,33 @@
 
 ## Durable Issue states
 
-Use exactly one repository lifecycle label on every open Issue:
+Use exactly one lifecycle label on each open Issue:
 
-- `needs-triage` — scope or ownership is unclear.
-- `needs-info` — a named fact, policy, or decision is missing.
-- `ready-for-agent` — a fresh Paseo Agent can execute the v3 contract.
-- `ready-for-human` — a maintainer-only action is required.
-- `wontfix` — no implementation is intended.
+- `needs-triage` — scope/ownership unclear.
+- `needs-info` — named fact/policy/decision missing.
+- `ready-for-agent` — fresh Paseo Agent can execute the v3 contract.
+- `ready-for-human` — maintainer-only action required.
+- `wontfix` — no implementation intended.
 
-GitHub dependencies determine readiness for the frontier. Runtime Agent state
-does not create a second Issue lifecycle.
+GitHub dependencies determine frontier readiness. Runtime Agent state never
+creates a second Issue lifecycle.
 
 ## Campaign states
 
 ```text
-PLANNED -> CLAIMED -> WAITING_HOTSET | ROOM_READY
-WAITING_HOTSET -> ROOM_READY -> ORCHESTRATOR_CREATED -> ACTIVE
-ACTIVE -> RESULT_POSTED -> VERIFIED -> WAITING_INTEGRATION -> MERGED -> ARCHIVED
-ACTIVE -> BLOCKED | STOPPED -> durable handoff
+PLANNED -> ROOM_READY -> CONTROL_CREATING -> CONTROL_VERIFIED -> ACTIVE
+ACTIVE -> RESULT_POSTED -> VERIFIED -> REVIEWING -> WAITING_INTEGRATION
+WAITING_INTEGRATION -> MERGED -> CLOSING -> ARCHIVED
+ACTIVE | REVIEWING -> BLOCKED | STOPPED -> durable handoff
 ```
 
-While ACTIVE, the Campaign Orchestrator runs an event-driven loop:
+`CONTROL_CREATING` is a preserve-and-reconcile admission transaction. A
+partial Agent/Workspace create is never blindly retried or automatically
+deleted. New v4.3 Campaigns become ACTIVE only after exact parent, Workspace,
+Provider/mode, labels, branch/head, local-only branch, clean state, and zero
+unique commits are read back. Legacy active Campaigns remain Agent-only.
+
+While ACTIVE, run:
 
 ```text
 RECONCILE_CAMPAIGN -> PLAN_WAVE -> DISPATCH_WAVE -> WAIT_WORKERS
@@ -30,46 +36,46 @@ WAIT_WORKERS -> VERIFY_RESULTS -> REVIEW -> RETURN_CANDIDATE
 RETURN_CANDIDATE -> WAITING_INTEGRATION
 ```
 
-`chat wait` is bounded to 60 seconds. A timeout replays the room but does not
-poll running Agents. A valid `HEARTBEAT` refreshes runtime visibility without
-changing lifecycle. Fifteen minutes of silence permits one recovery inspection,
-not cancellation or replacement.
+Plan all eligible Workers together, up to three dedicated Worker slots. A
+finish notification accelerates wake only. `chat wait` is bounded to 60 seconds;
+timeout replays without polling. HEARTBEAT changes visibility only. Fifteen
+minutes of silence permits one inspection, never cancellation/replacement.
 
-Every transition needs readback from its owning system. Room messages announce
-transitions but do not authorize them.
+## Parentage and direct messages
 
-## Dispatch and continuation
+The Coordinator is the repository root and survives all Campaigns. Each
+Campaign is its direct Paseo `subagent`; Workers, Spec Reviewer, and Quality
+Reviewer are direct Campaign subagents. Use `detached` only for explicit
+handoff outside GWO ownership. Provider-native subagents never enter this tree.
 
-The Repository Coordinator is the repository-resident root Agent and survives
-every Campaign. Create one Campaign Orchestrator as its direct `subagent` for
-each Campaign, then create Campaign-owned Workers as direct children of that
-Campaign Orchestrator. Use `detached` only for an explicit handoff that must
-survive its parent. A follow-up continues the same Agent only after it is idle;
-a busy Agent receives room work for its next checkpoint.
+A direct user message to Campaign is accepted only inside Campaign scope.
+Cross-Campaign/Hotset/Integration/`dev` changes relay to Coordinator. A Worker
+first posts ASK. In-contract clarification may receive REPLY; durable scope or
+architecture changes require a GitHub decision gate.
 
-Different Campaign Orchestrators may run concurrently with independent Provider
-Bindings when admitted Hotsets do not overlap. Only the Campaign holding the
-repository Integration Lease enters integration.
+## Review and integration
 
-Within one Campaign, plan the whole ready wave. Start all selected Workers
-without waiting for the first to complete. Dispatch IDs are stable per attempt;
-after three terminal failures the Issue moves to `ready-for-human` and no
-fourth automatic attempt is allowed.
+Fast review stays in Campaign. Standard/strict creates/reuses exactly two
+independent Reviewers. Both lock the same candidate/base/diff/acceptance and
+both results are required. The Campaign-issued lock is persisted/read back;
+Reviewer claims cannot authorize it. Recovery retains the full lock and both
+Reviewer IDs. A failed axis returns to the same Worker; the next round is delta
+for both axes with prior-lock lineage.
+
+Different Campaign Provider Bindings may run concurrently. Only the Integration
+Lease holder can merge. Dirty/missing Integration Control leaves the candidate
+`WAITING_INTEGRATION` without stopping Workers or mutating user WIP.
 
 ## Completion and cleanup
 
-Completion requires accepted Issue behavior, locally green evidence, applicable
-review/manual gates, a verified PR into `dev`, and durable GitHub readback.
-Archive the Agent/worktree only after the cleanup guard passes. For delegated
-work, archive the Agent first and read back both terminal archive state and an
-unbound worktree before a second guard pass can authorize worktree cleanup. A
-blocked or unsafe campaign remains visible with its room and worktree
-preserved.
+Completion requires accepted behavior, green evidence, both applicable review
+axes/manual gates, verified PR into `dev`, and durable readback. After three
+terminal failed attempts, move to `ready-for-human`; attempt four is never
+automatic.
 
-The Campaign Orchestrator never archives itself. After `CAMPAIGN_CLOSED`, the
-Repository Coordinator may archive that direct child only after terminal Agent,
-room, Git, and GitHub readback. This is Agent-only retirement; it does not
-require or delete a fabricated feature worktree. `CAMPAIGN_CLOSED` never
-archives the Repository Coordinator. Retiring the Repository Coordinator
-requires a human operator using the existing Paseo UI or CLI and a durable
-repository-level handoff.
+Cleanup order is Workers and Reviewers, Campaign Agent, Campaign Control
+Workspace, then local branch. The direct-child list and each phase require new
+readback; worktree archive and branch deletion are never one action wave. Legacy v4.2 Campaigns
+without control worktree retire Agent-only. Blocked/unsafe state stays visible.
+The Campaign never archives itself; `CAMPAIGN_CLOSED` never archives the
+Coordinator. Coordinator retirement is human-only after durable handoff.

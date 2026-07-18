@@ -12,6 +12,8 @@ from typing import Any
 
 from contract_schema import (
     DEFAULT_MAX_DISPATCH_ATTEMPTS_PER_ISSUE,
+    DEFAULT_MAX_REVIEW_SLOTS_PER_CAMPAIGN,
+    DEFAULT_MAX_WORKER_SLOTS_PER_CAMPAIGN,
     VERIFICATION_CLASSES,
 )
 from hotset_policy import (
@@ -25,6 +27,8 @@ SCHEMA_VERSION = 1
 LIFECYCLE_READY = "ready-for-agent"
 REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 CAMPAIGN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{5,63}$")
+IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$")
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 PREDECESSOR_TERMINAL_EVENTS = {"STOPPED"}
 PREDECESSOR_AGENT_STATUSES = {"error", "closed", "archived"}
 
@@ -88,6 +92,18 @@ def _capacity(value: Any) -> tuple[dict[str, int], list[str]]:
     campaign_limit = _positive_integer(
         "campaign_agent_limit", value.get("campaign_agent_limit")
     )
+    campaign_active_workers = _nonnegative_integer(
+        "campaign_active_workers", value.get("campaign_active_workers")
+    )
+    campaign_worker_limit = _positive_integer(
+        "campaign_worker_limit", value.get("campaign_worker_limit")
+    )
+    campaign_active_reviewers = _nonnegative_integer(
+        "campaign_active_reviewers", value.get("campaign_active_reviewers")
+    )
+    campaign_review_limit = _positive_integer(
+        "campaign_review_limit", value.get("campaign_review_limit")
+    )
     global_active = _nonnegative_integer(
         "global_active_agents", value.get("global_active_agents")
     )
@@ -95,19 +111,89 @@ def _capacity(value: Any) -> tuple[dict[str, int], list[str]]:
         "global_agent_limit", value.get("global_agent_limit")
     )
     blockers: list[str] = []
-    if campaign_active > campaign_limit or global_active > global_limit:
+    if (
+        campaign_active > campaign_limit
+        or campaign_active_workers > campaign_worker_limit
+        or campaign_active_reviewers > campaign_review_limit
+        or global_active > global_limit
+    ):
         blockers.append("capacity-already-exceeded")
     if campaign_active > global_active:
         blockers.append("capacity-counts-contradictory")
     # The repository-resident Coordinator is outside every Campaign but counts globally.
     if campaign_active and campaign_active + 1 > global_active:
         blockers.append("repository-coordinator-missing-from-global-count")
+    if campaign_limit < 1 + campaign_worker_limit + campaign_review_limit:
+        blockers.append("campaign-capacity-does-not-fit-dedicated-slots")
+    if campaign_worker_limit > DEFAULT_MAX_WORKER_SLOTS_PER_CAMPAIGN:
+        blockers.append("worker-slot-limit-exceeded")
+    if campaign_review_limit != DEFAULT_MAX_REVIEW_SLOTS_PER_CAMPAIGN:
+        blockers.append("review-slot-limit-invalid")
+    if campaign_active != 1 + campaign_active_workers + campaign_active_reviewers:
+        blockers.append("campaign-agent-count-contradicts-dedicated-slots")
     return {
         "campaign_active": campaign_active,
         "campaign_limit": campaign_limit,
+        "campaign_active_workers": campaign_active_workers,
+        "campaign_worker_limit": campaign_worker_limit,
+        "campaign_active_reviewers": campaign_active_reviewers,
+        "campaign_review_limit": campaign_review_limit,
         "global_active": global_active,
         "global_limit": global_limit,
     }, blockers
+
+
+def _review_agents(
+    value: Any,
+    *,
+    repository: str,
+    campaign_id: str,
+    campaign_agent_id: str,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    if not isinstance(value, dict) or set(value) != {"spec", "quality"}:
+        return {}, ["review-agent-evidence-missing"]
+    result: dict[str, dict[str, Any]] = {}
+    blockers: list[str] = []
+    for axis in ("spec", "quality"):
+        item = value.get(axis)
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("exists"), bool)
+            or item.get("axis") != axis
+            or not isinstance(item.get("reusable"), bool)
+            or item.get("read_back") is not True
+        ):
+            blockers.append("review-agent-evidence-missing")
+            continue
+        exists = item["exists"]
+        if not exists:
+            if any(
+                item.get(field) is not None
+                for field in ("agent_id", "parent_agent_id", "relationship", "labels")
+            ):
+                blockers.append(f"{axis}-review-agent-evidence-contradictory")
+            result[axis] = {"exists": False, "reusable": item["reusable"]}
+            continue
+        labels = item.get("labels")
+        valid = bool(
+            isinstance(item.get("agent_id"), str)
+            and IDENTIFIER_RE.fullmatch(item["agent_id"])
+            and item.get("parent_agent_id") == campaign_agent_id
+            and item.get("relationship") == "subagent"
+            and isinstance(labels, dict)
+            and labels.get("repository") == repository
+            and labels.get("campaign_id") == campaign_id
+            and labels.get("role") == "review"
+            and labels.get("review_axis") == axis
+        )
+        if not valid:
+            blockers.append(f"{axis}-review-agent-identity-invalid")
+        result[axis] = {
+            "exists": True,
+            "reusable": item["reusable"],
+            "agent_id": item.get("agent_id"),
+        }
+    return result, blockers
 
 
 def _active_dispatches(value: Any) -> tuple[list[dict[str, Any]], list[str]]:
@@ -262,6 +348,9 @@ def _candidate(item: Any, index: int, max_attempts: int) -> dict[str, Any]:
         raise ValueError(f"candidates[{index}] has invalid verification_class")
     attempt = _positive_integer(f"candidates[{index}].attempt", item.get("attempt"))
     dispatch_id = f"dispatch-issue-{issue}-a{attempt}"
+    slug = _nonempty_text(f"candidates[{index}].slug", item.get("slug"))
+    if not SLUG_RE.fullmatch(slug):
+        raise ValueError(f"candidates[{index}].slug is invalid")
     blockers: list[str] = []
     if item.get("lifecycle") != LIFECYCLE_READY:
         blockers.append("lifecycle-not-ready")
@@ -291,6 +380,7 @@ def _candidate(item: Any, index: int, max_attempts: int) -> dict[str, Any]:
         "verification_class": verification_class,
         "attempt": attempt,
         "dispatch_id": dispatch_id,
+        "slug": slug,
         "blockers": blockers,
     }
 
@@ -302,6 +392,9 @@ def plan_wave(snapshot: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("snapshot schema_version must be 1")
     repository = _nonempty_text("repository", snapshot.get("repository"))
     campaign_id = _nonempty_text("campaign_id", snapshot.get("campaign_id"))
+    campaign_agent_id = _nonempty_text(
+        "campaign_agent_id", snapshot.get("campaign_agent_id")
+    )
     if not REPOSITORY_RE.fullmatch(repository):
         raise ValueError("repository must be owner/name")
     if not CAMPAIGN_RE.fullmatch(campaign_id):
@@ -321,6 +414,14 @@ def plan_wave(snapshot: dict[str, Any]) -> dict[str, Any]:
     campaign_repository_wide = not campaign_hotset
     capacity, capacity_blockers = _capacity(snapshot.get("capacity"))
     active, active_blockers = _active_dispatches(snapshot.get("active_dispatches", []))
+    if not IDENTIFIER_RE.fullmatch(campaign_agent_id):
+        raise ValueError("campaign_agent_id is invalid")
+    review_agents, review_blockers = _review_agents(
+        snapshot.get("review_agents"),
+        repository=repository,
+        campaign_id=campaign_id,
+        campaign_agent_id=campaign_agent_id,
+    )
     external, external_blockers = _external_hotsets(
         snapshot.get("active_external_hotsets", {}), campaign_id
     )
@@ -329,6 +430,7 @@ def plan_wave(snapshot: dict[str, Any]) -> dict[str, Any]:
             _control_plane_blockers(snapshot.get("control_plane"))
             + capacity_blockers
             + active_blockers
+            + review_blockers
             + external_blockers
         )
     )
@@ -348,19 +450,12 @@ def plan_wave(snapshot: dict[str, Any]) -> dict[str, Any]:
     ):
         global_blockers.append("campaign-hotset-conflict")
 
-    review_agent = snapshot.get("review_agent")
-    if (
-        not isinstance(review_agent, dict)
-        or not isinstance(review_agent.get("exists"), bool)
-        or not isinstance(review_agent.get("reusable"), bool)
-    ):
-        global_blockers.append("review-agent-evidence-missing")
-    elif review_agent["exists"] and capacity["campaign_active"] < 2:
-        global_blockers.append("review-agent-missing-from-campaign-count")
-    minimum_campaign_agents = 1 + len(active)
-    if isinstance(review_agent, dict) and review_agent.get("exists") is True:
-        minimum_campaign_agents += 1
-    if capacity["campaign_active"] < minimum_campaign_agents:
+    existing_reviewers = sum(
+        1 for item in review_agents.values() if item.get("exists") is True
+    )
+    if existing_reviewers != capacity["campaign_active_reviewers"]:
+        global_blockers.append("review-agent-count-contradicts-capacity")
+    if len(active) != capacity["campaign_active_workers"]:
         global_blockers.append("active-dispatch-count-contradicts-capacity")
 
     raw_candidates = snapshot.get("candidates")
@@ -412,25 +507,39 @@ def plan_wave(snapshot: dict[str, Any]) -> dict[str, Any]:
         item["verification_class"] in {"standard", "strict"}
         for item in [*base_ready, *active]
     )
-    review_slot_reserved = bool(
-        review_required
-        and isinstance(review_agent, dict)
-        and review_agent.get("exists") is False
+    missing_reviewers = [
+        axis
+        for axis in ("spec", "quality")
+        if review_agents.get(axis, {}).get("exists") is False
+    ]
+    review_pair_needed = review_required and bool(missing_reviewers)
+    if review_required:
+        for axis, item in review_agents.items():
+            if item["exists"] and not item["reusable"]:
+                global_blockers.append(f"{axis}-reviewer-not-reusable")
+    review_remaining = max(
+        0,
+        capacity["campaign_review_limit"]
+        - capacity["campaign_active_reviewers"],
     )
-    if (
-        review_required
-        and isinstance(review_agent, dict)
-        and review_agent.get("exists") is True
-        and review_agent.get("reusable") is False
-    ):
-        global_blockers.append("review-agent-not-reusable")
+    if review_required and len(missing_reviewers) > review_remaining:
+        global_blockers.append("review-capacity-insufficient")
     campaign_remaining = max(
         0, capacity["campaign_limit"] - capacity["campaign_active"]
     )
     global_remaining = max(0, capacity["global_limit"] - capacity["global_active"])
-    dispatch_slots = min(campaign_remaining, global_remaining)
-    if review_slot_reserved:
-        dispatch_slots = max(0, dispatch_slots - 1)
+    review_capacity_reservation = len(missing_reviewers) if review_required else 0
+    campaign_worker_capacity = max(
+        0, campaign_remaining - review_capacity_reservation
+    )
+    global_worker_capacity = max(0, global_remaining - review_capacity_reservation)
+    worker_remaining = max(
+        0,
+        capacity["campaign_worker_limit"] - capacity["campaign_active_workers"],
+    )
+    dispatch_slots = min(
+        worker_remaining, campaign_worker_capacity, global_worker_capacity
+    )
 
     dispatches: list[dict[str, Any]] = []
     claims: list[dict[str, Any]] = [*active, *external]
@@ -476,6 +585,23 @@ def plan_wave(snapshot: dict[str, Any]) -> dict[str, Any]:
                     "dispatch_id": item["dispatch_id"],
                     "attempt": item["attempt"],
                     "action": "claim-and-create-worker",
+                    "agent_name": f"Worker · #{item['issue']} · a{item['attempt']}",
+                    "workspace_title": f"WT · #{item['issue']} · {item['slug']}",
+                    "relationship": "subagent",
+                    "parent_agent_id": campaign_agent_id,
+                    "labels": {
+                        "repository": repository,
+                        "campaign_id": campaign_id,
+                        "dispatch_id": item["dispatch_id"],
+                        "role": "implementation",
+                        "issue": str(item["issue"]),
+                    },
+                    "expected_readback": {
+                        "agent_name": f"Worker · #{item['issue']} · a{item['attempt']}",
+                        "workspace_title": f"WT · #{item['issue']} · {item['slug']}",
+                        "relationship": "subagent",
+                        "parent_agent_id": campaign_agent_id,
+                    },
                     "hotset": item["hotset"],
                     "exclusive_scope": "repository"
                     if item["repository_wide"]
@@ -504,7 +630,12 @@ def plan_wave(snapshot: dict[str, Any]) -> dict[str, Any]:
         "slots": {
             "campaign_remaining": campaign_remaining,
             "global_remaining": global_remaining,
-            "review_slot_reserved": review_slot_reserved,
+            "campaign_worker_slots": worker_remaining,
+            "global_slots": global_remaining,
+            "review_slot_reserved": False,
+            "review_pair_needed": review_pair_needed,
+            "review_slots_available": review_remaining,
+            "review_global_slots_reserved": review_capacity_reservation,
             "dispatch_slots": dispatch_slots,
             "selected": len(dispatches) if not global_blockers else 0,
         },

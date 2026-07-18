@@ -43,6 +43,7 @@ def candidate(issue: int, **overrides):
         "verification_class": "fast",
         "attempt": 1,
         "contract_valid": True,
+        "slug": f"issue-{issue}",
     }
     payload.update(overrides)
     attempt = payload["attempt"]
@@ -75,11 +76,34 @@ def candidate(issue: int, **overrides):
     return payload
 
 
+def review_agent(axis: str, *, exists: bool, reusable: bool) -> dict:
+    return {
+        "axis": axis,
+        "exists": exists,
+        "reusable": reusable,
+        "agent_id": f"agent-{axis}-reviewer" if exists else None,
+        "parent_agent_id": "agent-campaign" if exists else None,
+        "relationship": "subagent" if exists else None,
+        "labels": (
+            {
+                "repository": "owner/repo",
+                "campaign_id": "campaign-20260718",
+                "role": "review",
+                "review_axis": axis,
+            }
+            if exists
+            else None
+        ),
+        "read_back": True,
+    }
+
+
 def snapshot(*candidates, **overrides):
     payload = {
         "schema_version": 1,
         "repository": "owner/repo",
         "campaign_id": "campaign-20260718",
+        "campaign_agent_id": "agent-campaign",
         "campaign_hotset": ["src"],
         "case_sensitive_paths": True,
         "control_plane": {
@@ -90,11 +114,18 @@ def snapshot(*candidates, **overrides):
         },
         "capacity": {
             "campaign_active_agents": 1,
-            "campaign_agent_limit": 4,
+            "campaign_agent_limit": 6,
+            "campaign_active_workers": 0,
+            "campaign_worker_limit": 3,
+            "campaign_active_reviewers": 0,
+            "campaign_review_limit": 2,
             "global_active_agents": 2,
-            "global_agent_limit": 8,
+            "global_agent_limit": 13,
         },
-        "review_agent": {"exists": False, "reusable": False},
+        "review_agents": {
+            "spec": review_agent("spec", exists=False, reusable=False),
+            "quality": review_agent("quality", exists=False, reusable=False),
+        },
         "candidates": list(candidates),
         "active_dispatches": [],
         "active_external_hotsets": {},
@@ -112,8 +143,11 @@ class CampaignSchedulerTests(unittest.TestCase):
         self.assertTrue(report["automatic_execution"])
         self.assertEqual([1, 2, 3], [item["issue"] for item in report["dispatches"]])
         self.assertEqual(3, report["slots"]["dispatch_slots"])
+        self.assertEqual("Worker · #1 · a1", report["dispatches"][0]["agent_name"])
+        self.assertEqual("WT · #1 · issue-1", report["dispatches"][0]["workspace_title"])
+        self.assertEqual("agent-campaign", report["dispatches"][0]["parent_agent_id"])
 
-    def test_standard_wave_reserves_one_review_slot(self) -> None:
+    def test_standard_wave_keeps_all_three_worker_slots(self) -> None:
         report = SCHEDULER.plan_wave(
             snapshot(
                 candidate(1, verification_class="standard"),
@@ -122,33 +156,101 @@ class CampaignSchedulerTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual([1, 2], [item["issue"] for item in report["dispatches"]])
-        self.assertTrue(report["slots"]["review_slot_reserved"])
-        self.assertEqual(
-            ["capacity-exhausted"],
-            next(item for item in report["deferred"] if item["issue"] == 3)["blockers"],
+        self.assertEqual([1, 2, 3], [item["issue"] for item in report["dispatches"]])
+        self.assertFalse(report["slots"]["review_slot_reserved"])
+        self.assertTrue(report["slots"]["review_pair_needed"])
+        self.assertEqual(2, report["slots"]["review_slots_available"])
+
+    def test_four_worker_slots_or_nonpair_review_capacity_fails_closed(self) -> None:
+        four_workers = SCHEDULER.plan_wave(
+            snapshot(
+                candidate(1),
+                capacity={
+                    "campaign_active_agents": 1,
+                    "campaign_agent_limit": 7,
+                    "campaign_active_workers": 0,
+                    "campaign_worker_limit": 4,
+                    "campaign_active_reviewers": 0,
+                    "campaign_review_limit": 2,
+                    "global_active_agents": 2,
+                    "global_agent_limit": 13,
+                },
+            )
+        )
+        one_reviewer = SCHEDULER.plan_wave(
+            snapshot(
+                candidate(1),
+                capacity={
+                    "campaign_active_agents": 1,
+                    "campaign_agent_limit": 5,
+                    "campaign_active_workers": 0,
+                    "campaign_worker_limit": 3,
+                    "campaign_active_reviewers": 0,
+                    "campaign_review_limit": 1,
+                    "global_active_agents": 2,
+                    "global_agent_limit": 13,
+                },
+            )
         )
 
-    def test_nonreusable_review_agent_blocks_instead_of_admitting_a_second(
+        self.assertEqual([], four_workers["dispatches"])
+        self.assertIn("worker-slot-limit-exceeded", four_workers["global_blockers"])
+        self.assertEqual([], one_reviewer["dispatches"])
+        self.assertIn("review-slot-limit-invalid", one_reviewer["global_blockers"])
+
+    def test_nonreusable_review_pair_member_blocks_instead_of_admitting_a_second(
         self,
     ) -> None:
         report = SCHEDULER.plan_wave(
             snapshot(
                 candidate(1, verification_class="standard"),
                 candidate(2, verification_class="standard"),
-                review_agent={"exists": True, "reusable": False},
+                review_agents={
+                    "spec": review_agent("spec", exists=True, reusable=False),
+                    "quality": review_agent("quality", exists=True, reusable=True),
+                },
                 capacity={
-                    "campaign_active_agents": 2,
-                    "campaign_agent_limit": 4,
-                    "global_active_agents": 3,
-                    "global_agent_limit": 8,
+                    "campaign_active_agents": 3,
+                    "campaign_agent_limit": 6,
+                    "campaign_active_workers": 0,
+                    "campaign_worker_limit": 3,
+                    "campaign_active_reviewers": 2,
+                    "campaign_review_limit": 2,
+                    "global_active_agents": 4,
+                    "global_agent_limit": 13,
                 },
             )
         )
 
         self.assertEqual([], report["dispatches"])
         self.assertFalse(report["slots"]["review_slot_reserved"])
-        self.assertIn("review-agent-not-reusable", report["global_blockers"])
+        self.assertIn("spec-reviewer-not-reusable", report["global_blockers"])
+
+    def test_review_agent_identity_must_be_read_back_for_this_campaign(self) -> None:
+        spec = review_agent("spec", exists=True, reusable=True)
+        spec["labels"]["campaign_id"] = "campaign-foreign"
+        report = SCHEDULER.plan_wave(
+            snapshot(
+                candidate(1, verification_class="standard"),
+                review_agents={
+                    "spec": spec,
+                    "quality": review_agent("quality", exists=False, reusable=False),
+                },
+                capacity={
+                    "campaign_active_agents": 2,
+                    "campaign_agent_limit": 6,
+                    "campaign_active_workers": 0,
+                    "campaign_worker_limit": 3,
+                    "campaign_active_reviewers": 1,
+                    "campaign_review_limit": 2,
+                    "global_active_agents": 3,
+                    "global_agent_limit": 13,
+                },
+            )
+        )
+
+        self.assertEqual([], report["dispatches"])
+        self.assertIn("spec-review-agent-identity-invalid", report["global_blockers"])
 
     def test_dependency_and_hotset_conflicts_defer_only_affected_issues(self) -> None:
         report = SCHEDULER.plan_wave(
@@ -337,9 +439,13 @@ class CampaignSchedulerTests(unittest.TestCase):
                 active_external_hotsets={"campaign-other": ["src/shared"]},
                 capacity={
                     "campaign_active_agents": 1,
-                    "campaign_agent_limit": 4,
+                    "campaign_agent_limit": 6,
+                    "campaign_active_workers": 0,
+                    "campaign_worker_limit": 3,
+                    "campaign_active_reviewers": 0,
+                    "campaign_review_limit": 2,
                     "global_active_agents": 3,
-                    "global_agent_limit": 8,
+                    "global_agent_limit": 13,
                 },
             )
         )
@@ -354,9 +460,13 @@ class CampaignSchedulerTests(unittest.TestCase):
                 active_external_hotsets={"campaign-other": ["docs"]},
                 capacity={
                     "campaign_active_agents": 1,
-                    "campaign_agent_limit": 4,
+                    "campaign_agent_limit": 6,
+                    "campaign_active_workers": 0,
+                    "campaign_worker_limit": 3,
+                    "campaign_active_reviewers": 0,
+                    "campaign_review_limit": 2,
                     "global_active_agents": 3,
-                    "global_agent_limit": 8,
+                    "global_agent_limit": 13,
                 },
             )
         )
@@ -378,7 +488,10 @@ class CampaignSchedulerTests(unittest.TestCase):
         missing_review_count = SCHEDULER.plan_wave(
             snapshot(
                 candidate(1),
-                review_agent={"exists": True, "reusable": True},
+                review_agents={
+                    "spec": review_agent("spec", exists=True, reusable=True),
+                    "quality": review_agent("quality", exists=False, reusable=False),
+                },
             )
         )
 
@@ -386,7 +499,7 @@ class CampaignSchedulerTests(unittest.TestCase):
         self.assertIn("repository-coordinator-conflict", duplicate["global_blockers"])
         self.assertEqual([], missing_review_count["dispatches"])
         self.assertIn(
-            "review-agent-missing-from-campaign-count",
+            "review-agent-count-contradicts-capacity",
             missing_review_count["global_blockers"],
         )
         self.assertIn(
@@ -398,7 +511,10 @@ class CampaignSchedulerTests(unittest.TestCase):
         report = SCHEDULER.plan_wave(
             snapshot(
                 candidate(8),
-                review_agent={"exists": True, "reusable": True},
+                review_agents={
+                    "spec": review_agent("spec", exists=True, reusable=True),
+                    "quality": review_agent("quality", exists=True, reusable=True),
+                },
                 active_dispatches=[
                     {
                         "issue": 7,
@@ -408,10 +524,14 @@ class CampaignSchedulerTests(unittest.TestCase):
                     }
                 ],
                 capacity={
-                    "campaign_active_agents": 2,
-                    "campaign_agent_limit": 4,
-                    "global_active_agents": 3,
-                    "global_agent_limit": 8,
+                    "campaign_active_agents": 4,
+                    "campaign_agent_limit": 6,
+                    "campaign_active_workers": 0,
+                    "campaign_worker_limit": 3,
+                    "campaign_active_reviewers": 2,
+                    "campaign_review_limit": 2,
+                    "global_active_agents": 5,
+                    "global_agent_limit": 13,
                 },
             )
         )
@@ -420,6 +540,84 @@ class CampaignSchedulerTests(unittest.TestCase):
             "active-dispatch-count-contradicts-capacity", report["global_blockers"]
         )
         self.assertEqual([], report["dispatches"])
+
+    def test_foreign_active_agents_reduce_actual_global_wave_capacity(self) -> None:
+        report = SCHEDULER.plan_wave(
+            snapshot(
+                candidate(1),
+                candidate(2),
+                candidate(3),
+                capacity={
+                    "campaign_active_agents": 1,
+                    "campaign_agent_limit": 6,
+                    "campaign_active_workers": 0,
+                    "campaign_worker_limit": 3,
+                    "campaign_active_reviewers": 0,
+                    "campaign_review_limit": 2,
+                    "global_active_agents": 12,
+                    "global_agent_limit": 13,
+                },
+            )
+        )
+
+        self.assertEqual([1], [item["issue"] for item in report["dispatches"]])
+        self.assertEqual(1, report["slots"]["global_slots"])
+
+    def test_standard_wave_preserves_global_capacity_for_missing_review_pair(self) -> None:
+        report = SCHEDULER.plan_wave(
+            snapshot(
+                candidate(1, verification_class="standard"),
+                candidate(2, verification_class="standard"),
+                candidate(3, verification_class="standard"),
+                capacity={
+                    "campaign_active_agents": 1,
+                    "campaign_agent_limit": 6,
+                    "campaign_active_workers": 0,
+                    "campaign_worker_limit": 3,
+                    "campaign_active_reviewers": 0,
+                    "campaign_review_limit": 2,
+                    "global_active_agents": 10,
+                    "global_agent_limit": 13,
+                },
+            )
+        )
+
+        self.assertEqual([1], [item["issue"] for item in report["dispatches"]])
+        self.assertEqual(2, report["slots"]["review_global_slots_reserved"])
+        self.assertEqual(1, report["slots"]["dispatch_slots"])
+
+    def test_two_full_campaigns_plus_coordinator_exactly_fill_global_default(self) -> None:
+        report = SCHEDULER.plan_wave(
+            snapshot(
+                candidate(7),
+                capacity={
+                    "campaign_active_agents": 6,
+                    "campaign_agent_limit": 6,
+                    "campaign_active_workers": 3,
+                    "campaign_worker_limit": 3,
+                    "campaign_active_reviewers": 2,
+                    "campaign_review_limit": 2,
+                    "global_active_agents": 13,
+                    "global_agent_limit": 13,
+                },
+                active_dispatches=[
+                    {
+                        "issue": issue,
+                        "dispatch_id": f"dispatch-issue-{issue}-a1",
+                        "hotset": [f"src/issue-{issue}"],
+                        "verification_class": "standard",
+                    }
+                    for issue in (1, 2, 3)
+                ],
+                review_agents={
+                    "spec": review_agent("spec", exists=True, reusable=True),
+                    "quality": review_agent("quality", exists=True, reusable=True),
+                },
+            )
+        )
+
+        self.assertEqual([], report["dispatches"])
+        self.assertEqual(0, report["slots"]["dispatch_slots"])
 
     def test_cli_reads_one_snapshot_and_emits_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -670,6 +868,51 @@ class CoordinatorLoopPolicyTests(unittest.TestCase):
         self.assertEqual(60, policy["wait_timeout_seconds"])
         self.assertEqual(300, policy["worker_heartbeat_target_seconds"])
         self.assertEqual(900, policy["worker_stale_after_seconds"])
+        self.assertEqual(6, policy["max_active_agents_per_campaign"])
+        self.assertEqual(3, policy["max_worker_slots_per_campaign"])
+        self.assertEqual(2, policy["max_review_slots_per_campaign"])
+        self.assertEqual(13, policy["max_active_agents_global"])
+
+    def test_capacity_config_must_fit_campaign_and_repository_control_planes(self) -> None:
+        with self.assertRaisesRegex(ValueError, "campaign capacity"):
+            LOOP.resolve_orchestration_config(
+                {
+                    "orchestration": {
+                        "max_active_agents_per_campaign": 5,
+                        "max_worker_slots_per_campaign": 3,
+                        "max_review_slots_per_campaign": 2,
+                    }
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "global capacity"):
+            LOOP.resolve_orchestration_config(
+                {
+                    "orchestration": {
+                        "max_active_agents_per_campaign": 6,
+                        "max_active_agents_global": 6,
+                    }
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "must not exceed 3"):
+            LOOP.resolve_orchestration_config(
+                {
+                    "orchestration": {
+                        "max_active_agents_per_campaign": 7,
+                        "max_worker_slots_per_campaign": 4,
+                        "max_review_slots_per_campaign": 2,
+                    }
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "must equal 2"):
+            LOOP.resolve_orchestration_config(
+                {
+                    "orchestration": {
+                        "max_active_agents_per_campaign": 5,
+                        "max_worker_slots_per_campaign": 3,
+                        "max_review_slots_per_campaign": 1,
+                    }
+                }
+            )
 
 
 if __name__ == "__main__":

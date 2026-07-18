@@ -7,6 +7,8 @@ description: Execute one assigned GitHub Issue as a provider-neutral Paseo Agent
 
 Own one Issue execution, worktree, `work/issue-...` branch, PR, and evidence
 trail. Do not claim another Issue, select a Provider, or spawn another work item.
+Do not invoke Provider-native Agent, Task, Swarm, or subagent features; GWO
+parentage contains Paseo Agents only.
 
 ## Accept one v3 contract
 
@@ -33,6 +35,9 @@ Stay inside the assigned hotset. Replay the room at safe checkpoints. Do not
 send prompts or mentions to busy Agents. Post one blocking `ASK` before durable
 architecture, compatibility, security/privacy, migration, or cross-Issue
 choices, then wait for a correlated `REPLY` after durable decision readback.
+Any direct user instruction first becomes `ASK`; act only after the Campaign
+classifies it as an in-contract clarification or completes a GitHub decision
+gate for expanded scope.
 
 Implement the smallest accepted change. Run targeted checks and the required
 suite/manual evidence. Do not run formal review.

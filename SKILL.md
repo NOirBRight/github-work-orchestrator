@@ -1,6 +1,6 @@
 ---
 name: github-work-orchestrator
-description: Orchestrate GitHub execution campaigns through provider-neutral Paseo Agents, campaign rooms, isolated worktrees, review, integration, recovery, and cleanup. Use when an agent must reconcile a GitHub frontier, dispatch implementation, coordinate cross-provider work, or arbitrate integration.
+description: Orchestrate GitHub execution campaigns through provider-neutral Paseo Agents, campaign workspaces, rooms, parallel Workers, dual-axis review, integration, recovery, and cleanup. Use when an agent must route repository work, reconcile a GitHub frontier, dispatch implementation, coordinate cross-provider work, or arbitrate integration.
 ---
 
 # Compatibility entry point

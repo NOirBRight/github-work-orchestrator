@@ -11,7 +11,10 @@ from typing import Any
 from contract_schema import (
     DEFAULT_COORDINATOR_WAIT_SECONDS,
     DEFAULT_MAX_ACTIVE_AGENTS_PER_CAMPAIGN,
+    DEFAULT_MAX_ACTIVE_AGENTS_GLOBAL,
     DEFAULT_MAX_DISPATCH_ATTEMPTS_PER_ISSUE,
+    DEFAULT_MAX_REVIEW_SLOTS_PER_CAMPAIGN,
+    DEFAULT_MAX_WORKER_SLOTS_PER_CAMPAIGN,
     DEFAULT_STALE_RECHECK_SECONDS,
     DEFAULT_WORKER_HEARTBEAT_SECONDS,
     DEFAULT_WORKER_STALE_SECONDS,
@@ -19,6 +22,9 @@ from contract_schema import (
 
 DEFAULTS = {
     "max_active_agents_per_campaign": DEFAULT_MAX_ACTIVE_AGENTS_PER_CAMPAIGN,
+    "max_worker_slots_per_campaign": DEFAULT_MAX_WORKER_SLOTS_PER_CAMPAIGN,
+    "max_review_slots_per_campaign": DEFAULT_MAX_REVIEW_SLOTS_PER_CAMPAIGN,
+    "max_active_agents_global": DEFAULT_MAX_ACTIVE_AGENTS_GLOBAL,
     "max_dispatch_attempts_per_issue": DEFAULT_MAX_DISPATCH_ATTEMPTS_PER_ISSUE,
     "wait_timeout_seconds": DEFAULT_COORDINATOR_WAIT_SECONDS,
     "worker_heartbeat_target_seconds": DEFAULT_WORKER_HEARTBEAT_SECONDS,
@@ -56,8 +62,34 @@ def resolve_orchestration_config(preferences: dict[str, Any]) -> dict[str, int]:
         > DEFAULT_MAX_DISPATCH_ATTEMPTS_PER_ISSUE
     ):
         raise ValueError("max_dispatch_attempts_per_issue must not exceed 3")
+    if (
+        resolved["max_worker_slots_per_campaign"]
+        > DEFAULT_MAX_WORKER_SLOTS_PER_CAMPAIGN
+    ):
+        raise ValueError("max_worker_slots_per_campaign must not exceed 3")
+    if (
+        resolved["max_review_slots_per_campaign"]
+        != DEFAULT_MAX_REVIEW_SLOTS_PER_CAMPAIGN
+    ):
+        raise ValueError("max_review_slots_per_campaign must equal 2")
     if resolved["wait_timeout_seconds"] > 60:
         raise ValueError("wait_timeout_seconds must not exceed 60")
+    required_campaign_capacity = (
+        1
+        + resolved["max_worker_slots_per_campaign"]
+        + resolved["max_review_slots_per_campaign"]
+    )
+    if resolved["max_active_agents_per_campaign"] < required_campaign_capacity:
+        raise ValueError(
+            "campaign capacity must fit one Campaign, all Worker slots, and all Review slots"
+        )
+    if (
+        resolved["max_active_agents_global"]
+        < 1 + resolved["max_active_agents_per_campaign"]
+    ):
+        raise ValueError(
+            "global capacity must fit one Repository Coordinator and one full Campaign"
+        )
     if resolved["worker_stale_after_seconds"] < DEFAULT_WORKER_STALE_SECONDS:
         raise ValueError("worker_stale_after_seconds must be at least 900")
     if resolved["stale_recheck_cooldown_seconds"] < DEFAULT_STALE_RECHECK_SECONDS:

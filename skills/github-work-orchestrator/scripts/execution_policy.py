@@ -149,6 +149,8 @@ def campaign_concurrency_report(
     pinned_dev_sha: str,
     current_dev_sha: str,
     case_sensitive_paths: bool | None = None,
+    integration_control_available: bool | None = None,
+    integration_control_clean: bool | None = None,
 ) -> dict[str, Any]:
     """Report parallel-execution and serialized-integration eligibility."""
 
@@ -178,6 +180,10 @@ def campaign_concurrency_report(
             raise ValueError(f"{name} must be lowercase 40-hex")
     if not isinstance(case_sensitive_paths, bool):
         raise ValueError("case_sensitive_paths readback must be boolean")
+    if not isinstance(integration_control_available, bool):
+        raise ValueError("integration_control_available readback must be boolean")
+    if not isinstance(integration_control_clean, bool):
+        raise ValueError("integration_control_clean readback must be boolean")
 
     normalized_requested_hotset = [
         normalize_hotset_entry(entry) for entry in requested_hotset
@@ -211,16 +217,34 @@ def campaign_concurrency_report(
         blockers.append("integration-lease-not-held")
     if dev_advanced:
         blockers.append("dev-advanced")
+    if not integration_control_available:
+        blockers.append("integration-control-worktree-unavailable")
+    elif not integration_control_clean:
+        blockers.append("integration-control-worktree-dirty")
     can_execute = not conflicting_campaigns
+    can_merge_dev = (
+        can_execute
+        and integration_lease_held
+        and not dev_advanced
+        and integration_control_available
+        and integration_control_clean
+    )
     return {
         "schema_version": 1,
         "campaign_id": campaign_id,
         "case_sensitive_paths": case_sensitive_paths,
         "can_execute": can_execute,
-        "can_merge_dev": can_execute and integration_lease_held and not dev_advanced,
+        "can_merge_dev": can_merge_dev,
+        "candidate_state": (
+            "BLOCKED" if not can_execute else "READY_TO_INTEGRATE" if can_merge_dev else "WAITING_INTEGRATION"
+        ),
         "integration_lease_available": not lease_held_by_other,
         "integration_lease_held": integration_lease_held,
         "requires_base_refresh": dev_advanced,
+        "integration_control_available": integration_control_available,
+        "integration_control_clean": integration_control_clean,
+        "preserve_user_wip": not integration_control_available or not integration_control_clean,
+        "recovery_actions": [],
         "conflicting_campaigns": conflicting_campaigns,
         "blockers": blockers,
     }
@@ -261,6 +285,32 @@ def _parser() -> argparse.ArgumentParser:
         const=True,
         dest="case_sensitive_paths",
     )
+    control_availability = concurrency.add_mutually_exclusive_group(required=True)
+    control_availability.add_argument(
+        "--integration-control-available",
+        action="store_const",
+        const=True,
+        dest="integration_control_available",
+    )
+    control_availability.add_argument(
+        "--integration-control-unavailable",
+        action="store_const",
+        const=False,
+        dest="integration_control_available",
+    )
+    control_cleanliness = concurrency.add_mutually_exclusive_group(required=True)
+    control_cleanliness.add_argument(
+        "--integration-control-clean",
+        action="store_const",
+        const=True,
+        dest="integration_control_clean",
+    )
+    control_cleanliness.add_argument(
+        "--integration-control-dirty",
+        action="store_const",
+        const=False,
+        dest="integration_control_clean",
+    )
     case_semantics.add_argument(
         "--case-insensitive-paths",
         action="store_const",
@@ -275,6 +325,14 @@ def _parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--seconds-since-event", type=int, required=True)
     cleanup.add_argument(
         "--execution-mode", choices=("inline", "paseo-agent"), required=True
+    )
+    cleanup.add_argument(
+        "--target-kind", choices=("worker", "campaign", "ephemeral"), required=True
+    )
+    cleanup.add_argument(
+        "--resource-kind",
+        choices=("issue-worktree", "campaign-control", "none"),
+        required=True,
     )
     cleanup.add_argument("--actor-agent-id", required=True)
     cleanup.add_argument("--actor-role", required=True)
@@ -292,6 +350,15 @@ def _parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--target-dispatch-id")
     cleanup.add_argument("--target-agent-idle", action="store_true")
     cleanup.add_argument("--target-agent-archived", action="store_true")
+    cleanup.add_argument("--campaign-control-expected", action="store_true")
+    cleanup.add_argument(
+        "--campaign-generation", choices=("v4.3", "legacy-v4.2")
+    )
+    cleanup.add_argument("--campaign-generation-read-back", action="store_true")
+    cleanup.add_argument("--target-lifecycle")
+    cleanup.add_argument("--target-labels-read-back", action="store_true")
+    cleanup.add_argument("--result-captured", action="store_true")
+    cleanup.add_argument("--result-captured-read-back", action="store_true")
     cleanup.add_argument("--target-worktree")
     cleanup.add_argument("--branch")
     cleanup.add_argument("--execution-repository")
@@ -301,6 +368,20 @@ def _parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--worktree-clean", action="store_true")
     cleanup.add_argument("--work-durable", action="store_true")
     cleanup.add_argument("--branch-merged", action="store_true")
+    cleanup.add_argument("--unique-commits", type=int, required=True)
+    cleanup.add_argument("--branch-local-only", action="store_true")
+    cleanup.add_argument("--remaining-child-agent-id", action="append", default=[])
+    cleanup.add_argument("--children-read-back", action="store_true")
+    cleanup.add_argument("--children-repository")
+    cleanup.add_argument("--children-campaign-id")
+    cleanup.add_argument(
+        "--children-scope", choices=("direct-subagent",)
+    )
+    cleanup.add_argument("--no-worktree-read-back", action="store_true")
+    cleanup.add_argument("--resource-identity-read-back", action="store_true")
+    cleanup.add_argument("--worktree-slug")
+    cleanup.add_argument("--resource-archived", action="store_true")
+    cleanup.add_argument("--branch-deleted", action="store_true")
     cleanup.add_argument("--agent-only", action="store_true")
     cleanup.add_argument("--terminal-event")
     cleanup.add_argument("--terminal-signal-id")
@@ -341,6 +422,8 @@ def main() -> int:
                 pinned_dev_sha=arguments.pinned_dev_sha,
                 current_dev_sha=arguments.current_dev_sha,
                 case_sensitive_paths=arguments.case_sensitive_paths,
+                integration_control_available=arguments.integration_control_available,
+                integration_control_clean=arguments.integration_control_clean,
             )
         else:
             target = None
@@ -355,6 +438,17 @@ def main() -> int:
                     "repository": arguments.target_repository,
                     "campaign_id": arguments.target_campaign_id,
                     "dispatch_id": arguments.target_dispatch_id,
+                    "campaign_control_expected": arguments.campaign_control_expected,
+                    "campaign_generation": arguments.campaign_generation,
+                    "campaign_generation_read_back": arguments.campaign_generation_read_back,
+                    "labels": (
+                        {"gwo.lifecycle": arguments.target_lifecycle}
+                        if arguments.target_lifecycle is not None
+                        else {}
+                    ),
+                    "labels_read_back": arguments.target_labels_read_back,
+                    "result_captured": arguments.result_captured,
+                    "result_captured_read_back": arguments.result_captured_read_back,
                 }
             report = cleanup_plan(
                 event=arguments.event,
@@ -370,6 +464,8 @@ def main() -> int:
                     "dispatch_id": arguments.actor_dispatch_id,
                 },
                 target=target,
+                target_kind=arguments.target_kind,
+                resource_kind=arguments.resource_kind,
                 execution={
                     "worktree": arguments.target_worktree,
                     "branch": arguments.branch,
@@ -378,6 +474,18 @@ def main() -> int:
                     "bound_agent_ids": arguments.worktree_agent_id,
                     "branch_merged": arguments.branch_merged,
                     "agent_only": arguments.agent_only,
+                    "unique_commits": arguments.unique_commits,
+                    "branch_local_only": arguments.branch_local_only,
+                    "remaining_child_agent_ids": arguments.remaining_child_agent_id,
+                    "children_read_back": arguments.children_read_back,
+                    "children_repository": arguments.children_repository,
+                    "children_campaign_id": arguments.children_campaign_id,
+                    "children_scope": arguments.children_scope,
+                    "no_worktree_read_back": arguments.no_worktree_read_back,
+                    "resource_identity_read_back": arguments.resource_identity_read_back,
+                    "worktree_slug": arguments.worktree_slug,
+                    "resource_archived": arguments.resource_archived,
+                    "branch_deleted": arguments.branch_deleted,
                     "repository": arguments.execution_repository,
                     "campaign_id": arguments.execution_campaign_id,
                     "dispatch_id": arguments.execution_dispatch_id,
