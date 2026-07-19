@@ -96,6 +96,6 @@ no actions. Missing, contradictory, active, dirty, shared, or foreign evidence
 fails closed without partial actions.
 
 Only `COMPLETED`/`STOPPED` can retire Worker-like targets, and only
-`CAMPAIGN_CLOSED` can retire a Campaign. HEARTBEAT, CHECKPOINT, WORKER_DONE, and
-REVIEW_RESULT are never terminal cleanup evidence. `CAMPAIGN_CLOSED` never
-targets the Coordinator.
+`CAMPAIGN_CLOSED` can retire a Campaign. HEARTBEAT, CHECKPOINT, WORKER_DONE,
+REVIEW_RESULT, DELIVERY_WAKE, and DELIVERY_ACK are never terminal cleanup
+evidence. `CAMPAIGN_CLOSED` never targets the Coordinator.

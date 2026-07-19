@@ -33,9 +33,13 @@ The Agent must post `AGENT_READY` after room and repository preflight. Publish
 Room events are replayable coordination, while GitHub/Git/Paseo state supplies
 authorization evidence.
 
-Do not send a follow-up to a busy Agent. When idle, wake the same Agent with a
-pointer to the exact room message UUID. Create a successor only after terminal
-proof, durable WIP, and released ownership.
+Publish addressed results with `paseo_room.py post-material` under
+`worker-dispatch` with compiled identity receipts, then use
+`material_delivery.py delivery-plan`. Do not send a
+follow-up to a busy Agent. When idle, send only the returned Room/Signal/UUID
+pointer, post `DELIVERY_WAKE` after Paseo accepts it, and wait until the Campaign
+posts `DELIVERY_ACK`. Create a successor only after terminal proof, durable WIP,
+and released ownership. ACK is receipt only, not candidate verification.
 
 The Worker posts HEARTBEAT only at safe boundaries, with a five-minute target
 during long phases. A long command may miss the target. It posts WORKER_DONE,

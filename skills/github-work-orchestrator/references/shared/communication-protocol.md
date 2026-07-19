@@ -137,28 +137,65 @@ The chat message UUID is a publish receipt. It proves that the daemon stored a
 message, not that the claimed author or evidence is true. Re-read Agent state,
 GitHub, Git, the worktree, and verification evidence before acting.
 
-## Delivery and wake-up
+## Material delivery and wake-up
 
-1. Publish the complete event to the campaign room.
-2. Consumers replay the bounded room and deduplicate by `signal_id`.
-3. Use `chat wait` for at most 60 seconds; after every wake or timeout, replay
-   the room so the CLI read/wait race cannot lose an event.
-4. Do not mention or send a prompt to a busy Agent. A prompt may replace its
-   active run. Record the work in the room and let the Agent read it at its next
-   safe checkpoint.
-5. When the target is verified idle, `send_agent_prompt` may point it to the
-   exact room message UUID. The room remains the authoritative communication.
+Every explicitly addressed event except `PROGRESS`, `HEARTBEAT`,
+`DELIVERY_WAKE`, and `DELIVERY_ACK` uses the mandatory Material Delivery
+transaction. Do not end a terminal Worker/Reviewer/Campaign handoff merely
+because `chat post` returned a UUID.
+Do not mention or send a prompt to a busy Agent.
 
-An ordinary wait timeout causes only room replay. Do not poll a running Agent.
-A full Agent/timeline inspection is allowed after 15 minutes without a valid
-runtime signal, after a finish/permission notification, or during explicit
-restart recovery. A stale signal alone never authorizes cancel, replacement,
-archive, merge, or cleanup.
+1. Publish through `paseo_room.py post-material` with the exact identity-plan
+   authority scope and `--identity-receipts <compiled-json-file>`. Publication
+   fails before writing unless the sender, recipient, direct relationship, and
+   authority scope match those receipts. Its output contains the publish UUID
+   and normalized pending `delivery` object. Plain `post` remains for visibility
+   and delivery-control events.
+2. Add fresh sender and recipient Paseo readbacks to that object and run
+   `material_delivery.py delivery-plan`. Self, sibling, foreign, archived,
+   wrong-scope, unverified, or non-direct relationships fail closed.
+3. If the exact recipient is idle, execute the returned `send-signal-only`
+   action once. The prompt has only `GWO_WAKE room=<room> signal=<signal-id>
+   message=<uuid>`; it contains no evidence or task prompt. After Paseo accepts
+   the send, run `wake-receipt-plan` and post the deterministic
+   `DELIVERY_WAKE` event.
+4. If the recipient is running or initializing, do not send a prompt. Wait for
+   an ACK with `chat wait` for at most 60 seconds, replay, then read only that
+   exact recipient's status and re-run `delivery-plan`. This narrow delivery
+   readback is not Worker polling and never inspects the timeline. Never prompt
+   a running Agent.
+5. After the recipient identity-verifies and replays the source event, it runs
+   `ack-plan` and posts `DELIVERY_ACK` before processing the source. The sender
+   replays until the delivery state is `acknowledged`; ACK means accepted into
+   reconciliation, not that the requested work is finished.
+
+`DELIVERY_WAKE` and `DELIVERY_ACK` are deterministic, correlated by source
+Signal-ID, publish UUID, sender/recipient, authority scope, and delivery digest.
+Exact retries deduplicate. Invalid delivery metadata is rejected separately
+and cannot poison the valid business event or Dispatch. Neither event changes
+GitHub state, proves liveness, authorizes merge, or counts as cleanup terminal
+evidence. `delivery-plan` rejects a caller-claimed `wake-sent` or
+`acknowledged` state unless replay supplied the matching deterministic Signal-ID
+and Room message UUID.
+
+A `wake-sent` delivery whose recipient becomes idle again without ACK is
+protected with `wake-unacknowledged-recipient-idle` and escalated; GWO does not
+spam a second prompt. A crash between the
+native send and Wake Receipt can cause an at-least-once retry, but the source
+Signal-ID makes repeated consumption idempotent. Finish notifications remain
+best-effort accelerators only.
+
+Outside one pending Material Delivery, an ordinary wait timeout causes only
+room replay. Do not poll a running Agent. A full Agent/timeline inspection is
+allowed after 15 minutes without a valid runtime signal, after a
+finish/permission notification, or during explicit restart recovery. A stale
+signal alone never authorizes cancel, replacement, archive, merge, or cleanup.
 
 ## Event states
 
 Use material states plus the bounded coordination events `HEARTBEAT`, `ASK`,
-`REPLY`, `DECISION_GATE`, `WORKER_DONE`, and `ESCALATION`.
+`REPLY`, `DECISION_GATE`, `WORKER_DONE`, and `ESCALATION`. `DELIVERY_WAKE` and
+`DELIVERY_ACK` are transport receipts, not lifecycle states.
 
 `HEARTBEAT` is a Worker-to-Campaign-Orchestrator liveness signal, not
 Orchestrator polling. Post one at safe phase boundaries and, during a long

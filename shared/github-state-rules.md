@@ -91,6 +91,9 @@ ledgers. Verify chat author against Paseo identity/parentage/labels and GitHub/G
 evidence. Reconcile on lost callback/restart; continue exact idle Agents,
 preserve active/ambiguous WIP, and create successors only after terminal proof.
 Silence and HEARTBEAT never authorize completion, replacement, or cleanup.
+An addressed Campaign Room event is not delivered until its exact recipient
+posts `DELIVERY_ACK`. Wake and ACK receipts are transport metadata only and
+cannot replace GitHub/Git/Paseo verification.
 
 ## Typed cleanup
 

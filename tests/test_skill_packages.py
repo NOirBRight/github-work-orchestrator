@@ -37,9 +37,11 @@ class SkillPackageTests(unittest.TestCase):
                 self.assertTrue((skill / "SKILL.md").is_file())
                 self.assertTrue((skill / ".skill-package.json").is_file())
                 self.assertTrue((skill / "scripts" / "paseo_room.py").is_file())
+                self.assertTrue(
+                    (skill / "scripts" / "material_delivery.py").is_file()
+                )
 
     def test_shared_references_and_room_runtime_are_synchronized(self) -> None:
-        canonical_room = ROOT / "skills/github-work-orchestrator/scripts/paseo_room.py"
         for name, filenames in SYNC.PACKAGES.items():
             shared = ROOT / "skills" / name / "references" / "shared"
             self.assertEqual(set(filenames), {path.name for path in shared.glob("*.md")})
@@ -48,10 +50,12 @@ class SkillPackageTests(unittest.TestCase):
                     (ROOT / "shared" / filename).read_bytes(),
                     (shared / filename).read_bytes(),
                 )
-            self.assertEqual(
-                canonical_room.read_bytes(),
-                (ROOT / "skills" / name / "scripts" / "paseo_room.py").read_bytes(),
-            )
+            for runtime in SYNC.RUNTIME_SCRIPTS:
+                canonical = ROOT / "skills/github-work-orchestrator/scripts" / runtime
+                self.assertEqual(
+                    canonical.read_bytes(),
+                    (ROOT / "skills" / name / "scripts" / runtime).read_bytes(),
+                )
 
     def test_sync_check_accepts_committed_packages(self) -> None:
         self.assertEqual([], SYNC.find_drift(ROOT))
@@ -67,7 +71,7 @@ class SkillPackageTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
     def test_package_manifests_pin_version_and_content_digest(self) -> None:
-        self.assertEqual("4.3.0", SYNC.PACKAGE_VERSION)
+        self.assertEqual("4.3.1", SYNC.PACKAGE_VERSION)
         for name in SKILLS:
             package = ROOT / "skills" / name
             manifest = json.loads(
@@ -151,6 +155,31 @@ class SkillPackageTests(unittest.TestCase):
         ):
             self.assertIn(phrase, normalized)
         self.assertIn("not that the claimed author or evidence is true", normalized)
+
+    def test_material_delivery_requires_wake_receipt_and_recipient_ack(self) -> None:
+        protocol = (ROOT / "shared/communication-protocol.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = " ".join(protocol.split()).lower()
+        for phrase in (
+            "paseo_room.py post-material",
+            "material_delivery.py delivery-plan",
+            "delivery_wake",
+            "delivery_ack",
+            "wake-unacknowledged",
+            "cannot poison the valid business event",
+            "never prompt a running agent",
+        ):
+            self.assertIn(phrase, normalized)
+        for skill in SKILLS:
+            packaged = ROOT / "skills" / skill / "scripts" / "material_delivery.py"
+            self.assertTrue(packaged.is_file())
+        cleanup = (
+            ROOT
+            / "skills/github-work-orchestrator/references/cleanup-safety-policy.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("DELIVERY_WAKE", cleanup)
+        self.assertIn("DELIVERY_ACK", cleanup)
 
     def test_provider_selection_is_role_based_and_fail_closed(self) -> None:
         orchestrator = (ROOT / "skills/github-work-orchestrator/SKILL.md").read_text(
@@ -289,7 +318,7 @@ class SkillPackageTests(unittest.TestCase):
         for phrase in (
             "worker_done",
             "never authorizes completion",
-            "heartbeat, checkpoint, worker_done, and review_result are never terminal cleanup evidence",
+            "heartbeat, checkpoint, worker_done, review_result, delivery_wake, and delivery_ack are never terminal cleanup evidence",
             "event=merged",
             "branch_merged: true",
         ):

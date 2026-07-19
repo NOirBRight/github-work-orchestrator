@@ -21,7 +21,8 @@ ADMIT_CAMPAIGNS -> WAIT_CAMPAIGNS -> INTEGRATE -> CLOSE`.
    consecutively without waiting for an earlier Campaign. Each keeps its own
    Provider Binding.
 5. **WAIT_CAMPAIGNS** — wait for room, finish, permission, or operator events.
-   Do not poll or prompt busy Campaigns.
+   Campaign material events remain pending until this Coordinator posts
+   `DELIVERY_ACK`. Do not poll or prompt busy Campaigns.
 6. **INTEGRATE** — order verified-ready candidates by durable timestamp then
    Campaign ID and grant one Integration Lease. A dirty/missing Integration
    Control Worktree leaves candidates `WAITING_INTEGRATION`; preserve user WIP.
@@ -49,6 +50,9 @@ VERIFY_RESULTS -> REVIEW -> RETURN_CANDIDATE`.
    they declare `worker-dispatch` authority plus `--consumer-role worker`, so
    formal Review results stay in the Campaign consumer view. Campaign
    reconciliation is unscoped. Normal timeout does not inspect running Agents.
+   For one pending Material Delivery only, replay after the ACK wait, re-read
+   that exact sender/recipient pair, and run `material_delivery.py
+   delivery-plan`; this does not authorize general Agent polling.
 6. Verify every `WORKER_DONE` against Agent/Git/worktree/GitHub/contract facts.
 7. Run `review_policy.py plan-review` with fresh read-backed Campaign/global
    capacity. Fast stays inline; standard/strict uses the reusable independent
@@ -58,6 +62,30 @@ VERIFY_RESULTS -> REVIEW -> RETURN_CANDIDATE`.
    room results.
 8. Return the fully verified candidate to the Coordinator. Waiting for the
    Integration Lease does not block other disjoint implementation.
+
+## Material Delivery loop
+
+Use the same loop at all four supervision boundaries: Coordinator→Campaign,
+Campaign→Worker/Reviewer, Worker/Reviewer→Campaign, and Campaign→Coordinator.
+
+1. Publish the addressed business event with `paseo_room.py post-material` and
+   its identity-plan authority scope and compiled identity receipts.
+2. Run `material_delivery.py delivery-plan` with the returned publish receipt
+   and fresh direct-relative Agent readbacks.
+3. Send only the returned `GWO_WAKE` prompt when the recipient is idle. Record
+   an accepted send using `wake-receipt-plan` and plain Room `post`.
+4. A running/initializing recipient is not prompted. The sender performs a
+   bounded Room wait, replays, re-reads that exact recipient status, and
+   re-plans.
+5. The recipient posts `ack-plan` output immediately after identity-verified
+   replay. It then records the source Signal-ID in the next CHECKPOINT and
+   reconciles the business event.
+6. `wake-sent` followed by an idle recipient without ACK is protected and
+   escalated; never create a replacement or resend automatically.
+
+`DELIVERY_WAKE` and `DELIVERY_ACK` are transport receipts. They cannot satisfy
+verification, integration, terminal, or cleanup gates, and a malformed receipt
+cannot block the source Dispatch.
 
 ## Wave rules
 

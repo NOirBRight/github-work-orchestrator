@@ -158,12 +158,29 @@ fields or infer control scope from an ID. Workers always replay/wait with
 lifecycle, sibling history, and Campaign-owned Review results cannot block
 activation or review-fix work. Campaign reconciliation remains unscoped.
 
+Every addressed material event uses the packaged delivery transaction. Publish
+with `paseo_room.py post-material --authority-scope <scope>
+--identity-receipts <compiled-json-file>`, combine its
+`delivery` output with fresh exact sender/recipient readbacks, then run
+`material_delivery.py delivery-plan`. Execute only the returned action: send
+the exact signal-only prompt to an idle recipient, or wait without prompting a
+running/initializing recipient. After an accepted send, post the deterministic
+`DELIVERY_WAKE` from `wake-receipt-plan`. The recipient posts the deterministic
+`DELIVERY_ACK` from `ack-plan` immediately after identity-verified replay and
+before processing. A terminal sender does not claim successful handoff before
+ACK. Invalid delivery metadata never poisons its business event; Wake/ACK never
+authorizes completion, merge, cleanup, or replacement.
+
 HEARTBEAT is Worker-to-Campaign liveness at safe boundaries with a five-minute
 target. It is not Coordinator polling, completion, merge, or cleanup evidence.
 Wait through `chat wait` for at most 60 seconds. Ordinary timeout only replays
 the room. At 15 minutes without START/PROGRESS/HEARTBEAT, inspect once; silence
 never authorizes cancel, archive, or replacement. Prompt an idle non-terminal
 Agent once, never a busy Agent.
+The only shorter status readback is for one already-pending Material Delivery:
+after its bounded ACK wait, re-read that exact recipient and re-plan. If a
+recorded wake returns idle without ACK, protect and escalate instead of sending
+again.
 
 A Worker receiving direct user instructions first posts `ASK`. A clarification
 inside its contract may receive correlated `REPLY`; scope, architecture, Hotset,

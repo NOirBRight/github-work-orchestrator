@@ -45,6 +45,12 @@ events, or conflicting Signal-IDs block the Dispatch. The Campaign may report a
 verdict only when both axes are complete; either `fail` returns to the original
 Worker.
 
+Each Reviewer publishes `REVIEW_RESULT` through `post-material` with
+`review-dispatch` authority and runs the shared Material Delivery handshake.
+The Campaign posts `DELIVERY_ACK` after verified replay, before aggregating the
+axis. Wake/ACK metadata never counts as either review axis and cannot complete a
+pair.
+
 Before dispatching the pair, the Campaign persists and reads back a
 `campaign-verified-candidate` lock receipt. Pass those receipts to room
 replay/wait with `--review-locks`; matching Reviewer claims cannot self-authorize

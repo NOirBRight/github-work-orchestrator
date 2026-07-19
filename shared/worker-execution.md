@@ -71,9 +71,15 @@ after `WORKER_DONE`, `BLOCKED`, or `STOPPED`.
 ## Publication
 
 Commit and push the assigned branch, open/update the PR against `dev`, and post
-`PR_OPENED` followed by `WORKER_DONE` with exact evidence. The Orchestrator
-verifies room, Agent, Git, GitHub, and test state before it posts
-`READY_FOR_REVIEW` or `COMPLETED` and before any merge.
+`PR_OPENED` followed by `WORKER_DONE` with exact evidence. Publish each through
+`paseo_room.py post-material --authority-scope worker-dispatch
+--identity-receipts <compiled-json-file>`, then run the
+packaged `material_delivery.py delivery-plan`. Wake only an idle Campaign using
+the exact returned signal-only action, post `DELIVERY_WAKE` after an accepted
+send, and remain in bounded room waits until the Campaign identity-verifies the
+source and posts `DELIVERY_ACK`. A busy Campaign receives no prompt. ACK proves
+receipt only; the Orchestrator still verifies room, Agent, Git, GitHub, and test
+state before it posts `READY_FOR_REVIEW` or `COMPLETED` and before any merge.
 
 The high-autonomy mode prevents routine prompts. If a Provider still requests
 permission, pause without retrying: Paseo notifies the parent. The parent may

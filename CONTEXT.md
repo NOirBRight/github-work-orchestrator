@@ -95,6 +95,24 @@ lifecycle events before identity lookup. Full unscoped replay remains a
 Campaign responsibility.
 _Avoid_: Incomplete Campaign reconciliation, sender filtering after rejection
 
+**Material Delivery**:
+The GWO transaction that carries one explicitly addressed, durable Campaign
+Room event from its publish UUID through an idle-only signal wake to a
+recipient-authored Delivery ACK. Progress and Heartbeat events do not enter it.
+_Avoid_: Finish callback, mention, unacknowledged room post
+
+**Wake Receipt**:
+The non-authoritative `DELIVERY_WAKE` room record written after Paseo accepts a
+signal-only wake. It prevents unlimited retries and never proves the recipient
+processed the source event.
+_Avoid_: Completion receipt, Agent liveness
+
+**Delivery ACK**:
+The non-authoritative `DELIVERY_ACK` written by the exact recipient after an
+identity-verified replay of the source message. It proves receipt, not business
+completion, merge, or cleanup eligibility.
+_Avoid_: Result evidence, terminal receipt
+
 **Cleanup Guard**:
 The GWO-owned policy that authorizes exact cleanup actions from observed Paseo,
 Git, and worktree evidence without requiring host or runtime source changes.

@@ -40,6 +40,11 @@ Plan all eligible Workers together, up to three dedicated Worker slots. A
 finish notification accelerates wake only. `chat wait` is bounded to 60 seconds;
 timeout replays without polling. HEARTBEAT changes visibility only. Fifteen
 minutes of silence permits one inspection, never cancellation/replacement.
+Every addressed material transition uses `post-material` and remains pending
+until the exact recipient posts `DELIVERY_ACK`. During that handshake only, the
+sender may re-read the one recipient after a bounded ACK wait; it never prompts
+a running Agent. `DELIVERY_WAKE`/`DELIVERY_ACK` do not advance these lifecycle
+states.
 
 ## Parentage and direct messages
 

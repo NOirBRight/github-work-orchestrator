@@ -39,6 +39,7 @@ CONTRACT = load_module("validate_execution_contract")
 POLICY = load_module("execution_policy")
 PROVIDERS = load_module("provider_policy")
 ROOM = load_module("paseo_room")
+MATERIAL = load_module("material_delivery")
 PREFLIGHT = load_module("preflight", WORKER_SCRIPTS)
 
 
@@ -884,25 +885,30 @@ class ExecutionPolicyTests(unittest.TestCase):
                 root,
                 target_overrides={"campaign_id": "campaign-other"},
             )
-            heartbeat = cleanup_report(
-                root,
-                execution_overrides={
-                    "terminal_receipt": {
-                        "event_type": "HEARTBEAT",
-                        "signal_id": "heartbeat-7",
-                        "sender_agent_id": "agent-worker-7",
-                        "repository": "owner/repo",
-                        "campaign_id": "campaign-20260718",
-                        "dispatch_id": "dispatch-issue-7",
-                        "read_back": True,
-                    }
-                },
-            )
+            invalid_terminal_reports = []
+            for event_type in ("HEARTBEAT", "DELIVERY_WAKE", "DELIVERY_ACK"):
+                invalid_terminal_reports.append(
+                    cleanup_report(
+                        root,
+                        execution_overrides={
+                            "terminal_receipt": {
+                                "event_type": event_type,
+                                "signal_id": f"{event_type.lower()}-7",
+                                "sender_agent_id": "agent-worker-7",
+                                "repository": "owner/repo",
+                                "campaign_id": "campaign-20260718",
+                                "dispatch_id": "dispatch-issue-7",
+                                "read_back": True,
+                            }
+                        },
+                    )
+                )
 
         self.assertIn("terminal-receipt-missing", missing["blockers"])
         self.assertIn("cleanup-identity-mismatch", mismatch["blockers"])
-        self.assertIn("terminal-receipt-invalid", heartbeat["blockers"])
-        for report in (missing, mismatch, heartbeat):
+        for report in invalid_terminal_reports:
+            self.assertIn("terminal-receipt-invalid", report["blockers"])
+        for report in (missing, mismatch, *invalid_terminal_reports):
             self.assertEqual("protected", report["status"])
             self.assertEqual([], report["actions"])
 
@@ -2319,11 +2325,454 @@ class PaseoRoomProtocolTests(unittest.TestCase):
         self.assertEqual("agent-worker-7", preflight["agent_id"])
         self.assertEqual("message-1", receipt["message_id"])
 
+    def test_post_material_returns_delivery_snapshot_from_publish_receipt(self) -> None:
+        material = event(
+            event_type="WORKER_DONE",
+            signal_id="worker-done-material-post-1",
+            evidence={
+                "head_sha": "a" * 40,
+                "verification": ["pytest: passed"],
+                "changed_paths": ["src/policy.py"],
+                "pr": "https://example.test/pr/7",
+            },
+            next_action="return candidate",
+        )
+
+        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "agent-worker-7"}):
+            receipt = self.protocol.post_material(
+                "gwo-campaign-20260718",
+                material,
+                authority_scope="worker-dispatch",
+                identity_receipts=[
+                    identity_receipt(),
+                    identity_receipt(
+                        agent_id="agent-orchestrator",
+                        role="orchestrator",
+                        parent_agent_id="agent-repository-coordinator",
+                    ),
+                ],
+            )
+
+        self.assertEqual("message-1", receipt["message_id"])
+        self.assertEqual(
+            {
+                "state": "pending",
+                "room": "gwo-campaign-20260718",
+                "event_type": "WORKER_DONE",
+                "signal_id": "worker-done-material-post-1",
+                "message_id": "message-1",
+                "dispatch_id": "dispatch-issue-7",
+                "issue": "#7",
+                "sender_agent_id": "agent-worker-7",
+                "recipient_agent_id": "agent-orchestrator",
+                "authority_scope": "worker-dispatch",
+                "identity_verified": True,
+            },
+            receipt["delivery"],
+        )
+
+    def test_post_material_requires_compiled_identity_receipts_before_publish(self) -> None:
+        material = event()
+
+        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "agent-worker-7"}):
+            with self.assertRaisesRegex(ROOM.RoomProtocolError, "identity receipts"):
+                self.protocol.post_material(
+                    "gwo-campaign-20260718",
+                    material,
+                    authority_scope="worker-dispatch",
+                )
+
+        self.assertEqual([], self.runner.messages)
+
+    def test_post_material_requires_runtime_agent_identity_before_publish(self) -> None:
+        receipts = [
+            identity_receipt(),
+            identity_receipt(
+                agent_id="agent-orchestrator",
+                role="orchestrator",
+                parent_agent_id="agent-repository-coordinator",
+            ),
+        ]
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ROOM.RoomProtocolError, "PASEO_AGENT_ID"):
+                self.protocol.post_material(
+                    "gwo-campaign-20260718",
+                    event(),
+                    authority_scope="worker-dispatch",
+                    identity_receipts=receipts,
+                )
+
+        self.assertEqual([], self.runner.messages)
+
+    def test_campaign_completed_material_uses_control_authority_to_root(self) -> None:
+        campaign = identity_receipt(
+            agent_id="agent-orchestrator",
+            role="orchestrator",
+            parent_agent_id="agent-repository-coordinator",
+            authority_kind="campaign-control",
+        )
+        root = identity_receipt(
+            agent_id="agent-repository-coordinator",
+            role="repository-coordinator",
+            parent_agent_id=None,
+            relationship="root",
+        )
+        completed = event(
+            signal_id="campaign-completed-upward-1",
+            event_type="COMPLETED",
+            sender_agent_id="agent-orchestrator",
+            recipient_agent_id="agent-repository-coordinator",
+            evidence="candidate verified and ready for integration",
+            next_action="request integration lease",
+        )
+
+        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "agent-orchestrator"}):
+            receipt = self.protocol.post_material(
+                "gwo-campaign-20260718",
+                completed,
+                authority_scope="campaign-control",
+                identity_receipts=[campaign, root],
+            )
+
+        self.assertEqual("campaign-control", receipt["delivery"]["authority_scope"])
+        self.assertEqual(
+            "agent-repository-coordinator",
+            receipt["delivery"]["recipient_agent_id"],
+        )
+
+    def test_post_material_rejects_a_non_relative_recipient_before_publish(self) -> None:
+        material = event(recipient_agent_id="agent-sibling")
+        receipts = [
+            identity_receipt(),
+            identity_receipt(
+                agent_id="agent-orchestrator",
+                role="orchestrator",
+                parent_agent_id="agent-repository-coordinator",
+            ),
+        ]
+
+        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "agent-worker-7"}):
+            with self.assertRaisesRegex(ROOM.RoomProtocolError, "recipient"):
+                self.protocol.post_material(
+                    "gwo-campaign-20260718",
+                    material,
+                    authority_scope="worker-dispatch",
+                    identity_receipts=receipts,
+                )
+
+        self.assertEqual([], self.runner.messages)
+
+    def test_post_material_rejects_visibility_and_recipientless_events(self) -> None:
+        heartbeat = event(
+            event_type="HEARTBEAT",
+            evidence={
+                "phase": "implementation",
+                "last_completed_step": "updated policy",
+                "next_step": "run tests",
+                "head_sha": None,
+                "worktree_dirty": True,
+                "blocking": False,
+            },
+        )
+        recipientless = event(recipient_agent_id=None)
+
+        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "agent-worker-7"}):
+            with self.assertRaisesRegex(ROOM.RoomProtocolError, "does not require"):
+                self.protocol.post_material(
+                    "gwo-campaign-20260718",
+                    heartbeat,
+                    authority_scope="worker-dispatch",
+                )
+            with self.assertRaisesRegex(ROOM.RoomProtocolError, "requires recipient"):
+                self.protocol.post_material(
+                    "gwo-campaign-20260718",
+                    recipientless,
+                    authority_scope="worker-dispatch",
+                )
+        self.assertEqual([], self.runner.messages)
+
     def test_sender_identity_mismatch_fails_before_publish(self) -> None:
         with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "other-agent"}):
             with self.assertRaisesRegex(ROOM.RoomProtocolError, "does not match"):
                 self.protocol.post("gwo-campaign-20260718", event())
         self.assertEqual([], self.runner.messages)
+
+    def test_material_delivery_replay_separates_business_event_and_ack_state(self) -> None:
+        source_message_id = "33333333-3333-4333-8333-333333333331"
+        source = event(
+            signal_id="worker-done-delivery-1",
+            sequence=1,
+            event_type="WORKER_DONE",
+            evidence={
+                "head_sha": "a" * 40,
+                "verification": ["pytest: passed"],
+                "changed_paths": ["src/policy.py"],
+                "pr": "https://example.test/pr/7",
+            },
+            next_action="return candidate",
+        )
+        snapshot = {
+            "schema_version": 1,
+            "repository": "owner/repo",
+            "campaign_id": "campaign-20260718",
+            "delivery": {
+                "state": "pending",
+                "room": "gwo-campaign-20260718",
+                "event_type": "WORKER_DONE",
+                "signal_id": source["signal_id"],
+                "message_id": source_message_id,
+                "dispatch_id": source["dispatch_id"],
+                "issue": source["issue"],
+                "sender_agent_id": source["sender_agent_id"],
+                "recipient_agent_id": source["recipient_agent_id"],
+                "authority_scope": "worker-dispatch",
+                "identity_verified": True,
+            },
+            "sender": {
+                "agent_id": "agent-worker-7",
+                "status": "running",
+                "archived": False,
+                "parent_agent_id": "agent-orchestrator",
+                "relationship": "subagent",
+                "labels": {
+                    "repository": "owner/repo",
+                    "campaign_id": "campaign-20260718",
+                    "dispatch_id": "dispatch-issue-7",
+                    "role": "implementation",
+                },
+                "read_back": True,
+            },
+            "recipient": {
+                "agent_id": "agent-orchestrator",
+                "status": "idle",
+                "archived": False,
+                "parent_agent_id": "agent-repository-coordinator",
+                "relationship": "subagent",
+                "labels": {
+                    "repository": "owner/repo",
+                    "campaign_id": "campaign-20260718",
+                    "role": "orchestrator",
+                },
+                "read_back": True,
+            },
+        }
+        snapshot["next_sequence"] = 2
+        snapshot["wake_result"] = {
+            "agent_id": "agent-orchestrator",
+            "accepted": True,
+        }
+        wake = MATERIAL.wake_receipt_event_plan(snapshot)["event"]
+        snapshot["next_sequence"] = 1
+        ack = MATERIAL.ack_event_plan(snapshot)["event"]
+        for message_id, payload, author in (
+            (source_message_id, source, "agent-worker-7"),
+            ("33333333-3333-4333-8333-333333333332", wake, "agent-worker-7"),
+            ("33333333-3333-4333-8333-333333333333", ack, "agent-orchestrator"),
+        ):
+            self.runner.messages.append(
+                {"id": message_id, "body": json.dumps(payload), "author": author}
+            )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=[
+                identity_receipt(),
+                identity_receipt(
+                    agent_id="agent-orchestrator",
+                    role="orchestrator",
+                    parent_agent_id="agent-repository-coordinator",
+                ),
+            ],
+        )
+
+        self.assertEqual(["WORKER_DONE"], [item["event_type"] for item in replay["events"]])
+        self.assertEqual(
+            ["DELIVERY_WAKE", "DELIVERY_ACK"],
+            [item["event_type"] for item in replay["delivery_events"]],
+        )
+        self.assertEqual("acknowledged", replay["deliveries"][0]["state"])
+        self.assertEqual(source_message_id, replay["deliveries"][0]["message_id"])
+        self.assertEqual([], replay["blocked_dispatches"])
+
+    def test_repository_coordinator_start_delivery_is_acked_by_campaign(self) -> None:
+        root_id = "agent-repository-coordinator"
+        campaign_id = "agent-orchestrator"
+        source_message_id = "44444444-4444-4444-8444-444444444441"
+        source = event(
+            signal_id="campaign-start-delivery-1",
+            sequence=1,
+            event_type="START",
+            sender_agent_id=root_id,
+            recipient_agent_id=campaign_id,
+            evidence="campaign admission read back",
+            next_action="start campaign reconciliation",
+        )
+        snapshot = {
+            "schema_version": 1,
+            "repository": "owner/repo",
+            "campaign_id": "campaign-20260718",
+            "delivery": {
+                "state": "pending",
+                "room": "gwo-campaign-20260718",
+                "event_type": "START",
+                "signal_id": source["signal_id"],
+                "message_id": source_message_id,
+                "dispatch_id": source["dispatch_id"],
+                "issue": source["issue"],
+                "sender_agent_id": root_id,
+                "recipient_agent_id": campaign_id,
+                "authority_scope": "campaign-admission",
+                "identity_verified": True,
+            },
+            "sender": {
+                "agent_id": root_id,
+                "status": "running",
+                "archived": False,
+                "parent_agent_id": None,
+                "relationship": "root",
+                "labels": {
+                    "repository": "owner/repo",
+                    "role": "repository-coordinator",
+                },
+                "read_back": True,
+            },
+            "recipient": {
+                "agent_id": campaign_id,
+                "status": "idle",
+                "archived": False,
+                "parent_agent_id": root_id,
+                "relationship": "subagent",
+                "labels": {
+                    "repository": "owner/repo",
+                    "campaign_id": "campaign-20260718",
+                    "role": "orchestrator",
+                },
+                "read_back": True,
+            },
+        }
+        snapshot["next_sequence"] = 2
+        snapshot["wake_result"] = {"agent_id": campaign_id, "accepted": True}
+        wake = MATERIAL.wake_receipt_event_plan(snapshot)["event"]
+        snapshot["next_sequence"] = 1
+        ack = MATERIAL.ack_event_plan(snapshot)["event"]
+        for message_id, payload, author in (
+            (source_message_id, source, root_id),
+            ("44444444-4444-4444-8444-444444444442", wake, root_id),
+            ("44444444-4444-4444-8444-444444444443", ack, campaign_id),
+        ):
+            self.runner.messages.append(
+                {"id": message_id, "body": json.dumps(payload), "author": author}
+            )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=[
+                identity_receipt(
+                    agent_id=root_id,
+                    role="repository-coordinator",
+                    parent_agent_id=None,
+                    relationship="root",
+                ),
+                identity_receipt(
+                    agent_id=campaign_id,
+                    role="orchestrator",
+                    parent_agent_id=root_id,
+                    authority_kind="campaign-control",
+                ),
+            ],
+        )
+
+        self.assertEqual("acknowledged", replay["deliveries"][0]["state"])
+        self.assertEqual([], replay["blocked_dispatches"])
+        self.assertEqual([], replay["rejected"])
+
+    def test_invalid_delivery_receipt_does_not_poison_valid_business_event(self) -> None:
+        source_message_id = "66666666-6666-4666-8666-666666666661"
+        source = event(
+            signal_id="worker-done-nonpoison-1",
+            event_type="WORKER_DONE",
+            evidence={
+                "head_sha": "a" * 40,
+                "verification": ["pytest: passed"],
+                "changed_paths": ["src/policy.py"],
+                "pr": "https://example.test/pr/7",
+            },
+        )
+        snapshot = {
+            "schema_version": 1,
+            "repository": "owner/repo",
+            "campaign_id": "campaign-20260718",
+            "delivery": {
+                "state": "pending",
+                "room": "gwo-campaign-20260718",
+                "event_type": "WORKER_DONE",
+                "signal_id": source["signal_id"],
+                "message_id": source_message_id,
+                "dispatch_id": source["dispatch_id"],
+                "issue": source["issue"],
+                "sender_agent_id": source["sender_agent_id"],
+                "recipient_agent_id": source["recipient_agent_id"],
+                "authority_scope": "worker-dispatch",
+                "identity_verified": True,
+            },
+            "sender": {
+                "agent_id": "agent-worker-7",
+                "status": "running",
+                "archived": False,
+                "parent_agent_id": "agent-orchestrator",
+                "relationship": "subagent",
+                "labels": {
+                    "repository": "owner/repo",
+                    "campaign_id": "campaign-20260718",
+                    "dispatch_id": "dispatch-issue-7",
+                    "role": "implementation",
+                },
+                "read_back": True,
+            },
+            "recipient": {
+                "agent_id": "agent-orchestrator",
+                "status": "idle",
+                "archived": False,
+                "parent_agent_id": "agent-repository-coordinator",
+                "relationship": "subagent",
+                "labels": {
+                    "repository": "owner/repo",
+                    "campaign_id": "campaign-20260718",
+                    "role": "orchestrator",
+                },
+                "read_back": True,
+            },
+            "next_sequence": 1,
+        }
+        forged_ack = MATERIAL.ack_event_plan(snapshot)["event"]
+        forged_ack["evidence"]["source_message_id"] = (
+            "66666666-6666-4666-8666-666666666669"
+        )
+        for message_id, payload, author in (
+            (source_message_id, source, "agent-worker-7"),
+            ("66666666-6666-4666-8666-666666666662", forged_ack, "agent-orchestrator"),
+        ):
+            self.runner.messages.append(
+                {"id": message_id, "body": json.dumps(payload), "author": author}
+            )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=[
+                identity_receipt(),
+                identity_receipt(
+                    agent_id="agent-orchestrator",
+                    role="orchestrator",
+                    parent_agent_id="agent-repository-coordinator",
+                ),
+            ],
+        )
+
+        self.assertEqual(["WORKER_DONE"], [item["event_type"] for item in replay["events"]])
+        self.assertEqual("pending", replay["deliveries"][0]["state"])
+        self.assertEqual([], replay["blocked_dispatches"])
+        self.assertEqual("delivery-correlation-invalid", replay["rejected"][0]["reason"])
 
     def test_missing_runtime_agent_identity_fails_before_publish(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -2349,6 +2798,7 @@ class PaseoRoomProtocolTests(unittest.TestCase):
             "gwo-campaign-20260718", identity_receipts=[identity_receipt()]
         )
         self.assertEqual([], replay["events"])
+        self.assertEqual([], replay["deliveries"])
         self.assertEqual(["dispatch-issue-7"], replay["blocked_dispatches"])
         self.assertEqual(
             ["duplicate-signal-conflict", "event-must-be-object"],

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -36,16 +37,30 @@ EVENT_TYPES = {
     "STOPPED",
     "CHECKPOINT",
     "CAMPAIGN_CLOSED",
+    "DELIVERY_WAKE",
+    "DELIVERY_ACK",
 }
 CAMPAIGN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{5,63}$")
 REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+MESSAGE_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+DELIVERY_ID_RE = re.compile(r"^delivery-[0-9a-f]{24}$")
 TIMEOUT_RE = re.compile(r"^([1-9][0-9]*)(ms|s|m)$")
 HEARTBEAT_PHASES = {"analysis", "implementation", "verification", "review-fix"}
 REVIEW_AXES = {"spec", "quality"}
 WORKER_TERMINAL_EVENTS = {"WORKER_DONE", "BLOCKED", "STOPPED"}
+DELIVERY_CONTROL_EVENTS = {"DELIVERY_WAKE", "DELIVERY_ACK"}
+DELIVERY_VISIBILITY_ONLY_EVENTS = {"PROGRESS", "HEARTBEAT"}
+DELIVERY_AUTHORITY_SCOPES = {
+    "worker-dispatch",
+    "review-dispatch",
+    "campaign-control",
+    "campaign-admission",
+}
 AGENT_ROLES = {
     "repository-coordinator",
     "orchestrator",
@@ -77,6 +92,8 @@ EVENT_ALLOWED_ROLES = {
     "STOPPED": AGENT_ROLES,
     "CHECKPOINT": COORDINATOR_ROLES,
     "CAMPAIGN_CLOSED": {"orchestrator"},
+    "DELIVERY_WAKE": AGENT_ROLES,
+    "DELIVERY_ACK": AGENT_ROLES,
 }
 CAMPAIGN_CONTROL_EVENTS = {"CAMPAIGN_OPENED", "CHECKPOINT", "CAMPAIGN_CLOSED"}
 
@@ -287,6 +304,58 @@ def validate_event(payload: Any) -> list[str]:
             or evidence["attempts"] < 1
         ):
             errors.append("invalid-escalation-evidence")
+    elif event_type in DELIVERY_CONTROL_EVENTS:
+        base_fields = {
+            "delivery_id",
+            "source_message_id",
+            "source_signal_id",
+            "source_sender_agent_id",
+            "source_recipient_agent_id",
+            "authority_scope",
+        }
+        expected_fields = (
+            base_fields | {"outcome"}
+            if event_type == "DELIVERY_WAKE"
+            else base_fields
+        )
+        valid = bool(
+            isinstance(evidence, dict)
+            and set(evidence) == expected_fields
+            and isinstance(evidence.get("delivery_id"), str)
+            and DELIVERY_ID_RE.fullmatch(evidence["delivery_id"])
+            and isinstance(evidence.get("source_message_id"), str)
+            and MESSAGE_UUID_RE.fullmatch(evidence["source_message_id"])
+            and isinstance(evidence.get("source_signal_id"), str)
+            and IDENTIFIER_RE.fullmatch(evidence["source_signal_id"])
+            and isinstance(evidence.get("source_sender_agent_id"), str)
+            and IDENTIFIER_RE.fullmatch(evidence["source_sender_agent_id"])
+            and isinstance(evidence.get("source_recipient_agent_id"), str)
+            and IDENTIFIER_RE.fullmatch(evidence["source_recipient_agent_id"])
+            and evidence.get("authority_scope") in DELIVERY_AUTHORITY_SCOPES
+            and evidence.get("source_signal_id") == in_reply_to
+            and recipient is not None
+        )
+        if valid and event_type == "DELIVERY_WAKE":
+            valid = bool(
+                evidence.get("outcome") == "sent"
+                and payload.get("signal_id")
+                == "delivery-wake-"
+                + evidence["delivery_id"].removeprefix("delivery-")
+                and evidence.get("source_sender_agent_id")
+                == payload.get("sender_agent_id")
+                and evidence.get("source_recipient_agent_id") == recipient
+            )
+        elif valid:
+            valid = bool(
+                payload.get("signal_id")
+                == "delivery-ack-"
+                + evidence["delivery_id"].removeprefix("delivery-")
+                and evidence.get("source_sender_agent_id") == recipient
+                and evidence.get("source_recipient_agent_id")
+                == payload.get("sender_agent_id")
+            )
+        if not valid:
+            errors.append("invalid-delivery-control-evidence")
     return sorted(set(errors))
 
 
@@ -828,6 +897,154 @@ def _review_lock_from_event(event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _delivery_authority_scope(receipt: dict[str, Any]) -> str | None:
+    role = receipt.get("role")
+    authority = receipt.get("authority")
+    kind = authority.get("kind") if isinstance(authority, dict) else None
+    if role == "review" and kind == "reusable-reviewer":
+        return "review-dispatch"
+    if role in WORKER_ROLES and kind == "dispatch-owner":
+        return "worker-dispatch"
+    if role == "repository-coordinator" and kind == "admitted-campaign":
+        return "campaign-admission"
+    if role == "orchestrator" and kind == "campaign-control":
+        return "campaign-control"
+    if role == "orchestrator" and kind == "direct-child-dispatch":
+        subjects = authority.get("subjects")
+        if not isinstance(subjects, list):
+            subject_labels = authority.get("subject_labels")
+            subjects = [{"labels": subject_labels}]
+        subject_roles = {
+            item.get("labels", {}).get("role")
+            for item in subjects
+            if isinstance(item, dict) and isinstance(item.get("labels"), dict)
+        }
+        if subject_roles and subject_roles <= {"review"}:
+            return "review-dispatch"
+        if subject_roles and not (subject_roles & {"review"}):
+            return "worker-dispatch"
+    return None
+
+
+def _authority_subject_ids(receipt: dict[str, Any]) -> set[str]:
+    authority = receipt.get("authority")
+    if not isinstance(authority, dict) or authority.get("read_back") is not True:
+        return set()
+    subjects = authority.get("subjects")
+    if isinstance(subjects, list):
+        return {
+            item["agent_id"]
+            for item in subjects
+            if isinstance(item, dict) and isinstance(item.get("agent_id"), str)
+        }
+    subject = authority.get("subject_agent_id")
+    return {subject} if isinstance(subject, str) and subject else set()
+
+
+def _material_recipient_errors(
+    event: dict[str, Any],
+    sender: dict[str, Any],
+    receipt_lookup: dict[tuple[str, str, str], dict[str, Any]],
+    authority_scope: str,
+) -> list[str]:
+    recipient_id = event.get("recipient_agent_id")
+    recipient = receipt_lookup.get(
+        (recipient_id, event["campaign_id"], event["dispatch_id"])
+    )
+    if recipient is None:
+        return ["material-recipient-identity-receipt-missing"]
+    if recipient.get("read_back") is not True:
+        return ["material-recipient-identity-not-read-back"]
+    sender_role = sender.get("role")
+    recipient_role = recipient.get("role")
+    repository = sender.get("labels", {}).get("repository")
+    if recipient.get("labels", {}).get("repository") != repository:
+        return ["material-recipient-repository-mismatch"]
+
+    valid = False
+    if authority_scope in {"worker-dispatch", "review-dispatch"}:
+        if sender_role == "orchestrator":
+            valid = bool(
+                recipient_id in _authority_subject_ids(sender)
+                and recipient.get("parent_agent_id") == sender.get("agent_id")
+                and recipient.get("relationship") == "subagent"
+            )
+        else:
+            valid = bool(
+                recipient_id == sender.get("parent_agent_id")
+                and recipient_role == "orchestrator"
+                and recipient.get("relationship") == "subagent"
+                and sender.get("agent_id") in _authority_subject_ids(recipient)
+            )
+    elif sender_role == "repository-coordinator":
+        valid = bool(
+            recipient_role == "orchestrator"
+            and recipient_id in _authority_subject_ids(sender)
+            and recipient.get("parent_agent_id") == sender.get("agent_id")
+            and recipient.get("relationship") == "subagent"
+        )
+    elif sender_role == "orchestrator":
+        valid = bool(
+            recipient_role == "repository-coordinator"
+            and recipient_id == sender.get("parent_agent_id")
+            and recipient.get("relationship") == "root"
+            and recipient.get("parent_agent_id") is None
+            and sender.get("agent_id") in _authority_subject_ids(recipient)
+        )
+    return [] if valid else ["material-recipient-not-direct-relative"]
+
+
+def _delivery_id(payload: dict[str, Any]) -> str:
+    identity = {
+        field: payload.get(field)
+        for field in (
+            "room",
+            "message_id",
+            "signal_id",
+            "sender_agent_id",
+            "recipient_agent_id",
+            "authority_scope",
+        )
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return f"delivery-{digest[:24]}"
+
+
+def _material_delivery(
+    room: str,
+    event: dict[str, Any],
+    message_id: Any,
+    receipt: dict[str, Any],
+) -> dict[str, Any] | None:
+    recipient = event.get("recipient_agent_id")
+    if (
+        not isinstance(recipient, str)
+        or event["event_type"] in DELIVERY_CONTROL_EVENTS
+        or event["event_type"] in DELIVERY_VISIBILITY_ONLY_EVENTS
+    ):
+        return None
+    authority_scope = _delivery_authority_scope(receipt)
+    if authority_scope is None:
+        return None
+    delivery = {
+        "state": "pending",
+        "room": room,
+        "event_type": event["event_type"],
+        "signal_id": event["signal_id"],
+        "message_id": str(message_id),
+        "dispatch_id": event["dispatch_id"],
+        "issue": event["issue"],
+        "sender_agent_id": event["sender_agent_id"],
+        "recipient_agent_id": recipient,
+        "authority_scope": authority_scope,
+        "identity_verified": True,
+    }
+    delivery["delivery_id"] = _delivery_id(delivery)
+    return delivery
+
+
 def _identity_receipt_errors(
     event: dict[str, Any],
     message_author: Any,
@@ -912,7 +1129,17 @@ def _identity_receipt_errors(
             expected_authority = "reusable-reviewer"
         elif role in WORKER_ROLES:
             expected_authority = "dispatch-owner"
-        elif role == "orchestrator" and event["event_type"] in CAMPAIGN_CONTROL_EVENTS:
+        elif role == "orchestrator" and event["event_type"] in DELIVERY_CONTROL_EVENTS:
+            scope = event.get("evidence", {}).get("authority_scope")
+            expected_authority = (
+                "campaign-control"
+                if scope in {"campaign-control", "campaign-admission"}
+                else "direct-child-dispatch"
+            )
+        elif role == "orchestrator" and (
+            event["event_type"] in CAMPAIGN_CONTROL_EVENTS
+            or authority.get("kind") == "campaign-control"
+        ):
             expected_authority = "campaign-control"
         elif role == "orchestrator":
             expected_authority = "direct-child-dispatch"
@@ -1160,6 +1387,86 @@ class PaseoRoom:
             raise RoomProtocolError("chat post did not return a message UUID")
         return {"room": room, "message_id": message_id, "signal_id": event["signal_id"]}
 
+    def post_material(
+        self,
+        room: str,
+        event: dict[str, Any],
+        *,
+        authority_scope: str,
+        identity_receipts: Sequence[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if authority_scope not in DELIVERY_AUTHORITY_SCOPES:
+            raise RoomProtocolError("material delivery authority scope is invalid")
+        errors = validate_event(event)
+        if errors:
+            raise RoomProtocolError("invalid room event: " + ", ".join(errors))
+        if room != room_name(event["campaign_id"]):
+            raise RoomProtocolError("room does not match campaign_id")
+        if event.get("event_type") in (
+            DELIVERY_CONTROL_EVENTS | DELIVERY_VISIBILITY_ONLY_EVENTS
+        ):
+            raise RoomProtocolError("event type does not require material delivery")
+        recipient = event.get("recipient_agent_id")
+        if not isinstance(recipient, str) or not IDENTIFIER_RE.fullmatch(recipient):
+            raise RoomProtocolError("material event requires recipient_agent_id")
+        if not identity_receipts:
+            raise RoomProtocolError("material post requires compiled identity receipts")
+        receipt_lookup = _identity_receipt_lookup(identity_receipts)
+        receipt = receipt_lookup.get(
+            (
+                event.get("sender_agent_id"),
+                event.get("campaign_id"),
+                event.get("dispatch_id"),
+            )
+        )
+        runtime_agent_id = os.environ.get("PASEO_AGENT_ID", "").strip()
+        if not runtime_agent_id:
+            raise RoomProtocolError(
+                "PASEO_AGENT_ID is required for material Agent-authored events"
+            )
+        if event.get("sender_agent_id") != runtime_agent_id:
+            raise RoomProtocolError(
+                "material sender_agent_id does not match PASEO_AGENT_ID"
+            )
+        identity_errors = _identity_receipt_errors(
+            event, runtime_agent_id, receipt, receipt_lookup
+        )
+        if not identity_errors and receipt is not None:
+            identity_errors.extend(_event_authority_errors(event, receipt))
+        if identity_errors:
+            raise RoomProtocolError(
+                "material post identity receipts are invalid: "
+                + ", ".join(identity_errors)
+            )
+        if receipt is None or _delivery_authority_scope(receipt) != authority_scope:
+            raise RoomProtocolError(
+                "material post authority scope does not match identity receipts"
+            )
+        recipient_errors = _material_recipient_errors(
+            event, receipt, receipt_lookup, authority_scope
+        )
+        if recipient_errors:
+            raise RoomProtocolError(
+                "material post recipient identity receipts are invalid: "
+                + ", ".join(recipient_errors)
+            )
+        receipt = self.post(room, event)
+        return receipt | {
+            "delivery": {
+                "state": "pending",
+                "room": room,
+                "event_type": event["event_type"],
+                "signal_id": event["signal_id"],
+                "message_id": receipt["message_id"],
+                "dispatch_id": event["dispatch_id"],
+                "issue": event["issue"],
+                "sender_agent_id": event["sender_agent_id"],
+                "recipient_agent_id": recipient,
+                "authority_scope": authority_scope,
+                "identity_verified": True,
+            }
+        }
+
     def replay(
         self,
         room: str,
@@ -1197,6 +1504,9 @@ class PaseoRoom:
         blocked_dispatches: set[str] = set()
         asks: dict[str, dict[str, Any]] = {}
         review_rounds: dict[tuple[str, int], dict[str, Any]] = {}
+        source_events: dict[str, dict[str, Any]] = {}
+        deliveries: dict[str, dict[str, Any]] = {}
+        delivery_events: list[dict[str, Any]] = []
         for message in payload:
             message_id = (
                 message.get("id", "unknown") if isinstance(message, dict) else "unknown"
@@ -1240,7 +1550,8 @@ class PaseoRoom:
             if not identity_errors and receipt is not None:
                 identity_errors.extend(_event_authority_errors(event, receipt))
             if identity_errors:
-                blocked_dispatches.add(event["dispatch_id"])
+                if event.get("event_type") not in DELIVERY_CONTROL_EVENTS:
+                    blocked_dispatches.add(event["dispatch_id"])
                 rejected.append(
                     _rejection(message_id, ",".join(identity_errors), event)
                 )
@@ -1249,16 +1560,18 @@ class PaseoRoom:
             signal_id = event["signal_id"]
             if signal_id in seen:
                 if seen[signal_id] != canonical:
-                    blocked_dispatches.update(
-                        {event["dispatch_id"], seen_dispatches[signal_id]}
-                    )
+                    if event["event_type"] not in DELIVERY_CONTROL_EVENTS:
+                        blocked_dispatches.update(
+                            {event["dispatch_id"], seen_dispatches[signal_id]}
+                        )
                     rejected.append(
                         _rejection(message_id, "duplicate-signal-conflict", event)
                     )
                 continue
             sequence_key = (event["sender_agent_id"], event["dispatch_id"])
             if event["sequence"] <= last_sequence.get(sequence_key, -1):
-                blocked_dispatches.add(event["dispatch_id"])
+                if event["event_type"] not in DELIVERY_CONTROL_EVENTS:
+                    blocked_dispatches.add(event["dispatch_id"])
                 rejected.append(_rejection(message_id, "nonmonotonic-sequence", event))
                 continue
             if (
@@ -1283,6 +1596,64 @@ class PaseoRoom:
                         _rejection(message_id, "reply-correlation-invalid", event)
                     )
                     continue
+            if event["event_type"] in DELIVERY_CONTROL_EVENTS:
+                source = source_events.get(event["in_reply_to"])
+                delivery = deliveries.get(event["in_reply_to"])
+                evidence = event["evidence"]
+                correlation_valid = bool(
+                    source is not None
+                    and delivery is not None
+                    and evidence["source_message_id"] == source["message_id"]
+                    and evidence["source_signal_id"] == source["signal_id"]
+                    and evidence["source_sender_agent_id"]
+                    == source["sender_agent_id"]
+                    and evidence["source_recipient_agent_id"]
+                    == source.get("recipient_agent_id")
+                    and evidence["authority_scope"] == delivery["authority_scope"]
+                    and evidence["delivery_id"] == delivery["delivery_id"]
+                )
+                if not correlation_valid:
+                    rejected.append(
+                        _rejection(message_id, "delivery-correlation-invalid", event)
+                    )
+                    continue
+                if event["event_type"] == "DELIVERY_WAKE":
+                    if delivery["state"] != "pending":
+                        rejected.append(
+                            _rejection(
+                                message_id, "delivery-wake-state-invalid", event
+                            )
+                        )
+                        continue
+                    delivery.update(
+                        {
+                            "state": "wake-sent",
+                            "wake_signal_id": event["signal_id"],
+                            "wake_message_id": str(message_id),
+                        }
+                    )
+                else:
+                    if delivery["state"] == "acknowledged":
+                        rejected.append(
+                            _rejection(
+                                message_id, "delivery-ack-state-invalid", event
+                            )
+                        )
+                        continue
+                    delivery.update(
+                        {
+                            "state": "acknowledged",
+                            "ack_signal_id": event["signal_id"],
+                            "ack_message_id": str(message_id),
+                        }
+                    )
+                seen[signal_id] = canonical
+                seen_dispatches[signal_id] = event["dispatch_id"]
+                last_sequence[sequence_key] = event["sequence"]
+                delivery_events.append(
+                    event | {"message_id": str(message_id), "identity_verified": True}
+                )
+                continue
             if event["event_type"] == "REVIEW_RESULT":
                 evidence = event["evidence"]
                 authorized = review_lock_lookup.get(
@@ -1345,11 +1716,27 @@ class PaseoRoom:
                 terminal_dispatches.add(event["dispatch_id"])
             if event["event_type"] == "ASK":
                 asks[signal_id] = event
-            events.append(
-                event | {"message_id": str(message_id), "identity_verified": True}
-            )
+            accepted_event = event | {
+                "message_id": str(message_id),
+                "identity_verified": True,
+            }
+            events.append(accepted_event)
+            source_events[signal_id] = accepted_event
+            delivery = _material_delivery(room, event, message_id, receipt)
+            if delivery is not None:
+                deliveries[signal_id] = delivery
         actionable_events = [
             event for event in events if event["dispatch_id"] not in blocked_dispatches
+        ]
+        actionable_delivery_events = [
+            event
+            for event in delivery_events
+            if event["dispatch_id"] not in blocked_dispatches
+        ]
+        actionable_deliveries = [
+            delivery
+            for delivery in deliveries.values()
+            if delivery["dispatch_id"] not in blocked_dispatches
         ]
         review_pairs: dict[str, dict[str, Any]] = {}
         for (dispatch_id, review_round), state in sorted(review_rounds.items()):
@@ -1380,6 +1767,8 @@ class PaseoRoom:
             "rejected": rejected,
             "blocked_dispatches": sorted(blocked_dispatches),
             "review_pairs": review_pairs,
+            "delivery_events": actionable_delivery_events,
+            "deliveries": actionable_deliveries,
         }
 
     def wait(
@@ -1451,6 +1840,13 @@ def _parser() -> argparse.ArgumentParser:
     post = subparsers.add_parser("post")
     post.add_argument("--room", required=True)
     post.add_argument("--input", type=Path)
+    post_material = subparsers.add_parser("post-material")
+    post_material.add_argument("--room", required=True)
+    post_material.add_argument("--input", type=Path)
+    post_material.add_argument(
+        "--authority-scope", choices=sorted(DELIVERY_AUTHORITY_SCOPES), required=True
+    )
+    post_material.add_argument("--identity-receipts", type=Path, required=True)
     identity_plan = subparsers.add_parser("identity-plan")
     identity_plan.add_argument("--snapshot", type=Path, required=True)
     identity_plan.add_argument("--receipts-output", type=Path, required=True)
@@ -1491,6 +1887,15 @@ def main() -> int:
             )
         elif arguments.command == "post":
             result = protocol.post(arguments.room, _read_event(arguments.input))
+        elif arguments.command == "post-material":
+            result = protocol.post_material(
+                arguments.room,
+                _read_event(arguments.input),
+                authority_scope=arguments.authority_scope,
+                identity_receipts=_read_identity_receipts(
+                    arguments.identity_receipts
+                ),
+            )
         elif arguments.command == "identity-plan":
             result = identity_receipt_plan(
                 json.loads(arguments.snapshot.read_text(encoding="utf-8"))

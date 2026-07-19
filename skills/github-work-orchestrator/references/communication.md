@@ -16,6 +16,13 @@ Finish notification and mention delivery are best effort and may be lost across
 restart. A chat message is durable but its claimed author is not authentication.
 Never infer terminal state from age, silence, or a missing UI row.
 
+For a new addressed material event, use `post-material` plus
+`material_delivery.py`. A pending source, accepted `DELIVERY_WAKE`, and exact
+recipient `DELIVERY_ACK` are separately replayable. Recovery resumes that state
+machine: pending+idle wakes once, pending+running waits, wake-sent+running waits
+for ACK, and wake-sent+idle is protected/escalated. Do not reinterpret Wake or
+ACK as completion evidence.
+
 HEARTBEAT is a Worker room event, not Coordinator polling. A normal 60-second
 `chat wait` timeout causes room replay only. At 15 minutes without a valid
 runtime signal, use `coordinator_loop.py` for one state/timeline inspection; do

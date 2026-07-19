@@ -35,5 +35,10 @@ state, and URL after every create/update.
 
 When a campaign room is supplied, pass the packaged room preflight and post one
 material `COMPLETED`, `DISCUSSION_REQUIRED`, or `BLOCKED` event with validated
-Issue evidence. Do not use mention delivery as proof. Without a room, return the
-same concise result to the caller; GitHub remains the durable record.
+Issue evidence through `paseo_room.py post-material` with `worker-dispatch`
+authority and the compiled identity receipts. Run the packaged
+`material_delivery.py`, wake only an idle Campaign
+with the returned signal-only token, record `DELIVERY_WAKE`, and wait for
+`DELIVERY_ACK`. Do not use mention, finish notification, Wake, or ACK as Issue
+proof. Without a room, return the same concise result to the caller; GitHub
+remains the durable record.

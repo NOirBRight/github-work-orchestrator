@@ -50,8 +50,13 @@ HEARTBEAT is liveness only and stops after a terminal event.
 
 Commit and push the assigned branch, open/update the PR against `dev`, then post
 `PR_OPENED` and `WORKER_DONE` with commit, changed paths, checks, timings, scope
-delta, blockers, and next action. The Campaign Orchestrator alone verifies and
-posts `READY_FOR_REVIEW` or `COMPLETED`.
+delta, blockers, and next action through `paseo_room.py post-material` with
+`worker-dispatch` authority and the compiled identity receipts. Run the packaged
+`material_delivery.py`: prompt an
+idle Campaign only with the returned Room/Signal/UUID token, record
+`DELIVERY_WAKE` after an accepted send, and wait for the Campaign's
+`DELIVERY_ACK`. Never prompt a busy Campaign. The Campaign Orchestrator alone
+verifies and posts `READY_FOR_REVIEW` or `COMPLETED`; ACK is receipt only.
 
 On failure, preserve useful WIP, post `BLOCKED` or `STOPPED`, and leave Agent,
 branch, and worktree intact. Never merge, close/reprioritize the Issue, reset,
