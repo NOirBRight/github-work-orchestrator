@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by 0007
 ---
 
 # Keep cleanup authorization inside GWO

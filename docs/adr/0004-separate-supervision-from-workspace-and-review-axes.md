@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by 0007
 ---
 
 # Separate Paseo supervision from Workspace visibility and review axes
