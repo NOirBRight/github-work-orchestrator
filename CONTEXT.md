@@ -1,119 +1,111 @@
 # GitHub Work Orchestration
 
-This context coordinates concurrent GitHub execution while keeping repository
-ownership, campaign ownership, and runtime parentage unambiguous.
+This context defines the language of a lightweight, repository-scoped harness
+that plans GitHub work and coordinates disposable execution Agents without
+turning the orchestration layer into a runtime hierarchy.
 
-## Language
+## Control
 
-**Repository Coordinator**:
-The single repository-labeled root Agent that arbitrates Campaigns and owns
-integration decisions for one repository. Its conversation home and integration
-worktree are separate resources.
-_Avoid_: Father, Repository Orchestrator
+**Orchestrator**:
+The portable Skill and policy harness that coordinates work for one repository.
+It is not an Agent, daemon, or long-running service.
+_Avoid_: Father, Orchestrator Agent, orchestration daemon
+
+**Coordinator Workspace**:
+The stable repository workspace on the configured integration branch from which
+coordination is performed. It is never a feature-branch or disposable Worker
+workspace.
+_Avoid_: Father worktree, Campaign workspace, Worker workspace
+
+**Coordinator**:
+Any qualifying root Agent currently coordinating one repository from its
+Coordinator Workspace. Provider, model, reasoning level, and mode are runtime
+attributes, not identity or ownership.
+_Avoid_: permanent Father, provider-bound Coordinator, Campaign Orchestrator
+
+**Reconcile**:
+The idempotent act of rebuilding the repository's orchestration view from
+GitHub and current runtime facts before choosing the next safe actions.
+_Avoid_: polling loop, heartbeat cycle, room replay
+
+## Planning
+
+**Triage**:
+The Coordinator's project-management work of clarifying, prioritizing,
+relating, and preparing an Issue before execution.
+_Avoid_: Intake Agent, scheduling-only pass
+
+**Issue Design**:
+The decision-complete, risk-proportional execution contract attached to one
+Issue. It states the goal, boundaries, acceptance, Hotset, and validation
+needed by a Worker.
+_Avoid_: raw Issue body, mandatory full template, implementation transcript
+
+**Priority**:
+The urgency dimension used to decide what should run first, expressed as
+`P0` through `P3`.
+_Avoid_: Difficulty, Risk, model tier
+
+**Difficulty Tier**:
+The stable `light`, `standard`, or `heavy` classification of how capable and
+costly a Worker runtime should be. Concrete providers and models remain local
+runtime choices.
+_Avoid_: Priority, Risk, provider name, model binding
+
+**Risk**:
+The `low`, `standard`, or `strict` verification rigor required before
+integration.
+_Avoid_: Difficulty, Priority, Reviewer count
 
 **Campaign**:
-A bounded execution effort and the user-visible name of its coordinating Paseo
-Agent. The Agent is a direct child of the Repository Coordinator, owns exactly
-one Campaign ID, and has one Campaign Control Workspace.
-_Avoid_: Activity, run, Campaign Orchestrator in UI, Father, Orchestrator without qualification
+An optional GitHub Milestone that groups Issues sharing a business outcome.
+It has no Agent, workspace, lifecycle protocol, or execution authority.
+_Avoid_: Campaign Agent, Campaign Orchestrator, mandatory grouping
 
-**Dispatch**:
-One Campaign-owned assignment to one Agent, branch, worktree, and editor.
-_Avoid_: Task, lane
-
-**Provider Binding**:
-The Campaign-local runtime choice of provider and model for an Agent role.
-_Avoid_: Global model, fixed model
+**Wave Generation**:
+The Issues admitted into currently free WIP Slots by one reconcile decision.
+It is a rolling scheduling snapshot, not a batch, barrier, or runtime entity.
+_Avoid_: fixed cohort, Campaign run, completion gate
 
 **Hotset**:
-The files or modules a Campaign claims for exclusive editing while it is active.
-_Avoid_: Write set, scope
+The repository-relative paths one Dispatch may modify. It constrains writes,
+while the Worker may read the whole repository.
+_Avoid_: read scope, runtime lock, best-effort changed-path list
 
-**Integration Lease**:
-The repository-scoped exclusive right for one Campaign to update the integration
-branch.
-_Avoid_: Merge lock
+## Execution
 
-**Coordinator Loop**:
-The event-driven Repository/Campaign reconciliation cycle that rebuilds state,
-plans a ready wave, waits on Paseo signals, verifies evidence, and integrates.
-_Avoid_: Poller, daemon, watchdog service
+**Dispatch**:
+One assignment binding exactly one Issue, Worker, workspace, branch, and pull
+request. Creating the Worker authorizes execution without a handshake.
+_Avoid_: Work Package, multi-Issue bundle, Campaign lane
 
-**Heartbeat**:
-A best-effort Worker room signal at safe execution boundaries with a five-minute
-target. It reports liveness only and cannot authorize completion or cleanup.
-_Avoid_: Orchestrator poll, timer SLA, terminal receipt
+**Worker**:
+A disposable Agent that implements one Dispatch and delivers its result through
+one pull request. It owns no scheduling, integration, or cleanup authority.
+_Avoid_: standing Agent, nested Orchestrator, multi-Issue Worker
 
-**Coordinator Home Workspace**:
-The long-lived Coordinator conversation location. It may be dirty or not on
-`dev` and is never used as an implicit integration target.
-_Avoid_: Father worktree, control branch
+**Reviewer**:
+An optional, disposable Agent that evaluates one pull-request revision against
+both the Issue Design and repository quality expectations.
+_Avoid_: standing review pool, mandatory dual-axis pair
 
-**Integration Control Worktree**:
-The explicitly addressed `dev` worktree used only for repository integration.
-It must be clean immediately before merge and is permanently protected from
-Campaign cleanup.
-_Avoid_: Coordinator Home, execution worktree
+**WIP Slot**:
+One repository-level allowance for an unfinished Dispatch from creation until
+merge or explicit retirement. Review does not release the slot.
+_Avoid_: running-Agent count, machine-wide Agent capacity
 
-**Campaign Control Workspace**:
-The dedicated sidebar entry and local `gwo/campaign/*` worktree for one new
-Campaign. It carries coordination context, no feature changes, no push, and no
-PR.
-_Avoid_: Worker worktree, shared repository root
+**Project Projection**:
+An optional GitHub Project view of orchestration facts already owned by Issues,
+pull requests, checks, and labels. Projection failure cannot block core work.
+_Avoid_: control plane, task database, required Project template
 
-**Operator Relay**:
-A one-shot ordinary Task that durably forwards a sanitized request to the
-existing Coordinator through the Repository Room, optionally wakes it by
-Signal-ID, records a receipt, then idles.
-_Avoid_: Temporary Coordinator, Campaign
+**Retirement**:
+The guarded cleanup of a completed or explicitly stopped Dispatch's disposable
+runtime resources. A Coordinator and its Workspace are never retirement
+targets.
+_Avoid_: self-archive, campaign close, unconditional cleanup
 
-**Spec Reviewer**:
-The reusable Campaign-owned Paseo Reviewer for Issue, decision, scope, Hotset,
-and acceptance conformity.
-_Avoid_: General reviewer, implementation Worker
-
-**Quality Reviewer**:
-The reusable Campaign-owned Paseo Reviewer for standards, architecture,
-security, tests, and maintainability.
-_Avoid_: General reviewer, implementation Worker
-
-**Candidate Lock Receipt**:
-The Campaign-issued, persisted and read-backed immutable identity of one review
-round: Dispatch, candidate/base SHA, diff/acceptance digests, scope, and prior
-round lineage. Reviewer claims cannot create or replace it.
-_Avoid_: Reviewer lock claim, matching hashes alone
-
-**Review Assignment**:
-The read-backed dynamic binding from one reusable Reviewer and static axis label
-to one Campaign parent, Dispatch, and Candidate Lock Receipt. It changes between
-candidates without relabeling the Reviewer.
-_Avoid_: Reviewer Dispatch label, permanent Worker identity
-
-**Dispatch-scoped Replay**:
-A Worker view of one Campaign Room that ignores all other Dispatch and Campaign
-lifecycle events before identity lookup. Full unscoped replay remains a
-Campaign responsibility.
-_Avoid_: Incomplete Campaign reconciliation, sender filtering after rejection
-
-**Material Delivery**:
-The GWO transaction that carries one explicitly addressed, durable Campaign
-Room event from its publish UUID through an idle-only signal wake to a
-recipient-authored Delivery ACK. Progress and Heartbeat events do not enter it.
-_Avoid_: Finish callback, mention, unacknowledged room post
-
-**Wake Receipt**:
-The non-authoritative `DELIVERY_WAKE` room record written after Paseo accepts a
-signal-only wake. It prevents unlimited retries and never proves the recipient
-processed the source event.
-_Avoid_: Completion receipt, Agent liveness
-
-**Delivery ACK**:
-The non-authoritative `DELIVERY_ACK` written by the exact recipient after an
-identity-verified replay of the source message. It proves receipt, not business
-completion, merge, or cleanup eligibility.
-_Avoid_: Result evidence, terminal receipt
-
-**Cleanup Guard**:
-The GWO-owned policy that authorizes exact cleanup actions from observed Paseo,
-Git, and worktree evidence without requiring host or runtime source changes.
-_Avoid_: Daemon guard, host cleanup service
+**NEEDS-HUMAN**:
+An explicit escalation for a product decision, unsafe state, or external gate
+outside the Coordinator's authority.
+_Avoid_: silent retry, guessed decision, indefinite prompting

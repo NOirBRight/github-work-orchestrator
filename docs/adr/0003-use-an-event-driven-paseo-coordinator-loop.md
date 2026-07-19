@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by 0007
 ---
 
 # Use an event-driven Paseo Coordinator loop inside GWO

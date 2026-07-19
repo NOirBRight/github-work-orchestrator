@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by 0007
 ---
 
 # Require acknowledged delivery for material Campaign Room events

@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "global": {
+    "default_tier": "standard",
+    "worker_slots": 3,
+    "max_attempts": 2
+  },
+  "tiers": {
+    "light": {
+      "provider": "your-provider",
+      "settings": {
+        "model": "your-fast-model",
+        "thinkingOptionId": "low",
+        "modeId": "your-unattended-mode",
+        "features": {}
+      }
+    },
+    "standard": {
+      "provider": "your-provider",
+      "settings": {
+        "model": "your-default-model",
+        "thinkingOptionId": "medium",
+        "modeId": "your-unattended-mode",
+        "features": {}
+      }
+    },
+    "heavy": {
+      "provider": "your-provider",
+      "settings": {
+        "model": "your-strongest-model",
+        "thinkingOptionId": "high",
+        "modeId": "your-unattended-mode",
+        "features": {}
+      }
+    }
+  },
+  "reviewer_tiers": {
+    "standard": "standard",
+    "strict": "heavy"
+  },
+  "repositories": {
+    "owner/repo": {
+      "integration_branch": "dev",
+      "merge_method": "squash",
+      "worker_slots": 3,
+      "default_tier": "standard",
+      "milestone_tiers": {},
+      "tiers": {},
+      "project_number": null
+    }
+  }
+}

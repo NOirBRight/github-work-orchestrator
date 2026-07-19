@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by 0007
 ---
 
 # Compose independently compiled Worker and Review dispatch receipts
