@@ -30,7 +30,7 @@ PACKAGES = {
 }
 RUNTIME_SCRIPT_TARGETS = ("github-issue-intake", "github-issue-worker")
 RUNTIME_SCRIPTS = ("paseo_room.py", "material_delivery.py")
-PACKAGE_VERSION = "4.3.1"
+PACKAGE_VERSION = "4.3.2"
 PACKAGE_MANIFEST = ".skill-package.json"
 TEXT_SUFFIXES = {".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
 

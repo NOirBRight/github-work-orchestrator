@@ -129,6 +129,15 @@ as a read-backed same-repository/same-Campaign Orchestrator; matching child and
 assignment strings without that parent receipt are invalid. Worker-dispatch
 identity compilation applies the same parent rule.
 
+When one Issue Dispatch contains both its implementation Worker and reusable
+Review Pair, compile `worker-dispatch` and `review-dispatch` receipts
+independently and concatenate the generated arrays. Replay/post-material merges
+only duplicate Campaign receipts whose complete static identity and
+`direct-child-dispatch` authority agree; conflicting child evidence still fails
+closed. The addressed child's read-backed role selects `worker-dispatch` or
+`review-dispatch` for that material event. Never hand-merge subjects or replace
+the independently compiled receipts.
+
 `campaign-control` scope also requires the Campaign's exact parent to appear as
 a read-backed root `repository-coordinator` for the same repository. A Campaign
 label plus an arbitrary parent string cannot mint lifecycle/CHECKPOINT authority.

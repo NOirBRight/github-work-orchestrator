@@ -67,6 +67,12 @@ Reviewers never gain a static `dispatch_id` label; the dynamic
 after the next assignment is persisted/read back. The Campaign direct-child
 receipt may list both assigned Reviewers.
 
+For Campaign-wide replay, concatenate this generated review receipt array with
+the generated `worker-dispatch` receipt array for the same Issue Dispatch. The
+room helper safely composes the duplicate Campaign receipt only when both
+compiled identities agree and selects delivery scope from the addressed child.
+Do not hand-author a combined authority receipt.
+
 ## Queue and delta rounds
 
 The pair reviews one candidate at a time. Queue verified candidates by durable

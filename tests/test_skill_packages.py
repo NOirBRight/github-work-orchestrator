@@ -71,7 +71,7 @@ class SkillPackageTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
     def test_package_manifests_pin_version_and_content_digest(self) -> None:
-        self.assertEqual("4.3.1", SYNC.PACKAGE_VERSION)
+        self.assertEqual("4.3.2", SYNC.PACKAGE_VERSION)
         for name in SKILLS:
             package = ROOT / "skills" / name
             manifest = json.loads(

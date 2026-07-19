@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -426,9 +427,67 @@ def _identity_receipt_lookup(
                 f"identity receipt {index} requires agent_id, campaign_id, and dispatch_id"
             )
         if key in lookup:
-            raise RoomProtocolError("duplicate identity receipt")
-        lookup[key] = receipt
+            lookup[key] = _merge_identity_receipts(lookup[key], receipt)
+        else:
+            lookup[key] = copy.deepcopy(receipt)
     return lookup
+
+
+def _merge_identity_receipts(
+    existing: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    if {
+        key: value for key, value in existing.items() if key != "authority"
+    } != {key: value for key, value in incoming.items() if key != "authority"}:
+        raise RoomProtocolError("duplicate identity receipt")
+    if existing.get("role") != "orchestrator":
+        raise RoomProtocolError("duplicate identity receipt")
+    existing_authority = existing.get("authority")
+    incoming_authority = incoming.get("authority")
+    if not isinstance(existing_authority, dict) or not isinstance(
+        incoming_authority, dict
+    ):
+        raise RoomProtocolError("duplicate identity receipt")
+    authority_fields = {
+        "kind",
+        "campaign_id",
+        "dispatch_id",
+        "subjects",
+        "read_back",
+    }
+    if (
+        set(existing_authority) != authority_fields
+        or set(incoming_authority) != authority_fields
+        or any(
+            existing_authority.get(field) != incoming_authority.get(field)
+            for field in authority_fields - {"subjects"}
+        )
+        or existing_authority.get("kind") != "direct-child-dispatch"
+    ):
+        raise RoomProtocolError("duplicate identity receipt")
+    existing_subjects = existing_authority.get("subjects")
+    incoming_subjects = incoming_authority.get("subjects")
+    if not isinstance(existing_subjects, list) or not isinstance(
+        incoming_subjects, list
+    ):
+        raise RoomProtocolError("duplicate identity receipt")
+
+    subjects: dict[str, dict[str, Any]] = {}
+    for subject in [*existing_subjects, *incoming_subjects]:
+        if not isinstance(subject, dict) or not isinstance(
+            subject.get("agent_id"), str
+        ):
+            raise RoomProtocolError("duplicate identity receipt")
+        agent_id = subject["agent_id"]
+        if agent_id in subjects and subjects[agent_id] != subject:
+            raise RoomProtocolError("duplicate identity receipt")
+        subjects[agent_id] = copy.deepcopy(subject)
+
+    merged = copy.deepcopy(existing)
+    merged["authority"]["subjects"] = [
+        subjects[agent_id] for agent_id in sorted(subjects)
+    ]
+    return merged
 
 
 IDENTITY_AUTHORITY_SCOPES = {
@@ -897,7 +956,9 @@ def _review_lock_from_event(event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _delivery_authority_scope(receipt: dict[str, Any]) -> str | None:
+def _delivery_authority_scope(
+    receipt: dict[str, Any], event: dict[str, Any] | None = None
+) -> str | None:
     role = receipt.get("role")
     authority = receipt.get("authority")
     kind = authority.get("kind") if isinstance(authority, dict) else None
@@ -914,6 +975,19 @@ def _delivery_authority_scope(receipt: dict[str, Any]) -> str | None:
         if not isinstance(subjects, list):
             subject_labels = authority.get("subject_labels")
             subjects = [{"labels": subject_labels}]
+        recipient_id = event.get("recipient_agent_id") if event is not None else None
+        if isinstance(recipient_id, str):
+            recipient_roles = {
+                item.get("labels", {}).get("role")
+                for item in subjects
+                if isinstance(item, dict)
+                and item.get("agent_id") == recipient_id
+                and isinstance(item.get("labels"), dict)
+            }
+            if recipient_roles == {"review"}:
+                return "review-dispatch"
+            if len(recipient_roles) == 1 and not (recipient_roles & {"review"}):
+                return "worker-dispatch"
         subject_roles = {
             item.get("labels", {}).get("role")
             for item in subjects
@@ -1025,7 +1099,7 @@ def _material_delivery(
         or event["event_type"] in DELIVERY_VISIBILITY_ONLY_EVENTS
     ):
         return None
-    authority_scope = _delivery_authority_scope(receipt)
+    authority_scope = _delivery_authority_scope(receipt, event)
     if authority_scope is None:
         return None
     delivery = {
@@ -1438,7 +1512,10 @@ class PaseoRoom:
                 "material post identity receipts are invalid: "
                 + ", ".join(identity_errors)
             )
-        if receipt is None or _delivery_authority_scope(receipt) != authority_scope:
+        if (
+            receipt is None
+            or _delivery_authority_scope(receipt, event) != authority_scope
+        ):
             raise RoomProtocolError(
                 "material post authority scope does not match identity receipts"
             )

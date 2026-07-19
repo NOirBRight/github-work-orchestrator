@@ -2371,6 +2371,75 @@ class PaseoRoomProtocolTests(unittest.TestCase):
             receipt["delivery"],
         )
 
+    def test_campaign_material_post_selects_scope_from_the_addressed_child(
+        self,
+    ) -> None:
+        worker_receipt = identity_receipt()
+        worker_parent = identity_receipt(
+            agent_id="agent-orchestrator",
+            role="orchestrator",
+            parent_agent_id="agent-repository-coordinator",
+        )
+        worker_parent["authority"] = {
+            "kind": "direct-child-dispatch",
+            "campaign_id": "campaign-20260718",
+            "dispatch_id": "dispatch-issue-7",
+            "subjects": [
+                {
+                    "agent_id": "agent-worker-7",
+                    "parent_agent_id": "agent-orchestrator",
+                    "relationship": "subagent",
+                    "labels": worker_receipt["labels"],
+                    "assignment": None,
+                }
+            ],
+            "read_back": True,
+        }
+        receipts = [
+            worker_receipt,
+            worker_parent,
+            *review_identity_receipts("spec", "quality"),
+        ]
+        start = event(
+            signal_id="start-worker-from-combined-receipts",
+            event_type="START",
+            sender_agent_id="agent-orchestrator",
+            recipient_agent_id="agent-worker-7",
+            sequence=1,
+        )
+        ready = event(
+            signal_id="ready-reviewer-from-combined-receipts",
+            event_type="READY_FOR_REVIEW",
+            sender_agent_id="agent-orchestrator",
+            recipient_agent_id="agent-spec-reviewer",
+            sequence=2,
+            evidence="candidate lock read back",
+            next_action="review the locked candidate",
+        )
+
+        with mock.patch.dict(
+            os.environ, {"PASEO_AGENT_ID": "agent-orchestrator"}
+        ):
+            worker_delivery = self.protocol.post_material(
+                "gwo-campaign-20260718",
+                start,
+                authority_scope="worker-dispatch",
+                identity_receipts=receipts,
+            )
+            review_delivery = self.protocol.post_material(
+                "gwo-campaign-20260718",
+                ready,
+                authority_scope="review-dispatch",
+                identity_receipts=receipts,
+            )
+
+        self.assertEqual(
+            "worker-dispatch", worker_delivery["delivery"]["authority_scope"]
+        )
+        self.assertEqual(
+            "review-dispatch", review_delivery["delivery"]["authority_scope"]
+        )
+
     def test_post_material_requires_compiled_identity_receipts_before_publish(self) -> None:
         material = event()
 
@@ -3451,6 +3520,164 @@ class PaseoRoomProtocolTests(unittest.TestCase):
                     "review_assignments": orphan_assignments,
                 }
             )
+
+    def test_campaign_replay_accepts_worker_and_review_receipts_for_one_dispatch(
+        self,
+    ) -> None:
+        orchestrator = {
+            "agent_id": "agent-orchestrator",
+            "parent_agent_id": "agent-repository-coordinator",
+            "relationship": "subagent",
+            "labels": {
+                "repository": "owner/repo",
+                "campaign_id": "campaign-20260718",
+                "role": "orchestrator",
+            },
+            "read_back": True,
+        }
+        worker = {
+            "agent_id": "agent-worker-7",
+            "parent_agent_id": "agent-orchestrator",
+            "relationship": "subagent",
+            "labels": {
+                "repository": "owner/repo",
+                "campaign_id": "campaign-20260718",
+                "dispatch_id": "dispatch-issue-7",
+                "role": "implementation",
+            },
+            "read_back": True,
+        }
+        lock = {
+            "dispatch_id": "dispatch-issue-7",
+            "candidate_sha": "b" * 40,
+            "base_sha": "a" * 40,
+            "diff_sha256": "c" * 64,
+            "acceptance_sha256": "d" * 64,
+            "review_round": 1,
+            "scope": "full",
+            "previous_candidate_sha": None,
+        }
+        reviewers = [
+            {
+                "agent_id": f"agent-{axis}-reviewer",
+                "parent_agent_id": "agent-orchestrator",
+                "relationship": "subagent",
+                "labels": {
+                    "repository": "owner/repo",
+                    "campaign_id": "campaign-20260718",
+                    "role": "review",
+                    "review_axis": axis,
+                },
+                "read_back": True,
+            }
+            for axis in ("spec", "quality")
+        ]
+        assignments = [
+            {
+                "agent_id": reviewer["agent_id"],
+                "campaign_id": "campaign-20260718",
+                "review_axis": reviewer["labels"]["review_axis"],
+                "campaign_parent_agent_id": "agent-orchestrator",
+                "lock": lock,
+                "review_lock_read_back": True,
+                "read_back": True,
+            }
+            for reviewer in reviewers
+        ]
+        worker_plan = ROOM.identity_receipt_plan(
+            {
+                "schema_version": 1,
+                "repository": "owner/repo",
+                "campaign_id": "campaign-20260718",
+                "dispatch_id": "dispatch-issue-7",
+                "authority_scope": "worker-dispatch",
+                "agent_readbacks": [orchestrator, worker],
+            }
+        )
+        review_plan = ROOM.identity_receipt_plan(
+            {
+                "schema_version": 1,
+                "repository": "owner/repo",
+                "campaign_id": "campaign-20260718",
+                "dispatch_id": "dispatch-issue-7",
+                "authority_scope": "review-dispatch",
+                "agent_readbacks": [orchestrator, *reviewers],
+                "review_assignments": assignments,
+            }
+        )
+        start = event(
+            signal_id="start-worker-with-review-pair",
+            event_type="START",
+            sender_agent_id="agent-orchestrator",
+            recipient_agent_id="agent-worker-7",
+        )
+        spec = self.review_result(
+            axis="spec",
+            sender="agent-spec-reviewer",
+            signal_id="review-spec-shared-dispatch",
+        )
+        quality = self.review_result(
+            axis="quality",
+            sender="agent-quality-reviewer",
+            signal_id="review-quality-shared-dispatch",
+        )
+        for index, payload in enumerate((start, spec, quality), start=1):
+            self.runner.messages.append(
+                {
+                    "id": f"message-shared-{index}",
+                    "body": json.dumps(payload),
+                    "author": payload["sender_agent_id"],
+                }
+            )
+
+        replay = self.protocol.replay(
+            "gwo-campaign-20260718",
+            identity_receipts=[
+                *worker_plan["receipts"],
+                *review_plan["receipts"],
+            ],
+            review_locks=[review_lock_receipt()],
+        )
+
+        self.assertEqual([], replay["rejected"])
+        self.assertEqual([], replay["blocked_dispatches"])
+        self.assertEqual(
+            [
+                ("START", "worker-dispatch"),
+                ("REVIEW_RESULT", "review-dispatch"),
+                ("REVIEW_RESULT", "review-dispatch"),
+            ],
+            [
+                (item["event_type"], item["authority_scope"])
+                for item in replay["deliveries"]
+            ],
+        )
+        self.assertEqual(
+            "complete", replay["review_pairs"]["dispatch-issue-7"]["status"]
+        )
+
+    def test_campaign_replay_rejects_conflicting_duplicate_receipts(self) -> None:
+        first = identity_receipt(
+            agent_id="agent-orchestrator",
+            role="orchestrator",
+            parent_agent_id="agent-repository-coordinator",
+        )
+        conflicting = json.loads(json.dumps(first))
+        conflicting["labels"]["repository"] = "foreign/repo"
+        worker = identity_receipt()
+
+        for receipts in (
+            [first, conflicting],
+            [worker, json.loads(json.dumps(worker))],
+        ):
+            with self.subTest(role=receipts[0]["role"]):
+                with self.assertRaisesRegex(
+                    ROOM.RoomProtocolError, "duplicate identity"
+                ):
+                    self.protocol.replay(
+                        "gwo-campaign-20260718",
+                        identity_receipts=receipts,
+                    )
 
     def test_identity_plan_uses_explicit_campaign_control_scope(self) -> None:
         plan = ROOM.identity_receipt_plan(
