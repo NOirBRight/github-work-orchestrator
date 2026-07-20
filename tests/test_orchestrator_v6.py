@@ -441,6 +441,197 @@ def test_worker_slots_are_bounded_and_blocked_only_releases_when_parked():
         assert error.value.code == "WORKER_SLOTS_INVALID"
 
 
+def _lifecycle_snapshot(core, *, status="running", parked=False):
+    contract = {
+        "design": ["Keep the existing behavior."],
+        "acceptance": ["The managed change remains verified."],
+        "hotset": ["src/worker"],
+        "done_when": ["python -m pytest -q"],
+        "dependencies": [3],
+        "priority": "P1",
+        "difficulty": "standard",
+        "risk": "standard",
+        "unresolved_decisions": [],
+    }
+    contract["sha256"] = core.contract_hash(contract)
+    dispatch = {
+        "id": "dispatch-issue-7-a1",
+        "attempt": 1,
+        "status": status,
+        "parked": parked,
+        "worker_agent_id": "worker-7",
+        "workspace_id": "workspace-7",
+        "branch": "work/issue-7",
+        "base_sha": "a" * 40,
+        "contract_sha256": contract["sha256"],
+    }
+    return {
+        "schema_version": 1,
+        "repository": "owner/repo",
+        "base_sha": "a" * 40,
+        "worker_slots": 3,
+        "closed_issues": [3],
+        "issues": [
+            {
+                "number": 7,
+                "state": "blocked" if parked else "active",
+                "contract": contract,
+                "contract_valid": True,
+                "dependencies": [3],
+                "hotset": ["src/worker"],
+                "dispatch": dispatch,
+            }
+        ],
+        "runtime_agents": [
+            {
+                "id": "worker-7",
+                "workspace_id": "workspace-7",
+                "branch": "work/issue-7",
+                "labels": {"orch.dispatch": "dispatch-issue-7-a1"},
+                "state": "idle" if parked else "running",
+            }
+        ],
+    }
+
+
+def test_park_is_two_phase_and_releases_capacity_only_after_stop_readback():
+    core = load_core()
+    snapshot = _lifecycle_snapshot(core)
+    planned = core.plan_lifecycle_command(snapshot, "dispatch-issue-7-a1", "park")
+    update = planned["record_updates"][0]["dispatch"]
+    assert update["status"] == "parking"
+    assert update["parked"] is False
+    assert planned["actions"] == [
+        {
+            "action_id": "park-dispatch-issue-7-a1",
+            "type": "stop_worker",
+            "dispatch_id": "dispatch-issue-7-a1",
+            "agent_id": "worker-7",
+        }
+    ]
+    in_transition = {
+        **snapshot,
+        "issues": [{**snapshot["issues"][0], "dispatch": update}],
+    }
+    assert core.plan_reconcile(in_transition)["summary"]["wip"] == 1
+
+    stopped = core.apply_observations(
+        in_transition,
+        [{"action_id": "park-dispatch-issue-7-a1", "status": "succeeded"}],
+    )
+    parked = stopped["issues"][0]["dispatch"]
+    assert parked["status"] == "blocked"
+    assert parked["parked"] is True
+    assert core.plan_reconcile(stopped)["summary"]["wip"] == 0
+    duplicate = core.apply_observations(
+        stopped,
+        [{"action_id": "park-dispatch-issue-7-a1", "status": "succeeded"}],
+    )
+    assert duplicate["issues"][0]["dispatch"] == parked
+
+
+def test_park_crash_recovery_reuses_action_and_accepts_stopped_agent_readback():
+    core = load_core()
+    snapshot = _lifecycle_snapshot(core)
+    initial = core.plan_lifecycle_command(snapshot, "dispatch-issue-7-a1", "park")
+    transition = {
+        **snapshot,
+        "issues": [
+            {
+                **snapshot["issues"][0],
+                "dispatch": initial["record_updates"][0]["dispatch"],
+            }
+        ],
+    }
+    repeated = core.plan_lifecycle_transitions(transition)
+    assert repeated["actions"] == initial["actions"]
+
+    transition["runtime_agents"] = [{**snapshot["runtime_agents"][0], "state": "idle"}]
+    recovered = core.plan_lifecycle_transitions(transition)
+    assert recovered["actions"] == []
+    assert recovered["record_updates"][0]["dispatch"]["parked"] is True
+
+
+def test_resume_revalidates_then_wakes_the_same_worker_in_two_phases():
+    core = load_core()
+    snapshot = _lifecycle_snapshot(core, status="blocked", parked=True)
+    planned = core.plan_lifecycle_command(snapshot, "dispatch-issue-7-a1", "resume")
+    update = planned["record_updates"][0]["dispatch"]
+    assert update["status"] == "resuming"
+    assert update["parked"] is False
+    assert planned["actions"] == [
+        {
+            "action_id": "resume-dispatch-issue-7-a1",
+            "type": "resume_worker",
+            "dispatch_id": "dispatch-issue-7-a1",
+            "agent_id": "worker-7",
+            "message": "Resume Dispatch dispatch-issue-7-a1 from its unchanged contract and preserved WIP.",
+        }
+    ]
+    transition = {
+        **snapshot,
+        "issues": [{**snapshot["issues"][0], "dispatch": update}],
+    }
+    assert core.plan_reconcile(transition)["summary"]["wip"] == 1
+    running = core.apply_observations(
+        transition,
+        [
+            {
+                "action_id": "resume-dispatch-issue-7-a1",
+                "status": "succeeded",
+                "agent_id": "worker-7",
+                "workspace_id": "workspace-7",
+                "branch": "work/issue-7",
+            }
+        ],
+    )["issues"][0]["dispatch"]
+    assert running["status"] == "running"
+    assert running["parked"] is False
+    assert running["worker_agent_id"] == "worker-7"
+    duplicate = core.apply_observations(
+        {**transition, "issues": [{**transition["issues"][0], "dispatch": running}]},
+        [
+            {
+                "action_id": "resume-dispatch-issue-7-a1",
+                "status": "succeeded",
+            }
+        ],
+    )
+    assert duplicate["issues"][0]["dispatch"] == running
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("base", "RESUME_BASE_DRIFT"),
+        ("contract", "RESUME_CONTRACT_INVALID"),
+        ("dependency", "RESUME_DEPENDENCY_BLOCKED"),
+        ("hotset", "RESUME_HOTSET_CONFLICT"),
+    ],
+)
+def test_resume_fails_closed_on_drift_or_conflict(mutation, code):
+    core = load_core()
+    snapshot = _lifecycle_snapshot(core, status="blocked", parked=True)
+    if mutation == "base":
+        snapshot["base_sha"] = "b" * 40
+    elif mutation == "contract":
+        snapshot["issues"][0]["contract"]["design"] = ["Changed while parked."]
+    elif mutation == "dependency":
+        snapshot["closed_issues"] = []
+    else:
+        snapshot["issues"].append(
+            {
+                "number": 8,
+                "state": "active",
+                "hotset": ["src/worker/api"],
+                "dispatch": {"status": "running", "parked": False},
+            }
+        )
+    with pytest.raises(core.PolicyError) as rejected:
+        core.plan_lifecycle_command(snapshot, "dispatch-issue-7-a1", "resume")
+    assert rejected.value.code == code
+
+
 def test_p0_at_full_capacity_is_advisory_only():
     core = load_core()
     result = core.plan_reconcile(
@@ -1554,6 +1745,134 @@ def test_workspace_selection_precedence_and_nonstable_entry():
             "prompt": "run orchestration",
         }
     ]
+
+
+def _coordinator_context(*, current=True, collaboration_mode="default"):
+    workspace = {
+        "id": "stable-dev",
+        "repository": "owner/repo",
+        "branch": "dev",
+        "relationship": "root",
+        "dirty": False,
+        "pr_head": False,
+        "ephemeral": False,
+        "worker": False,
+        "agent_cwd_matches": True,
+    }
+    return {
+        "schema_version": 1,
+        "actor": {
+            "id": "root-a",
+            "cwd": "C:/repo",
+            "workspace_id": "stable-dev" if current else "feature-17",
+            "provider": "codex",
+            "settings": {"model": "gpt-5.6", "modeId": "full-access"},
+        },
+        "current_workspace": workspace
+        if current
+        else {
+            **workspace,
+            "id": "feature-17",
+            "branch": "work/issue-17",
+            "worker": True,
+        },
+        "candidate_workspaces": [workspace],
+        "mode": {
+            "collaboration_mode": collaboration_mode,
+            "write_capable": True,
+            "colorTier": "dangerous",
+        },
+        "features": {"plan_mode": False},
+        "remote_branches": ["dev", "main"],
+        "active_root_agents": [],
+        "request": "continue the managed wave",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ({"mode": {"collaboration_mode": "plan"}}, "COORDINATOR_MODE_READ_ONLY"),
+        ({"features": {"plan_mode": True}}, "COORDINATOR_MODE_READ_ONLY"),
+        ({"mode": {"colorTier": "planning"}}, "COORDINATOR_MODE_READ_ONLY"),
+        ({"mode": {"write_capable": None}}, "COORDINATOR_CAPABILITY_UNKNOWN"),
+    ],
+)
+def test_coordinator_entry_fails_closed_when_mode_cannot_write(mutation, code):
+    core = load_core()
+    context = _coordinator_context()
+    for key, value in mutation.items():
+        context[key] = {**context.get(key, {}), **value}
+    with pytest.raises(core.PolicyError) as rejected:
+        core.plan_coordinator_entry(
+            context,
+            {"repository": "owner/repo", "integration_branch": "dev"},
+            expected_actor_id="root-a",
+            expected_cwd="C:/repo",
+        )
+    assert rejected.value.code == code
+
+
+def test_coordinator_entry_resolves_dev_only_from_unambiguous_live_readback():
+    core = load_core()
+    context = _coordinator_context()
+    ready = core.plan_coordinator_entry(
+        context,
+        {"repository": "owner/repo"},
+        expected_actor_id="root-a",
+        expected_cwd="C:/repo",
+    )
+    assert ready["status"] == "ready"
+    assert ready["repository_config"]["integration_branch"] == "dev"
+
+    for broken in (
+        {**context, "remote_branches": ["main"]},
+        {
+            **context,
+            "candidate_workspaces": [
+                *context["candidate_workspaces"],
+                {**context["candidate_workspaces"][0], "id": "another-dev"},
+            ],
+        },
+    ):
+        with pytest.raises(core.PolicyError) as rejected:
+            core.plan_coordinator_entry(
+                broken,
+                {"repository": "owner/repo"},
+                expected_actor_id="root-a",
+                expected_cwd="C:/repo",
+            )
+        assert rejected.value.code == "INTEGRATION_BRANCH_REQUIRED"
+
+
+def test_nonstable_coordinator_entry_routes_request_without_persisting_it():
+    core = load_core()
+    context = _coordinator_context(current=False)
+    routed = core.plan_coordinator_entry(
+        context,
+        {
+            "repository": "owner/repo",
+            "integration_branch": "dev",
+            "workspace_id": "stable-dev",
+        },
+        expected_actor_id="root-a",
+        expected_cwd="C:/repo",
+    )
+    assert routed["status"] == "forwarded"
+    assert routed["actions"] == [
+        {
+            "type": "create_root_agent",
+            "relationship": "detached",
+            "workspace_id": "stable-dev",
+            "runtime": {
+                "provider": "codex",
+                "settings": {"model": "gpt-5.6", "modeId": "full-access"},
+            },
+            "prompt": "continue the managed wave",
+        }
+    ]
+    assert "request" not in routed
+    assert "prompt" not in routed["repository_config"]
 
 
 def test_config_resolution_order_and_v5_migration_preserve_thinking():

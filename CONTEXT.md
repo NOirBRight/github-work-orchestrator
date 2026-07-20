@@ -91,7 +91,8 @@ _Avoid_: standing review pool, mandatory dual-axis pair
 
 **WIP Slot**:
 One repository-level allowance for an unfinished Dispatch from creation until
-merge or explicit retirement. Review does not release the slot.
+merge or explicit retirement. Review does not release it; a confirmed Human
+Park temporarily does while preserving the Dispatch and WIP.
 _Avoid_: running-Agent count, machine-wide Agent capacity
 
 **Project Projection**:

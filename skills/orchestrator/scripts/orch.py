@@ -15,7 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 import orch_core as core
 
@@ -65,6 +65,14 @@ fragment OrchIssue on Issue{
 
 class CommandError(RuntimeError):
     pass
+
+
+class DispatchRuntimeEvidence(TypedDict):
+    state: Literal["present", "auto_archived", "invalid"]
+    detail: dict[str, Any] | None
+    cwd: Path | None
+    branch: str | None
+    blocker: str | None
 
 
 def _read_json(source: str | Path) -> Any:
@@ -125,7 +133,7 @@ class GitHub:
     def run(self, args: list[str]) -> str:
         return _run([self.executable, *args])
 
-    def snapshot(self, repo: str, integration_branch: str = "dev") -> dict[str, Any]:
+    def snapshot(self, repo: str, integration_branch: str) -> dict[str, Any]:
         owner, name = repo.split("/", 1)
         payload = json.loads(
             self.run(
@@ -341,6 +349,7 @@ class GitHub:
                 "workspace_id": None,
                 "branch": action["branch"],
                 "base_sha": action.get("base_sha"),
+                "contract_sha256": (record.get("contract") or {}).get("sha256"),
                 "status": "claiming",
                 "claimed_at": core.utc_now(),
             }
@@ -838,7 +847,7 @@ class Paseo:
         return _run([self.executable, *args])
 
     def agents_for_dispatch(self, dispatch: str) -> list[dict[str, Any]]:
-        return json.loads(
+        matches = json.loads(
             self.run(
                 [
                     "ls",
@@ -850,6 +859,9 @@ class Paseo:
                 ]
             )
         )
+        for match in matches:
+            match["_matched_dispatch_label"] = dispatch
+        return matches
 
     def agents_for_labels(self, labels: dict[str, str]) -> list[dict[str, Any]]:
         command = ["ls", "--global", "--all"]
@@ -989,10 +1001,44 @@ def _runtime_worktrees() -> list[dict[str, Any]]:
     )
 
 
+def _runtime_evidence(
+    state: Literal["present", "auto_archived", "invalid"],
+    *,
+    detail: dict[str, Any] | None = None,
+    cwd: Path | None = None,
+    branch: str | None = None,
+    blocker: str | None = None,
+) -> DispatchRuntimeEvidence:
+    return {
+        "state": state,
+        "detail": detail,
+        "cwd": cwd,
+        "branch": branch,
+        "blocker": blocker,
+    }
+
+
+def _agent_label(item: dict[str, Any], key: str) -> str | None:
+    labels = item.get("labels") or item.get("Labels") or {}
+    if isinstance(labels, dict):
+        value = labels.get(key)
+        return str(value) if value is not None else None
+    for label in labels if isinstance(labels, list) else []:
+        if isinstance(label, str) and label.startswith(f"{key}="):
+            return label.split("=", 1)[1]
+        if isinstance(label, dict) and label.get("key") == key:
+            return str(label.get("value"))
+    return None
+
+
 def _verified_dispatch_runtime(
-    dispatch: dict[str, Any], paseo: Paseo, integration_branch: str
-) -> tuple[dict[str, Any] | None, Path | None, str | None, str | None]:
-    """Read back the exact Agent, Workspace, and branch bound to a Dispatch."""
+    dispatch: dict[str, Any],
+    paseo: Paseo,
+    integration_branch: str,
+    *,
+    candidate_sha: str | None = None,
+) -> DispatchRuntimeEvidence:
+    """Classify exact runtime evidence, including host-first auto-archive."""
 
     dispatch_id = dispatch.get("id")
     expected_agent = dispatch.get("worker_agent_id")
@@ -1001,45 +1047,68 @@ def _verified_dispatch_runtime(
     try:
         issue_number = core.dispatch_issue(dispatch_id)
     except core.PolicyError:
-        return None, None, None, "dispatch-identity-mismatch"
+        return _runtime_evidence("invalid", blocker="dispatch-identity-mismatch")
     if (
         not expected_agent
         or not expected_workspace
         or expected_branch != f"work/issue-{issue_number}"
         or expected_branch == integration_branch
     ):
-        return None, None, None, "dispatch-identity-mismatch"
+        return _runtime_evidence("invalid", blocker="dispatch-identity-mismatch")
     matches = paseo.agents_for_dispatch(dispatch_id)
     if len(matches) != 1:
-        return (
-            None,
-            None,
-            None,
-            "agent-identity-unknown" if not matches else "duplicate-dispatch-agent",
+        return _runtime_evidence(
+            "invalid",
+            blocker="agent-identity-unknown"
+            if not matches
+            else "duplicate-dispatch-agent",
         )
-    detail = paseo.inspect(matches[0]["id"])
+    match = matches[0]
+    detail = paseo.inspect(match["id"])
     cwd = _expand_cwd(detail.get("Cwd"))
     actual_worktree = detail.get("Worktree")
     actual_workspace = (
         actual_worktree.get("Id") if isinstance(actual_worktree, dict) else None
     )
-    if detail.get("Id") != expected_agent or not cwd or not cwd.is_dir():
-        return None, None, None, "dispatch-identity-mismatch"
-    actual_branch = _git_at(cwd, "branch", "--show-current").strip()
-    if actual_branch != expected_branch:
-        return None, None, None, "dispatch-identity-mismatch"
+    if detail.get("Id") != expected_agent:
+        return _runtime_evidence("invalid", blocker="dispatch-identity-mismatch")
     if actual_workspace is not None and actual_workspace != expected_workspace:
-        return None, None, None, "dispatch-identity-mismatch"
-    if actual_workspace is None:
-        registered = [
-            worktree
-            for worktree in _runtime_worktrees()
-            if worktree.get("branch") == expected_branch
-            and _expand_cwd(worktree.get("path")) == cwd
-        ]
-        if len(registered) != 1:
-            return None, None, None, "dispatch-identity-mismatch"
-    return detail, cwd, actual_branch, None
+        return _runtime_evidence("invalid", blocker="dispatch-identity-mismatch")
+
+    if cwd and cwd.is_dir():
+        actual_branch = _git_at(cwd, "branch", "--show-current").strip()
+        if actual_branch != expected_branch:
+            return _runtime_evidence("invalid", blocker="dispatch-identity-mismatch")
+        if actual_workspace is None:
+            registered = [
+                worktree
+                for worktree in _runtime_worktrees()
+                if worktree.get("branch") == expected_branch
+                and _expand_cwd(worktree.get("path")) == cwd
+            ]
+            if len(registered) != 1:
+                return _runtime_evidence(
+                    "invalid", blocker="dispatch-identity-mismatch"
+                )
+        return _runtime_evidence(
+            "present", detail=detail, cwd=cwd, branch=actual_branch
+        )
+
+    dispatch_label = (
+        _agent_label(match, "orch.dispatch")
+        or _agent_label(detail, "orch.dispatch")
+        or match.get("_matched_dispatch_label")
+    )
+    auto_archive_proven = bool(
+        detail.get("Archived")
+        and dispatch_label == dispatch_id
+        and dispatch.get("status") == "merged"
+        and re.fullmatch(r"[0-9a-fA-F]{40}", str(candidate_sha or ""))
+        and dispatch.get("candidate_sha") == candidate_sha
+    )
+    if auto_archive_proven:
+        return _runtime_evidence("auto_archived", detail=detail, branch=expected_branch)
+    return _runtime_evidence("invalid", blocker="dispatch-identity-mismatch")
 
 
 def _cleanup_after_merge(
@@ -1053,17 +1122,6 @@ def _cleanup_after_merge(
     dispatch_id = dispatch.get("id")
     if not dispatch_id:
         return {"actions": [], "manual_cleanup": [], "blockers": ["dispatch-missing"]}
-    paseo = Paseo()
-    detail, cwd, branch, identity_blocker = _verified_dispatch_runtime(
-        dispatch, paseo, integration_branch
-    )
-    if identity_blocker:
-        return {
-            "actions": [],
-            "manual_cleanup": [],
-            "blockers": [identity_blocker],
-        }
-    assert detail is not None and cwd is not None and branch is not None
     candidate_sha = (issue.get("pr") or {}).get("head_sha")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", str(candidate_sha or "")):
         return {
@@ -1071,18 +1129,55 @@ def _cleanup_after_merge(
             "manual_cleanup": [],
             "blockers": ["cleanup-candidate-unknown"],
         }
-    if _git_at(cwd, "rev-parse", "HEAD").strip() != candidate_sha:
+    recorded_candidate = dispatch.get("candidate_sha")
+    if recorded_candidate is not None and recorded_candidate != candidate_sha:
         return {
             "actions": [],
             "manual_cleanup": [],
-            "blockers": ["local-head-not-merged-candidate"],
+            "blockers": ["cleanup-candidate-mismatch"],
         }
+    paseo = Paseo()
+    evidence = _verified_dispatch_runtime(
+        dispatch,
+        paseo,
+        integration_branch,
+        candidate_sha=candidate_sha,
+    )
+    if evidence["state"] == "invalid":
+        return {
+            "actions": [],
+            "manual_cleanup": [],
+            "blockers": [evidence["blocker"]],
+        }
+    branch = evidence["branch"]
+    assert branch is not None
     remote_sha = github.remote_branch_sha(repo, branch)
     if remote_sha not in {None, candidate_sha}:
         return {
             "actions": [],
             "manual_cleanup": [],
             "blockers": ["remote-branch-has-unmerged-wip"],
+        }
+    if evidence["state"] == "auto_archived":
+        completed: list[dict[str, Any]] = []
+        if remote_sha == candidate_sha:
+            github.delete_remote_branch(repo, branch, candidate_sha)
+            completed.append({"type": "delete_branch", "branch": branch})
+        return {
+            "actions": completed,
+            "manual_cleanup": [],
+            "blockers": [],
+            "runtime_evidence": "auto_archived",
+        }
+
+    detail = evidence["detail"]
+    cwd = evidence["cwd"]
+    assert detail is not None and cwd is not None
+    if _git_at(cwd, "rev-parse", "HEAD").strip() != candidate_sha:
+        return {
+            "actions": [],
+            "manual_cleanup": [],
+            "blockers": ["local-head-not-merged-candidate"],
         }
     worker = {
         "agent_id": detail.get("Id"),
@@ -1206,16 +1301,24 @@ def _retire_stopped_dispatch(
 ) -> dict[str, Any]:
     dispatch = issue.get("dispatch") or {}
     paseo = Paseo()
-    detail, cwd, branch, identity_blocker = _verified_dispatch_runtime(
-        dispatch, paseo, integration_branch
-    )
-    if identity_blocker:
+    evidence = _verified_dispatch_runtime(dispatch, paseo, integration_branch)
+    if evidence["state"] == "invalid":
         return {
             "actions": [],
             "manual_cleanup": [],
-            "blockers": [identity_blocker],
+            "blockers": [evidence["blocker"]],
             "retirement_verified": False,
         }
+    if evidence["state"] == "auto_archived":
+        return {
+            "actions": [],
+            "manual_cleanup": [],
+            "blockers": [],
+            "retirement_verified": True,
+        }
+    detail = evidence["detail"]
+    cwd = evidence["cwd"]
+    branch = evidence["branch"]
     assert detail is not None and cwd is not None and branch is not None
     agent_id = detail.get("Id")
     parent_id = detail.get("ParentAgentId")
@@ -1337,6 +1440,23 @@ def _dedupe_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _persist_record_updates(
+    github: GitHub,
+    repository: str,
+    snapshot: dict[str, Any],
+    updates: list[dict[str, Any]],
+) -> None:
+    by_number = {int(issue["number"]): issue for issue in snapshot.get("issues") or []}
+    for update in updates:
+        issue = by_number[int(update["issue"])]
+        issue["dispatch"] = update["dispatch"]
+        github.update_record(repository, issue)
+        state = update.get("state")
+        if state and issue.get("state") != state:
+            github.set_issue_state(repository, int(issue["number"]), state)
+            issue["state"] = state
+
+
 def _materialize_worker_wave(
     actions: list[dict[str, Any]],
     *,
@@ -1392,10 +1512,9 @@ def _materialize_worker_wave(
 def _repository_config(config: dict[str, Any], repo: str) -> dict[str, Any]:
     global_config = config.get("global") or {}
     configured = dict((config.get("repositories") or {}).get(repo) or {})
-    return {
+    resolved = {
         **configured,
         "repository": repo,
-        "integration_branch": configured.get("integration_branch", "dev"),
         "merge_method": configured.get("merge_method", "squash"),
         "worker_slots": configured.get(
             "worker_slots", global_config.get("worker_slots", 3)
@@ -1404,6 +1523,9 @@ def _repository_config(config: dict[str, Any], repo: str) -> dict[str, Any]:
             "max_attempts", global_config.get("max_attempts", 2)
         ),
     }
+    if configured.get("integration_branch"):
+        resolved["integration_branch"] = configured["integration_branch"]
+    return resolved
 
 
 def _load_config(path: Path, *, write_migration: bool = True) -> dict[str, Any]:
@@ -1447,6 +1569,95 @@ def _paseo_current() -> tuple[dict[str, Any], dict[str, Any]]:
         "cwd": payload.get("Cwd"),
     }
     return runtime, identity
+
+
+def _same_path(left: Any, right: Any) -> bool:
+    if not isinstance(left, str) or not isinstance(right, (str, Path)):
+        return False
+    return os.path.normcase(
+        os.path.abspath(os.path.expanduser(left))
+    ) == os.path.normcase(os.path.abspath(os.path.expanduser(str(right))))
+
+
+def _coordinator_preflight(
+    args: argparse.Namespace, config: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read back and validate Coordinator authority before constructing GitHub."""
+
+    source = getattr(args, "coordinator_context", None)
+    if not source:
+        raise core.PolicyError(
+            "COORDINATOR_CONTEXT_REQUIRED",
+            "--coordinator-context is required for state-changing commands",
+        )
+    context = _read_json(source)
+    if not isinstance(context, dict):
+        raise core.PolicyError(
+            "COORDINATOR_CONTEXT_INVALID", "Coordinator context must be an object"
+        )
+    runtime, identity = _paseo_current()
+    actor = context.get("actor") or {}
+    if identity.get("workspace_id") is not None and identity.get(
+        "workspace_id"
+    ) != actor.get("workspace_id"):
+        raise core.PolicyError(
+            "COORDINATOR_WORKSPACE_MISMATCH",
+            "Paseo Actor and supplied Workspace disagree",
+        )
+    top_level = Path(
+        _run([_tool("git", "ORCH_GIT_PATH"), "rev-parse", "--show-toplevel"]).strip()
+    ).resolve()
+    if not _same_path(identity.get("cwd"), top_level):
+        raise core.PolicyError(
+            "COORDINATOR_CWD_MISMATCH", "Paseo cwd and Git worktree disagree"
+        )
+    entry = core.plan_coordinator_entry(
+        context,
+        _repository_config(config, args.repo),
+        expected_actor_id=runtime["agent_id"],
+        expected_cwd=str(top_level),
+    )
+    branch = entry["repository_config"]["integration_branch"]
+    try:
+        _run(
+            [
+                _tool("git", "ORCH_GIT_PATH"),
+                "ls-remote",
+                "--exit-code",
+                "--heads",
+                "origin",
+                f"refs/heads/{branch}",
+            ]
+        )
+    except CommandError as error:
+        raise core.PolicyError(
+            "INTEGRATION_BRANCH_REQUIRED",
+            f"remote integration branch was not read back: {branch}",
+        ) from error
+    return entry["repository_config"], entry
+
+
+def _resolved_read_only_config(
+    args: argparse.Namespace, config: dict[str, Any]
+) -> dict[str, Any]:
+    repo_config = _repository_config(config, args.repo)
+    if repo_config.get("integration_branch"):
+        return repo_config
+    source = getattr(args, "coordinator_context", None)
+    if not source:
+        raise core.PolicyError(
+            "INTEGRATION_BRANCH_REQUIRED",
+            "configure integration_branch or provide Coordinator readback",
+        )
+    context = _read_json(source)
+    if not isinstance(context, dict):
+        raise core.PolicyError(
+            "COORDINATOR_CONTEXT_INVALID", "Coordinator context must be an object"
+        )
+    repo_config["integration_branch"] = core.resolve_integration_branch(
+        repo_config, context
+    )
+    return repo_config
 
 
 def _remote_repository() -> str:
@@ -1567,7 +1778,27 @@ def _prepare_snapshot(
         original = {issue["number"]: issue for issue in snapshot["issues"]}
         for issue in observed["issues"]:
             if issue.get("dispatch") != original[issue["number"]].get("dispatch"):
-                github.update_record(repo, issue)
+                dispatch = issue.get("dispatch") or {}
+                desired_state = None
+                if (
+                    dispatch.get("parked") is True
+                    or dispatch.get("status") == "blocked"
+                ):
+                    desired_state = "blocked"
+                elif dispatch.get("status") in {"running", "resuming"}:
+                    desired_state = "active"
+                _persist_record_updates(
+                    github,
+                    repo,
+                    observed,
+                    [
+                        {
+                            "issue": int(issue["number"]),
+                            "dispatch": dispatch,
+                            "state": desired_state,
+                        }
+                    ],
+                )
     return observed, runtime
 
 
@@ -1586,7 +1817,14 @@ def _plan_recoveries(
         if issue.get("state") != "active":
             continue
         dispatch = issue.get("dispatch") or {}
-        if dispatch.get("status") == "claiming":
+        if dispatch.get("status") in {
+            "claiming",
+            "parking",
+            "resuming",
+            "blocked",
+            "retired",
+            "merged",
+        }:
             continue
         worker_id = dispatch.get("worker_agent_id")
         agent = by_id.get(worker_id)
@@ -1639,6 +1877,12 @@ def _plan_recoveries(
 
 def _reconcile(args: argparse.Namespace) -> dict[str, Any]:
     observations = _observations(args.observations)
+    lifecycle_command = "park" if getattr(args, "park", None) else None
+    if getattr(args, "resume", None):
+        lifecycle_command = "resume"
+    lifecycle_dispatch = (
+        getattr(args, lifecycle_command, None) if lifecycle_command else None
+    )
     if args.snapshot:
         snapshot = _read_json(args.snapshot)
         if snapshot.get("repository") not in {None, args.repo}:
@@ -1647,9 +1891,23 @@ def _reconcile(args: argparse.Namespace) -> dict[str, Any]:
             )
         snapshot["repository"] = args.repo
         snapshot = core.apply_observations(snapshot, observations)
+        if lifecycle_command:
+            lifecycle = core.plan_lifecycle_command(
+                snapshot, lifecycle_dispatch, lifecycle_command
+            )
+            return {
+                "schema_version": 1,
+                "status": lifecycle["status"],
+                "actions": lifecycle["actions"],
+                "warnings": lifecycle["warnings"],
+                "summary": {"record_updates": lifecycle["record_updates"]},
+            }
         result = core.plan_reconcile(snapshot)
         partial = core.plan_partial_dispatch(snapshot)
-        result["actions"] = _dedupe_actions([*result["actions"], *partial["actions"]])
+        lifecycle = core.plan_lifecycle_transitions(snapshot)
+        result["actions"] = _dedupe_actions(
+            [*result["actions"], *partial["actions"], *lifecycle["actions"]]
+        )
         result["warnings"].extend(partial["warnings"])
         result["status"] = "actions" if result["actions"] else result["status"]
         if partial["record_updates"]:
@@ -1657,19 +1915,29 @@ def _reconcile(args: argparse.Namespace) -> dict[str, Any]:
         return result
 
     config = _load_config(args.config, write_migration=False)
-    repo_config = _repository_config(config, args.repo)
-    github = GitHub()
     if args.read_only:
+        if lifecycle_command:
+            raise core.PolicyError(
+                "LIFECYCLE_REQUIRES_WRITE", "Park/Resume cannot run read-only"
+            )
+        repo_config = _resolved_read_only_config(args, config)
+        github = GitHub()
         snapshot, runtime = _prepare_snapshot(
             github, args.repo, repo_config, observations, mutate=False
         )
         planned = core.plan_reconcile(snapshot)
         partial = core.plan_partial_dispatch(snapshot)
+        lifecycle = core.plan_lifecycle_transitions(snapshot)
         recovery_actions, recovery_warnings = _plan_recoveries(
             snapshot, repo_config, runtime, github, mutate=False
         )
         planned["actions"] = _dedupe_actions(
-            [*planned["actions"], *partial["actions"], *recovery_actions]
+            [
+                *planned["actions"],
+                *partial["actions"],
+                *lifecycle["actions"],
+                *recovery_actions,
+            ]
         )
         planned["warnings"].extend(recovery_warnings)
         planned["warnings"].extend(partial["warnings"])
@@ -1691,26 +1959,52 @@ def _reconcile(args: argparse.Namespace) -> dict[str, Any]:
             planned["summary"]["pending_record_updates"] = len(
                 partial["record_updates"]
             )
+        if lifecycle["record_updates"]:
+            planned["summary"]["pending_lifecycle_updates"] = len(
+                lifecycle["record_updates"]
+            )
         planned["status"] = "actions" if planned["actions"] else planned["status"]
         return planned
 
+    repo_config, entry = _coordinator_preflight(args, config)
+    if entry["status"] == "forwarded":
+        return entry
+    github = GitHub()
     with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
         snapshot, runtime = _prepare_snapshot(
             github, args.repo, repo_config, observations, mutate=True
         )
+        if lifecycle_command:
+            lifecycle = core.plan_lifecycle_command(
+                snapshot, lifecycle_dispatch, lifecycle_command
+            )
+            _persist_record_updates(
+                github, args.repo, snapshot, lifecycle["record_updates"]
+            )
+            return {
+                "schema_version": 1,
+                "status": lifecycle["status"],
+                "actions": lifecycle["actions"],
+                "warnings": lifecycle["warnings"],
+                "summary": {
+                    "dispatch": lifecycle_dispatch,
+                    "record_updates": len(lifecycle["record_updates"]),
+                },
+            }
         config = _load_config(args.config, write_migration=True)
-        repo_config = _repository_config(config, args.repo)
+        refreshed = _repository_config(config, args.repo)
+        refreshed.setdefault("integration_branch", repo_config["integration_branch"])
+        repo_config = refreshed
         recovery_actions, recovery_warnings = _plan_recoveries(
             snapshot, repo_config, runtime, github, mutate=True
         )
         planned = core.plan_reconcile(snapshot)
         partial = core.plan_partial_dispatch(snapshot)
-        for update in partial["record_updates"]:
-            issue = next(
-                item for item in snapshot["issues"] if item["number"] == update["issue"]
-            )
-            issue["dispatch"] = update["dispatch"]
-            github.update_record(args.repo, issue)
+        lifecycle = core.plan_lifecycle_transitions(snapshot)
+        _persist_record_updates(
+            github, args.repo, snapshot, lifecycle["record_updates"]
+        )
+        _persist_record_updates(github, args.repo, snapshot, partial["record_updates"])
         raw_actions = _dedupe_actions([*planned["actions"], *partial["actions"]])
         issues_by_number = {issue["number"]: issue for issue in snapshot["issues"]}
         materialized, materialization_warnings = _materialize_worker_wave(
@@ -1723,6 +2017,7 @@ def _reconcile(args: argparse.Namespace) -> dict[str, Any]:
             runtime=runtime,
             github=github,
         )
+        materialized.extend(lifecycle["actions"])
         recovery_creates = [
             action for action in recovery_actions if action["type"] == "create_worker"
         ]
@@ -1780,7 +2075,9 @@ def _integrate(args: argparse.Namespace) -> dict[str, Any]:
     if args.snapshot:
         return core.plan_integration(_read_json(args.snapshot))
     config = _load_config(args.config, write_migration=False)
-    repo_config = _repository_config(config, args.repo)
+    repo_config, entry = _coordinator_preflight(args, config)
+    if entry["status"] == "forwarded":
+        return entry
     if repo_config["integration_branch"] == "main":
         raise core.PolicyError(
             "MAIN_RELEASE_REQUIRES_EXPLICIT_REQUEST",
@@ -1794,7 +2091,9 @@ def _integrate(args: argparse.Namespace) -> dict[str, Any]:
         workspace = snapshot["coordinator_workspace"]
         core.qualify_workspace(workspace, repo_config, operation="integrate")
         config = _load_config(args.config, write_migration=True)
-        repo_config = _repository_config(config, args.repo)
+        refreshed = _repository_config(config, args.repo)
+        refreshed.setdefault("integration_branch", repo_config["integration_branch"])
+        repo_config = refreshed
         matching = [
             issue
             for issue in snapshot["issues"]
@@ -1912,9 +2211,11 @@ def _retire(args: argparse.Namespace) -> dict[str, Any]:
     if args.snapshot:
         return core.plan_retirement(_read_json(args.snapshot))
     issue_number = core.dispatch_issue(args.dispatch)
-    github = GitHub()
     config = _load_config(args.config, write_migration=False)
-    repo_config = _repository_config(config, args.repo)
+    repo_config, entry = _coordinator_preflight(args, config)
+    if entry["status"] == "forwarded":
+        return entry
+    github = GitHub()
     with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
         _prepare_snapshot(github, args.repo, repo_config, [], mutate=True)
         view = json.loads(
@@ -1949,7 +2250,9 @@ def _retire(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
         config = _load_config(args.config, write_migration=True)
-        repo_config = _repository_config(config, args.repo)
+        refreshed = _repository_config(config, args.repo)
+        refreshed.setdefault("integration_branch", repo_config["integration_branch"])
+        repo_config = refreshed
         runtime, _ = _paseo_current()
         preflight = _retire_stopped_dispatch(
             issue,
@@ -1986,7 +2289,9 @@ def _retire(args: argparse.Namespace) -> dict[str, Any]:
 
 def _project(args: argparse.Namespace) -> dict[str, Any]:
     config = _load_config(args.config, write_migration=False)
-    repo_config = _repository_config(config, args.repo)
+    repo_config, entry = _coordinator_preflight(args, config)
+    if entry["status"] == "forwarded":
+        return entry
     number = repo_config.get("project_number")
     owner = repo_config.get("project_owner") or args.repo.split("/", 1)[0]
     try:
@@ -1994,7 +2299,11 @@ def _project(args: argparse.Namespace) -> dict[str, Any]:
         with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
             _prepare_snapshot(github, args.repo, repo_config, [], mutate=True)
             config = _load_config(args.config, write_migration=True)
-            repo_config = _repository_config(config, args.repo)
+            refreshed = _repository_config(config, args.repo)
+            refreshed.setdefault(
+                "integration_branch", repo_config["integration_branch"]
+            )
+            repo_config = refreshed
             labels = github.project_labels(args.repo)
             if not number:
                 return {
@@ -2051,21 +2360,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     reconcile.add_argument("--repo", required=True)
     reconcile.add_argument("--read-only", action="store_true")
     reconcile.add_argument("--observations")
+    lifecycle = reconcile.add_mutually_exclusive_group()
+    lifecycle.add_argument("--park")
+    lifecycle.add_argument("--resume")
+    reconcile.add_argument("--coordinator-context")
     reconcile.add_argument("--snapshot", help=argparse.SUPPRESS)
     reconcile.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     integrate = commands.add_parser("integrate")
     integrate.add_argument("--repo", required=True)
     integrate.add_argument("--pr", required=True, type=int)
+    integrate.add_argument("--coordinator-context")
     integrate.add_argument("--snapshot", help=argparse.SUPPRESS)
     integrate.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     retire = commands.add_parser("retire")
     retire.add_argument("--repo", required=True)
     retire.add_argument("--dispatch", required=True)
+    retire.add_argument("--coordinator-context")
     retire.add_argument("--snapshot", help=argparse.SUPPRESS)
     retire.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     project = commands.add_parser("project")
     project.add_argument("operation", choices=("init", "sync"))
     project.add_argument("--repo", required=True)
+    project.add_argument("--coordinator-context")
     project.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     return parser.parse_args(argv)
 

@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Literal, NotRequired, TypedDict
 
 
 PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
@@ -34,8 +34,64 @@ class PolicyError(ValueError):
         self.code = code
 
 
+class CoordinatorActor(TypedDict):
+    id: str
+    cwd: str
+    workspace_id: str
+    provider: str
+    settings: dict[str, Any]
+
+
+class CoordinatorMode(TypedDict):
+    collaboration_mode: str
+    write_capable: bool
+    colorTier: NotRequired[str]
+
+
+class CoordinatorContext(TypedDict):
+    schema_version: Literal[1]
+    actor: CoordinatorActor
+    current_workspace: dict[str, Any]
+    candidate_workspaces: list[dict[str, Any]]
+    mode: CoordinatorMode
+    features: dict[str, Any]
+    remote_branches: list[str]
+    active_root_agents: list[dict[str, Any]]
+    request: str
+
+
+class LifecycleAction(TypedDict):
+    action_id: str
+    type: Literal["stop_worker", "resume_worker"]
+    dispatch_id: str
+    agent_id: str
+    message: NotRequired[str]
+
+
+class LifecycleRecordUpdate(TypedDict):
+    issue: int
+    state: str
+    dispatch: dict[str, Any]
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _validate_lifecycle_observation_identity(
+    dispatch: dict[str, Any], observation: dict[str, Any]
+) -> None:
+    for source, target in (
+        ("agent_id", "worker_agent_id"),
+        ("workspace_id", "workspace_id"),
+        ("branch", "branch"),
+    ):
+        observed = observation.get(source)
+        if observed and observed != dispatch.get(target):
+            raise PolicyError(
+                "OBSERVATION_IDENTITY_CONFLICT",
+                f"lifecycle observation conflicts on {target}",
+            )
 
 
 def apply_observations(
@@ -47,7 +103,7 @@ def apply_observations(
         return snapshot
     updated = dict(snapshot)
     issues = [dict(issue) for issue in snapshot.get("issues") or []]
-    runtime_agents = list(snapshot.get("runtime_agents") or [])
+    runtime_agents = [dict(agent) for agent in snapshot.get("runtime_agents") or []]
     by_action: dict[str, dict[str, Any]] = {}
     for observation in observations:
         action_id = observation.get("action_id")
@@ -90,6 +146,83 @@ def apply_observations(
                     }
                 )
             consumed.add(action_id)
+
+        current_dispatch = issue.get("dispatch") or {}
+        lifecycle = None
+        if current_dispatch.get("status") == "parking":
+            lifecycle = "park"
+        elif current_dispatch.get("status") == "resuming":
+            lifecycle = "resume"
+        if lifecycle:
+            lifecycle_action_id = f"{lifecycle}-{current_dispatch['id']}"
+            if lifecycle_action_id in by_action:
+                observation = by_action[lifecycle_action_id]
+                if observation.get("status") not in {"succeeded", "failed"}:
+                    raise PolicyError(
+                        "OBSERVATION_STATUS_INVALID", "observation status invalid"
+                    )
+                _validate_lifecycle_observation_identity(current_dispatch, observation)
+                transitioned = dict(current_dispatch)
+                if observation["status"] == "succeeded":
+                    if lifecycle == "park":
+                        transitioned.update(
+                            {
+                                "status": "blocked",
+                                "parked": True,
+                                "parked_at": utc_now(),
+                            }
+                        )
+                    else:
+                        transitioned.update(
+                            {
+                                "status": "running",
+                                "parked": False,
+                                "resumed_at": utc_now(),
+                            }
+                        )
+                    transitioned.pop("last_error", None)
+                else:
+                    transitioned.update(
+                        {
+                            "status": "running" if lifecycle == "park" else "blocked",
+                            "parked": lifecycle == "resume",
+                            "last_error": observation.get("error")
+                            or f"{lifecycle} action failed",
+                        }
+                    )
+                issue["dispatch"] = transitioned
+                for agent in runtime_agents:
+                    if agent.get("id") == transitioned.get("worker_agent_id"):
+                        agent["state"] = (
+                            "idle" if transitioned.get("parked") is True else "running"
+                        )
+                consumed.add(lifecycle_action_id)
+            continue
+
+        completed_lifecycle = None
+        if (
+            current_dispatch.get("status") == "blocked"
+            and current_dispatch.get("parked") is True
+            and current_dispatch.get("parked_at")
+        ):
+            completed_lifecycle = "park"
+        elif (
+            current_dispatch.get("status") == "running"
+            and current_dispatch.get("parked") is False
+            and current_dispatch.get("resumed_at")
+        ):
+            completed_lifecycle = "resume"
+        if completed_lifecycle:
+            completed_action_id = f"{completed_lifecycle}-{current_dispatch['id']}"
+            if completed_action_id in by_action:
+                observation = by_action[completed_action_id]
+                if observation.get("status") != "succeeded":
+                    raise PolicyError(
+                        "OBSERVATION_STATUS_STALE",
+                        "completed lifecycle only accepts duplicate success",
+                    )
+                _validate_lifecycle_observation_identity(current_dispatch, observation)
+                consumed.add(completed_action_id)
 
     reviewer_actions = {
         action["action_id"]: action
@@ -445,6 +578,240 @@ def _agent_dispatch_label(agent: dict[str, Any]) -> str | None:
             if isinstance(label, str) and label.startswith("gwo.dispatch="):
                 return label.split("=", 1)[1]
     return None
+
+
+_STOPPED_AGENT_STATES = {"idle", "stopped", "closed", "finished", "completed"}
+
+
+def _dispatch_runtime_agent(
+    snapshot: dict[str, Any], dispatch: dict[str, Any]
+) -> dict[str, Any]:
+    dispatch_id = dispatch.get("id")
+    matches = [
+        agent
+        for agent in snapshot.get("runtime_agents") or []
+        if _agent_dispatch_label(agent) == dispatch_id
+    ]
+    if len(matches) != 1:
+        raise PolicyError(
+            "WORKER_IDENTITY_INVALID",
+            f"expected one runtime Worker for {dispatch_id}",
+        )
+    agent = matches[0]
+    for runtime_key, dispatch_key in (
+        ("id", "worker_agent_id"),
+        ("workspace_id", "workspace_id"),
+        ("branch", "branch"),
+    ):
+        if not dispatch.get(dispatch_key) or agent.get(runtime_key) != dispatch.get(
+            dispatch_key
+        ):
+            raise PolicyError(
+                "WORKER_IDENTITY_INVALID",
+                f"runtime Worker conflicts on {dispatch_key}",
+            )
+    if str(agent.get("state") or "").lower() == "archived":
+        raise PolicyError(
+            "WORKER_NOT_RESUMABLE", "parked Worker was unexpectedly archived"
+        )
+    return agent
+
+
+def _lifecycle_action(dispatch: dict[str, Any], command: str) -> LifecycleAction:
+    dispatch_id = dispatch["id"]
+    if command == "park":
+        return {
+            "action_id": f"park-{dispatch_id}",
+            "type": "stop_worker",
+            "dispatch_id": dispatch_id,
+            "agent_id": dispatch["worker_agent_id"],
+        }
+    return {
+        "action_id": f"resume-{dispatch_id}",
+        "type": "resume_worker",
+        "dispatch_id": dispatch_id,
+        "agent_id": dispatch["worker_agent_id"],
+        "message": (
+            f"Resume Dispatch {dispatch_id} from its unchanged contract and "
+            "preserved WIP."
+        ),
+    }
+
+
+def _lifecycle_update(
+    issue: dict[str, Any], dispatch: dict[str, Any], *, state: str
+) -> LifecycleRecordUpdate:
+    return {
+        "issue": int(issue["number"]),
+        "state": state,
+        "dispatch": dispatch,
+    }
+
+
+def plan_lifecycle_transitions(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Recover interrupted Park/Resume actions from durable state and readback."""
+
+    actions: list[LifecycleAction] = []
+    updates: list[LifecycleRecordUpdate] = []
+    for issue in snapshot.get("issues") or []:
+        dispatch = dict(issue.get("dispatch") or {})
+        status = dispatch.get("status")
+        if status not in {"parking", "resuming"}:
+            continue
+        agent = _dispatch_runtime_agent(snapshot, dispatch)
+        agent_state = str(agent.get("state") or "").lower()
+        if status == "parking" and agent_state in _STOPPED_AGENT_STATES:
+            dispatch.update(
+                {"status": "blocked", "parked": True, "parked_at": utc_now()}
+            )
+            updates.append(_lifecycle_update(issue, dispatch, state="blocked"))
+            continue
+        if status == "resuming" and agent_state in {"running", "busy"}:
+            dispatch.update(
+                {"status": "running", "parked": False, "resumed_at": utc_now()}
+            )
+            updates.append(_lifecycle_update(issue, dispatch, state="active"))
+            continue
+        command = "park" if status == "parking" else "resume"
+        actions.append(_lifecycle_action(dispatch, command))
+    return {
+        "schema_version": 1,
+        "status": "actions" if actions else "idle",
+        "actions": actions,
+        "record_updates": updates,
+        "warnings": [],
+    }
+
+
+def _validate_resume(
+    snapshot: dict[str, Any], issue: dict[str, Any], dispatch: dict[str, Any]
+) -> None:
+    try:
+        contract = validate_contract(issue.get("contract") or {})
+    except PolicyError as error:
+        raise PolicyError("RESUME_CONTRACT_INVALID", str(error)) from error
+    if issue.get("contract_valid") is not True or dispatch.get(
+        "contract_sha256"
+    ) != contract.get("sha256"):
+        raise PolicyError("RESUME_CONTRACT_INVALID", "parked Dispatch contract changed")
+    if dispatch.get("base_sha") != snapshot.get("base_sha"):
+        raise PolicyError("RESUME_BASE_DRIFT", "integration base changed while parked")
+    closed = set(snapshot.get("closed_issues") or [])
+    if any(dependency not in closed for dependency in contract["dependencies"]):
+        raise PolicyError(
+            "RESUME_DEPENDENCY_BLOCKED", "a Dispatch dependency is no longer closed"
+        )
+    others = [
+        candidate
+        for candidate in snapshot.get("issues") or []
+        if candidate.get("number") != issue.get("number") and _counts_as_wip(candidate)
+    ]
+    slots = int(snapshot.get("worker_slots", 3))
+    if len(others) >= slots:
+        raise PolicyError("RESUME_CAPACITY_FULL", "no Worker Slot is available")
+    hotset = list(contract.get("hotset") or [])
+    if (
+        (_exclusive_hotset(hotset) and others)
+        or any(_exclusive_hotset(other.get("hotset")) for other in others)
+        or any(_hotsets_overlap(hotset, other.get("hotset") or []) for other in others)
+    ):
+        raise PolicyError(
+            "RESUME_HOTSET_CONFLICT", "parked Dispatch Hotset now conflicts"
+        )
+
+
+def plan_lifecycle_command(
+    snapshot: dict[str, Any], dispatch_id: str, command: str
+) -> dict[str, Any]:
+    """Start or idempotently continue one Human Park/Resume command."""
+
+    _dispatch_issue(dispatch_id)
+    if command not in {"park", "resume"}:
+        raise PolicyError("LIFECYCLE_COMMAND_INVALID", "unknown lifecycle command")
+    matches = [
+        issue
+        for issue in snapshot.get("issues") or []
+        if (issue.get("dispatch") or {}).get("id") == dispatch_id
+    ]
+    if len(matches) != 1:
+        raise PolicyError("DISPATCH_NOT_MANAGED", "Dispatch record not found")
+    issue = matches[0]
+    dispatch = dict(issue["dispatch"])
+    if (command == "park" and dispatch.get("status") == "parking") or (
+        command == "resume" and dispatch.get("status") == "resuming"
+    ):
+        return plan_lifecycle_transitions(snapshot)
+    if command == "park" and dispatch.get("parked") is True:
+        return {
+            "schema_version": 1,
+            "status": "idle",
+            "actions": [],
+            "record_updates": [],
+            "warnings": [],
+        }
+    if command == "resume" and dispatch.get("status") == "running":
+        return {
+            "schema_version": 1,
+            "status": "idle",
+            "actions": [],
+            "record_updates": [],
+            "warnings": [],
+        }
+    expected_status = "running" if command == "park" else "blocked"
+    if dispatch.get("status") != expected_status or (
+        command == "resume" and dispatch.get("parked") is not True
+    ):
+        raise PolicyError(
+            "LIFECYCLE_STATE_INVALID",
+            f"Dispatch cannot {command} from {dispatch.get('status')}",
+        )
+    agent = _dispatch_runtime_agent(snapshot, dispatch)
+    if command == "park":
+        try:
+            contract = validate_contract(issue.get("contract") or {})
+        except PolicyError as error:
+            raise PolicyError("PARK_CONTRACT_INVALID", str(error)) from error
+        dispatch["contract_sha256"] = contract["sha256"]
+    else:
+        _validate_resume(snapshot, issue, dispatch)
+    agent_state = str(agent.get("state") or "").lower()
+    if command == "park" and agent_state in _STOPPED_AGENT_STATES:
+        dispatch.update({"status": "blocked", "parked": True, "parked_at": utc_now()})
+        return {
+            "schema_version": 1,
+            "status": "idle",
+            "actions": [],
+            "record_updates": [_lifecycle_update(issue, dispatch, state="blocked")],
+            "warnings": [],
+        }
+    if command == "resume" and agent_state in {"running", "busy"}:
+        dispatch.update({"status": "running", "parked": False, "resumed_at": utc_now()})
+        return {
+            "schema_version": 1,
+            "status": "idle",
+            "actions": [],
+            "record_updates": [_lifecycle_update(issue, dispatch, state="active")],
+            "warnings": [],
+        }
+    dispatch.update(
+        {
+            "status": "parking" if command == "park" else "resuming",
+            "parked": False,
+        }
+    )
+    return {
+        "schema_version": 1,
+        "status": "actions",
+        "actions": [_lifecycle_action(dispatch, command)],
+        "record_updates": [
+            _lifecycle_update(
+                issue,
+                dispatch,
+                state="active" if command == "resume" else issue["state"],
+            )
+        ],
+        "warnings": [],
+    }
 
 
 def plan_partial_dispatch(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -1088,7 +1455,7 @@ def materialize_worker_action(
             "orch.dispatch": action["dispatch_id"],
             "orch.creator": coordinator_runtime.get("agent_id"),
             "orch.role": "worker",
-            "orch.version": "6.0.0",
+            "orch.version": "6.0.1",
         },
         "runtime_request": runtime,
         "contract": contract,
@@ -1175,7 +1542,7 @@ def materialize_reviewer_action(
             "orch.pr": str(action["pr"]),
             "orch.creator": coordinator_runtime.get("agent_id"),
             "orch.role": "reviewer",
-            "orch.version": "6.0.0",
+            "orch.version": "6.0.1",
             "orch.candidate": action["candidate_sha"],
             "orch.review-axis": action["axis"],
             "orch.action": action["action_id"],
@@ -1213,34 +1580,54 @@ def _validate_durable_value(value: Any, path: str = "record") -> None:
             )
 
 
+def _render_marker_json(marker: str, value: dict[str, Any]) -> str:
+    body = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)
+    return f"{marker}\n```json\n{body}\n```\n"
+
+
+def _parse_marker_json(
+    body: str,
+    marker: str,
+    *,
+    marker_error: str,
+    record_error: str,
+    description: str,
+) -> dict[str, Any]:
+    if body.count(marker) != 1:
+        raise PolicyError(marker_error, f"{description} marker invalid")
+    match = re.search(
+        re.escape(marker) + r"\s*```json\s*(\{.*?\})\s*```",
+        body,
+        flags=re.DOTALL,
+    )
+    if not match:
+        raise PolicyError(record_error, f"{description} record invalid")
+    try:
+        value = json.loads(match.group(1))
+    except json.JSONDecodeError as error:
+        raise PolicyError(record_error, str(error)) from error
+    if not isinstance(value, dict):
+        raise PolicyError(record_error, f"{description} record must be an object")
+    return value
+
+
 def render_issue_record(record: dict[str, Any]) -> str:
     """Render the single editable GitHub Issue record."""
 
     _validate_durable_value(record)
-    body = json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False)
-    return f"{ISSUE_MARKER}\n```json\n{body}\n```\n"
+    return _render_marker_json(ISSUE_MARKER, record)
 
 
 def parse_issue_record(body: str) -> dict[str, Any]:
     """Parse one managed Issue record and reject ambiguous duplicates."""
 
-    if body.count(ISSUE_MARKER) != 1:
-        raise PolicyError("ISSUE_RECORD_MARKER_INVALID", "managed Issue marker invalid")
-    match = re.search(
-        re.escape(ISSUE_MARKER) + r"\s*```json\s*(\{.*?\})\s*```",
+    record = _parse_marker_json(
         body,
-        flags=re.DOTALL,
+        ISSUE_MARKER,
+        marker_error="ISSUE_RECORD_MARKER_INVALID",
+        record_error="ISSUE_RECORD_INVALID",
+        description="managed Issue",
     )
-    if not match:
-        raise PolicyError("ISSUE_RECORD_INVALID", "managed Issue record is invalid")
-    try:
-        record = json.loads(match.group(1))
-    except json.JSONDecodeError as error:
-        raise PolicyError("ISSUE_RECORD_INVALID", str(error)) from error
-    if not isinstance(record, dict):
-        raise PolicyError(
-            "ISSUE_RECORD_INVALID", "managed Issue record must be an object"
-        )
     _validate_durable_value(record)
     return record
 
@@ -1296,8 +1683,7 @@ def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
 
 def render_delivery(delivery: dict[str, Any]) -> str:
     _validate_delivery_shape(delivery)
-    body = json.dumps(delivery, indent=2, sort_keys=True, ensure_ascii=False)
-    return f"{DELIVERY_MARKER}\n```json\n{body}\n```\n"
+    return _render_marker_json(DELIVERY_MARKER, delivery)
 
 
 def _validate_delivery_shape(delivery: dict[str, Any]) -> None:
@@ -1355,19 +1741,13 @@ def _validate_delivery_shape(delivery: dict[str, Any]) -> None:
 
 
 def parse_delivery(body: str) -> dict[str, Any]:
-    if body.count(DELIVERY_MARKER) != 1:
-        raise PolicyError("DELIVERY_MARKER_INVALID", "delivery marker invalid")
-    match = re.search(
-        re.escape(DELIVERY_MARKER) + r"\s*```json\s*(\{.*?\})\s*```",
+    delivery = _parse_marker_json(
         body,
-        flags=re.DOTALL,
+        DELIVERY_MARKER,
+        marker_error="DELIVERY_MARKER_INVALID",
+        record_error="DELIVERY_INVALID",
+        description="delivery",
     )
-    if not match:
-        raise PolicyError("DELIVERY_INVALID", "delivery record invalid")
-    try:
-        delivery = json.loads(match.group(1))
-    except json.JSONDecodeError as error:
-        raise PolicyError("DELIVERY_INVALID", str(error)) from error
     _validate_delivery_shape(delivery)
     return delivery
 
@@ -1437,24 +1817,17 @@ def _validate_review_shape(review: dict[str, Any]) -> None:
 
 def render_review(review: dict[str, Any]) -> str:
     _validate_review_shape(review)
-    body = json.dumps(review, indent=2, sort_keys=True, ensure_ascii=False)
-    return f"{REVIEW_MARKER}\n```json\n{body}\n```\n"
+    return _render_marker_json(REVIEW_MARKER, review)
 
 
 def parse_review(body: str) -> dict[str, Any]:
-    if body.count(REVIEW_MARKER) != 1:
-        raise PolicyError("REVIEW_MARKER_INVALID", "review marker invalid")
-    match = re.search(
-        re.escape(REVIEW_MARKER) + r"\s*```json\s*(\{.*?\})\s*```",
+    review = _parse_marker_json(
         body,
-        flags=re.DOTALL,
+        REVIEW_MARKER,
+        marker_error="REVIEW_MARKER_INVALID",
+        record_error="REVIEW_RECORD_INVALID",
+        description="review",
     )
-    if not match:
-        raise PolicyError("REVIEW_RECORD_INVALID", "review record invalid")
-    try:
-        review = json.loads(match.group(1))
-    except json.JSONDecodeError as error:
-        raise PolicyError("REVIEW_RECORD_INVALID", str(error)) from error
     _validate_review_shape(review)
     return review
 
@@ -1852,6 +2225,178 @@ def select_workspace(
     return eligible[0]
 
 
+def _stable_workspace_candidate(workspace: dict[str, Any], repository: str) -> bool:
+    return bool(
+        workspace.get("id")
+        and workspace.get("repository") == repository
+        and workspace.get("relationship") in {"root", "detached"}
+        and not workspace.get("pr_head")
+        and not workspace.get("ephemeral")
+        and not workspace.get("worker")
+    )
+
+
+def resolve_integration_branch(
+    repository_config: dict[str, Any], context: CoordinatorContext
+) -> str:
+    """Resolve an integration branch without treating ``main`` as a fallback."""
+
+    configured = repository_config.get("integration_branch")
+    if configured:
+        if not isinstance(configured, str) or configured.startswith("work/"):
+            raise PolicyError(
+                "INTEGRATION_BRANCH_INVALID", "integration branch invalid"
+            )
+        return configured
+
+    remote_branches = context.get("remote_branches")
+    candidates = context.get("candidate_workspaces")
+    current = context.get("current_workspace")
+    if not isinstance(remote_branches, list) or not isinstance(candidates, list):
+        raise PolicyError(
+            "INTEGRATION_BRANCH_REQUIRED",
+            "integration branch cannot be inferred from incomplete readback",
+        )
+    normalized_branches = {
+        str(branch).removeprefix("refs/heads/") for branch in remote_branches
+    }
+    by_id: dict[str, dict[str, Any]] = {}
+    for candidate in [current, *candidates]:
+        if isinstance(candidate, dict) and isinstance(candidate.get("id"), str):
+            by_id[candidate["id"]] = candidate
+    stable = [
+        workspace
+        for workspace in by_id.values()
+        if _stable_workspace_candidate(workspace, repository_config["repository"])
+    ]
+    if (
+        "dev" not in normalized_branches
+        or len(stable) != 1
+        or stable[0].get("branch") != "dev"
+    ):
+        raise PolicyError(
+            "INTEGRATION_BRANCH_REQUIRED",
+            "configure integration_branch or provide one stable dev Workspace",
+        )
+    return "dev"
+
+
+def _normalized_cwd(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    return value.replace("\\", "/").rstrip("/").casefold()
+
+
+def _validate_coordinator_capability(context: CoordinatorContext) -> None:
+    mode = context.get("mode")
+    features = context.get("features")
+    if not isinstance(mode, dict) or not isinstance(features, dict):
+        raise PolicyError(
+            "COORDINATOR_CAPABILITY_UNKNOWN", "Coordinator capability is unknown"
+        )
+    collaboration_mode = mode.get("collaboration_mode")
+    plan_mode = features.get("plan_mode")
+    write_capable = mode.get("write_capable")
+    color_tier = mode.get("colorTier", mode.get("color_tier"))
+    if collaboration_mode == "plan" or plan_mode is True or color_tier == "planning":
+        raise PolicyError(
+            "COORDINATOR_MODE_READ_ONLY", "Coordinator is in a planning-only mode"
+        )
+    if (
+        not isinstance(collaboration_mode, str)
+        or not isinstance(plan_mode, bool)
+        or write_capable is not True
+    ):
+        raise PolicyError(
+            "COORDINATOR_CAPABILITY_UNKNOWN",
+            "Coordinator write capability was not positively read back",
+        )
+
+
+def plan_coordinator_entry(
+    context: CoordinatorContext,
+    repository_config: dict[str, Any],
+    *,
+    expected_actor_id: str,
+    expected_cwd: str,
+) -> dict[str, Any]:
+    """Validate a write-capable Coordinator and route non-stable callers."""
+
+    if not isinstance(context, dict) or context.get("schema_version") != 1:
+        raise PolicyError(
+            "COORDINATOR_CONTEXT_INVALID", "Coordinator context schema is invalid"
+        )
+    _validate_coordinator_capability(context)
+    actor = context.get("actor")
+    current = context.get("current_workspace")
+    candidates = context.get("candidate_workspaces")
+    if not isinstance(actor, dict) or not isinstance(current, dict):
+        raise PolicyError(
+            "COORDINATOR_CONTEXT_INVALID", "Coordinator identity readback is missing"
+        )
+    if actor.get("id") != expected_actor_id:
+        raise PolicyError(
+            "COORDINATOR_IDENTITY_MISMATCH", "Coordinator Actor identity changed"
+        )
+    if _normalized_cwd(actor.get("cwd")) != _normalized_cwd(expected_cwd):
+        raise PolicyError(
+            "COORDINATOR_CWD_MISMATCH", "Coordinator cwd changed after readback"
+        )
+    if actor.get("workspace_id") != current.get("id"):
+        raise PolicyError(
+            "COORDINATOR_WORKSPACE_MISMATCH",
+            "Coordinator Actor and current Workspace disagree",
+        )
+    if not isinstance(candidates, list):
+        raise PolicyError(
+            "COORDINATOR_CONTEXT_INVALID", "candidate Workspace readback is missing"
+        )
+
+    resolved = dict(repository_config)
+    resolved["integration_branch"] = resolve_integration_branch(resolved, context)
+    selected = select_workspace(current, candidates, resolved)
+    if selected.get("id") == current.get("id"):
+        qualify_workspace(current, resolved, operation="reconcile-write")
+        return {
+            "schema_version": 1,
+            "status": "ready",
+            "actions": [],
+            "warnings": [],
+            "repository_config": resolved,
+            "summary": {"workspace_id": selected["id"]},
+        }
+
+    request = context.get("request")
+    if not isinstance(request, str) or not request.strip():
+        raise PolicyError(
+            "COORDINATOR_REQUEST_MISSING", "forwarded request is required"
+        )
+    roots = [
+        agent
+        for agent in context.get("active_root_agents") or []
+        if agent.get("workspace_id") == selected.get("id")
+    ]
+    routed = plan_nonstable_entry(
+        {
+            "request": request,
+            "target_workspace_id": selected["id"],
+            "active_root_agents": roots,
+            "caller_runtime": {
+                "provider": actor.get("provider"),
+                "settings": dict(actor.get("settings") or {}),
+            },
+        }
+    )
+    return {
+        "schema_version": 1,
+        "status": "forwarded",
+        "actions": routed["actions"],
+        "warnings": [],
+        "repository_config": resolved,
+        "summary": {"workspace_id": selected["id"]},
+    }
+
+
 def plan_nonstable_entry(snapshot: dict[str, Any]) -> dict[str, Any]:
     agents = list(snapshot.get("active_root_agents") or [])
     if len(agents) > 1:
@@ -1862,7 +2407,7 @@ def plan_nonstable_entry(snapshot: dict[str, Any]) -> dict[str, Any]:
         return {
             "actions": [
                 {
-                    "type": "send_prompt",
+                    "type": "forward_request",
                     "agent_id": agents[0]["id"],
                     "message": snapshot["request"],
                 }
@@ -1966,10 +2511,19 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             or not isinstance(settings, dict)
         ):
             raise PolicyError("REPOSITORY_CONFIG_INVALID", "repository config invalid")
-        branch = settings.get("integration_branch", "dev")
-        if not isinstance(branch, str) or not branch or branch.startswith("work/"):
+        branch = settings.get("integration_branch")
+        if branch is not None and (
+            not isinstance(branch, str) or not branch or branch.startswith("work/")
+        ):
             raise PolicyError(
                 "INTEGRATION_BRANCH_INVALID", "integration branch invalid"
+            )
+        workspace_id = settings.get("workspace_id")
+        if workspace_id is not None and (
+            not isinstance(workspace_id, str) or not workspace_id
+        ):
+            raise PolicyError(
+                "WORKSPACE_CONFIG_INVALID", "configured Workspace ID invalid"
             )
         if settings.get("worker_slots", slots) not in range(1, 6):
             raise PolicyError("WORKER_SLOTS_INVALID", "repository worker slots invalid")
