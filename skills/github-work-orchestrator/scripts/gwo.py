@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""gwo CLI: the stdlib-only GWO V7 coordination kernel entry point.
+
+Resolves caller identity from the spawn-injected ``GWO_AGENT_ID`` environment
+variable on every write and delegates state transitions to the gwo store. Each
+command is one explicit SQLite transaction; failures roll back cleanly without
+partial authority or lifecycle state. GitHub is the only durable business
+truth; the store is a rebuildable coordination cache.
+
+Invoke as ``python <skill>/scripts/gwo.py <command> ...``. State lives under
+``GWO_HOME`` (default ``~/.gwo/<repo-slug>/state.db``) in WAL mode.
+
+See docs/design/gwo-v7-architecture.md and ADRs 0007-0009.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Sequence
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import gwo_store  # type: ignore[import-not-found]  # noqa: E402
+
+
+REPOSITORY_RE = "^[^/\\s]+/[^/\\s]+$"
+
+
+def _repository(value: str) -> str:
+    import re
+
+    if not re.fullmatch(REPOSITORY_RE, value.strip()):
+        raise argparse.ArgumentTypeError("repository must be owner/repo")
+    return value.strip()
+
+
+def _store(args: argparse.Namespace) -> gwo_store.Store:
+    return gwo_store.Store.connect(args.gwo_home, args.repository)
+
+
+def _emit(payload: Any) -> None:
+    sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True))
+    sys.stdout.write("\n")
+
+
+def _fail(message: str, code: int = 1) -> int:
+    sys.stderr.write(f"error: {message}\n")
+    return code
+
+
+def cmd_coordinator(args: argparse.Namespace) -> int:
+    store = _store(args)
+    try:
+        if args.action == "claim":
+            store.claim_coordinator()
+            _emit({"repo": args.repository, "holder": store.coordinator_holder()})
+            return 0
+        if args.action == "release":
+            store.release_coordinator()
+            _emit({"repo": args.repository, "holder": None})
+            return 0
+        return _fail(f"unknown coordinator action: {args.action}")
+    except gwo_store.StoreError as error:
+        return _fail(str(error))
+    finally:
+        store.close()
+
+
+def cmd_task(args: argparse.Namespace) -> int:
+    store = _store(args)
+    try:
+        if args.action == "create":
+            task = store.create_task(
+                issue=args.issue,
+                group_label=args.group,
+                risk=args.risk,
+                hotset=args.hotset,
+                deps=args.deps,
+                created_by=args.created_by,
+            )
+            _emit(task)
+            return 0
+        if args.action == "list":
+            _emit(store.list_tasks())
+            return 0
+        if args.action == "update":
+            task = store.update_task(
+                task_id=args.task_id,
+                status=args.status,
+                hotset=args.hotset,
+                deps=args.deps,
+            )
+            _emit(task)
+            return 0
+        return _fail(f"unknown task action: {args.action}")
+    except gwo_store.StoreError as error:
+        return _fail(str(error))
+    finally:
+        store.close()
+
+
+def cmd_dispatch(args: argparse.Namespace) -> int:
+    store = _store(args)
+    try:
+        if args.action == "create":
+            dispatch = store.create_dispatch(
+                task_id=args.task_id,
+                agent_id=args.agent_id,
+                worktree=args.worktree,
+                branch=args.branch,
+                dispatched_by=args.dispatched_by,
+            )
+            _emit(dispatch)
+            return 0
+        return _fail(f"unknown dispatch action: {args.action}")
+    except gwo_store.StoreError as error:
+        return _fail(str(error))
+    finally:
+        store.close()
+
+
+def cmd_done(args: argparse.Namespace) -> int:
+    store = _store(args)
+    try:
+        dispatch = store.mark_done(
+            task_id=args.task_id,
+            dispatch_id=args.dispatch_id,
+            status=args.status,
+            actor=args.actor,
+        )
+        _emit(dispatch)
+        return 0
+    except gwo_store.StoreError as error:
+        return _fail(str(error))
+    finally:
+        store.close()
+
+
+def _json_list(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    try:
+        result = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {error}")
+    if not isinstance(result, list):
+        raise argparse.ArgumentTypeError("expected a JSON list")
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gwo.py",
+        description="GWO V7 coordination kernel (stdlib-only, WAL store).",
+    )
+    parser.add_argument(
+        "--gwo-home",
+        type=Path,
+        default=None,
+        help="GWO_HOME directory (defaults to $GWO_HOME or ~/.gwo)",
+    )
+    parser.add_argument(
+        "--repository",
+        type=_repository,
+        default=os.environ.get("GWO_REPOSITORY", "owner/repo"),
+        help="repository as owner/repo",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    coordinator = sub.add_parser("coordinator", help="claim or release the coordinator lock")
+    coordinator.add_argument("action", choices=("claim", "release"))
+    coordinator.set_defaults(func=cmd_coordinator)
+
+    task = sub.add_parser("task", help="create, list, or update tasks")
+    task_sub = task.add_subparsers(dest="action", required=True)
+
+    task_create = task_sub.add_parser("create")
+    task_create.add_argument("--issue", type=int, required=True)
+    task_create.add_argument("--group", required=True)
+    task_create.add_argument("--risk", required=True, choices=("fast", "standard", "strict"))
+    task_create.add_argument("--hotset", type=_json_list, default=None)
+    task_create.add_argument("--deps", type=_json_list, default=None)
+    task_create.add_argument("--created-by", default=None, help=argparse.SUPPRESS)
+    task_create.set_defaults(func=cmd_task)
+
+    task_list = task_sub.add_parser("list")
+    task_list.set_defaults(func=cmd_task)
+
+    task_update = task_sub.add_parser("update")
+    task_update.add_argument("task_id")
+    task_update.add_argument("--status", default=None)
+    task_update.add_argument("--hotset", type=_json_list, default=None)
+    task_update.add_argument("--deps", type=_json_list, default=None)
+    task_update.set_defaults(func=cmd_task)
+
+    dispatch = sub.add_parser("dispatch", help="store-only dispatch")
+    dispatch_sub = dispatch.add_subparsers(dest="action", required=True)
+
+    dispatch_create = dispatch_sub.add_parser("create")
+    dispatch_create.add_argument("--task-id", required=True)
+    dispatch_create.add_argument("--agent-id", required=True)
+    dispatch_create.add_argument("--worktree", required=True)
+    dispatch_create.add_argument("--branch", required=True)
+    dispatch_create.add_argument("--dispatched-by", default=None, help=argparse.SUPPRESS)
+    dispatch_create.set_defaults(func=cmd_dispatch)
+
+    done = sub.add_parser("done", help="mark a dispatch done/blocked/stopped")
+    done.add_argument("--task-id", required=True)
+    done.add_argument("--dispatch-id", required=True)
+    done.add_argument("--status", required=True, choices=("done", "blocked", "stopped"))
+    done.add_argument("--actor", default=None, help=argparse.SUPPRESS)
+    done.set_defaults(func=cmd_done)
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    gwo_home = args.gwo_home
+    if gwo_home is None:
+        env_home = os.environ.get("GWO_HOME")
+        if env_home:
+            gwo_home = Path(env_home)
+        else:
+            gwo_home = Path.home() / ".gwo"
+    args.gwo_home = gwo_home
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
