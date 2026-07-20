@@ -2,8 +2,16 @@
   "schema_version": 1,
   "global": {
     "default_tier": "standard",
-    "worker_slots": 3,
-    "max_attempts": 2
+    "execution_slots": 3,
+    "integration_wip_limit": 6,
+    "max_attempts": 2,
+    "intake": {
+      "include_labels": ["ready-for-agent"],
+      "human_labels": ["ready-for-human"],
+      "clarify_labels": ["needs-info"],
+      "candidate_limit": 100,
+      "ready_reserve_target": 6
+    }
   },
   "tiers": {
     "light": {
@@ -43,7 +51,8 @@
       "integration_branch": "dev",
       "workspace_id": "paseo-stable-workspace-id",
       "merge_method": "squash",
-      "worker_slots": 3,
+      "execution_slots": 3,
+      "integration_wip_limit": 6,
       "default_tier": "standard",
       "milestone_tiers": {},
       "tiers": {},

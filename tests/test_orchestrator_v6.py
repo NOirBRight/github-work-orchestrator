@@ -105,6 +105,14 @@ def test_reconcile_fills_free_slots_with_ranked_disjoint_issues():
         ],
         "warnings": [],
         "summary": {
+            "execution_slots": 3,
+            "active_execution": 1,
+            "free_execution_slots": 2,
+            "integration_wip_limit": 3,
+            "integration_wip": 1,
+            "free_integration_wip": 2,
+            "parallel_width": 2,
+            "search_exhausted": False,
             "worker_slots": 3,
             "wip": 1,
             "free_slots": 2,
@@ -1444,6 +1452,14 @@ def test_cli_read_only_reconcile_has_stable_envelope(tmp_path):
         "actions": [],
         "warnings": [],
         "summary": {
+            "execution_slots": 3,
+            "active_execution": 0,
+            "free_execution_slots": 3,
+            "integration_wip_limit": 3,
+            "integration_wip": 0,
+            "free_integration_wip": 3,
+            "parallel_width": 0,
+            "search_exhausted": False,
             "worker_slots": 3,
             "wip": 0,
             "free_slots": 3,
@@ -1951,7 +1967,8 @@ def test_config_resolution_order_and_v5_migration_preserve_thinking():
     assert "roles" not in migrated
     assert migrated["tiers"]["heavy"]["settings"]["thinkingOptionId"] == "high"
     assert "modeId" not in migrated["tiers"]["heavy"]["settings"]
-    assert migrated["global"]["worker_slots"] == 3
+    assert migrated["global"]["execution_slots"] == 3
+    assert migrated["global"]["integration_wip_limit"] == 6
     assert migrated["global"]["max_attempts"] == 2
 
     migrated["repositories"] = {

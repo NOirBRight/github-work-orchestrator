@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -29,7 +30,7 @@ def test_quick_validation_and_manifest_are_at_fixed_point():
         "content_sha256": sync.package_digest(PACKAGE),
         "schema_version": 1,
         "skill": "orchestrator",
-        "version": "6.0.1",
+        "version": "6.1.0",
     }
 
 
@@ -38,6 +39,20 @@ def test_only_one_skill_and_no_compatibility_entry_remain():
     assert not (ROOT / "skills" / "agile-orchestrator" / "SKILL.md").exists()
     skill_files = sorted((ROOT / "skills").glob("*/SKILL.md"))
     assert skill_files == [PACKAGE / "SKILL.md"]
+
+
+def test_skill_description_uses_a_strict_yaml_safe_scalar():
+    lines = (PACKAGE / "SKILL.md").read_text(encoding="utf-8").splitlines()
+    closing_fence = lines.index("---", 1)
+    frontmatter = lines[1:closing_fence]
+    description_line = next(
+        line for line in frontmatter if line.startswith("description: ")
+    )
+    scalar = description_line.removeprefix("description: ")
+
+    assert scalar.startswith('"')
+    assert scalar.endswith('"')
+    assert "repository: preflight" in scalar
 
 
 def test_skill_and_templates_keep_lightweight_line_budgets():
@@ -77,3 +92,79 @@ def test_openai_metadata_is_explicit_and_invocable():
     assert 'display_name: "Orchestrator"' in text
     assert "$orchestrator" in text
     assert "allow_implicit_invocation: true" in text
+
+
+def test_v61_parallel_frontier_is_documented_as_one_consistent_model():
+    skill = (PACKAGE / "SKILL.md").read_text(encoding="utf-8")
+    design = (ROOT / "docs" / "orchestrator-v6-living-design.md").read_text(
+        encoding="utf-8"
+    )
+    context = (ROOT / "docs" / "CONTEXT.md").read_text(encoding="utf-8")
+
+    for required in (
+        "frontier scan",
+        "frontier admit",
+        "Ready Reserve",
+        "execution slots",
+        "integration WIP",
+        "orchestrator:issue:v2",
+    ):
+        assert required in skill
+        assert required in design
+    for term in (
+        "Candidate Pool",
+        "Admission",
+        "Ready Reserve",
+        "Parallel Width",
+        "Conflict Claim",
+        "Execution Slot",
+        "Integration WIP Limit",
+    ):
+        assert term in context
+    assert (
+        ROOT / "docs" / "adr" / "0010-adopt-parallel-frontier-admission.md"
+    ).is_file()
+
+
+def test_three_install_surfaces_are_byte_identical_and_cli_smokes(tmp_path):
+    sync = _load(
+        "sync_orchestrator_v61_install_test",
+        ROOT / "scripts" / "sync_orchestrator.py",
+    )
+    roots = [
+        tmp_path / surface / "skills" for surface in (".agents", ".codex", ".claude")
+    ]
+    for root in roots:
+        sync.install_atomic(PACKAGE, root, tmp_path / "backups")
+        assert sync.install_drift(PACKAGE, root) == []
+
+    cli = roots[0] / "orchestrator" / "scripts" / "orch.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(cli),
+            "reconcile",
+            "--repo",
+            "owner/repo",
+            "--read-only",
+            "--snapshot",
+            "-",
+        ],
+        input=json.dumps(
+            {
+                "repository": "owner/repo",
+                "execution_slots": 3,
+                "integration_wip_limit": 6,
+                "issues": [],
+                "closed_issues": [],
+            }
+        ),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "idle"
+    assert payload["actions"] == []
+    assert payload["warnings"] == []

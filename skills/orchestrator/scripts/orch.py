@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Orchestrator V6 command seam.
+"""Orchestrator V6.1 command seam.
 
 The CLI owns short-lived GitHub/Git mutations. Agent creation and prompts are
 returned as actions for the Skill to execute through Paseo MCP.
@@ -18,6 +18,8 @@ import sys
 from typing import Any, Literal, TypedDict
 
 import orch_core as core
+
+frontier = core.frontier
 
 
 DEFAULT_CONFIG = Path.home() / ".orch" / "config.json"
@@ -61,6 +63,30 @@ fragment OrchIssue on Issue{
   comments(first:100){pageInfo{hasNextPage} nodes{databaseId body createdAt updatedAt author{login}}}
 }
 """.replace("__ORCH_PR_FIELDS__", ORCH_PR_FIELDS)
+FRONTIER_ISSUE_FIELDS = r"""
+number title body updatedAt
+labels(first:30){nodes{name}}
+milestone{title dueOn}
+assignees(first:20){nodes{login}}
+"""
+FRONTIER_DETAIL_FIELDS = (
+    FRONTIER_ISSUE_FIELDS
+    + "comments(first:100){pageInfo{hasNextPage} nodes{databaseId body createdAt updatedAt author{login}}}"
+)
+FRONTIER_QUERY = r"""
+query($owner:String!,$name:String!,$limit:Int!){
+  repository(owner:$owner,name:$name){
+    issues(first:$limit,states:OPEN,orderBy:{field:UPDATED_AT,direction:DESC}){
+      totalCount pageInfo{hasNextPage}
+      nodes{...FrontierIssue}
+    }
+  }
+}
+fragment FrontierIssue on Issue{__FRONTIER_ISSUE_FIELDS__}
+"""
+FRONTIER_QUERY = FRONTIER_QUERY.replace(
+    "__FRONTIER_ISSUE_FIELDS__", FRONTIER_ISSUE_FIELDS
+)
 
 
 class CommandError(RuntimeError):
@@ -191,7 +217,10 @@ class GitHub:
             {
                 int(dependency)
                 for issue in normalized["issues"]
-                for dependency in issue.get("dependencies") or []
+                for dependency in [
+                    *(issue.get("dispatch_after") or []),
+                    *(issue.get("merge_after") or []),
+                ]
             }
         )
         if dependencies:
@@ -203,6 +232,119 @@ class GitHub:
             (repository.get("ref") or {}).get("target") or {}
         ).get("oid")
         return normalized
+
+    def frontier_candidates(
+        self, repo: str, limit: int, labels: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Read the unfiltered open-Issue pool used by Frontier admission."""
+
+        if not 1 <= int(limit) <= 100:
+            raise core.PolicyError(
+                "FRONTIER_LIMIT_INVALID", "candidate limit must be between 1 and 100"
+            )
+        owner, name = repo.split("/", 1)
+        scoped_labels = list(dict.fromkeys(labels or []))
+        query = FRONTIER_QUERY
+        variables = []
+        connection_names = ["issues"]
+        if scoped_labels:
+            declarations = "".join(
+                f",$label{index}:String!" for index in range(len(scoped_labels))
+            )
+            connections = "\n".join(
+                f"l{index}:issues(first:$limit,states:OPEN,labels:[$label{index}],"
+                "orderBy:{field:UPDATED_AT,direction:DESC}){"
+                "totalCount pageInfo{hasNextPage} nodes{...FrontierIssue}}"
+                for index in range(len(scoped_labels))
+            )
+            query = (
+                f"query($owner:String!,$name:String!,$limit:Int!{declarations}){{"
+                f"repository(owner:$owner,name:$name){{{connections}}}}}"
+                f"fragment FrontierIssue on Issue{{{FRONTIER_ISSUE_FIELDS}}}"
+            )
+            variables = [
+                value
+                for index, label in enumerate(scoped_labels)
+                for value in ("-F", f"label{index}={label}")
+            ]
+            connection_names = [f"l{index}" for index in range(len(scoped_labels))]
+        payload = json.loads(
+            self.run(
+                [
+                    "api",
+                    "graphql",
+                    "-f",
+                    f"query={query}",
+                    "-F",
+                    f"owner={owner}",
+                    "-F",
+                    f"name={name}",
+                    "-F",
+                    f"limit={int(limit)}",
+                    *variables,
+                ]
+            )
+        )
+        repository = (payload.get("data") or {}).get("repository")
+        if not isinstance(repository, dict):
+            raise CommandError("GitHub Frontier snapshot missing")
+        connections = [repository.get(name) or {} for name in connection_names]
+        if any(
+            (connection.get("pageInfo") or {}).get("hasNextPage")
+            for connection in connections
+        ):
+            raise core.PolicyError(
+                "FRONTIER_PAGINATION_REQUIRED",
+                "candidate pool exceeds configured scan limit",
+            )
+        nodes = {
+            int(node["number"]): node
+            for connection in connections
+            for node in connection.get("nodes") or []
+        }
+        if len(nodes) > limit:
+            raise core.PolicyError(
+                "FRONTIER_LIMIT_REQUIRED",
+                "combined intake labels exceed configured candidate limit",
+            )
+        return [self._issue(nodes[number]) for number in sorted(nodes)]
+
+    def issues_by_number(self, repo: str, numbers: list[int]) -> list[dict[str, Any]]:
+        """Read full admission identity only for the proposed target Issues."""
+
+        unique = sorted({int(number) for number in numbers})
+        if not unique:
+            return []
+        owner, name = repo.split("/", 1)
+        aliases = " ".join(
+            f"i{number}:issue(number:{number}){{{FRONTIER_DETAIL_FIELDS}}}"
+            for number in unique
+        )
+        query = (
+            "query($owner:String!,$name:String!){"
+            f"repository(owner:$owner,name:$name){{{aliases}}}"
+            "}"
+        )
+        payload = json.loads(
+            self.run(
+                [
+                    "api",
+                    "graphql",
+                    "-f",
+                    f"query={query}",
+                    "-F",
+                    f"owner={owner}",
+                    "-F",
+                    f"name={name}",
+                ]
+            )
+        )
+        repository = (payload.get("data") or {}).get("repository") or {}
+        return [
+            self._issue(repository[f"i{number}"])
+            for number in unique
+            if repository.get(f"i{number}")
+        ]
 
     def pull_requests_by_number(
         self, repo: str, numbers: list[int]
@@ -389,6 +531,98 @@ class GitHub:
                 "ISSUE_RECORD_READBACK_FAILED", "claim record readback failed"
             )
         self.set_issue_state(repo, int(action["issue"]), "active")
+
+    def admit(
+        self, repo: str, candidate: dict[str, Any], contract: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Create or confirm one idempotent V2 managed record, then mark it Ready."""
+
+        core.validate_contract(contract)
+        if core.contract_version(contract) != 2:
+            raise core.PolicyError(
+                "ADMISSION_CONTRACT_VERSION_INVALID",
+                "new admissions require Contract V2",
+            )
+        marker_comments = [
+            comment
+            for comment in candidate.get("comments") or []
+            if any(
+                marker in str(comment.get("body") or "")
+                for marker in (core.ISSUE_MARKER_V1, core.ISSUE_MARKER_V2)
+            )
+        ]
+        if len(marker_comments) > 1:
+            raise core.PolicyError(
+                "ISSUE_RECORD_DUPLICATE",
+                f"Issue #{candidate.get('number')} has duplicate managed records",
+            )
+        record = {"contract": contract, "dispatch": None}
+        rendered = core.render_issue_record(record)
+        owner, name = repo.split("/", 1)
+        comment_id = None
+        if marker_comments:
+            existing = core.parse_issue_record(
+                str(marker_comments[0].get("body") or "")
+            )
+            existing_contract = existing.get("contract") or {}
+            try:
+                core.validate_contract(existing_contract)
+            except core.PolicyError as error:
+                raise core.PolicyError(
+                    "ISSUE_ALREADY_MANAGED",
+                    f"Issue #{candidate.get('number')} has an invalid existing contract",
+                ) from error
+            if existing_contract != contract or existing.get("dispatch") not in (
+                None,
+                {},
+            ):
+                raise core.PolicyError(
+                    "ISSUE_ALREADY_MANAGED",
+                    f"Issue #{candidate.get('number')} already has another contract",
+                )
+            comment_id = marker_comments[0].get("id")
+            if str(marker_comments[0].get("body") or "") != rendered:
+                response = json.loads(
+                    self.run(
+                        [
+                            "api",
+                            "--method",
+                            "PATCH",
+                            f"repos/{owner}/{name}/issues/comments/{comment_id}",
+                            "-f",
+                            f"body={rendered}",
+                        ]
+                    )
+                )
+                if response.get("body") != rendered:
+                    raise core.PolicyError(
+                        "ISSUE_RECORD_READBACK_FAILED",
+                        "admission record readback failed",
+                    )
+        else:
+            response = json.loads(
+                self.run(
+                    [
+                        "api",
+                        "--method",
+                        "POST",
+                        f"repos/{owner}/{name}/issues/{int(candidate['number'])}/comments",
+                        "-f",
+                        f"body={rendered}",
+                    ]
+                )
+            )
+            if response.get("body") != rendered:
+                raise core.PolicyError(
+                    "ISSUE_RECORD_READBACK_FAILED", "admission record readback failed"
+                )
+            comment_id = response.get("id")
+        self.set_issue_state(repo, int(candidate["number"]), "ready")
+        return {
+            "issue": int(candidate["number"]),
+            "comment_id": comment_id,
+            "state": "ready",
+        }
 
     def update_record(self, repo: str, issue: dict[str, Any]) -> None:
         record = dict(issue.get("managed_record") or {})
@@ -1512,16 +1746,33 @@ def _materialize_worker_wave(
 def _repository_config(config: dict[str, Any], repo: str) -> dict[str, Any]:
     global_config = config.get("global") or {}
     configured = dict((config.get("repositories") or {}).get(repo) or {})
+    execution_slots = configured.get(
+        "execution_slots",
+        configured.get(
+            "worker_slots",
+            global_config.get("execution_slots", global_config.get("worker_slots", 3)),
+        ),
+    )
+    integration_wip_limit = configured.get(
+        "integration_wip_limit",
+        global_config.get("integration_wip_limit", max(6, int(execution_slots) * 2)),
+    )
+    intake = {
+        **dict(global_config.get("intake") or {}),
+        **dict(configured.get("intake") or {}),
+    }
     resolved = {
         **configured,
         "repository": repo,
         "merge_method": configured.get("merge_method", "squash"),
-        "worker_slots": configured.get(
-            "worker_slots", global_config.get("worker_slots", 3)
-        ),
+        "execution_slots": execution_slots,
+        "integration_wip_limit": integration_wip_limit,
+        # Compatibility alias consumed by installed V6.0.x snapshots.
+        "worker_slots": execution_slots,
         "max_attempts": configured.get(
             "max_attempts", global_config.get("max_attempts", 2)
         ),
+        "intake": intake,
     }
     if configured.get("integration_branch"):
         resolved["integration_branch"] = configured["integration_branch"]
@@ -1745,7 +1996,14 @@ def _prepare_snapshot(
         raise core.PolicyError(
             "INTEGRATION_BASE_MISSING", "integration branch base SHA was not read back"
         )
-    snapshot["worker_slots"] = repo_config["worker_slots"]
+    execution_slots = int(
+        repo_config.get("execution_slots", repo_config.get("worker_slots", 3))
+    )
+    snapshot["execution_slots"] = execution_slots
+    snapshot["integration_wip_limit"] = int(
+        repo_config.get("integration_wip_limit", execution_slots)
+    )
+    snapshot["worker_slots"] = execution_slots
     snapshot["wave_generation"] = max(
         (
             int((issue.get("dispatch") or {}).get("generation", 0))
@@ -1911,6 +2169,350 @@ def _plan_recoveries(
             github.update_record(snapshot["repository"], issue)
         actions.append(action)
     return actions, warnings
+
+
+def _candidate_label_names(candidate: dict[str, Any]) -> set[str]:
+    return {
+        str(label.get("name") if isinstance(label, dict) else label).casefold()
+        for label in candidate.get("labels") or []
+    }
+
+
+def _frontier_policy(repo_config: dict[str, Any]) -> dict[str, Any]:
+    intake = dict(repo_config.get("intake") or {})
+    execution_slots = int(
+        repo_config.get("execution_slots", repo_config.get("worker_slots", 3))
+    )
+    return {
+        "include_labels": list(intake.get("include_labels") or []),
+        "human_labels": list(intake.get("human_labels") or []),
+        "clarify_labels": list(intake.get("clarify_labels") or []),
+        "reserve_target": int(
+            intake.get(
+                "ready_reserve_target",
+                max(6, execution_slots * 2),
+            )
+        ),
+    }
+
+
+def _frontier_snapshot(
+    github: GitHub, repo: str, repo_config: dict[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    intake = dict(repo_config.get("intake") or {})
+    limit = int(intake.get("candidate_limit", 100))
+    labels = [
+        label
+        for field in ("include_labels", "human_labels", "clarify_labels")
+        for label in intake.get(field) or []
+    ]
+    if labels:
+        labels.extend(["orch:ready", "orch:active", "orch:blocked"])
+    candidates = github.frontier_candidates(repo, limit, labels)
+    snapshot = github.snapshot(repo, repo_config["integration_branch"])
+    execution_slots = int(
+        repo_config.get("execution_slots", repo_config.get("worker_slots", 3))
+    )
+    snapshot["execution_slots"] = execution_slots
+    snapshot["integration_wip_limit"] = int(
+        repo_config.get("integration_wip_limit", execution_slots)
+    )
+    snapshot["worker_slots"] = execution_slots
+    return candidates, snapshot
+
+
+def _admission_target_numbers(value: Any, *, repository: str) -> list[int]:
+    """Validate plan target identity before fetching full Issue comments."""
+
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise core.PolicyError(
+            "ADMISSION_PLAN_INVALID", "admission plan schema_version must be 1"
+        )
+    if str(value.get("repository") or "").casefold() != repository.casefold():
+        raise core.PolicyError(
+            "REPOSITORY_MISMATCH", "admission plan repository mismatch"
+        )
+    admissions = value.get("admissions")
+    if not isinstance(admissions, list) or not admissions:
+        raise core.PolicyError(
+            "ADMISSION_PLAN_INVALID", "admissions must be a non-empty list"
+        )
+    numbers: list[int] = []
+    for admission in admissions:
+        if not isinstance(admission, dict):
+            raise core.PolicyError(
+                "ADMISSION_PLAN_INVALID", "each admission must be an object"
+            )
+        number = admission.get("issue")
+        if (
+            not isinstance(number, int)
+            or isinstance(number, bool)
+            or number <= 0
+            or number in numbers
+        ):
+            raise core.PolicyError(
+                "ADMISSION_ISSUE_INVALID", "admission Issue numbers must be unique"
+            )
+        numbers.append(number)
+    return numbers
+
+
+def _validate_admission_plan(
+    value: Any,
+    *,
+    repository: str,
+    candidates: list[dict[str, Any]],
+    managed_issues: list[dict[str, Any]] | None = None,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Validate a complete admission batch before the first GitHub mutation."""
+
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise core.PolicyError(
+            "ADMISSION_PLAN_INVALID", "admission plan schema_version must be 1"
+        )
+    if str(value.get("repository") or "").casefold() != repository.casefold():
+        raise core.PolicyError(
+            "REPOSITORY_MISMATCH", "admission plan repository mismatch"
+        )
+    admissions = value.get("admissions")
+    if not isinstance(admissions, list) or not admissions:
+        raise core.PolicyError(
+            "ADMISSION_PLAN_INVALID", "admissions must be a non-empty list"
+        )
+    by_number = {int(candidate["number"]): candidate for candidate in candidates}
+    resolved: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    seen: set[int] = set()
+    dependency_graph: dict[int, set[int]] = {}
+    core_labels = {"orch:ready", "orch:active", "orch:blocked"}
+    for admission in admissions:
+        if not isinstance(admission, dict):
+            raise core.PolicyError(
+                "ADMISSION_PLAN_INVALID", "each admission must be an object"
+            )
+        number = admission.get("issue")
+        if (
+            not isinstance(number, int)
+            or isinstance(number, bool)
+            or number <= 0
+            or number in seen
+        ):
+            raise core.PolicyError(
+                "ADMISSION_ISSUE_INVALID", "admission Issue numbers must be unique"
+            )
+        seen.add(number)
+        candidate = by_number.get(number)
+        if candidate is None:
+            raise core.PolicyError(
+                "ADMISSION_ISSUE_MISSING",
+                f"Issue #{number} is outside the Candidate Pool",
+            )
+        contract = admission.get("contract")
+        core.validate_contract(contract)
+        if core.contract_version(contract) != 2:
+            raise core.PolicyError(
+                "ADMISSION_CONTRACT_VERSION_INVALID",
+                "new admissions require Contract V2",
+            )
+        dependencies = set(core.contract_dispatch_after(contract)) | set(
+            core.contract_merge_after(contract)
+        )
+        if number in dependencies:
+            raise core.PolicyError(
+                "CONTRACT_DEPENDENCY_INVALID",
+                f"Issue #{number} cannot depend on itself",
+            )
+        dependency_graph[number] = dependencies
+        core_states = _candidate_label_names(candidate) & core_labels
+        marker_comments = [
+            comment
+            for comment in candidate.get("comments") or []
+            if any(
+                marker in str(comment.get("body") or "")
+                for marker in (core.ISSUE_MARKER_V1, core.ISSUE_MARKER_V2)
+            )
+        ]
+        if len(marker_comments) > 1 or (core_states and len(marker_comments) != 1):
+            raise core.PolicyError(
+                "ISSUE_ALREADY_MANAGED", f"Issue #{number} is already managed"
+            )
+        if marker_comments:
+            existing = core.parse_issue_record(
+                str(marker_comments[0].get("body") or "")
+            )
+            existing_contract = existing.get("contract") or {}
+            try:
+                core.validate_contract(existing_contract)
+            except core.PolicyError as error:
+                raise core.PolicyError(
+                    "ISSUE_ALREADY_MANAGED",
+                    f"Issue #{number} has an invalid existing contract",
+                ) from error
+            if (
+                existing_contract != contract
+                or existing.get("dispatch") not in (None, {})
+                or (core_states and core_states != {"orch:ready"})
+            ):
+                raise core.PolicyError(
+                    "ISSUE_ALREADY_MANAGED",
+                    f"Issue #{number} already has another orchestration record",
+                )
+        resolved.append((candidate, contract))
+
+    admitted = set(dependency_graph)
+    all_dependencies = {
+        int(issue["number"]): set(
+            issue.get("dispatch_after")
+            if issue.get("dispatch_after") is not None
+            else issue.get("dependencies") or []
+        )
+        | set(
+            issue.get("merge_after")
+            if issue.get("merge_after") is not None
+            else issue.get("dependencies") or []
+        )
+        for issue in managed_issues or []
+    }
+    all_dependencies.update(dependency_graph)
+    managed_numbers = set(all_dependencies)
+    graph = {
+        issue: dependencies & managed_numbers
+        for issue, dependencies in all_dependencies.items()
+    }
+    visiting: set[int] = set()
+    visited: set[int] = set()
+
+    def visit(issue: int) -> None:
+        if issue in visiting:
+            raise core.PolicyError(
+                "CONTRACT_DEPENDENCY_CYCLE", "admission dependency cycle"
+            )
+        if issue in visited:
+            return
+        visiting.add(issue)
+        for dependency in graph[issue]:
+            visit(dependency)
+        visiting.remove(issue)
+        visited.add(issue)
+
+    for issue in sorted(admitted):
+        visit(issue)
+    return resolved
+
+
+def _frontier(args: argparse.Namespace) -> dict[str, Any]:
+    config = _load_config(args.config, write_migration=False)
+    if args.operation == "admit":
+        if not args.plan:
+            raise core.PolicyError(
+                "ADMISSION_PLAN_REQUIRED", "frontier admit requires --plan"
+            )
+        repo_config, entry = _coordinator_preflight(args, config)
+        if entry["status"] == "forwarded":
+            return entry
+    else:
+        repo_config = _resolved_read_only_config(args, config)
+
+    github = GitHub()
+
+    def read_and_analyze() -> tuple[
+        list[dict[str, Any]], dict[str, Any], dict[str, Any]
+    ]:
+        candidates, snapshot = _frontier_snapshot(github, args.repo, repo_config)
+        analysis = frontier.analyze_frontier(
+            candidates, snapshot, _frontier_policy(repo_config)
+        )
+        analysis["candidates"] = [
+            {
+                key: candidate.get(key)
+                for key in (
+                    "number",
+                    "title",
+                    "body",
+                    "updatedAt",
+                    "labels",
+                    "milestone",
+                    "assignees",
+                )
+            }
+            for candidate in candidates
+        ]
+        return candidates, snapshot, analysis
+
+    if args.operation == "scan":
+        _candidates, _snapshot, analysis = read_and_analyze()
+        design_count = sum(
+            item["disposition"] == "design"
+            for item in analysis["candidate_assessments"]
+        )
+        return {
+            "schema_version": 1,
+            "status": "needs-admission"
+            if design_count and analysis["reserve_gap"]
+            else "idle",
+            "actions": [],
+            "warnings": [],
+            "summary": analysis,
+        }
+
+    plan = _read_json(args.plan)
+    with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
+        candidates, snapshot, analysis = read_and_analyze()
+        target_numbers = _admission_target_numbers(plan, repository=args.repo)
+        details = github.issues_by_number(args.repo, target_numbers)
+        details_by_number = {int(issue["number"]): issue for issue in details}
+        if set(details_by_number) != set(target_numbers):
+            raise core.PolicyError(
+                "ADMISSION_ISSUE_READBACK_MISSING",
+                "one or more admission Issues could not be read back",
+            )
+        candidates = [
+            details_by_number.get(int(candidate["number"]), candidate)
+            for candidate in candidates
+        ]
+        admissions = _validate_admission_plan(
+            plan,
+            repository=args.repo,
+            candidates=candidates,
+            managed_issues=snapshot.get("issues") or [],
+        )
+        dependency_numbers = sorted(
+            {
+                dependency
+                for _candidate, contract in admissions
+                for dependency in [
+                    *core.contract_dispatch_after(contract),
+                    *core.contract_merge_after(contract),
+                ]
+                if dependency not in {int(item["number"]) for item in candidates}
+            }
+        )
+        missing_dependencies = (
+            [
+                number
+                for number, state in github.dependency_states(
+                    args.repo, dependency_numbers
+                ).items()
+                if state is None
+            ]
+            if dependency_numbers
+            else []
+        )
+        if missing_dependencies:
+            raise core.PolicyError(
+                "CONTRACT_DEPENDENCY_INVALID",
+                f"dependency Issues do not exist: {missing_dependencies}",
+            )
+        admitted = [
+            github.admit(args.repo, candidate, contract)
+            for candidate, contract in admissions
+        ]
+    return {
+        "schema_version": 1,
+        "status": "completed",
+        "actions": [],
+        "warnings": [],
+        "summary": {**analysis, "admitted": admitted},
+    }
 
 
 def _reconcile(args: argparse.Namespace) -> dict[str, Any]:
@@ -2421,6 +3023,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     project.add_argument("--repo", required=True)
     project.add_argument("--coordinator-context")
     project.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    frontier_command = commands.add_parser("frontier")
+    frontier_command.add_argument("operation", choices=("scan", "admit"))
+    frontier_command.add_argument("--repo", required=True)
+    frontier_command.add_argument("--plan", type=Path)
+    frontier_command.add_argument("--coordinator-context")
+    frontier_command.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     return parser.parse_args(argv)
 
 
@@ -2429,6 +3037,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "reconcile":
             result = _reconcile(args)
+        elif args.command == "frontier":
+            result = _frontier(args)
         elif args.command == "integrate":
             result = _integrate(args)
         elif args.command == "retire":

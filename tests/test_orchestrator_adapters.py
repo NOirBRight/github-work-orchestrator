@@ -1076,6 +1076,10 @@ def test_state_repair_cannot_mutate_before_coordinator_eligibility(monkeypatch):
             "_retire",
         ),
         (["project", "sync", "--repo", "owner/repo"], "_project"),
+        (
+            ["frontier", "admit", "--repo", "owner/repo", "--plan", "plan.json"],
+            "_frontier",
+        ),
     ],
 )
 def test_every_mutation_entry_requires_context_before_github_adapter(
@@ -1106,6 +1110,10 @@ def test_every_mutation_entry_requires_context_before_github_adapter(
             "_retire",
         ),
         (["project", "sync", "--repo", "owner/repo"], "_project"),
+        (
+            ["frontier", "admit", "--repo", "owner/repo", "--plan", "plan.json"],
+            "_frontier",
+        ),
     ],
 )
 def test_plan_mode_blocks_every_mutation_before_github_adapter(
@@ -1216,6 +1224,16 @@ def test_cli_exposes_common_coordinator_context_and_lifecycle_flags():
             "sync",
             "--repo",
             "owner/repo",
+            "--coordinator-context",
+            "ctx.json",
+        ],
+        [
+            "frontier",
+            "admit",
+            "--repo",
+            "owner/repo",
+            "--plan",
+            "plan.json",
             "--coordinator-context",
             "ctx.json",
         ],
@@ -1602,3 +1620,350 @@ def test_one_claim_failure_does_not_block_the_rest_of_the_wave(monkeypatch):
     assert warnings == [
         {"code": "COMMAND_FAILED", "issue": 1, "detail": "claim readback failed"}
     ]
+
+
+def _contract_v2(core, *, path="src/api", dispatch_after=None, merge_after=None):
+    contract = {
+        "design": ["Implement the admitted change."],
+        "acceptance": ["The regression is covered."],
+        "change_claims": {"paths": [path], "resources": []},
+        "done_when": ["python -m pytest -q"],
+        "dependencies": {
+            "dispatch_after": list(dispatch_after or []),
+            "merge_after": list(merge_after or []),
+        },
+        "priority": "P1",
+        "difficulty": "standard",
+        "risk": "standard",
+        "unresolved_decisions": [],
+    }
+    contract["sha256"] = core.contract_hash(contract)
+    return contract
+
+
+def test_frontier_scan_uses_candidate_and_scheduler_production_adapters(monkeypatch):
+    core, cli = _modules()
+    events = []
+
+    class FakeGitHub:
+        def frontier_candidates(self, repo, limit, labels):
+            events.append(("candidates", repo, limit, labels))
+            return [
+                {
+                    "number": 23,
+                    "title": "Parallel candidate",
+                    "body": "Useful details",
+                    "labels": [{"name": "ready-for-agent"}],
+                    "comments": [],
+                }
+            ]
+
+        def snapshot(self, repo, branch):
+            events.append(("snapshot", repo, branch))
+            return {
+                "schema_version": 1,
+                "repository": repo,
+                "issues": [],
+                "closed_issues": [],
+            }
+
+    config = {
+        **core.default_config(),
+        "repositories": {
+            "owner/repo": {
+                "integration_branch": "dev",
+                "intake": {
+                    "include_labels": ["ready-for-agent"],
+                    "candidate_limit": 40,
+                    "ready_reserve_target": 6,
+                },
+            }
+        },
+    }
+    monkeypatch.setattr(cli, "GitHub", FakeGitHub)
+    monkeypatch.setattr(cli, "_load_config", lambda *_args, **_kwargs: config)
+
+    args = cli.parse_args(["frontier", "scan", "--repo", "owner/repo"])
+    result = cli._frontier(args)
+
+    assert events == [
+        (
+            "candidates",
+            "owner/repo",
+            40,
+            [
+                "ready-for-agent",
+                "ready-for-human",
+                "needs-info",
+                "orch:ready",
+                "orch:active",
+                "orch:blocked",
+            ],
+        ),
+        ("snapshot", "owner/repo", "dev"),
+    ]
+    assert result["summary"]["candidate_assessments"] == [
+        {"issue": 23, "disposition": "design", "reason": "candidate-label-match"}
+    ]
+    assert result["summary"]["reserve_gap"] == 6
+
+
+def test_frontier_admit_validates_the_entire_plan_before_any_github_write(
+    tmp_path, monkeypatch
+):
+    core, cli = _modules()
+    writes = []
+    valid = _contract_v2(core, path="src/a")
+    invalid = _contract_v2(core, path="src/b")
+    invalid["sha256"] = "0" * 64
+    plan = tmp_path / "admission.json"
+    plan.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "repository": "owner/repo",
+                "admissions": [
+                    {"issue": 1, "contract": valid},
+                    {"issue": 2, "contract": invalid},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeGitHub:
+        def frontier_candidates(self, _repo, _limit, _labels):
+            return [
+                {"number": 1, "labels": [], "comments": []},
+                {"number": 2, "labels": [], "comments": []},
+            ]
+
+        def snapshot(self, repo, _branch):
+            return {"repository": repo, "issues": [], "closed_issues": []}
+
+        def issues_by_number(self, _repo, numbers):
+            return [
+                {"number": number, "labels": [], "comments": []} for number in numbers
+            ]
+
+        def admit(self, repo, candidate, contract):
+            writes.append((repo, candidate["number"], contract["sha256"]))
+
+    repo_config = {
+        "repository": "owner/repo",
+        "integration_branch": "dev",
+        "execution_slots": 3,
+        "integration_wip_limit": 6,
+        "worker_slots": 3,
+        "intake": {},
+    }
+    monkeypatch.setattr(cli, "GitHub", FakeGitHub)
+    monkeypatch.setattr(
+        cli, "_load_config", lambda *_args, **_kwargs: core.default_config()
+    )
+    monkeypatch.setattr(
+        cli,
+        "_coordinator_preflight",
+        lambda *_args: (repo_config, {"status": "stable"}),
+    )
+    args = cli.parse_args(
+        [
+            "frontier",
+            "admit",
+            "--repo",
+            "owner/repo",
+            "--plan",
+            str(plan),
+            "--coordinator-context",
+            "context.json",
+        ]
+    )
+
+    with pytest.raises(core.PolicyError) as error:
+        cli._frontier(args)
+
+    assert error.value.code == "CONTRACT_HASH_MISMATCH"
+    assert writes == []
+
+
+def test_github_admit_writes_a_v2_record_then_reads_back_ready_state():
+    core, cli = _modules()
+    contract = _contract_v2(core)
+    calls = []
+    client = object.__new__(cli.GitHub)
+
+    def run(args):
+        calls.append(args)
+        if args[:3] == ["api", "--method", "POST"]:
+            return json.dumps({"id": 91, "body": args[-1][5:]})
+        if args[:2] == ["issue", "view"]:
+            return json.dumps({"labels": [{"name": "orch:ready"}]})
+        return ""
+
+    client.run = run
+    candidate = {"number": 7, "labels": [], "comments": []}
+
+    result = client.admit("owner/repo", candidate, contract)
+
+    assert result == {"issue": 7, "comment_id": 91, "state": "ready"}
+    rendered = next(
+        arg[5:] for call in calls for arg in call if arg.startswith("body=")
+    )
+    assert core.ISSUE_MARKER_V2 in rendered
+    assert [call[:2] for call in calls] == [
+        ["api", "--method"],
+        ["issue", "edit"],
+        ["issue", "view"],
+    ]
+
+
+def test_admission_rejects_a_dependency_cycle_through_existing_managed_work():
+    core, cli = _modules()
+    contract = _contract_v2(core, merge_after=[1])
+    plan = {
+        "schema_version": 1,
+        "repository": "owner/repo",
+        "admissions": [{"issue": 2, "contract": contract}],
+    }
+
+    with pytest.raises(core.PolicyError) as error:
+        cli._validate_admission_plan(
+            plan,
+            repository="owner/repo",
+            candidates=[{"number": 2, "labels": [], "comments": []}],
+            managed_issues=[
+                {
+                    "number": 1,
+                    "dispatch_after": [],
+                    "merge_after": [2],
+                }
+            ],
+        )
+
+    assert error.value.code == "CONTRACT_DEPENDENCY_CYCLE"
+
+
+def test_admission_preflight_rejects_an_unlabeled_partial_record_with_other_contract():
+    core, cli = _modules()
+    desired = _contract_v2(core, path="src/desired")
+    existing = _contract_v2(core, path="src/existing")
+    plan = {
+        "schema_version": 1,
+        "repository": "owner/repo",
+        "admissions": [{"issue": 2, "contract": desired}],
+    }
+    candidate = {
+        "number": 2,
+        "labels": [],
+        "comments": [
+            {
+                "id": 90,
+                "body": core.render_issue_record(
+                    {"contract": existing, "dispatch": None}
+                ),
+            }
+        ],
+    }
+
+    with pytest.raises(core.PolicyError) as error:
+        cli._validate_admission_plan(
+            plan, repository="owner/repo", candidates=[candidate]
+        )
+
+    assert error.value.code == "ISSUE_ALREADY_MANAGED"
+
+
+def test_legacy_worker_slots_gain_the_v61_integration_default_without_rewrite():
+    core, cli = _modules()
+    legacy = {
+        "schema_version": 1,
+        "global": {
+            "default_tier": "standard",
+            "worker_slots": 3,
+            "max_attempts": 2,
+        },
+        "tiers": {},
+        "reviewer_tiers": {"standard": "standard", "strict": "heavy"},
+        "repositories": {"owner/repo": {"integration_branch": "dev"}},
+    }
+
+    assert core.validate_config(legacy) == legacy
+    resolved = cli._repository_config(legacy, "owner/repo")
+    assert resolved["execution_slots"] == 3
+    assert resolved["integration_wip_limit"] == 6
+    assert resolved["worker_slots"] == 3
+
+
+def test_frontier_candidate_adapter_scopes_each_intake_label_and_deduplicates():
+    _core, cli = _modules()
+    client = object.__new__(cli.GitHub)
+    calls = []
+    node = {
+        "number": 7,
+        "title": "Candidate",
+        "body": "details",
+        "labels": {"nodes": [{"name": "ready-for-agent"}]},
+        "assignees": {"nodes": []},
+        "comments": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+    }
+
+    def run(args):
+        calls.append(args)
+        return json.dumps(
+            {
+                "data": {
+                    "repository": {
+                        "l0": {
+                            "pageInfo": {"hasNextPage": False},
+                            "nodes": [node],
+                        },
+                        "l1": {
+                            "pageInfo": {"hasNextPage": False},
+                            "nodes": [node],
+                        },
+                    }
+                }
+            }
+        )
+
+    client.run = run
+    candidates = client.frontier_candidates(
+        "owner/repo", 40, ["ready-for-agent", "needs-info"]
+    )
+
+    assert [candidate["number"] for candidate in candidates] == [7]
+    query = next(value for value in calls[0] if value.startswith("query="))
+    assert "l0:issues" in query and "labels:[$label0]" in query
+    assert "l1:issues" in query and "labels:[$label1]" in query
+    assert "comments(" not in query
+    assert "label0=ready-for-agent" in calls[0]
+    assert "label1=needs-info" in calls[0]
+
+
+def test_admission_detail_adapter_fetches_comments_only_for_target_issues():
+    _core, cli = _modules()
+    client = object.__new__(cli.GitHub)
+    calls = []
+    node = {
+        "number": 7,
+        "title": "Candidate",
+        "body": "details",
+        "labels": {"nodes": []},
+        "assignees": {"nodes": []},
+        "comments": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [{"databaseId": 91, "body": "plain context"}],
+        },
+    }
+
+    def run(args):
+        calls.append(args)
+        return json.dumps({"data": {"repository": {"i7": node}}})
+
+    client.run = run
+    issues = client.issues_by_number("owner/repo", [7])
+
+    assert issues[0]["comments"] == [{"id": 91, **node["comments"]["nodes"][0]}]
+    query = next(value for value in calls[0] if value.startswith("query="))
+    assert "i7:issue(number:7)" in query
+    assert "comments(first:100)" in query

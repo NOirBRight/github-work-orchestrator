@@ -561,3 +561,193 @@ def test_non_snapshot_production_path_persists_park_and_resume(tmp_path):
         "set_state:active",
         "update_record",
     ]
+
+
+def test_frontier_scan_admit_and_ready_wave_cross_the_production_cli(tmp_path):
+    core = _core()
+    real_git = shutil.which("git")
+    assert real_git
+
+    def git(cwd, *args):
+        result = subprocess.run(
+            [real_git, *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    stable = tmp_path / "stable"
+    stable.mkdir()
+    git(stable, "init", "-b", "dev")
+    git(stable, "config", "user.email", "test@example.invalid")
+    git(stable, "config", "user.name", "Test")
+    (stable / "tracked.txt").write_text("base\n", encoding="utf-8")
+    git(stable, "add", "tracked.txt")
+    git(stable, "commit", "-m", "base")
+    base_sha = git(stable, "rev-parse", "HEAD")
+
+    state_path = tmp_path / "github-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "scenario": "frontier",
+                "base_sha": base_sha,
+                "label": None,
+                "record_body": None,
+                "operations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = {
+        **core.default_config(),
+        "repositories": {
+            "owner/repo": {
+                "integration_branch": "dev",
+                "workspace_id": "stable-dev",
+                "merge_method": "squash",
+            }
+        },
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    workspace = {
+        "id": "stable-dev",
+        "repository": "owner/repo",
+        "branch": "dev",
+        "relationship": "root",
+        "dirty": False,
+        "pr_head": False,
+        "ephemeral": False,
+        "worker": False,
+        "agent_cwd_matches": True,
+    }
+    context_path = tmp_path / "coordinator-context.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "actor": {
+                    "id": "root-a",
+                    "cwd": str(stable.resolve()),
+                    "workspace_id": "stable-dev",
+                    "provider": "codex",
+                    "settings": {"model": "gpt-5.6", "modeId": "full-access"},
+                },
+                "current_workspace": workspace,
+                "candidate_workspaces": [workspace],
+                "mode": {
+                    "collaboration_mode": "Default",
+                    "write_capable": True,
+                    "colorTier": "dangerous",
+                },
+                "features": {"plan_mode": False},
+                "remote_branches": ["dev"],
+                "active_root_agents": [{"id": "root-a", "workspace_id": "stable-dev"}],
+                "request": "admit the parallel frontier",
+            }
+        ),
+        encoding="utf-8",
+    )
+    contract = {
+        "design": ["Implement the isolated API candidate."],
+        "acceptance": ["The candidate regression passes."],
+        "change_claims": {"paths": ["src/api"], "resources": []},
+        "done_when": ["python -m pytest tests/api -q"],
+        "dependencies": {"dispatch_after": [], "merge_after": []},
+        "priority": "P1",
+        "difficulty": "standard",
+        "risk": "standard",
+        "unresolved_decisions": [],
+    }
+    contract["sha256"] = core.contract_hash(contract)
+    plan_path = tmp_path / "admission.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "repository": "owner/repo",
+                "admissions": [{"issue": 23, "contract": contract}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fixture = ROOT / "tests" / "fixtures" / "fake_orchestrator_runtime.py"
+    for command, tool in (("api", "gh"), ("issue", "gh"), ("inspect", "paseo")):
+        (stable / command).write_text(
+            "import runpy, sys\n"
+            f"sys.argv = [{str(fixture)!r}, {tool!r}, {command!r}, *sys.argv[1:]]\n"
+            f"runpy.run_path({str(fixture)!r}, run_name='__main__')\n",
+            encoding="utf-8",
+        )
+
+    if os.name == "nt":
+        git_shim = tmp_path / "git.cmd"
+        git_shim.write_text(
+            f'@echo off\r\n"{sys.executable}" "{fixture}" git %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        git_shim = tmp_path / "git"
+        git_shim.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{fixture}" git "$@"\n',
+            encoding="utf-8",
+        )
+        git_shim.chmod(0o755)
+    env = {
+        **os.environ,
+        "PASEO_AGENT_ID": "root-a",
+        "ORCH_GH_PATH": sys.executable,
+        "ORCH_PASEO_PATH": sys.executable,
+        "ORCH_GIT_PATH": str(git_shim),
+        "ORCH_E2E_STATE": str(state_path),
+        "ORCH_E2E_ROOT_CWD": str(stable.resolve()),
+        "ORCH_E2E_BASE_SHA": base_sha,
+        "ORCH_E2E_REAL_GIT": real_git,
+    }
+    script = ROOT / "skills" / "orchestrator" / "scripts" / "orch.py"
+
+    def run(*arguments):
+        result = subprocess.run(
+            [sys.executable, str(script), *arguments, "--config", str(config_path)],
+            cwd=stable,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return json.loads(result.stdout)
+
+    scanned = run("frontier", "scan", "--repo", "owner/repo")
+    assert scanned["status"] == "needs-admission"
+    assert scanned["summary"]["candidate_assessments"] == [
+        {"issue": 23, "disposition": "design", "reason": "candidate-label-match"}
+    ]
+
+    admitted = run(
+        "frontier",
+        "admit",
+        "--repo",
+        "owner/repo",
+        "--plan",
+        str(plan_path),
+        "--coordinator-context",
+        str(context_path),
+    )
+    assert admitted["summary"]["admitted"] == [
+        {"issue": 23, "comment_id": 91, "state": "ready"}
+    ]
+    durable = json.loads(state_path.read_text(encoding="utf-8"))
+    assert durable["label"] == "ready"
+    assert durable["operations"] == ["admit_record", "set_state:ready"]
+    assert core.ISSUE_MARKER_V2 in durable["record_body"]
+
+    ready = run("frontier", "scan", "--repo", "owner/repo")
+    assert ready["summary"]["candidate_assessments"][0]["disposition"] == "managed"
+    assert ready["summary"]["ready_reserve"] == 1
+    assert ready["summary"]["wave"]["selected"] == [23]
