@@ -1,11 +1,11 @@
 # Orchestrator V6 Living Design
 
-> Status: released as Orchestrator 6.0.0 on 2026-07-20.
+> Status: hardened as Orchestrator 6.0.1 on 2026-07-20.
 > Last consolidated from Paseo thread
 > `f9589ab7-92ed-45cb-9b20-417dd5de067a` on 2026-07-19.
 
 This is the compression-safe behavioral source for V6. `CONTEXT.md` owns
-language and ADR 0008 owns the architectural trade-off.
+language, ADR 0008 owns the architecture, and ADR 0009 owns 6.0.1 hardening.
 
 ## Outcomes
 
@@ -25,7 +25,9 @@ language and ADR 0008 owns the architectural trade-off.
   including while another Agent's WIP is active. It uses its current provider,
   model, thinking, mode, and features.
 - Plan/read-only may inspect and plan; write actions require the same Agent to
-  enter a write-capable mode. No successor is created for capability changes.
+  enter a write-capable mode. Every mutation consumes fresh ephemeral Actor,
+  mode/feature, Workspace, and branch context before constructing GitHub;
+  Plan/planning/unknown capability and identity drift fail closed.
 - A cross-platform OS advisory mutex serializes one state-changing command and
   releases at process exit. There is no long-lived Lease, holder, epoch, TTL,
   transfer, or takeover protocol.
@@ -36,6 +38,9 @@ language and ADR 0008 owns the architectural trade-off.
   head or Worker worktree. Dirty state permits planning and execution but blocks
   merge; no automatic stash/reset is allowed.
 - Coordinator never authors a tracked-file change.
+- Workspace selection is current eligible, configured ID, then the unique
+  eligible candidate. Non-stable callers forward the raw request to one root in
+  that Workspace or create one detached root, then end without persisting it.
 
 ## GitHub facts
 
@@ -72,7 +77,10 @@ language and ADR 0008 owns the architectural trade-off.
   dispatch through merge or explicit stop. Review does not release a slot and
   Reviewers consume none.
 - Blocked retains its slot and Hotset. Human Park stops the Worker and releases
-  both while preserving WIP; resume revalidates base, design, and conflicts.
+  both only after stop readback while preserving Agent/Workspace/branch/WIP.
+  Resume revalidates contract hash, base, dependencies, Slot, Hotset, and Worker
+  identity, then reoccupies both before waking that same Worker. Deterministic
+  action IDs and `parking/resuming` states recover crashes without duplication.
 - Reconcile schedules on first invocation, Ready, slot release, failure/scope
   conflict, material priority/dependency/human change, or recovery. It is never
   triggered by heartbeat, timer, ordinary timeout, idle, or Review entry.
@@ -134,6 +142,11 @@ language and ADR 0008 owns the architectural trade-off.
   an explicit human release request.
 - After merge, accept Paseo auto-archive first. Current direct children may be
   archived manually; foreign-parent Agents become human cleanup candidates.
+- Runtime cleanup evidence is `present`, `auto_archived`, or `invalid`.
+  Auto-archive requires one archived Dispatch-labeled Agent plus matching
+  Worker/Workspace/branch and merged candidate records; a removed cwd is then
+  completion, not identity failure. A missing remote branch is complete; an
+  exact candidate ref is CAS-deleted; any new commit blocks.
 - Worktree/branch cleanup requires merged, clean, unbound evidence. Self, root,
   stable Workspace, integration branch, dirty/shared/ambiguous/WIP resources are
   permanently protected.
@@ -144,8 +157,11 @@ language and ADR 0008 owns the architectural trade-off.
 
 - Public CLI groups are `reconcile`, `integrate`, `retire`, and optional
   `project init|sync`; implementation policy stays private.
+- Every state-changing group requires `--coordinator-context PATH|-`; Park and
+  resume are `reconcile --park|--resume DISPATCH`.
 - `~/.orch/config.json` is the single optional config. Defaults are WIP three,
-  two attempts, `dev` when unambiguous, and current Runtime fallback.
+  two attempts, `dev` only when remote/live Workspace readback is unambiguous,
+  and current Runtime fallback. `main` is never inferred.
 - V6 is the only `/orchestrator` Skill, synchronized byte-identically to
   `.agents`, `.codex`, and `.claude`. No host or daemon changes.
 - New Dispatches use the installed version; running Workers finish their
@@ -167,3 +183,9 @@ heavy runtime and thinking readback, graded Review, serial merge, direct-child
 auto-archive, and root/Workspace survival. A second Coordinator reconstructed
 the completed state with zero actions, and a fresh installed Agent returned an
 idle, zero-warning read-only reconcile from the stable Workspace.
+
+6.0.1 adds production-path regression evidence for pre-mutation Plan blocking,
+stable-dev forwarding, two-phase Park/resume and crash recovery, and host-first
+auto-archive with zero duplicate cleanup. The full suite, packaging, lint,
+format, manifest, three-surface drift, and installed read-only smoke remain the
+release gates.

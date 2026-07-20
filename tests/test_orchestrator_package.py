@@ -29,7 +29,7 @@ def test_quick_validation_and_manifest_are_at_fixed_point():
         "content_sha256": sync.package_digest(PACKAGE),
         "schema_version": 1,
         "skill": "orchestrator",
-        "version": "6.0.0",
+        "version": "6.0.1",
     }
 
 

@@ -41,6 +41,7 @@
   "repositories": {
     "owner/repo": {
       "integration_branch": "dev",
+      "workspace_id": "paseo-stable-workspace-id",
       "merge_method": "squash",
       "worker_slots": 3,
       "default_tier": "standard",

@@ -14,7 +14,7 @@ import uuid
 
 
 SKILL = "orchestrator"
-VERSION = "6.0.0"
+VERSION = "6.0.1"
 MANIFEST = ".skill-package.json"
 TEXT_SUFFIXES = {".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
 

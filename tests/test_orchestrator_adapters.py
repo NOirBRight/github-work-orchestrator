@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "orchestrator" / "scripts"
@@ -453,6 +455,7 @@ def test_cleanup_adapter_requires_exact_dispatch_agent_workspace_and_branch(
                 "workspace_id": "workspace-7",
                 "branch": "work/issue-7",
             },
+            "pr": {"head_sha": "a" * 40},
         },
         "root-a",
         object(),
@@ -484,7 +487,7 @@ def test_dispatch_identity_uses_registered_git_worktree_when_cli_omits_id(
         "_runtime_worktrees",
         lambda: [{"path": str(worker_repo), "branch": "work/issue-7"}],
     )
-    detail, cwd, branch, blocker = cli._verified_dispatch_runtime(
+    evidence = cli._verified_dispatch_runtime(
         {
             "id": "dispatch-issue-7-a1",
             "worker_agent_id": "worker-7",
@@ -494,10 +497,287 @@ def test_dispatch_identity_uses_registered_git_worktree_when_cli_omits_id(
         FakePaseo(),
         "dev",
     )
-    assert blocker is None
-    assert detail["Id"] == "worker-7"
-    assert cwd == worker_repo.resolve()
-    assert branch == "work/issue-7"
+    assert evidence["state"] == "present"
+    assert evidence["blocker"] is None
+    assert evidence["detail"]["Id"] == "worker-7"
+    assert evidence["cwd"] == worker_repo.resolve()
+    assert evidence["branch"] == "work/issue-7"
+
+
+def test_cleanup_accepts_host_auto_archive_and_is_idempotent(tmp_path, monkeypatch):
+    _, cli = _modules()
+    removed_cwd = tmp_path / "already-removed"
+    candidate = "a" * 40
+
+    class FakePaseo:
+        def agents_for_dispatch(self, dispatch):
+            return [
+                {
+                    "id": "worker-7",
+                    "labels": {"orch.dispatch": dispatch},
+                }
+            ]
+
+        def inspect(self, _agent):
+            return {
+                "Id": "worker-7",
+                "ParentAgentId": "root-a",
+                "Status": "closed",
+                "Archived": True,
+                "Cwd": str(removed_cwd),
+                "Worktree": None,
+                "Labels": {"orch.dispatch": "dispatch-issue-7-a1"},
+            }
+
+        def all_agents(self):
+            raise AssertionError(
+                "auto-archived cleanup must not rediscover removed cwd"
+            )
+
+        def agents_for_labels(self, _labels):
+            raise AssertionError(
+                "completed host cleanup must not duplicate archive actions"
+            )
+
+    class FakeGitHub:
+        def __init__(self):
+            self.remote_sha = candidate
+            self.deleted = []
+
+        def remote_branch_sha(self, _repo, _branch):
+            return self.remote_sha
+
+        def delete_remote_branch(self, _repo, branch, expected_sha):
+            assert expected_sha == candidate
+            self.deleted.append(branch)
+            self.remote_sha = None
+
+    github = FakeGitHub()
+    monkeypatch.setattr(cli, "Paseo", FakePaseo)
+    issue = {
+        "number": 7,
+        "dispatch": {
+            "id": "dispatch-issue-7-a1",
+            "worker_agent_id": "worker-7",
+            "workspace_id": "workspace-7",
+            "branch": "work/issue-7",
+            "status": "merged",
+            "candidate_sha": candidate,
+        },
+        "pr": {"number": 17, "head_sha": candidate},
+    }
+    first = cli._cleanup_after_merge("owner/repo", issue, "root-a", github, "dev")
+    assert first["blockers"] == []
+    assert first["manual_cleanup"] == []
+    assert first["actions"] == [{"type": "delete_branch", "branch": "work/issue-7"}]
+    assert first["runtime_evidence"] == "auto_archived"
+
+    second = cli._cleanup_after_merge("owner/repo", issue, "root-a", github, "dev")
+    assert second["actions"] == []
+    assert second["blockers"] == []
+    assert github.deleted == ["work/issue-7"]
+
+
+def test_auto_archive_evidence_rejects_label_sha_or_remote_drift(tmp_path, monkeypatch):
+    _, cli = _modules()
+    candidate = "a" * 40
+
+    class FakePaseo:
+        label = "wrong-dispatch"
+
+        def agents_for_dispatch(self, _dispatch):
+            return [{"id": "worker-7", "labels": {"orch.dispatch": self.label}}]
+
+        def inspect(self, _agent):
+            return {
+                "Id": "worker-7",
+                "Archived": True,
+                "Cwd": str(tmp_path / "gone"),
+                "Worktree": None,
+            }
+
+    paseo = FakePaseo()
+    monkeypatch.setattr(cli, "Paseo", lambda: paseo)
+
+    class FakeGitHub:
+        remote_sha = "c" * 40
+
+        def remote_branch_sha(self, *_args):
+            return self.remote_sha
+
+    issue = {
+        "number": 7,
+        "dispatch": {
+            "id": "dispatch-issue-7-a1",
+            "worker_agent_id": "worker-7",
+            "workspace_id": "workspace-7",
+            "branch": "work/issue-7",
+            "status": "merged",
+            "candidate_sha": candidate,
+        },
+        "pr": {"number": 17, "head_sha": candidate},
+    }
+    mislabeled = cli._cleanup_after_merge(
+        "owner/repo", issue, "root-a", FakeGitHub(), "dev"
+    )
+    assert mislabeled["blockers"] == ["dispatch-identity-mismatch"]
+
+    paseo.label = "dispatch-issue-7-a1"
+    issue["dispatch"]["candidate_sha"] = "b" * 40
+    sha_drift = cli._cleanup_after_merge(
+        "owner/repo", issue, "root-a", FakeGitHub(), "dev"
+    )
+    assert sha_drift["blockers"] == ["cleanup-candidate-mismatch"]
+
+    issue["dispatch"]["candidate_sha"] = candidate
+    remote_drift = cli._cleanup_after_merge(
+        "owner/repo", issue, "root-a", FakeGitHub(), "dev"
+    )
+    assert remote_drift["blockers"] == ["remote-branch-has-unmerged-wip"]
+
+
+def test_production_integrate_accepts_host_first_archive_without_warning(
+    tmp_path, monkeypatch
+):
+    core, cli = _modules()
+    candidate = "a" * 40
+    contract = _contract(core)
+    issue = {
+        "number": 7,
+        "state": "ready-to-merge",
+        "priority": "P1",
+        "dependencies": [],
+        "contract": contract,
+        "contract_valid": True,
+        "dispatch": {
+            "id": "dispatch-issue-7-a1",
+            "status": "ready-to-merge",
+            "accepted_at": "2026-07-20T01:00:00Z",
+            "worker_agent_id": "worker-7",
+            "workspace_id": "workspace-7",
+            "branch": "work/issue-7",
+        },
+        "pr": {
+            "number": 17,
+            "head_sha": candidate,
+            "base": "dev",
+            "merge_state": "CLEAN",
+            "checks": "green",
+            "review_decision": "APPROVED",
+            "delivery_valid": True,
+        },
+    }
+    workspace = {
+        "id": "stable-dev",
+        "repository": "owner/repo",
+        "branch": "dev",
+        "relationship": "root",
+        "dirty": False,
+        "pr_head": False,
+        "ephemeral": False,
+        "worker": False,
+        "agent_cwd_matches": True,
+    }
+    snapshot = {
+        "repository": "owner/repo",
+        "issues": [issue],
+        "closed_issues": [],
+        "coordinator_workspace": workspace,
+    }
+
+    class AutoArchivedPaseo:
+        def agents_for_dispatch(self, dispatch):
+            return [{"id": "worker-7", "labels": {"orch.dispatch": dispatch}}]
+
+        def inspect(self, _agent):
+            return {
+                "Id": "worker-7",
+                "ParentAgentId": "root-a",
+                "Status": "closed",
+                "Archived": True,
+                "Cwd": str(tmp_path / "host-removed"),
+                "Worktree": None,
+            }
+
+    class FakeGitHub:
+        def __init__(self):
+            self.closed = False
+            self.deleted = []
+            self.remote_sha = candidate
+
+        def mark_integrating(self, _repo, managed, pr, sha, _state):
+            managed["dispatch"].update(
+                {
+                    "status": "integrating",
+                    "pr_number": pr,
+                    "candidate_sha": sha,
+                }
+            )
+
+        def merge(self, _repo, _pr, _method, expected_sha):
+            assert expected_sha == candidate
+            return {"state": "MERGED", "mergedAt": "2026-07-20T01:05:00Z"}
+
+        def mark_merged(self, _repo, managed, pr, sha, merged_at):
+            managed["dispatch"].update(
+                {
+                    "status": "merged",
+                    "pr_number": pr,
+                    "candidate_sha": sha,
+                    "merged_at": merged_at,
+                }
+            )
+
+        def close_issue(self, *_args):
+            self.closed = True
+
+        def remote_branch_sha(self, *_args):
+            return self.remote_sha
+
+        def delete_remote_branch(self, _repo, branch, expected_sha):
+            assert expected_sha == candidate
+            self.deleted.append(branch)
+            self.remote_sha = None
+
+    github = FakeGitHub()
+    config = {
+        **core.default_config(),
+        "repositories": {"owner/repo": {"integration_branch": "dev"}},
+    }
+    monkeypatch.setattr(cli, "GitHub", lambda: github)
+    monkeypatch.setattr(cli, "Paseo", AutoArchivedPaseo)
+    monkeypatch.setattr(cli, "_load_config", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(cli, "_git_common_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_coordinator_preflight",
+        lambda *_: (
+            {
+                "repository": "owner/repo",
+                "integration_branch": "dev",
+                "merge_method": "squash",
+                "worker_slots": 3,
+                "max_attempts": 2,
+            },
+            {"status": "ready"},
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_prepare_snapshot",
+        lambda *_args, **_kwargs: (snapshot, {"agent_id": "root-a"}),
+    )
+    args = type(
+        "Args",
+        (),
+        {"snapshot": None, "repo": "owner/repo", "pr": 17, "config": tmp_path},
+    )()
+    result = cli._integrate(args)
+    assert result["status"] == "idle"
+    assert result["warnings"] == []
+    assert result["summary"]["cleanup"]["runtime_evidence"] == "auto_archived"
+    assert github.closed is True
+    assert github.deleted == ["work/issue-7"]
 
 
 def test_cleanup_adapter_preserves_clean_local_or_remote_unmerged_wip(
@@ -668,6 +948,20 @@ def test_integrate_preserves_merge_fact_when_cleanup_fails(tmp_path, monkeypatch
     }
     monkeypatch.setattr(cli, "GitHub", lambda: fake)
     monkeypatch.setattr(cli, "_load_config", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(
+        cli,
+        "_coordinator_preflight",
+        lambda _args, _config: (
+            {
+                "repository": "owner/repo",
+                "integration_branch": "dev",
+                "merge_method": "squash",
+                "worker_slots": 3,
+                "max_attempts": 2,
+            },
+            {"status": "ready"},
+        ),
+    )
     monkeypatch.setattr(cli, "_git_common_dir", lambda: tmp_path)
     monkeypatch.setattr(
         cli,
@@ -770,6 +1064,417 @@ def test_state_repair_cannot_mutate_before_coordinator_eligibility(monkeypatch):
         )
     assert rejected.value.code == "COORDINATOR_NOT_ROOT"
     assert fake.repairs == []
+
+
+@pytest.mark.parametrize(
+    "argv, entrypoint",
+    [
+        (["reconcile", "--repo", "owner/repo"], "_reconcile"),
+        (["integrate", "--repo", "owner/repo", "--pr", "17"], "_integrate"),
+        (
+            ["retire", "--repo", "owner/repo", "--dispatch", "dispatch-issue-7-a1"],
+            "_retire",
+        ),
+        (["project", "sync", "--repo", "owner/repo"], "_project"),
+    ],
+)
+def test_every_mutation_entry_requires_context_before_github_adapter(
+    monkeypatch, tmp_path, argv, entrypoint
+):
+    core, cli = _modules()
+    args = cli.parse_args([*argv, "--config", str(tmp_path / "config.json")])
+    constructed = []
+
+    class ForbiddenGitHub:
+        def __init__(self):
+            constructed.append(True)
+
+    monkeypatch.setattr(cli, "GitHub", ForbiddenGitHub)
+    with pytest.raises(core.PolicyError) as rejected:
+        getattr(cli, entrypoint)(args)
+    assert rejected.value.code == "COORDINATOR_CONTEXT_REQUIRED"
+    assert constructed == []
+
+
+@pytest.mark.parametrize(
+    "argv, entrypoint",
+    [
+        (["reconcile", "--repo", "owner/repo"], "_reconcile"),
+        (["integrate", "--repo", "owner/repo", "--pr", "17"], "_integrate"),
+        (
+            ["retire", "--repo", "owner/repo", "--dispatch", "dispatch-issue-7-a1"],
+            "_retire",
+        ),
+        (["project", "sync", "--repo", "owner/repo"], "_project"),
+    ],
+)
+def test_plan_mode_blocks_every_mutation_before_github_adapter(
+    monkeypatch, tmp_path, argv, entrypoint
+):
+    core, cli = _modules()
+    workspace = {
+        "id": "stable-dev",
+        "repository": "owner/repo",
+        "branch": "dev",
+        "relationship": "root",
+        "dirty": False,
+        "pr_head": False,
+        "ephemeral": False,
+        "worker": False,
+        "agent_cwd_matches": True,
+    }
+    context = {
+        "schema_version": 1,
+        "actor": {
+            "id": "root-a",
+            "cwd": str(tmp_path),
+            "workspace_id": "stable-dev",
+            "provider": "codex",
+            "settings": {"model": "gpt-5.6", "modeId": "full-access"},
+        },
+        "current_workspace": workspace,
+        "candidate_workspaces": [workspace],
+        "mode": {
+            "collaboration_mode": "plan",
+            "write_capable": True,
+            "colorTier": "planning",
+        },
+        "features": {"plan_mode": True},
+        "remote_branches": ["dev"],
+        "active_root_agents": [],
+        "request": "write",
+    }
+    context_path = tmp_path / "context.json"
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    args = cli.parse_args(
+        [
+            *argv,
+            "--coordinator-context",
+            str(context_path),
+            "--config",
+            str(tmp_path / "config.json"),
+        ]
+    )
+    constructed = []
+    monkeypatch.setattr(cli, "GitHub", lambda: constructed.append(True))
+    monkeypatch.setattr(
+        cli,
+        "_paseo_current",
+        lambda: (
+            {"agent_id": "root-a"},
+            {
+                "workspace_id": "stable-dev",
+                "cwd": str(tmp_path),
+                "relationship": "root",
+                "archived": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(cli, "_tool", lambda *_: "git")
+    monkeypatch.setattr(cli, "_remote_repository", lambda: "owner/repo")
+    monkeypatch.setattr(
+        cli,
+        "_run",
+        lambda command, **_kwargs: (
+            json.loads(context_path.read_text(encoding="utf-8"))["current_workspace"][
+                "branch"
+            ]
+            if "branch" in command
+            else str(tmp_path)
+        ),
+    )
+    with pytest.raises(core.PolicyError) as rejected:
+        getattr(cli, entrypoint)(args)
+    assert rejected.value.code == "COORDINATOR_MODE_READ_ONLY"
+    assert constructed == []
+
+
+def test_cli_exposes_common_coordinator_context_and_lifecycle_flags():
+    _, cli = _modules()
+    for argv in (
+        ["reconcile", "--repo", "owner/repo", "--coordinator-context", "ctx.json"],
+        [
+            "integrate",
+            "--repo",
+            "owner/repo",
+            "--pr",
+            "17",
+            "--coordinator-context",
+            "ctx.json",
+        ],
+        [
+            "retire",
+            "--repo",
+            "owner/repo",
+            "--dispatch",
+            "dispatch-issue-7-a1",
+            "--coordinator-context",
+            "ctx.json",
+        ],
+        [
+            "project",
+            "sync",
+            "--repo",
+            "owner/repo",
+            "--coordinator-context",
+            "ctx.json",
+        ],
+    ):
+        assert cli.parse_args(argv).coordinator_context == "ctx.json"
+
+    parked = cli.parse_args(
+        ["reconcile", "--repo", "owner/repo", "--park", "dispatch-issue-7-a1"]
+    )
+    resumed = cli.parse_args(
+        ["reconcile", "--repo", "owner/repo", "--resume", "dispatch-issue-7-a1"]
+    )
+    assert parked.park == "dispatch-issue-7-a1"
+    assert resumed.resume == "dispatch-issue-7-a1"
+
+
+def test_coordinator_context_selection_and_forwarding_use_production_preflight(
+    monkeypatch, tmp_path
+):
+    _, cli = _modules()
+    workspace = {
+        "id": "stable-dev",
+        "repository": "owner/repo",
+        "branch": "dev",
+        "relationship": "root",
+        "dirty": False,
+        "pr_head": False,
+        "ephemeral": False,
+        "worker": False,
+        "agent_cwd_matches": True,
+    }
+    context = {
+        "schema_version": 1,
+        "actor": {
+            "id": "root-a",
+            "cwd": str(tmp_path),
+            "workspace_id": "stable-dev",
+            "provider": "codex",
+            "settings": {"model": "gpt-5.6", "modeId": "full-access"},
+        },
+        "current_workspace": workspace,
+        "candidate_workspaces": [workspace],
+        "mode": {
+            "collaboration_mode": "default",
+            "write_capable": True,
+            "colorTier": "dangerous",
+        },
+        "features": {"plan_mode": False},
+        "remote_branches": ["main", "dev"],
+        "active_root_agents": [],
+        "request": "continue",
+    }
+    context_path = tmp_path / "context.json"
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    args = type(
+        "Args",
+        (),
+        {"repo": "owner/repo", "coordinator_context": str(context_path)},
+    )()
+    monkeypatch.setattr(
+        cli,
+        "_paseo_current",
+        lambda: (
+            {"agent_id": "root-a"},
+            {
+                "workspace_id": "stable-dev",
+                "cwd": str(tmp_path),
+                "relationship": "root",
+                "archived": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(cli, "_tool", lambda *_: "git")
+    monkeypatch.setattr(cli, "_remote_repository", lambda: "owner/repo")
+    monkeypatch.setattr(
+        cli,
+        "_run",
+        lambda command, **_kwargs: (
+            json.loads(context_path.read_text(encoding="utf-8"))["current_workspace"][
+                "branch"
+            ]
+            if "branch" in command
+            else str(tmp_path)
+        ),
+    )
+
+    repo_config, entry = cli._coordinator_preflight(args, cli.core.default_config())
+    assert repo_config["integration_branch"] == "dev"
+    assert entry["status"] == "ready"
+
+    monkeypatch.setattr(
+        cli,
+        "_paseo_current",
+        lambda: (
+            {"agent_id": "root-a"},
+            {
+                "workspace_id": "stable-dev",
+                "cwd": str(tmp_path),
+                "relationship": "subagent",
+                "archived": False,
+            },
+        ),
+    )
+    with pytest.raises(cli.core.PolicyError) as relationship_drift:
+        cli._coordinator_preflight(args, cli.core.default_config())
+    assert relationship_drift.value.code == "COORDINATOR_RELATIONSHIP_MISMATCH"
+
+    feature = {
+        **workspace,
+        "id": "feature-17",
+        "branch": "work/issue-17",
+        "worker": True,
+    }
+    context["actor"]["workspace_id"] = "feature-17"
+    context["current_workspace"] = feature
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "_paseo_current",
+        lambda: (
+            {"agent_id": "root-a"},
+            {
+                "workspace_id": "feature-17",
+                "cwd": str(tmp_path),
+                "relationship": "root",
+                "archived": False,
+            },
+        ),
+    )
+    _, entry = cli._coordinator_preflight(args, cli.core.default_config())
+    assert entry["status"] == "forwarded"
+    assert entry["actions"][0]["type"] == "create_root_agent"
+
+    monkeypatch.setattr(
+        cli,
+        "_run",
+        lambda command, **_kwargs: "dev" if "branch" in command else str(tmp_path),
+    )
+    with pytest.raises(cli.core.PolicyError) as stale:
+        cli._coordinator_preflight(args, cli.core.default_config())
+    assert stale.value.code == "COORDINATOR_GIT_MISMATCH"
+
+
+def test_reconcile_park_and_resume_persist_before_returning_paseo_actions(
+    monkeypatch, tmp_path
+):
+    core, cli = _modules()
+    contract = _contract(core)
+    snapshot = {
+        "repository": "owner/repo",
+        "base_sha": "a" * 40,
+        "worker_slots": 3,
+        "closed_issues": [],
+        "issues": [
+            {
+                "number": 7,
+                "state": "active",
+                "contract": contract,
+                "contract_valid": True,
+                "hotset": contract["hotset"],
+                "dispatch": {
+                    "id": "dispatch-issue-7-a1",
+                    "attempt": 1,
+                    "status": "running",
+                    "parked": False,
+                    "worker_agent_id": "worker-7",
+                    "workspace_id": "workspace-7",
+                    "branch": "work/issue-7",
+                    "base_sha": "a" * 40,
+                    "contract_sha256": contract["sha256"],
+                },
+            }
+        ],
+        "runtime_agents": [
+            {
+                "id": "worker-7",
+                "workspace_id": "workspace-7",
+                "branch": "work/issue-7",
+                "labels": {"orch.dispatch": "dispatch-issue-7-a1"},
+                "state": "running",
+            }
+        ],
+    }
+
+    class FakeGitHub:
+        records = []
+        states = []
+
+        def update_record(self, _repo, issue):
+            self.records.append(issue["dispatch"]["status"])
+
+        def set_issue_state(self, _repo, _issue, state):
+            self.states.append(state)
+
+    github = FakeGitHub()
+    monkeypatch.setattr(cli, "GitHub", lambda: github)
+    monkeypatch.setattr(
+        cli,
+        "_coordinator_preflight",
+        lambda *_: (
+            {
+                "repository": "owner/repo",
+                "integration_branch": "dev",
+                "worker_slots": 3,
+                "max_attempts": 2,
+                "merge_method": "squash",
+            },
+            {"status": "ready"},
+        ),
+    )
+    monkeypatch.setattr(
+        cli, "_load_config", lambda *_args, **_kwargs: core.default_config()
+    )
+    monkeypatch.setattr(cli, "_git_common_dir", lambda: tmp_path)
+    snapshot_holder = {"value": snapshot}
+    monkeypatch.setattr(
+        cli,
+        "_prepare_snapshot",
+        lambda *_args, **_kwargs: (snapshot_holder["value"], {}),
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "repo": "owner/repo",
+            "observations": None,
+            "snapshot": None,
+            "read_only": False,
+            "park": "dispatch-issue-7-a1",
+            "resume": None,
+            "config": tmp_path / "config.json",
+        },
+    )()
+    result = cli._reconcile(args)
+    assert github.records == ["parking"]
+    assert github.states == []
+    assert result["actions"][0]["action_id"] == "park-dispatch-issue-7-a1-g1"
+
+    parked_snapshot = core.apply_observations(
+        snapshot,
+        [
+            {
+                "action_id": "park-dispatch-issue-7-a1-g1",
+                "status": "succeeded",
+                "agent_id": "worker-7",
+                "workspace_id": "workspace-7",
+                "branch": "work/issue-7",
+                "agent_state": "idle",
+            }
+        ],
+    )
+    parked_snapshot["issues"][0]["state"] = "blocked"
+    snapshot_holder["value"] = parked_snapshot
+    args.park = None
+    args.resume = "dispatch-issue-7-a1"
+    resumed = cli._reconcile(args)
+    assert github.records == ["parking", "resuming"]
+    assert github.states == ["active"]
+    assert resumed["actions"][0]["action_id"] == "resume-dispatch-issue-7-a1-g2"
 
 
 def test_dependency_states_are_read_in_one_followup_graphql_batch():

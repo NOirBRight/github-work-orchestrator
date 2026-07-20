@@ -41,6 +41,68 @@ stores only Difficulty Tier; concrete runtimes never become repository truth.
 }
 ```
 
+## Coordinator context
+
+Every state-changing `reconcile`, `integrate`, `retire`, or `project` command
+requires `--coordinator-context PATH|-`. The Skill creates this short-lived JSON
+from the latest Paseo MCP, collaboration-mode, and Git readbacks:
+
+```json
+{
+  "schema_version": 1,
+  "actor": {
+    "id": "paseo-agent-id",
+    "cwd": "current-workspace-cwd",
+    "workspace_id": "current-workspace-id",
+    "provider": "provider-id",
+    "settings": {"model": "model-id", "modeId": "write-mode"}
+  },
+  "current_workspace": {
+    "id": "current-workspace-id",
+    "repository": "owner/repo",
+    "branch": "dev",
+    "relationship": "root",
+    "dirty": false,
+    "pr_head": false,
+    "ephemeral": false,
+    "worker": false,
+    "agent_cwd_matches": true
+  },
+  "candidate_workspaces": [],
+  "mode": {
+    "collaboration_mode": "default",
+    "write_capable": true,
+    "colorTier": "dangerous"
+  },
+  "features": {"plan_mode": false},
+  "remote_branches": ["dev", "main"],
+  "active_root_agents": [],
+  "request": "the original request, used only if forwarding is required"
+}
+```
+
+Each candidate Workspace uses the same Workspace fields. Each active root entry
+has at least `id` and `workspace_id`. `write_capable` must be a positive fresh
+readback; absence or ambiguity is not permission. The CLI cross-checks Actor ID,
+cwd, and Workspace against `PASEO_AGENT_ID`, `paseo inspect`, and Git before it
+constructs the GitHub adapter. Plan collaboration, `plan_mode=true`, or
+`colorTier=planning` blocks all writes.
+
+The request exists only so a feature/PR Workspace can return one
+`forward_request` or `create_root_agent` action. Do not put the context in a
+GitHub record, log it, or retain its temporary file after executing the action.
+
+An explicit repository `integration_branch` always wins. Without one, `dev` is
+accepted only when the remote `dev` ref exists and exactly one stable Workspace
+candidate is on it. Otherwise the CLI returns `INTEGRATION_BRANCH_REQUIRED`; it
+never guesses `main`.
+
+Park/Resume success observations additionally require the exact durable
+`agent_id`, `workspace_id`, and `branch`, plus fresh `agent_state`. Park accepts
+only `idle`, `stopped`, `closed`, `finished`, or `completed`; resume accepts
+only `running` or `busy`. A bare `status=succeeded` never releases or reacquires
+a Slot/Hotset.
+
 Resolution is Issue Tier, Milestone default, repository default, global
 default, then `standard`; runtime mapping is repository Tier, global Tier,
 then the current Coordinator runtime. Missing mode/features may inherit only

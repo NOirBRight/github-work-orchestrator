@@ -1,9 +1,9 @@
 ---
 name: orchestrator
-description: Lightweight GitHub work orchestration (V6.0). Act as project manager for one repository: clarify and prioritize Issues, plan rolling Hotset-disjoint waves, dispatch up to five disposable Paseo Workers through local runtime tiers, grade review by risk, merge serially into the integration branch, and retire only proven-safe resources. Use for end-to-end GitHub Issue execution and parallel work coordination.
+description: Lightweight GitHub work orchestration (V6.0.1). Act as project manager for one repository: clarify and prioritize Issues, plan rolling Hotset-disjoint waves, dispatch up to five disposable Paseo Workers through local runtime tiers, grade review by risk, merge serially into the integration branch, and retire only proven-safe resources. Use for end-to-end GitHub Issue execution and parallel work coordination.
 ---
 
-# Orchestrator V6.0
+# Orchestrator V6.0.1
 
 Orchestrator is a portable harness used by the current Agent. It is not a
 permanent Agent, Campaign, room, daemon, lease, or task database.
@@ -26,13 +26,13 @@ Milestone are optional views. Paseo stores runtime facts only.
 2. Before creating any Agent, read `~/.paseo/orchestration-preferences.json`
    and load the `/paseo` Skill. Query Paseo provider/model/mode/thinking/feature
    capabilities immediately before creation.
-3. Inspect the current Agent, Git remote, branch, and Workspace.
+3. Inspect Agent, Git branches, mode/features, and candidate Workspaces. Build
+   the ephemeral [Coordinator context](references/runtime-config.md#coordinator-context) from fresh Paseo MCP readback; delete it afterwards.
 
-A state-changing Coordinator must be root/detached, match the repository, and
-be in the configured integration Workspace. The Workspace must not be a PR
-head, `work/issue-*`, archived, or ephemeral. Dirty is allowed for design,
-dispatch, execution, and review; it blocks merge. Never stash, reset, or author
-tracked changes from the Coordinator Workspace.
+Every state-changing CLI call passes `--coordinator-context PATH|-`. Plan
+collaboration, `plan_mode`, planning color tier, unknown write capability, or
+Actor/cwd/Workspace disagreement fails before GitHub mutation. A Coordinator is
+root/detached in the integration Workspace, never a PR head, Worker, archived, or ephemeral. Dirty blocks merge only. Never stash/reset there.
 
 Workspace choice is current eligible Workspace, configured `workspace_id`,
 then a unique eligible integration Workspace. If none or several remain, stop
@@ -41,8 +41,7 @@ with `WORKSPACE_SELECTION_REQUIRED`.
 When invoked from a non-stable Workspace, do not create a Relay, Draft, room,
 or nested Orchestrator. Forward the original request to the sole active root
 Agent in the target Workspace. If none exists, create one detached root Agent
-there with the caller's exact current runtime. If several exist, ask the user
-which one.
+there with the caller's runtime. If several exist, ask. Execute the returned Paseo action, end this turn, and never persist the raw request.
 
 ## Design the frontier
 
@@ -91,8 +90,8 @@ runtime—consolidate inseparable reports before Ready.
 Run:
 
 ```text
-python <skill>/scripts/orch.py reconcile --repo owner/repo --read-only
-python <skill>/scripts/orch.py reconcile --repo owner/repo
+python <skill>/scripts/orch.py reconcile --repo owner/repo --read-only --coordinator-context context.json
+python <skill>/scripts/orch.py reconcile --repo owner/repo --coordinator-context context.json
 ```
 
 The write command takes an OS advisory mutex for at most five seconds, reads
@@ -133,7 +132,7 @@ Execute every returned `create_worker` action without waiting between siblings:
 ```
 
 ```text
-python <skill>/scripts/orch.py reconcile --repo owner/repo --observations file.json
+python <skill>/scripts/orch.py reconcile --repo owner/repo --observations file.json --coordinator-context context.json
 ```
 
 The GitHub claim is written before Agent creation. Under two minutes, a missing
@@ -155,7 +154,9 @@ Do not poll busy Workers or add heartbeat/watchdog machinery. On an objective
 idle recovery action, send one prompt. After a confirmed closed/error terminal,
 one replacement may continue the same Workspace/branch; the second failure
 becomes Blocked. Human Park preserves branch/WIP but releases the slot and
-Hotset; resume revalidates base, design, and conflicts.
+Hotset only after `stop_worker` readback; resume revalidates contract, base,
+dependencies, Slot, Hotset, and identity. Run `reconcile --park DISPATCH` or
+`--resume DISPATCH`; execute it, then observe the deterministic ID with fresh Agent/Workspace/branch and `agent_state` readback.
 
 ## Review
 
@@ -183,7 +184,7 @@ independent E2E/security substitute.
 Run only the selected ready PR:
 
 ```text
-python <skill>/scripts/orch.py integrate --repo owner/repo --pr N
+python <skill>/scripts/orch.py integrate --repo owner/repo --pr N --coordinator-context context.json
 ```
 
 Integration re-reads head/base/checks/review/contract/Workspace under the short
@@ -202,7 +203,7 @@ and unknown identity are permanently protected.
 For an explicitly `stopped` or `abandoned` Dispatch:
 
 ```text
-python <skill>/scripts/orch.py retire --repo owner/repo --dispatch dispatch-id
+python <skill>/scripts/orch.py retire --repo owner/repo --dispatch dispatch-id --coordinator-context context.json
 ```
 
 Retirement preserves every unmerged remote branch and refuses unpushed or dirty
