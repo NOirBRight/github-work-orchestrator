@@ -156,7 +156,7 @@ one replacement may continue the same Workspace/branch; the second failure
 becomes Blocked. Human Park preserves branch/WIP but releases the slot and
 Hotset only after `stop_worker` readback; resume revalidates contract, base,
 dependencies, Slot, Hotset, and identity. Run `reconcile --park DISPATCH` or
-`--resume DISPATCH`; execute then observe the deterministic Paseo action.
+`--resume DISPATCH`; execute it, then observe the deterministic ID with fresh Agent/Workspace/branch and `agent_state` readback.
 
 ## Review
 

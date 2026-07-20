@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, Required, TypedDict
 
 
 PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
@@ -48,15 +48,36 @@ class CoordinatorMode(TypedDict):
     colorTier: NotRequired[str]
 
 
+class CoordinatorWorkspace(TypedDict):
+    id: str
+    repository: str
+    branch: str
+    relationship: str
+    dirty: bool
+    pr_head: bool
+    ephemeral: bool
+    worker: bool
+    agent_cwd_matches: bool
+
+
+class CoordinatorFeatures(TypedDict):
+    plan_mode: bool
+
+
+class CoordinatorRootAgent(TypedDict):
+    id: str
+    workspace_id: str
+
+
 class CoordinatorContext(TypedDict):
     schema_version: Literal[1]
     actor: CoordinatorActor
-    current_workspace: dict[str, Any]
-    candidate_workspaces: list[dict[str, Any]]
+    current_workspace: CoordinatorWorkspace
+    candidate_workspaces: list[CoordinatorWorkspace]
     mode: CoordinatorMode
-    features: dict[str, Any]
+    features: CoordinatorFeatures
     remote_branches: list[str]
-    active_root_agents: list[dict[str, Any]]
+    active_root_agents: list[CoordinatorRootAgent]
     request: str
 
 
@@ -68,10 +89,27 @@ class LifecycleAction(TypedDict):
     message: NotRequired[str]
 
 
+class LifecycleDispatch(TypedDict, total=False):
+    id: Required[str]
+    status: Required[str]
+    parked: bool
+    worker_agent_id: str
+    workspace_id: str
+    branch: str
+    base_sha: str
+    contract_sha256: str
+    parked_at: str
+    resumed_at: str
+    last_error: str
+    lifecycle_generation: int
+    lifecycle_action_id: str
+    last_lifecycle_action_id: str
+
+
 class LifecycleRecordUpdate(TypedDict):
     issue: int
     state: str
-    dispatch: dict[str, Any]
+    dispatch: LifecycleDispatch
 
 
 def utc_now() -> str:
@@ -92,6 +130,25 @@ def _validate_lifecycle_observation_identity(
                 "OBSERVATION_IDENTITY_CONFLICT",
                 f"lifecycle observation conflicts on {target}",
             )
+
+
+def _validate_lifecycle_success_readback(
+    dispatch: dict[str, Any], observation: dict[str, Any], lifecycle: str
+) -> str:
+    for key in ("agent_id", "workspace_id", "branch", "agent_state"):
+        if not observation.get(key):
+            raise PolicyError(
+                "OBSERVATION_INCOMPLETE", f"missing lifecycle readback {key}"
+            )
+    _validate_lifecycle_observation_identity(dispatch, observation)
+    state = str(observation["agent_state"]).casefold()
+    allowed = _STOPPED_AGENT_STATES if lifecycle == "park" else {"running", "busy"}
+    if state not in allowed:
+        raise PolicyError(
+            "OBSERVATION_STATE_INVALID",
+            f"Worker state does not confirm {lifecycle}: {state}",
+        )
+    return state
 
 
 def apply_observations(
@@ -115,6 +172,7 @@ def apply_observations(
             "agent_id",
             "workspace_id",
             "branch",
+            "agent_state",
             "error",
         }
         if unknown:
@@ -154,16 +212,24 @@ def apply_observations(
         elif current_dispatch.get("status") == "resuming":
             lifecycle = "resume"
         if lifecycle:
-            lifecycle_action_id = f"{lifecycle}-{current_dispatch['id']}"
+            lifecycle_action_id = _lifecycle_action_id(current_dispatch, lifecycle)
             if lifecycle_action_id in by_action:
                 observation = by_action[lifecycle_action_id]
                 if observation.get("status") not in {"succeeded", "failed"}:
                     raise PolicyError(
                         "OBSERVATION_STATUS_INVALID", "observation status invalid"
                     )
+                if lifecycle == "resume" and observation["status"] == "succeeded":
+                    _validate_resume(
+                        {**snapshot, "issues": issues}, issue, current_dispatch
+                    )
                 _validate_lifecycle_observation_identity(current_dispatch, observation)
                 transitioned = dict(current_dispatch)
+                readback_state = None
                 if observation["status"] == "succeeded":
+                    readback_state = _validate_lifecycle_success_readback(
+                        current_dispatch, observation, lifecycle
+                    )
                     if lifecycle == "park":
                         transitioned.update(
                             {
@@ -190,12 +256,14 @@ def apply_observations(
                             or f"{lifecycle} action failed",
                         }
                     )
+                transitioned["last_lifecycle_action_id"] = lifecycle_action_id
+                transitioned.pop("lifecycle_action_id", None)
                 issue["dispatch"] = transitioned
                 for agent in runtime_agents:
-                    if agent.get("id") == transitioned.get("worker_agent_id"):
-                        agent["state"] = (
-                            "idle" if transitioned.get("parked") is True else "running"
-                        )
+                    if readback_state and agent.get("id") == transitioned.get(
+                        "worker_agent_id"
+                    ):
+                        agent["state"] = readback_state
                 consumed.add(lifecycle_action_id)
             continue
 
@@ -213,7 +281,16 @@ def apply_observations(
         ):
             completed_lifecycle = "resume"
         if completed_lifecycle:
-            completed_action_id = f"{completed_lifecycle}-{current_dispatch['id']}"
+            completed_action_id = (
+                current_dispatch.get("last_lifecycle_action_id")
+                or f"{completed_lifecycle}-{current_dispatch['id']}"
+            )
+            if not str(completed_action_id).startswith(
+                f"{completed_lifecycle}-{current_dispatch['id']}"
+            ):
+                raise PolicyError(
+                    "LIFECYCLE_ACTION_INVALID", "completed lifecycle action conflicts"
+                )
             if completed_action_id in by_action:
                 observation = by_action[completed_action_id]
                 if observation.get("status") != "succeeded":
@@ -617,17 +694,30 @@ def _dispatch_runtime_agent(
     return agent
 
 
+def _lifecycle_action_id(dispatch: dict[str, Any], command: str) -> str:
+    action_id = dispatch.get("lifecycle_action_id")
+    if action_id:
+        generation = dispatch.get("lifecycle_generation")
+        expected = f"{command}-{dispatch['id']}-g{generation}"
+        if not isinstance(generation, int) or generation < 1 or action_id != expected:
+            raise PolicyError(
+                "LIFECYCLE_ACTION_INVALID", "durable lifecycle action conflicts"
+            )
+        return action_id
+    return f"{command}-{dispatch['id']}"
+
+
 def _lifecycle_action(dispatch: dict[str, Any], command: str) -> LifecycleAction:
     dispatch_id = dispatch["id"]
     if command == "park":
         return {
-            "action_id": f"park-{dispatch_id}",
+            "action_id": _lifecycle_action_id(dispatch, command),
             "type": "stop_worker",
             "dispatch_id": dispatch_id,
             "agent_id": dispatch["worker_agent_id"],
         }
     return {
-        "action_id": f"resume-{dispatch_id}",
+        "action_id": _lifecycle_action_id(dispatch, command),
         "type": "resume_worker",
         "dispatch_id": dispatch_id,
         "agent_id": dispatch["worker_agent_id"],
@@ -658,18 +748,34 @@ def plan_lifecycle_transitions(snapshot: dict[str, Any]) -> dict[str, Any]:
         status = dispatch.get("status")
         if status not in {"parking", "resuming"}:
             continue
+        if status == "resuming":
+            _validate_resume(snapshot, issue, dispatch)
         agent = _dispatch_runtime_agent(snapshot, dispatch)
         agent_state = str(agent.get("state") or "").lower()
         if status == "parking" and agent_state in _STOPPED_AGENT_STATES:
+            action_id = _lifecycle_action_id(dispatch, "park")
             dispatch.update(
-                {"status": "blocked", "parked": True, "parked_at": utc_now()}
+                {
+                    "status": "blocked",
+                    "parked": True,
+                    "parked_at": utc_now(),
+                    "last_lifecycle_action_id": action_id,
+                }
             )
+            dispatch.pop("lifecycle_action_id", None)
             updates.append(_lifecycle_update(issue, dispatch, state="blocked"))
             continue
         if status == "resuming" and agent_state in {"running", "busy"}:
+            action_id = _lifecycle_action_id(dispatch, "resume")
             dispatch.update(
-                {"status": "running", "parked": False, "resumed_at": utc_now()}
+                {
+                    "status": "running",
+                    "parked": False,
+                    "resumed_at": utc_now(),
+                    "last_lifecycle_action_id": action_id,
+                }
             )
+            dispatch.pop("lifecycle_action_id", None)
             updates.append(_lifecycle_update(issue, dispatch, state="active"))
             continue
         command = "park" if status == "parking" else "resume"
@@ -793,10 +899,14 @@ def plan_lifecycle_command(
             "record_updates": [_lifecycle_update(issue, dispatch, state="active")],
             "warnings": [],
         }
+    generation = int(dispatch.get("lifecycle_generation") or 0) + 1
+    dispatch.pop("resumed_at" if command == "park" else "parked_at", None)
     dispatch.update(
         {
             "status": "parking" if command == "park" else "resuming",
             "parked": False,
+            "lifecycle_generation": generation,
+            "lifecycle_action_id": f"{command}-{dispatch['id']}-g{generation}",
         }
     )
     return {
@@ -2298,7 +2408,11 @@ def _validate_coordinator_capability(context: CoordinatorContext) -> None:
     plan_mode = features.get("plan_mode")
     write_capable = mode.get("write_capable")
     color_tier = mode.get("colorTier", mode.get("color_tier"))
-    if collaboration_mode == "plan" or plan_mode is True or color_tier == "planning":
+    if (
+        str(collaboration_mode).casefold() == "plan"
+        or plan_mode is True
+        or str(color_tier).casefold() == "planning"
+    ):
         raise PolicyError(
             "COORDINATOR_MODE_READ_ONLY", "Coordinator is in a planning-only mode"
         )

@@ -503,7 +503,7 @@ def test_park_is_two_phase_and_releases_capacity_only_after_stop_readback():
     assert update["parked"] is False
     assert planned["actions"] == [
         {
-            "action_id": "park-dispatch-issue-7-a1",
+            "action_id": "park-dispatch-issue-7-a1-g1",
             "type": "stop_worker",
             "dispatch_id": "dispatch-issue-7-a1",
             "agent_id": "worker-7",
@@ -517,7 +517,16 @@ def test_park_is_two_phase_and_releases_capacity_only_after_stop_readback():
 
     stopped = core.apply_observations(
         in_transition,
-        [{"action_id": "park-dispatch-issue-7-a1", "status": "succeeded"}],
+        [
+            {
+                "action_id": "park-dispatch-issue-7-a1-g1",
+                "status": "succeeded",
+                "agent_id": "worker-7",
+                "workspace_id": "workspace-7",
+                "branch": "work/issue-7",
+                "agent_state": "idle",
+            }
+        ],
     )
     parked = stopped["issues"][0]["dispatch"]
     assert parked["status"] == "blocked"
@@ -525,7 +534,7 @@ def test_park_is_two_phase_and_releases_capacity_only_after_stop_readback():
     assert core.plan_reconcile(stopped)["summary"]["wip"] == 0
     duplicate = core.apply_observations(
         stopped,
-        [{"action_id": "park-dispatch-issue-7-a1", "status": "succeeded"}],
+        [{"action_id": "park-dispatch-issue-7-a1-g1", "status": "succeeded"}],
     )
     assert duplicate["issues"][0]["dispatch"] == parked
 
@@ -561,7 +570,7 @@ def test_resume_revalidates_then_wakes_the_same_worker_in_two_phases():
     assert update["parked"] is False
     assert planned["actions"] == [
         {
-            "action_id": "resume-dispatch-issue-7-a1",
+            "action_id": "resume-dispatch-issue-7-a1-g1",
             "type": "resume_worker",
             "dispatch_id": "dispatch-issue-7-a1",
             "agent_id": "worker-7",
@@ -573,15 +582,19 @@ def test_resume_revalidates_then_wakes_the_same_worker_in_two_phases():
         "issues": [{**snapshot["issues"][0], "dispatch": update}],
     }
     assert core.plan_reconcile(transition)["summary"]["wip"] == 1
+    with pytest.raises(core.PolicyError) as drifted_recovery:
+        core.plan_lifecycle_transitions({**transition, "base_sha": "b" * 40})
+    assert drifted_recovery.value.code == "RESUME_BASE_DRIFT"
     running = core.apply_observations(
         transition,
         [
             {
-                "action_id": "resume-dispatch-issue-7-a1",
+                "action_id": "resume-dispatch-issue-7-a1-g1",
                 "status": "succeeded",
                 "agent_id": "worker-7",
                 "workspace_id": "workspace-7",
                 "branch": "work/issue-7",
+                "agent_state": "running",
             }
         ],
     )["issues"][0]["dispatch"]
@@ -592,12 +605,37 @@ def test_resume_revalidates_then_wakes_the_same_worker_in_two_phases():
         {**transition, "issues": [{**transition["issues"][0], "dispatch": running}]},
         [
             {
-                "action_id": "resume-dispatch-issue-7-a1",
+                "action_id": "resume-dispatch-issue-7-a1-g1",
                 "status": "succeeded",
             }
         ],
     )
     assert duplicate["issues"][0]["dispatch"] == running
+
+
+def test_lifecycle_success_requires_exact_worker_state_readback():
+    core = load_core()
+    snapshot = _lifecycle_snapshot(core)
+    update = core.plan_lifecycle_command(snapshot, "dispatch-issue-7-a1", "park")[
+        "record_updates"
+    ][0]["dispatch"]
+    transition = {
+        **snapshot,
+        "issues": [{**snapshot["issues"][0], "dispatch": update}],
+    }
+    for observation in (
+        {"action_id": "park-dispatch-issue-7-a1-g1", "status": "succeeded"},
+        {
+            "action_id": "park-dispatch-issue-7-a1-g1",
+            "status": "succeeded",
+            "agent_id": "worker-7",
+            "workspace_id": "workspace-7",
+            "branch": "work/issue-7",
+            "agent_state": "running",
+        },
+    ):
+        with pytest.raises(core.PolicyError):
+            core.apply_observations(transition, [observation])
 
 
 @pytest.mark.parametrize(
@@ -1792,9 +1830,9 @@ def _coordinator_context(*, current=True, collaboration_mode="default"):
 @pytest.mark.parametrize(
     ("mutation", "code"),
     [
-        ({"mode": {"collaboration_mode": "plan"}}, "COORDINATOR_MODE_READ_ONLY"),
+        ({"mode": {"collaboration_mode": "Plan"}}, "COORDINATOR_MODE_READ_ONLY"),
         ({"features": {"plan_mode": True}}, "COORDINATOR_MODE_READ_ONLY"),
-        ({"mode": {"colorTier": "planning"}}, "COORDINATOR_MODE_READ_ONLY"),
+        ({"mode": {"colorTier": "Planning"}}, "COORDINATOR_MODE_READ_ONLY"),
         ({"mode": {"write_capable": None}}, "COORDINATOR_CAPABILITY_UNKNOWN"),
     ],
 )

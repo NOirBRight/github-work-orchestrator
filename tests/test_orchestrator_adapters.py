@@ -1166,7 +1166,18 @@ def test_plan_mode_blocks_every_mutation_before_github_adapter(
         ),
     )
     monkeypatch.setattr(cli, "_tool", lambda *_: "git")
-    monkeypatch.setattr(cli, "_run", lambda *_args, **_kwargs: str(tmp_path))
+    monkeypatch.setattr(cli, "_remote_repository", lambda: "owner/repo")
+    monkeypatch.setattr(
+        cli,
+        "_run",
+        lambda command, **_kwargs: (
+            json.loads(context_path.read_text(encoding="utf-8"))["current_workspace"][
+                "branch"
+            ]
+            if "branch" in command
+            else str(tmp_path)
+        ),
+    )
     with pytest.raises(core.PolicyError) as rejected:
         getattr(cli, entrypoint)(args)
     assert rejected.value.code == "COORDINATOR_MODE_READ_ONLY"
@@ -1268,7 +1279,18 @@ def test_coordinator_context_selection_and_forwarding_use_production_preflight(
         ),
     )
     monkeypatch.setattr(cli, "_tool", lambda *_: "git")
-    monkeypatch.setattr(cli, "_run", lambda *_args, **_kwargs: str(tmp_path))
+    monkeypatch.setattr(cli, "_remote_repository", lambda: "owner/repo")
+    monkeypatch.setattr(
+        cli,
+        "_run",
+        lambda command, **_kwargs: (
+            json.loads(context_path.read_text(encoding="utf-8"))["current_workspace"][
+                "branch"
+            ]
+            if "branch" in command
+            else str(tmp_path)
+        ),
+    )
 
     repo_config, entry = cli._coordinator_preflight(args, cli.core.default_config())
     assert repo_config["integration_branch"] == "dev"
@@ -1295,8 +1317,17 @@ def test_coordinator_context_selection_and_forwarding_use_production_preflight(
     assert entry["status"] == "forwarded"
     assert entry["actions"][0]["type"] == "create_root_agent"
 
+    monkeypatch.setattr(
+        cli,
+        "_run",
+        lambda command, **_kwargs: "dev" if "branch" in command else str(tmp_path),
+    )
+    with pytest.raises(cli.core.PolicyError) as stale:
+        cli._coordinator_preflight(args, cli.core.default_config())
+    assert stale.value.code == "COORDINATOR_GIT_MISMATCH"
 
-def test_reconcile_park_persists_transition_before_returning_stop_action(
+
+def test_reconcile_park_and_resume_persist_before_returning_paseo_actions(
     monkeypatch, tmp_path
 ):
     core, cli = _modules()
@@ -1339,12 +1370,13 @@ def test_reconcile_park_persists_transition_before_returning_stop_action(
 
     class FakeGitHub:
         records = []
+        states = []
 
         def update_record(self, _repo, issue):
             self.records.append(issue["dispatch"]["status"])
 
-        def set_issue_state(self, *_args):
-            raise AssertionError("park does not release the slot before stop readback")
+        def set_issue_state(self, _repo, _issue, state):
+            self.states.append(state)
 
     github = FakeGitHub()
     monkeypatch.setattr(cli, "GitHub", lambda: github)
@@ -1366,8 +1398,11 @@ def test_reconcile_park_persists_transition_before_returning_stop_action(
         cli, "_load_config", lambda *_args, **_kwargs: core.default_config()
     )
     monkeypatch.setattr(cli, "_git_common_dir", lambda: tmp_path)
+    snapshot_holder = {"value": snapshot}
     monkeypatch.setattr(
-        cli, "_prepare_snapshot", lambda *_args, **_kwargs: (snapshot, {})
+        cli,
+        "_prepare_snapshot",
+        lambda *_args, **_kwargs: (snapshot_holder["value"], {}),
     )
     args = type(
         "Args",
@@ -1384,7 +1419,30 @@ def test_reconcile_park_persists_transition_before_returning_stop_action(
     )()
     result = cli._reconcile(args)
     assert github.records == ["parking"]
-    assert result["actions"][0]["action_id"] == "park-dispatch-issue-7-a1"
+    assert github.states == []
+    assert result["actions"][0]["action_id"] == "park-dispatch-issue-7-a1-g1"
+
+    parked_snapshot = core.apply_observations(
+        snapshot,
+        [
+            {
+                "action_id": "park-dispatch-issue-7-a1-g1",
+                "status": "succeeded",
+                "agent_id": "worker-7",
+                "workspace_id": "workspace-7",
+                "branch": "work/issue-7",
+                "agent_state": "idle",
+            }
+        ],
+    )
+    parked_snapshot["issues"][0]["state"] = "blocked"
+    snapshot_holder["value"] = parked_snapshot
+    args.park = None
+    args.resume = "dispatch-issue-7-a1"
+    resumed = cli._reconcile(args)
+    assert github.records == ["parking", "resuming"]
+    assert github.states == ["active"]
+    assert resumed["actions"][0]["action_id"] == "resume-dispatch-issue-7-a1-g2"
 
 
 def test_dependency_states_are_read_in_one_followup_graphql_batch():

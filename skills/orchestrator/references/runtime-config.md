@@ -97,6 +97,12 @@ accepted only when the remote `dev` ref exists and exactly one stable Workspace
 candidate is on it. Otherwise the CLI returns `INTEGRATION_BRANCH_REQUIRED`; it
 never guesses `main`.
 
+Park/Resume success observations additionally require the exact durable
+`agent_id`, `workspace_id`, and `branch`, plus fresh `agent_state`. Park accepts
+only `idle`, `stopped`, `closed`, `finished`, or `completed`; resume accepts
+only `running` or `busy`. A bare `status=succeeded` never releases or reacquires
+a Slot/Hotset.
+
 Resolution is Issue Tier, Milestone default, repository default, global
 default, then `standard`; runtime mapping is repository Tier, global Tier,
 then the current Coordinator runtime. Missing mode/features may inherit only

@@ -1597,6 +1597,14 @@ def _coordinator_preflight(
         )
     runtime, identity = _paseo_current()
     actor = context.get("actor") or {}
+    current_workspace = context.get("current_workspace") or {}
+    if not actor.get("workspace_id") or actor.get(
+        "workspace_id"
+    ) != current_workspace.get("id"):
+        raise core.PolicyError(
+            "COORDINATOR_WORKSPACE_MISMATCH",
+            "Paseo MCP Actor and current Workspace disagree",
+        )
     if identity.get("workspace_id") is not None and identity.get(
         "workspace_id"
     ) != actor.get("workspace_id"):
@@ -1610,6 +1618,22 @@ def _coordinator_preflight(
     if not _same_path(identity.get("cwd"), top_level):
         raise core.PolicyError(
             "COORDINATOR_CWD_MISMATCH", "Paseo cwd and Git worktree disagree"
+        )
+    actual_branch = _run(
+        [_tool("git", "ORCH_GIT_PATH"), "branch", "--show-current"]
+    ).strip()
+    if (
+        current_workspace.get("branch") != actual_branch
+        or current_workspace.get("repository", "").casefold() != args.repo.casefold()
+        or current_workspace.get("agent_cwd_matches") is not True
+    ):
+        raise core.PolicyError(
+            "COORDINATOR_GIT_MISMATCH",
+            "supplied Workspace does not match live Git branch/repository",
+        )
+    if _remote_repository().casefold() != args.repo.casefold():
+        raise core.PolicyError(
+            "WORKSPACE_REPOSITORY_MISMATCH", "origin repository mismatch"
         )
     entry = core.plan_coordinator_entry(
         context,

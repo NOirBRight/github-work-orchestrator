@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -239,3 +242,107 @@ def test_rolling_three_worker_wave_runtime_review_merge_and_refill():
     )
     assert fourth["labels"]["orch.creator"] == "coordinator-b"
     assert fourth["relationship"] == "subagent"
+
+
+def test_cli_park_resume_crash_recovery_crosses_the_production_command_seam(
+    tmp_path,
+):
+    core = _core()
+    contract = _contract(core, 7, "standard")
+    dispatch_id = "dispatch-issue-7-a1"
+    snapshot = {
+        "repository": "owner/repo",
+        "base_sha": "a" * 40,
+        "worker_slots": 3,
+        "closed_issues": [],
+        "issues": [
+            {
+                "number": 7,
+                "state": "active",
+                "contract": contract,
+                "contract_valid": True,
+                "dependencies": [],
+                "hotset": contract["hotset"],
+                "dispatch": {
+                    "id": dispatch_id,
+                    "attempt": 1,
+                    "status": "running",
+                    "parked": False,
+                    "worker_agent_id": "worker-7",
+                    "workspace_id": "workspace-7",
+                    "branch": "work/issue-7",
+                    "base_sha": "a" * 40,
+                    "contract_sha256": contract["sha256"],
+                },
+            }
+        ],
+        "runtime_agents": [
+            {
+                "id": "worker-7",
+                "workspace_id": "workspace-7",
+                "branch": "work/issue-7",
+                "labels": {"orch.dispatch": dispatch_id},
+                "state": "running",
+            }
+        ],
+    }
+    script = ROOT / "skills" / "orchestrator" / "scripts" / "orch.py"
+    snapshot_path = tmp_path / "snapshot.json"
+
+    def run(command, value):
+        snapshot_path.write_text(json.dumps(value), encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "reconcile",
+                "--repo",
+                "owner/repo",
+                "--snapshot",
+                str(snapshot_path),
+                command,
+                dispatch_id,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return json.loads(result.stdout)
+
+    parking = run("--park", snapshot)
+    assert parking["actions"][0]["type"] == "stop_worker"
+    parking_dispatch = parking["summary"]["record_updates"][0]["dispatch"]
+
+    stopped = {
+        **snapshot,
+        "issues": [{**snapshot["issues"][0], "dispatch": parking_dispatch}],
+        "runtime_agents": [{**snapshot["runtime_agents"][0], "state": "idle"}],
+    }
+    parked = run("--park", stopped)
+    parked_dispatch = parked["summary"]["record_updates"][0]["dispatch"]
+    assert parked_dispatch["parked"] is True
+
+    resumable = {
+        **stopped,
+        "issues": [
+            {
+                **stopped["issues"][0],
+                "state": "blocked",
+                "dispatch": parked_dispatch,
+            }
+        ],
+    }
+    resuming = run("--resume", resumable)
+    assert resuming["actions"][0]["type"] == "resume_worker"
+    resuming_dispatch = resuming["summary"]["record_updates"][0]["dispatch"]
+
+    awake = {
+        **resumable,
+        "issues": [{**resumable["issues"][0], "dispatch": resuming_dispatch}],
+        "runtime_agents": [{**snapshot["runtime_agents"][0], "state": "running"}],
+    }
+    resumed = run("--resume", awake)
+    final_dispatch = resumed["summary"]["record_updates"][0]["dispatch"]
+    assert final_dispatch["status"] == "running"
+    assert final_dispatch["worker_agent_id"] == "worker-7"
