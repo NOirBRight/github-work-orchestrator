@@ -47,7 +47,7 @@ class FrontierPlan(TypedDict):
 
 
 def _path_parts(raw: str) -> tuple[str, ...]:
-    value = raw.replace("\\", "/").strip("/")
+    value = raw.strip().replace("\\", "/").strip("/").casefold()
     return PurePosixPath(value).parts
 
 
@@ -259,7 +259,6 @@ def _dispatch_after(issue: dict[str, Any]) -> list[int]:
 def _candidate_order(issue: dict[str, Any]) -> tuple[Any, ...]:
     return (
         PRIORITY_INDEX.get(issue.get("priority"), len(PRIORITIES)),
-        issue.get("milestone_due") or "9999-12-31",
         -int(issue.get("unlocks", 0)),
         int(issue["number"]),
     )

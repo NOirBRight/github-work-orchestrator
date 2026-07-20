@@ -1,32 +1,13 @@
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
-import sys
 
 import pytest
 
+from conftest import load_core, load_frontier
+
 
 ROOT = Path(__file__).resolve().parents[1]
-FRONTIER_PATH = ROOT / "skills" / "orchestrator" / "scripts" / "orch_frontier.py"
-CORE_PATH = ROOT / "skills" / "orchestrator" / "scripts" / "orch_core.py"
-
-
-def load_frontier():
-    spec = importlib.util.spec_from_file_location("orch_frontier_test", FRONTIER_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_core():
-    spec = importlib.util.spec_from_file_location("orch_core_frontier_test", CORE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def _v2_contract(core):
@@ -466,3 +447,64 @@ def test_bounded_search_seeds_from_low_conflict_candidates_before_proof_search()
 
     assert plan["selected"] == [96, 97, 98, 99, 100]
     assert plan["parallel_width"] == 5
+
+
+def test_claims_overlap_normalizes_case_and_whitespace():
+    frontier = load_frontier()
+    right = {"paths": ["src/api"], "resources": []}
+    assert frontier.claims_overlap({"paths": ["Src/Api"], "resources": []}, right)
+    assert frontier.claims_overlap(
+        {"paths": [" src/api/deep "], "resources": []}, right
+    )
+    assert not frontier.claims_overlap({"paths": ["src/api2"], "resources": []}, right)
+
+
+def test_milestone_due_does_not_steer_wave_selection():
+    frontier = load_frontier()
+    snapshot = {
+        "execution_slots": 1,
+        "integration_wip_limit": 2,
+        "closed_issues": [],
+        "issues": [
+            {
+                "number": 1,
+                "state": "ready",
+                "priority": "P1",
+                "milestone_due": "2027-01-01",
+                "change_claims": {"paths": ["src/a"], "resources": []},
+                "dispatch_after": [],
+                "contract_valid": True,
+            },
+            {
+                "number": 2,
+                "state": "ready",
+                "priority": "P1",
+                "milestone_due": "2026-01-01",
+                "change_claims": {"paths": ["src/b"], "resources": []},
+                "dispatch_after": [],
+                "contract_valid": True,
+            },
+        ],
+    }
+    assert frontier.select_wave(snapshot)["selected"] == [1]
+
+
+def test_config_validation_rejects_invalid_slots_attempts_and_intake():
+    core = load_core()
+    config = core.default_config()
+    cases = [
+        ({"execution_slots": 0}, "EXECUTION_SLOTS_INVALID"),
+        ({"execution_slots": 6}, "EXECUTION_SLOTS_INVALID"),
+        (
+            {"execution_slots": 3, "worker_slots": 4},
+            "EXECUTION_SLOTS_INVALID",
+        ),
+        ({"max_attempts": 0}, "ATTEMPTS_INVALID"),
+        ({"intake": ["bug"]}, "INTAKE_CONFIG_INVALID"),
+        ({"intake": {"include_labels": ["Bug", "bug"]}}, "INTAKE_CONFIG_INVALID"),
+    ]
+    for override, code in cases:
+        invalid = {**config, "global": {**config["global"], **override}}
+        with pytest.raises(core.PolicyError) as error:
+            core.validate_config(invalid)
+        assert error.value.code == code

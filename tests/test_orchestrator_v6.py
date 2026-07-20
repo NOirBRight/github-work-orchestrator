@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import multiprocessing
 from pathlib import Path
@@ -10,17 +9,10 @@ import time
 
 import pytest
 
+from conftest import load_core
+
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE_PATH = ROOT / "skills" / "orchestrator" / "scripts" / "orch_core.py"
-
-
-def load_core():
-    spec = importlib.util.spec_from_file_location("orch_core_v6", CORE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
 
 
 def test_reconcile_fills_free_slots_with_ranked_disjoint_issues():
@@ -1051,6 +1043,59 @@ def test_recovery_attempts_reuse_workspace_and_second_failure_blocks():
     )
     assert exhausted["actions"] == []
     assert exhausted["next_issue_state"] == "blocked"
+
+
+def test_recovery_replacement_carries_resume_invariants_through_park():
+    core = load_core()
+    snapshot = _lifecycle_snapshot(core)
+    contract = snapshot["issues"][0]["contract"]
+    replacement = core.plan_worker_recovery(
+        {
+            "dispatch": {
+                "id": "dispatch-issue-7-a1",
+                "attempt": 1,
+                "status": "error",
+                "worker_agent_id": "worker-7",
+                "workspace_id": "workspace-7",
+                "branch": "work/issue-7",
+                "recovery_prompt_sent": True,
+            },
+            "agent": {"id": "worker-7", "state": "error"},
+            "max_attempts": 2,
+            "base_sha": snapshot["base_sha"],
+            "contract_sha256": contract["sha256"],
+        }
+    )
+    update = replacement["dispatch_update"]
+    assert update["id"] == "dispatch-issue-7-a2"
+    assert update["base_sha"] == snapshot["base_sha"]
+    assert update["contract_sha256"] == contract["sha256"]
+
+    parked = _lifecycle_snapshot(core, status="blocked", parked=True)
+    parked["issues"][0]["dispatch"] = {
+        **update,
+        "status": "blocked",
+        "parked": True,
+        "worker_agent_id": "worker-7",
+    }
+    parked["runtime_agents"][0]["labels"] = {"orch.dispatch": update["id"]}
+    resumed = core.plan_lifecycle_command(parked, update["id"], "resume")
+    assert resumed["record_updates"][0]["dispatch"]["status"] == "resuming"
+
+
+def test_integration_wip_limit_violation_is_not_mislabeled():
+    core = load_core()
+    base = {
+        "schema_version": 1,
+        "repository": "owner/repo",
+        "issues": [],
+        "closed_issues": [],
+        "worker_slots": 3,
+    }
+    for invalid in (2, 21):
+        with pytest.raises(core.PolicyError) as error:
+            core.plan_reconcile({**base, "integration_wip_limit": invalid})
+        assert error.value.code == "INTEGRATION_WIP_INVALID"
 
 
 def test_review_plan_is_graded_and_commit_bound():
@@ -2341,3 +2386,132 @@ def test_project_projection_contains_only_four_derived_fields():
         "Wave": "4",
         "Risk": "strict",
     }
+
+
+def test_workspace_selection_fails_closed_when_configured_id_is_missing():
+    core = load_core()
+    current = {
+        "id": "current",
+        "repository": "owner/repo",
+        "branch": "dev",
+        "relationship": "root",
+        "dirty": False,
+        "pr_head": False,
+        "ephemeral": False,
+        "worker": False,
+    }
+    repo = {
+        "repository": "owner/repo",
+        "integration_branch": "dev",
+        "workspace_id": "stale-id",
+    }
+    with pytest.raises(core.PolicyError) as missing:
+        core.select_workspace(None, [current], repo)
+    assert missing.value.code == "WORKSPACE_CONFIGURED_MISSING"
+
+
+def test_review_complete_prefers_latest_submitted_axis_verdict():
+    core = load_core()
+    base = {
+        "axis": "combined",
+        "candidate_sha": "a" * 40,
+        "contract_sha256": "b" * 64,
+        "strength": "standard",
+        "findings": [],
+    }
+    older_pass = {**base, "verdict": "pass", "submitted_at": "2026-07-01T00:00:00Z"}
+    newer_fail = {
+        **base,
+        "verdict": "fail",
+        "findings": ["regression"],
+        "submitted_at": "2026-07-02T00:00:00Z",
+    }
+    assert not core.review_complete(
+        risk="standard",
+        candidate_sha="a" * 40,
+        reviews=[newer_fail, older_pass],
+        dual=False,
+        human_approved=False,
+    )
+    assert core.review_complete(
+        risk="standard",
+        candidate_sha="a" * 40,
+        reviews=[
+            {**newer_fail, "submitted_at": "2026-07-01T00:00:00Z"},
+            {**older_pass, "submitted_at": "2026-07-02T00:00:00Z"},
+        ],
+        dual=False,
+        human_approved=False,
+    )
+
+
+def test_p0_capacity_warning_skips_claim_conflicted_candidates():
+    core = load_core()
+    running = {
+        "number": 1,
+        "state": "active",
+        "priority": "P1",
+        "change_claims": {"paths": ["src/api"], "resources": []},
+        "dispatch_after": [],
+        "contract_valid": True,
+        "dispatch": {
+            "id": "dispatch-issue-1-a1",
+            "status": "running",
+            "parked": False,
+        },
+    }
+    conflicted = {
+        "number": 2,
+        "state": "ready",
+        "priority": "P0",
+        "change_claims": {"paths": ["src/api/deep"], "resources": []},
+        "dispatch_after": [],
+        "contract_valid": True,
+    }
+    compatible = {
+        "number": 3,
+        "state": "ready",
+        "priority": "P0",
+        "change_claims": {"paths": ["src/other"], "resources": []},
+        "dispatch_after": [],
+        "contract_valid": True,
+    }
+    snapshot = {
+        "schema_version": 1,
+        "repository": "owner/repo",
+        "issues": [running, conflicted, compatible],
+        "closed_issues": [],
+        "execution_slots": 1,
+        "integration_wip_limit": 2,
+    }
+    result = core.plan_reconcile(snapshot)
+    assert result["warnings"] == [
+        {"code": "P0_CAPACITY_FULL", "issues": [3], "preemption": "manual-only"}
+    ]
+
+
+def test_wave_search_bounded_warning_surfaces_in_reconcile_envelope():
+    core = load_core()
+    snapshot = {
+        "schema_version": 1,
+        "repository": "owner/repo",
+        "execution_slots": 5,
+        "integration_wip_limit": 10,
+        "closed_issues": [],
+        "issues": [
+            {
+                "number": number,
+                "state": "ready",
+                "priority": "P1",
+                "change_claims": {
+                    "paths": [f"items/{number}"],
+                    "resources": [f"exclusive-group:{number % 4}"],
+                },
+                "dispatch_after": [],
+                "contract_valid": True,
+            }
+            for number in range(1, 101)
+        ],
+    }
+    result = core.plan_reconcile(snapshot)
+    assert "WAVE_SEARCH_BOUNDED" in {warning["code"] for warning in result["warnings"]}

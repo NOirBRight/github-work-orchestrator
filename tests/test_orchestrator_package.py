@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 import subprocess
 import sys
+
+from conftest import load_module
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,12 +13,7 @@ PACKAGE = ROOT / "skills" / "orchestrator"
 
 
 def _load(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+    return load_module(name, path, register=True)
 
 
 def test_quick_validation_and_manifest_are_at_fixed_point():

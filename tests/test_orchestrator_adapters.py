@@ -1,33 +1,15 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 import subprocess
-import sys
 
 import pytest
 
+from conftest import load_modules as _modules
+
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "skills" / "orchestrator" / "scripts"
-
-
-def _modules():
-    core_spec = importlib.util.spec_from_file_location(
-        "orch_core", SCRIPTS / "orch_core.py"
-    )
-    core = importlib.util.module_from_spec(core_spec)
-    assert core_spec.loader is not None
-    sys.modules["orch_core"] = core
-    core_spec.loader.exec_module(core)
-    cli_spec = importlib.util.spec_from_file_location(
-        "orch_adapter_test", SCRIPTS / "orch.py"
-    )
-    cli = importlib.util.module_from_spec(cli_spec)
-    assert cli_spec.loader is not None
-    cli_spec.loader.exec_module(cli)
-    return core, cli
 
 
 def _contract(core):
@@ -54,7 +36,7 @@ def test_graphql_adapter_uses_one_frontier_call_and_flattens_connections():
         "data": {
             "repository": {
                 "ref": {"target": {"oid": "a" * 40}},
-                "issues": {
+                "readyIssues": {
                     "pageInfo": {"hasNextPage": False},
                     "nodes": [
                         {
@@ -130,7 +112,7 @@ def test_snapshot_recovers_durably_intended_pr_after_it_has_merged():
         "data": {
             "repository": {
                 "ref": {"target": {"oid": "a" * 40}},
-                "issues": {"pageInfo": {"hasNextPage": False}, "nodes": [issue]},
+                "activeIssues": {"pageInfo": {"hasNextPage": False}, "nodes": [issue]},
                 "pullRequests": {
                     "pageInfo": {"hasNextPage": False},
                     "nodes": [],
@@ -171,7 +153,7 @@ def test_graphql_adapter_fails_closed_instead_of_silently_truncating():
         "data": {
             "repository": {
                 "ref": {"target": {"oid": "a" * 40}},
-                "issues": {"pageInfo": {"hasNextPage": True}, "nodes": []},
+                "readyIssues": {"pageInfo": {"hasNextPage": True}, "nodes": []},
                 "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": []},
             }
         }
@@ -1056,6 +1038,8 @@ def test_state_repair_cannot_mutate_before_coordinator_eligibility(monkeypatch):
             "owner/repo",
             {
                 "integration_branch": "dev",
+                "execution_slots": 3,
+                "integration_wip_limit": 6,
                 "worker_slots": 3,
                 "repository": "owner/repo",
             },
@@ -1967,3 +1951,59 @@ def test_admission_detail_adapter_fetches_comments_only_for_target_issues():
     query = next(value for value in calls[0] if value.startswith("query="))
     assert "i7:issue(number:7)" in query
     assert "comments(first:100)" in query
+
+
+def test_issue_adapter_fails_closed_on_label_pagination():
+    core, cli = _modules()
+    node = {
+        "number": 7,
+        "labels": {"pageInfo": {"hasNextPage": True}, "nodes": []},
+        "comments": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+    }
+    with pytest.raises(core.PolicyError) as error:
+        cli.GitHub._issue(node)
+    assert error.value.code == "SNAPSHOT_PAGINATION_REQUIRED"
+
+
+def test_frontier_candidates_fail_closed_on_pagination_and_combined_limit():
+    core, cli = _modules()
+    paginated = {
+        "data": {"repository": {"l0": {"pageInfo": {"hasNextPage": True}, "nodes": []}}}
+    }
+    client = object.__new__(cli.GitHub)
+    client.run = lambda _args: json.dumps(paginated)
+    with pytest.raises(core.PolicyError) as pagination:
+        client.frontier_candidates("owner/repo", 10, ["bug"])
+    assert pagination.value.code == "FRONTIER_PAGINATION_REQUIRED"
+
+    over_limit = {
+        "data": {
+            "repository": {
+                "l0": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [{"number": number} for number in (1, 2, 3)],
+                }
+            }
+        }
+    }
+    client.run = lambda _args: json.dumps(over_limit)
+    with pytest.raises(core.PolicyError) as limit:
+        client.frontier_candidates("owner/repo", 2, ["bug"])
+    assert limit.value.code == "FRONTIER_LIMIT_REQUIRED"
+
+
+def test_frontier_admit_requires_a_plan_before_any_mutation(tmp_path):
+    core, cli = _modules()
+    args = cli.parse_args(
+        [
+            "frontier",
+            "admit",
+            "--repo",
+            "owner/repo",
+            "--config",
+            str(tmp_path / "config.json"),
+        ]
+    )
+    with pytest.raises(core.PolicyError) as error:
+        cli._frontier(args)
+    assert error.value.code == "ADMISSION_PLAN_REQUIRED"

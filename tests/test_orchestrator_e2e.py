@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -8,17 +7,10 @@ import shutil
 import subprocess
 import sys
 
+from conftest import load_core as _core
+
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE = ROOT / "skills" / "orchestrator" / "scripts" / "orch_core.py"
-
-
-def _core():
-    spec = importlib.util.spec_from_file_location("orch_core_e2e", CORE)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
 
 
 def _contract(core, number, difficulty, risk="standard"):

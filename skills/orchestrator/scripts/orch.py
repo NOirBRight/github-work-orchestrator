@@ -57,7 +57,7 @@ query($owner:String!,$name:String!,$branch:String!){
 }
 fragment OrchIssue on Issue{
   number title body updatedAt
-  labels(first:30){nodes{name}}
+  labels(first:100){pageInfo{hasNextPage} nodes{name}}
   milestone{title dueOn}
   assignees(first:20){nodes{login}}
   comments(first:100){pageInfo{hasNextPage} nodes{databaseId body createdAt updatedAt author{login}}}
@@ -65,7 +65,7 @@ fragment OrchIssue on Issue{
 """.replace("__ORCH_PR_FIELDS__", ORCH_PR_FIELDS)
 FRONTIER_ISSUE_FIELDS = r"""
 number title body updatedAt
-labels(first:30){nodes{name}}
+labels(first:100){pageInfo{hasNextPage} nodes{name}}
 milestone{title dueOn}
 assignees(first:20){nodes{login}}
 """
@@ -112,7 +112,12 @@ def _read_json(source: str | Path) -> Any:
         raise CommandError(f"invalid JSON: {error}") from error
 
 
-def _run(command: list[str], *, cwd: Path | None = None) -> str:
+SUBPROCESS_TIMEOUT = 120
+
+
+def _spawn(
+    command: list[str], *, cwd: Path | None = None
+) -> "subprocess.CompletedProcess[str]":
     executable = Path(command[0])
     if os.name == "nt" and executable.suffix.lower() in {".cmd", ".bat"}:
         command = [
@@ -122,13 +127,24 @@ def _run(command: list[str], *, cwd: Path | None = None) -> str:
             "/c",
             subprocess.list2cmdline(command),
         ]
-    result = subprocess.run(
-        command,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=SUBPROCESS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise CommandError(
+            f"{' '.join(command)}: timed out after {SUBPROCESS_TIMEOUT}s"
+        ) from error
+
+
+def _run(command: list[str], *, cwd: Path | None = None) -> str:
+    result = _spawn(command, cwd=cwd)
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip()
         raise CommandError(f"{' '.join(command)}: {detail}")
@@ -140,6 +156,22 @@ def _tool(name: str, env_name: str) -> str:
     if not found:
         raise CommandError(f"{name} not found; install it or set {env_name}")
     return found
+
+
+def _envelope(
+    status: str,
+    *,
+    actions: list[dict[str, Any]] | None = None,
+    warnings: list[dict[str, Any]] | None = None,
+    summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "status": status,
+        "actions": actions or [],
+        "warnings": warnings or [],
+        "summary": summary or {},
+    }
 
 
 def _git_common_dir() -> Path:
@@ -186,7 +218,7 @@ class GitHub:
             if name in repository
         ]
         if not issue_connections:
-            issue_connections = [repository.get("issues") or {}]
+            raise CommandError("GitHub issue snapshot missing")
         pr_connection = repository.get("pullRequests") or {}
         if any(
             (connection.get("pageInfo") or {}).get("hasNextPage")
@@ -309,89 +341,27 @@ class GitHub:
             )
         return [self._issue(nodes[number]) for number in sorted(nodes)]
 
-    def issues_by_number(self, repo: str, numbers: list[int]) -> list[dict[str, Any]]:
-        """Read full admission identity only for the proposed target Issues."""
-
-        unique = sorted({int(number) for number in numbers})
-        if not unique:
-            return []
-        owner, name = repo.split("/", 1)
-        aliases = " ".join(
-            f"i{number}:issue(number:{number}){{{FRONTIER_DETAIL_FIELDS}}}"
-            for number in unique
-        )
-        query = (
-            "query($owner:String!,$name:String!){"
-            f"repository(owner:$owner,name:$name){{{aliases}}}"
-            "}"
-        )
-        payload = json.loads(
-            self.run(
-                [
-                    "api",
-                    "graphql",
-                    "-f",
-                    f"query={query}",
-                    "-F",
-                    f"owner={owner}",
-                    "-F",
-                    f"name={name}",
-                ]
-            )
-        )
-        repository = (payload.get("data") or {}).get("repository") or {}
-        return [
-            self._issue(repository[f"i{number}"])
-            for number in unique
-            if repository.get(f"i{number}")
-        ]
-
-    def pull_requests_by_number(
-        self, repo: str, numbers: list[int]
-    ) -> list[dict[str, Any]]:
-        unique = sorted({int(number) for number in numbers})
-        if not unique:
-            return []
-        owner, name = repo.split("/", 1)
-        aliases = " ".join(
-            f"p{number}:pullRequest(number:{number}){{{ORCH_PR_FIELDS}}}"
-            for number in unique
-        )
-        query = (
-            "query($owner:String!,$name:String!){"
-            f"repository(owner:$owner,name:$name){{{aliases}}}"
-            "}"
-        )
-        payload = json.loads(
-            self.run(
-                [
-                    "api",
-                    "graphql",
-                    "-f",
-                    f"query={query}",
-                    "-F",
-                    f"owner={owner}",
-                    "-F",
-                    f"name={name}",
-                ]
-            )
-        )
-        repository = (payload.get("data") or {}).get("repository") or {}
-        return [
-            self._pr(repository[f"p{number}"])
-            for number in unique
-            if repository.get(f"p{number}")
-        ]
-
-    def dependency_states(self, repo: str, numbers: list[int]) -> dict[int, str | None]:
+    def _query_by_number(
+        self,
+        repo: str,
+        prefix: str,
+        node_kind: str,
+        fields: str,
+        numbers: list[int],
+    ) -> dict[int, dict[str, Any]]:
         unique = sorted({int(number) for number in numbers})
         if not unique:
             return {}
         owner, name = repo.split("/", 1)
-        fields = " ".join(
-            f"d{number}:issue(number:{number}){{number state}}" for number in unique
+        aliases = " ".join(
+            f"{prefix}{number}:{node_kind}(number:{number}){{{fields}}}"
+            for number in unique
         )
-        query = f"query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{{fields}}}}}"
+        query = (
+            "query($owner:String!,$name:String!){"
+            f"repository(owner:$owner,name:$name){{{aliases}}}"
+            "}"
+        )
         payload = json.loads(
             self.run(
                 [
@@ -408,12 +378,37 @@ class GitHub:
         )
         repository = (payload.get("data") or {}).get("repository") or {}
         return {
-            number: (repository.get(f"d{number}") or {}).get("state")
+            number: repository[f"{prefix}{number}"]
             for number in unique
+            if repository.get(f"{prefix}{number}")
         }
+
+    def issues_by_number(self, repo: str, numbers: list[int]) -> list[dict[str, Any]]:
+        """Read full admission identity only for the proposed target Issues."""
+
+        found = self._query_by_number(
+            repo, "i", "issue", FRONTIER_DETAIL_FIELDS, numbers
+        )
+        return [self._issue(found[number]) for number in sorted(found)]
+
+    def pull_requests_by_number(
+        self, repo: str, numbers: list[int]
+    ) -> list[dict[str, Any]]:
+        found = self._query_by_number(repo, "p", "pullRequest", ORCH_PR_FIELDS, numbers)
+        return [self._pr(found[number]) for number in sorted(found)]
+
+    def dependency_states(self, repo: str, numbers: list[int]) -> dict[int, str | None]:
+        unique = sorted({int(number) for number in numbers})
+        found = self._query_by_number(repo, "d", "issue", "number state", unique)
+        return {number: (found.get(number) or {}).get("state") for number in unique}
 
     @staticmethod
     def _issue(node: dict[str, Any]) -> dict[str, Any]:
+        if ((node.get("labels") or {}).get("pageInfo") or {}).get("hasNextPage"):
+            raise core.PolicyError(
+                "SNAPSHOT_PAGINATION_REQUIRED",
+                f"Issue #{node.get('number')} has more than 100 labels",
+            )
         if ((node.get("comments") or {}).get("pageInfo") or {}).get("hasNextPage"):
             raise core.PolicyError(
                 "SNAPSHOT_PAGINATION_REQUIRED",
@@ -769,7 +764,7 @@ class GitHub:
             "orch:blocked": "D93F0B",
         }
         for label, color in colors.items():
-            result = subprocess.run(
+            result = _spawn(
                 [
                     self.executable,
                     "label",
@@ -780,10 +775,7 @@ class GitHub:
                     "--color",
                     color,
                     "--force",
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
+                ]
             )
             if result.returncode:
                 raise CommandError(result.stderr.strip())
@@ -1016,15 +1008,12 @@ class GitHub:
     def remote_branch_sha(self, repo: str, branch: str) -> str | None:
         owner, name = repo.split("/", 1)
         encoded = branch.replace("/", "%2F")
-        result = subprocess.run(
+        result = _spawn(
             [
                 self.executable,
                 "api",
                 f"repos/{owner}/{name}/git/ref/heads/{encoded}",
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
+            ]
         )
         if result.returncode:
             if "Not Found" in (result.stderr + result.stdout):
@@ -1046,17 +1035,14 @@ class GitHub:
             raise core.PolicyError(
                 "REMOTE_BRANCH_ADVANCED", "remote branch has unmerged WIP"
             )
-        result = subprocess.run(
+        result = _spawn(
             [
                 _tool("git", "ORCH_GIT_PATH"),
                 "push",
                 f"--force-with-lease=refs/heads/{branch}:{expected_sha}",
                 "origin",
                 f":refs/heads/{branch}",
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
+            ]
         )
         if result.returncode:
             after_failure = self.remote_branch_sha(repo, branch)
@@ -1183,15 +1169,7 @@ def _ensure_local_base(base_sha: str, integration_branch: str) -> bool:
     ]
 
     def available() -> bool:
-        return (
-            subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-            ).returncode
-            == 0
-        )
+        return _spawn(command).returncode == 0
 
     if available():
         return False
@@ -1787,6 +1765,17 @@ def _load_config(path: Path, *, write_migration: bool = True) -> dict[str, Any]:
     )
 
 
+def _reload_repo_config(
+    args: argparse.Namespace, repo_config: dict[str, Any]
+) -> dict[str, Any]:
+    """Re-read config inside the mutex, preserving the resolved integration branch."""
+
+    config = _load_config(args.config, write_migration=True)
+    refreshed = _repository_config(config, args.repo)
+    refreshed.setdefault("integration_branch", repo_config["integration_branch"])
+    return refreshed
+
+
 def _paseo_current() -> tuple[dict[str, Any], dict[str, Any]]:
     agent_id = os.environ.get("PASEO_AGENT_ID")
     if not agent_id:
@@ -1996,13 +1985,9 @@ def _prepare_snapshot(
         raise core.PolicyError(
             "INTEGRATION_BASE_MISSING", "integration branch base SHA was not read back"
         )
-    execution_slots = int(
-        repo_config.get("execution_slots", repo_config.get("worker_slots", 3))
-    )
+    execution_slots = int(repo_config["execution_slots"])
     snapshot["execution_slots"] = execution_slots
-    snapshot["integration_wip_limit"] = int(
-        repo_config.get("integration_wip_limit", execution_slots)
-    )
+    snapshot["integration_wip_limit"] = int(repo_config["integration_wip_limit"])
     snapshot["worker_slots"] = execution_slots
     snapshot["wave_generation"] = max(
         (
@@ -2137,6 +2122,8 @@ def _plan_recoveries(
                 "dispatch": dispatch,
                 "agent": agent,
                 "max_attempts": repo_config["max_attempts"],
+                "base_sha": snapshot.get("base_sha"),
+                "contract_sha256": (issue.get("contract") or {}).get("sha256"),
             }
         )
         updated = recovery["dispatch_update"]
@@ -2180,9 +2167,7 @@ def _candidate_label_names(candidate: dict[str, Any]) -> set[str]:
 
 def _frontier_policy(repo_config: dict[str, Any]) -> dict[str, Any]:
     intake = dict(repo_config.get("intake") or {})
-    execution_slots = int(
-        repo_config.get("execution_slots", repo_config.get("worker_slots", 3))
-    )
+    execution_slots = int(repo_config["execution_slots"])
     return {
         "include_labels": list(intake.get("include_labels") or []),
         "human_labels": list(intake.get("human_labels") or []),
@@ -2210,13 +2195,9 @@ def _frontier_snapshot(
         labels.extend(["orch:ready", "orch:active", "orch:blocked"])
     candidates = github.frontier_candidates(repo, limit, labels)
     snapshot = github.snapshot(repo, repo_config["integration_branch"])
-    execution_slots = int(
-        repo_config.get("execution_slots", repo_config.get("worker_slots", 3))
-    )
+    execution_slots = int(repo_config["execution_slots"])
     snapshot["execution_slots"] = execution_slots
-    snapshot["integration_wip_limit"] = int(
-        repo_config.get("integration_wip_limit", execution_slots)
-    )
+    snapshot["integration_wip_limit"] = int(repo_config["integration_wip_limit"])
     snapshot["worker_slots"] = execution_slots
     return candidates, snapshot
 
@@ -2444,15 +2425,10 @@ def _frontier(args: argparse.Namespace) -> dict[str, Any]:
             item["disposition"] == "design"
             for item in analysis["candidate_assessments"]
         )
-        return {
-            "schema_version": 1,
-            "status": "needs-admission"
-            if design_count and analysis["reserve_gap"]
-            else "idle",
-            "actions": [],
-            "warnings": [],
-            "summary": analysis,
-        }
+        return _envelope(
+            "needs-admission" if design_count and analysis["reserve_gap"] else "idle",
+            summary=analysis,
+        )
 
     plan = _read_json(args.plan)
     with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
@@ -2506,13 +2482,7 @@ def _frontier(args: argparse.Namespace) -> dict[str, Any]:
             github.admit(args.repo, candidate, contract)
             for candidate, contract in admissions
         ]
-    return {
-        "schema_version": 1,
-        "status": "completed",
-        "actions": [],
-        "warnings": [],
-        "summary": {**analysis, "admitted": admitted},
-    }
+    return _envelope("completed", summary={**analysis, "admitted": admitted})
 
 
 def _reconcile(args: argparse.Namespace) -> dict[str, Any]:
@@ -2535,13 +2505,12 @@ def _reconcile(args: argparse.Namespace) -> dict[str, Any]:
             lifecycle = core.plan_lifecycle_command(
                 snapshot, lifecycle_dispatch, lifecycle_command
             )
-            return {
-                "schema_version": 1,
-                "status": lifecycle["status"],
-                "actions": lifecycle["actions"],
-                "warnings": lifecycle["warnings"],
-                "summary": {"record_updates": lifecycle["record_updates"]},
-            }
+            return _envelope(
+                lifecycle["status"],
+                actions=lifecycle["actions"],
+                warnings=lifecycle["warnings"],
+                summary={"record_updates": lifecycle["record_updates"]},
+            )
         result = core.plan_reconcile(snapshot)
         partial = core.plan_partial_dispatch(snapshot)
         lifecycle = core.plan_lifecycle_transitions(snapshot)
@@ -2621,20 +2590,16 @@ def _reconcile(args: argparse.Namespace) -> dict[str, Any]:
             _persist_record_updates(
                 github, args.repo, snapshot, lifecycle["record_updates"]
             )
-            return {
-                "schema_version": 1,
-                "status": lifecycle["status"],
-                "actions": lifecycle["actions"],
-                "warnings": lifecycle["warnings"],
-                "summary": {
+            return _envelope(
+                lifecycle["status"],
+                actions=lifecycle["actions"],
+                warnings=lifecycle["warnings"],
+                summary={
                     "dispatch": lifecycle_dispatch,
                     "record_updates": len(lifecycle["record_updates"]),
                 },
-            }
-        config = _load_config(args.config, write_migration=True)
-        refreshed = _repository_config(config, args.repo)
-        refreshed.setdefault("integration_branch", repo_config["integration_branch"])
-        repo_config = refreshed
+            )
+        repo_config = _reload_repo_config(args, repo_config)
         recovery_actions, recovery_warnings = _plan_recoveries(
             snapshot, repo_config, runtime, github, mutate=True
         )
@@ -2730,10 +2695,7 @@ def _integrate(args: argparse.Namespace) -> dict[str, Any]:
         )
         workspace = snapshot["coordinator_workspace"]
         core.qualify_workspace(workspace, repo_config, operation="integrate")
-        config = _load_config(args.config, write_migration=True)
-        refreshed = _repository_config(config, args.repo)
-        refreshed.setdefault("integration_branch", repo_config["integration_branch"])
-        repo_config = refreshed
+        repo_config = _reload_repo_config(args, repo_config)
         matching = [
             issue
             for issue in snapshot["issues"]
@@ -2746,18 +2708,16 @@ def _integrate(args: argparse.Namespace) -> dict[str, Any]:
         issue = matching[0]
         ordered = core.integration_order(snapshot["issues"], snapshot["closed_issues"])
         if not ordered or ordered[0]["number"] != issue["number"]:
-            return {
-                "schema_version": 1,
-                "status": "waiting",
-                "actions": [],
-                "warnings": [
+            return _envelope(
+                "waiting",
+                warnings=[
                     {
                         "code": "INTEGRATION_ORDER_WAIT",
                         "next_issue": ordered[0]["number"] if ordered else None,
                     }
                 ],
-                "summary": {"pr": args.pr, "issue": issue["number"]},
-            }
+                summary={"pr": args.pr, "issue": issue["number"]},
+            )
         pr = issue["pr"]
         merge_state = str(pr.get("merge_state") or "").upper()
         checks = pr.get("checks")
@@ -2785,17 +2745,14 @@ def _integrate(args: argparse.Namespace) -> dict[str, Any]:
         if plan["status"] != "actions":
             if plan["actions"] and plan["actions"][0]["type"] == "update_branch":
                 github.update_branch(args.repo, args.pr)
-            return {
-                "schema_version": 1,
-                "status": "waiting",
-                "actions": [],
-                "warnings": [],
-                "summary": {
+            return _envelope(
+                "waiting",
+                summary={
                     "pr": args.pr,
                     "issue": issue["number"],
                     "updated_branch": bool(plan["actions"]),
                 },
-            }
+            )
         github.mark_integrating(
             args.repo,
             issue,
@@ -2831,20 +2788,18 @@ def _integrate(args: argparse.Namespace) -> dict[str, Any]:
                 "manual_cleanup": [],
                 "blockers": [f"cleanup-failed:{error}"],
             }
-        return {
-            "schema_version": 1,
-            "status": "idle",
-            "actions": [],
-            "warnings": [{"code": "cleanup-deferred", "blockers": cleanup["blockers"]}]
+        return _envelope(
+            "idle",
+            warnings=[{"code": "cleanup-deferred", "blockers": cleanup["blockers"]}]
             if cleanup["blockers"] or cleanup["manual_cleanup"]
             else [],
-            "summary": {
+            summary={
                 "pr": args.pr,
                 "issue": issue["number"],
                 "merged_at": readback["mergedAt"],
                 "cleanup": cleanup,
             },
-        }
+        )
 
 
 def _retire(args: argparse.Namespace) -> dict[str, Any]:
@@ -2889,10 +2844,7 @@ def _retire(args: argparse.Namespace) -> dict[str, Any]:
                 "remote_branch": True,
             }
         )
-        config = _load_config(args.config, write_migration=True)
-        refreshed = _repository_config(config, args.repo)
-        refreshed.setdefault("integration_branch", repo_config["integration_branch"])
-        repo_config = refreshed
+        repo_config = _reload_repo_config(args, repo_config)
         runtime, _ = _paseo_current()
         preflight = _retire_stopped_dispatch(
             issue,
@@ -2915,16 +2867,11 @@ def _retire(args: argparse.Namespace) -> dict[str, Any]:
                     execute=True,
                 )
             )
-        if cleanup.get("retirement_verified") and issue.get("state") != "blocked":
-            # retire_issue already persisted the terminal before any destructive step.
-            issue["state"] = "blocked"
-        return {
-            "schema_version": 1,
-            "status": "blocked" if cleanup["blockers"] else "idle",
-            "actions": [],
-            "warnings": [],
-            "summary": {"dispatch": args.dispatch, "cleanup": cleanup},
-        }
+        # retire_issue already persisted the terminal before any destructive step.
+        return _envelope(
+            "blocked" if cleanup["blockers"] else "idle",
+            summary={"dispatch": args.dispatch, "cleanup": cleanup},
+        )
 
 
 def _project(args: argparse.Namespace) -> dict[str, Any]:
@@ -2934,25 +2881,17 @@ def _project(args: argparse.Namespace) -> dict[str, Any]:
         return entry
     number = repo_config.get("project_number")
     owner = repo_config.get("project_owner") or args.repo.split("/", 1)[0]
-    try:
-        github = GitHub()
-        with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
-            _prepare_snapshot(github, args.repo, repo_config, [], mutate=True)
-            config = _load_config(args.config, write_migration=True)
-            refreshed = _repository_config(config, args.repo)
-            refreshed.setdefault(
-                "integration_branch", repo_config["integration_branch"]
-            )
-            repo_config = refreshed
+    github = GitHub()
+    with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
+        _prepare_snapshot(github, args.repo, repo_config, [], mutate=True)
+        repo_config = _reload_repo_config(args, repo_config)
+        try:
             labels = github.project_labels(args.repo)
             if not number:
-                return {
-                    "schema_version": 1,
-                    "status": "idle",
-                    "actions": [],
-                    "warnings": [],
-                    "summary": {"labels": labels, "project": "not-configured"},
-                }
+                return _envelope(
+                    "idle",
+                    summary={"labels": labels, "project": "not-configured"},
+                )
             project_id, fields = github.ensure_project_fields(int(number), owner)
             synced = 0
             if args.operation == "sync":
@@ -2967,20 +2906,15 @@ def _project(args: argparse.Namespace) -> dict[str, Any]:
                         projection=core.project_projection(issue),
                     )
                     synced += 1
-    except (CommandError, core.PolicyError, OSError) as error:
-        return {
-            "schema_version": 1,
-            "status": "waiting",
-            "actions": [],
-            "warnings": [{"code": "project-sync-degraded", "detail": str(error)}],
-            "summary": {"project_optional": True},
-        }
-    return {
-        "schema_version": 1,
-        "status": "idle",
-        "actions": [],
-        "warnings": [],
-        "summary": {
+        except (CommandError, core.PolicyError, OSError) as error:
+            return _envelope(
+                "waiting",
+                warnings=[{"code": "project-sync-degraded", "detail": str(error)}],
+                summary={"project_optional": True},
+            )
+    return _envelope(
+        "idle",
+        summary={
             "labels": labels,
             "project_optional": True,
             "project_number": number,
@@ -2990,7 +2924,7 @@ def _project(args: argparse.Namespace) -> dict[str, Any]:
                 "Current Wave Board: filter Active/Review/Ready to merge and group by Wave",
             ],
         },
-    }
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -3033,6 +2967,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
     args = parse_args(argv)
     try:
         if args.command == "reconcile":
@@ -3051,13 +2989,7 @@ def main(argv: list[str] | None = None) -> int:
         code = getattr(error, "code", "COMMAND_FAILED")
         print(
             json.dumps(
-                {
-                    "schema_version": 1,
-                    "status": "blocked",
-                    "actions": [],
-                    "warnings": [{"code": code, "detail": str(error)}],
-                    "summary": {},
-                },
+                _envelope("blocked", warnings=[{"code": code, "detail": str(error)}]),
                 ensure_ascii=False,
             )
         )

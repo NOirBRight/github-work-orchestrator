@@ -12,7 +12,6 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from pathlib import PurePosixPath
 from typing import Any, Literal, NotRequired, Required, TypedDict
 
 
@@ -26,11 +25,9 @@ _FRONTIER_SPEC.loader.exec_module(frontier)
 
 
 PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
-WIP_STATES = {"active", "review", "ready-to-merge"}
 TIERS = {"light", "standard", "heavy"}
 ISSUE_MARKER_V1 = "<!-- orchestrator:issue:v1 -->"
 ISSUE_MARKER_V2 = "<!-- orchestrator:issue:v2 -->"
-ISSUE_MARKER = ISSUE_MARKER_V1
 DELIVERY_MARKER = "<!-- orchestrator:delivery:v1 -->"
 REVIEW_MARKER = "<!-- orchestrator:review:v1 -->"
 _WINDOWS_ABSOLUTE = re.compile(r"(?:^|[\s'\"(])(?:[A-Za-z]:[\\/]|\\\\)")
@@ -312,7 +309,6 @@ def apply_observations(
         action["action_id"]: action
         for action in plan_review_actions({**snapshot, "issues": issues})["actions"]
     }
-    reviewer_observations = list(snapshot.get("reviewer_observations") or [])
     for action_id, observation in by_action.items():
         if action_id not in reviewer_actions:
             continue
@@ -341,7 +337,6 @@ def apply_observations(
                         "state": "running",
                     }
                 )
-        reviewer_observations.append(dict(observation))
         consumed.add(action_id)
     unknown_actions = set(by_action) - consumed
     if unknown_actions:
@@ -351,19 +346,7 @@ def apply_observations(
         )
     updated["issues"] = issues
     updated["runtime_agents"] = runtime_agents
-    if reviewer_observations:
-        updated["reviewer_observations"] = reviewer_observations
     return updated
-
-
-def _path_parts(raw: str) -> tuple[str, ...]:
-    value = raw.replace("\\", "/").strip("/")
-    return PurePosixPath(value).parts
-
-
-def _paths_overlap(left: str, right: str) -> bool:
-    a, b = _path_parts(left), _path_parts(right)
-    return a[: len(b)] == b or b[: len(a)] == a
 
 
 def _hotsets_overlap(left: list[str], right: list[str]) -> bool:
@@ -373,75 +356,10 @@ def _hotsets_overlap(left: list[str], right: list[str]) -> bool:
     )
 
 
-def _implicit_conflict_group(raw: str) -> str | None:
-    path = raw.replace("\\", "/").lower()
-    name = path.rsplit("/", 1)[-1]
-    if name.endswith((".lock", "-lock.json")) or name in {
-        "package.json",
-        "pyproject.toml",
-        "cargo.toml",
-        "go.mod",
-        "pom.xml",
-    }:
-        return "dependency-manifest"
-    if "migration" in path or "schema" in path:
-        return "schema-migration"
-    if "/generated/" in f"/{path}/" or name.endswith(
-        (".proto", ".graphql", ".openapi.json", ".openapi.yaml")
-    ):
-        return "generated-input"
-    return None
-
-
 def hotsets_overlap(left: list[str], right: list[str]) -> bool:
     """Expose the conservative write-overlap rule for adapters and tests."""
 
     return _hotsets_overlap(left, right)
-
-
-def _exclusive_hotset(hotset: Any) -> bool:
-    if not isinstance(hotset, list) or not hotset:
-        return True
-    for raw in hotset:
-        if not isinstance(raw, str) or not raw.strip():
-            return True
-        value = raw.replace("\\", "/")
-        parts = PurePosixPath(value).parts
-        if value.startswith("/") or (len(value) > 1 and value[1] == ":"):
-            return True
-        if ".." in parts or not parts or value in {".", "./"}:
-            return True
-        if any(character in value for character in ("*", "?", "[", "]", "\x00")):
-            return True
-    return False
-
-
-def _counts_as_wip(issue: dict[str, Any]) -> bool:
-    dispatch = issue.get("dispatch") or {}
-    if dispatch.get("parked") is True or dispatch.get("status") in {
-        "merged",
-        "retired",
-    }:
-        return False
-    if not dispatch.get("parked", False) and dispatch.get("status") in {
-        "claiming",
-        "running",
-        "review",
-        "ready-to-merge",
-    }:
-        return True
-    if issue.get("state") in WIP_STATES:
-        return True
-    return issue.get("state") == "blocked" and not dispatch.get("parked", False)
-
-
-def _sort_key(issue: dict[str, Any]) -> tuple[Any, ...]:
-    return (
-        PRIORITY_ORDER.get(issue.get("priority"), 99),
-        issue.get("milestone_due") or "9999-12-31",
-        -int(issue.get("unlocks", 0)),
-        int(issue["number"]),
-    )
 
 
 def plan_reconcile(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -452,9 +370,9 @@ def plan_reconcile(snapshot: dict[str, Any]) -> dict[str, Any]:
     except ValueError as error:
         message = str(error)
         code = (
-            "WORKER_SLOTS_INVALID"
-            if "execution slots" in message
-            else "INTEGRATION_WIP_INVALID"
+            "INTEGRATION_WIP_INVALID"
+            if "integration WIP" in message
+            else "WORKER_SLOTS_INVALID"
         )
         raise PolicyError(code, message) from error
     issues = list(snapshot.get("issues", []))
@@ -496,6 +414,20 @@ def plan_reconcile(snapshot: dict[str, Any]) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
     if wave["dispatch_capacity"] == 0:
         closed = set(snapshot.get("closed_issues", []))
+        wip_claims = [
+            frontier.issue_claims(candidate)
+            for candidate in issues
+            if frontier.counts_as_integration_wip(candidate)
+        ]
+
+        def p0_blocked_by_claims(issue: dict[str, Any]) -> bool:
+            claims = frontier.issue_claims(issue)
+            return bool(wip_claims) and (
+                frontier.exclusive_claims(claims)
+                or any(frontier.exclusive_claims(other) for other in wip_claims)
+                or any(frontier.claims_overlap(claims, other) for other in wip_claims)
+            )
+
         waiting_p0 = [
             int(issue["number"])
             for issue in issues
@@ -510,6 +442,7 @@ def plan_reconcile(snapshot: dict[str, Any]) -> dict[str, Any]:
                     else issue.get("dependencies", [])
                 )
             )
+            and not p0_blocked_by_claims(issue)
         ]
         if waiting_p0:
             warnings.append(
@@ -1075,6 +1008,8 @@ def plan_worker_recovery(snapshot: dict[str, Any]) -> dict[str, Any]:
             "workspace_id": dispatch.get("workspace_id"),
             "worker_agent_id": None,
             "recovery_prompt_sent": False,
+            "base_sha": snapshot.get("base_sha"),
+            "contract_sha256": snapshot.get("contract_sha256"),
         }
         return {
             "actions": [_create_worker_action(replacement)],
@@ -2015,13 +1950,15 @@ def validate_delivery(
             )
         paths = actual_paths
     claimed_paths = contract_change_claims(contract)["paths"]
+    claimed = {"paths": claimed_paths, "resources": []}
     for path in paths:
-        if _exclusive_hotset([path]):
+        changed = {"paths": [path], "resources": []}
+        if frontier.exclusive_claims(changed):
             raise PolicyError(
                 "DELIVERY_PATHS_INVALID", f"changed path is invalid: {path}"
             )
-        if not _exclusive_hotset(claimed_paths) and not any(
-            _paths_overlap(path, root) for root in claimed_paths
+        if not frontier.exclusive_claims(claimed) and not frontier.claims_overlap(
+            changed, claimed
         ):
             raise PolicyError(
                 "DELIVERY_HOTSET_VIOLATION", f"changed path outside hotset: {path}"
@@ -2084,8 +2021,14 @@ def review_complete(
 ) -> bool:
     latest: dict[str, dict[str, Any]] = {}
     for review in reviews:
-        if review.get("candidate_sha") == candidate_sha:
-            latest[str(review.get("axis"))] = review
+        if review.get("candidate_sha") != candidate_sha:
+            continue
+        axis = str(review.get("axis"))
+        previous = latest.get(axis)
+        if previous is None or str(review.get("submitted_at") or "") >= str(
+            previous.get("submitted_at") or ""
+        ):
+            latest[axis] = review
     passing = {
         axis: review
         for axis, review in latest.items()
@@ -2248,7 +2191,9 @@ def normalize_github_snapshot(
                         "sha256"
                     ):
                         continue
-                    review_records.append(parsed_review)
+                    review_records.append(
+                        {**parsed_review, "submitted_at": raw_review.get("submittedAt")}
+                    )
                     if (
                         parsed_review.get("candidate_sha") == head_sha
                         and parsed_review.get("verdict") == "pass"
@@ -2463,11 +2408,13 @@ def select_workspace(
     configured_id = repository_config.get("workspace_id")
     if configured_id:
         configured = [item for item in candidates if item.get("id") == configured_id]
-        if len(configured) == 1:
-            qualify_workspace(
-                configured[0], repository_config, operation="reconcile-read"
+        if len(configured) != 1:
+            raise PolicyError(
+                "WORKSPACE_CONFIGURED_MISSING",
+                f"configured Workspace {configured_id} is not an eligible candidate",
             )
-            return configured[0]
+        qualify_workspace(configured[0], repository_config, operation="reconcile-read")
+        return configured[0]
     eligible = []
     for candidate in candidates:
         try:

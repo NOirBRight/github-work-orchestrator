@@ -91,6 +91,11 @@ python <skill>/scripts/orch.py reconcile --repo owner/repo --read-only --coordin
 python <skill>/scripts/orch.py reconcile --repo owner/repo --coordinator-context context.json
 ```
 
+`reconcile` also takes `--observations FILE|-` (submit bounded action outcomes
+from the previous turn) and `--park ID` / `--resume ID` (one Human Park or
+Resume of a running Dispatch). Every command reads `~/.orch/config.json`
+unless `--config PATH` overrides it. The hidden `--snapshot` is a test hook.
+
 The write call takes an OS advisory mutex for at most five seconds, reads one
 snapshot, repairs observations, claims a compatible wave, and releases. It
 never holds a long Lease. The JSON envelope is always
