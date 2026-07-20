@@ -1,8 +1,13 @@
 ---
 status: accepted
+superseded-by: 0007-move-invariants-into-a-stateful-gwo-cli.md
 ---
 
 # Require acknowledged delivery for material Campaign Room events
+
+Superseded by ADR 0007 for the V7 design: the acknowledged-delivery guarantee
+moves into the gwo CLI (`inbox --ack-on-read`, Signal-ID idempotency,
+idle-only wake). Operative until roadmap Phase 1 lands.
 
 Treat a durable Room post and parent activation as separate facts. Every
 explicitly addressed material event uses the GWO-owned transaction

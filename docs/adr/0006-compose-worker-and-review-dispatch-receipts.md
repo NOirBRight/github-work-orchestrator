@@ -1,8 +1,12 @@
 ---
 status: accepted
+superseded-by: 0007-move-invariants-into-a-stateful-gwo-cli.md
 ---
 
 # Compose independently compiled Worker and Review dispatch receipts
+
+Superseded by ADR 0007 for the V7 design: write-time identity replaces
+compiled receipt composition. Operative until roadmap Phase 1 lands.
 
 Keep one Issue Dispatch across implementation and formal review. Compile
 Worker and reusable Review Pair authority independently with the existing

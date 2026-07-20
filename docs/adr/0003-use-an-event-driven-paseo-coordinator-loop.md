@@ -1,8 +1,13 @@
 ---
 status: accepted
+amended-by: 0007-move-invariants-into-a-stateful-gwo-cli.md
 ---
 
 # Use an event-driven Paseo Coordinator loop inside GWO
+
+Amended by ADR 0007: the event-driven loop is retained; the "no local task
+database" constraint is narrowed to prohibit a second source of business
+truth, permitting the rebuildable gwo coordination store.
 
 Keep orchestration in `github-work-orchestrator`; do not add another Skill,
 daemon, sidecar, or local task database. GitHub remains durable business state
