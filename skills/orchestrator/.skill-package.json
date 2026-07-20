@@ -1,6 +1,6 @@
 {
-  "content_sha256": "15f30573752ffeb0d6b4c28ed88df2e66b13e880ef6c537b09d5e4e3b0821334",
+  "content_sha256": "5d44ac351d2bc8c41dc25ceac77d7580956e65a65f770f951c0997f6206f1ce6",
   "schema_version": 1,
   "skill": "orchestrator",
-  "version": "6.0.1"
+  "version": "6.1.0"
 }

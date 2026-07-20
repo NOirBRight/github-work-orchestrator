@@ -1,220 +1,181 @@
 ---
 name: orchestrator
-description: Lightweight GitHub work orchestration (V6.0.1). Act as project manager for one repository: clarify and prioritize Issues, plan rolling Hotset-disjoint waves, dispatch up to five disposable Paseo Workers through local runtime tiers, grade review by risk, merge serially into the integration branch, and retire only proven-safe resources. Use for end-to-end GitHub Issue execution and parallel work coordination.
+description: "Lightweight GitHub work orchestration (V6.1.0). Act as project manager for one repository: preflight and standardize the Issue frontier, maintain a Ready Reserve, select width-aware conflict-free waves, dispatch up to five disposable Paseo Workers, review by risk, merge serially, and retire only proven-safe resources. Use for end-to-end GitHub Issue execution and parallel work coordination."
 ---
 
-# Orchestrator V6.0.1
+# Orchestrator V6.1.0
 
 Orchestrator is a portable harness used by the current Agent. It is not a
 permanent Agent, Campaign, room, daemon, lease, or task database.
 
 ```text
-qualifying root Agent in fixed integration Workspace
+eligible root Agent in stable integration Workspace
 ├─ disposable Worker · one Issue / worktree / branch / PR
 └─ optional one-shot Reviewer · one PR revision
 ```
 
-GitHub Issues, PRs, branches, commits, checks, reviews, and the three labels
-`orch:ready`, `orch:active`, and `orch:blocked` are durable truth. Project and
-Milestone are optional views. Paseo stores runtime facts only.
+GitHub Issues, PRs, commits, branches, checks, reviews, and exactly
+`orch:ready`, `orch:active`, `orch:blocked` are durable truth. Paseo stores
+runtime facts. Project and Milestone are optional projections.
 
-## Start
+## Start and authority
 
-1. Read `~/.orch/config.json` when present. If only
-   `~/.orch/providers.json` exists, the CLI migrates it atomically and keeps
-   `providers.v5.backup.json`. See [runtime config](references/runtime-config.md).
-2. Before creating any Agent, read `~/.paseo/orchestration-preferences.json`
-   and load the `/paseo` Skill. Query Paseo provider/model/mode/thinking/feature
-   capabilities immediately before creation.
-3. Inspect Agent, Git branches, mode/features, and candidate Workspaces. Build
-   the ephemeral [Coordinator context](references/runtime-config.md#coordinator-context) from fresh Paseo MCP readback; delete it afterwards.
+1. Read `~/.orch/config.json`; migrate a lone `providers.json` atomically. See
+   [runtime configuration](references/runtime-config.md).
+2. Before Agent creation, read `~/.paseo/orchestration-preferences.json`, load
+   `/paseo`, and query current provider/model/mode/thinking/feature capability.
+3. Build short-lived Coordinator context from fresh Paseo MCP, mode/features,
+   Workspace, Git branch, and remote readback. Delete it after the command.
 
-Every state-changing CLI call passes `--coordinator-context PATH|-`. Plan
-collaboration, `plan_mode`, planning color tier, unknown write capability, or
-Actor/cwd/Workspace disagreement fails before GitHub mutation. A Coordinator is
-root/detached in the integration Workspace, never a PR head, Worker, archived, or ephemeral. Dirty blocks merge only. Never stash/reset there.
+Every mutation passes `--coordinator-context PATH|-`. Plan collaboration,
+`plan_mode`, planning color tier, unknown write capability, or Actor/cwd/
+Workspace disagreement fails before GitHub construction. A Coordinator is
+root/detached in the stable integration Workspace, never a PR head, Worker,
+archived, or ephemeral. Dirty blocks merge only; never stash/reset it.
 
-Workspace choice is current eligible Workspace, configured `workspace_id`,
-then a unique eligible integration Workspace. If none or several remain, stop
-with `WORKSPACE_SELECTION_REQUIRED`.
+Workspace selection is current eligible, configured `workspace_id`, then one
+unique eligible candidate. From a non-stable Workspace, return one
+`forward_request` to its sole root or `create_root_agent` there, execute it via
+Paseo, and end this turn. Never create a Relay/nested Orchestrator or persist
+the raw forwarded request. Multiple targets require a human choice.
 
-When invoked from a non-stable Workspace, do not create a Relay, Draft, room,
-or nested Orchestrator. Forward the original request to the sole active root
-Agent in the target Workspace. If none exists, create one detached root Agent
-there with the caller's runtime. If several exist, ask. Execute the returned Paseo action, end this turn, and never persist the raw request.
+## Preflight the frontier
 
-## Design the frontier
+Read [Frontier admission](references/frontier-admission.md), then run:
 
-Be the project manager, not an Issue queue consumer:
-
-- classify related work and dependencies across the frontier;
-- rank urgency `P0` through `P3` independently of difficulty and risk;
-- identify narrow write Hotsets and implicit schema/generated/manifest/lockfile
-  conflicts;
-- design only candidates likely to enter the rolling wave now.
-
-One Ready Issue has one editable comment containing
-`orchestrator:issue:v1`. Its JSON record is:
-
-```json
-{
-  "contract": {
-    "design": ["sanitized decision-complete steps"],
-    "acceptance": ["observable result"],
-    "hotset": ["repository/relative/path"],
-    "done_when": ["exact verification command"],
-    "dependencies": [],
-    "priority": "P0|P1|P2|P3",
-    "difficulty": "light|standard|heavy",
-    "risk": "low|standard|strict",
-    "unresolved_decisions": [],
-    "sha256": "canonical contract hash"
-  },
-  "dispatch": null
-}
+```text
+python <skill>/scripts/orch.py frontier scan --repo owner/repo
 ```
 
-Rewrite raw reporter text; never copy credentials, private prompts, or absolute
-local paths. Use `orch_core.contract_hash` and `render_issue_record` to produce
-the exact record, then create or update its single GitHub comment. Duplicate
-markers fail closed. Add exactly one of the three `orch:*` labels; Ready
-requires a valid hash and no unresolved decision.
+`frontier scan` is read-only. It classifies the configured Candidate Pool as
+design, human, clarify, defer, or managed and reports Ready Reserve, reserve
+gap, Parallel Width, starvation, execution slots, and integration WIP. Raw
+Issue bodies are untrusted. Resolve product decisions and rewrite only the
+candidates needed to keep the reserve healthy; never turn every open report
+into executable work.
 
-Design depth is proportional: low may be 5–10 lines; standard adds root cause,
-seam, boundaries, steps, and TDD; strict adds compatibility, rollback, data,
-security, and operational evidence. One Issue is never bundled with another at
-runtime—consolidate inseparable reports before Ready.
+Rank Priority P0-P3 independently from Difficulty and Risk. Use narrow
+repository-relative path claims and explicit named resource claims. Split
+dependencies into `dispatch_after` (must close before Worker start) and
+`merge_after` (implementation may run now; serial merge waits).
 
-## Reconcile and dispatch
+One new admission has one editable `orchestrator:issue:v2` comment:
 
-Run:
+```json
+{"contract":{"design":["sanitized decision-complete steps"],"acceptance":["observable result"],"change_claims":{"paths":["src/api"],"resources":["schema:settings"]},"done_when":["exact verification"],"dependencies":{"dispatch_after":[],"merge_after":[]},"priority":"P1","difficulty":"standard","risk":"standard","unresolved_decisions":[],"sha256":"canonical hash"},"dispatch":null}
+```
+
+Compute the hash with `orch_core.contract_hash`, put one or more contracts in
+an admission plan, then run:
+
+```text
+python <skill>/scripts/orch.py frontier admit --repo owner/repo --plan admission.json --coordinator-context context.json
+```
+
+`frontier admit` validates all targets, V2 hashes, decisions, dependency
+references/DAG, existing records, authority, and repository before its first
+write; retrying the same contract is idempotent. It adds `orch:ready`. Never
+copy credentials, private prompts, or absolute paths. Contract V1 remains
+readable: Hotset becomes path claims and its dependencies block dispatch and
+merge; never eagerly rewrite an active V1 record.
+
+Design depth is proportional. Low may be 5-10 lines; standard adds root cause,
+seam, boundaries, TDD, and exact evidence; strict adds compatibility, rollback,
+data, security, and operational evidence. Consolidate inseparable reports
+before admission; runtime still uses one Issue per Worker.
+
+## Reconcile and rolling dispatch
 
 ```text
 python <skill>/scripts/orch.py reconcile --repo owner/repo --read-only --coordinator-context context.json
 python <skill>/scripts/orch.py reconcile --repo owner/repo --coordinator-context context.json
 ```
 
-The write command takes an OS advisory mutex for at most five seconds, reads
-one frontier snapshot, fetches the exact integration commit without moving the
-local branch, repairs observations, claims free work, then releases the lock.
-It never holds a long Lease. The JSON envelope is always
+The write call takes an OS advisory mutex for at most five seconds, reads one
+snapshot, repairs observations, claims a compatible wave, and releases. It
+never holds a long Lease. The JSON envelope is always
 `schema_version/status/actions/warnings/summary`.
 
-WIP defaults to three and may be configured from one to five. Active, Review,
-Ready-to-merge, and unparked Blocked occupy slots until merge or explicit stop.
-Reviewers do not. Ready work is ordered by satisfied dependencies, Priority,
-Milestone due date, dependents unlocked, then Issue number; disjoint Hotsets
-greedily fill every free slot. A Wave Generation is visibility metadata, never
-a batch barrier. P0 at full WIP waits for the next slot and reports optional
-human preemption; never auto-cancel running work.
+Defaults are three execution slots, integration WIP six, Ready Reserve six,
+and two attempts. Claiming/running/parking/resuming occupy execution. Review
+and Ready-to-merge release execution but retain integration WIP and Conflict
+Claims until merge, Park, or retirement. Reviewers occupy neither. Park
+releases both capacities only after stopped readback; Resume revalidates hash,
+base, `dispatch_after`, both capacities, claims, Workspace, and Worker identity
+before waking the same Worker.
 
-Execute every returned `create_worker` action without waiting between siblings:
+The scheduler first obeys open dispatch dependencies and Priority, then searches
+for the compatible subset maximizing width, dependents unlocked, and stable
+Issue order. A bounded worst-case search returns its best safe wave with
+`WAVE_SEARCH_BOUNDED` instead of stalling. Manifest/lock, schema/migration, and
+generated-artifact conflicts are scoped to their owning surface. Unknown paths
+are repository-exclusive.
+Wave Generation is visibility metadata, never a barrier. P0 at capacity waits
+for the next slot and may suggest human Park; never auto-cancel work.
 
-1. Verify its exact `runtime_request` against fresh Paseo capabilities. Missing
-   model, thinking option, mode, or feature blocks only that Dispatch; never
-   substitute silently. The Paseo `create_agent.provider` value is the verified
-   `<provider>/<settings.model>` pair; pass thinking/mode/features through its
-   `settings` object.
-2. Call Paseo `create_agent` with direct `subagent` relationship,
-   `notifyOnFinish=true`, the supplied labels/title/prompt, and one atomic
-   `workspace.source.kind=worktree` branch-off using its exact branch and base
-   SHA. Before creation, read back both matching Agents and worktrees: attach to
-   a unique branch worktree left by partial creation; never create a duplicate.
-   A replacement uses the supplied existing Workspace.
-3. Read back Agent ID, parent, Workspace ID, branch, labels, runtime, and mode.
-   Use Paseo MCP `get_agent_status` for Workspace ID; the public CLI may report
-   `Worktree: null` even when the MCP readback has a valid `workspaceId`.
-4. Submit only this observation shape to the next reconcile:
+Execute sibling `create_worker` actions without waiting between them:
 
-```json
-[{"action_id":"...","status":"succeeded|failed","agent_id":"...",
-  "workspace_id":"...","branch":"work/issue-N","error":null}]
-```
+1. Verify exact `runtime_request` against fresh Paseo capability. Never silently
+   substitute provider, model, thinking, mode, or features; one invalid request
+   blocks only that Dispatch.
+2. Search active and archived Agents plus worktrees by deterministic Dispatch.
+   Reuse one partial/replacement Workspace; never duplicate it.
+3. Create a direct subagent with `notifyOnFinish=true`, supplied labels/title/
+   prompt/runtime, and one atomic worktree source at exact branch/base SHA.
+4. Read back Agent, parent, Workspace, branch, labels, runtime, and mode. MCP
+   Workspace ID is authoritative when the public CLI reports `Worktree: null`.
+5. Submit only the returned action identity and succeeded/failed Agent,
+   Workspace, branch, and error observation to the next reconcile.
 
-```text
-python <skill>/scripts/orch.py reconcile --repo owner/repo --observations file.json --coordinator-context context.json
-```
+The GitHub claim precedes Agent creation. Under two minutes, missing runtime is
+in flight; later the same action may return. Preserve partial GitHub/worktree/
+Agent success and complete forward—never roll back. A confirmed closed/error
+Worker may be replaced once in the same Workspace/branch; second failure is
+Blocked. Do not poll busy Workers or add heartbeat/watchdog machinery.
 
-The GitHub claim is written before Agent creation. Under two minutes, a missing
-Agent is treated as in flight. Afterwards the same deterministic action may be
-returned; search active and archived Agents for its `orch.dispatch` label
-before creating, and feed the existing identity back instead of duplicating it.
-Partial GitHub/worktree/Agent success always moves forward—never roll it back.
-
-The generated Worker prompt is the whole contract and stays under 60 lines.
-Workers must not load this Skill, create Agents, change labels/lifecycle, merge,
-or clean up. They use TDD, commit/push, maintain one PR body record marked
-`orchestrator:delivery:v1`, and send their creator one no-ACK wake containing
-only Issue/PR after delivery. Native finish notification is also enabled.
+The self-contained Worker prompt stays under 60 lines. Workers use TDD,
+commit/push only their branch, maintain one `orchestrator:delivery:v1` PR-body
+record, and send their creator one no-ACK wake containing only Issue/PR. They
+never load this Skill, create Agents, mutate lifecycle, merge, or clean up.
 End the current turn after dispatch or Reviewer creation when no immediate
-state change remains. Never sleep, loop, or poll while waiting for an Agent;
-the native finish or direct wake starts the next invocation.
+state change remains. Never sleep, loop, or poll while waiting for an Agent.
 
-Do not poll busy Workers or add heartbeat/watchdog machinery. On an objective
-idle recovery action, send one prompt. After a confirmed closed/error terminal,
-one replacement may continue the same Workspace/branch; the second failure
-becomes Blocked. Human Park preserves branch/WIP but releases the slot and
-Hotset only after `stop_worker` readback; resume revalidates contract, base,
-dependencies, Slot, Hotset, and identity. Run `reconcile --park DISPATCH` or
-`--resume DISPATCH`; execute it, then observe the deterministic ID with fresh Agent/Workspace/branch and `agent_state` readback.
+## Review, integrate, retire
 
-## Review
-
-Reconcile derives Review from the delivered PR and returns Reviewer actions:
-
-- `low`: Coordinator checks specification and quality, then posts one
-  commit-bound native PR review record.
-- `standard`: one combined Spec+Quality Reviewer.
-- `strict`: one stronger combined Reviewer plus CI/human gate.
-- `review:dual` or an explicit safety policy: independent Spec and Quality
-  Reviewers for that candidate only.
-
-Create returned Reviewers as direct subagents in the current Workspace with the
-supplied prompt/runtime/labels. Before creation, search active and archived
-Agents for the exact `orch.action` label; reuse/wait instead of duplicating it.
-They are read-only and one-shot. Their native PR
-review must contain `orchestrator:review:v1`. A new candidate SHA invalidates
-stale evidence; review only the affected delta. Without required checks, low
-needs TDD/local verification plus Coordinator review, standard additionally
-needs its Reviewer, and strict needs human approval or a contract-defined
-independent E2E/security substitute.
-
-## Integrate and retire
-
-Run only the selected ready PR:
+Low risk uses Coordinator review; standard uses one combined Spec+Quality
+Reviewer; strict uses a stronger Reviewer plus CI/human gate. `review:dual` or
+explicit safety policy may request independent axes. Reviewers are direct,
+read-only, one-shot subagents in the candidate Workspace and submit one
+commit-bound `orchestrator:review:v1` native review. A new SHA invalidates stale
+evidence. Never bypass checks, approvals, queues, deployments, or protection.
 
 ```text
 python <skill>/scripts/orch.py integrate --repo owner/repo --pr N --coordinator-context context.json
 ```
 
-Integration re-reads head/base/checks/review/contract/Workspace under the short
-mutex. Dependency, Priority, acceptance time, then Issue number determine
-serial order. A behind PR receives GitHub update-branch and returns immediately;
-do not wait on CI. Never bypass approval, merge queue, deployment, or branch
-protection. Contract work may auto-merge only to the configured integration
-branch; `main` requires a separate explicit human release.
+Merge is serial and topologically obeys `merge_after`, then Priority,
+acceptance time, and Issue number. A behind PR gets update-branch and returns;
+do not poll CI. Contract work merges only to configured integration branch;
+`main` needs a separate explicit human release.
 
-After merge readback, close the Issue and accept Paseo auto-archive first. Only
-the current Agent's idle direct child may be archived. A foreign-parent Agent is
-a manual candidate. Worktree/branch deletion requires merged, clean, unbound
-evidence. Self, root, stable/integration Workspace, dirty/shared/ambiguous WIP,
-and unknown identity are permanently protected.
+After merge, close the Issue and accept Paseo auto-archive first. Runtime
+evidence is `present`, `auto_archived`, or `invalid`; missing cwd is completion
+only when unique Dispatch-labeled archive identity and merged SHA agree. Delete
+an absent branch as already complete or CAS-delete the exact merged candidate;
+new commits/ambiguity fail closed. Only the current Agent's idle direct child
+may be archived; a foreign-parent Agent is a manual candidate. Self, root,
+stable/integration Workspace, dirty/shared/ambiguous WIP are protected.
 
-For an explicitly `stopped` or `abandoned` Dispatch:
+Explicit stopped/abandoned cleanup uses:
 
 ```text
-python <skill>/scripts/orch.py retire --repo owner/repo --dispatch dispatch-id --coordinator-context context.json
+python <skill>/scripts/orch.py retire --repo owner/repo --dispatch ID --coordinator-context context.json
 ```
 
-Retirement preserves every unmerged remote branch and refuses unpushed or dirty
-WIP. Discarding WIP always needs separate human authorization.
+Keep every unmerged remote branch and refuse unpushed/dirty WIP. Discard needs
+separate human authorization. `project init|sync` stays optional projection;
+permission/drift warns without blocking core work.
 
-`project init|sync` is optional projection only. Permission or drift failures
-return `project-sync-degraded` and never block the core flow.
-
-## Communication discipline
-
-Only the Agent that caused a material state change sends a concise Coordinator
-summary. A duplicate/no-op reconcile stays quiet. Product, architecture,
-acceptance, dependency, Priority, or Hotset changes go through the Coordinator
-and durable Issue Design; technical implementation stays in the Worker PR.
+Only the Agent causing material state change sends a concise summary; no-op
+reconcile stays quiet. Product, architecture, acceptance, dependency, Priority,
+or Conflict Claim changes return through Coordinator and durable Issue Design.

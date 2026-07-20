@@ -1,11 +1,12 @@
-# Orchestrator V6 Living Design
+# Orchestrator V6.1 Living Design
 
-> Status: hardened as Orchestrator 6.0.1 on 2026-07-20.
+> Status: implemented for review as Orchestrator 6.1.0 on 2026-07-20.
 > Last consolidated from Paseo thread
 > `f9589ab7-92ed-45cb-9b20-417dd5de067a` on 2026-07-19.
 
-This is the compression-safe behavioral source for V6. `CONTEXT.md` owns
-language, ADR 0008 owns the architecture, and ADR 0009 owns 6.0.1 hardening.
+This is the compression-safe behavioral source for V6.1. `CONTEXT.md` owns
+language, ADR 0008 owns the architecture, ADR 0009 owns 6.0.1 safety, and ADR
+0010 owns parallel Frontier admission.
 
 ## Outcomes
 
@@ -14,6 +15,8 @@ language, ADR 0008 owns the architecture, and ADR 0009 owns 6.0.1 hardening.
 - Orchestration consumes less than five percent of normal task time.
 - The common path contains one Issue design, one PR, one best-effort wake, an
   optional review, and one merge.
+- A healthy repository keeps a Ready Reserve of at least twice its execution
+  slots and exposes starvation instead of silently running single-threaded.
 - Mechanisms exist only for observed failures or immediately before irreversible
   merge/delete actions.
 
@@ -49,46 +52,54 @@ language, ADR 0008 owns the architecture, and ADR 0009 owns 6.0.1 hardening.
   Ready-to-merge, and Done are derived.
 - Coordinator is the lifecycle writer. Worker writes its branch, PR, and
   technical evidence; Reviewer writes a PR review.
-- One editable `orchestrator:issue:v1` comment holds the sanitized design and
-  current dispatch. One `orchestrator:delivery:v1` PR body holds delivery facts.
+- One editable `orchestrator:issue:v2` comment holds each new sanitized design
+  and current dispatch. V1 remains readable without eager rewrite. One
+  `orchestrator:delivery:v1` PR body holds delivery facts.
 - Project is optional projection of Status, Priority, Wave, and Risk with
   Backlog Table and Current Wave Board. Failure yields a warning only.
 - Campaign is an optional Milestone; independent work needs none.
 
 ## Triage and design
 
-- Coordinator quickly classifies the whole frontier, then designs only likely
-  candidates. Each complete design dispatches immediately.
-- Every Ready Issue has goal, scope, acceptance, Hotset, `done_when`,
-  dependencies, Priority, Difficulty, Risk, and unresolved decisions.
+- `frontier scan` reads the configured Candidate Pool and current scheduler,
+  then reports assessment, Ready Reserve, reserve gap, Parallel Width, both
+  capacities, and starvation without mutation.
+- Coordinator designs only likely candidates. `frontier admit` validates the
+  entire V2 batch, cross-frontier dependency DAG, references, identity, and
+  authority before its first idempotent record/Ready write.
+- Every new Ready Issue has goal, acceptance, `change_claims`, `done_when`,
+  typed `dispatch_after`/`merge_after`, Priority, Difficulty, Risk, and no open
+  decision. Raw Issue text remains untrusted.
 - Low design is often 5-10 lines. Standard adds root cause, seam, steps,
   boundaries, and TDD. Strict adds compatibility, rollback, security, data, and
   operational risk.
 - Worker receives the Coordinator's sanitized rewrite, not raw untrusted Issue
   instructions. Product, architecture, dependency, acceptance, priority, or
-  Hotset changes return to Coordinator.
+  Conflict Claim changes return to Coordinator.
 - TDD is default; justified exceptions record replacement evidence.
 
 ## Rolling Wave
 
 - One Issue equals one Dispatch, Worker, worktree, branch, and PR. Inseparable
   reports are consolidated before Ready; runtime Work Packages do not exist.
-- WIP defaults to three and is configurable from one to five. It lasts from
-  dispatch through merge or explicit stop. Review does not release a slot and
-  Reviewers consume none.
-- Blocked retains its slot and Hotset. Human Park stops the Worker and releases
-  both only after stop readback while preserving Agent/Workspace/branch/WIP.
-  Resume revalidates contract hash, base, dependencies, Slot, Hotset, and Worker
-  identity, then reoccupies both before waking that same Worker. Deterministic
+- Execution defaults to three slots; integration WIP defaults to six. Claiming,
+  running, parking, and resuming occupy execution. Review/Ready-to-merge release
+  execution but retain integration WIP and Conflict Claims; Reviewers use none.
+- Human Park stops the Worker and releases both capacities/claims only after
+  stop readback while preserving Agent/Workspace/branch/WIP. Resume revalidates
+  contract hash, base, dispatch dependencies, both capacities, claims, and
+  Worker identity, then reacquires before waking that same Worker. Deterministic
   action IDs and `parking/resuming` states recover crashes without duplication.
 - Reconcile schedules on first invocation, Ready, slot release, failure/scope
   conflict, material priority/dependency/human change, or recovery. It is never
   triggered by heartbeat, timer, ordinary timeout, idle, or Review entry.
-- Stable order is dependency satisfaction, P0-P3, Milestone due date, number of
-  dependents unlocked, then Issue number. Hotset-disjoint candidates greedily
-  fill free slots.
-- Hotset limits writes only. Unknown/invalid paths are exclusive; parent/child,
-  generated inputs, schemas, migrations, manifests, and lockfiles conflict.
+- Dispatch first obeys hard dependencies and P0-P3, then bounded compatible-
+  subset search maximizes Parallel Width, dependents unlocked, and stable Issue
+  order. A worst-case budget returns the best safe wave with an explicit
+  `WAVE_SEARCH_BOUNDED` warning. `merge_after` affects only serial integration.
+- Conflict Claims limit writes only. Unknown/invalid paths are exclusive;
+  parent/child and scoped generated, schema/migration, manifest/lock resources
+  conflict without globally serializing unrelated subprojects.
 - A Wave Generation is assigned only when slots are filled. It is visibility
   metadata, not a barrier or recovery dependency.
 - P0 at full WIP takes the next slot and reports an optional human preemption;
@@ -135,7 +146,7 @@ language, ADR 0008 owns the architecture, and ADR 0009 owns 6.0.1 hardening.
 
 - Any qualifying Coordinator may integrate, one PR at a time under the command
   mutex. Base drift uses GitHub update-branch and returns to waiting for checks.
-- Order is dependencies, Priority, acceptance time, then Issue. Required
+- Order is `merge_after`, Priority, acceptance time, then Issue. Required
   approvals, merge queue, deployments, and branch protection are never bypassed
   or polled.
 - Contract work may merge to the configured integration branch. `main` requires
@@ -155,13 +166,15 @@ language, ADR 0008 owns the architecture, and ADR 0009 owns 6.0.1 hardening.
 
 ## Interface and distribution
 
-- Public CLI groups are `reconcile`, `integrate`, `retire`, and optional
-  `project init|sync`; implementation policy stays private.
+- Public CLI groups are `frontier scan|admit`, `reconcile`, `integrate`,
+  `retire`, and optional `project init|sync`; implementation policy stays
+  private.
 - Every state-changing group requires `--coordinator-context PATH|-`; Park and
   resume are `reconcile --park|--resume DISPATCH`.
-- `~/.orch/config.json` is the single optional config. Defaults are WIP three,
-  two attempts, `dev` only when remote/live Workspace readback is unambiguous,
-  and current Runtime fallback. `main` is never inferred.
+- `~/.orch/config.json` is the single optional config. Defaults are three
+  execution slots, integration WIP six, Ready Reserve six, two attempts, `dev`
+  only when remote/live Workspace readback is unambiguous, and current Runtime
+  fallback. `main` is never inferred.
 - V6 is the only `/orchestrator` Skill, synchronized byte-identically to
   `.agents`, `.codex`, and `.claude`. No host or daemon changes.
 - New Dispatches use the installed version; running Workers finish their
@@ -184,8 +197,9 @@ auto-archive, and root/Workspace survival. A second Coordinator reconstructed
 the completed state with zero actions, and a fresh installed Agent returned an
 idle, zero-warning read-only reconcile from the stable Workspace.
 
-6.0.1 adds production-path regression evidence for pre-mutation Plan blocking,
-stable-dev forwarding, two-phase Park/resume and crash recovery, and host-first
-auto-archive with zero duplicate cleanup. The full suite, packaging, lint,
-format, manifest, three-surface drift, and installed read-only smoke remain the
+6.1 adds production-path Frontier scan/admit tests, all-before-first-write batch
+validation, V1/V2 compatibility, typed dependency and scoped-claim regressions,
+separate execution/integration capacity, Review refill, and a bounded
+100-candidate width search. The full suite, packaging, lint, format, manifest,
+three-surface drift, dual-axis review, and installed read-only smoke remain the
 release gates.

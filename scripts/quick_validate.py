@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fast syntax, package, metadata, link, and line-budget checks for V6."""
+"""Fast syntax, package, metadata, link, and line-budget checks for V6.1."""
 
 from __future__ import annotations
 
@@ -16,9 +16,11 @@ REQUIRED = (
     ".skill-package.json",
     "SKILL.md",
     "agents/openai.yaml",
+    "references/frontier-admission.md",
     "references/runtime-config.md",
     "scripts/orch.py",
     "scripts/orch_core.py",
+    "scripts/orch_frontier.py",
     "templates/config.example.json",
     "templates/worker-prompt.md",
     "templates/reviewer-prompt.md",
@@ -67,7 +69,7 @@ def findings(root: Path) -> list[str]:
         skill_text.startswith("---\n")
         and "\nname: orchestrator\n" in skill_text
         and "\ndescription:" in skill_text
-        and "V6.0" in skill_text
+        and "V6.1" in skill_text
     ):
         errors.append("invalid Orchestrator Skill frontmatter/version")
     for relative, maximum in LINE_BUDGETS.items():

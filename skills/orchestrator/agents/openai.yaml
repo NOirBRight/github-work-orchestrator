@@ -1,7 +1,7 @@
 interface:
   display_name: "Orchestrator"
-  short_description: "Plan and run lightweight rolling GitHub work waves"
-  default_prompt: "Use $orchestrator to triage this repository and dispatch the next safe rolling wave."
+  short_description: "Preflight and run parallel rolling GitHub work"
+  default_prompt: "Use $orchestrator to scan the repository frontier, admit decision-complete Issues, and dispatch the next safe parallel wave."
 
 policy:
   allow_implicit_invocation: true

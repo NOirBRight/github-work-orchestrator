@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -49,8 +50,84 @@ def _connection(nodes: list[dict]) -> dict:
     }
 
 
+def _frontier_issue_node(state: dict, *, detailed: bool) -> dict:
+    labels = [{"name": "ready-for-agent"}]
+    if state.get("label"):
+        labels.append({"name": f"orch:{state['label']}"})
+    comments = []
+    if detailed and state.get("record_body"):
+        comments.append(
+            {
+                "databaseId": 91,
+                "body": state["record_body"],
+                "createdAt": "2026-07-20T01:00:00Z",
+                "updatedAt": "2026-07-20T01:00:00Z",
+                "author": {"login": "owner"},
+            }
+        )
+    return {
+        "number": 23,
+        "title": "Parallel Frontier candidate",
+        "body": "Reporter context only",
+        "updatedAt": "2026-07-20T01:00:00Z",
+        "labels": {"nodes": labels},
+        "milestone": None,
+        "assignees": {"nodes": []},
+        "comments": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": comments,
+        },
+    }
+
+
+def _gh_frontier(args: list[str], state: dict) -> int:
+    if args[:2] == ["api", "graphql"]:
+        query = next(value[6:] for value in args if value.startswith("query="))
+        if "readyIssues:issues" in query:
+            issue = _frontier_issue_node(state, detailed=True)
+            repository = {
+                "ref": {"target": {"oid": state["base_sha"]}},
+                "readyIssues": _connection(
+                    [issue] if state.get("label") == "ready" else []
+                ),
+                "activeIssues": _connection([]),
+                "blockedIssues": _connection([]),
+                "pullRequests": _connection([]),
+            }
+        elif "i23:issue(number:23)" in query:
+            repository = {"i23": _frontier_issue_node(state, detailed=True)}
+        else:
+            aliases = re.findall(r"(l\d+):issues", query) or ["issues"]
+            repository = {
+                alias: _connection([_frontier_issue_node(state, detailed=False)])
+                for alias in aliases
+            }
+        print(json.dumps({"data": {"repository": repository}}))
+        return 0
+    if args[:2] == ["api", "--method"]:
+        body = next(value[5:] for value in args if value.startswith("body="))
+        state["record_body"] = body
+        state["operations"].append("admit_record")
+        _save_state(state)
+        print(json.dumps({"id": 91, "body": body}))
+        return 0
+    if args[:2] == ["issue", "edit"]:
+        label = args[args.index("--add-label") + 1]
+        state["label"] = label.removeprefix("orch:")
+        state["operations"].append(f"set_state:{state['label']}")
+        _save_state(state)
+        return 0
+    if args[:2] == ["issue", "view"]:
+        print(json.dumps({"labels": [{"name": f"orch:{state['label']}"}]}))
+        return 0
+    print(json.dumps({"error": {"message": f"unexpected fake gh args: {args}"}}))
+    return 2
+
+
 def _gh(args: list[str]) -> int:
     state = _load_state()
+    if state.get("scenario") == "frontier":
+        return _gh_frontier(args, state)
     if args[:2] == ["api", "graphql"]:
         issue = _issue_node(state)
         repository = {

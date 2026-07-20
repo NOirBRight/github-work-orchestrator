@@ -8,8 +8,16 @@ stores only Difficulty Tier; concrete runtimes never become repository truth.
   "schema_version": 1,
   "global": {
     "default_tier": "standard",
-    "worker_slots": 3,
-    "max_attempts": 2
+    "execution_slots": 3,
+    "integration_wip_limit": 6,
+    "max_attempts": 2,
+    "intake": {
+      "include_labels": ["ready-for-agent"],
+      "human_labels": ["ready-for-human"],
+      "clarify_labels": ["needs-info"],
+      "candidate_limit": 100,
+      "ready_reserve_target": 6
+    }
   },
   "tiers": {
     "light": {
@@ -31,7 +39,8 @@ stores only Difficulty Tier; concrete runtimes never become repository truth.
       "integration_branch": "dev",
       "merge_method": "squash",
       "workspace_id": "optional-paseo-workspace-id",
-      "worker_slots": 3,
+      "execution_slots": 3,
+      "integration_wip_limit": 6,
       "default_tier": "standard",
       "milestone_tiers": {"release-name": "heavy"},
       "tiers": {},
@@ -43,9 +52,10 @@ stores only Difficulty Tier; concrete runtimes never become repository truth.
 
 ## Coordinator context
 
-Every state-changing `reconcile`, `integrate`, `retire`, or `project` command
-requires `--coordinator-context PATH|-`. The Skill creates this short-lived JSON
-from the latest Paseo MCP, collaboration-mode, and Git readbacks:
+Every state-changing `frontier admit`, `reconcile`, `integrate`, `retire`, or
+`project` command requires `--coordinator-context PATH|-`. The Skill creates
+this short-lived JSON from the latest Paseo MCP, collaboration-mode, and Git
+readbacks:
 
 ```json
 {
@@ -101,7 +111,7 @@ Park/Resume success observations additionally require the exact durable
 `agent_id`, `workspace_id`, and `branch`, plus fresh `agent_state`. Park accepts
 only `idle`, `stopped`, `closed`, `finished`, or `completed`; resume accepts
 only `running` or `busy`. A bare `status=succeeded` never releases or reacquires
-a Slot/Hotset.
+execution/integration capacity and Conflict Claims.
 
 Resolution is Issue Tier, Milestone default, repository default, global
 default, then `standard`; runtime mapping is repository Tier, global Tier,
@@ -113,11 +123,15 @@ Ambiguous or unsupported combinations fail closed for that action.
 The Coordinator always uses its current session runtime. There is deliberately
 no `roles.coordinator` binding.
 
-If V6 finds `~/.orch/providers.json` but no new config, it copies the source to
+If V6.1 finds `~/.orch/providers.json` but no new config, it copies the source to
 `providers.v5.backup.json`, translates model and `thinking` to the new settings
 shape, and atomically installs `config.json`. It ignores V5 role bindings and
 never reads the old file at runtime afterwards.
 
-Valid Worker slots are 1–5; valid attempts are 1–5; merge methods are `merge`,
-`squash`, or `rebase`. Invalid configuration blocks new mutations but does not
-alter already-running Workers.
+Valid execution slots are 1–5. Integration WIP must be at least execution
+capacity and at most 20. Candidate and Ready Reserve limits are at most 100;
+valid attempts are 1–5; merge methods are `merge`, `squash`, or `rebase`.
+Legacy `worker_slots` remains accepted as an execution-capacity alias when the
+new keys are absent; its integration limit defaults to at least six and twice
+execution capacity without rewriting the file. Invalid configuration blocks
+new mutations but does not alter already-running Workers.
