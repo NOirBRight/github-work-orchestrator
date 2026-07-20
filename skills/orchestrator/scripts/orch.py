@@ -1605,6 +1605,20 @@ def _coordinator_preflight(
             "COORDINATOR_WORKSPACE_MISMATCH",
             "Paseo MCP Actor and current Workspace disagree",
         )
+    live_relationship = identity.get("relationship")
+    context_relationship = current_workspace.get("relationship")
+    relationship_matches = live_relationship == context_relationship or (
+        live_relationship == "root" and context_relationship == "detached"
+    )
+    if not relationship_matches:
+        raise core.PolicyError(
+            "COORDINATOR_RELATIONSHIP_MISMATCH",
+            "Paseo relationship and current Workspace disagree",
+        )
+    if identity.get("archived") is not False or current_workspace.get("ephemeral"):
+        raise core.PolicyError(
+            "COORDINATOR_ARCHIVED", "archived/ephemeral Actor cannot coordinate"
+        )
     if identity.get("workspace_id") is not None and identity.get(
         "workspace_id"
     ) != actor.get("workspace_id"):

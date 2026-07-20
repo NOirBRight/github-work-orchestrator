@@ -1162,7 +1162,12 @@ def test_plan_mode_blocks_every_mutation_before_github_adapter(
         "_paseo_current",
         lambda: (
             {"agent_id": "root-a"},
-            {"workspace_id": "stable-dev", "cwd": str(tmp_path)},
+            {
+                "workspace_id": "stable-dev",
+                "cwd": str(tmp_path),
+                "relationship": "root",
+                "archived": False,
+            },
         ),
     )
     monkeypatch.setattr(cli, "_tool", lambda *_: "git")
@@ -1275,7 +1280,12 @@ def test_coordinator_context_selection_and_forwarding_use_production_preflight(
         "_paseo_current",
         lambda: (
             {"agent_id": "root-a"},
-            {"workspace_id": "stable-dev", "cwd": str(tmp_path)},
+            {
+                "workspace_id": "stable-dev",
+                "cwd": str(tmp_path),
+                "relationship": "root",
+                "archived": False,
+            },
         ),
     )
     monkeypatch.setattr(cli, "_tool", lambda *_: "git")
@@ -1296,6 +1306,23 @@ def test_coordinator_context_selection_and_forwarding_use_production_preflight(
     assert repo_config["integration_branch"] == "dev"
     assert entry["status"] == "ready"
 
+    monkeypatch.setattr(
+        cli,
+        "_paseo_current",
+        lambda: (
+            {"agent_id": "root-a"},
+            {
+                "workspace_id": "stable-dev",
+                "cwd": str(tmp_path),
+                "relationship": "subagent",
+                "archived": False,
+            },
+        ),
+    )
+    with pytest.raises(cli.core.PolicyError) as relationship_drift:
+        cli._coordinator_preflight(args, cli.core.default_config())
+    assert relationship_drift.value.code == "COORDINATOR_RELATIONSHIP_MISMATCH"
+
     feature = {
         **workspace,
         "id": "feature-17",
@@ -1310,7 +1337,12 @@ def test_coordinator_context_selection_and_forwarding_use_production_preflight(
         "_paseo_current",
         lambda: (
             {"agent_id": "root-a"},
-            {"workspace_id": "feature-17", "cwd": str(tmp_path)},
+            {
+                "workspace_id": "feature-17",
+                "cwd": str(tmp_path),
+                "relationship": "root",
+                "archived": False,
+            },
         ),
     )
     _, entry = cli._coordinator_preflight(args, cli.core.default_config())

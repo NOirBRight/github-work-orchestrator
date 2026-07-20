@@ -585,6 +585,21 @@ def test_resume_revalidates_then_wakes_the_same_worker_in_two_phases():
     with pytest.raises(core.PolicyError) as drifted_recovery:
         core.plan_lifecycle_transitions({**transition, "base_sha": "b" * 40})
     assert drifted_recovery.value.code == "RESUME_BASE_DRIFT"
+    failed = core.apply_observations(
+        transition,
+        [
+            {
+                "action_id": "resume-dispatch-issue-7-a1-g1",
+                "status": "failed",
+                "error": "wake readback unavailable",
+            }
+        ],
+    )
+    failed_dispatch = failed["issues"][0]["dispatch"]
+    assert failed_dispatch["status"] == "resuming"
+    assert failed_dispatch["parked"] is False
+    assert failed_dispatch["lifecycle_action_id"] == ("resume-dispatch-issue-7-a1-g1")
+    assert core.plan_lifecycle_transitions(failed)["actions"] == planned["actions"]
     running = core.apply_observations(
         transition,
         [

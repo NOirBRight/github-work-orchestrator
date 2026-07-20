@@ -247,17 +247,12 @@ def apply_observations(
                             }
                         )
                     transitioned.pop("last_error", None)
+                    transitioned["last_lifecycle_action_id"] = lifecycle_action_id
+                    transitioned.pop("lifecycle_action_id", None)
                 else:
-                    transitioned.update(
-                        {
-                            "status": "running" if lifecycle == "park" else "blocked",
-                            "parked": lifecycle == "resume",
-                            "last_error": observation.get("error")
-                            or f"{lifecycle} action failed",
-                        }
+                    transitioned["last_error"] = (
+                        observation.get("error") or f"{lifecycle} action failed"
                     )
-                transitioned["last_lifecycle_action_id"] = lifecycle_action_id
-                transitioned.pop("lifecycle_action_id", None)
                 issue["dispatch"] = transitioned
                 for agent in runtime_agents:
                     if readback_state and agent.get("id") == transitioned.get(

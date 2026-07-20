@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -346,3 +348,216 @@ def test_cli_park_resume_crash_recovery_crosses_the_production_command_seam(
     final_dispatch = resumed["summary"]["record_updates"][0]["dispatch"]
     assert final_dispatch["status"] == "running"
     assert final_dispatch["worker_agent_id"] == "worker-7"
+
+
+def test_non_snapshot_production_path_persists_park_and_resume(tmp_path):
+    core = _core()
+    real_git = shutil.which("git")
+    assert real_git
+
+    def git(cwd, *args):
+        result = subprocess.run(
+            [real_git, *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    stable = tmp_path / "stable"
+    stable.mkdir()
+    git(stable, "init", "-b", "dev")
+    git(stable, "config", "user.email", "test@example.invalid")
+    git(stable, "config", "user.name", "Test")
+    (stable / "tracked.txt").write_text("base\n", encoding="utf-8")
+    git(stable, "add", "tracked.txt")
+    git(stable, "commit", "-m", "base")
+    base_sha = git(stable, "rev-parse", "HEAD")
+
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    git(worker, "init", "-b", "work/issue-7")
+    git(worker, "config", "user.email", "test@example.invalid")
+    git(worker, "config", "user.name", "Test")
+    (worker / "tracked.txt").write_text("worker\n", encoding="utf-8")
+    git(worker, "add", "tracked.txt")
+    git(worker, "commit", "-m", "worker")
+
+    contract = _contract(core, 7, "standard")
+    dispatch_id = "dispatch-issue-7-a1"
+    record = {
+        "contract": contract,
+        "dispatch": {
+            "id": dispatch_id,
+            "attempt": 1,
+            "status": "running",
+            "parked": False,
+            "worker_agent_id": "worker-7",
+            "workspace_id": "workspace-7",
+            "branch": "work/issue-7",
+            "base_sha": base_sha,
+            "contract_sha256": contract["sha256"],
+        },
+    }
+    state_path = tmp_path / "github-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "base_sha": base_sha,
+                "label": "active",
+                "record_body": core.render_issue_record(record),
+                "operations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    worker_state = tmp_path / "worker-state.txt"
+    worker_state.write_text("running", encoding="utf-8")
+    config = {
+        **core.default_config(),
+        "repositories": {
+            "owner/repo": {
+                "integration_branch": "dev",
+                "workspace_id": "stable-dev",
+                "merge_method": "squash",
+            }
+        },
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    workspace = {
+        "id": "stable-dev",
+        "repository": "owner/repo",
+        "branch": "dev",
+        "relationship": "root",
+        "dirty": False,
+        "pr_head": False,
+        "ephemeral": False,
+        "worker": False,
+        "agent_cwd_matches": True,
+    }
+    context_path = tmp_path / "coordinator-context.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "actor": {
+                    "id": "root-a",
+                    "cwd": str(stable.resolve()),
+                    "workspace_id": "stable-dev",
+                    "provider": "codex",
+                    "settings": {"model": "gpt-5.6", "modeId": "full-access"},
+                },
+                "current_workspace": workspace,
+                "candidate_workspaces": [workspace],
+                "mode": {
+                    "collaboration_mode": "Default",
+                    "write_capable": True,
+                    "colorTier": "dangerous",
+                },
+                "features": {"plan_mode": False},
+                "remote_branches": ["dev"],
+                "active_root_agents": [{"id": "root-a", "workspace_id": "stable-dev"}],
+                "request": "park and resume",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fixture = ROOT / "tests" / "fixtures" / "fake_orchestrator_runtime.py"
+
+    for command, tool in (
+        ("api", "gh"),
+        ("issue", "gh"),
+        ("inspect", "paseo"),
+        ("ls", "paseo"),
+    ):
+        (stable / command).write_text(
+            "import runpy, sys\n"
+            f"sys.argv = [{str(fixture)!r}, {tool!r}, {command!r}, *sys.argv[1:]]\n"
+            f"runpy.run_path({str(fixture)!r}, run_name='__main__')\n",
+            encoding="utf-8",
+        )
+
+    def shim(name):
+        if os.name == "nt":
+            path = tmp_path / f"{name}.cmd"
+            path.write_text(
+                f'@echo off\r\n"{sys.executable}" "{fixture}" {name} %*\r\n',
+                encoding="utf-8",
+            )
+        else:
+            path = tmp_path / name
+            path.write_text(
+                f'#!/bin/sh\nexec "{sys.executable}" "{fixture}" {name} "$@"\n',
+                encoding="utf-8",
+            )
+            path.chmod(0o755)
+        return path
+
+    env = {
+        **os.environ,
+        "PASEO_AGENT_ID": "root-a",
+        "ORCH_GH_PATH": sys.executable,
+        "ORCH_PASEO_PATH": sys.executable,
+        "ORCH_GIT_PATH": str(shim("git")),
+        "ORCH_E2E_STATE": str(state_path),
+        "ORCH_E2E_ROOT_CWD": str(stable.resolve()),
+        "ORCH_E2E_WORKER_CWD": str(worker.resolve()),
+        "ORCH_E2E_WORKER_STATE": str(worker_state),
+        "ORCH_E2E_BASE_SHA": base_sha,
+        "ORCH_E2E_REAL_GIT": real_git,
+    }
+    script = ROOT / "skills" / "orchestrator" / "scripts" / "orch.py"
+
+    def reconcile(flag):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "reconcile",
+                "--repo",
+                "owner/repo",
+                "--coordinator-context",
+                str(context_path),
+                "--config",
+                str(config_path),
+                flag,
+                dispatch_id,
+            ],
+            cwd=stable,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return json.loads(result.stdout)
+
+    parking = reconcile("--park")
+    assert parking["actions"][0]["type"] == "stop_worker"
+    worker_state.write_text("idle", encoding="utf-8")
+    parked = reconcile("--park")
+    assert parked["actions"] == []
+
+    resuming = reconcile("--resume")
+    assert resuming["actions"][0]["type"] == "resume_worker"
+    worker_state.write_text("running", encoding="utf-8")
+    resumed = reconcile("--resume")
+    assert resumed["actions"] == []
+
+    final_state = json.loads(state_path.read_text(encoding="utf-8"))
+    final_record = core.parse_issue_record(final_state["record_body"])
+    assert final_record["dispatch"]["status"] == "running"
+    assert final_record["dispatch"]["worker_agent_id"] == "worker-7"
+    assert final_state["label"] == "active"
+    assert final_state["operations"] == [
+        "update_record",
+        "update_record",
+        "set_state:blocked",
+        "update_record",
+        "set_state:active",
+        "update_record",
+    ]
