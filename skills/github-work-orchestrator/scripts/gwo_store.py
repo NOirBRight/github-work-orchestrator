@@ -36,11 +36,19 @@ DONE_STATUSES = ("done", "blocked", "stopped")
 TASK_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "pending": ("ready",),
     "ready": ("dispatched", "pending"),
-    "dispatched": ("done", "failed", "blocked", "ready"),
+    "dispatched": (),
     "blocked": ("ready", "failed"),
     "failed": ("ready", "pending"),
     "done": (),
 }
+
+# Terminal task statuses reachable from ``dispatched`` through ``mark_done``.
+# ``update_task`` may not move a dispatched task to any of these because that
+# would bypass the dispatched-agent check in ``mark_done`` and could leave a
+# terminal task with an active dispatch. Only ``mark_done`` (which updates the
+# linked dispatch in the same transaction) may move ``dispatched`` to a
+# terminal status.
+DISPATCHED_TERMINAL_STATUSES = ("done", "failed", "blocked")
 
 DISPATCH_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "active": ("done", "blocked", "stopped"),
@@ -345,35 +353,52 @@ class Store:
         return [str(row[0]) for row in rows if not str(row[0]).startswith("sqlite_")]
 
     def run_migrations(self) -> None:
+        caller = self._caller()
         self.db.execute("BEGIN IMMEDIATE")
-        self.db.execute(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY)"
-        )
-        applied = {
-            str(row[0])
-            for row in self.db.execute(
-                "SELECT name FROM schema_migrations"
-            ).fetchall()
-        }
-        self.db.execute("COMMIT")
+        try:
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY)"
+            )
+            applied = {
+                str(row[0])
+                for row in self.db.execute(
+                    "SELECT name FROM schema_migrations"
+                ).fetchall()
+            }
+            self.db.execute("COMMIT")
+        except BaseException:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
         for name, ddl in MIGRATIONS:
             if name in applied:
                 continue
-            # executescript issues an implicit COMMIT; run it outside our
-            # explicit transaction, then record the migration in a new one.
-            self.db.executescript(ddl)
-            self.db.execute("BEGIN IMMEDIATE")
+            self._apply_migration(name, ddl, caller)
+            applied.add(name)
+
+    def _apply_migration(self, name: str, ddl: str, caller: str) -> None:
+        # Execute each migration and its schema_migrations record in one
+        # transaction so a failure in any DDL statement rolls back the whole
+        # migration (no DDL left without a record). executescript issues an
+        # implicit COMMIT, so we split the DDL into statements and execute
+        # them one by one inside an explicit BEGIN IMMEDIATE transaction.
+        statements = [stmt.strip() for stmt in ddl.split(";") if stmt.strip()]
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in statements:
+                self.db.execute(statement)
+            self.db.execute(
+                "INSERT INTO schema_migrations (name) VALUES (?)", (name,)
+            )
+            self.db.execute("COMMIT")
+        except BaseException:
             try:
-                self.db.execute(
-                    "INSERT INTO schema_migrations (name) VALUES (?)", (name,)
-                )
-                self.db.execute("COMMIT")
-            except BaseException:
-                try:
-                    self.db.execute("ROLLBACK")
-                except sqlite3.OperationalError:
-                    pass
-                raise
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
 
     def _identity(self, supplied: Any, field: str) -> str:
         self._reject_supplied_identity(supplied, field)
@@ -689,10 +714,18 @@ class Store:
             if task_row is None:
                 raise TransitionError(f"unknown task {task_id}")
             current = str(task_row["status"])
-            allowed = TASK_TRANSITIONS.get(current, ())
-            if task_status not in allowed:
+            # Only a dispatched task may be moved to a terminal status through
+            # mark_done. update_task cannot reach these because
+            # TASK_TRANSITIONS["dispatched"] is empty; mark_done owns the
+            # dispatched -> terminal transition and updates the linked dispatch
+            # in this same transaction.
+            if current != "dispatched":
                 raise TransitionError(
-                    f"task {task_id} cannot transition {current} -> {task_status}"
+                    f"task {task_id} is {current}, not dispatched"
+                )
+            if task_status not in DISPATCHED_TERMINAL_STATUSES:
+                raise TransitionError(
+                    f"mark_done cannot transition dispatched -> {task_status}"
                 )
             self.db.execute(
                 "UPDATE dispatches SET status = ?, terminal_evidence_json = ? "

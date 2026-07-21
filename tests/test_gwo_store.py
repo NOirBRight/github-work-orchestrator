@@ -923,5 +923,227 @@ class WindowsPathTests(unittest.TestCase):
         )
 
 
+class UpdateTaskDispatchBypassTests(unittest.TestCase):
+    """Finding 1: update_task must not permit dispatched -> done|failed|blocked
+    transitions while an active dispatch exists, because that bypasses the
+    dispatched-agent check in done and can leave a terminal task with an
+    active dispatch. Only the done path (or an explicitly authorized
+    coordinator override that updates the linked dispatch in the same
+    transaction) may move a dispatched task to a terminal status.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = StoreFixture(self, repo="owner/repo")
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_update_task_rejects_dispatched_to_done_with_active_dispatch(self) -> None:
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-001",
+            worktree="/tmp/wt-42",
+            branch="work/issue-42",
+        )
+        with self.assertRaises(self.store_mod.TransitionError):
+            self.store.update_task(task_id=task["task_id"], status="done")
+        tasks = self.store.list_tasks()
+        self.assertEqual("dispatched", tasks[0]["status"])
+        active = int(self.store.db.execute(
+            "SELECT COUNT(*) FROM dispatches WHERE task_id = ? AND status = 'active'",
+            (task["task_id"],),
+        ).fetchone()[0])
+        self.assertEqual(1, active, "active dispatch must remain after rejection")
+
+    def test_update_task_rejects_dispatched_to_failed_with_active_dispatch(self) -> None:
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-001",
+            worktree="/tmp/wt-42",
+            branch="work/issue-42",
+        )
+        with self.assertRaises(self.store_mod.TransitionError):
+            self.store.update_task(task_id=task["task_id"], status="failed")
+        self.assertEqual("dispatched", self.store.list_tasks()[0]["status"])
+
+    def test_update_task_rejects_dispatched_to_blocked_with_active_dispatch(self) -> None:
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-001",
+            worktree="/tmp/wt-42",
+            branch="work/issue-42",
+        )
+        with self.assertRaises(self.store_mod.TransitionError):
+            self.store.update_task(task_id=task["task_id"], status="blocked")
+        self.assertEqual("dispatched", self.store.list_tasks()[0]["status"])
+
+    def test_update_task_rejects_dispatched_to_ready_with_active_dispatch(self) -> None:
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-001",
+            worktree="/tmp/wt-42",
+            branch="work/issue-42",
+        )
+        with self.assertRaises(self.store_mod.TransitionError):
+            self.store.update_task(task_id=task["task_id"], status="ready")
+        self.assertEqual("dispatched", self.store.list_tasks()[0]["status"])
+
+    def test_update_task_allows_dispatched_to_ready_after_dispatch_closed(self) -> None:
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        dispatch = self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-001",
+            worktree="/tmp/wt-42",
+            branch="work/issue-42",
+        )
+        os.environ["GWO_AGENT_ID"] = "worker-001"
+        self.store.mark_done(
+            task_id=task["task_id"],
+            dispatch_id=dispatch["dispatch_id"],
+            status="blocked",
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        updated = self.store.update_task(task_id=task["task_id"], status="ready")
+        self.assertEqual("ready", updated["status"])
+
+
+class MigrationAtomicityTests(unittest.TestCase):
+    """Finding 2: each migration and its schema_migrations record must commit in
+    one transaction. A multi-statement migration whose later statement fails must
+    roll back the whole migration so no DDL is left without a record.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = StoreFixture(self, repo="owner/repo")
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_failing_second_statement_rolls_back_whole_migration(self) -> None:
+        store_mod = self.store_mod
+        original_migrations = store_mod.MIGRATIONS
+        broken_ddl = (
+            "CREATE TABLE IF NOT EXISTS migration_probe (id INTEGER PRIMARY KEY); "
+            "CREATE TABLE migration_probe_dup (id INTEGER PRIMARY KEY); "
+            "CREATE TABLE migration_probe_dup (id INTEGER PRIMARY KEY);"
+        )
+        store_mod.MIGRATIONS = original_migrations + (
+            ("9999-broken", broken_ddl),
+        )
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.run_migrations()
+            records = self.store.db.execute(
+                "SELECT name FROM schema_migrations WHERE name = '9999-broken'"
+            ).fetchall()
+            self.assertEqual(0, len(records), "broken migration must not be recorded")
+            tables = set(self.store.table_names())
+            self.assertNotIn(
+                "migration_probe",
+                tables,
+                "first DDL statement must roll back with the failing migration",
+            )
+        finally:
+            store_mod.MIGRATIONS = original_migrations
+
+    def test_reopen_after_failed_migration_applies_cleanly(self) -> None:
+        store_mod = self.store_mod
+        original_migrations = store_mod.MIGRATIONS
+        broken_ddl = (
+            "CREATE TABLE IF NOT EXISTS migration_probe2 (id INTEGER PRIMARY KEY); "
+            "CREATE TABLE migration_probe2_dup (id INTEGER PRIMARY KEY); "
+            "CREATE TABLE migration_probe2_dup (id INTEGER PRIMARY KEY);"
+        )
+        good_ddl = "CREATE TABLE IF NOT EXISTS migration_probe3 (id INTEGER PRIMARY KEY);"
+        store_mod.MIGRATIONS = original_migrations + (
+            ("9998-broken", broken_ddl),
+            ("9997-good", good_ddl),
+        )
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.run_migrations()
+            self.store.close()
+            store_mod.MIGRATIONS = original_migrations + (
+                ("9997-good", good_ddl),
+            )
+            reopened = store_mod.Store.connect(
+                self.fixture.home, self.fixture.repo, caller_agent_id="coordinator-001"
+            )
+            try:
+                records = {
+                    str(row[0])
+                    for row in reopened.db.execute(
+                        "SELECT name FROM schema_migrations"
+                    ).fetchall()
+                }
+                self.assertNotIn("9998-broken", records)
+                self.assertIn("9997-good", records)
+                self.assertIn("migration_probe3", set(reopened.table_names()))
+                self.assertNotIn(
+                    "migration_probe2", set(reopened.table_names()),
+                    "rolled-back DDL must not survive reopen",
+                )
+            finally:
+                reopened.close()
+        finally:
+            store_mod.MIGRATIONS = original_migrations
+            try:
+                self.store_mod = load_store()
+            except Exception:
+                pass
+
+
+class MigrationIdentityTests(unittest.TestCase):
+    """Finding 3: run_migrations is a public store write and must re-resolve
+    GWO_AGENT_ID at migration write time. It must fail when GWO_AGENT_ID is
+    removed after connect, and it is part of the every-write identity matrix.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = StoreFixture(self, repo="owner/repo")
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_run_migrations_fails_after_gwo_agent_id_removed(self) -> None:
+        saved = os.environ.pop("GWO_AGENT_ID")
+        try:
+            with self.assertRaises(self.store_mod.IdentityError):
+                self.store.run_migrations()
+        finally:
+            os.environ["GWO_AGENT_ID"] = saved
+
+    def test_connect_run_migrations_fails_without_gwo_agent_id(self) -> None:
+        store_mod = self.store_mod
+        original_migrations = store_mod.MIGRATIONS
+        store_mod.MIGRATIONS = original_migrations + (
+            ("9996-probe", "CREATE TABLE IF NOT EXISTS migration_probe4 (id INTEGER PRIMARY KEY);"),
+        )
+        try:
+            saved = os.environ.pop("GWO_AGENT_ID")
+            try:
+                with self.assertRaises(store_mod.IdentityError):
+                    store_mod.Store.connect(self.fixture.home, self.fixture.repo)
+            finally:
+                os.environ["GWO_AGENT_ID"] = saved
+        finally:
+            store_mod.MIGRATIONS = original_migrations
+
+
 if __name__ == "__main__":
     unittest.main()
