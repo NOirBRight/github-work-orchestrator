@@ -2668,5 +2668,283 @@ class StoreConstructionErrorTests(unittest.TestCase):
         self.assertTrue(result.stderr.strip().startswith("error:"))
 
 
+# ---------------------------------------------------------------------------
+# Fifth commit-bound heavy review regression tests. Each test reproduces one
+# finding from the review before the fix lands.
+# ---------------------------------------------------------------------------
+
+
+class WorkerDoneDispatchBindingTests(unittest.TestCase):
+    """Finding 1: worker_done must bind payload.dispatch_id to the sender.
+    The active dispatch's worker_agent_id must equal live GWO_AGENT_ID.
+    worker-002 cannot author worker_done for worker-001's dispatch.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.mailbox_mod = self.fixture.mailbox_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_worker_done_rejects_wrong_agent_for_dispatch(self) -> None:
+        # worker-001 has the active dispatch; worker-002 tries worker_done.
+        dispatch_id = self.fixture.dispatch["dispatch_id"]
+        with self.fixture.as_agent("worker-002"):
+            with self.assertRaises(self.mailbox_mod.MailboxError) as ctx:
+                self.store.send(
+                    to_agent="coordinator-001",
+                    event_type="worker_done",
+                    payload={"dispatch_id": dispatch_id},
+                    signal_id="sig-wd-bind-aaaaaaaa",
+                )
+        self.assertIn("dispatch", str(ctx.exception).lower())
+
+    def test_worker_done_accepts_correct_agent_for_dispatch(self) -> None:
+        dispatch_id = self.fixture.dispatch["dispatch_id"]
+        with self.fixture.as_agent("worker-001"):
+            msg = self.store.send(
+                to_agent="coordinator-001",
+                event_type="worker_done",
+                payload={"dispatch_id": dispatch_id},
+                signal_id="sig-wd-bind2-aaaaaaa",
+            )
+        self.assertEqual("worker_done", msg["type"])
+        self.assertEqual("worker-001", msg["from_agent"])
+
+    def test_worker_done_without_dispatch_id_rejected(self) -> None:
+        with self.fixture.as_agent("worker-001"):
+            with self.assertRaises(self.mailbox_mod.MailboxError) as ctx:
+                self.store.send(
+                    to_agent="coordinator-001",
+                    event_type="worker_done",
+                    payload={},
+                    signal_id="sig-wd-nodispatch-aa",
+                )
+        self.assertIn("dispatch_id", str(ctx.exception).lower())
+
+
+class CliAgentStatusFileSnapshotTests(unittest.TestCase):
+    """Finding 2: agent status CLI must have a usable runtime-readback input
+    usable by an independent CLI invocation (a file under GWO_HOME or CLI
+    option), not only in-process set_readback_snapshot.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self._saved_env = {
+            "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
+            "PYTHONPATH": os.environ.get("PYTHONPATH"),
+        }
+        os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+
+    def tearDown(self) -> None:
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(GWO_PY), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _setup_and_register(self) -> str:
+        self.run_cli("coordinator", "claim")
+        reg = self.run_cli(
+            "agent", "register",
+            "--agent-id", "worker-cli-001",
+            "--adapter", "paseo",
+            "--runtime-ref", "ref-cli-001",
+            "--role", "worker",
+            "--group-label", "g-42",
+        )
+        self.assertEqual(0, reg.returncode, reg.stdout + reg.stderr)
+        return "worker-cli-001"
+
+    def test_cli_agent_status_running_with_file_snapshot(self) -> None:
+        agent_id = self._setup_and_register()
+        # Write a readback snapshot file under GWO_HOME.
+        snapshot = {"agents": [{"agent_id": agent_id, "state": "running"}]}
+        (self.home / "readback.json").write_text(json.dumps(snapshot))
+        result = self.run_cli("agent", "status", agent_id, "--readback-snapshot", str(self.home / "readback.json"))
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual("running", payload["state"])
+
+    def test_cli_agent_status_stalled_when_not_in_snapshot(self) -> None:
+        agent_id = self._setup_and_register()
+        snapshot = {"agents": []}
+        (self.home / "readback.json").write_text(json.dumps(snapshot))
+        result = self.run_cli("agent", "status", agent_id, "--readback-snapshot", str(self.home / "readback.json"))
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual("stalled", payload["state"])
+
+    def test_cli_agent_status_exited_in_snapshot(self) -> None:
+        agent_id = self._setup_and_register()
+        snapshot = {"agents": [{"agent_id": agent_id, "state": "exited",
+                                "terminal_evidence": {"reason": "crashed"}}]}
+        (self.home / "readback.json").write_text(json.dumps(snapshot))
+        result = self.run_cli("agent", "status", agent_id, "--readback-snapshot", str(self.home / "readback.json"))
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual("exited", payload["state"])
+        self.assertNotEqual({}, payload["terminal_evidence"])
+
+    def test_cli_agent_status_no_snapshot_is_stalled(self) -> None:
+        agent_id = self._setup_and_register()
+        # No readback snapshot file: without a runtime source, stalled.
+        result = self.run_cli("agent", "status", agent_id)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual("stalled", payload["state"])
+
+
+class ExistingAgentFieldComparisonTests(unittest.TestCase):
+    """Finding 3: existing agent vs adapter evidence must compare all
+    persisted/runtime identity fields (role, adapter, runtime_ref, session_id,
+    pid, group_label), not just role/adapter.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_existing_agent_conflicting_runtime_ref_surfaces_ambiguity(self) -> None:
+        self.store.register_agent(
+            agent_id="agent-existing",
+            adapter="paseo",
+            runtime_ref="ref-original",
+            role="worker",
+            group_label="g-42",
+        )
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-existing", "status": "running",
+                 "role": "worker", "adapter": "paseo",
+                 "runtime_ref": "ref-conflicting"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "existing agent with conflicting runtime_ref must surface ambiguity",
+        )
+        # The existing row must be unchanged.
+        row = self.store.db.execute(
+            "SELECT runtime_ref FROM agents WHERE agent_id = ?", ("agent-existing",)
+        ).fetchone()
+        self.assertEqual("ref-original", str(row["runtime_ref"]))
+
+    def test_existing_agent_conflicting_session_id_surfaces_ambiguity(self) -> None:
+        self.store.register_agent(
+            agent_id="agent-existing2",
+            adapter="paseo",
+            runtime_ref="ref-2",
+            role="worker",
+            group_label="g-42",
+            session_id="sess-original",
+        )
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-existing2", "status": "running",
+                 "role": "worker", "adapter": "paseo",
+                 "session_id": "sess-conflicting"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(len(result["ambiguities"]), 0)
+
+    def test_existing_agent_matching_fields_no_ambiguity(self) -> None:
+        self.store.register_agent(
+            agent_id="agent-matching",
+            adapter="paseo",
+            runtime_ref="ref-match",
+            role="worker",
+            group_label="g-42",
+            session_id="sess-match",
+        )
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-matching", "status": "running",
+                 "role": "worker", "adapter": "paseo",
+                 "runtime_ref": "ref-match", "session_id": "sess-match",
+                 "group_label": "g-42"},
+            ],
+            git_worktrees=[],
+        )
+        ambiguity_text = " ".join(result["ambiguities"])
+        self.assertNotIn("agent-matching", ambiguity_text)
+
+
+class DuplicateIssueEvidenceTests(unittest.TestCase):
+    """Finding 4: doctor_rebuild must detect duplicate GitHub issue rows and
+    tasks must have a repo+issue uniqueness guard.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_duplicate_identical_issues_inserts_one(self) -> None:
+        issue = {"number": 100, "risk": "standard", "group": "g-100",
+                 "hotset": [], "deps": []}
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [issue, dict(issue)], "agents": [], "worktrees": []},
+            adapter_listing=[],
+            git_worktrees=[],
+        )
+        tasks = [t for t in self.store.list_tasks() if t["issue"] == 100]
+        self.assertEqual(1, len(tasks), "identical duplicate issues must insert one task")
+
+    def test_duplicate_conflicting_issues_surfaces_ambiguity(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={
+                "issues": [
+                    {"number": 101, "risk": "standard", "group": "g-101", "hotset": [], "deps": []},
+                    {"number": 101, "risk": "fast", "group": "g-101", "hotset": [], "deps": []},
+                ],
+                "agents": [],
+                "worktrees": [],
+            },
+            adapter_listing=[],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "conflicting duplicate issues must surface ambiguity",
+        )
+        tasks = [t for t in self.store.list_tasks() if t["issue"] == 101]
+        self.assertEqual(0, len(tasks), "conflicting duplicate must not insert a task")
+
+    def test_repo_issue_uniqueness_guard_in_store(self) -> None:
+        # Directly inserting two tasks with the same repo+issue must fail.
+        self.store.create_task(issue=200, group_label="g-200", risk="standard")
+        with self.assertRaises(self.fixture.store_mod.StoreError):
+            self.store.create_task(issue=200, group_label="g-200", risk="standard")
+
+
 if __name__ == "__main__":
     unittest.main()

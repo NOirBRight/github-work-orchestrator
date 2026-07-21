@@ -300,6 +300,24 @@ def send(
             raise EntitlementError(
                 f"role {role} is not entitled to send {event_type}"
             )
+        # worker_done binding: the payload must carry dispatch_id, and the
+        # active dispatch's agent_id must equal the live caller. This prevents
+        # worker-002 from authoring worker_done for worker-001's dispatch.
+        if event_type == "worker_done":
+            dispatch_id = body.get("dispatch_id")
+            if not dispatch_id:
+                raise MailboxError("worker_done requires payload.dispatch_id")
+            dispatch_row = db.execute(
+                "SELECT agent_id, status FROM dispatches WHERE dispatch_id = ?",
+                (str(dispatch_id),),
+            ).fetchone()
+            if dispatch_row is None:
+                raise MailboxError(f"worker_done references unknown dispatch {dispatch_id}")
+            if str(dispatch_row["agent_id"]) != caller:
+                raise EntitlementError(
+                    f"worker_done author {caller} does not match dispatch agent "
+                    f"{dispatch_row['agent_id']} for dispatch {dispatch_id}"
+                )
         # Per-sender monotonic sequence under the write lock.
         seq_row = db.execute(
             "SELECT MAX(seq) AS max_seq FROM messages WHERE from_agent = ?",
@@ -551,10 +569,14 @@ def ask(
     )
 
 
-def agent_status(store: Any, agent_id: str) -> dict[str, Any]:
+def agent_status(
+    store: Any, agent_id: str, *, readback_snapshot_path: str | None = None
+) -> dict[str, Any]:
     """Return the runtime status of one agent (delegates to gwo_status)."""
     import gwo_status
-    return gwo_status.agent_status(store, agent_id)
+    return gwo_status.agent_status(
+        store, agent_id, readback_snapshot_path=readback_snapshot_path
+    )
 
 
 def config_check(store: Any, *, gwo_home: str | None = None) -> dict[str, Any]:

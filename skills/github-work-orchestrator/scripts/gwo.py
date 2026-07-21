@@ -254,7 +254,10 @@ def cmd_agent(args: argparse.Namespace) -> int:
     try:
         store = _store(args)
         if args.action == "status":
-            status = store.agent_status(args.agent_id)
+            snapshot_path = getattr(args, "readback_snapshot", None)
+            status = store.agent_status(
+                args.agent_id, readback_snapshot_path=snapshot_path
+            )
             _emit(status)
             return 0
         if args.action == "register":
@@ -412,6 +415,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent_status = agent_sub.add_parser("status")
     agent_status.add_argument("agent_id")
+    agent_status.add_argument(
+        "--readback-snapshot", default=None, dest="readback_snapshot",
+        help="JSON file with runtime readback snapshot",
+    )
     agent_status.set_defaults(func=cmd_agent)
 
     agent_register = agent_sub.add_parser("register")

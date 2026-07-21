@@ -29,7 +29,9 @@ class StatusError(RuntimeError):
     """Base class for gwo_status errors."""
 
 
-EXPECTED_MIGRATIONS = frozenset({"0001-initial", "0002-messages-in-reply-to"})
+EXPECTED_MIGRATIONS = frozenset({
+    "0001-initial", "0002-messages-in-reply-to", "0003-tasks-repo-issue-unique",
+})
 
 # Runtime readback source registry. Phase 1 uses an injected/read-only Paseo
 # snapshot (set via set_readback_snapshot) so agent_status can observe actual
@@ -51,7 +53,40 @@ def set_readback_snapshot(store: Any, snapshot: dict[str, Any]) -> None:
 
 
 def _get_readback_snapshot(store: Any) -> dict[str, Any] | None:
-    return _READBACK_SNAPSHOTS.get(id(store.db))
+    in_memory = _READBACK_SNAPSHOTS.get(id(store.db))
+    if in_memory is not None:
+        return in_memory
+    # File-based readback: check GWO_HOME/readback.json for a cross-process
+    # snapshot usable by independent CLI invocations.
+    home = getattr(store, "home", None)
+    if home is not None:
+        snapshot_path = os.path.join(os.fspath(home), "readback.json")
+        if os.path.isfile(snapshot_path):
+            try:
+                with open(snapshot_path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict):
+                    return data
+            except (json.JSONDecodeError, OSError):
+                pass
+    return None
+
+
+def load_readback_snapshot_file(path: str) -> dict[str, Any]:
+    """Load a readback snapshot from a JSON file path.
+
+    Raises StatusError if the file is malformed or not a JSON object.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError as error:
+        raise StatusError(f"readback snapshot is malformed: {error}")
+    except OSError as error:
+        raise StatusError(f"readback snapshot read failed: {error}")
+    if not isinstance(data, dict):
+        raise StatusError("readback snapshot must be a JSON object")
+    return data
 
 
 def preflight_config(
@@ -249,16 +284,23 @@ def readback_agent(store: Any, agent_id: str) -> dict[str, Any]:
     }
 
 
-def agent_status(store: Any, agent_id: str) -> dict[str, Any]:
+def agent_status(
+    store: Any,
+    agent_id: str,
+    *,
+    readback_snapshot_path: str | None = None,
+) -> dict[str, Any]:
     """Return the runtime status of one agent: running/stalled/exited + evidence.
 
-    Delegates to ``readback_agent`` (monkeypatchable for tests and future
-    adapter phases) so the state and terminal evidence come from the adapter
-    readback, not a static table guess. This lets a real adapter produce
-    ``stalled`` from a frozen Event Journal and carry non-empty terminal
-    evidence on ``exited``.
+    Delegates to ``readback_agent`` so the state and terminal evidence come
+    from the adapter readback, not a static table guess. An optional
+    ``readback_snapshot_path`` loads a JSON file snapshot usable by independent
+    CLI invocations.
     """
     _validate_agent_id(agent_id, "agent_id")
+    if readback_snapshot_path is not None:
+        snapshot = load_readback_snapshot_file(readback_snapshot_path)
+        set_readback_snapshot(store, snapshot)
     readback = readback_agent(store, agent_id)
     state = readback.get("state", "exited")
     if state not in ("running", "stalled", "exited"):
@@ -363,7 +405,9 @@ def doctor_rebuild(
     tasks_to_insert: list[dict[str, Any]] = []
     agents_to_insert: list[dict[str, Any]] = []
 
-    # Prevalidate issues/tasks.
+    # Prevalidate issues/tasks. Detect duplicate issue rows first.
+    seen_issues: dict[int, dict[str, Any]] = {}
+    conflicted_issues: set[int] = set()
     for issue in github_snapshot.get("issues", []):
         number = issue.get("number")
         risk = issue.get("risk")
@@ -373,6 +417,39 @@ def doctor_rebuild(
                 f"issue {number} missing required fields (risk/group)"
             )
             continue
+        if number in seen_issues:
+            prior = seen_issues[number]
+            conflicts = []
+            for field in ("risk", "group"):
+                if prior.get(field) != issue.get(field):
+                    conflicts.append(
+                        f"{field}: {prior.get(field)} vs {issue.get(field)}"
+                    )
+            if prior.get("hotset", []) != issue.get("hotset", []):
+                conflicts.append(
+                    f"hotset: {prior.get('hotset', [])} vs {issue.get('hotset', [])}"
+                )
+            if prior.get("deps", []) != issue.get("deps", []):
+                conflicts.append(
+                    f"deps: {prior.get('deps', [])} vs {issue.get('deps', [])}"
+                )
+            if conflicts:
+                ambiguities.append(
+                    f"issue {number} has conflicting duplicate evidence: "
+                    + ", ".join(conflicts)
+                )
+                conflicted_issues.add(number)
+            # Identical duplicates are not an ambiguity but still must not
+            # create a duplicate task (handled by the uniqueness guard and
+            # deduplication below).
+            continue
+        seen_issues[number] = issue
+
+    for number, issue in seen_issues.items():
+        if number in conflicted_issues:
+            continue
+        risk = issue.get("risk")
+        group = issue.get("group")
         # Check existing task evidence field-by-field.
         existing = db.execute(
             "SELECT task_id, group_label, risk, hotset_json, deps_json "
@@ -463,21 +540,35 @@ def doctor_rebuild(
         if role not in ROLE_VALUES:
             ambiguities.append(f"agent {aid} has invalid role {role}")
             continue
-        # Check existing store row for conflicts.
+        # Check existing store row for conflicts across all persisted/runtime
+        # identity fields, not just role/adapter.
         existing = db.execute(
-            "SELECT agent_id, adapter, role FROM agents WHERE agent_id = ?",
+            "SELECT agent_id, adapter, role, runtime_ref, session_id, "
+            "pid, group_label FROM agents WHERE agent_id = ?",
             (aid,),
         ).fetchone()
         if existing is not None:
             existing_conflicts = []
-            if str(existing["role"]) != role:
-                existing_conflicts.append(
-                    f"role: store={existing['role']} vs adapter={role}"
-                )
-            if str(existing["adapter"]) != adapter_name:
-                existing_conflicts.append(
-                    f"adapter: store={existing['adapter']} vs adapter={adapter_name}"
-                )
+            for field in ("role", "adapter", "runtime_ref", "session_id",
+                          "group_label"):
+                store_val = existing[field] if field != "group_label" else existing["group_label"]
+                store_val_str = str(store_val) if store_val is not None else None
+                entry_val = entry.get(field)
+                entry_val_str = str(entry_val) if entry_val is not None else None
+                if store_val_str != entry_val_str:
+                    existing_conflicts.append(
+                        f"{field}: store={store_val_str} vs adapter={entry_val_str}"
+                    )
+            # Compare pid as int.
+            store_pid = existing["pid"]
+            entry_pid = entry.get("pid")
+            if store_pid is not None or entry_pid is not None:
+                if int(store_pid) if store_pid is not None else None != (
+                    int(entry_pid) if entry_pid is not None else None
+                ):
+                    existing_conflicts.append(
+                        f"pid: store={store_pid} vs adapter={entry_pid}"
+                    )
             if existing_conflicts:
                 ambiguities.append(
                     f"agent {aid} existing row conflicts with adapter listing: "

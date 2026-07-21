@@ -204,6 +204,13 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
             ON messages (from_agent, seq);
         """,
     ),
+    (
+        "0003-tasks-repo-issue-unique",
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
+            ON tasks (repo, issue);
+        """,
+    ),
 )
 
 
@@ -565,6 +572,14 @@ class Store:
                 ),
             )
             self.db.execute("COMMIT")
+        except sqlite3.IntegrityError as error:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise TransitionError(
+                f"task for issue {issue} already exists in repo {self.repo}"
+            ) from error
         except BaseException:
             try:
                 self.db.execute("ROLLBACK")
@@ -900,10 +915,14 @@ class Store:
             wait=wait,
         )
 
-    def agent_status(self, agent_id: str) -> dict[str, Any]:
+    def agent_status(
+        self, agent_id: str, *, readback_snapshot_path: str | None = None
+    ) -> dict[str, Any]:
         """Return the runtime status of one agent."""
         import gwo_mailbox
-        return gwo_mailbox.agent_status(self, agent_id)
+        return gwo_mailbox.agent_status(
+            self, agent_id, readback_snapshot_path=readback_snapshot_path
+        )
 
     def config_check(self, *, gwo_home: str | None = None) -> dict[str, Any]:
         """Validate the GWO configuration."""
