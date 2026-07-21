@@ -3,13 +3,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -550,7 +549,7 @@ class AskReplyTests(unittest.TestCase):
 
     def test_ask_requires_in_reply_to_for_reply(self) -> None:
         with self.fixture.as_agent("worker-001"):
-            ask = self.store.send(
+            self.store.send(
                 to_agent="coordinator-001",
                 event_type="ask",
                 payload={"question": "scope?"},
@@ -2102,7 +2101,7 @@ class RebuildEvidenceComparisonTests(unittest.TestCase):
 
     def test_existing_task_conflicting_risk_surfaces_ambiguity(self) -> None:
         # Pre-create a task with risk=standard.
-        task = self.store.create_task(issue=77, group_label="g-77", risk="standard")
+        self.store.create_task(issue=77, group_label="g-77", risk="standard")
         # Rebuild with a GitHub snapshot that claims risk=fast for the same issue.
         result = self.store.doctor_rebuild(
             github_snapshot={
@@ -2919,7 +2918,7 @@ class DuplicateIssueEvidenceTests(unittest.TestCase):
     def test_duplicate_identical_issues_inserts_one(self) -> None:
         issue = {"number": 100, "risk": "standard", "group": "g-100",
                  "hotset": [], "deps": []}
-        result = self.store.doctor_rebuild(
+        self.store.doctor_rebuild(
             github_snapshot={"issues": [issue, dict(issue)], "agents": [], "worktrees": []},
             adapter_listing=[],
             git_worktrees=[],
@@ -3390,7 +3389,6 @@ class LegacyDuplicateRebuildDetectionTests(unittest.TestCase):
     def test_doctor_rebuild_detects_legacy_duplicate_tasks(self) -> None:
         store = self._make_legacy_duplicate_store()
         try:
-            status_mod = load_status()
             result = store.doctor_rebuild(
                 github_snapshot={"issues": [], "agents": [], "worktrees": []},
                 adapter_listing=[],

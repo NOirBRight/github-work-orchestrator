@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -76,6 +74,26 @@ class DoctorRebuildTests(unittest.TestCase):
         )
         self.assertTrue(result["rebuilt"])
         self.assertEqual([], result["ambiguities"])
+
+    def test_rebuild_fails_closed_when_issues_evidence_is_missing(self) -> None:
+        existing = self.store.create_task(
+            issue=99, group_label="g-99", risk="fast"
+        )
+        result = self.store.doctor_rebuild(
+            github_snapshot={"agents": [], "worktrees": []},
+            adapter_listing=[],
+            git_worktrees=[],
+        )
+        self.assertFalse(result["rebuilt"])
+        self.assertEqual(0, result["rebuilt_count"])
+        self.assertTrue(
+            any(
+                "issues" in ambiguity.lower()
+                and "missing" in ambiguity.lower()
+                for ambiguity in result["ambiguities"]
+            )
+        )
+        self.assertEqual([existing["task_id"]], [task["task_id"] for task in self.store.list_tasks()])
 
     def test_rebuild_reconstructs_task_from_issue(self) -> None:
         result = self.store.doctor_rebuild(

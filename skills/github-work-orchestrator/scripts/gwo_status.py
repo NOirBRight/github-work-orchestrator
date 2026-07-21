@@ -411,6 +411,23 @@ def doctor_rebuild(
     is additive and atomic/fail-closed.
     """
     ambiguities: list[str] = []
+    if "issues" not in github_snapshot:
+        return {
+            "rebuilt": False,
+            "rebuilt_count": 0,
+            "ambiguities": [
+                "GitHub snapshot missing required issues evidence"
+            ],
+        }
+    issues = github_snapshot["issues"]
+    if not isinstance(issues, list):
+        return {
+            "rebuilt": False,
+            "rebuilt_count": 0,
+            "ambiguities": [
+                "GitHub snapshot issues evidence must be a list"
+            ],
+        }
     caller = store._caller()
     db = store.db
     # Phase 1: prevalidate all evidence before any write. Collect the lists of
@@ -435,7 +452,7 @@ def doctor_rebuild(
     # Prevalidate issues/tasks. Detect duplicate issue rows first.
     seen_issues: dict[int, dict[str, Any]] = {}
     conflicted_issues: set[int] = set()
-    for issue in github_snapshot.get("issues", []):
+    for issue in issues:
         number = issue.get("number")
         risk = issue.get("risk")
         group = issue.get("group")
@@ -588,7 +605,6 @@ def doctor_rebuild(
         if aid in conflicted_agents or aid in invalid_agents:
             continue
         role = entry.get("role")
-        adapter_name = entry.get("adapter")
         if role not in ROLE_VALUES:
             ambiguities.append(f"agent {aid} has invalid role {role}")
             continue
