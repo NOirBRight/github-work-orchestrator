@@ -924,14 +924,15 @@ class CliConfigCheckTests(unittest.TestCase):
         self.assertIn("valid", payload)
         self.assertIn("errors", payload)
 
-    def test_config_check_fails_without_agent_id(self) -> None:
+    def test_config_check_does_not_require_agent_id(self) -> None:
+        # config check is a non-destructive preflight; it does not open a
+        # Store or require GWO_AGENT_ID.
         saved = os.environ.pop("GWO_AGENT_ID")
         try:
             result = self.fixture.run("config", "check")
         finally:
             os.environ["GWO_AGENT_ID"] = saved
-        self.assertNotEqual(0, result.returncode)
-        self.assertIn("GWO_AGENT_ID", result.stderr)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
 
 class CliDoctorRebuildTests(unittest.TestCase):
@@ -1882,24 +1883,40 @@ class ProductionReadbackTests(unittest.TestCase):
         self.assertNotEqual({}, status["terminal_evidence"])
         self.assertEqual(False, status["registered"])
 
-    def test_production_readback_stalled_via_runtime_input(self) -> None:
-        # Register an agent with a runtime_ref pointing at a non-existent
-        # process/session. The production readback should detect that the
-        # runtime is not advancing and report stalled.
+    def test_production_readback_paseo_agent_without_pid_is_running(self) -> None:
+        # A registered Paseo agent without PID is running (resident-agent
+        # model): the agent is long-lived with idle/running states. The
+        # production readback must not report it as stalled just because
+        # there is no PID.
         self.store.register_agent(
             agent_id="worker-003",
             adapter="paseo",
-            runtime_ref="definitely-not-a-real-ref",
+            runtime_ref="ref-003",
             role="worker",
             group_label="g-42",
         )
         status = self.store.agent_status("worker-003")
-        # With no real runtime to observe, a registered agent whose runtime
-        # cannot be contacted should be stalled (not running), because the
-        # production readback must observe runtime activity, not just the
-        # agents table.
-        self.assertIn(status["state"], ("stalled", "exited"),
-                      "unobservable runtime must not be reported as running")
+        self.assertEqual(
+            "running", status["state"],
+            "a registered Paseo agent without PID is running, not stalled",
+        )
+
+    def test_production_readback_non_paseo_without_pid_is_stalled(self) -> None:
+        # A registered agent with a non-paseo adapter (future headless) and no
+        # PID is stalled, because the session-process model requires PID
+        # liveness to confirm running.
+        self.store.register_agent(
+            agent_id="worker-004",
+            adapter="headless",
+            runtime_ref="ref-004",
+            role="worker",
+            group_label="g-42",
+        )
+        status = self.store.agent_status("worker-004")
+        self.assertEqual(
+            "stalled", status["state"],
+            "a non-paseo agent without PID is stalled (no runtime observable)",
+        )
 
 
 class ConfigPreflightTests(unittest.TestCase):
@@ -1963,6 +1980,360 @@ class ConfigPreflightTests(unittest.TestCase):
 
     def store_mod_error(self):
         return self.fixture.store_mod.StoreError
+
+
+# ---------------------------------------------------------------------------
+# Third commit-bound heavy review regression tests. Each test reproduces one
+# finding from the review before the fix lands.
+# ---------------------------------------------------------------------------
+
+
+class RebuildAtomicityTests(unittest.TestCase):
+    """Finding 1: doctor_rebuild must prevalidate all evidence before any write;
+    conflicted identities must remain uninserted.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_conflicting_duplicate_rows_leave_neither_inserted(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-conflict", "status": "running",
+                 "role": "worker", "adapter": "paseo"},
+                {"agent_id": "agent-conflict", "status": "running",
+                 "role": "reviewer", "adapter": "paseo"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(len(result["ambiguities"]), 0)
+        self.assertEqual(
+            0, result["rebuilt_count"],
+            "conflicted agent must not be inserted",
+        )
+        rows = self.store.db.execute(
+            "SELECT agent_id FROM agents WHERE agent_id = ?", ("agent-conflict",)
+        ).fetchall()
+        self.assertEqual(0, len(rows), "neither row may be inserted")
+
+
+class NonDestructivePreflightTests(unittest.TestCase):
+    """Finding 2: config check CLI must inspect config/database/migration state
+    before Store.connect or any filesystem/schema mutation.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self._saved_env = {
+            "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
+            "PYTHONPATH": os.environ.get("PYTHONPATH"),
+        }
+        os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+
+    def tearDown(self) -> None:
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(GWO_PY), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_config_check_nonexistent_home_reports_error_without_creating_db(self) -> None:
+        nonexistent = self.home / "does-not-exist"
+        result = self.run_cli("--gwo-home", str(nonexistent), "config", "check")
+        self.assertNotEqual(0, result.returncode)
+        # The nonexistent home must NOT have been created by the check.
+        self.assertFalse(
+            (nonexistent / "state.db").is_file() or nonexistent.is_dir(),
+            "config check must not create GWO_HOME or state.db",
+        )
+
+    def test_config_check_reports_migration_drift_without_connecting(self) -> None:
+        # Create a store with migration drift (drop a migration record).
+        store_mod = load_store()
+        store = store_mod.Store.connect(self.home, "owner/repo")
+        store.claim_coordinator()
+        store.db.execute(
+            "DELETE FROM schema_migrations WHERE name = '0002-messages-in-reply-to'"
+        )
+        store.close()
+        result = self.run_cli("config", "check")
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("migration", result.stderr.lower() + result.stdout.lower())
+
+
+class RebuildEvidenceComparisonTests(unittest.TestCase):
+    """Finding 3: rebuild must compare existing task evidence field-by-field,
+    reject incomplete adapter records, and surface known-agent/orphan-dispatch
+    worktree ambiguity.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_existing_task_conflicting_risk_surfaces_ambiguity(self) -> None:
+        # Pre-create a task with risk=standard.
+        task = self.store.create_task(issue=77, group_label="g-77", risk="standard")
+        # Rebuild with a GitHub snapshot that claims risk=fast for the same issue.
+        result = self.store.doctor_rebuild(
+            github_snapshot={
+                "issues": [
+                    {"number": 77, "risk": "fast", "group": "g-77",
+                     "hotset": [], "deps": []},
+                ],
+                "agents": [],
+                "worktrees": [],
+            },
+            adapter_listing=[],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "existing task with conflicting risk must surface ambiguity",
+        )
+
+    def test_adapter_entry_missing_status_rejected(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-no-status", "role": "worker",
+                 "adapter": "paseo"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "adapter entry missing status must surface ambiguity",
+        )
+        rows = self.store.db.execute(
+            "SELECT agent_id FROM agents WHERE agent_id = ?", ("agent-no-status",)
+        ).fetchall()
+        self.assertEqual(0, len(rows), "incomplete adapter record must not be inserted")
+
+    def test_known_agent_worktree_without_dispatch_surfaces_ambiguity(self) -> None:
+        # Register an agent (known agent).
+        self.store.register_agent(
+            agent_id="worker-orphan",
+            adapter="paseo",
+            runtime_ref="ref-orphan",
+            role="worker",
+            group_label="g-42",
+        )
+        # A worktree referencing the known agent but with no matching dispatch.
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[],
+            git_worktrees=[
+                {"path": "/tmp/wt-orphan-wt", "branch": "work/issue-99",
+                 "agent_id": "worker-orphan"},
+            ],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "known-agent worktree without matching dispatch must surface ambiguity",
+        )
+
+
+class TruthfulReadbackTests(unittest.TestCase):
+    """Finding 4: readback_agent must use the recorded adapter and
+    runtime_ref/session_id for truthful resident Paseo runtime readback, not
+    just optional PID probing. A registered Paseo agent without PID must be
+    running (resident-agent model), not stalled.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_paseo_agent_without_pid_is_running(self) -> None:
+        self.store.register_agent(
+            agent_id="worker-paseo",
+            adapter="paseo",
+            runtime_ref="agent-ref-paseo",
+            role="worker",
+            group_label="g-42",
+        )
+        status = self.store.agent_status("worker-paseo")
+        self.assertEqual(
+            "running", status["state"],
+            "a registered Paseo resident agent without PID is running, not stalled",
+        )
+
+    def test_paseo_agent_uses_runtime_ref_in_evidence(self) -> None:
+        self.store.register_agent(
+            agent_id="worker-paseo2",
+            adapter="paseo",
+            runtime_ref="agent-ref-paseo2",
+            role="worker",
+            group_label="g-42",
+            session_id="sess-123",
+        )
+        status = self.store.agent_status("worker-paseo2")
+        self.assertEqual("running", status["state"])
+        self.assertIn("runtime_ref", status)
+        self.assertEqual("agent-ref-paseo2", status["runtime_ref"])
+
+    def test_exited_agent_has_non_empty_terminal_evidence_with_reason(self) -> None:
+        self.store.register_agent(
+            agent_id="worker-exit",
+            adapter="paseo",
+            runtime_ref="ref-exit",
+            role="worker",
+            group_label="g-42",
+        )
+        self.store.db.execute(
+            "UPDATE agents SET archived_at = ? WHERE agent_id = ?",
+            (1234567.0, "worker-exit"),
+        )
+        status = self.store.agent_status("worker-exit")
+        self.assertEqual("exited", status["state"])
+        self.assertNotEqual({}, status["terminal_evidence"])
+        self.assertIn("reason", status["terminal_evidence"])
+
+    def test_unknown_agent_exited_with_evidence(self) -> None:
+        status = self.store.agent_status("never-registered")
+        self.assertEqual("exited", status["state"])
+        self.assertNotEqual({}, status["terminal_evidence"])
+        self.assertEqual(False, status["registered"])
+
+
+class CliErrorControlTests(unittest.TestCase):
+    """Finding 5: CLI handlers must catch all domain validation errors, not
+    just StoreError. Invalid event types and malformed payloads must produce
+    controlled error output, not tracebacks.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = CliFixture(claim=True)
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _seed_dispatch(self) -> tuple[str, str]:
+        create = self.fixture.run(
+            "task", "create", "--issue", "42", "--group", "g-42", "--risk", "standard"
+        )
+        task_id = json.loads(create.stdout)["task_id"]
+        self.fixture.run("task", "update", task_id, "--status", "ready")
+        dispatch = self.fixture.run(
+            "dispatch", "create",
+            "--task-id", task_id,
+            "--agent-id", "worker-001",
+            "--worktree", "/tmp/wt-42",
+            "--branch", "work/issue-42",
+        )
+        return task_id, json.loads(dispatch.stdout)["dispatch_id"]
+
+    def test_send_unknown_event_type_no_traceback(self) -> None:
+        self._seed_dispatch()
+        os.environ["GWO_AGENT_ID"] = "worker-001"
+        try:
+            result = self.fixture.run(
+                "send", "--to", "coordinator-001", "--type", "PROGRESS",
+                "--signal-id", "sig-err-aaaaaaaaaa",
+            )
+        finally:
+            os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("Traceback", result.stdout)
+
+    def test_send_malformed_payload_no_traceback(self) -> None:
+        self._seed_dispatch()
+        os.environ["GWO_AGENT_ID"] = "worker-001"
+        try:
+            result = self.fixture.run(
+                "send", "--to", "coordinator-001", "--type", "status",
+                "--signal-id", "sig-err2-aaaaaaaaa",
+                "--payload", "{not json",
+            )
+        finally:
+            os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("Traceback", result.stdout)
+
+    def test_doctor_rebuild_malformed_json_no_traceback(self) -> None:
+        result = self.fixture.run(
+            "doctor", "rebuild",
+            "--github-snapshot", "{bad json",
+            "--adapter-listing", "[]",
+            "--git-worktrees", "[]",
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("Traceback", result.stdout)
+
+    def test_done_malformed_evidence_no_traceback(self) -> None:
+        create = self.fixture.run(
+            "task", "create", "--issue", "42", "--group", "g-42", "--risk", "standard"
+        )
+        task_id = json.loads(create.stdout)["task_id"]
+        self.fixture.run("task", "update", task_id, "--status", "ready")
+        dispatch = self.fixture.run(
+            "dispatch", "create",
+            "--task-id", task_id,
+            "--agent-id", "worker-001",
+            "--worktree", "/tmp/wt-42",
+            "--branch", "work/issue-42",
+        )
+        dispatch_id = json.loads(dispatch.stdout)["dispatch_id"]
+        os.environ["GWO_AGENT_ID"] = "worker-001"
+        try:
+            result = self.fixture.run(
+                "done", "--task-id", task_id, "--dispatch-id", dispatch_id,
+                "--status", "done", "--evidence", "{bad",
+            )
+        finally:
+            os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("Traceback", result.stdout)
+
+    def test_cli_error_output_is_structured(self) -> None:
+        self._seed_dispatch()
+        os.environ["GWO_AGENT_ID"] = "worker-001"
+        try:
+            result = self.fixture.run(
+                "send", "--to", "coordinator-001", "--type", "PROGRESS",
+                "--signal-id", "sig-struct-aaaaaaaa",
+            )
+        finally:
+            os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertNotEqual(0, result.returncode)
+        # Structured error: stderr starts with "error: " prefix (no raw traceback).
+        stderr = result.stderr.strip()
+        self.assertTrue(
+            stderr.startswith("error:"),
+            f"CLI error output must start with 'error:', got: {stderr[:80]}",
+        )
 
 
 if __name__ == "__main__":

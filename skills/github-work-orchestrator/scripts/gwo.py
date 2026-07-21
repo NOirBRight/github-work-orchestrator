@@ -54,6 +54,22 @@ def _fail(message: str, code: int = 1) -> int:
     return code
 
 
+def _controlled_error(error: BaseException) -> int:
+    """Convert any domain/validation error into a controlled CLI error.
+
+    Catches RuntimeError subclasses (StoreError, MailboxError, StatusError,
+    EntitlementError, SignalIdError, DeliveryError, TransitionError),
+    argparse.ArgumentTypeError (malformed JSON), and any other Exception
+    that is not SystemExit/KeyboardInterrupt. Never lets a traceback reach
+    the user for domain validation failures.
+    """
+    if isinstance(error, SystemExit):
+        raise error
+    if isinstance(error, KeyboardInterrupt):
+        raise error
+    return _fail(str(error))
+
+
 def cmd_coordinator(args: argparse.Namespace) -> int:
     store = _store(args)
     try:
@@ -66,8 +82,8 @@ def cmd_coordinator(args: argparse.Namespace) -> int:
             _emit({"repo": args.repository, "holder": None})
             return 0
         return _fail(f"unknown coordinator action: {args.action}")
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
         store.close()
 
@@ -99,8 +115,8 @@ def cmd_task(args: argparse.Namespace) -> int:
             _emit(task)
             return 0
         return _fail(f"unknown task action: {args.action}")
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
         store.close()
 
@@ -119,8 +135,8 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
             _emit(dispatch)
             return 0
         return _fail(f"unknown dispatch action: {args.action}")
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
         store.close()
 
@@ -128,17 +144,18 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
 def cmd_done(args: argparse.Namespace) -> int:
     store = _store(args)
     try:
+        evidence = _json_value(args.evidence)
         dispatch = store.mark_done(
             task_id=args.task_id,
             dispatch_id=args.dispatch_id,
             status=args.status,
             actor=args.actor,
-            evidence=_json_value(args.evidence),
+            evidence=evidence,
         )
         _emit(dispatch)
         return 0
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
         store.close()
 
@@ -149,9 +166,9 @@ def _json_value(value: str | None) -> dict[str, Any] | None:
     try:
         result = json.loads(value)
     except json.JSONDecodeError as error:
-        raise argparse.ArgumentTypeError(f"invalid JSON: {error}")
+        raise ValueError(f"invalid JSON: {error}")
     if not isinstance(result, dict):
-        raise argparse.ArgumentTypeError("expected a JSON object")
+        raise ValueError("expected a JSON object")
     return result
 
 
@@ -161,23 +178,24 @@ def _json_list_or_obj(value: str | None) -> Any:
     try:
         return json.loads(value)
     except json.JSONDecodeError as error:
-        raise argparse.ArgumentTypeError(f"invalid JSON: {error}")
+        raise ValueError(f"invalid JSON: {error}")
 
 
 def cmd_send(args: argparse.Namespace) -> int:
     store = _store(args)
     try:
+        payload = _json_value(args.payload)
         msg = store.send(
             to_agent=args.to,
             event_type=args.type,
-            payload=_json_value(args.payload),
+            payload=payload,
             signal_id=args.signal_id,
             in_reply_to=args.in_reply_to,
         )
         _emit(msg)
         return 0
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
         store.close()
 
@@ -185,16 +203,17 @@ def cmd_send(args: argparse.Namespace) -> int:
 def cmd_ask(args: argparse.Namespace) -> int:
     store = _store(args)
     try:
+        payload = _json_value(args.payload)
         msg = store.ask(
             to_agent=args.to,
-            payload=_json_value(args.payload),
+            payload=payload,
             signal_id=args.signal_id,
             timeout=args.timeout,
         )
         _emit(msg)
         return 0
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
         store.close()
 
@@ -210,8 +229,8 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         )
         _emit(messages)
         return 0
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
         store.close()
 
@@ -236,24 +255,22 @@ def cmd_agent(args: argparse.Namespace) -> int:
             _emit(row)
             return 0
         return _fail(f"unknown agent action: {args.action}")
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
         store.close()
 
 
 def cmd_config(args: argparse.Namespace) -> int:
-    store = _store(args)
     try:
+        import gwo_status
         if args.action == "check":
-            result = store.config_check()
+            result = gwo_status.preflight_config(args.gwo_home, args.repository)
             _emit(result)
-            return 0
+            return 0 if result["valid"] else 1
         return _fail(f"unknown config action: {args.action}")
-    except gwo_store.StoreError as error:
+    except Exception as error:
         return _fail(str(error))
-    finally:
-        store.close()
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -268,8 +285,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             _emit(result)
             return 0
         return _fail(f"unknown doctor action: {args.action}")
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
         store.close()
 
@@ -280,9 +297,9 @@ def _json_list(value: str | None) -> list[str] | None:
     try:
         result = json.loads(value)
     except json.JSONDecodeError as error:
-        raise argparse.ArgumentTypeError(f"invalid JSON: {error}")
+        raise ValueError(f"invalid JSON: {error}")
     if not isinstance(result, list):
-        raise argparse.ArgumentTypeError("expected a JSON list")
+        raise ValueError("expected a JSON list")
     return result
 
 
