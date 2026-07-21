@@ -409,6 +409,19 @@ def doctor_rebuild(
     tasks_to_insert: list[dict[str, Any]] = []
     agents_to_insert: list[dict[str, Any]] = []
 
+    # Legacy duplicate task scan: detect existing duplicate tasks(repo, issue)
+    # in the store that may predate migration 0003's unique index. These are
+    # surfaced as ambiguity for human adjudication.
+    legacy_dup_rows = db.execute(
+        "SELECT repo, issue, COUNT(*) AS n FROM tasks "
+        "GROUP BY repo, issue HAVING COUNT(*) > 1"
+    ).fetchall()
+    for dr in legacy_dup_rows:
+        ambiguities.append(
+            f"issue {dr['issue']} has {dr['n']} duplicate task rows "
+            f"in repo {dr['repo']}; legacy ambiguity"
+        )
+
     # Prevalidate issues/tasks. Detect duplicate issue rows first.
     seen_issues: dict[int, dict[str, Any]] = {}
     conflicted_issues: set[int] = set()
@@ -454,13 +467,22 @@ def doctor_rebuild(
             continue
         risk = issue.get("risk")
         group = issue.get("group")
-        # Check existing task evidence field-by-field.
-        existing = db.execute(
+        # Check existing task evidence field-by-field. Use fetchall() not
+        # fetchone() to detect legacy duplicate tasks.
+        existing_rows = db.execute(
             "SELECT task_id, group_label, risk, hotset_json, deps_json "
             "FROM tasks WHERE repo = ? AND issue = ?",
             (store.repo, number),
-        ).fetchone()
-        if existing is not None:
+        ).fetchall()
+        if len(existing_rows) > 1:
+            # Legacy duplicate tasks: surface ambiguity.
+            ambiguities.append(
+                f"issue {number} has {len(existing_rows)} duplicate task rows "
+                f"in repo {store.repo}; legacy ambiguity"
+            )
+            continue
+        if len(existing_rows) == 1:
+            existing = existing_rows[0]
             existing_conflicts = []
             if str(existing["group_label"] or "") != group:
                 existing_conflicts.append(

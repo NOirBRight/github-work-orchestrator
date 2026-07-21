@@ -267,11 +267,40 @@ def send(
     db = store.db
     db.execute("BEGIN IMMEDIATE")
     try:
+        # Signal-ID idempotency: check for an existing row with this signal_id
+        # BEFORE any mutable lifecycle entitlement checks. Exact retries must
+        # deduplicate even after the dispatch becomes terminal; conflicting
+        # retries must be rejected. This runs before worker_done dispatch
+        # binding and role resolution so lifecycle state changes do not break
+        # idempotent retries.
+        existing = db.execute(
+            "SELECT msg_id, from_agent, to_agent, type, payload_json, "
+            "in_reply_to IS NOT NULL AS has_reply, in_reply_to "
+            "FROM messages WHERE signal_id = ?",
+            (signal_id,),
+        ).fetchone()
+        if existing is not None:
+            prior_payload = json.loads(existing["payload_json"])
+            prior_fingerprint = _content_fingerprint(
+                existing["from_agent"],
+                existing["to_agent"],
+                existing["type"],
+                prior_payload,
+                existing["in_reply_to"] if existing["has_reply"] else None,
+            )
+            new_fingerprint = _content_fingerprint(
+                caller, to_agent, event_type, body, in_reply_to,
+            )
+            if prior_fingerprint != new_fingerprint:
+                raise SignalIdError(
+                    f"signal_id {signal_id} conflicts with prior content"
+                )
+            db.execute("ROLLBACK")
+            return _message_row(db, existing["msg_id"])
+
         # Reply binding: verify the referenced ask exists, the reply author
         # is that ask's intended recipient, and the reply recipient is the
         # ask author. This prevents adversarial replies from unrelated agents.
-        # This check runs before role resolution because the reply authority
-        # comes from being the ask's intended recipient, not just the role.
         if event_type == "reply" and in_reply_to is not None:
             ask_row = db.execute(
                 "SELECT from_agent, to_agent, type FROM messages "
@@ -297,8 +326,6 @@ def send(
         # worker_done binding: the payload must carry dispatch_id, and the
         # active dispatch's agent_id must equal the live caller. This prevents
         # worker-002 from authoring worker_done for worker-001's dispatch.
-        # This check runs before role resolution because the dispatch's agent
-        # identity is the authority, not the generic role.
         if event_type == "worker_done":
             dispatch_id = body.get("dispatch_id")
             if not dispatch_id:
@@ -331,33 +358,6 @@ def send(
             (caller,),
         ).fetchone()
         next_seq = 1 if seq_row["max_seq"] is None else int(seq_row["max_seq"]) + 1
-
-        # Signal-ID idempotency: check for an existing row with this signal_id.
-        existing = db.execute(
-            "SELECT msg_id, from_agent, to_agent, type, payload_json, "
-            "in_reply_to IS NOT NULL AS has_reply, in_reply_to "
-            "FROM messages WHERE signal_id = ?",
-            (signal_id,),
-        ).fetchone()
-        if existing is not None:
-            # Exact retry: same content -> deduplicate by returning the row.
-            prior_payload = json.loads(existing["payload_json"])
-            prior_fingerprint = _content_fingerprint(
-                existing["from_agent"],
-                existing["to_agent"],
-                existing["type"],
-                prior_payload,
-                existing["in_reply_to"] if existing["has_reply"] else None,
-            )
-            new_fingerprint = _content_fingerprint(
-                caller, to_agent, event_type, body, in_reply_to,
-            )
-            if prior_fingerprint != new_fingerprint:
-                raise SignalIdError(
-                    f"signal_id {signal_id} conflicts with prior content"
-                )
-            db.execute("ROLLBACK")
-            return _message_row(db, existing["msg_id"])
 
         msg_id = _new_msg_id()
         payload_json = json.dumps(body, sort_keys=True)

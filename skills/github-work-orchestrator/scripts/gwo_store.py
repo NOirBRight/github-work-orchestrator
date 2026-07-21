@@ -585,6 +585,18 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self._require_coordinator_claim(actor)
+            # Logical uniqueness guard: even when the unique index could not be
+            # installed (legacy stores with duplicate tasks), enforce that no
+            # task for this repo+issue exists before inserting. This catches
+            # both the index-backed case and the legacy case.
+            count_row = self.db.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE repo = ? AND issue = ?",
+                (self.repo, issue),
+            ).fetchone()
+            if int(count_row["n"]) > 0:
+                raise TransitionError(
+                    f"task for issue {issue} already exists in repo {self.repo}"
+                )
             self.db.execute(
                 "INSERT INTO tasks (task_id, repo, issue, group_label, risk, "
                 "hotset_json, deps_json, status, created_by, created_at) "

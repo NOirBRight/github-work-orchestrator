@@ -3253,5 +3253,168 @@ class ConfigCheckMigrationSetTests(unittest.TestCase):
         self.assertTrue(result["valid"], result.get("errors", []))
 
 
+# ---------------------------------------------------------------------------
+# Seventh commit-bound heavy review regression tests.
+# ---------------------------------------------------------------------------
+
+
+class WorkerDoneTerminalRetryIdempotencyTests(unittest.TestCase):
+    """Finding 1: exact worker_done retries must remain idempotent after the
+    dispatch becomes terminal. Signal-ID deduplication must occur before the
+    mutable lifecycle entitlement checks.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.mailbox_mod = self.fixture.mailbox_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_exact_worker_done_retry_after_mark_done_is_idempotent(self) -> None:
+        dispatch_id = self.fixture.dispatch["dispatch_id"]
+        signal_id = "sig-retry-idem-aaaaaaaaa"
+        with self.fixture.as_agent("worker-001"):
+            msg1 = self.store.send(
+                to_agent="coordinator-001",
+                event_type="worker_done",
+                payload={"dispatch_id": dispatch_id},
+                signal_id=signal_id,
+            )
+        self.assertEqual("worker_done", msg1["type"])
+        # Mark the dispatch done (terminal) via mark_done.
+        with self.fixture.as_agent("worker-001"):
+            self.store.mark_done(
+                task_id=self.fixture.task["task_id"],
+                dispatch_id=dispatch_id,
+                status="done",
+            )
+        # Retry the identical worker_done: must deduplicate, not raise.
+        with self.fixture.as_agent("worker-001"):
+            msg2 = self.store.send(
+                to_agent="coordinator-001",
+                event_type="worker_done",
+                payload={"dispatch_id": dispatch_id},
+                signal_id=signal_id,
+            )
+        self.assertEqual(msg1["msg_id"], msg2["msg_id"],
+                         "exact retry must return the recorded message")
+
+    def test_conflicting_worker_done_retry_after_mark_done_rejected(self) -> None:
+        dispatch_id = self.fixture.dispatch["dispatch_id"]
+        signal_id = "sig-retry-conf-aaaaaaaa"
+        with self.fixture.as_agent("worker-001"):
+            self.store.send(
+                to_agent="coordinator-001",
+                event_type="worker_done",
+                payload={"dispatch_id": dispatch_id},
+                signal_id=signal_id,
+            )
+        with self.fixture.as_agent("worker-001"):
+            self.store.mark_done(
+                task_id=self.fixture.task["task_id"],
+                dispatch_id=dispatch_id,
+                status="done",
+            )
+        # Conflicting retry (different payload): must be rejected, not accepted.
+        with self.fixture.as_agent("worker-001"):
+            with self.assertRaises(self.mailbox_mod.MailboxError) as ctx:
+                self.store.send(
+                    to_agent="coordinator-001",
+                    event_type="worker_done",
+                    payload={"dispatch_id": dispatch_id, "extra": "conflict"},
+                    signal_id=signal_id,
+                )
+        self.assertIn("conflict", str(ctx.exception).lower())
+
+
+class LegacyDuplicateRebuildDetectionTests(unittest.TestCase):
+    """Finding 2: legacy duplicate tasks must be detected during rebuild and
+    create_task must enforce logical uniqueness even without the unique index.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self._saved_env = {
+            "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
+        }
+        os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+
+    def tearDown(self) -> None:
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def _make_legacy_duplicate_store(self) -> Any:
+        store_mod = load_store()
+        store = store_mod.Store.connect(self.home, "owner/repo")
+        store.claim_coordinator()
+        # Drop migration 0003 unique index to simulate legacy store.
+        store.db.execute("BEGIN IMMEDIATE")
+        try:
+            store.db.execute("DROP INDEX IF EXISTS idx_tasks_repo_issue_unique")
+            store.db.execute("DELETE FROM schema_migrations WHERE name = '0003-tasks-repo-issue-unique'")
+            store.db.execute("COMMIT")
+        except Exception:
+            store.db.execute("ROLLBACK")
+            raise
+        # Insert two duplicate tasks.
+        store.db.execute("BEGIN IMMEDIATE")
+        try:
+            for tid in ("t-leg1", "t-leg2"):
+                store.db.execute(
+                    "INSERT INTO tasks (task_id, repo, issue, group_label, risk, "
+                    "hotset_json, deps_json, status, created_by, created_at) "
+                    "VALUES (?, 'owner/repo', 400, 'g-400', 'standard', '[]', '[]', "
+                    "'pending', 'coordinator-001', 0)",
+                    (tid,)
+                )
+            store.db.execute("COMMIT")
+        except Exception:
+            store.db.execute("ROLLBACK")
+            raise
+        store.close()
+        # Reconnect (migration 0003 retries, skips unique index on duplicates).
+        # Coordinator is already claimed from the first connection; reconnect
+        # preserves the claim.
+        store2 = store_mod.Store.connect(self.home, "owner/repo")
+        return store2
+
+    def test_doctor_rebuild_detects_legacy_duplicate_tasks(self) -> None:
+        store = self._make_legacy_duplicate_store()
+        try:
+            status_mod = load_status()
+            result = store.doctor_rebuild(
+                github_snapshot={"issues": [], "agents": [], "worktrees": []},
+                adapter_listing=[],
+                git_worktrees=[],
+            )
+            ambiguity_text = " ".join(result["ambiguities"])
+            self.assertIn(
+                "400", ambiguity_text,
+                "legacy duplicate tasks for issue 400 must surface ambiguity",
+            )
+        finally:
+            store.close()
+
+    def test_create_task_rejects_third_duplicate_without_unique_index(self) -> None:
+        store = self._make_legacy_duplicate_store()
+        try:
+            with self.assertRaises(Exception):
+                store.create_task(issue=400, group_label="g-400", risk="standard")
+            tasks = [t for t in store.list_tasks() if t["issue"] == 400]
+            self.assertEqual(2, len(tasks),
+                             "logical uniqueness must prevent a third duplicate")
+        finally:
+            store.close()
+
+
 if __name__ == "__main__":
     unittest.main()
