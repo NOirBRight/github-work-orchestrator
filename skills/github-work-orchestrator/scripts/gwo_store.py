@@ -196,6 +196,20 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
         );
         """,
     ),
+    (
+        "0002-messages-in-reply-to",
+        """
+        ALTER TABLE messages ADD COLUMN in_reply_to TEXT;
+        CREATE INDEX IF NOT EXISTS idx_messages_from_seq
+            ON messages (from_agent, seq);
+        """,
+    ),
+    (
+        "0003-tasks-repo-issue-unique",
+        """
+        CREATE INDEX IF NOT EXISTS idx_tasks_repo_issue ON tasks (repo, issue);
+        """,
+    ),
 )
 
 
@@ -364,6 +378,14 @@ class Store:
             )
 
     def close(self) -> None:
+        # Clear any injected readback snapshot for this Store's connection
+        # so a recycled connection ID cannot return stale runtime evidence
+        # from a prior Store.
+        try:
+            import gwo_status
+            gwo_status._READBACK_SNAPSHOTS.pop(id(self.db), None)
+        except Exception:
+            pass
         self.db.close()
 
     def journal_mode(self) -> str:
@@ -401,6 +423,37 @@ class Store:
                 continue
             self._apply_migration(name, ddl, caller)
             applied.add(name)
+            # Post-migration 0003: attempt the unique index. If duplicate tasks
+            # exist (legacy Issue #21 stores), skip the unique index so
+            # Store.connect does not crash; doctor_rebuild surfaces the
+            # ambiguity. If no duplicates, the unique index is created safely.
+            if name == "0003-tasks-repo-issue-unique":
+                self._try_unique_index_or_skip()
+
+    def _try_unique_index_or_skip(self) -> None:
+        """Attempt to create the unique index on tasks(repo, issue).
+
+        If duplicate tasks exist (legacy Issue #21 stores), the unique index
+        creation fails and we skip it so Store.connect does not crash. The
+        non-unique index from migration 0003 remains, and doctor_rebuild can
+        surface the legacy ambiguity. If no duplicates exist, the unique index
+        is created safely.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique "
+                    "ON tasks (repo, issue)"
+                )
+                self.db.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                self.db.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
 
     def _apply_migration(self, name: str, ddl: str, caller: str) -> None:
         # Execute each migration and its schema_migrations record in one
@@ -540,6 +593,18 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self._require_coordinator_claim(actor)
+            # Logical uniqueness guard: even when the unique index could not be
+            # installed (legacy stores with duplicate tasks), enforce that no
+            # task for this repo+issue exists before inserting. This catches
+            # both the index-backed case and the legacy case.
+            count_row = self.db.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE repo = ? AND issue = ?",
+                (self.repo, issue),
+            ).fetchone()
+            if int(count_row["n"]) > 0:
+                raise TransitionError(
+                    f"task for issue {issue} already exists in repo {self.repo}"
+                )
             self.db.execute(
                 "INSERT INTO tasks (task_id, repo, issue, group_label, risk, "
                 "hotset_json, deps_json, status, created_by, created_at) "
@@ -557,6 +622,14 @@ class Store:
                 ),
             )
             self.db.execute("COMMIT")
+        except sqlite3.IntegrityError as error:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise TransitionError(
+                f"task for issue {issue} already exists in repo {self.repo}"
+            ) from error
         except BaseException:
             try:
                 self.db.execute("ROLLBACK")
@@ -657,6 +730,16 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self._require_coordinator_claim(actor)
+            # Config preflight gate: a failed config check blocks new
+            # dispatches but never abandons existing work. The check is
+            # non-destructive (reads config.json + migration set).
+            import gwo_status
+            preflight = gwo_status.config_check(self)
+            if not preflight["valid"]:
+                raise TransitionError(
+                    "config check failed; dispatch blocked: "
+                    + "; ".join(preflight["errors"])
+                )
             # Conditional DML: atomically flip the task from ready to
             # dispatched. If another writer already won the race, rowcount is
             # 0 and we reject without inserting. This makes validation and the
@@ -799,3 +882,115 @@ class Store:
                 pass
             raise
         return self._dispatch_row(dispatch_id)
+
+    # --- Phase 1 mailbox / event delivery (gwo_mailbox delegation) ---------
+
+    def register_agent(
+        self,
+        *,
+        agent_id: str,
+        adapter: str,
+        runtime_ref: str | None,
+        role: str,
+        group_label: str | None = None,
+        session_id: str | None = None,
+        pid: int | None = None,
+    ) -> dict[str, Any]:
+        """Register or refresh an agent row. Coordinator-only."""
+        import gwo_mailbox  # local import to avoid circular at module load
+        return gwo_mailbox.register_agent(
+            self,
+            agent_id=agent_id,
+            adapter=adapter,
+            runtime_ref=runtime_ref,
+            role=role,
+            group_label=group_label,
+            session_id=session_id,
+            pid=pid,
+        )
+
+    def send(
+        self,
+        *,
+        to_agent: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        signal_id: str,
+        in_reply_to: str | None = None,
+    ) -> dict[str, Any]:
+        """Post one mailbox event with entitlement and idempotency checks."""
+        import gwo_mailbox
+        return gwo_mailbox.send(
+            self,
+            to_agent=to_agent,
+            event_type=event_type,
+            payload=payload,
+            signal_id=signal_id,
+            in_reply_to=in_reply_to,
+        )
+
+    def ask(
+        self,
+        *,
+        to_agent: str,
+        payload: dict[str, Any] | None = None,
+        signal_id: str,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Send an ask event and block for the correlated reply."""
+        import gwo_mailbox
+        return gwo_mailbox.ask(
+            self,
+            to_agent=to_agent,
+            payload=payload,
+            signal_id=signal_id,
+            timeout=timeout,
+        )
+
+    def inbox(
+        self,
+        *,
+        agent_id: str,
+        ack_on_read: bool = False,
+        dispatch_id: str | None = None,
+        wait: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read (and optionally acknowledge) messages addressed to agent_id."""
+        import gwo_mailbox
+        return gwo_mailbox.inbox(
+            self,
+            agent_id=agent_id,
+            ack_on_read=ack_on_read,
+            dispatch_id=dispatch_id,
+            wait=wait,
+        )
+
+    def agent_status(
+        self, agent_id: str, *, readback_snapshot_path: str | None = None
+    ) -> dict[str, Any]:
+        """Return the runtime status of one agent."""
+        import gwo_mailbox
+        return gwo_mailbox.agent_status(
+            self, agent_id, readback_snapshot_path=readback_snapshot_path
+        )
+
+    def config_check(self, *, gwo_home: str | None = None) -> dict[str, Any]:
+        """Validate the GWO configuration."""
+        import gwo_mailbox
+        return gwo_mailbox.config_check(self, gwo_home=gwo_home)
+
+    def doctor_rebuild(
+        self,
+        *,
+        github_snapshot: dict[str, Any],
+        adapter_listing: list[dict[str, Any]],
+        git_worktrees: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Rebuild the store from GitHub + adapter readback (additive, fail-closed)."""
+        import gwo_mailbox
+        return gwo_mailbox.doctor_rebuild(
+            self,
+            github_snapshot=github_snapshot,
+            adapter_listing=adapter_listing,
+            git_worktrees=git_worktrees,
+        )

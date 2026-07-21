@@ -54,9 +54,26 @@ def _fail(message: str, code: int = 1) -> int:
     return code
 
 
+def _controlled_error(error: BaseException) -> int:
+    """Convert any domain/validation error into a controlled CLI error.
+
+    Catches RuntimeError subclasses (StoreError, MailboxError, StatusError,
+    EntitlementError, SignalIdError, DeliveryError, TransitionError),
+    argparse.ArgumentTypeError (malformed JSON), and any other Exception
+    that is not SystemExit/KeyboardInterrupt. Never lets a traceback reach
+    the user for domain validation failures.
+    """
+    if isinstance(error, SystemExit):
+        raise error
+    if isinstance(error, KeyboardInterrupt):
+        raise error
+    return _fail(str(error))
+
+
 def cmd_coordinator(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
         if args.action == "claim":
             store.claim_coordinator()
             _emit({"repo": args.repository, "holder": store.coordinator_holder()})
@@ -66,15 +83,17 @@ def cmd_coordinator(args: argparse.Namespace) -> int:
             _emit({"repo": args.repository, "holder": None})
             return 0
         return _fail(f"unknown coordinator action: {args.action}")
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def cmd_task(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
         if args.action == "create":
             task = store.create_task(
                 issue=args.issue,
@@ -99,15 +118,17 @@ def cmd_task(args: argparse.Namespace) -> int:
             _emit(task)
             return 0
         return _fail(f"unknown task action: {args.action}")
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
         if args.action == "create":
             dispatch = store.create_dispatch(
                 task_id=args.task_id,
@@ -119,27 +140,176 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
             _emit(dispatch)
             return 0
         return _fail(f"unknown dispatch action: {args.action}")
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def cmd_done(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
+        evidence = _json_value(args.evidence)
         dispatch = store.mark_done(
             task_id=args.task_id,
             dispatch_id=args.dispatch_id,
             status=args.status,
             actor=args.actor,
+            evidence=evidence,
         )
         _emit(dispatch)
         return 0
-    except gwo_store.StoreError as error:
-        return _fail(str(error))
+    except Exception as error:
+        return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
+
+
+def _json_value(value: str | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    try:
+        result = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid JSON: {error}")
+    if not isinstance(result, dict):
+        raise ValueError("expected a JSON object")
+    return result
+
+
+def _json_list_or_obj(value: str | None) -> Any:
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid JSON: {error}")
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    store = None
+    try:
+        store = _store(args)
+        payload = _json_value(args.payload)
+        msg = store.send(
+            to_agent=args.to,
+            event_type=args.type,
+            payload=payload,
+            signal_id=args.signal_id,
+            in_reply_to=args.in_reply_to,
+        )
+        _emit(msg)
+        return 0
+    except Exception as error:
+        return _controlled_error(error)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    store = None
+    try:
+        store = _store(args)
+        payload = _json_value(args.payload)
+        msg = store.ask(
+            to_agent=args.to,
+            payload=payload,
+            signal_id=args.signal_id,
+            timeout=args.timeout,
+        )
+        _emit(msg)
+        return 0
+    except Exception as error:
+        return _controlled_error(error)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def cmd_inbox(args: argparse.Namespace) -> int:
+    store = None
+    try:
+        store = _store(args)
+        messages = store.inbox(
+            agent_id=args.agent_id,
+            ack_on_read=args.ack_on_read,
+            dispatch_id=args.dispatch_id,
+            wait=args.wait,
+        )
+        _emit(messages)
+        return 0
+    except Exception as error:
+        return _controlled_error(error)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def cmd_agent(args: argparse.Namespace) -> int:
+    store = None
+    try:
+        store = _store(args)
+        if args.action == "status":
+            snapshot_path = getattr(args, "readback_snapshot", None)
+            status = store.agent_status(
+                args.agent_id, readback_snapshot_path=snapshot_path
+            )
+            _emit(status)
+            return 0
+        if args.action == "register":
+            row = store.register_agent(
+                agent_id=args.agent_id,
+                adapter=args.adapter,
+                runtime_ref=args.runtime_ref,
+                role=args.role,
+                group_label=args.group_label,
+                session_id=args.session_id,
+                pid=args.pid,
+            )
+            _emit(row)
+            return 0
+        return _fail(f"unknown agent action: {args.action}")
+    except Exception as error:
+        return _controlled_error(error)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    try:
+        import gwo_status
+        if args.action == "check":
+            result = gwo_status.preflight_config(args.gwo_home, args.repository)
+            _emit(result)
+            return 0 if result["valid"] else 1
+        return _fail(f"unknown config action: {args.action}")
+    except Exception as error:
+        return _fail(str(error))
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    store = None
+    try:
+        store = _store(args)
+        if args.action == "rebuild":
+            result = store.doctor_rebuild(
+                github_snapshot=_json_list_or_obj(args.github_snapshot),
+                adapter_listing=_json_list_or_obj(args.adapter_listing),
+                git_worktrees=_json_list_or_obj(args.git_worktrees),
+            )
+            _emit(result)
+            return 0
+        return _fail(f"unknown doctor action: {args.action}")
+    except Exception as error:
+        return _controlled_error(error)
+    finally:
+        if store is not None:
+            store.close()
 
 
 def _json_list(value: str | None) -> list[str] | None:
@@ -148,9 +318,9 @@ def _json_list(value: str | None) -> list[str] | None:
     try:
         result = json.loads(value)
     except json.JSONDecodeError as error:
-        raise argparse.ArgumentTypeError(f"invalid JSON: {error}")
+        raise ValueError(f"invalid JSON: {error}")
     if not isinstance(result, list):
-        raise argparse.ArgumentTypeError("expected a JSON list")
+        raise ValueError("expected a JSON list")
     return result
 
 
@@ -214,8 +384,65 @@ def build_parser() -> argparse.ArgumentParser:
     done.add_argument("--task-id", required=True)
     done.add_argument("--dispatch-id", required=True)
     done.add_argument("--status", required=True, choices=("done", "blocked", "stopped"))
+    done.add_argument("--evidence", default=None, help="JSON object terminal evidence")
     done.add_argument("--actor", default=None, help=argparse.SUPPRESS)
     done.set_defaults(func=cmd_done)
+
+    send = sub.add_parser("send", help="post one mailbox event")
+    send.add_argument("--to", required=True, help="recipient agent id")
+    send.add_argument("--type", required=True, help="event type")
+    send.add_argument("--signal-id", required=True, dest="signal_id")
+    send.add_argument("--payload", default=None, help="JSON object payload")
+    send.add_argument("--in-reply-to", default=None, dest="in_reply_to")
+    send.set_defaults(func=cmd_send)
+
+    ask = sub.add_parser("ask", help="post an ask event (blocking sugar over send)")
+    ask.add_argument("--to", required=True, help="recipient agent id")
+    ask.add_argument("--signal-id", required=True, dest="signal_id")
+    ask.add_argument("--payload", default=None, help="JSON object payload")
+    ask.add_argument("--timeout", type=float, default=30.0)
+    ask.set_defaults(func=cmd_ask)
+
+    inbox = sub.add_parser("inbox", help="read/wait for mailbox events")
+    inbox.add_argument("--agent-id", required=True, dest="agent_id")
+    inbox.add_argument("--ack-on-read", action="store_true", dest="ack_on_read")
+    inbox.add_argument("--dispatch-id", default=None, dest="dispatch_id")
+    inbox.add_argument("--wait", type=float, default=None)
+    inbox.set_defaults(func=cmd_inbox)
+
+    agent = sub.add_parser("agent", help="agent status and registration")
+    agent_sub = agent.add_subparsers(dest="action", required=True)
+
+    agent_status = agent_sub.add_parser("status")
+    agent_status.add_argument("agent_id")
+    agent_status.add_argument(
+        "--readback-snapshot", default=None, dest="readback_snapshot",
+        help="JSON file with runtime readback snapshot",
+    )
+    agent_status.set_defaults(func=cmd_agent)
+
+    agent_register = agent_sub.add_parser("register")
+    agent_register.add_argument("--agent-id", required=True, dest="agent_id")
+    agent_register.add_argument("--adapter", required=True)
+    agent_register.add_argument("--runtime-ref", default=None, dest="runtime_ref")
+    agent_register.add_argument("--role", required=True)
+    agent_register.add_argument("--group-label", default=None, dest="group_label")
+    agent_register.add_argument("--session-id", default=None, dest="session_id")
+    agent_register.add_argument("--pid", type=int, default=None)
+    agent_register.set_defaults(func=cmd_agent)
+
+    config = sub.add_parser("config", help="configuration validation")
+    config_sub = config.add_subparsers(dest="action", required=True)
+    config_check = config_sub.add_parser("check")
+    config_check.set_defaults(func=cmd_config)
+
+    doctor = sub.add_parser("doctor", help="store rebuild and recovery")
+    doctor_sub = doctor.add_subparsers(dest="action", required=True)
+    doctor_rebuild = doctor_sub.add_parser("rebuild")
+    doctor_rebuild.add_argument("--github-snapshot", required=True, dest="github_snapshot")
+    doctor_rebuild.add_argument("--adapter-listing", required=True, dest="adapter_listing")
+    doctor_rebuild.add_argument("--git-worktrees", required=True, dest="git_worktrees")
+    doctor_rebuild.set_defaults(func=cmd_doctor)
 
     return parser
 
