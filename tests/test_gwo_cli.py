@@ -212,6 +212,65 @@ class CliIdentityTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("cannot be caller-supplied", result.stderr.lower())
 
+    def test_every_write_fails_without_agent_id(self) -> None:
+        commands = [
+            ("coordinator", "claim"),
+            ("task", "create", "--issue", "42", "--group", "g-42", "--risk", "standard"),
+            ("task", "update", "t-x", "--status", "ready"),
+            ("dispatch", "create", "--task-id", "t-x", "--agent-id", "w",
+             "--worktree", "/x", "--branch", "b"),
+            ("done", "--task-id", "t-x", "--dispatch-id", "d-x", "--status", "done"),
+        ]
+        for args in commands:
+            with self.subTest(cmd=args[0]):
+                saved = os.environ.pop("GWO_AGENT_ID")
+                try:
+                    result = self.fixture.run(*args)
+                finally:
+                    os.environ["GWO_AGENT_ID"] = saved
+                self.assertNotEqual(0, result.returncode, args)
+                self.assertIn("GWO_AGENT_ID", result.stderr)
+
+    def test_dispatch_rejects_caller_supplied_identity(self) -> None:
+        create = self.fixture.run(
+            "task", "create", "--issue", "42", "--group", "g-42", "--risk", "standard"
+        )
+        task_id = json.loads(create.stdout)["task_id"]
+        self.fixture.run("task", "update", task_id, "--status", "ready")
+        result = self.fixture.run(
+            "dispatch", "create",
+            "--task-id", task_id,
+            "--agent-id", "worker-001",
+            "--worktree", "/tmp/wt-42",
+            "--branch", "work/issue-42",
+            "--dispatched-by", "attacker",
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("cannot be caller-supplied", result.stderr.lower())
+
+    def test_done_rejects_caller_supplied_identity(self) -> None:
+        create = self.fixture.run(
+            "task", "create", "--issue", "42", "--group", "g-42", "--risk", "standard"
+        )
+        task_id = json.loads(create.stdout)["task_id"]
+        self.fixture.run("task", "update", task_id, "--status", "ready")
+        dispatch = self.fixture.run(
+            "dispatch", "create",
+            "--task-id", task_id,
+            "--agent-id", "worker-001",
+            "--worktree", "/tmp/wt-42",
+            "--branch", "work/issue-42",
+        )
+        dispatch_id = json.loads(dispatch.stdout)["dispatch_id"]
+        os.environ["GWO_AGENT_ID"] = "worker-001"
+        result = self.fixture.run(
+            "done", "--task-id", task_id, "--dispatch-id", dispatch_id,
+            "--status", "done", "--actor", "attacker",
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("cannot be caller-supplied", result.stderr.lower())
+
 
 class CliPersistenceTests(unittest.TestCase):
     def setUp(self) -> None:

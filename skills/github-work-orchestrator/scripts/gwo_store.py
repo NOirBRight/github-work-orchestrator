@@ -14,16 +14,20 @@ See docs/design/gwo-v7-architecture.md and ADRs 0007-0009.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 import uuid
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 
 SCHEMA_VERSION = 1
 SCHEMA_NAME = "gwo-store-v1"
+
+REPOSITORY_RE = re.compile(r"^[^/\s\\]+/[^/\s\\]+$")
 
 TASK_STATUSES = ("pending", "ready", "dispatched", "done", "failed", "blocked")
 DISPATCH_STATUSES = ("active", "done", "blocked", "stopped")
@@ -43,6 +47,15 @@ DISPATCH_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "done": (),
     "blocked": ("active", "stopped"),
     "stopped": (),
+}
+
+# When a dispatch terminates with one of these statuses, the task transitions
+# to the mapped task status. ``stopped`` is a dispatch-only terminal state and
+# must never be written to tasks.status (it is absent from TASK_STATUSES).
+DONE_TO_TASK_STATUS: dict[str, str] = {
+    "done": "done",
+    "blocked": "blocked",
+    "stopped": "failed",
 }
 
 
@@ -118,6 +131,11 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
 
         CREATE INDEX IF NOT EXISTS idx_dispatches_task ON dispatches (task_id);
         CREATE INDEX IF NOT EXISTS idx_dispatches_agent ON dispatches (agent_id);
+        -- At most one active dispatch per task. Defense-in-depth against the
+        -- dispatch race: even if two writers race past validation, this
+        -- partial unique index rejects the second active insert atomically.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatches_one_active
+            ON dispatches (task_id) WHERE status = 'active';
 
         CREATE TABLE IF NOT EXISTS messages (
             msg_id TEXT PRIMARY KEY,
@@ -181,16 +199,75 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
 
 
+def _validate_repository(repo: str) -> str:
+    """Validate the repository string is owner/repo with no path traversal.
+
+    Reject Windows backslash separators and ``..`` segments so a crafted
+    repository cannot escape GWO_HOME. The owner/repo parts must not contain
+    path separators, traversal segments, or control characters.
+    """
+    if not isinstance(repo, str):
+        raise IdentityError("repository must be a string")
+    candidate = repo.strip()
+    if not REPOSITORY_RE.fullmatch(candidate):
+        raise IdentityError("repository must be owner/repo with no separators")
+    if "\\" in candidate or ".." in candidate.split("/") or any(
+        part in ("", ".", "..") for part in candidate.split("/")
+    ):
+        raise IdentityError("repository contains forbidden path segment")
+    return candidate
+
+
 def _repo_slug(repo: str) -> str:
-    return repo.replace("/", "-")
+    """Return a collision-safe, path-safe slug for one repository.
+
+    The slug encodes the validated owner/repo as a hex digest so that no
+    caller-supplied character can ever reach the filesystem as a path
+    component. This is defense-in-depth on top of ``_validate_repository``.
+    """
+    validated = _validate_repository(repo)
+    digest = hashlib.sha256(validated.lower().encode("utf-8")).hexdigest()[:24]
+    safe = re.sub(r"[^a-z0-9-]+", "-", validated.lower()).strip("-")
+    return f"{safe[:48]}-{digest}"
 
 
-def _resolve_caller(caller_agent_id: str | None) -> str:
-    if caller_agent_id is None:
-        caller_agent_id = os.environ.get("GWO_AGENT_ID", "")
-    if not caller_agent_id or not caller_agent_id.strip():
+def _repo_path(home: str, repo: str) -> str:
+    """Resolve the repo directory and enforce it stays inside GWO_HOME."""
+    slug = _repo_slug(repo)
+    home_resolved = os.path.realpath(home)
+    repo_dir = os.path.realpath(os.path.join(home_resolved, slug))
+    if not (repo_dir == home_resolved or repo_dir.startswith(
+        home_resolved + os.sep
+    )):
+        raise IdentityError("repository path escapes GWO_HOME")
+    return repo_dir
+
+
+def _resolve_caller() -> str:
+    """Resolve caller identity from GWO_AGENT_ID on every write.
+
+    The spawn-injected ``GWO_AGENT_ID`` environment variable is the sole source
+    of caller authority. There is no override parameter and no cached identity:
+    a write whose environment no longer carries a valid identity fails, even
+    if ``connect()`` was called with an override. Identity columns are derived
+    inside the store boundary and callers can never supply them.
+    """
+    caller = os.environ.get("GWO_AGENT_ID", "")
+    if not caller or not caller.strip():
         raise IdentityError("GWO_AGENT_ID is required for every write")
-    return caller_agent_id.strip()
+    return caller.strip()
+
+
+def _resolve_connect_identity(caller_agent_id: str | None) -> str:
+    """Resolve identity at connect time from GWO_AGENT_ID.
+
+    ``caller_agent_id`` is accepted only as a connection-time convenience and
+    is NEVER stored or used to authorize writes. It cannot forge authority:
+    identity always comes from the live ``GWO_AGENT_ID`` environment variable,
+    and every write re-resolves from that source. The override is ignored so a
+    caller-supplied value can never broaden authority beyond the environment.
+    """
+    return _resolve_caller()
 
 
 def _ensure_list(value: Any) -> list[Any]:
@@ -209,12 +286,10 @@ class Store:
         db: sqlite3.Connection,
         home: str | os.PathLike[str],
         repo: str,
-        caller_agent_id: str,
     ) -> None:
         self.db = db
         self.home = os.fspath(home)
-        self.repo = repo
-        self.caller_agent_id = caller_agent_id
+        self.repo = _validate_repository(repo)
 
     @classmethod
     def connect(
@@ -224,22 +299,37 @@ class Store:
         *,
         caller_agent_id: str | None = None,
     ) -> "Store":
-        caller = _resolve_caller(caller_agent_id)
+        # Identity is resolved from GWO_AGENT_ID at connect time. The
+        # caller_agent_id override is ignored and never stored; every write
+        # re-resolves from GWO_AGENT_ID so a cached identity can never forge
+        # authority.
+        _resolve_connect_identity(caller_agent_id)
         home_path = os.fspath(home)
-        repo_dir = os.path.join(home_path, _repo_slug(repo))
+        repo_dir = _repo_path(home_path, repo)
         os.makedirs(repo_dir, exist_ok=True)
         db_path = os.path.join(repo_dir, "state.db")
         connection = sqlite3.connect(db_path)
         try:
             connection.row_factory = sqlite3.Row
+            connection.isolation_level = None
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA foreign_keys=ON")
-            store = cls(connection, home_path, repo, caller)
+            store = cls(connection, home_path, repo)
             store.run_migrations()
         except Exception:
             connection.close()
             raise
         return store
+
+    def _caller(self) -> str:
+        """Resolve caller identity from GWO_AGENT_ID for this write."""
+        return _resolve_caller()
+
+    def _reject_supplied_identity(self, supplied: Any, field: str) -> None:
+        if supplied is not None:
+            raise IdentityError(
+                f"{field} is derived from GWO_AGENT_ID and cannot be caller-supplied"
+            )
 
     def close(self) -> None:
         self.db.close()
@@ -255,33 +345,44 @@ class Store:
         return [str(row[0]) for row in rows if not str(row[0]).startswith("sqlite_")]
 
     def run_migrations(self) -> None:
-        with self.db:
-            self.db.execute(
-                "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY)"
-            )
-            applied = {
-                str(row[0])
-                for row in self.db.execute(
-                    "SELECT name FROM schema_migrations"
-                ).fetchall()
-            }
-            for name, ddl in MIGRATIONS:
-                if name in applied:
-                    continue
-                self.db.executescript(ddl)
+        self.db.execute("BEGIN IMMEDIATE")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY)"
+        )
+        applied = {
+            str(row[0])
+            for row in self.db.execute(
+                "SELECT name FROM schema_migrations"
+            ).fetchall()
+        }
+        self.db.execute("COMMIT")
+        for name, ddl in MIGRATIONS:
+            if name in applied:
+                continue
+            # executescript issues an implicit COMMIT; run it outside our
+            # explicit transaction, then record the migration in a new one.
+            self.db.executescript(ddl)
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
                 self.db.execute(
                     "INSERT INTO schema_migrations (name) VALUES (?)", (name,)
                 )
+                self.db.execute("COMMIT")
+            except BaseException:
+                try:
+                    self.db.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
 
     def _identity(self, supplied: Any, field: str) -> str:
-        if supplied is not None:
-            raise IdentityError(
-                f"{field} is derived from GWO_AGENT_ID and cannot be caller-supplied"
-            )
-        return _resolve_caller(None)
+        self._reject_supplied_identity(supplied, field)
+        return self._caller()
 
     def claim_coordinator(self) -> None:
-        with self.db:
+        caller = self._caller()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
             row = self.db.execute(
                 "SELECT agent_id, released_at FROM coordinator WHERE repo = ?",
                 (self.repo,),
@@ -291,8 +392,9 @@ class Store:
                 self.db.execute(
                     "INSERT INTO coordinator (repo, agent_id, claimed_at, released_at) "
                     "VALUES (?, ?, ?, NULL)",
-                    (self.repo, self.caller_agent_id, now),
+                    (self.repo, caller, now),
                 )
+                self.db.execute("COMMIT")
                 return
             if row["released_at"] is None:
                 raise CoordinatorBusy(
@@ -301,8 +403,15 @@ class Store:
             self.db.execute(
                 "UPDATE coordinator SET agent_id = ?, claimed_at = ?, released_at = NULL "
                 "WHERE repo = ?",
-                (self.caller_agent_id, now, self.repo),
+                (caller, now, self.repo),
             )
+            self.db.execute("COMMIT")
+        except BaseException:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
 
     def coordinator_holder(self) -> str | None:
         row = self.db.execute(
@@ -312,14 +421,16 @@ class Store:
         return str(row["agent_id"]) if row is not None else None
 
     def release_coordinator(self) -> None:
-        with self.db:
+        caller = self._caller()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
             row = self.db.execute(
                 "SELECT agent_id, released_at FROM coordinator WHERE repo = ?",
                 (self.repo,),
             ).fetchone()
             if row is None or row["released_at"] is not None:
                 raise TransitionError("no active coordinator claim to release")
-            if row["agent_id"] != self.caller_agent_id:
+            if row["agent_id"] != caller:
                 raise TransitionError(
                     "only the claiming coordinator may release"
                 )
@@ -327,6 +438,13 @@ class Store:
                 "UPDATE coordinator SET released_at = ? WHERE repo = ?",
                 (_now(), self.repo),
             )
+            self.db.execute("COMMIT")
+        except BaseException:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
 
     def create_task(
         self,
@@ -342,7 +460,8 @@ class Store:
         task_id = _new_id("t")
         hotset_json = json.dumps(_ensure_list(hotset))
         deps_json = json.dumps(_ensure_list(deps))
-        with self.db:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
             self.db.execute(
                 "INSERT INTO tasks (task_id, repo, issue, group_label, risk, "
                 "hotset_json, deps_json, status, created_by, created_at) "
@@ -359,6 +478,13 @@ class Store:
                     _now(),
                 ),
             )
+            self.db.execute("COMMIT")
+        except BaseException:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
         return self._task_row(task_id)
 
     def list_tasks(self) -> list[dict[str, Any]]:
@@ -375,13 +501,17 @@ class Store:
         hotset: list[str] | None = None,
         deps: list[str] | None = None,
     ) -> dict[str, Any]:
-        with self.db:
+        self._caller()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
             row = self.db.execute(
                 "SELECT status FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             if row is None:
                 raise TransitionError(f"unknown task {task_id}")
             if status is not None and status != row["status"]:
+                if status not in TASK_STATUSES:
+                    raise TransitionError(f"invalid task status {status}")
                 allowed = TASK_TRANSITIONS.get(str(row["status"]), ())
                 if status not in allowed:
                     raise TransitionError(
@@ -401,6 +531,13 @@ class Store:
                     "UPDATE tasks SET deps_json = ? WHERE task_id = ?",
                     (json.dumps(_ensure_list(deps)), task_id),
                 )
+            self.db.execute("COMMIT")
+        except BaseException:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
         return self._task_row(task_id)
 
     def _task_row(self, task_id: str) -> dict[str, Any]:
@@ -438,13 +575,23 @@ class Store:
     ) -> dict[str, Any]:
         actor = self._identity(dispatched_by, "dispatched_by")
         dispatch_id = _new_id("d")
-        with self.db:
-            row = self.db.execute(
-                "SELECT status FROM tasks WHERE task_id = ?", (task_id,)
-            ).fetchone()
-            if row is None:
-                raise TransitionError(f"unknown task {task_id}")
-            if row["status"] != "ready":
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            # Conditional DML: atomically flip the task from ready to
+            # dispatched. If another writer already won the race, rowcount is
+            # 0 and we reject without inserting. This makes validation and the
+            # state transition a single atomic step relative to other writers.
+            cursor = self.db.execute(
+                "UPDATE tasks SET status = 'dispatched' "
+                "WHERE task_id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            if cursor.rowcount == 0:
+                row = self.db.execute(
+                    "SELECT status FROM tasks WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                if row is None:
+                    raise TransitionError(f"unknown task {task_id}")
                 raise TransitionError(
                     f"cannot dispatch task in status {row['status']}"
                 )
@@ -468,10 +615,13 @@ class Store:
                     _now(),
                 ),
             )
-            self.db.execute(
-                "UPDATE tasks SET status = 'dispatched' WHERE task_id = ?",
-                (task_id,),
-            )
+            self.db.execute("COMMIT")
+        except BaseException:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
         return self._dispatch_row(dispatch_id)
 
     def _dispatch_row(self, dispatch_id: str) -> dict[str, Any]:
@@ -509,14 +659,22 @@ class Store:
         resolved = self._identity(actor, "actor")
         if status not in DONE_STATUSES:
             raise TransitionError(f"invalid done status {status}")
+        task_status = DONE_TO_TASK_STATUS[status]
         evidence_json = json.dumps(evidence or {})
-        with self.db:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
             dispatch = self.db.execute(
-                "SELECT agent_id, status FROM dispatches WHERE dispatch_id = ?",
+                "SELECT task_id, agent_id, status FROM dispatches WHERE dispatch_id = ?",
                 (dispatch_id,),
             ).fetchone()
             if dispatch is None:
                 raise TransitionError(f"unknown dispatch {dispatch_id}")
+            # The dispatch must belong to the supplied task; a caller cannot
+            # close one dispatch while marking an unrelated task done.
+            if dispatch["task_id"] != task_id:
+                raise TransitionError(
+                    f"dispatch {dispatch_id} does not belong to task {task_id}"
+                )
             if dispatch["agent_id"] != resolved:
                 raise IdentityError(
                     "only the dispatched agent may mark done for its dispatch"
@@ -530,6 +688,12 @@ class Store:
             ).fetchone()
             if task_row is None:
                 raise TransitionError(f"unknown task {task_id}")
+            current = str(task_row["status"])
+            allowed = TASK_TRANSITIONS.get(current, ())
+            if task_status not in allowed:
+                raise TransitionError(
+                    f"task {task_id} cannot transition {current} -> {task_status}"
+                )
             self.db.execute(
                 "UPDATE dispatches SET status = ?, terminal_evidence_json = ? "
                 "WHERE dispatch_id = ?",
@@ -537,6 +701,13 @@ class Store:
             )
             self.db.execute(
                 "UPDATE tasks SET status = ? WHERE task_id = ?",
-                (status, task_id),
+                (task_status, task_id),
             )
+            self.db.execute("COMMIT")
+        except BaseException:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
         return self._dispatch_row(dispatch_id)
