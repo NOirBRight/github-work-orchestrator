@@ -142,6 +142,137 @@ def cmd_done(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _json_value(value: str | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    try:
+        result = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {error}")
+    if not isinstance(result, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    return result
+
+
+def _json_list_or_obj(value: str | None) -> Any:
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {error}")
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    store = _store(args)
+    try:
+        msg = store.send(
+            to_agent=args.to,
+            event_type=args.type,
+            payload=_json_value(args.payload),
+            signal_id=args.signal_id,
+            in_reply_to=args.in_reply_to,
+        )
+        _emit(msg)
+        return 0
+    except gwo_store.StoreError as error:
+        return _fail(str(error))
+    finally:
+        store.close()
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    store = _store(args)
+    try:
+        msg = store.send(
+            to_agent=args.to,
+            event_type="ask",
+            payload=_json_value(args.payload),
+            signal_id=args.signal_id,
+        )
+        _emit(msg)
+        return 0
+    except gwo_store.StoreError as error:
+        return _fail(str(error))
+    finally:
+        store.close()
+
+
+def cmd_inbox(args: argparse.Namespace) -> int:
+    store = _store(args)
+    try:
+        messages = store.inbox(
+            agent_id=args.agent_id,
+            ack_on_read=args.ack_on_read,
+            dispatch_id=args.dispatch_id,
+            wait=args.wait,
+        )
+        _emit(messages)
+        return 0
+    except gwo_store.StoreError as error:
+        return _fail(str(error))
+    finally:
+        store.close()
+
+
+def cmd_agent(args: argparse.Namespace) -> int:
+    store = _store(args)
+    try:
+        if args.action == "status":
+            status = store.agent_status(args.agent_id)
+            _emit(status)
+            return 0
+        if args.action == "register":
+            row = store.register_agent(
+                agent_id=args.agent_id,
+                adapter=args.adapter,
+                runtime_ref=args.runtime_ref,
+                role=args.role,
+                group_label=args.group_label,
+                session_id=args.session_id,
+                pid=args.pid,
+            )
+            _emit(row)
+            return 0
+        return _fail(f"unknown agent action: {args.action}")
+    except gwo_store.StoreError as error:
+        return _fail(str(error))
+    finally:
+        store.close()
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    store = _store(args)
+    try:
+        if args.action == "check":
+            result = store.config_check()
+            _emit(result)
+            return 0
+        return _fail(f"unknown config action: {args.action}")
+    except gwo_store.StoreError as error:
+        return _fail(str(error))
+    finally:
+        store.close()
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    store = _store(args)
+    try:
+        if args.action == "rebuild":
+            result = store.doctor_rebuild(
+                github_snapshot=_json_list_or_obj(args.github_snapshot),
+                adapter_listing=_json_list_or_obj(args.adapter_listing),
+                git_worktrees=_json_list_or_obj(args.git_worktrees),
+            )
+            _emit(result)
+            return 0
+        return _fail(f"unknown doctor action: {args.action}")
+    except gwo_store.StoreError as error:
+        return _fail(str(error))
+    finally:
+        store.close()
+
+
 def _json_list(value: str | None) -> list[str] | None:
     if value is None:
         return None
@@ -216,6 +347,57 @@ def build_parser() -> argparse.ArgumentParser:
     done.add_argument("--status", required=True, choices=("done", "blocked", "stopped"))
     done.add_argument("--actor", default=None, help=argparse.SUPPRESS)
     done.set_defaults(func=cmd_done)
+
+    send = sub.add_parser("send", help="post one mailbox event")
+    send.add_argument("--to", required=True, help="recipient agent id")
+    send.add_argument("--type", required=True, help="event type")
+    send.add_argument("--signal-id", required=True, dest="signal_id")
+    send.add_argument("--payload", default=None, help="JSON object payload")
+    send.add_argument("--in-reply-to", default=None, dest="in_reply_to")
+    send.set_defaults(func=cmd_send)
+
+    ask = sub.add_parser("ask", help="post an ask event (blocking sugar over send)")
+    ask.add_argument("--to", required=True, help="recipient agent id")
+    ask.add_argument("--signal-id", required=True, dest="signal_id")
+    ask.add_argument("--payload", default=None, help="JSON object payload")
+    ask.set_defaults(func=cmd_ask)
+
+    inbox = sub.add_parser("inbox", help="read/wait for mailbox events")
+    inbox.add_argument("--agent-id", required=True, dest="agent_id")
+    inbox.add_argument("--ack-on-read", action="store_true", dest="ack_on_read")
+    inbox.add_argument("--dispatch-id", default=None, dest="dispatch_id")
+    inbox.add_argument("--wait", type=float, default=None)
+    inbox.set_defaults(func=cmd_inbox)
+
+    agent = sub.add_parser("agent", help="agent status and registration")
+    agent_sub = agent.add_subparsers(dest="action", required=True)
+
+    agent_status = agent_sub.add_parser("status")
+    agent_status.add_argument("agent_id")
+    agent_status.set_defaults(func=cmd_agent)
+
+    agent_register = agent_sub.add_parser("register")
+    agent_register.add_argument("--agent-id", required=True, dest="agent_id")
+    agent_register.add_argument("--adapter", required=True)
+    agent_register.add_argument("--runtime-ref", default=None, dest="runtime_ref")
+    agent_register.add_argument("--role", required=True)
+    agent_register.add_argument("--group-label", default=None, dest="group_label")
+    agent_register.add_argument("--session-id", default=None, dest="session_id")
+    agent_register.add_argument("--pid", type=int, default=None)
+    agent_register.set_defaults(func=cmd_agent)
+
+    config = sub.add_parser("config", help="configuration validation")
+    config_sub = config.add_subparsers(dest="action", required=True)
+    config_check = config_sub.add_parser("check")
+    config_check.set_defaults(func=cmd_config)
+
+    doctor = sub.add_parser("doctor", help="store rebuild and recovery")
+    doctor_sub = doctor.add_subparsers(dest="action", required=True)
+    doctor_rebuild = doctor_sub.add_parser("rebuild")
+    doctor_rebuild.add_argument("--github-snapshot", required=True, dest="github_snapshot")
+    doctor_rebuild.add_argument("--adapter-listing", required=True, dest="adapter_listing")
+    doctor_rebuild.add_argument("--git-worktrees", required=True, dest="git_worktrees")
+    doctor_rebuild.set_defaults(func=cmd_doctor)
 
     return parser
 

@@ -196,6 +196,14 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
         );
         """,
     ),
+    (
+        "0002-messages-in-reply-to",
+        """
+        ALTER TABLE messages ADD COLUMN in_reply_to TEXT;
+        CREATE INDEX IF NOT EXISTS idx_messages_from_seq
+            ON messages (from_agent, seq);
+        """,
+    ),
 )
 
 
@@ -799,3 +807,93 @@ class Store:
                 pass
             raise
         return self._dispatch_row(dispatch_id)
+
+    # --- Phase 1 mailbox / event delivery (gwo_mailbox delegation) ---------
+
+    def register_agent(
+        self,
+        *,
+        agent_id: str,
+        adapter: str,
+        runtime_ref: str | None,
+        role: str,
+        group_label: str | None = None,
+        session_id: str | None = None,
+        pid: int | None = None,
+    ) -> dict[str, Any]:
+        """Register or refresh an agent row. Coordinator-only."""
+        import gwo_mailbox  # local import to avoid circular at module load
+        return gwo_mailbox.register_agent(
+            self,
+            agent_id=agent_id,
+            adapter=adapter,
+            runtime_ref=runtime_ref,
+            role=role,
+            group_label=group_label,
+            session_id=session_id,
+            pid=pid,
+        )
+
+    def send(
+        self,
+        *,
+        to_agent: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        signal_id: str,
+        in_reply_to: str | None = None,
+    ) -> dict[str, Any]:
+        """Post one mailbox event with entitlement and idempotency checks."""
+        import gwo_mailbox
+        return gwo_mailbox.send(
+            self,
+            to_agent=to_agent,
+            event_type=event_type,
+            payload=payload,
+            signal_id=signal_id,
+            in_reply_to=in_reply_to,
+        )
+
+    def inbox(
+        self,
+        *,
+        agent_id: str,
+        ack_on_read: bool = False,
+        dispatch_id: str | None = None,
+        wait: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read (and optionally acknowledge) messages addressed to agent_id."""
+        import gwo_mailbox
+        return gwo_mailbox.inbox(
+            self,
+            agent_id=agent_id,
+            ack_on_read=ack_on_read,
+            dispatch_id=dispatch_id,
+            wait=wait,
+        )
+
+    def agent_status(self, agent_id: str) -> dict[str, Any]:
+        """Return the runtime status of one agent."""
+        import gwo_mailbox
+        return gwo_mailbox.agent_status(self, agent_id)
+
+    def config_check(self, *, gwo_home: str | None = None) -> dict[str, Any]:
+        """Validate the GWO configuration."""
+        import gwo_mailbox
+        return gwo_mailbox.config_check(self, gwo_home=gwo_home)
+
+    def doctor_rebuild(
+        self,
+        *,
+        github_snapshot: dict[str, Any],
+        adapter_listing: list[dict[str, Any]],
+        git_worktrees: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Rebuild the store from GitHub + adapter readback (additive, fail-closed)."""
+        import gwo_mailbox
+        return gwo_mailbox.doctor_rebuild(
+            self,
+            github_snapshot=github_snapshot,
+            adapter_listing=adapter_listing,
+            git_worktrees=git_worktrees,
+        )
