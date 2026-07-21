@@ -31,7 +31,13 @@ def load_store():
 class StoreFixture:
     """Open a store against an isolated temporary GWO_HOME."""
 
-    def __init__(self, test_case: unittest.TestCase, *, repo: str = "owner/repo"):
+    def __init__(
+        self,
+        test_case: unittest.TestCase,
+        *,
+        repo: str = "owner/repo",
+        claim: bool = True,
+    ):
         self.test_case = test_case
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
@@ -46,6 +52,8 @@ class StoreFixture:
         self.store = self.store_mod.Store.connect(
             self.home, repo, caller_agent_id="coordinator-001"
         )
+        if claim:
+            self.store.claim_coordinator()
 
     def cleanup(self) -> None:
         self.store.close()
@@ -95,7 +103,6 @@ class SchemaTests(unittest.TestCase):
 
     def test_reopen_preserves_state_and_reuses_wal_mode(self) -> None:
         self.store_mod = load_store()
-        self.store.claim_coordinator()
         self.store.close()
         reopened = self.store_mod.Store.connect(
             self.fixture.home, self.fixture.repo, caller_agent_id="coordinator-001"
@@ -176,20 +183,20 @@ class IdentityTests(unittest.TestCase):
             )
 
     def test_done_records_caller_identity_from_agent_id(self) -> None:
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        dispatch = self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-001",
+            worktree="/tmp/wt-42",
+            branch="work/issue-42",
+        )
         os.environ["GWO_AGENT_ID"] = "worker-001"
         self.store_mod = load_store()
         store = self.store_mod.Store.connect(
             self.fixture.home, self.fixture.repo, caller_agent_id="worker-001"
         )
         try:
-            task = store.create_task(issue=42, group_label="g-42", risk="standard")
-            store.update_task(task_id=task["task_id"], status="ready")
-            dispatch = store.create_dispatch(
-                task_id=task["task_id"],
-                agent_id="worker-001",
-                worktree="/tmp/wt-42",
-                branch="work/issue-42",
-            )
             store.mark_done(
                 task_id=task["task_id"],
                 dispatch_id=dispatch["dispatch_id"],
@@ -200,20 +207,20 @@ class IdentityTests(unittest.TestCase):
         os.environ["GWO_AGENT_ID"] = "coordinator-001"
 
     def test_done_rejects_caller_supplied_identity(self) -> None:
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        dispatch = self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-001",
+            worktree="/tmp/wt-42",
+            branch="work/issue-42",
+        )
         os.environ["GWO_AGENT_ID"] = "worker-001"
         self.store_mod = load_store()
         store = self.store_mod.Store.connect(
             self.fixture.home, self.fixture.repo, caller_agent_id="worker-001"
         )
         try:
-            task = store.create_task(issue=42, group_label="g-42", risk="standard")
-            store.update_task(task_id=task["task_id"], status="ready")
-            dispatch = store.create_dispatch(
-                task_id=task["task_id"],
-                agent_id="worker-001",
-                worktree="/tmp/wt-42",
-                branch="work/issue-42",
-            )
             with self.assertRaises(self.store_mod.IdentityError):
                 store.mark_done(
                     task_id=task["task_id"],
@@ -228,7 +235,7 @@ class IdentityTests(unittest.TestCase):
 
 class CoordinatorLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fixture = StoreFixture(self, repo="owner/repo")
+        self.fixture = StoreFixture(self, repo="owner/repo", claim=False)
         self.store = self.fixture.store
         self.store_mod = self.fixture.store_mod
 
@@ -501,7 +508,6 @@ class TransactionTests(unittest.TestCase):
     def test_two_writers_serialize_without_partial_state(self) -> None:
         task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
         self.store.update_task(task_id=task["task_id"], status="ready")
-        self.store.claim_coordinator()
         os.environ["GWO_AGENT_ID"] = "other-002"
         other = self.store_mod.Store.connect(
             self.fixture.home, self.fixture.repo
@@ -796,17 +802,16 @@ class IdentityOverrideTests(unittest.TestCase):
         self.fixture.cleanup()
 
     def test_connect_override_cannot_forge_task_author(self) -> None:
-        os.environ["GWO_AGENT_ID"] = "worker-001"
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
         self.store_mod = load_store()
         forged = self.store_mod.Store.connect(
             self.fixture.home, self.fixture.repo, caller_agent_id="attacker"
         )
         try:
             task = forged.create_task(issue=42, group_label="g-42", risk="standard")
-            self.assertEqual("worker-001", task["created_by"])
+            self.assertEqual("coordinator-001", task["created_by"])
         finally:
             forged.close()
-        os.environ["GWO_AGENT_ID"] = "coordinator-001"
 
     def test_connect_override_cannot_forge_dispatch_author(self) -> None:
         os.environ["GWO_AGENT_ID"] = "coordinator-001"
@@ -844,7 +849,6 @@ class IdentityOverrideTests(unittest.TestCase):
             os.environ["GWO_AGENT_ID"] = saved
 
     def test_release_fails_after_gwo_agent_id_removed(self) -> None:
-        self.store.claim_coordinator()
         saved = os.environ.pop("GWO_AGENT_ID")
         try:
             with self.assertRaises(self.store_mod.IdentityError):
@@ -1141,6 +1145,467 @@ class MigrationIdentityTests(unittest.TestCase):
                     store_mod.Store.connect(self.fixture.home, self.fixture.repo)
             finally:
                 os.environ["GWO_AGENT_ID"] = saved
+        finally:
+            store_mod.MIGRATIONS = original_migrations
+
+
+class CoordinatorClaimAuthorizationTests(unittest.TestCase):
+    """Finding 1: create_task, update_task, and create_dispatch are
+    Coordinator-owned operations. They must require the caller to hold the
+    active repository coordinator claim, checked inside the same write
+    transaction. A foreign worker (or an unclaimed repo) must not be able to
+    create/mutate tasks or dispatch to an attacker-selected agent.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = StoreFixture(self, repo="owner/repo", claim=False)
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_create_task_rejected_when_no_active_claim(self) -> None:
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
+            self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.assertIn("coordinator", str(ctx.exception).lower())
+        self.assertEqual(0, len(self.store.list_tasks()))
+
+    def test_create_task_rejected_for_foreign_caller_without_claim(self) -> None:
+        self.store.claim_coordinator()
+        os.environ["GWO_AGENT_ID"] = "worker-foreign"
+        foreign = self.store_mod.Store.connect(
+            self.fixture.home, self.fixture.repo
+        )
+        try:
+            with self.assertRaises(self.store_mod.IdentityError) as ctx:
+                foreign.create_task(issue=42, group_label="g-42", risk="standard")
+            self.assertIn("coordinator", str(ctx.exception).lower())
+        finally:
+            foreign.close()
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertEqual(0, len(self.store.list_tasks()))
+
+    def test_create_task_succeeds_for_active_claim_holder(self) -> None:
+        self.store.claim_coordinator()
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.assertEqual("coordinator-001", task["created_by"])
+
+    def test_update_task_rejected_when_no_active_claim(self) -> None:
+        self.store.claim_coordinator()
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.store.release_coordinator()
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
+            self.store.update_task(task_id=task["task_id"], status="ready")
+        self.assertIn("coordinator", str(ctx.exception).lower())
+        self.assertEqual("pending", self.store.list_tasks()[0]["status"])
+
+    def test_update_task_rejected_for_foreign_caller(self) -> None:
+        self.store.claim_coordinator()
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        os.environ["GWO_AGENT_ID"] = "worker-foreign"
+        foreign = self.store_mod.Store.connect(
+            self.fixture.home, self.fixture.repo
+        )
+        try:
+            with self.assertRaises(self.store_mod.IdentityError) as ctx:
+                foreign.update_task(task_id=task["task_id"], status="ready")
+            self.assertIn("coordinator", str(ctx.exception).lower())
+        finally:
+            foreign.close()
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertEqual("pending", self.store.list_tasks()[0]["status"])
+
+    def test_create_dispatch_rejected_when_no_active_claim(self) -> None:
+        self.store.claim_coordinator()
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        self.store.release_coordinator()
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
+            self.store.create_dispatch(
+                task_id=task["task_id"],
+                agent_id="worker-001",
+                worktree="/tmp/wt-42",
+                branch="work/issue-42",
+            )
+        self.assertIn("coordinator", str(ctx.exception).lower())
+        active = int(self.store.db.execute(
+            "SELECT COUNT(*) FROM dispatches WHERE task_id = ? AND status = 'active'",
+            (task["task_id"],),
+        ).fetchone()[0])
+        self.assertEqual(0, active)
+        self.assertEqual("ready", self.store.list_tasks()[0]["status"])
+
+    def test_create_dispatch_rejected_for_foreign_caller(self) -> None:
+        self.store.claim_coordinator()
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        os.environ["GWO_AGENT_ID"] = "worker-foreign"
+        foreign = self.store_mod.Store.connect(
+            self.fixture.home, self.fixture.repo
+        )
+        try:
+            with self.assertRaises(self.store_mod.IdentityError) as ctx:
+                foreign.create_dispatch(
+                    task_id=task["task_id"],
+                    agent_id="attacker-agent",
+                    worktree="/tmp/evil",
+                    branch="evil",
+                )
+            self.assertIn("coordinator", str(ctx.exception).lower())
+        finally:
+            foreign.close()
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        active = int(self.store.db.execute(
+            "SELECT COUNT(*) FROM dispatches WHERE task_id = ? AND status = 'active'",
+            (task["task_id"],),
+        ).fetchone()[0])
+        self.assertEqual(0, active, "foreign caller must not dispatch")
+        self.assertEqual("ready", self.store.list_tasks()[0]["status"])
+
+    def test_create_dispatch_succeeds_for_active_claim_holder(self) -> None:
+        self.store.claim_coordinator()
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        dispatch = self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-001",
+            worktree="/tmp/wt-42",
+            branch="work/issue-42",
+        )
+        self.assertEqual("active", dispatch["status"])
+
+    def test_release_then_reclaim_restores_authorization(self) -> None:
+        self.store.claim_coordinator()
+        task = self.store.create_task(issue=42, group_label="g-42", risk="standard")
+        self.store.release_coordinator()
+        with self.assertRaises(self.store_mod.IdentityError):
+            self.store.update_task(task_id=task["task_id"], status="ready")
+        self.store.claim_coordinator()
+        updated = self.store.update_task(task_id=task["task_id"], status="ready")
+        self.assertEqual("ready", updated["status"])
+
+
+class MigrationConcurrencyTests(unittest.TestCase):
+    """Finding 2: migration discovery occurs before the per-migration
+    transaction. Two synchronized Store.connect calls can both observe the same
+    pending migration; one succeeds and the other fails on
+    schema_migrations.name uniqueness. The migration row must be claimed or
+    re-checked under the same BEGIN IMMEDIATE that applies DDL and records
+    completion.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = StoreFixture(self, repo="owner/repo")
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_concurrent_connect_does_not_raise_uniqueness_error(self) -> None:
+        store_mod = self.store_mod
+        original_migrations = store_mod.MIGRATIONS
+        probe_ddl = (
+            "CREATE TABLE IF NOT EXISTS migration_concurrency_probe "
+            "(id INTEGER PRIMARY KEY)"
+        )
+        store_mod.MIGRATIONS = original_migrations + (
+            ("9995-concurrent-probe", probe_ddl),
+        )
+        self.store.close()
+        try:
+            os.environ["GWO_AGENT_ID"] = "coordinator-001"
+            first = store_mod.Store.connect(
+                self.fixture.home, self.fixture.repo, caller_agent_id="coordinator-001"
+            )
+            first.close()
+            second = store_mod.Store.connect(
+                self.fixture.home, self.fixture.repo, caller_agent_id="coordinator-001"
+            )
+            try:
+                records = {
+                    str(row[0])
+                    for row in second.db.execute(
+                        "SELECT name FROM schema_migrations"
+                    ).fetchall()
+                }
+                self.assertIn("9995-concurrent-probe", records)
+                self.assertEqual(
+                    1,
+                    len(second.db.execute(
+                        "SELECT name FROM schema_migrations WHERE name = '9995-concurrent-probe'"
+                    ).fetchall()),
+                    "migration must be recorded exactly once across connects",
+                )
+                self.assertIn(
+                    "migration_concurrency_probe", set(second.table_names())
+                )
+            finally:
+                second.close()
+        finally:
+            store_mod.MIGRATIONS = original_migrations
+
+    def test_concurrent_discovery_then_apply_serializes_cleanly(self) -> None:
+        """Reproduce the race: both writers discover the pending migration
+        before either applies it. Writer A commits the migration. Writer B,
+        holding a stale 'pending' snapshot, must not fail with a uniqueness
+        error; it must re-check under its own BEGIN IMMEDIATE and skip the
+        already-applied migration."""
+        store_mod = self.store_mod
+        original_migrations = store_mod.MIGRATIONS
+        probe_ddl = (
+            "CREATE TABLE IF NOT EXISTS migration_concurrency_probe3 "
+            "(id INTEGER PRIMARY KEY)"
+        )
+        migration_name = "9993b-concurrent-probe3"
+        store_mod.MIGRATIONS = original_migrations + (
+            (migration_name, probe_ddl),
+        )
+        slug = store_mod._repo_slug("owner/repo")
+        db_path = str(self.fixture.home / slug / "state.db")
+        try:
+            b_raw = sqlite3.connect(db_path)
+            b_raw.row_factory = sqlite3.Row
+            b_raw.isolation_level = None
+            b_raw.execute("BEGIN IMMEDIATE")
+            b_raw.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY)"
+            )
+            b_discovered = {
+                str(row[0])
+                for row in b_raw.execute(
+                    "SELECT name FROM schema_migrations"
+                ).fetchall()
+            }
+            self.assertNotIn(
+                migration_name, b_discovered,
+                "B must observe the migration as pending before A applies it",
+            )
+            b_raw.execute("COMMIT")
+            os.environ["GWO_AGENT_ID"] = "coordinator-001"
+            a_store = store_mod.Store.connect(
+                self.fixture.home, self.fixture.repo, caller_agent_id="coordinator-001"
+            )
+            a_store.close()
+            b_store = store_mod.Store.connect(
+                self.fixture.home, self.fixture.repo, caller_agent_id="coordinator-001"
+            )
+            try:
+                b_store.run_migrations()
+                records = {
+                    str(row[0])
+                    for row in b_store.db.execute(
+                        "SELECT name FROM schema_migrations"
+                    ).fetchall()
+                }
+                self.assertIn(migration_name, records)
+                self.assertEqual(
+                    1,
+                    len(b_store.db.execute(
+                        "SELECT name FROM schema_migrations WHERE name = ?",
+                        (migration_name,),
+                    ).fetchall()),
+                    "migration must be recorded exactly once after the race",
+                )
+            finally:
+                b_store.close()
+                b_raw.close()
+        finally:
+            store_mod.MIGRATIONS = original_migrations
+
+    def test_apply_migration_rechecks_row_under_same_transaction(self) -> None:
+        """Directly reproduce the uniqueness race: A applies the migration,
+        then B calls _apply_migration for the same name. B must re-check the
+        schema_migrations row under its own BEGIN IMMEDIATE and skip cleanly
+        rather than raising a uniqueness error."""
+        store_mod = self.store_mod
+        original_migrations = store_mod.MIGRATIONS
+        probe_ddl = (
+            "CREATE TABLE IF NOT EXISTS migration_concurrency_probe4 "
+            "(id INTEGER PRIMARY KEY)"
+        )
+        migration_name = "9993c-concurrent-probe4"
+        store_mod.MIGRATIONS = original_migrations + (
+            (migration_name, probe_ddl),
+        )
+        try:
+            os.environ["GWO_AGENT_ID"] = "coordinator-001"
+            a_store = store_mod.Store.connect(
+                self.fixture.home, self.fixture.repo, caller_agent_id="coordinator-001"
+            )
+            a_store.close()
+            b_store = store_mod.Store.connect(
+                self.fixture.home, self.fixture.repo, caller_agent_id="coordinator-001"
+            )
+            try:
+                b_store._apply_migration(migration_name, probe_ddl, "coordinator-001")
+                records = {
+                    str(row[0])
+                    for row in b_store.db.execute(
+                        "SELECT name FROM schema_migrations"
+                    ).fetchall()
+                }
+                self.assertIn(migration_name, records)
+                self.assertEqual(
+                    1,
+                    len(b_store.db.execute(
+                        "SELECT name FROM schema_migrations WHERE name = ?",
+                        (migration_name,),
+                    ).fetchall()),
+                    "migration must be recorded exactly once after duplicate apply",
+                )
+            finally:
+                b_store.close()
+        finally:
+            store_mod.MIGRATIONS = original_migrations
+
+    def test_concurrent_migration_claim_serializes_cleanly(self) -> None:
+        store_mod = self.store_mod
+        original_migrations = store_mod.MIGRATIONS
+        probe_ddl = (
+            "CREATE TABLE IF NOT EXISTS migration_concurrency_probe2 "
+            "(id INTEGER PRIMARY KEY)"
+        )
+        store_mod.MIGRATIONS = original_migrations + (
+            ("9994-concurrent-probe2", probe_ddl),
+        )
+        try:
+            slug = store_mod._repo_slug("owner/repo")
+            db_path = str(self.fixture.home / slug / "state.db")
+            a_raw = sqlite3.connect(db_path)
+            a_raw.row_factory = sqlite3.Row
+            a_raw.isolation_level = None
+            try:
+                a_raw.execute("BEGIN IMMEDIATE")
+                a_raw.execute(
+                    "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY)"
+                )
+                a_raw.execute(
+                    "INSERT INTO schema_migrations (name) VALUES (?)",
+                    ("9994-concurrent-probe2",),
+                )
+                a_raw.execute(probe_ddl)
+                a_raw.execute("COMMIT")
+                os.environ["GWO_AGENT_ID"] = "coordinator-001"
+                reopened = store_mod.Store.connect(
+                    self.fixture.home, self.fixture.repo, caller_agent_id="coordinator-001"
+                )
+                try:
+                    records = {
+                        str(row[0])
+                        for row in reopened.db.execute(
+                            "SELECT name FROM schema_migrations"
+                        ).fetchall()
+                    }
+                    self.assertIn("9994-concurrent-probe2", records)
+                    self.assertEqual(
+                        1,
+                        len(reopened.db.execute(
+                            "SELECT name FROM schema_migrations WHERE name = '9994-concurrent-probe2'"
+                        ).fetchall()),
+                        "migration must be recorded exactly once",
+                    )
+                finally:
+                    reopened.close()
+            finally:
+                a_raw.close()
+        finally:
+            store_mod.MIGRATIONS = original_migrations
+
+
+class MigrationStatementParserTests(unittest.TestCase):
+    """Finding 3: ddl.split(';') is not a SQLite statement parser and breaks
+    valid literals/comments/triggers containing semicolons. Use
+    sqlite3.complete_statement or explicit statement sequences while
+    preserving atomic rollback.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = StoreFixture(self, repo="owner/repo")
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_semicolon_in_string_literal_is_not_split(self) -> None:
+        store_mod = self.store_mod
+        original_migrations = store_mod.MIGRATIONS
+        ddl = (
+            "CREATE TABLE IF NOT EXISTS migration_literal_probe "
+            "(id INTEGER PRIMARY KEY, note TEXT); "
+            "INSERT INTO migration_literal_probe (id, note) VALUES "
+            "(1, 'semi;colon;in;literal')"
+        )
+        store_mod.MIGRATIONS = original_migrations + (
+            ("9993-literal", ddl),
+        )
+        try:
+            self.store.run_migrations()
+            records = self.store.db.execute(
+                "SELECT name FROM schema_migrations WHERE name = '9993-literal'"
+            ).fetchall()
+            self.assertEqual(1, len(records))
+            row = self.store.db.execute(
+                "SELECT note FROM migration_literal_probe WHERE id = 1"
+            ).fetchone()
+            self.assertEqual("semi;colon;in;literal", row["note"])
+        finally:
+            store_mod.MIGRATIONS = original_migrations
+
+    def test_semicolon_in_sql_comment_is_not_split(self) -> None:
+        store_mod = self.store_mod
+        original_migrations = store_mod.MIGRATIONS
+        ddl = (
+            "CREATE TABLE IF NOT EXISTS migration_comment_probe "
+            "(id INTEGER PRIMARY KEY); "
+            "-- this comment has a ; semicolon in it\n"
+            "CREATE TABLE IF NOT EXISTS migration_comment_probe2 "
+            "(id INTEGER PRIMARY KEY)"
+        )
+        store_mod.MIGRATIONS = original_migrations + (
+            ("9992-comment", ddl),
+        )
+        try:
+            self.store.run_migrations()
+            records = self.store.db.execute(
+                "SELECT name FROM schema_migrations WHERE name = '9992-comment'"
+            ).fetchall()
+            self.assertEqual(1, len(records))
+            tables = set(self.store.table_names())
+            self.assertIn("migration_comment_probe", tables)
+            self.assertIn("migration_comment_probe2", tables)
+        finally:
+            store_mod.MIGRATIONS = original_migrations
+
+    def test_rollback_preserved_with_literal_containing_semicolon(self) -> None:
+        store_mod = self.store_mod
+        original_migrations = store_mod.MIGRATIONS
+        ddl = (
+            "CREATE TABLE IF NOT EXISTS migration_rollback_probe "
+            "(id INTEGER PRIMARY KEY, note TEXT); "
+            "INSERT INTO migration_rollback_probe (id, note) VALUES "
+            "(1, 'a;b;c'); "
+            "CREATE TABLE migration_rollback_dup (id INTEGER PRIMARY KEY); "
+            "CREATE TABLE migration_rollback_dup (id INTEGER PRIMARY KEY)"
+        )
+        store_mod.MIGRATIONS = original_migrations + (
+            ("9991-rollback-literal", ddl),
+        )
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.run_migrations()
+            records = self.store.db.execute(
+                "SELECT name FROM schema_migrations WHERE name = '9991-rollback-literal'"
+            ).fetchall()
+            self.assertEqual(0, len(records), "failed migration must not be recorded")
+            tables = set(self.store.table_names())
+            self.assertNotIn(
+                "migration_rollback_probe",
+                tables,
+                "first DDL must roll back with the failing migration",
+            )
         finally:
             store_mod.MIGRATIONS = original_migrations
 

@@ -286,6 +286,30 @@ def _ensure_list(value: Any) -> list[Any]:
     raise IdentityError("expected a list, got " + type(value).__name__)
 
 
+def _split_sql_statements(ddl: str) -> list[str]:
+    """Split a DDL string into individual SQL statements.
+
+    Uses ``sqlite3.complete_statement`` to find statement boundaries so
+    semicolons inside string literals, comments, and trigger bodies do not
+    falsely terminate a statement. Returns only non-empty stripped statements.
+    """
+    statements: list[str] = []
+    buffer = ""
+    remaining = ddl
+    while remaining:
+        buffer += remaining[:1]
+        remaining = remaining[1:]
+        if sqlite3.complete_statement(buffer):
+            stripped = buffer.strip()
+            if stripped:
+                statements.append(stripped)
+            buffer = ""
+    stripped = buffer.strip()
+    if stripped:
+        statements.append(stripped)
+    return statements
+
+
 class Store:
     """A SQLite coordination cache under GWO_HOME."""
 
@@ -381,12 +405,19 @@ class Store:
     def _apply_migration(self, name: str, ddl: str, caller: str) -> None:
         # Execute each migration and its schema_migrations record in one
         # transaction so a failure in any DDL statement rolls back the whole
-        # migration (no DDL left without a record). executescript issues an
-        # implicit COMMIT, so we split the DDL into statements and execute
-        # them one by one inside an explicit BEGIN IMMEDIATE transaction.
-        statements = [stmt.strip() for stmt in ddl.split(";") if stmt.strip()]
+        # migration (no DDL left without a record). Re-check the migration row
+        # under the same BEGIN IMMEDIATE so two concurrent writers cannot both
+        # apply the same migration: the loser sees the row inserted by the
+        # winner and skips cleanly instead of raising a uniqueness error.
+        statements = _split_sql_statements(ddl)
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            existing = self.db.execute(
+                "SELECT name FROM schema_migrations WHERE name = ?", (name,)
+            ).fetchone()
+            if existing is not None:
+                self.db.execute("ROLLBACK")
+                return
             for statement in statements:
                 self.db.execute(statement)
             self.db.execute(
@@ -403,6 +434,27 @@ class Store:
     def _identity(self, supplied: Any, field: str) -> str:
         self._reject_supplied_identity(supplied, field)
         return self._caller()
+
+    def _require_coordinator_claim(self, caller: str) -> None:
+        """Require the caller to hold the active repository coordinator claim.
+
+        Must be called inside the same BEGIN IMMEDIATE write transaction that
+        performs the Coordinator-owned mutation so authorization and the state
+        change are atomic. A foreign worker or an unclaimed repo cannot create
+        or mutate tasks or dispatch.
+        """
+        row = self.db.execute(
+            "SELECT agent_id FROM coordinator WHERE repo = ? AND released_at IS NULL",
+            (self.repo,),
+        ).fetchone()
+        if row is None:
+            raise IdentityError(
+                f"coordinator claim required for repo {self.repo}"
+            )
+        if str(row["agent_id"]) != caller:
+            raise IdentityError(
+                "only the active coordinator claim holder may perform this operation"
+            )
 
     def claim_coordinator(self) -> None:
         caller = self._caller()
@@ -487,6 +539,7 @@ class Store:
         deps_json = json.dumps(_ensure_list(deps))
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            self._require_coordinator_claim(actor)
             self.db.execute(
                 "INSERT INTO tasks (task_id, repo, issue, group_label, risk, "
                 "hotset_json, deps_json, status, created_by, created_at) "
@@ -526,9 +579,10 @@ class Store:
         hotset: list[str] | None = None,
         deps: list[str] | None = None,
     ) -> dict[str, Any]:
-        self._caller()
+        caller = self._caller()
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            self._require_coordinator_claim(caller)
             row = self.db.execute(
                 "SELECT status FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
@@ -602,6 +656,7 @@ class Store:
         dispatch_id = _new_id("d")
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            self._require_coordinator_claim(actor)
             # Conditional DML: atomically flip the task from ready to
             # dispatched. If another writer already won the race, rowcount is
             # 0 and we reject without inserting. This makes validation and the

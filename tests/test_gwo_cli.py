@@ -17,7 +17,7 @@ SCRIPT_DIR = str(GWO_PY.parent)
 class CliFixture:
     """Run gwo.py against an isolated temporary GWO_HOME."""
 
-    def __init__(self, repo: str = "owner/repo") -> None:
+    def __init__(self, repo: str = "owner/repo", *, claim: bool = False) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.repo = repo
@@ -29,6 +29,8 @@ class CliFixture:
         os.environ["GWO_HOME"] = str(self.home)
         os.environ["GWO_AGENT_ID"] = "coordinator-001"
         os.environ["PYTHONPATH"] = SCRIPT_DIR + os.pathsep + os.environ.get("PYTHONPATH", "")
+        if claim:
+            self.run("coordinator", "claim")
 
     def cleanup(self) -> None:
         for key, value in self._saved_env.items():
@@ -78,7 +80,7 @@ class CliCoordinatorTests(unittest.TestCase):
 
 class CliTaskTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fixture = CliFixture()
+        self.fixture = CliFixture(claim=True)
 
     def tearDown(self) -> None:
         self.fixture.cleanup()
@@ -122,7 +124,7 @@ class CliTaskTests(unittest.TestCase):
 
 class CliDispatchDoneTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fixture = CliFixture()
+        self.fixture = CliFixture(claim=True)
 
     def tearDown(self) -> None:
         self.fixture.cleanup()
@@ -188,7 +190,7 @@ class CliDispatchDoneTests(unittest.TestCase):
 
 class CliIdentityTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fixture = CliFixture()
+        self.fixture = CliFixture(claim=True)
 
     def tearDown(self) -> None:
         self.fixture.cleanup()
