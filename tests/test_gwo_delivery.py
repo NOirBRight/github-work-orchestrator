@@ -187,7 +187,11 @@ class RoleEntitlementTests(unittest.TestCase):
                 payload={},
                 signal_id="sig-done-bbbbbbbbbb",
             )
-        self.assertIn("not entitled", str(ctx.exception).lower())
+        msg = str(ctx.exception).lower()
+        self.assertTrue(
+            "not entitled" in msg or "dispatch_id" in msg,
+            f"expected entitlement or dispatch_id error, got: {msg}",
+        )
 
     def test_coordinator_can_send_reply_to_worker(self) -> None:
         with self.fixture.as_agent("worker-001"):
@@ -262,7 +266,11 @@ class RoleEntitlementTests(unittest.TestCase):
                     signal_id="sig-imp-aaaaaaaaaa",
                 )
         msg = str(ctx.exception).lower()
-        self.assertTrue("not entitled" in msg or "no registered role" in msg, msg)
+        self.assertTrue(
+            "not entitled" in msg or "no registered role" in msg
+            or "does not match dispatch" in msg,
+            f"expected impersonation rejection, got: {msg}",
+        )
 
 
 class SequenceTests(unittest.TestCase):
@@ -2944,6 +2952,305 @@ class DuplicateIssueEvidenceTests(unittest.TestCase):
         self.store.create_task(issue=200, group_label="g-200", risk="standard")
         with self.assertRaises(self.fixture.store_mod.StoreError):
             self.store.create_task(issue=200, group_label="g-200", risk="standard")
+
+
+# ---------------------------------------------------------------------------
+# Sixth commit-bound heavy review regression tests. Each test reproduces one
+# finding from the review before the fix lands.
+# ---------------------------------------------------------------------------
+
+
+class SiblingDispatchInboxLeakTests(unittest.TestCase):
+    """Finding 1: dispatch-scoped inbox must filter by the requested dispatch,
+    not just to_agent. Sibling-dispatch traffic for the same Agent leaks.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.mailbox_mod = self.fixture.mailbox_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_sibling_dispatch_traffic_not_leaked(self) -> None:
+        # The fixture has one dispatch for worker-001.
+        # Create a second task and dispatch for the same worker-001.
+        task2 = self.store.create_task(issue=50, group_label="g-50", risk="standard")
+        self.store.update_task(task_id=task2["task_id"], status="ready")
+        dispatch1 = self.fixture.dispatch
+        dispatch2 = self.store.create_dispatch(
+            task_id=task2["task_id"],
+            agent_id="worker-001",
+            worktree="/tmp/wt-50",
+            branch="work/issue-50",
+        )
+        # Send a message to worker-001 with dispatch1's dispatch_id.
+        self.store.send(
+            to_agent="worker-001",
+            event_type="status",
+            payload={"dispatch_id": dispatch1["dispatch_id"], "msg": "for-d1"},
+            signal_id="sig-sib-d1-aaaaaaaaaa",
+        )
+        # Send a message to worker-001 with dispatch2's dispatch_id.
+        self.store.send(
+            to_agent="worker-001",
+            event_type="status",
+            payload={"dispatch_id": dispatch2["dispatch_id"], "msg": "for-d2"},
+            signal_id="sig-sib-d2-aaaaaaaaaa",
+        )
+        # worker-001 reads dispatch1-scoped inbox: must see only d1 traffic.
+        with self.fixture.as_agent("worker-001"):
+            msgs_d1 = self.store.inbox(
+                agent_id="worker-001", dispatch_id=dispatch1["dispatch_id"]
+            )
+        payloads = [m["payload"] for m in msgs_d1]
+        d1_msgs = [p for p in payloads if p.get("dispatch_id") == dispatch1["dispatch_id"]]
+        d2_msgs = [p for p in payloads if p.get("dispatch_id") == dispatch2["dispatch_id"]]
+        self.assertGreater(len(d1_msgs), 0, "must see d1 traffic")
+        self.assertEqual(0, len(d2_msgs), "sibling d2 traffic must not leak into d1 inbox")
+
+
+class WorkerDoneTerminalDispatchTests(unittest.TestCase):
+    """Finding 2: worker_done must require the dispatch to be active, not just
+    owned. A terminal dispatch still accepts new worker_done.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.mailbox_mod = self.fixture.mailbox_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_worker_done_rejected_for_terminal_dispatch(self) -> None:
+        dispatch_id = self.fixture.dispatch["dispatch_id"]
+        # Mark the dispatch done first.
+        with self.fixture.as_agent("worker-001"):
+            self.store.mark_done(
+                task_id=self.fixture.task["task_id"],
+                dispatch_id=dispatch_id,
+                status="done",
+            )
+        # Now try to send worker_done again for the same (now terminal) dispatch.
+        with self.fixture.as_agent("worker-001"):
+            with self.assertRaises(self.mailbox_mod.MailboxError) as ctx:
+                self.store.send(
+                    to_agent="coordinator-001",
+                    event_type="worker_done",
+                    payload={"dispatch_id": dispatch_id},
+                    signal_id="sig-term-wd-aaaaaaaa",
+                )
+        self.assertIn("active", str(ctx.exception).lower())
+
+
+class InvalidAdapterEvidenceTests(unittest.TestCase):
+    """Finding 3: incomplete or invalid adapter evidence must be fail-closed
+    per identity. Any incomplete/invalid/conflicting evidence for an identity
+    must surface ambiguity and leave that identity uninserted.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_invalid_status_value_rejected(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-bad-status", "status": "banana",
+                 "role": "worker", "adapter": "paseo"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "invalid status value must surface ambiguity",
+        )
+        rows = self.store.db.execute(
+            "SELECT agent_id FROM agents WHERE agent_id = ?", ("agent-bad-status",)
+        ).fetchall()
+        self.assertEqual(0, len(rows), "invalid-status agent must not be inserted")
+
+    def test_invalid_status_with_missing_field_rejects_identity(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-incomplete", "status": "banana",
+                 "role": "worker"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(len(result["ambiguities"]), 0)
+        rows = self.store.db.execute(
+            "SELECT agent_id FROM agents WHERE agent_id = ?", ("agent-incomplete",)
+        ).fetchall()
+        self.assertEqual(0, len(rows))
+
+
+class LegacyDuplicateTaskMigrationTests(unittest.TestCase):
+    """Finding 4: migration 0003 must not break Issue #21 stores containing
+    duplicate tasks(repo, issue). The migration must be compatible and allow
+    doctor rebuild to surface legacy ambiguity without Store.connect failing.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self._saved_env = {
+            "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
+        }
+        os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+
+    def tearDown(self) -> None:
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def test_store_connect_succeeds_with_legacy_duplicate_tasks(self) -> None:
+        # Simulate an Issue #21 store: create a store with only migration 0001
+        # applied (before 0003's unique index), manually insert duplicate tasks,
+        # then reconnect to trigger migration 0003.
+        store_mod = load_store()
+        # First connect applies all migrations including 0003.
+        store = store_mod.Store.connect(self.home, "owner/repo")
+        store.claim_coordinator()
+        # Remove the 0003 migration record and drop the unique index to
+        # simulate a legacy store that only has 0001/0002.
+        store.db.execute("BEGIN IMMEDIATE")
+        try:
+            store.db.execute("DROP INDEX IF EXISTS idx_tasks_repo_issue_unique")
+            store.db.execute("DROP INDEX IF EXISTS idx_tasks_repo_issue")
+            store.db.execute("DELETE FROM schema_migrations WHERE name = '0003-tasks-repo-issue-unique'")
+            store.db.execute("COMMIT")
+        except Exception:
+            store.db.execute("ROLLBACK")
+            raise
+        # Insert two tasks with the same repo+issue (legacy duplicate).
+        store.db.execute("BEGIN IMMEDIATE")
+        try:
+            store.db.execute(
+                "INSERT INTO tasks (task_id, repo, issue, group_label, risk, "
+                "hotset_json, deps_json, status, created_by, created_at) "
+                "VALUES ('t-dup1', 'owner/repo', 300, 'g-300', 'standard', '[]', '[]', "
+                "'pending', 'coordinator-001', 0)"
+            )
+            store.db.execute(
+                "INSERT INTO tasks (task_id, repo, issue, group_label, risk, "
+                "hotset_json, deps_json, status, created_by, created_at) "
+                "VALUES ('t-dup2', 'owner/repo', 300, 'g-300', 'standard', '[]', '[]', "
+                "'pending', 'coordinator-001', 0)"
+            )
+            store.db.execute("COMMIT")
+        except Exception:
+            store.db.execute("ROLLBACK")
+            raise
+        store.close()
+        # Reconnect: migration 0003 must not crash on duplicate tasks.
+        store2 = store_mod.Store.connect(self.home, "owner/repo")
+        try:
+            tasks = store2.list_tasks()
+            self.assertGreaterEqual(len(tasks), 2, "legacy duplicate tasks must survive")
+        finally:
+            store2.close()
+
+
+class PidComparisonTests(unittest.TestCase):
+    """Finding 5: PID comparison must normalize and compare deterministically.
+    Matching 123 must match; mismatch/zero cases must be correct.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_matching_pid_no_ambiguity(self) -> None:
+        self.store.register_agent(
+            agent_id="agent-pid-match",
+            adapter="paseo",
+            runtime_ref="ref-pm",
+            role="worker",
+            group_label="g-42",
+            pid=123,
+        )
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-pid-match", "status": "running",
+                 "role": "worker", "adapter": "paseo",
+                 "runtime_ref": "ref-pm", "session_id": None,
+                 "pid": 123, "group_label": "g-42"},
+            ],
+            git_worktrees=[],
+        )
+        ambiguity_text = " ".join(result["ambiguities"])
+        self.assertNotIn("pid", ambiguity_text.lower(),
+                         "matching PID must not surface ambiguity")
+
+    def test_mismatching_pid_surfaces_ambiguity(self) -> None:
+        self.store.register_agent(
+            agent_id="agent-pid-mismatch",
+            adapter="paseo",
+            runtime_ref="ref-pmm",
+            role="worker",
+            group_label="g-42",
+            pid=123,
+        )
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-pid-mismatch", "status": "running",
+                 "role": "worker", "adapter": "paseo",
+                 "runtime_ref": "ref-pmm", "session_id": None,
+                 "pid": 456, "group_label": "g-42"},
+            ],
+            git_worktrees=[],
+        )
+        ambiguity_text = " ".join(result["ambiguities"])
+        self.assertIn("pid", ambiguity_text.lower(),
+                      "mismatching PID must surface ambiguity")
+
+
+class ConfigCheckMigrationSetTests(unittest.TestCase):
+    """Finding 6: config_check used by create_dispatch must include migration
+    0003 in the expected set, consistent with CLI preflight.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_config_check_includes_migration_0003(self) -> None:
+        # Drop migration 0003 record to simulate drift.
+        self.store.db.execute(
+            "DELETE FROM schema_migrations WHERE name = '0003-tasks-repo-issue-unique'"
+        )
+        result = self.store.config_check()
+        self.assertFalse(result["valid"], result)
+        errors_text = " ".join(result["errors"])
+        self.assertIn("0003", errors_text)
+
+    def test_config_check_valid_with_all_migrations(self) -> None:
+        result = self.store.config_check()
+        self.assertTrue(result["valid"], result.get("errors", []))
 
 
 if __name__ == "__main__":

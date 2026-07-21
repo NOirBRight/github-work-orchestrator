@@ -294,15 +294,11 @@ def send(
                     f"reply recipient {to_agent} is not the ask author "
                     f"{ask_author} of ask {in_reply_to}"
                 )
-        role = _resolve_role(store, caller)
-        entitled = ROLE_ENTITLEMENT.get(event_type, frozenset())
-        if role not in entitled:
-            raise EntitlementError(
-                f"role {role} is not entitled to send {event_type}"
-            )
         # worker_done binding: the payload must carry dispatch_id, and the
         # active dispatch's agent_id must equal the live caller. This prevents
         # worker-002 from authoring worker_done for worker-001's dispatch.
+        # This check runs before role resolution because the dispatch's agent
+        # identity is the authority, not the generic role.
         if event_type == "worker_done":
             dispatch_id = body.get("dispatch_id")
             if not dispatch_id:
@@ -318,6 +314,17 @@ def send(
                     f"worker_done author {caller} does not match dispatch agent "
                     f"{dispatch_row['agent_id']} for dispatch {dispatch_id}"
                 )
+            if str(dispatch_row["status"]) != "active":
+                raise MailboxError(
+                    f"worker_done dispatch {dispatch_id} is "
+                    f"{dispatch_row['status']}, not active"
+                )
+        role = _resolve_role(store, caller)
+        entitled = ROLE_ENTITLEMENT.get(event_type, frozenset())
+        if role not in entitled:
+            raise EntitlementError(
+                f"role {role} is not entitled to send {event_type}"
+            )
         # Per-sender monotonic sequence under the write lock.
         seq_row = db.execute(
             "SELECT MAX(seq) AS max_seq FROM messages WHERE from_agent = ?",
@@ -466,8 +473,13 @@ def inbox(
                         "the dispatched agent"
                     )
                 # Return only deliveries the caller may read: messages addressed
-                # TO the mailbox owner (agent_id). This excludes the owner's
-                # outbound traffic, which the owner already authored.
+                # TO the mailbox owner (agent_id) AND related to the requested
+                # dispatch. A message is related to this dispatch if its payload
+                # contains a matching dispatch_id, or if it has no dispatch_id
+                # (general traffic to the dispatched agent that is not
+                # dispatch-specific is still visible). Messages with a different
+                # dispatch_id are sibling-dispatch traffic and must be filtered
+                # out.
                 rows = db.execute(
                     "SELECT msg_id, signal_id, seq, from_agent, to_agent, type, "
                     "payload_json, in_reply_to, created_at, acked_at, acked_by "
@@ -475,6 +487,14 @@ def inbox(
                     "ORDER BY seq",
                     (agent_id,),
                 ).fetchall()
+                filtered_rows = []
+                for r in rows:
+                    payload = json.loads(r["payload_json"])
+                    msg_dispatch_id = payload.get("dispatch_id")
+                    if msg_dispatch_id is not None and str(msg_dispatch_id) != dispatch_id:
+                        continue  # sibling-dispatch traffic: filter out
+                    filtered_rows.append(r)
+                rows = filtered_rows
             else:
                 if agent_id != caller:
                     raise DeliveryError(

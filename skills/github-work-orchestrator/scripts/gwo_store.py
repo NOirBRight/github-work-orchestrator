@@ -207,8 +207,7 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     (
         "0003-tasks-repo-issue-unique",
         """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
-            ON tasks (repo, issue);
+        CREATE INDEX IF NOT EXISTS idx_tasks_repo_issue ON tasks (repo, issue);
         """,
     ),
 )
@@ -416,6 +415,37 @@ class Store:
                 continue
             self._apply_migration(name, ddl, caller)
             applied.add(name)
+            # Post-migration 0003: attempt the unique index. If duplicate tasks
+            # exist (legacy Issue #21 stores), skip the unique index so
+            # Store.connect does not crash; doctor_rebuild surfaces the
+            # ambiguity. If no duplicates, the unique index is created safely.
+            if name == "0003-tasks-repo-issue-unique":
+                self._try_unique_index_or_skip()
+
+    def _try_unique_index_or_skip(self) -> None:
+        """Attempt to create the unique index on tasks(repo, issue).
+
+        If duplicate tasks exist (legacy Issue #21 stores), the unique index
+        creation fails and we skip it so Store.connect does not crash. The
+        non-unique index from migration 0003 remains, and doctor_rebuild can
+        surface the legacy ambiguity. If no duplicates exist, the unique index
+        is created safely.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique "
+                    "ON tasks (repo, issue)"
+                )
+                self.db.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                self.db.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
 
     def _apply_migration(self, name: str, ddl: str, caller: str) -> None:
         # Execute each migration and its schema_migrations record in one

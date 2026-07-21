@@ -25,6 +25,9 @@ AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$")
 ROLE_VALUES = frozenset({"coordinator", "worker", "reviewer", "monitor"})
 
 
+ADAPTER_STATUSES = frozenset({"running", "stalled", "exited", "idle"})
+
+
 class StatusError(RuntimeError):
     """Base class for gwo_status errors."""
 
@@ -360,8 +363,9 @@ def config_check(store: Any, *, gwo_home: str | None = None) -> dict[str, Any]:
                 errors.append(f"config.json is malformed: {error}")
             except OSError as error:
                 errors.append(f"config.json read failed: {error}")
-    # Check the expected migration set is fully applied.
-    expected_migrations = {"0001-initial", "0002-messages-in-reply-to"}
+    # Check the expected migration set is fully applied. Use the single
+    # authoritative EXPECTED_MIGRATIONS constant so drift blocks dispatch
+    # consistently with CLI preflight.
     try:
         applied = {
             str(row[0])
@@ -369,7 +373,7 @@ def config_check(store: Any, *, gwo_home: str | None = None) -> dict[str, Any]:
                 "SELECT name FROM schema_migrations"
             ).fetchall()
         }
-        missing = expected_migrations - applied
+        missing = EXPECTED_MIGRATIONS - applied
         if missing:
             errors.append(
                 f"migration drift: missing {sorted(missing)}"
@@ -493,6 +497,7 @@ def doctor_rebuild(
     # and detect conflicts, then queue only conflict-free entries for insertion.
     seen_agents: dict[str, dict[str, Any]] = {}
     conflicted_agents: set[str] = set()
+    invalid_agents: set[str] = set()
     for entry in adapter_listing:
         aid = entry.get("agent_id")
         if aid is None:
@@ -507,6 +512,15 @@ def doctor_rebuild(
             ambiguities.append(
                 f"agent {aid} missing required fields: {', '.join(missing)}"
             )
+            invalid_agents.add(aid)
+            continue
+        # Validate status value: must be a known adapter status.
+        status_val = entry.get("status")
+        if status_val not in ADAPTER_STATUSES:
+            ambiguities.append(
+                f"agent {aid} has invalid status: {status_val}"
+            )
+            invalid_agents.add(aid)
             continue
         if aid in seen_agents:
             prior = seen_agents[aid]
@@ -533,7 +547,7 @@ def doctor_rebuild(
 
     # Second pass: queue only conflict-free, valid entries for insertion.
     for aid, entry in seen_agents.items():
-        if aid in conflicted_agents:
+        if aid in conflicted_agents or aid in invalid_agents:
             continue
         role = entry.get("role")
         adapter_name = entry.get("adapter")
@@ -559,16 +573,13 @@ def doctor_rebuild(
                     existing_conflicts.append(
                         f"{field}: store={store_val_str} vs adapter={entry_val_str}"
                     )
-            # Compare pid as int.
-            store_pid = existing["pid"]
-            entry_pid = entry.get("pid")
-            if store_pid is not None or entry_pid is not None:
-                if int(store_pid) if store_pid is not None else None != (
-                    int(entry_pid) if entry_pid is not None else None
-                ):
-                    existing_conflicts.append(
-                        f"pid: store={store_pid} vs adapter={entry_pid}"
-                    )
+            # Compare pid deterministically: normalize both to int or None.
+            store_pid_val = int(existing["pid"]) if existing["pid"] is not None else None
+            entry_pid_val = int(entry.get("pid")) if entry.get("pid") is not None else None
+            if store_pid_val != entry_pid_val:
+                existing_conflicts.append(
+                    f"pid: store={store_pid_val} vs adapter={entry_pid_val}"
+                )
             if existing_conflicts:
                 ambiguities.append(
                     f"agent {aid} existing row conflicts with adapter listing: "
