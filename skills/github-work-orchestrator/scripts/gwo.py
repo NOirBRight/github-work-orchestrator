@@ -312,6 +312,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             store.close()
 
 
+def cmd_guard(args: argparse.Namespace) -> int:
+    """Run deterministic plan guards without touching the store."""
+    if args.action == "check-dag":
+        import gwo_dag  # type: ignore[import-not-found]  # noqa: E402
+        return gwo_dag.main(args)
+    return _fail(f"unknown guard action: {args.action}")
+
+
 def _json_list(value: str | None) -> list[str] | None:
     if value is None:
         return None
@@ -443,6 +451,12 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_rebuild.add_argument("--adapter-listing", required=True, dest="adapter_listing")
     doctor_rebuild.add_argument("--git-worktrees", required=True, dest="git_worktrees")
     doctor_rebuild.set_defaults(func=cmd_doctor)
+
+    guard = sub.add_parser("guard", help="deterministic plan guards")
+    guard_sub = guard.add_subparsers(dest="action", required=True)
+    guard_check = guard_sub.add_parser("check-dag", help="validate a DAG plan")
+    guard_check.add_argument("--plan", required=True, help="path to JSON plan or '-' for stdin")
+    guard_check.set_defaults(func=cmd_guard)
 
     return parser
 
