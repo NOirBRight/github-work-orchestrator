@@ -1884,10 +1884,8 @@ class ProductionReadbackTests(unittest.TestCase):
         self.assertEqual(False, status["registered"])
 
     def test_production_readback_paseo_agent_without_pid_is_running(self) -> None:
-        # A registered Paseo agent without PID is running (resident-agent
-        # model): the agent is long-lived with idle/running states. The
-        # production readback must not report it as stalled just because
-        # there is no PID.
+        # A registered Paseo agent without PID is running when the readback
+        # snapshot confirms it present as running (resident-agent model).
         self.store.register_agent(
             agent_id="worker-003",
             adapter="paseo",
@@ -1895,11 +1893,11 @@ class ProductionReadbackTests(unittest.TestCase):
             role="worker",
             group_label="g-42",
         )
-        status = self.store.agent_status("worker-003")
-        self.assertEqual(
-            "running", status["state"],
-            "a registered Paseo agent without PID is running, not stalled",
+        self.status_mod.set_readback_snapshot(
+            self.store, {"agents": [{"agent_id": "worker-003", "state": "running"}]}
         )
+        status = self.store.agent_status("worker-003")
+        self.assertEqual("running", status["state"])
 
     def test_production_readback_non_paseo_without_pid_is_stalled(self) -> None:
         # A registered agent with a non-paseo adapter (future headless) and no
@@ -2180,11 +2178,11 @@ class TruthfulReadbackTests(unittest.TestCase):
             role="worker",
             group_label="g-42",
         )
-        status = self.store.agent_status("worker-paseo")
-        self.assertEqual(
-            "running", status["state"],
-            "a registered Paseo resident agent without PID is running, not stalled",
+        self.status_mod.set_readback_snapshot(
+            self.store, {"agents": [{"agent_id": "worker-paseo", "state": "running"}]}
         )
+        status = self.store.agent_status("worker-paseo")
+        self.assertEqual("running", status["state"])
 
     def test_paseo_agent_uses_runtime_ref_in_evidence(self) -> None:
         self.store.register_agent(
@@ -2194,6 +2192,9 @@ class TruthfulReadbackTests(unittest.TestCase):
             role="worker",
             group_label="g-42",
             session_id="sess-123",
+        )
+        self.status_mod.set_readback_snapshot(
+            self.store, {"agents": [{"agent_id": "worker-paseo2", "state": "running"}]}
         )
         status = self.store.agent_status("worker-paseo2")
         self.assertEqual("running", status["state"])
@@ -2334,6 +2335,337 @@ class CliErrorControlTests(unittest.TestCase):
             stderr.startswith("error:"),
             f"CLI error output must start with 'error:', got: {stderr[:80]}",
         )
+
+
+# ---------------------------------------------------------------------------
+# Fourth commit-bound heavy review regression tests. Each test reproduces one
+# finding from the review before the fix lands.
+# ---------------------------------------------------------------------------
+
+
+class RuntimeReadbackSourceTests(unittest.TestCase):
+    """Finding 1: agent_status must not infer running solely from the adapter
+    name. It must use a real runtime readback source (an injected/read-only
+    Paseo snapshot or explicit readback source) and truthfully return
+    running/stalled/exited plus terminal evidence based on runtime identity.
+    A paseo agent with a runtime_ref that does not appear in the readback
+    source must not be reported as running.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_paseo_agent_with_runtime_ref_in_snapshot_is_running(self) -> None:
+        self.store.register_agent(
+            agent_id="worker-001",
+            adapter="paseo",
+            runtime_ref="ref-001",
+            role="worker",
+            group_label="g-42",
+        )
+        # Inject a readback snapshot listing this agent as running.
+        self.status_mod.set_readback_snapshot(
+            self.store, {"agents": [{"agent_id": "worker-001", "state": "running"}]}
+        )
+        status = self.store.agent_status("worker-001")
+        self.assertEqual("running", status["state"])
+
+    def test_paseo_agent_not_in_snapshot_is_stalled(self) -> None:
+        self.store.register_agent(
+            agent_id="worker-002",
+            adapter="paseo",
+            runtime_ref="ref-002",
+            role="worker",
+            group_label="g-42",
+        )
+        # Inject an empty snapshot — agent is registered but not in the snapshot.
+        self.status_mod.set_readback_snapshot(
+            self.store, {"agents": []}
+        )
+        status = self.store.agent_status("worker-002")
+        self.assertEqual(
+            "stalled", status["state"],
+            "a paseo agent not present in the readback snapshot is stalled, "
+            "not running",
+        )
+        self.assertNotEqual({}, status["terminal_evidence"])
+
+    def test_paseo_agent_exited_in_snapshot_is_exited(self) -> None:
+        self.store.register_agent(
+            agent_id="worker-003",
+            adapter="paseo",
+            runtime_ref="ref-003",
+            role="worker",
+            group_label="g-42",
+        )
+        self.status_mod.set_readback_snapshot(
+            self.store,
+            {"agents": [{"agent_id": "worker-003", "state": "exited",
+                         "terminal_evidence": {"reason": "crashed"}}]},
+        )
+        status = self.store.agent_status("worker-003")
+        self.assertEqual("exited", status["state"])
+        self.assertNotEqual({}, status["terminal_evidence"])
+
+    def test_no_snapshot_defaults_to_stalled_not_running(self) -> None:
+        self.store.register_agent(
+            agent_id="worker-004",
+            adapter="paseo",
+            runtime_ref="ref-004",
+            role="worker",
+            group_label="g-42",
+        )
+        # No snapshot injected: the readback has no runtime source.
+        status = self.store.agent_status("worker-004")
+        self.assertIn(
+            status["state"], ("stalled", "exited"),
+            "without a readback source, agent must not be reported running",
+        )
+
+
+class AdapterEvidenceFieldComparisonTests(unittest.TestCase):
+    """Finding 2: duplicate adapter evidence must compare every identity/
+    runtime field (status, role, adapter, runtime_ref, session_id, pid,
+    group_label), not just status/role/adapter. Any disagreement must create
+    ambiguity, insert nothing, and never last-wins.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_conflicting_runtime_ref_surfaces_ambiguity(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-dup", "status": "running", "role": "worker",
+                 "adapter": "paseo", "runtime_ref": "ref-a"},
+                {"agent_id": "agent-dup", "status": "running", "role": "worker",
+                 "adapter": "paseo", "runtime_ref": "ref-b"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "conflicting runtime_ref must surface ambiguity",
+        )
+        self.assertEqual(0, result["rebuilt_count"])
+        rows = self.store.db.execute(
+            "SELECT agent_id FROM agents WHERE agent_id = ?", ("agent-dup",)
+        ).fetchall()
+        self.assertEqual(0, len(rows))
+
+    def test_conflicting_session_id_surfaces_ambiguity(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-dup2", "status": "running", "role": "worker",
+                 "adapter": "paseo", "session_id": "sess-a"},
+                {"agent_id": "agent-dup2", "status": "running", "role": "worker",
+                 "adapter": "paseo", "session_id": "sess-b"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(len(result["ambiguities"]), 0)
+        self.assertEqual(0, result["rebuilt_count"])
+
+    def test_conflicting_pid_surfaces_ambiguity(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-dup3", "status": "running", "role": "worker",
+                 "adapter": "paseo", "pid": 100},
+                {"agent_id": "agent-dup3", "status": "running", "role": "worker",
+                 "adapter": "paseo", "pid": 200},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(len(result["ambiguities"]), 0)
+        self.assertEqual(0, result["rebuilt_count"])
+
+    def test_conflicting_group_label_surfaces_ambiguity(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-dup4", "status": "running", "role": "worker",
+                 "adapter": "paseo", "group_label": "g-a"},
+                {"agent_id": "agent-dup4", "status": "running", "role": "worker",
+                 "adapter": "paseo", "group_label": "g-b"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(len(result["ambiguities"]), 0)
+        self.assertEqual(0, result["rebuilt_count"])
+
+    def test_last_row_does_not_overwrite_first_on_conflict(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-lw", "status": "running", "role": "worker",
+                 "adapter": "paseo", "runtime_ref": "ref-first"},
+                {"agent_id": "agent-lw", "status": "running", "role": "worker",
+                 "adapter": "paseo", "runtime_ref": "ref-last"},
+            ],
+            git_worktrees=[],
+        )
+        # The conflict must be detected; last-wins must not silently insert
+        # the second row.
+        self.assertEqual(0, result["rebuilt_count"])
+        rows = self.store.db.execute(
+            "SELECT agent_id FROM agents WHERE agent_id = ?", ("agent-lw",)
+        ).fetchall()
+        self.assertEqual(0, len(rows))
+
+
+class WorktreeFieldComparisonTests(unittest.TestCase):
+    """Finding 3: worktree recovery must compare path/workspace/branch/agent
+    linkage field-by-field against matching dispatch evidence. Contradictory
+    path/branch must surface ambiguity and remain unmutated.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+        self.dispatch_id = self.fixture.dispatch["dispatch_id"]
+        self.dispatched_agent = self.fixture.dispatch["agent_id"]
+        self.dispatch_worktree = self.fixture.dispatch["worktree"]
+        self.dispatch_branch = self.fixture.dispatch["branch"]
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_worktree_conflicting_path_surfaces_ambiguity(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[],
+            git_worktrees=[
+                {"agent_id": self.dispatched_agent,
+                 "path": "C:/wrong",  # conflicts with dispatch worktree
+                 "branch": self.dispatch_branch},
+            ],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "worktree path conflicting with dispatch evidence must surface ambiguity",
+        )
+
+    def test_worktree_conflicting_branch_surfaces_ambiguity(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[],
+            git_worktrees=[
+                {"agent_id": self.dispatched_agent,
+                 "path": self.dispatch_worktree,
+                 "branch": "work/wrong"},  # conflicts with dispatch branch
+            ],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "worktree branch conflicting with dispatch evidence must surface ambiguity",
+        )
+
+    def test_worktree_matching_dispatch_is_not_ambiguous(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[],
+            git_worktrees=[
+                {"agent_id": self.dispatched_agent,
+                 "path": self.dispatch_worktree,
+                 "branch": self.dispatch_branch},
+            ],
+        )
+        ambiguity_text = " ".join(result["ambiguities"])
+        self.assertNotIn(
+            self.dispatched_agent, ambiguity_text,
+            "matching worktree must not be ambiguous",
+        )
+
+
+class StoreConstructionErrorTests(unittest.TestCase):
+    """Finding 4: store-backed handlers must move store construction inside
+    the controlled boundary so connection-time errors (missing GWO_AGENT_ID,
+    migration failures) produce structured error output, not tracebacks.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self._saved_env = {
+            "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
+            "PYTHONPATH": os.environ.get("PYTHONPATH"),
+        }
+        os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+
+    def tearDown(self) -> None:
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(GWO_PY), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_missing_agent_id_produces_structured_error_not_traceback(self) -> None:
+        # First claim coordinator to set up a valid store.
+        self.run_cli("coordinator", "claim")
+        # Now remove GWO_AGENT_ID and run a write command.
+        saved = os.environ.pop("GWO_AGENT_ID")
+        try:
+            result = self.run_cli(
+                "task", "create", "--issue", "42", "--group", "g-42", "--risk", "standard"
+            )
+        finally:
+            os.environ["GWO_AGENT_ID"] = saved
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("Traceback", result.stdout)
+        self.assertTrue(
+            result.stderr.strip().startswith("error:"),
+            f"must start with 'error:', got: {result.stderr[:80]}",
+        )
+
+    def test_coordinator_claim_missing_agent_id_structured_error(self) -> None:
+        saved = os.environ.pop("GWO_AGENT_ID")
+        try:
+            result = self.run_cli("coordinator", "claim")
+        finally:
+            os.environ["GWO_AGENT_ID"] = saved
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertTrue(result.stderr.strip().startswith("error:"))
+
+    def test_send_missing_agent_id_structured_error(self) -> None:
+        saved = os.environ.pop("GWO_AGENT_ID")
+        try:
+            result = self.run_cli(
+                "send", "--to", "coordinator-001", "--type", "status",
+                "--signal-id", "sig-conerr-aaaaaaaa",
+            )
+        finally:
+            os.environ["GWO_AGENT_ID"] = saved
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertTrue(result.stderr.strip().startswith("error:"))
 
 
 if __name__ == "__main__":

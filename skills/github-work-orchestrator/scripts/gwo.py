@@ -71,8 +71,9 @@ def _controlled_error(error: BaseException) -> int:
 
 
 def cmd_coordinator(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
         if args.action == "claim":
             store.claim_coordinator()
             _emit({"repo": args.repository, "holder": store.coordinator_holder()})
@@ -85,12 +86,14 @@ def cmd_coordinator(args: argparse.Namespace) -> int:
     except Exception as error:
         return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def cmd_task(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
         if args.action == "create":
             task = store.create_task(
                 issue=args.issue,
@@ -118,12 +121,14 @@ def cmd_task(args: argparse.Namespace) -> int:
     except Exception as error:
         return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
         if args.action == "create":
             dispatch = store.create_dispatch(
                 task_id=args.task_id,
@@ -138,12 +143,14 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     except Exception as error:
         return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def cmd_done(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
         evidence = _json_value(args.evidence)
         dispatch = store.mark_done(
             task_id=args.task_id,
@@ -157,7 +164,8 @@ def cmd_done(args: argparse.Namespace) -> int:
     except Exception as error:
         return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def _json_value(value: str | None) -> dict[str, Any] | None:
@@ -182,8 +190,9 @@ def _json_list_or_obj(value: str | None) -> Any:
 
 
 def cmd_send(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
         payload = _json_value(args.payload)
         msg = store.send(
             to_agent=args.to,
@@ -197,12 +206,14 @@ def cmd_send(args: argparse.Namespace) -> int:
     except Exception as error:
         return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
         payload = _json_value(args.payload)
         msg = store.ask(
             to_agent=args.to,
@@ -215,12 +226,14 @@ def cmd_ask(args: argparse.Namespace) -> int:
     except Exception as error:
         return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def cmd_inbox(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
         messages = store.inbox(
             agent_id=args.agent_id,
             ack_on_read=args.ack_on_read,
@@ -232,12 +245,14 @@ def cmd_inbox(args: argparse.Namespace) -> int:
     except Exception as error:
         return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def cmd_agent(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
         if args.action == "status":
             status = store.agent_status(args.agent_id)
             _emit(status)
@@ -258,7 +273,8 @@ def cmd_agent(args: argparse.Namespace) -> int:
     except Exception as error:
         return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -274,8 +290,9 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    store = _store(args)
+    store = None
     try:
+        store = _store(args)
         if args.action == "rebuild":
             result = store.doctor_rebuild(
                 github_snapshot=_json_list_or_obj(args.github_snapshot),
@@ -288,7 +305,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as error:
         return _controlled_error(error)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def _json_list(value: str | None) -> list[str] | None:

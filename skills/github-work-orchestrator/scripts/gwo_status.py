@@ -31,6 +31,28 @@ class StatusError(RuntimeError):
 
 EXPECTED_MIGRATIONS = frozenset({"0001-initial", "0002-messages-in-reply-to"})
 
+# Runtime readback source registry. Phase 1 uses an injected/read-only Paseo
+# snapshot (set via set_readback_snapshot) so agent_status can observe actual
+# runtime state rather than inferring it from the adapter name. Phase 4 will
+# replace this with a Runtime Port adapter call. The snapshot is a dict with
+# an "agents" list of {agent_id, state, terminal_evidence} entries.
+_READBACK_SNAPSHOTS: dict[int, dict[str, Any]] = {}
+
+
+def set_readback_snapshot(store: Any, snapshot: dict[str, Any]) -> None:
+    """Inject a read-only Paseo runtime snapshot for agent_status readback.
+
+    The snapshot maps agent_id -> {state, terminal_evidence} entries. This is
+    the stdlib-safe boundary for Phase 1: tests and the Coordinator inject a
+    snapshot obtained from a Paseo listing (get_agent_status readbacks). Phase
+    4 replaces this with a direct Runtime Port adapter call.
+    """
+    _READBACK_SNAPSHOTS[id(store.db)] = snapshot
+
+
+def _get_readback_snapshot(store: Any) -> dict[str, Any] | None:
+    return _READBACK_SNAPSHOTS.get(id(store.db))
+
 
 def preflight_config(
     home: str | os.PathLike[str],
@@ -114,26 +136,25 @@ def _validate_agent_id(agent_id: str, field: str = "agent_id") -> str:
 def readback_agent(store: Any, agent_id: str) -> dict[str, Any]:
     """Production stdlib runtime readback seam for agent_status.
 
-    Implements truthful resident Paseo runtime readback for Phase 1: a
-    registered Paseo agent (adapter="paseo") is a resident-agent that is
-    long-lived with idle/running states. Without an external adapter wired in
-    yet, the readback uses the available stdlib runtime evidence:
+    Implements truthful resident Paseo runtime readback for Phase 1 using a
+    read-only Paseo snapshot (injected via set_readback_snapshot) as the
+    runtime readback source. The snapshot maps agent_id -> {state,
+    terminal_evidence} entries obtained from Paseo listing readbacks.
 
-    - If the agent row carries a ``pid``, check process liveness via
-      ``os.kill(pid, 0)``. A live PID means running; a gone PID means exited
-      with terminal evidence.
-    - If no PID is recorded, the resident-agent model says the agent is
-      running unless the row is archived. The adapter field distinguishes
-      the execution model: ``paseo`` (resident-agent) defaults to running;
-      ``headless`` (session-process, future) would use PID liveness
-      exclusively.
+    - If a snapshot is present and lists the agent, use its state and
+      terminal_evidence. This is the truthful readback from the runtime.
+    - If a snapshot is present but the agent is NOT listed, the agent is
+      stalled (registered but not observed in the runtime).
+    - If a PID is recorded, use os.kill(pid, 0) as a secondary signal (a gone
+      PID means exited even if the snapshot says running).
+    - If no snapshot is present, a paseo agent without PID is stalled (we
+      cannot confirm liveness without a runtime source).
     - An archived agent is exited with archived evidence.
     - An unknown agent is exited with not-registered evidence.
 
     This is a real seam: Phase 4 replaces this function body with a Runtime
     Port adapter call, but the contract (returns state + terminal_evidence +
-    last_activity) is stable. Tests exercise the production path directly
-    without monkeypatching.
+    last_activity) is stable.
     """
     db = store.db
     row = db.execute(
@@ -156,11 +177,44 @@ def readback_agent(store: Any, agent_id: str) -> dict[str, Any]:
             },
             "last_activity": float(row["archived_at"]),
         }
-    adapter = str(row["adapter"])
     pid = row["pid"]
-    runtime_ref = row["runtime_ref"]
-    session_id = row["session_id"]
-    # If a PID is recorded, use real process liveness via stdlib os.
+    snapshot = _get_readback_snapshot(store)
+    # If a snapshot is present, use it as the authoritative runtime source.
+    if snapshot is not None:
+        agents_map = {
+            str(a.get("agent_id")): a
+            for a in snapshot.get("agents", [])
+            if isinstance(a, dict)
+        }
+        if agent_id in agents_map:
+            entry = agents_map[agent_id]
+            state = str(entry.get("state", "stalled"))
+            if state not in ("running", "stalled", "exited"):
+                state = "stalled"
+            evidence = entry.get("terminal_evidence", {})
+            if not isinstance(evidence, dict):
+                evidence = {}
+            # If a PID is recorded and says exited, override to exited.
+            if pid is not None and state == "running":
+                try:
+                    os.kill(int(pid), 0)
+                except ProcessLookupError:
+                    state = "exited"
+                    evidence = {"reason": "process-gone", "pid": int(pid)}
+                except (PermissionError, OSError):
+                    pass
+            return {
+                "state": state,
+                "terminal_evidence": evidence,
+                "last_activity": float(row["created_at"]),
+            }
+        # Agent is registered but not in the snapshot: stalled.
+        return {
+            "state": "stalled",
+            "terminal_evidence": {"reason": "not-in-runtime-snapshot"},
+            "last_activity": float(row["created_at"]),
+        }
+    # No snapshot: use PID liveness if available.
     if pid is not None:
         try:
             os.kill(int(pid), 0)
@@ -172,10 +226,7 @@ def readback_agent(store: Any, agent_id: str) -> dict[str, Any]:
         except ProcessLookupError:
             return {
                 "state": "exited",
-                "terminal_evidence": {
-                    "reason": "process-gone",
-                    "pid": int(pid),
-                },
+                "terminal_evidence": {"reason": "process-gone", "pid": int(pid)},
                 "last_activity": float(row["created_at"]),
             }
         except PermissionError:
@@ -190,24 +241,10 @@ def readback_agent(store: Any, agent_id: str) -> dict[str, Any]:
                 "terminal_evidence": {"reason": "pid-unobservable", "pid": int(pid)},
                 "last_activity": float(row["created_at"]),
             }
-    # No PID recorded. For the resident-agent model (paseo adapter), a
-    # registered agent is running unless archived — the agent is long-lived
-    # with idle/running states. The runtime_ref and session_id are the
-    # resident-runtime evidence of this liveness.
-    if adapter == "paseo":
-        return {
-            "state": "running",
-            "terminal_evidence": {},
-            "last_activity": float(row["created_at"]),
-        }
-    # For other adapters (future headless/session-process), no PID means the
-    # runtime is unobservable; report stalled.
+    # No snapshot and no PID: cannot confirm liveness; stalled.
     return {
         "state": "stalled",
-        "terminal_evidence": {
-            "reason": "no-runtime-observable",
-            "adapter": adapter,
-        },
+        "terminal_evidence": {"reason": "no-runtime-source"},
         "last_activity": float(row["created_at"]),
     }
 
@@ -397,7 +434,11 @@ def doctor_rebuild(
         if aid in seen_agents:
             prior = seen_agents[aid]
             conflicts = []
-            for field in ("status", "role", "adapter"):
+            # Compare every identity/runtime field, not just status/role/adapter.
+            for field in (
+                "status", "role", "adapter", "runtime_ref",
+                "session_id", "pid", "group_label",
+            ):
                 if prior.get(field) != entry.get(field):
                     conflicts.append(
                         f"{field}: {prior.get(field)} vs {entry.get(field)}"
@@ -408,7 +449,8 @@ def doctor_rebuild(
                     + ", ".join(conflicts)
                 )
                 conflicted_agents.add(aid)
-            seen_agents[aid] = entry
+            # Do NOT overwrite seen_agents with the later row on conflict;
+            # keep the first row so the conflict is recorded without last-wins.
             continue
         seen_agents[aid] = entry
 
@@ -444,7 +486,8 @@ def doctor_rebuild(
             continue
         agents_to_insert.append(entry)
 
-    # Prevalidate git worktrees against known agents and dispatches.
+    # Prevalidate git worktrees against known agents, dispatches, and
+    # matching dispatch evidence (path/branch/agent linkage field-by-field).
     known_agent_ids = set(seen_agents.keys())
     store_agent_rows = db.execute("SELECT agent_id FROM agents").fetchall()
     known_agent_ids.update(str(r["agent_id"]) for r in store_agent_rows)
@@ -452,6 +495,16 @@ def doctor_rebuild(
         str(r["agent_id"])
         for r in db.execute("SELECT agent_id FROM dispatches").fetchall()
     }
+    # Build a map of dispatch evidence by agent_id for field-by-field comparison.
+    dispatch_evidence: dict[str, list[dict[str, Any]]] = {}
+    for dr in db.execute(
+        "SELECT agent_id, worktree, branch FROM dispatches"
+    ).fetchall():
+        aid = str(dr["agent_id"])
+        dispatch_evidence.setdefault(aid, []).append({
+            "worktree": str(dr["worktree"]) if dr["worktree"] is not None else None,
+            "branch": str(dr["branch"]) if dr["branch"] is not None else None,
+        })
     for wt in git_worktrees:
         wt_agent = wt.get("agent_id")
         wt_path = wt.get("path")
@@ -476,6 +529,20 @@ def doctor_rebuild(
                 f"git worktree {wt_path} references known agent {wt_agent} "
                 f"with no matching dispatch; ambiguous"
             )
+            continue
+        # The agent has a dispatch: compare path/branch field-by-field.
+        if wt_agent in dispatch_evidence:
+            matched = False
+            for de in dispatch_evidence[wt_agent]:
+                if de["worktree"] == wt_path and de["branch"] == wt_branch:
+                    matched = True
+                    break
+            if not matched:
+                ambiguities.append(
+                    f"git worktree {wt_path} (branch {wt_branch}) for agent "
+                    f"{wt_agent} does not match any dispatch evidence "
+                    f"(path/branch mismatch); ambiguous"
+                )
 
     # Phase 2: write only prevalidated, conflict-free entities. This is atomic:
     # all writes commit or roll back together.
