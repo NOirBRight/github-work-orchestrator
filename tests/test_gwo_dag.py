@@ -51,9 +51,50 @@ def _run_check_dag(plan: dict[str, Any]) -> dict[str, Any]:
     return {"returncode": result.returncode, **payload}
 
 
+def _run_direct_dag(plan_path: Path) -> dict[str, Any]:
+    """Invoke `python gwo_dag.py --plan <file>` and parse JSON stdout."""
+    result = subprocess.run(
+        [sys.executable, str(DAG_SCRIPT), "--plan", str(plan_path)],
+        capture_output=True,
+        text=True,
+        cwd=str(DAG_SCRIPT.parent),
+    )
+    payload = json.loads(result.stdout) if result.stdout.strip() else {}
+    return {"returncode": result.returncode, **payload}
+
+
 def test_dag_script_compiles() -> None:
     import py_compile
     py_compile.compile(str(DAG_SCRIPT), doraise=True)
+
+
+def test_direct_python_execution_parses_plan_file() -> None:
+    """Direct `python gwo_dag.py --plan <file>` must parse and validate the file."""
+    plan = _plan()
+    with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as handle:
+        json.dump(plan, handle)
+        plan_path = Path(handle.name)
+    try:
+        result = _run_direct_dag(plan_path)
+    finally:
+        plan_path.unlink(missing_ok=True)
+    assert result["returncode"] == 0
+    assert result.get("ok") is True
+    assert result.get("rejection_codes") == []
+
+
+def test_direct_python_execution_rejects_invalid_plan() -> None:
+    """Direct `python gwo_dag.py --plan <file>` must reject a malformed plan."""
+    with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as handle:
+        json.dump({"schema_version": 1}, handle)
+        plan_path = Path(handle.name)
+    try:
+        result = _run_direct_dag(plan_path)
+    finally:
+        plan_path.unlink(missing_ok=True)
+    assert result["returncode"] == 1
+    assert result.get("ok") is False
+    assert result.get("rejection_codes")
 
 
 def test_guard_check_dag_accepts_valid_plan() -> None:
@@ -630,6 +671,49 @@ def test_v6_compatibility_dependency_deferral() -> None:
     dag_result = _run_check_dag(dag_plan)
     assert dag_result["returncode"] == 0
     assert dag_result.get("ready_frontier") == ["t-10"]
+
+
+def test_1500_node_chain_does_not_recursionerror() -> None:
+    """A deterministic 1500-node chain must validate without RecursionError."""
+    nodes = [
+        {"id": f"t-{i}", "kind": "issue", "issue": i, "group": "g", "risk": "fast", "hotset": [f"src/{i}"]}
+        for i in range(1, 1501)
+    ]
+    edges = [[f"t-{i}", f"t-{i + 1}"] for i in range(1, 1500)]
+    github_dependencies: dict[str, list[int]] = {f"t-{i}": [i - 1] for i in range(2, 1501)}
+    contract_dependencies: dict[str, list[int]] = {f"t-{i}": [i - 1] for i in range(2, 1501)}
+    plan = _plan(
+        nodes=nodes,
+        edges=edges,
+        github_dependencies=github_dependencies,
+        contract_dependencies=contract_dependencies,
+        capacity={
+            "global_agent_limit": 1500,
+            "global_active_agents": 0,
+            "group_limits": {"g": {"limit": 1500, "active": 0}},
+        },
+    )
+    result = _run_check_dag(plan)
+    assert result["returncode"] == 0
+    assert result.get("ok") is True
+    assert result.get("ready_frontier") == ["t-1"]
+
+
+def test_malformed_schema_returns_structured_rejection() -> None:
+    """Malformed schema/shape input must return a structured rejection, not ValueError."""
+    result = _run_check_dag({"schema_version": 1})
+    assert result["returncode"] == 1
+    assert result.get("ok") is False
+    assert result.get("rejection_codes")
+    assert "error" in result
+
+
+def test_rejection_codes_is_list_and_first_code_is_deterministic() -> None:
+    """rejection_codes must remain a list and report a stable first code."""
+    result = _run_check_dag({"schema_version": 1})
+    codes = result.get("rejection_codes")
+    assert isinstance(codes, list)
+    assert codes[0] == "repository-missing"
 
 
 if __name__ == "__main__":
