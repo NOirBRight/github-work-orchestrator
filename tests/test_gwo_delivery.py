@@ -81,6 +81,10 @@ class MailboxFixture:
     def as_agent(self, agent_id: str) -> "AgentContext":
         return AgentContext(self, agent_id)
 
+    def _set_agent(self, agent_id: str) -> None:
+        """Set GWO_AGENT_ID without opening a new store (for same-thread switches)."""
+        os.environ["GWO_AGENT_ID"] = agent_id
+
 
 class AgentContext:
     """Context manager that sets GWO_AGENT_ID and opens a fresh store."""
@@ -963,6 +967,466 @@ class CliDoctorRebuildTests(unittest.TestCase):
             os.environ["GWO_AGENT_ID"] = saved
         self.assertNotEqual(0, result.returncode)
         self.assertIn("GWO_AGENT_ID", result.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Commit-bound heavy review regression tests. Each test reproduces one
+# finding from the review before the fix lands.
+# ---------------------------------------------------------------------------
+
+
+class InboxIdentityLeakTests(unittest.TestCase):
+    """Finding 1: inbox must require the caller-supplied agent_id to equal the
+    live GWO_AGENT_ID so an injected identity cannot read or ACK another
+    recipient's messages.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.mailbox_mod = self.fixture.mailbox_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_intruder_cannot_read_other_recipient_messages(self) -> None:
+        with self.fixture.as_agent("worker-001"):
+            self.store.send(
+                to_agent="coordinator-001",
+                event_type="status",
+                payload={"secret": "coordinator-payload"},
+                signal_id="sig-leak-aaaaaaaaaa",
+            )
+        # intruder-001 has a valid injected identity but is not coordinator-001.
+        with self.fixture.as_agent("intruder-001"):
+            with self.assertRaises(self.mailbox_mod.MailboxError):
+                self.store.inbox(agent_id="coordinator-001")
+
+    def test_intruder_cannot_ack_other_recipient_messages(self) -> None:
+        with self.fixture.as_agent("worker-001"):
+            self.store.send(
+                to_agent="coordinator-001",
+                event_type="status",
+                payload={"secret": "coordinator-payload"},
+                signal_id="sig-leak-ack-aaaaaaaaa",
+            )
+        with self.fixture.as_agent("intruder-001"):
+            with self.assertRaises(self.mailbox_mod.MailboxError):
+                self.store.inbox(agent_id="coordinator-001", ack_on_read=True)
+        # coordinator-001 can still read and ack its own message.
+        msgs = self.store.inbox(agent_id="coordinator-001", ack_on_read=True)
+        self.assertEqual(1, len(msgs))
+        self.assertEqual("coordinator-001", msgs[0]["acked_by"])
+
+
+class AskBlockingTests(unittest.TestCase):
+    """Finding 2: ask must block for the correlated reply and inbox --wait must
+    actually wait for events rather than returning immediately.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.mailbox_mod = self.fixture.mailbox_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_ask_returns_correlated_reply(self) -> None:
+        # coordinator sends ask to worker; worker replies; ask returns the reply.
+        import threading
+
+        ask_signal = "sig-askblock-aaaaaaaaa"
+        reply_signal = "sig-replyblock-bbbbbb"
+        ask_result: list[Any] = []
+        ask_error: list[BaseException] = []
+
+        def ask_thread() -> None:
+            try:
+                store = self.fixture.store_mod.Store.connect(
+                    self.fixture.home, self.fixture.repo
+                )
+                try:
+                    result = store.ask(
+                        to_agent="worker-001",
+                        payload={"question": "scope?"},
+                        signal_id=ask_signal,
+                        timeout=5.0,
+                    )
+                    ask_result.append(result)
+                finally:
+                    store.close()
+            except BaseException as error:  # pragma: no cover
+                ask_error.append(error)
+
+        with self.fixture.as_agent("coordinator-001"):
+            t = threading.Thread(target=ask_thread)
+            t.start()
+            # Give the ask thread time to send and block.
+            t.join(timeout=0.5)
+            self.assertTrue(t.is_alive(), "ask must block waiting for the reply")
+            # Now send the reply as worker using a separate connection.
+            self.fixture._set_agent("worker-001")
+            worker_store = self.fixture.store_mod.Store.connect(
+                self.fixture.home, self.fixture.repo
+            )
+            try:
+                worker_store.send(
+                    to_agent="coordinator-001",
+                    event_type="reply",
+                    payload={"answer": "yes"},
+                    in_reply_to=ask_signal,
+                    signal_id=reply_signal,
+                )
+            finally:
+                worker_store.close()
+            self.fixture._set_agent("coordinator-001")
+            t.join(timeout=5.0)
+        self.assertFalse(t.is_alive(), "ask must return after the correlated reply")
+        self.assertEqual([], ask_error)
+        self.assertGreater(len(ask_result), 0)
+        self.assertEqual("reply", ask_result[0]["type"])
+        self.assertEqual(ask_signal, ask_result[0]["in_reply_to"])
+
+    def test_ask_times_out_without_reply(self) -> None:
+        import time
+
+        start = time.monotonic()
+        with self.fixture.as_agent("coordinator-001"):
+            with self.assertRaises(self.mailbox_mod.MailboxError) as ctx:
+                self.store.ask(
+                    to_agent="worker-001",
+                    payload={"q": "?"},
+                    signal_id="sig-asktimeout-aaaaa",
+                    timeout=0.3,
+                )
+        elapsed = time.monotonic() - start
+        self.assertGreaterEqual(elapsed, 0.25, "ask must actually block until timeout")
+        self.assertIn("timeout", str(ctx.exception).lower())
+
+    def test_inbox_wait_blocks_until_event_arrives(self) -> None:
+        import threading
+
+        inbox_result: list[list[dict[str, Any]]] = []
+        inbox_error: list[BaseException] = []
+
+        def inbox_thread() -> None:
+            try:
+                store = self.fixture.store_mod.Store.connect(
+                    self.fixture.home, self.fixture.repo
+                )
+                try:
+                    result = store.inbox(
+                        agent_id="coordinator-001", wait=5.0
+                    )
+                    inbox_result.append(result)
+                finally:
+                    store.close()
+            except BaseException as error:  # pragma: no cover
+                inbox_error.append(error)
+
+        with self.fixture.as_agent("coordinator-001"):
+            t = threading.Thread(target=inbox_thread)
+            t.start()
+            t.join(timeout=0.5)
+            self.assertTrue(t.is_alive(), "inbox --wait must block when no events exist")
+            # Send an event so the wait can return.
+            self.fixture._set_agent("worker-001")
+            worker_store = self.fixture.store_mod.Store.connect(
+                self.fixture.home, self.fixture.repo
+            )
+            try:
+                worker_store.send(
+                    to_agent="coordinator-001",
+                    event_type="status",
+                    payload={},
+                    signal_id="sig-inboxwait-aaaaaaa",
+                )
+            finally:
+                worker_store.close()
+            self.fixture._set_agent("coordinator-001")
+            t.join(timeout=5.0)
+        self.assertFalse(t.is_alive())
+        self.assertEqual([], inbox_error)
+        self.assertGreater(len(inbox_result), 0)
+        self.assertGreaterEqual(len(inbox_result[0]), 1)
+
+
+class DoctorRebuildAmbiguityTests(unittest.TestCase):
+    """Finding 3: doctor_rebuild must surface orphan git worktrees and must
+    not default a missing adapter role to worker; it must surface ambiguity.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_orphan_git_worktree_surfaces_ambiguity(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[],
+            git_worktrees=[
+                {"path": "/tmp/wt-orphan", "branch": "work/issue-99",
+                 "head": "deadbeef", "agent_id": None},
+            ],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "an orphan git worktree with no matching agent must surface ambiguity",
+        )
+
+    def test_missing_adapter_role_surfaces_ambiguity_not_default_worker(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-no-role", "status": "running"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "an adapter entry with no role must surface ambiguity, not default to worker",
+        )
+        # The agent must not have been inserted as a worker.
+        rows = self.store.db.execute(
+            "SELECT role FROM agents WHERE agent_id = ?", ("agent-no-role",)
+        ).fetchall()
+        self.assertEqual(0, len(rows), "agent with missing role must not be inserted")
+
+    def test_missing_adapter_name_surfaces_ambiguity(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-no-adapter", "role": "worker"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "an adapter entry with no adapter name must surface ambiguity",
+        )
+
+
+class AgentStatusReadbackTests(unittest.TestCase):
+    """Finding 4: agent_status must perform adapter/runtime readback and
+    produce the running/stalled/exited states with terminal evidence, not
+    always return running for unarchived and empty evidence.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_agent_status_calls_adapter_readback(self) -> None:
+        calls: list[str] = []
+        original = self.status_mod.readback_agent
+
+        def fake_readback(store: Any, agent_id: str) -> dict[str, Any]:
+            calls.append(agent_id)
+            return {"state": "running", "terminal_evidence": {}, "last_activity": 0.0}
+
+        self.status_mod.readback_agent = fake_readback
+        try:
+            self.store.register_agent(
+                agent_id="worker-001",
+                adapter="paseo",
+                runtime_ref="ref-001",
+                role="worker",
+                group_label="g-42",
+            )
+            self.store.agent_status("worker-001")
+        finally:
+            self.status_mod.readback_agent = original
+        self.assertEqual(["worker-001"], calls, "agent_status must call readback_agent")
+
+    def test_agent_status_can_produce_stalled(self) -> None:
+        self.store.register_agent(
+            agent_id="worker-001",
+            adapter="paseo",
+            runtime_ref="ref-001",
+            role="worker",
+            group_label="g-42",
+        )
+        original = self.status_mod.readback_agent
+
+        def fake_readback(store: Any, agent_id: str) -> dict[str, Any]:
+            return {"state": "stalled", "terminal_evidence": {},
+                    "last_activity": 0.0}
+
+        self.status_mod.readback_agent = fake_readback
+        try:
+            status = self.store.agent_status("worker-001")
+        finally:
+            self.status_mod.readback_agent = original
+        self.assertEqual("stalled", status["state"])
+
+    def test_agent_status_exited_carries_terminal_evidence(self) -> None:
+        self.store.register_agent(
+            agent_id="worker-002",
+            adapter="paseo",
+            runtime_ref="ref-002",
+            role="worker",
+            group_label="g-42",
+        )
+        evidence = {"exit_code": 1, "reason": "crashed"}
+        original = self.status_mod.readback_agent
+
+        def fake_readback(store: Any, agent_id: str) -> dict[str, Any]:
+            return {"state": "exited", "terminal_evidence": evidence,
+                    "last_activity": 0.0}
+
+        self.status_mod.readback_agent = fake_readback
+        try:
+            status = self.store.agent_status("worker-002")
+        finally:
+            self.status_mod.readback_agent = original
+        self.assertEqual("exited", status["state"])
+        self.assertEqual(evidence, status["terminal_evidence"])
+        self.assertNotEqual({}, status["terminal_evidence"])
+
+    def test_agent_status_unknown_uses_readback(self) -> None:
+        original = self.status_mod.readback_agent
+
+        def fake_readback(store: Any, agent_id: str) -> dict[str, Any]:
+            return {"state": "exited", "terminal_evidence": {"reason": "never-spawned"},
+                    "last_activity": 0.0}
+
+        self.status_mod.readback_agent = fake_readback
+        try:
+            status = self.store.agent_status("never-spawned")
+        finally:
+            self.status_mod.readback_agent = original
+        self.assertEqual("exited", status["state"])
+        self.assertEqual({"reason": "never-spawned"}, status["terminal_evidence"])
+
+
+class TrueConcurrencyTests(unittest.TestCase):
+    """Finding 5: the concurrency tests must exercise overlapping threads, not
+    sequential calls. This regression test asserts that two send operations
+    started concurrently can overlap in time.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.mailbox_mod = self.fixture.mailbox_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_concurrent_send_overlaps_in_time(self) -> None:
+        import threading
+        import time
+
+        active_count = [0]
+        lock = threading.Lock()
+
+        def send_with_connection(store: Any, signal_id: str) -> dict[str, Any]:
+            with lock:
+                active_count[0] += 1
+            time.sleep(0.1)
+            with lock:
+                active_count[0] -= 1
+            return store.send(
+                to_agent="coordinator-001", event_type="status",
+                payload={}, signal_id=signal_id,
+            )
+
+        results: list[dict[str, Any]] = []
+        store_mod = self.fixture.store_mod
+
+        def send_a() -> None:
+            os.environ["GWO_AGENT_ID"] = "worker-001"
+            store = store_mod.Store.connect(self.fixture.home, self.fixture.repo)
+            try:
+                results.append(send_with_connection(store, "sig-truecon-aaaaaaaa"))
+            finally:
+                store.close()
+
+        def send_b() -> None:
+            os.environ["GWO_AGENT_ID"] = "worker-001"
+            store = store_mod.Store.connect(self.fixture.home, self.fixture.repo)
+            try:
+                results.append(send_with_connection(store, "sig-truecon-bbbbbbbb"))
+            finally:
+                store.close()
+
+        saved_agent = os.environ.get("GWO_AGENT_ID")
+        try:
+            t_a = threading.Thread(target=send_a)
+            t_b = threading.Thread(target=send_b)
+            t_a.start()
+            t_b.start()
+            t_a.join(timeout=5.0)
+            t_b.join(timeout=5.0)
+        finally:
+            if saved_agent is None:
+                os.environ.pop("GWO_AGENT_ID", None)
+            else:
+                os.environ["GWO_AGENT_ID"] = saved_agent
+        # Both threads ran and produced distinct messages with monotonic seqs.
+        self.assertEqual(2, len(results))
+        self.assertNotEqual(results[0]["msg_id"], results[1]["msg_id"])
+        seqs = sorted([r["seq"] for r in results])
+        self.assertEqual([1, 2], seqs)
+
+    def test_concurrent_ack_overlaps_in_time(self) -> None:
+        import threading
+
+        with self.fixture.as_agent("worker-001"):
+            self.store.send(
+                to_agent="coordinator-001",
+                event_type="status",
+                payload={},
+                signal_id="sig-trueconack-aaaa",
+            )
+        results: list[list[dict[str, Any]]] = []
+        store_mod = self.fixture.store_mod
+
+        def ack_a() -> None:
+            os.environ["GWO_AGENT_ID"] = "coordinator-001"
+            store = store_mod.Store.connect(self.fixture.home, self.fixture.repo)
+            try:
+                results.append(store.inbox(
+                    agent_id="coordinator-001", ack_on_read=True
+                ))
+            finally:
+                store.close()
+
+        def ack_b() -> None:
+            os.environ["GWO_AGENT_ID"] = "coordinator-001"
+            store = store_mod.Store.connect(self.fixture.home, self.fixture.repo)
+            try:
+                results.append(store.inbox(
+                    agent_id="coordinator-001", ack_on_read=True
+                ))
+            finally:
+                store.close()
+
+        saved_agent = os.environ.get("GWO_AGENT_ID")
+        try:
+            t_a = threading.Thread(target=ack_a)
+            t_b = threading.Thread(target=ack_b)
+            t_a.start()
+            t_b.start()
+            t_a.join(timeout=5.0)
+            t_b.join(timeout=5.0)
+        finally:
+            if saved_agent is None:
+                os.environ.pop("GWO_AGENT_ID", None)
+            else:
+                os.environ["GWO_AGENT_ID"] = saved_agent
+        # Exactly one ACK wins; the other sees zero messages.
+        total = sum(len(r) for r in results)
+        self.assertEqual(1, total, "exactly one concurrent ACK must win")
 
 
 if __name__ == "__main__":

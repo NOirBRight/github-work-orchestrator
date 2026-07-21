@@ -854,6 +854,24 @@ class Store:
             in_reply_to=in_reply_to,
         )
 
+    def ask(
+        self,
+        *,
+        to_agent: str,
+        payload: dict[str, Any] | None = None,
+        signal_id: str,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Send an ask event and block for the correlated reply."""
+        import gwo_mailbox
+        return gwo_mailbox.ask(
+            self,
+            to_agent=to_agent,
+            payload=payload,
+            signal_id=signal_id,
+            timeout=timeout,
+        )
+
     def inbox(
         self,
         *,

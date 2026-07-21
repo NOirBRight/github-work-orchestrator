@@ -370,59 +370,138 @@ def inbox(
     transaction so a concurrent reader cannot double-ack. With
     ``dispatch_id``, messages are filtered to the caller's dispatch scope
     (messages from the dispatched agent or to the dispatched agent).
+
+    With ``wait`` set, when no messages are immediately available the call
+    polls up to ``wait`` seconds for at least one message to arrive, then
+    returns whatever is available (which may be empty if the wait elapses).
+
+    The caller-supplied ``agent_id`` must equal the live ``GWO_AGENT_ID`` so
+    an injected identity cannot read or ACK another recipient's messages.
+    The only exception is a dispatch-scoped read where the caller is the
+    coordinator reading the dispatch's agent traffic, or the dispatched agent
+    reading its own traffic.
     """
     _validate_agent_id(agent_id, "agent_id")
     caller = store._caller()
     db = store.db
-    db.execute("BEGIN IMMEDIATE")
-    try:
-        if dispatch_id is not None:
-            # Dispatch-scoped inbox: only messages between the coordinator and
-            # the dispatched agent for this dispatch.
-            dispatch = db.execute(
-                "SELECT agent_id FROM dispatches WHERE dispatch_id = ?",
-                (dispatch_id,),
-            ).fetchone()
-            if dispatch is None:
-                raise DeliveryError(f"unknown dispatch {dispatch_id}")
-            dispatched_agent = str(dispatch["agent_id"])
-            rows = db.execute(
-                "SELECT msg_id, signal_id, seq, from_agent, to_agent, type, "
-                "payload_json, in_reply_to, created_at, acked_at, acked_by "
-                "FROM messages "
-                "WHERE (from_agent = ? AND to_agent = ?) "
-                "   OR (from_agent = ? AND to_agent = ?) "
-                "ORDER BY seq",
-                (dispatched_agent, agent_id, agent_id, dispatched_agent),
-            ).fetchall()
-        else:
-            rows = db.execute(
-                "SELECT msg_id, signal_id, seq, from_agent, to_agent, type, "
-                "payload_json, in_reply_to, created_at, acked_at, acked_by "
-                "FROM messages WHERE to_agent = ? AND acked_at IS NULL "
-                "ORDER BY seq",
-                (agent_id,),
-            ).fetchall()
-        messages = [_message_from_row(r) for r in rows]
-        if ack_on_read:
-            now = _now()
-            for msg in messages:
-                if msg["acked_at"] is None:
-                    db.execute(
-                        "UPDATE messages SET acked_at = ?, acked_by = ? "
-                        "WHERE msg_id = ? AND acked_at IS NULL",
-                        (now, caller, msg["msg_id"]),
-                    )
-            # Re-read to reflect acked_at/acked_by.
-            messages = [_message_row(db, m["msg_id"]) for m in messages]
-        db.execute("COMMIT")
-    except BaseException:
+    poll_interval = 0.05
+    deadline = _now() + wait if wait is not None else None
+    while True:
+        db.execute("BEGIN IMMEDIATE")
         try:
-            db.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            pass
-        raise
-    return messages
+            dispatched_agent: str | None = None
+            if dispatch_id is not None:
+                dispatch = db.execute(
+                    "SELECT agent_id FROM dispatches WHERE dispatch_id = ?",
+                    (dispatch_id,),
+                ).fetchone()
+                if dispatch is None:
+                    raise DeliveryError(f"unknown dispatch {dispatch_id}")
+                dispatched_agent = str(dispatch["agent_id"])
+                caller_is_dispatched = caller == dispatched_agent
+                caller_is_coord = _is_coordinator(store, caller)
+                if not (caller_is_dispatched or caller_is_coord):
+                    raise DeliveryError(
+                        "only the dispatched agent or coordinator may read a "
+                        "dispatch-scoped inbox"
+                    )
+                rows = db.execute(
+                    "SELECT msg_id, signal_id, seq, from_agent, to_agent, type, "
+                    "payload_json, in_reply_to, created_at, acked_at, acked_by "
+                    "FROM messages "
+                    "WHERE (from_agent = ? AND to_agent = ?) "
+                    "   OR (from_agent = ? AND to_agent = ?) "
+                    "ORDER BY seq",
+                    (dispatched_agent, agent_id, agent_id, dispatched_agent),
+                ).fetchall()
+            else:
+                if agent_id != caller:
+                    raise DeliveryError(
+                        "agent_id must equal the caller's GWO_AGENT_ID to read "
+                        "a non-scoped inbox"
+                    )
+                rows = db.execute(
+                    "SELECT msg_id, signal_id, seq, from_agent, to_agent, type, "
+                    "payload_json, in_reply_to, created_at, acked_at, acked_by "
+                    "FROM messages WHERE to_agent = ? AND acked_at IS NULL "
+                    "ORDER BY seq",
+                    (agent_id,),
+                ).fetchall()
+            messages = [_message_from_row(r) for r in rows]
+            if messages:
+                if ack_on_read:
+                    now = _now()
+                    for msg in messages:
+                        if msg["acked_at"] is None:
+                            db.execute(
+                                "UPDATE messages SET acked_at = ?, acked_by = ? "
+                                "WHERE msg_id = ? AND acked_at IS NULL",
+                                (now, caller, msg["msg_id"]),
+                            )
+                    messages = [_message_row(db, m["msg_id"]) for m in messages]
+                db.execute("COMMIT")
+                return messages
+            # No messages found. Release the write lock and decide whether to wait.
+            db.execute("COMMIT")
+            if deadline is None or _now() >= deadline:
+                return []
+            time.sleep(poll_interval)
+        except BaseException:
+            try:
+                db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+
+
+def _is_coordinator(store: Any, agent_id: str) -> bool:
+    """Return True if agent_id holds the active coordinator claim for this repo."""
+    row = store.db.execute(
+        "SELECT agent_id FROM coordinator WHERE repo = ? AND released_at IS NULL",
+        (store.repo,),
+    ).fetchone()
+    return row is not None and str(row["agent_id"]) == agent_id
+
+
+def ask(
+    store: Any,
+    *,
+    to_agent: str,
+    payload: dict[str, Any] | None = None,
+    signal_id: str,
+    timeout: float = 30.0,
+    poll_interval: float = 0.05,
+) -> dict[str, Any]:
+    """Send an ask event and block until the correlated reply arrives.
+
+    Sends an ``ask`` event to ``to_agent``, then polls the caller's inbox for a
+    ``reply`` event whose ``in_reply_to`` matches ``signal_id``. Blocks up to
+    ``timeout`` seconds. Raises ``MailboxError`` on timeout. The reply event is
+    returned and not auto-acked (the caller decides when to ack).
+    """
+    ask_msg = send(
+        store,
+        to_agent=to_agent,
+        event_type="ask",
+        payload=payload,
+        signal_id=signal_id,
+    )
+    caller = ask_msg["from_agent"]
+    deadline = _now() + timeout
+    while _now() < deadline:
+        rows = store.db.execute(
+            "SELECT msg_id, signal_id, seq, from_agent, to_agent, type, "
+            "payload_json, in_reply_to, created_at, acked_at, acked_by "
+            "FROM messages WHERE to_agent = ? AND type = 'reply' "
+            "AND in_reply_to = ? ORDER BY seq",
+            (caller, signal_id),
+        ).fetchall()
+        if rows:
+            return _message_from_row(rows[0])
+        time.sleep(poll_interval)
+    raise MailboxError(
+        f"ask {signal_id} timed out after {timeout}s waiting for reply"
+    )
 
 
 def agent_status(store: Any, agent_id: str) -> dict[str, Any]:

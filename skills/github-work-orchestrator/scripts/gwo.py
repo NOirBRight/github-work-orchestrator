@@ -184,11 +184,11 @@ def cmd_send(args: argparse.Namespace) -> int:
 def cmd_ask(args: argparse.Namespace) -> int:
     store = _store(args)
     try:
-        msg = store.send(
+        msg = store.ask(
             to_agent=args.to,
-            event_type="ask",
             payload=_json_value(args.payload),
             signal_id=args.signal_id,
+            timeout=args.timeout,
         )
         _emit(msg)
         return 0
@@ -360,6 +360,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--to", required=True, help="recipient agent id")
     ask.add_argument("--signal-id", required=True, dest="signal_id")
     ask.add_argument("--payload", default=None, help="JSON object payload")
+    ask.add_argument("--timeout", type=float, default=30.0)
     ask.set_defaults(func=cmd_ask)
 
     inbox = sub.add_parser("inbox", help="read/wait for mailbox events")
