@@ -3416,5 +3416,219 @@ class LegacyDuplicateRebuildDetectionTests(unittest.TestCase):
             store.close()
 
 
+# ---------------------------------------------------------------------------
+# Eighth commit-bound heavy review regression tests.
+# ---------------------------------------------------------------------------
+
+
+class InboxDefaultDispatchScopeTests(unittest.TestCase):
+    """Finding 1: inbox without an explicit dispatch_id must default to the
+    caller's own active dispatch scope so prior-dispatch or sibling-dispatch
+    traffic does not leak into normal Worker replay.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.mailbox_mod = self.fixture.mailbox_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_ordinary_inbox_does_not_return_prior_dispatch_traffic(self) -> None:
+        dispatch1_id = self.fixture.dispatch["dispatch_id"]
+        # Send a message to worker-001 referencing dispatch1.
+        self.store.send(
+            to_agent="worker-001",
+            event_type="status",
+            payload={"dispatch_id": dispatch1_id, "msg": "prior-dispatch"},
+            signal_id="sig-default-prior-aaaaa",
+        )
+        # Mark dispatch1 done (terminal).
+        with self.fixture.as_agent("worker-001"):
+            self.store.mark_done(
+                task_id=self.fixture.task["task_id"],
+                dispatch_id=dispatch1_id,
+                status="done",
+            )
+        # Create a new task + dispatch for the same worker-001.
+        task2 = self.store.create_task(issue=60, group_label="g-60", risk="standard")
+        self.store.update_task(task_id=task2["task_id"], status="ready")
+        dispatch2 = self.store.create_dispatch(
+            task_id=task2["task_id"],
+            agent_id="worker-001",
+            worktree="/tmp/wt-60",
+            branch="work/issue-60",
+        )
+        # Send a message to worker-001 referencing dispatch2.
+        self.store.send(
+            to_agent="worker-001",
+            event_type="status",
+            payload={"dispatch_id": dispatch2["dispatch_id"], "msg": "current-dispatch"},
+            signal_id="sig-default-current-aaa",
+        )
+        # Ordinary inbox call (no dispatch_id) must return only the current
+        # dispatch's traffic, not the prior dispatch's unacked message.
+        with self.fixture.as_agent("worker-001"):
+            msgs = self.store.inbox(agent_id="worker-001")
+        payloads = [m["payload"] for m in msgs]
+        prior_msgs = [p for p in payloads if p.get("dispatch_id") == dispatch1_id]
+        current_msgs = [p for p in payloads if p.get("dispatch_id") == dispatch2["dispatch_id"]]
+        self.assertEqual(0, len(prior_msgs),
+                         "ordinary inbox must not leak prior-dispatch traffic")
+        self.assertGreater(len(current_msgs), 0,
+                           "ordinary inbox must see current dispatch traffic")
+
+
+class MalformedAdapterEvidenceTests(unittest.TestCase):
+    """Finding 2: doctor_rebuild must validate agent_id against AGENT_ID_RE and
+    reject empty adapter strings. Malformed runtime evidence must be surfaced
+    and left uninserted.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_malformed_agent_id_rejected(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "bad id", "status": "running",
+                 "role": "worker", "adapter": "paseo"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "malformed agent_id must surface ambiguity",
+        )
+        rows = self.store.db.execute(
+            "SELECT agent_id FROM agents WHERE agent_id = ?", ("bad id",)
+        ).fetchall()
+        self.assertEqual(0, len(rows), "malformed agent_id must not be inserted")
+
+    def test_empty_adapter_rejected(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-empty-adapter", "status": "running",
+                 "role": "worker", "adapter": ""},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "empty adapter string must surface ambiguity",
+        )
+        rows = self.store.db.execute(
+            "SELECT agent_id FROM agents WHERE agent_id = ?", ("agent-empty-adapter",)
+        ).fetchall()
+        self.assertEqual(0, len(rows), "empty-adapter agent must not be inserted")
+
+
+class ReadbackSnapshotLeakTests(unittest.TestCase):
+    """Finding 3: injected runtime snapshots must be owned by the Store and
+    cleared when the Store closes, so a recycled connection ID cannot return
+    stale runtime evidence from a prior Store.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self._saved_env = {
+            "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
+        }
+        os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        import sys as _sys
+        if str(SCRIPT_DIR) not in _sys.path:
+            _sys.path.insert(0, str(SCRIPT_DIR))
+
+    def tearDown(self) -> None:
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def test_snapshot_cleared_on_store_close(self) -> None:
+        store_mod = load_store()
+        status_mod = load_status()
+        store = store_mod.Store.connect(self.home, "owner/repo")
+        store.claim_coordinator()
+        store.register_agent(
+            agent_id="worker-snap",
+            adapter="paseo",
+            runtime_ref="ref-snap",
+            role="worker",
+            group_label="g-42",
+        )
+        status_mod.set_readback_snapshot(
+            store, {"agents": [{"agent_id": "worker-snap", "state": "running"}]}
+        )
+        status = status_mod.agent_status(store, "worker-snap")
+        self.assertEqual("running", status["state"])
+        old_db_id = id(store.db)
+        self.assertIn(old_db_id, status_mod._READBACK_SNAPSHOTS)
+        store.close()
+        # After close, the snapshot must be cleared so a recycled connection
+        # ID cannot return stale runtime evidence.
+        self.assertNotIn(
+            old_db_id, status_mod._READBACK_SNAPSHOTS,
+            "closed Store's snapshot must be cleared, not retained",
+        )
+
+
+class UnexpectedMigrationDriftTests(unittest.TestCase):
+    """Finding 4: config_check must detect unexpected migration records, not
+    just missing ones. An older kernel must not dispatch against an
+    unrecognized newer/drifted schema.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_store_config_check_detects_unexpected_migration(self) -> None:
+        self.store.db.execute(
+            "INSERT INTO schema_migrations (name) VALUES (?)",
+            ("9999-future",),
+        )
+        result = self.store.config_check()
+        self.assertFalse(result["valid"], result)
+        errors_text = " ".join(result["errors"])
+        self.assertIn("unexpected", errors_text.lower())
+
+    def test_cli_preflight_detects_unexpected_migration(self) -> None:
+        cli = CliFixture(claim=False)
+        try:
+            cli.run("coordinator", "claim")
+            # Insert an unexpected migration into the store.
+            store_mod = load_store()
+            store = store_mod.Store.connect(cli.home, "owner/repo")
+            store.db.execute(
+                "INSERT INTO schema_migrations (name) VALUES (?)",
+                ("9999-future",),
+            )
+            store.close()
+            result = cli.run("config", "check")
+            self.assertNotEqual(0, result.returncode)
+            output = (result.stdout + result.stderr).lower()
+            self.assertIn("unexpected", output)
+        finally:
+            cli.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()

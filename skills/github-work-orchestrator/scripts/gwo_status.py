@@ -154,6 +154,11 @@ def preflight_config(
                 errors.append(
                     f"migration drift: missing {sorted(missing)}"
                 )
+            unexpected = applied - EXPECTED_MIGRATIONS
+            if unexpected:
+                errors.append(
+                    f"migration drift: unexpected {sorted(unexpected)}"
+                )
         finally:
             conn.close()
     except sqlite3.Error as error:
@@ -378,6 +383,11 @@ def config_check(store: Any, *, gwo_home: str | None = None) -> dict[str, Any]:
             errors.append(
                 f"migration drift: missing {sorted(missing)}"
             )
+        unexpected = applied - EXPECTED_MIGRATIONS
+        if unexpected:
+            errors.append(
+                f"migration drift: unexpected {sorted(unexpected)}"
+            )
     except sqlite3.Error as error:
         errors.append(f"schema check failed: {error}")
     return {"valid": len(errors) == 0, "errors": errors}
@@ -525,10 +535,16 @@ def doctor_rebuild(
         if aid is None:
             ambiguities.append("adapter listing entry missing agent_id")
             continue
+        # Validate agent_id format against AGENT_ID_RE.
+        if not isinstance(aid, str) or not AGENT_ID_RE.fullmatch(aid):
+            ambiguities.append(f"agent {aid} has malformed agent_id; not inserted")
+            invalid_agents.add(aid if isinstance(aid, str) else str(aid))
+            continue
         # Required fields: agent_id, status, role, adapter.
         missing = []
         for field in ("status", "role", "adapter"):
-            if entry.get(field) is None:
+            val = entry.get(field)
+            if val is None or (isinstance(val, str) and val.strip() == ""):
                 missing.append(field)
         if missing:
             ambiguities.append(

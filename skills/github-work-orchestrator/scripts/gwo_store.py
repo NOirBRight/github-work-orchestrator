@@ -378,6 +378,14 @@ class Store:
             )
 
     def close(self) -> None:
+        # Clear any injected readback snapshot for this Store's connection
+        # so a recycled connection ID cannot return stale runtime evidence
+        # from a prior Store.
+        try:
+            import gwo_status
+            gwo_status._READBACK_SNAPSHOTS.pop(id(self.db), None)
+        except Exception:
+            pass
         self.db.close()
 
     def journal_mode(self) -> str:

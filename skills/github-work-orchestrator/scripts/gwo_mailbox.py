@@ -501,6 +501,18 @@ def inbox(
                         "agent_id must equal the caller's GWO_AGENT_ID to read "
                         "a non-scoped inbox"
                     )
+                # Default to the caller's own active dispatch scope. If the
+                # caller has an active dispatch, only return messages addressed
+                # to the caller that relate to that dispatch (payload
+                # dispatch_id matches or is absent). This prevents prior-
+                # dispatch or sibling-dispatch traffic from leaking into normal
+                # Worker replay.
+                active_dispatch = db.execute(
+                    "SELECT dispatch_id FROM dispatches "
+                    "WHERE agent_id = ? AND status = 'active' "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (caller,),
+                ).fetchone()
                 rows = db.execute(
                     "SELECT msg_id, signal_id, seq, from_agent, to_agent, type, "
                     "payload_json, in_reply_to, created_at, acked_at, acked_by "
@@ -508,6 +520,16 @@ def inbox(
                     "ORDER BY seq",
                     (agent_id,),
                 ).fetchall()
+                if active_dispatch is not None:
+                    active_did = str(active_dispatch["dispatch_id"])
+                    filtered_rows = []
+                    for r in rows:
+                        payload = json.loads(r["payload_json"])
+                        msg_dispatch_id = payload.get("dispatch_id")
+                        if msg_dispatch_id is not None and str(msg_dispatch_id) != active_did:
+                            continue  # prior/sibling-dispatch traffic: filter out
+                        filtered_rows.append(r)
+                    rows = filtered_rows
             messages = [_message_from_row(r) for r in rows]
             if messages:
                 if ack_on_read:
