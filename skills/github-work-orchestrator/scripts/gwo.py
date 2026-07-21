@@ -133,6 +133,7 @@ def cmd_done(args: argparse.Namespace) -> int:
             dispatch_id=args.dispatch_id,
             status=args.status,
             actor=args.actor,
+            evidence=_json_value(args.evidence),
         )
         _emit(dispatch)
         return 0
@@ -345,6 +346,7 @@ def build_parser() -> argparse.ArgumentParser:
     done.add_argument("--task-id", required=True)
     done.add_argument("--dispatch-id", required=True)
     done.add_argument("--status", required=True, choices=("done", "blocked", "stopped"))
+    done.add_argument("--evidence", default=None, help="JSON object terminal evidence")
     done.add_argument("--actor", default=None, help=argparse.SUPPRESS)
     done.set_defaults(func=cmd_done)
 

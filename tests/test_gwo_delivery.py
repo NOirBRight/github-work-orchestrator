@@ -1429,5 +1429,541 @@ class TrueConcurrencyTests(unittest.TestCase):
         self.assertEqual(1, total, "exactly one concurrent ACK must win")
 
 
+# ---------------------------------------------------------------------------
+# Second commit-bound heavy review regression tests. Each test reproduces one
+# finding from the review before the fix lands.
+# ---------------------------------------------------------------------------
+
+
+class ReplyAuthorBindingTests(unittest.TestCase):
+    """Finding 1: reply must verify the referenced ask exists, the reply author
+    is that ask's intended recipient, and the reply recipient is the ask author.
+    An adversarial reply from an unrelated agent must be rejected so ask()
+    cannot accept it.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.mailbox_mod = self.fixture.mailbox_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_reply_rejects_when_referenced_ask_does_not_exist(self) -> None:
+        with self.fixture.as_agent("worker-001"):
+            with self.assertRaises(self.mailbox_mod.MailboxError) as ctx:
+                self.store.send(
+                    to_agent="coordinator-001",
+                    event_type="reply",
+                    payload={"answer": "yes"},
+                    in_reply_to="sig-nonexistent-ask",
+                    signal_id="sig-reply-noask-aaaa",
+                )
+        self.assertIn("ask", str(ctx.exception).lower())
+
+    def test_reply_rejects_adversarial_author_not_ask_recipient(self) -> None:
+        # coordinator asks worker-001.
+        ask = self.store.send(
+            to_agent="worker-001",
+            event_type="ask",
+            payload={"q": "scope?"},
+            signal_id="sig-rb-ask-aaaaaaaaa",
+        )
+        self.assertEqual("coordinator-001", ask["from_agent"])
+        self.assertEqual("worker-001", ask["to_agent"])
+        # An unrelated agent (worker-002) tries to reply to the ask,
+        # claiming to be the answerer. This must be rejected because
+        # worker-002 is not the ask's intended recipient.
+        with self.fixture.as_agent("worker-002"):
+            with self.assertRaises(self.mailbox_mod.MailboxError) as ctx:
+                self.store.send(
+                    to_agent="coordinator-001",
+                    event_type="reply",
+                    payload={"answer": "hijack"},
+                    in_reply_to="sig-rb-ask-aaaaaaaaa",
+                    signal_id="sig-rb-reply-adversa",
+                )
+        self.assertIn("not the intended recipient", str(ctx.exception).lower())
+
+    def test_reply_rejects_when_recipient_is_not_ask_author(self) -> None:
+        # coordinator asks worker-001.
+        self.store.send(
+            to_agent="worker-001",
+            event_type="ask",
+            payload={"q": "scope?"},
+            signal_id="sig-rb-ask2-aaaaaaaa",
+        )
+        # worker-001 (the legitimate recipient) tries to reply to someone
+        # other than the ask author (coordinator-001). This must be rejected.
+        with self.fixture.as_agent("worker-001"):
+            with self.assertRaises(self.mailbox_mod.MailboxError) as ctx:
+                self.store.send(
+                    to_agent="worker-002",
+                    event_type="reply",
+                    payload={"answer": "wrong-recipient"},
+                    in_reply_to="sig-rb-ask2-aaaaaaaa",
+                    signal_id="sig-rb-reply-wrongrec",
+                )
+        self.assertIn("not the ask author", str(ctx.exception).lower())
+
+    def test_ask_rejects_adversarial_reply_from_unrelated_agent(self) -> None:
+        import threading
+
+        ask_signal = "sig-rb-ask3-aaaaaaaaa"
+        ask_result: list[Any] = []
+        ask_error: list[BaseException] = []
+
+        def ask_thread() -> None:
+            try:
+                store = self.fixture.store_mod.Store.connect(
+                    self.fixture.home, self.fixture.repo
+                )
+                try:
+                    result = store.ask(
+                        to_agent="worker-001",
+                        payload={"q": "?"},
+                        signal_id=ask_signal,
+                        timeout=1.0,
+                    )
+                    ask_result.append(result)
+                finally:
+                    store.close()
+            except BaseException as error:
+                ask_error.append(error)
+
+        with self.fixture.as_agent("coordinator-001"):
+            t = threading.Thread(target=ask_thread)
+            t.start()
+            t.join(timeout=0.3)
+            self.assertTrue(t.is_alive(), "ask must block")
+            # Adversarial reply from worker-002 (not the intended recipient).
+            self.fixture._set_agent("worker-002")
+            adv_store = self.fixture.store_mod.Store.connect(
+                self.fixture.home, self.fixture.repo
+            )
+            try:
+                with self.assertRaises(self.mailbox_mod.MailboxError):
+                    adv_store.send(
+                        to_agent="coordinator-001",
+                        event_type="reply",
+                        payload={"answer": "hijack"},
+                        in_reply_to=ask_signal,
+                        signal_id="sig-rb-adv-reply-aa",
+                    )
+            finally:
+                adv_store.close()
+            self.fixture._set_agent("coordinator-001")
+            t.join(timeout=2.0)
+        # ask must have timed out because the adversarial reply was rejected.
+        self.assertEqual([], ask_result)
+        self.assertGreater(len(ask_error), 0)
+        self.assertIn("timed out", str(ask_error[0]).lower())
+
+
+class DispatchScopedInboxBindingTests(unittest.TestCase):
+    """Finding 2: dispatch-scoped inbox must bind agent_id to the live caller,
+    return only deliveries the caller may read, and ensure only the intended
+    recipient can ACK.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.mailbox_mod = self.fixture.mailbox_mod
+        self.dispatch_id = self.fixture.dispatch["dispatch_id"]
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_dispatch_scoped_inbox_returns_only_readable_by_caller(self) -> None:
+        # coordinator sends a message to worker-001 (worker reads its own).
+        self.store.send(
+            to_agent="worker-001",
+            event_type="status",
+            payload={"msg": "to-worker"},
+            signal_id="sig-dsi-to-worker-aaa",
+        )
+        # worker-001 sends a message to coordinator (outbound, worker should
+        # see its own outbound; coordinator should see its inbound).
+        with self.fixture.as_agent("worker-001"):
+            self.store.send(
+                to_agent="coordinator-001",
+                event_type="status",
+                payload={"msg": "to-coordinator"},
+                signal_id="sig-dsi-to-coord-aaaa",
+            )
+        # worker-001 reads its dispatch-scoped inbox: should see messages
+        # addressed TO worker-001 (its inbox), not its own outbound to coordinator.
+        with self.fixture.as_agent("worker-001"):
+            msgs = self.store.inbox(
+                agent_id="worker-001",
+                dispatch_id=self.dispatch_id,
+            )
+        self.assertGreater(len(msgs), 0, "must see the message addressed to worker-001")
+        to_agent_values = [m["to_agent"] for m in msgs]
+        self.assertTrue(
+            all(a == "worker-001" for a in to_agent_values),
+            "dispatch-scoped inbox for the dispatched agent must return only "
+            "messages addressed to that agent, not its outbound traffic",
+        )
+
+    def test_dispatch_scoped_inbox_ack_only_by_intended_recipient(self) -> None:
+        # coordinator sends a message to worker-001.
+        self.store.send(
+            to_agent="worker-001",
+            event_type="status",
+            payload={"msg": "to-worker"},
+            signal_id="sig-dsi-ack-aaaaaaaaa",
+        )
+        # coordinator reads the dispatch-scoped inbox with ack_on_read.
+        # coordinator is NOT the intended recipient (worker-001 is), so the
+        # message must NOT be acked by coordinator.
+        msgs = self.store.inbox(
+            agent_id="worker-001",
+            dispatch_id=self.dispatch_id,
+            ack_on_read=True,
+        )
+        # The message is visible (coordinator can read dispatch traffic) but
+        # must not be acked by coordinator because coordinator is not the
+        # recipient.
+        self.assertGreater(len(msgs), 0)
+        for m in msgs:
+            self.assertIsNone(
+                m["acked_at"],
+                "coordinator must not ACK messages addressed to worker-001",
+            )
+        # worker-001 (the actual recipient) can ACK.
+        with self.fixture.as_agent("worker-001"):
+            msgs = self.store.inbox(
+                agent_id="worker-001",
+                dispatch_id=self.dispatch_id,
+                ack_on_read=True,
+            )
+        self.assertGreater(len(msgs), 0)
+        self.assertEqual("worker-001", msgs[0]["acked_by"])
+
+    def test_dispatch_scoped_inbox_rejects_agent_id_not_caller(self) -> None:
+        # An intruder (not the dispatched agent, not coordinator) tries to
+        # read a dispatch-scoped inbox with an agent_id that is not theirs.
+        with self.fixture.as_agent("intruder-001"):
+            with self.assertRaises(self.mailbox_mod.MailboxError):
+                self.store.inbox(
+                    agent_id="worker-001",
+                    dispatch_id=self.dispatch_id,
+                )
+
+
+class DoneTerminalEvidenceTests(unittest.TestCase):
+    """Finding 3: done CLI must accept structured terminal evidence input,
+    pass it through to mark_done, and the two-agent send -> ack -> done
+    scenario must record and assert non-empty terminal_evidence_json.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.mailbox_mod = self.fixture.mailbox_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_mark_done_records_non_empty_terminal_evidence(self) -> None:
+        evidence = {
+            "candidate_sha": "abc123",
+            "pr_url": "https://example/pr/29",
+            "changed_paths": ["a.py", "b.py"],
+        }
+        with self.fixture.as_agent("worker-001"):
+            result = self.store.mark_done(
+                task_id=self.fixture.task["task_id"],
+                dispatch_id=self.fixture.dispatch["dispatch_id"],
+                status="done",
+                evidence=evidence,
+            )
+        self.assertEqual("done", result["status"])
+        self.assertIsNotNone(result["terminal_evidence_json"])
+        stored = json.loads(result["terminal_evidence_json"])
+        self.assertEqual(evidence, stored)
+        self.assertNotEqual({}, stored)
+
+    def test_cli_done_accepts_terminal_evidence(self) -> None:
+        cli = CliFixture(claim=True)
+        try:
+            create = cli.run(
+                "task", "create", "--issue", "42", "--group", "g-42", "--risk", "standard"
+            )
+            task_id = json.loads(create.stdout)["task_id"]
+            cli.run("task", "update", task_id, "--status", "ready")
+            dispatch = cli.run(
+                "dispatch", "create",
+                "--task-id", task_id,
+                "--agent-id", "worker-001",
+                "--worktree", "/tmp/wt-42",
+                "--branch", "work/issue-42",
+            )
+            dispatch_id = json.loads(dispatch.stdout)["dispatch_id"]
+            os.environ["GWO_AGENT_ID"] = "worker-001"
+            try:
+                evidence = json.dumps({"candidate_sha": "deadbeef", "pr_url": "https://x"})
+                result = cli.run(
+                    "done", "--task-id", task_id, "--dispatch-id", dispatch_id,
+                    "--status", "done", "--evidence", evidence,
+                )
+            finally:
+                os.environ["GWO_AGENT_ID"] = "coordinator-001"
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            stored = json.loads(payload["terminal_evidence_json"])
+            self.assertEqual("deadbeef", stored["candidate_sha"])
+        finally:
+            cli.cleanup()
+
+    def test_two_agent_send_ack_done_records_terminal_evidence(self) -> None:
+        with self.fixture.as_agent("worker-001"):
+            self.store.send(
+                to_agent="coordinator-001",
+                event_type="status",
+                payload={"phase": "running"},
+                signal_id="sig-evi-send-aaaaaaaa",
+            )
+        msgs = self.store.inbox(agent_id="coordinator-001", ack_on_read=True)
+        self.assertEqual(1, len(msgs))
+        self.assertEqual("coordinator-001", msgs[0]["acked_by"])
+        evidence = {"candidate_sha": "face0ff", "pr_url": "https://example/pr/29"}
+        with self.fixture.as_agent("worker-001"):
+            result = self.store.mark_done(
+                task_id=self.fixture.task["task_id"],
+                dispatch_id=self.fixture.dispatch["dispatch_id"],
+                status="done",
+                evidence=evidence,
+            )
+        self.assertEqual("done", result["status"])
+        stored = json.loads(result["terminal_evidence_json"])
+        self.assertEqual(evidence, stored)
+        self.assertNotEqual({}, stored)
+
+
+class DoctorRebuildConflictTests(unittest.TestCase):
+    """Finding 4: doctor_rebuild must detect conflicts across status, role,
+    adapter, and existing-row evidence; surface ambiguities rather than
+    first-wins insertion.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_same_status_conflicting_role_surfaces_ambiguity(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-dup", "status": "running", "role": "worker", "adapter": "paseo"},
+                {"agent_id": "agent-dup", "status": "running", "role": "reviewer", "adapter": "paseo"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "same status but conflicting role must surface ambiguity",
+        )
+
+    def test_same_status_conflicting_adapter_surfaces_ambiguity(self) -> None:
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-dup2", "status": "running", "role": "worker", "adapter": "paseo"},
+                {"agent_id": "agent-dup2", "status": "running", "role": "worker", "adapter": "headless"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "same status but conflicting adapter must surface ambiguity",
+        )
+
+    def test_existing_row_conflicting_role_surfaces_ambiguity(self) -> None:
+        # Pre-register an agent as worker.
+        self.store.register_agent(
+            agent_id="agent-existing",
+            adapter="paseo",
+            runtime_ref="ref-1",
+            role="worker",
+            group_label="g-42",
+        )
+        # Rebuild with an adapter listing that claims a different role.
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-existing", "status": "running", "role": "reviewer", "adapter": "paseo"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "existing row with conflicting role must surface ambiguity",
+        )
+
+    def test_existing_row_conflicting_adapter_surfaces_ambiguity(self) -> None:
+        self.store.register_agent(
+            agent_id="agent-existing2",
+            adapter="paseo",
+            runtime_ref="ref-2",
+            role="worker",
+            group_label="g-42",
+        )
+        result = self.store.doctor_rebuild(
+            github_snapshot={"issues": [], "agents": [], "worktrees": []},
+            adapter_listing=[
+                {"agent_id": "agent-existing2", "status": "running", "role": "worker", "adapter": "headless"},
+            ],
+            git_worktrees=[],
+        )
+        self.assertGreater(
+            len(result["ambiguities"]), 0,
+            "existing row with conflicting adapter must surface ambiguity",
+        )
+
+
+class ProductionReadbackTests(unittest.TestCase):
+    """Finding 5: production readback_agent must be a real stdlib runtime
+    readback seam that can observe stalled/exited state with terminal evidence,
+    testable without monkeypatching.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_production_readback_running_for_active_agent(self) -> None:
+        # Register an agent with the current process's PID so the production
+        # readback can observe a live process via stdlib os.kill.
+        import os as _os
+        self.store.register_agent(
+            agent_id="worker-001",
+            adapter="paseo",
+            runtime_ref="ref-001",
+            role="worker",
+            group_label="g-42",
+            pid=_os.getpid(),
+        )
+        status = self.store.agent_status("worker-001")
+        self.assertEqual("running", status["state"])
+        self.assertEqual(True, status["registered"])
+
+    def test_production_readback_exited_for_archived_agent(self) -> None:
+        self.store.register_agent(
+            agent_id="worker-002",
+            adapter="paseo",
+            runtime_ref="ref-002",
+            role="worker",
+            group_label="g-42",
+        )
+        # Archive the agent by setting archived_at.
+        self.store.db.execute(
+            "UPDATE agents SET archived_at = ? WHERE agent_id = ?",
+            (1234567.0, "worker-002"),
+        )
+        status = self.store.agent_status("worker-002")
+        self.assertEqual("exited", status["state"])
+        self.assertNotEqual({}, status["terminal_evidence"])
+
+    def test_production_readback_exited_for_unknown_agent(self) -> None:
+        status = self.store.agent_status("never-spawned")
+        self.assertEqual("exited", status["state"])
+        self.assertNotEqual({}, status["terminal_evidence"])
+        self.assertEqual(False, status["registered"])
+
+    def test_production_readback_stalled_via_runtime_input(self) -> None:
+        # Register an agent with a runtime_ref pointing at a non-existent
+        # process/session. The production readback should detect that the
+        # runtime is not advancing and report stalled.
+        self.store.register_agent(
+            agent_id="worker-003",
+            adapter="paseo",
+            runtime_ref="definitely-not-a-real-ref",
+            role="worker",
+            group_label="g-42",
+        )
+        status = self.store.agent_status("worker-003")
+        # With no real runtime to observe, a registered agent whose runtime
+        # cannot be contacted should be stalled (not running), because the
+        # production readback must observe runtime activity, not just the
+        # agents table.
+        self.assertIn(status["state"], ("stalled", "exited"),
+                      "unobservable runtime must not be reported as running")
+
+
+class ConfigPreflightTests(unittest.TestCase):
+    """Finding 6: config_check must be a non-destructive preflight that reads
+    GWO_HOME/config.json and the expected migration set, and dispatch creation
+    must be gated on a successful config check.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = MailboxFixture(self)
+        self.store = self.fixture.store
+        self.status_mod = self.fixture.status_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_config_check_reads_config_json(self) -> None:
+        import json as _json
+        config_path = Path(self.fixture.home) / "config.json"
+        config_path.write_text(_json.dumps({
+            "max_workers": 3,
+            "max_reviewers": 2,
+            "stalled_threshold_seconds": 900,
+        }))
+        result = self.store.config_check()
+        self.assertTrue(result["valid"], result.get("errors", []))
+
+    def test_config_check_reports_malformed_config_json(self) -> None:
+        config_path = Path(self.fixture.home) / "config.json"
+        config_path.write_text("{not valid json")
+        result = self.store.config_check()
+        self.assertFalse(result["valid"])
+        self.assertGreater(len(result["errors"]), 0)
+
+    def test_config_check_reports_migration_drift(self) -> None:
+        # Drop a migration row to simulate drift.
+        self.store.db.execute(
+            "DELETE FROM schema_migrations WHERE name = '0002-messages-in-reply-to'"
+        )
+        result = self.store.config_check()
+        self.assertFalse(result["valid"])
+        self.assertGreater(len(result["errors"]), 0)
+
+    def test_dispatch_creation_gated_on_config_check(self) -> None:
+        # Malform config so config_check fails.
+        config_path = Path(self.fixture.home) / "config.json"
+        config_path.write_text("{bad json")
+        task = self.store.create_task(issue=99, group_label="g-99", risk="fast")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        with self.assertRaises(self.store_mod_error()) as ctx:
+            self.store.create_dispatch(
+                task_id=task["task_id"],
+                agent_id="worker-009",
+                worktree="/tmp/wt-99",
+                branch="work/issue-99",
+            )
+        self.assertIn("config", str(ctx.exception).lower())
+        # The new task (issue 99) must remain ready (not dispatched).
+        tasks = {t["issue"]: t for t in self.store.list_tasks()}
+        self.assertEqual("ready", tasks[99]["status"])
+
+    def store_mod_error(self):
+        return self.fixture.store_mod.StoreError
+
+
 if __name__ == "__main__":
     unittest.main()

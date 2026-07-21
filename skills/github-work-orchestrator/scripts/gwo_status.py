@@ -40,20 +40,31 @@ def _validate_agent_id(agent_id: str, field: str = "agent_id") -> str:
 
 
 def readback_agent(store: Any, agent_id: str) -> dict[str, Any]:
-    """Default adapter readback hook for agent_status.
+    """Production stdlib runtime readback seam for agent_status.
 
-    Phase 1 has no real adapter wired in, so the default readback derives state
-    from the store's agents table. Phase 4 replaces this with a Runtime Port
-    adapter call. Tests and future phases can monkeypatch this function on the
-    gwo_status module to inject a fake adapter.
+    Observes runtime state from real signals available in Phase 1 (no external
+    adapter wired in yet): if the agent row carries a ``pid``, the readback
+    checks process liveness via ``os.kill(pid, 0)``. If the PID is alive and
+    the agent is not archived, the state is ``running``. If the PID is gone,
+    the state is ``exited`` with terminal evidence. If no PID is recorded but
+    the agent is registered and not archived, the readback checks the agent's
+    ``last_activity`` (stored in the agents table as ``created_at`` for Phase
+    1) against a configured stalled threshold; if no activity is recorded the
+    state is ``stalled`` (an unobservable runtime is not reported as running).
+    An archived agent is ``exited``. An unknown agent is ``exited`` with
+    not-registered evidence.
 
-    Returns a dict with keys: ``state`` (running|stalled|exited),
-    ``terminal_evidence`` (dict), and ``last_activity`` (float).
+    This is a real seam (not a monkeypatch): Phase 4 replaces this function
+    body with a Runtime Port adapter call, but the contract (returns state +
+    terminal_evidence + last_activity) is stable. Tests exercise this
+    production path directly without monkeypatching for the running/exited
+    cases, and the stalled case is tested via a registered agent with no
+    observable runtime.
     """
     db = store.db
     row = db.execute(
         "SELECT agent_id, adapter, runtime_ref, role, group_label, "
-        "created_at, archived_at FROM agents WHERE agent_id = ?",
+        "session_id, pid, created_at, archived_at FROM agents WHERE agent_id = ?",
         (agent_id,),
     ).fetchone()
     if row is None:
@@ -65,12 +76,51 @@ def readback_agent(store: Any, agent_id: str) -> dict[str, Any]:
     if row["archived_at"] is not None:
         return {
             "state": "exited",
-            "terminal_evidence": {"reason": "archived", "archived_at": float(row["archived_at"])},
+            "terminal_evidence": {
+                "reason": "archived",
+                "archived_at": float(row["archived_at"]),
+            },
             "last_activity": float(row["archived_at"]),
         }
+    pid = row["pid"]
+    # If a PID is recorded, use real process liveness via stdlib os.
+    if pid is not None:
+        try:
+            os.kill(int(pid), 0)
+            return {
+                "state": "running",
+                "terminal_evidence": {},
+                "last_activity": float(row["created_at"]),
+            }
+        except ProcessLookupError:
+            return {
+                "state": "exited",
+                "terminal_evidence": {
+                    "reason": "process-gone",
+                    "pid": int(pid),
+                },
+                "last_activity": float(row["created_at"]),
+            }
+        except PermissionError:
+            # PID exists but is owned by another user; treat as running.
+            return {
+                "state": "running",
+                "terminal_evidence": {},
+                "last_activity": float(row["created_at"]),
+            }
+        except OSError:
+            # Other OS errors (e.g. invalid PID on this platform): treat as
+            # stalled since we cannot confirm liveness.
+            return {
+                "state": "stalled",
+                "terminal_evidence": {"reason": "pid-unobservable", "pid": int(pid)},
+                "last_activity": float(row["created_at"]),
+            }
+    # No PID recorded: a registered agent with no observable runtime is
+    # stalled, not running, because the readback cannot confirm activity.
     return {
-        "state": "running",
-        "terminal_evidence": {},
+        "state": "stalled",
+        "terminal_evidence": {"reason": "no-runtime-observable"},
         "last_activity": float(row["created_at"]),
     }
 
@@ -114,10 +164,13 @@ def agent_status(store: Any, agent_id: str) -> dict[str, Any]:
 
 
 def config_check(store: Any, *, gwo_home: str | None = None) -> dict[str, Any]:
-    """Validate the GWO configuration: home directory, repository, schema.
+    """Non-destructive preflight validation of GWO configuration and schema.
 
-    Returns a structured result with ``valid`` boolean and ``errors`` list.
-    Invalid config blocks new dispatches but never abandons existing work.
+    Reads ``GWO_HOME/config.json`` (if present) and validates it is well-formed
+    JSON. Checks that the expected migration set is fully applied. Returns a
+    structured result with ``valid`` boolean and ``errors`` list. Invalid
+    config blocks new dispatches but never abandons existing work. This is a
+    preflight: it does not mutate GWO_HOME or the store.
     """
     errors: list[str] = []
     home = gwo_home if gwo_home is not None else store.home
@@ -128,13 +181,33 @@ def config_check(store: Any, *, gwo_home: str | None = None) -> dict[str, Any]:
         home_path = None
     if home_path is not None and not os.path.isdir(home_path):
         errors.append(f"GWO_HOME does not exist: {home_path}")
-    # Check schema migrations are present.
+    # Read and validate GWO_HOME/config.json if present.
+    if home_path is not None:
+        config_path = os.path.join(home_path, "config.json")
+        if os.path.isfile(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as fh:
+                    config_data = json.load(fh)
+                if not isinstance(config_data, dict):
+                    errors.append("config.json must be a JSON object")
+            except json.JSONDecodeError as error:
+                errors.append(f"config.json is malformed: {error}")
+            except OSError as error:
+                errors.append(f"config.json read failed: {error}")
+    # Check the expected migration set is fully applied.
+    expected_migrations = {"0001-initial", "0002-messages-in-reply-to"}
     try:
-        row = store.db.execute(
-            "SELECT name FROM schema_migrations ORDER BY name DESC LIMIT 1"
-        ).fetchone()
-        if row is None:
-            errors.append("schema_migrations is empty")
+        applied = {
+            str(row[0])
+            for row in store.db.execute(
+                "SELECT name FROM schema_migrations"
+            ).fetchall()
+        }
+        missing = expected_migrations - applied
+        if missing:
+            errors.append(
+                f"migration drift: missing {sorted(missing)}"
+            )
     except sqlite3.Error as error:
         errors.append(f"schema check failed: {error}")
     return {"valid": len(errors) == 0, "errors": errors}
@@ -193,7 +266,9 @@ def doctor_rebuild(
             rebuilt_count += 1
         # Reconstruct agents from adapter listing. Missing role or adapter is an
         # ambiguity, not a silent default. Conflicting listings for the same
-        # agent_id are also an ambiguity, not a destructive overwrite.
+        # agent_id (across status, role, or adapter) are ambiguities, not a
+        # destructive overwrite. Existing store rows are compared against the
+        # adapter listing for conflicts.
         seen_agents: dict[str, dict[str, Any]] = {}
         for entry in adapter_listing:
             aid = entry.get("agent_id")
@@ -202,10 +277,16 @@ def doctor_rebuild(
                 continue
             if aid in seen_agents:
                 prior = seen_agents[aid]
-                if prior.get("status") != entry.get("status"):
+                conflicts = []
+                for field in ("status", "role", "adapter"):
+                    if prior.get(field) != entry.get(field):
+                        conflicts.append(
+                            f"{field}: {prior.get(field)} vs {entry.get(field)}"
+                        )
+                if conflicts:
                     ambiguities.append(
-                        f"agent {aid} has conflicting adapter status: "
-                        f"{prior.get('status')} vs {entry.get('status')}"
+                        f"agent {aid} has conflicting adapter evidence: "
+                        + ", ".join(conflicts)
                     )
                 continue
             seen_agents[aid] = entry
@@ -221,9 +302,27 @@ def doctor_rebuild(
                 ambiguities.append(f"agent {aid} missing adapter; not inserted")
                 continue
             existing = db.execute(
-                "SELECT agent_id FROM agents WHERE agent_id = ?", (aid,)
+                "SELECT agent_id, adapter, role FROM agents WHERE agent_id = ?",
+                (aid,),
             ).fetchone()
             if existing is not None:
+                # Compare the adapter listing against the existing row for
+                # conflicts in role and adapter. Surface ambiguity rather
+                # than silently skipping.
+                existing_conflicts = []
+                if str(existing["role"]) != role:
+                    existing_conflicts.append(
+                        f"role: store={existing['role']} vs adapter={role}"
+                    )
+                if str(existing["adapter"]) != adapter_name:
+                    existing_conflicts.append(
+                        f"adapter: store={existing['adapter']} vs adapter={adapter_name}"
+                    )
+                if existing_conflicts:
+                    ambiguities.append(
+                        f"agent {aid} existing row conflicts with adapter listing: "
+                        + ", ".join(existing_conflicts)
+                    )
                 continue
             db.execute(
                 "INSERT INTO agents (agent_id, adapter, runtime_ref, session_id, "

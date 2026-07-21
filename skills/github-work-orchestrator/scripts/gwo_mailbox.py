@@ -267,6 +267,33 @@ def send(
     db = store.db
     db.execute("BEGIN IMMEDIATE")
     try:
+        # Reply binding: verify the referenced ask exists, the reply author
+        # is that ask's intended recipient, and the reply recipient is the
+        # ask author. This prevents adversarial replies from unrelated agents.
+        # This check runs before role resolution because the reply authority
+        # comes from being the ask's intended recipient, not just the role.
+        if event_type == "reply" and in_reply_to is not None:
+            ask_row = db.execute(
+                "SELECT from_agent, to_agent, type FROM messages "
+                "WHERE signal_id = ? AND type = 'ask'",
+                (in_reply_to,),
+            ).fetchone()
+            if ask_row is None:
+                raise MailboxError(
+                    f"reply references unknown or non-ask signal_id {in_reply_to}"
+                )
+            ask_author = str(ask_row["from_agent"])
+            ask_recipient = str(ask_row["to_agent"])
+            if caller != ask_recipient:
+                raise EntitlementError(
+                    f"reply author {caller} is not the intended recipient "
+                    f"{ask_recipient} of ask {in_reply_to}"
+                )
+            if to_agent != ask_author:
+                raise MailboxError(
+                    f"reply recipient {to_agent} is not the ask author "
+                    f"{ask_author} of ask {in_reply_to}"
+                )
         role = _resolve_role(store, caller)
         entitled = ROLE_ENTITLEMENT.get(event_type, frozenset())
         if role not in entitled:
@@ -405,14 +432,30 @@ def inbox(
                         "only the dispatched agent or coordinator may read a "
                         "dispatch-scoped inbox"
                     )
+                # Bind agent_id to the live caller: the dispatched agent reads
+                # its own mailbox (agent_id == caller == dispatched_agent); the
+                # coordinator reads the dispatched agent's mailbox
+                # (agent_id == dispatched_agent). This prevents an injected
+                # identity from reading another recipient's dispatch traffic.
+                if caller_is_dispatched and agent_id != caller:
+                    raise DeliveryError(
+                        "dispatch-scoped inbox agent_id must equal the caller "
+                        "(dispatched agent)"
+                    )
+                if caller_is_coord and agent_id != dispatched_agent:
+                    raise DeliveryError(
+                        "coordinator dispatch-scoped inbox agent_id must equal "
+                        "the dispatched agent"
+                    )
+                # Return only deliveries the caller may read: messages addressed
+                # TO the mailbox owner (agent_id). This excludes the owner's
+                # outbound traffic, which the owner already authored.
                 rows = db.execute(
                     "SELECT msg_id, signal_id, seq, from_agent, to_agent, type, "
                     "payload_json, in_reply_to, created_at, acked_at, acked_by "
-                    "FROM messages "
-                    "WHERE (from_agent = ? AND to_agent = ?) "
-                    "   OR (from_agent = ? AND to_agent = ?) "
+                    "FROM messages WHERE to_agent = ? AND acked_at IS NULL "
                     "ORDER BY seq",
-                    (dispatched_agent, agent_id, agent_id, dispatched_agent),
+                    (agent_id,),
                 ).fetchall()
             else:
                 if agent_id != caller:
@@ -433,11 +476,15 @@ def inbox(
                     now = _now()
                     for msg in messages:
                         if msg["acked_at"] is None:
-                            db.execute(
-                                "UPDATE messages SET acked_at = ?, acked_by = ? "
-                                "WHERE msg_id = ? AND acked_at IS NULL",
-                                (now, caller, msg["msg_id"]),
-                            )
+                            # Only the intended recipient (to_agent == caller)
+                            # may ACK. A coordinator reading dispatch traffic
+                            # must not ACK messages addressed to the worker.
+                            if msg["to_agent"] == caller:
+                                db.execute(
+                                    "UPDATE messages SET acked_at = ?, acked_by = ? "
+                                    "WHERE msg_id = ? AND acked_at IS NULL",
+                                    (now, caller, msg["msg_id"]),
+                                )
                     messages = [_message_row(db, m["msg_id"]) for m in messages]
                 db.execute("COMMIT")
                 return messages

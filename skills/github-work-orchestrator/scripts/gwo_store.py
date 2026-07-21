@@ -665,6 +665,16 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self._require_coordinator_claim(actor)
+            # Config preflight gate: a failed config check blocks new
+            # dispatches but never abandons existing work. The check is
+            # non-destructive (reads config.json + migration set).
+            import gwo_status
+            preflight = gwo_status.config_check(self)
+            if not preflight["valid"]:
+                raise TransitionError(
+                    "config check failed; dispatch blocked: "
+                    + "; ".join(preflight["errors"])
+                )
             # Conditional DML: atomically flip the task from ready to
             # dispatched. If another writer already won the race, rowcount is
             # 0 and we reject without inserting. This makes validation and the
