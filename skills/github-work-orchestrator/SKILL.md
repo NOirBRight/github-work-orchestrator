@@ -48,16 +48,11 @@ python <skill>/scripts/gwo.py coordinator claim --repository <owner/repo>
 ```
 
 The store refuses a second claim and names the holder. If a Coordinator already
-holds the lock, become an Operator Relay: sanitize the request to at most 500
-characters plus a SHA-256, then use:
-
-```text
-python <skill>/scripts/gwo.py send --to <coordinator> --type ask --signal-id <id> --payload <json>
-```
-
-Do not read the GitHub frontier or worktrees; never promote an Agent in
-`work/issue-*` or an existing Dispatch. Duplicate Coordinators stop admission
-and integration; preserve every Agent for human adjudication.
+holds the lock, the caller is not the Coordinator: post only one sanitized
+request to the repository mailbox and idle. Do not read the GitHub frontier
+or worktrees; never promote an Agent in `work/issue-*` or an existing Dispatch.
+Duplicate Coordinators stop admission and integration; preserve every Agent for
+human adjudication.
 
 ## Separate home and Integration Control Workspaces
 
@@ -112,11 +107,13 @@ not roll back successful siblings.
 
 Use the exact `Worker · #<issue> · a<attempt>` Agent name and
 `WT · #<issue> · <slug>` Workspace title, then include those values in runtime
-readback. Worker and Reviewer capacity are independent: a Task Group has three
-Worker slots and two Review slots; `standard`/`strict` never reduce Worker slots
-from three. Foreign active Paseo Agents consume global capacity; empty UI
-drafts, archived Agents, and terminal idle Relays do not. Integration Lease
-availability never serializes implementation.
+readback. Different tasks execute concurrently only when their canonical
+repository-relative Hotsets do not overlap. Worker and Reviewer capacity are
+independent: a Task Group has three Worker slots and two Review slots;
+`standard`/`strict` never reduce Worker slots from three. Foreign active Paseo
+Agents consume global capacity; empty UI drafts, archived Agents, and terminal
+idle Relays do not. A repository-scoped Integration Lease serializes updates to
+`dev`, not implementation.
 
 Only use Paseo Agents created through the installed `paseo` Skill inside the
 GWO tree. Provider-native Agent/Task/Swarm features must not appear inside a

@@ -8,15 +8,17 @@ other.
 ## Supervision and Workspace ownership
 
 Keep one Repository Coordinator per repository. It is the single root Agent
-with repository/role labels and survives every Task Group. Its Coordinator Home
+with repository/role labels and survives every Campaign. Its Coordinator Home
 Workspace stores the long-lived conversation; it need not itself be clean or on
 `dev`. Select an Integration Control Worktree separately and pass its exact path
 to integration Git commands.
 
-A Task Group is only a label on tasks. It has no coordinating Paseo Agent, no
-Campaign Control Workspace, and no per-Group room. Workers, Spec Reviewer, and
-Quality Reviewer are direct `subagent` children of the Coordinator when review is
-needed.
+Each Campaign has one coordinating Paseo Agent, user-visible as
+`Campaign · <id> · <purpose>` and internally labeled role `orchestrator`. It is
+a direct `subagent` of the Coordinator and may use its own Provider Binding.
+Every new v4.3 Campaign receives a dedicated local Campaign Control Workspace
+on `gwo/campaign/<id>`. Its branch is not pushed, has no PR, and carries no
+feature commit. Legacy active Campaigns without one are not migrated.
 
 If duplicate Coordinators exist, stop admission/integration, preserve both, and
 require human durable handoff/adjudication. Unlabeled root Agents are foreign
@@ -49,11 +51,11 @@ mode, labels, Workspace, branch, and worktree before START.
 ## Execution and integration
 
 Pin each Dispatch to exact `dev` SHA; PRs target `dev`. `main` receives only an
-explicit verified release merge from `dev`. Coordinator Home and Task Group
-labels never carry feature commits; inline feature work also uses an isolated
-`work/issue-*` worktree. A Coordinator Home Workspace carries no feature commit.
+explicit verified release merge from `dev`. Coordinator/Campaign control
+branches never carry feature commits; inline feature work also uses an isolated
+`work/issue-*` worktree.
 
-Different Tasks execute concurrently only when canonical repository-relative
+Different Campaigns execute concurrently only when canonical repository-relative
 Hotsets do not overlap. Reject absolute paths, empty components, `.`/`..`, and
 missing case-sensitivity evidence. One repository-scoped Integration Lease
 serializes updates to `dev`, not implementation.

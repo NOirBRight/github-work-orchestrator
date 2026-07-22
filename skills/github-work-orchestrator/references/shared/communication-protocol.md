@@ -9,10 +9,11 @@ recurring Paseo heartbeats for normal coordination correctness.
 ## Coordinator mailbox
 
 The Coordinator claims a repository lock in the gwo store. All addressed
-requests flow through `gwo send --to coordinator`. An Operator Relay sends a
-sanitized summary of at most 500 characters plus a SHA-256 of the original
-message, not the full message. Reject credentials, private prompts, absolute
-paths, unknown payload fields, and non-monotonic sequence.
+requests flow through `gwo send --to coordinator`. A caller that is not the
+Coordinator sends at most one sanitized summary of 500 characters plus a
+SHA-256 of the original message, not the full message, then idles. Reject
+credentials, private prompts, absolute paths, unknown payload fields, and
+non-monotonic sequence.
 
 The store mailbox is a persistent coordination cache, not business truth. The
 Coordinator replays it at startup, before waiting, and before ending every turn.

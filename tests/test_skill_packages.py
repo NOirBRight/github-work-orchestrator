@@ -36,9 +36,13 @@ class SkillPackageTests(unittest.TestCase):
             with self.subTest(skill=name):
                 self.assertTrue((skill / "SKILL.md").is_file())
                 self.assertTrue((skill / ".skill-package.json").is_file())
-                self.assertTrue((skill / "scripts" / "paseo_room.py").is_file())
-                self.assertTrue(
-                    (skill / "scripts" / "material_delivery.py").is_file()
+                self.assertFalse(
+                    (skill / "scripts" / "paseo_room.py").exists(),
+                    "V6 paseo_room.py must not be packaged in V7",
+                )
+                self.assertFalse(
+                    (skill / "scripts" / "material_delivery.py").exists(),
+                    "V6 material_delivery.py must not be packaged in V7",
                 )
 
     def test_shared_references_and_room_runtime_are_synchronized(self) -> None:
@@ -171,7 +175,10 @@ class SkillPackageTests(unittest.TestCase):
             self.assertIn(phrase, normalized)
         for skill in SKILLS:
             packaged = ROOT / "skills" / skill / "scripts" / "material_delivery.py"
-            self.assertTrue(packaged.is_file())
+            self.assertFalse(
+                packaged.exists(),
+                "V6 material_delivery.py must not be packaged in V7",
+            )
         cleanup = (
             ROOT
             / "skills/github-work-orchestrator/references/cleanup-safety-policy.md"
@@ -410,7 +417,7 @@ class SkillPackageTests(unittest.TestCase):
         )
         normalized = " ".join(skill.split()).lower()
         for phrase in (
-            "operator relay",
+            "caller is not the coordinator",
             "coordinator claim",
             "three worker slots",
             "two review slots",

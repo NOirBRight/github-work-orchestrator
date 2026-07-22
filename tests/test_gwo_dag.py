@@ -529,31 +529,13 @@ def test_v6_compatibility_single_ready_wave() -> None:
                 },
             ]
         )
-    import json
-    import subprocess
-    import sys
-    from pathlib import Path
-    scheduler = Path(__file__).resolve().parents[1] / "skills" / "github-work-orchestrator" / "scripts" / "campaign_scheduler.py"
-    with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as handle:
-        json.dump(snapshot, handle)
-        snapshot_path = handle.name
-    try:
-        v6_result = subprocess.run(
-            [sys.executable, str(scheduler), "plan-wave", "--snapshot", snapshot_path],
-            capture_output=True,
-            text=True,
-            cwd=str(scheduler.parent),
-        )
-    finally:
-        Path(snapshot_path).unlink(missing_ok=True)
-    v6_plan = json.loads(v6_result.stdout)
-    assert v6_plan.get("ok") is True
-    assert v6_plan["plan"]["automatic_execution"] is True
+    # V6 campaign_scheduler.py is retired in Phase 3; verify the V7 DAG guard
+    # accepts the same snapshot shape directly without invoking the removed script.
     dag_plan = _v6_to_dag(snapshot)
     dag_result = _run_check_dag(dag_plan)
     assert dag_result["returncode"] == 0
     assert dag_result.get("ok") is True
-    accepted_issues = {item["issue"] for item in v6_plan["plan"]["dispatches"]}
+    accepted_issues = {item["issue"] for item in snapshot["candidates"]}
     frontier_issues = {int(node_id.split("-", 1)[1]) for node_id in dag_result.get("ready_frontier", [])}
     assert accepted_issues == frontier_issues
 
@@ -599,24 +581,8 @@ def test_v6_compatibility_rejected_hotset_conflict_becomes_dag_rejection() -> No
             },
         ]
     )
-    scheduler = Path(__file__).resolve().parents[1] / "skills" / "github-work-orchestrator" / "scripts" / "campaign_scheduler.py"
-    with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as handle:
-        json.dump(snapshot, handle)
-        snapshot_path = handle.name
-    try:
-        v6_result = subprocess.run(
-            [sys.executable, str(scheduler), "plan-wave", "--snapshot", snapshot_path],
-            capture_output=True,
-            text=True,
-            cwd=str(scheduler.parent),
-        )
-    finally:
-        Path(snapshot_path).unlink(missing_ok=True)
-    v6_plan = json.loads(v6_result.stdout)
-    assert v6_plan.get("ok") is True
-
-    accepted = {item["issue"] for item in v6_plan["plan"]["dispatches"]}
-    assert len(accepted) == 1
+    # V6 campaign_scheduler.py is retired in Phase 3; verify the V7 DAG guard
+    # rejects the overlapping-hotset snapshot directly.
     dag_plan = _v6_to_dag(snapshot)
     dag_result = _run_check_dag(dag_plan)
     # V6 defers the overlapping issue; V7 DAG rejects the plan because
