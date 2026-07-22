@@ -1,46 +1,44 @@
 # GitHub Work Orchestration
 
 This context coordinates concurrent GitHub execution while keeping repository
-ownership, campaign ownership, and runtime parentage unambiguous.
+ownership, Task Group ownership, and runtime parentage unambiguous.
 
 ## Language
 
 **Repository Coordinator**:
-The single repository-labeled root Agent that arbitrates Campaigns and owns
+The single repository-labeled root Agent that arbitrates Task Groups and owns
 integration decisions for one repository. Its conversation home and integration
 worktree are separate resources.
-_Avoid_: Father, Repository Orchestrator
+_Avoid_: Father, Repository Orchestrator, Campaign
 
-**Campaign**:
-A bounded execution effort and the user-visible name of its coordinating Paseo
-Agent. The Agent is a direct child of the Repository Coordinator, owns exactly
-one Campaign ID, and has one Campaign Control Workspace.
-_Avoid_: Activity, run, Campaign Orchestrator in UI, Father, Orchestrator without qualification
+**Task Group**:
+A label on tasks that names a bounded effort. It is not an Agent, Workspace, or
+room.
+_Avoid_: Campaign Agent, Campaign Control Workspace, Campaign room
 
 **Dispatch**:
-One Campaign-owned assignment to one Agent, branch, worktree, and editor.
+One assignment to one Agent, branch, worktree, and editor.
 _Avoid_: Task, lane
 
 **Provider Binding**:
-The Campaign-local runtime choice of provider and model for an Agent role.
+The runtime-local choice of provider and model for an Agent role.
 _Avoid_: Global model, fixed model
 
 **Hotset**:
-The files or modules a Campaign claims for exclusive editing while it is active.
+The files or modules a Dispatch claims for exclusive editing while it is active.
 _Avoid_: Write set, scope
 
 **Integration Lease**:
-The repository-scoped exclusive right for one Campaign to update the integration
-branch.
+The repository-scoped exclusive right to update the integration branch.
 _Avoid_: Merge lock
 
 **Coordinator Loop**:
-The event-driven Repository/Campaign reconciliation cycle that rebuilds state,
-plans a ready wave, waits on Paseo signals, verifies evidence, and integrates.
+The event-driven repository reconciliation cycle that rebuilds state, plans a
+ready wave, waits on Paseo signals, verifies evidence, and integrates.
 _Avoid_: Poller, daemon, watchdog service
 
 **Heartbeat**:
-A best-effort Worker room signal at safe execution boundaries with a five-minute
+A best-effort Worker signal at safe execution boundaries with a five-minute
 target. It reports liveness only and cannot authorize completion or cleanup.
 _Avoid_: Orchestrator poll, timer SLA, terminal receipt
 
@@ -52,58 +50,46 @@ _Avoid_: Father worktree, control branch
 **Integration Control Worktree**:
 The explicitly addressed `dev` worktree used only for repository integration.
 It must be clean immediately before merge and is permanently protected from
-Campaign cleanup.
+Task Group cleanup.
 _Avoid_: Coordinator Home, execution worktree
 
-**Campaign Control Workspace**:
-The dedicated sidebar entry and local `gwo/campaign/*` worktree for one new
-Campaign. It carries coordination context, no feature changes, no push, and no
-PR.
-_Avoid_: Worker worktree, shared repository root
-
-**Operator Relay**:
-A one-shot ordinary Task that durably forwards a sanitized request to the
-existing Coordinator through the Repository Room, optionally wakes it by
-Signal-ID, records a receipt, then idles.
-_Avoid_: Temporary Coordinator, Campaign
-
 **Spec Reviewer**:
-The reusable Campaign-owned Paseo Reviewer for Issue, decision, scope, Hotset,
-and acceptance conformity.
-_Avoid_: General reviewer, implementation Worker
+The reusable Reviewer for Issue, decision, scope, Hotset, and acceptance
+conformity.
+_Avoid_: General reviewer, implementation Worker, Campaign-owned
 
 **Quality Reviewer**:
-The reusable Campaign-owned Paseo Reviewer for standards, architecture,
-security, tests, and maintainability.
-_Avoid_: General reviewer, implementation Worker
+The reusable Reviewer for standards, architecture, security, tests, and
+maintainability.
+_Avoid_: General reviewer, implementation Worker, Campaign-owned
 
-**Candidate Lock Receipt**:
-The Campaign-issued, persisted and read-backed immutable identity of one review
-round: Dispatch, candidate/base SHA, diff/acceptance digests, scope, and prior
-round lineage. Reviewer claims cannot create or replace it.
+**Review Lock**:
+The Coordinator-issued immutable identity of one review round: dispatch,
+candidate/base SHA, diff/acceptance digests, scope, and prior-round lineage.
+Reviewer claims cannot create or replace it.
 _Avoid_: Reviewer lock claim, matching hashes alone
 
 **Review Assignment**:
-The read-backed dynamic binding from one reusable Reviewer and static axis label
-to one Campaign parent, Dispatch, and Candidate Lock Receipt. It changes between
+The read-backed dynamic binding from one reusable Reviewer and fixed axis label
+to one Coordinator parent, Dispatch, and Review Lock. It changes between
 candidates without relabeling the Reviewer.
 _Avoid_: Reviewer Dispatch label, permanent Worker identity
 
 **Dispatch-scoped Replay**:
-A Worker view of one Campaign Room that ignores all other Dispatch and Campaign
-lifecycle events before identity lookup. Full unscoped replay remains a
-Campaign responsibility.
-_Avoid_: Incomplete Campaign reconciliation, sender filtering after rejection
+A Worker view of the store mailbox that ignores all other Dispatch and Task
+Group lifecycle events before identity lookup. Full unscoped replay remains a
+Coordinator responsibility.
+_Avoid_: Incomplete reconciliation, sender filtering after rejection
 
 **Material Delivery**:
-The GWO transaction that carries one explicitly addressed, durable Campaign
-Room event from its publish UUID through an idle-only signal wake to a
-recipient-authored Delivery ACK. Progress and Heartbeat events do not enter it.
+The gwo transaction that carries one explicitly addressed store mailbox event
+from its publish UUID through an idle-only signal wake to a recipient-authored
+delivery ACK. Progress and heartbeat events do not enter it.
 _Avoid_: Finish callback, mention, unacknowledged room post
 
 **Wake Receipt**:
-The non-authoritative `DELIVERY_WAKE` room record written after Paseo accepts a
-signal-only wake. It prevents unlimited retries and never proves the recipient
+The non-authoritative `DELIVERY_WAKE` store record written after Paseo accepts
+a signal-only wake. It prevents unlimited retries and never proves the recipient
 processed the source event.
 _Avoid_: Completion receipt, Agent liveness
 
@@ -117,3 +103,9 @@ _Avoid_: Result evidence, terminal receipt
 The GWO-owned policy that authorizes exact cleanup actions from observed Paseo,
 Git, and worktree evidence without requiring host or runtime source changes.
 _Avoid_: Daemon guard, host cleanup service
+
+**GWO Kernel**:
+The packaged `gwo.py` CLI and SQLite store that enforce coordination invariants
+at write time. The store is a rebuildable cache; GitHub remains the only durable
+business truth.
+_Avoid_: Second orchestrator, business state

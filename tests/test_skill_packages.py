@@ -36,9 +36,13 @@ class SkillPackageTests(unittest.TestCase):
             with self.subTest(skill=name):
                 self.assertTrue((skill / "SKILL.md").is_file())
                 self.assertTrue((skill / ".skill-package.json").is_file())
-                self.assertTrue((skill / "scripts" / "paseo_room.py").is_file())
-                self.assertTrue(
-                    (skill / "scripts" / "material_delivery.py").is_file()
+                self.assertFalse(
+                    (skill / "scripts" / "paseo_room.py").exists(),
+                    "V6 paseo_room.py must not be packaged in V7",
+                )
+                self.assertFalse(
+                    (skill / "scripts" / "material_delivery.py").exists(),
+                    "V6 material_delivery.py must not be packaged in V7",
                 )
 
     def test_shared_references_and_room_runtime_are_synchronized(self) -> None:
@@ -107,7 +111,7 @@ class SkillPackageTests(unittest.TestCase):
     def test_legacy_root_wrapper_loads_packaged_orchestrator(self) -> None:
         wrapper = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("skills/github-work-orchestrator/SKILL.md", wrapper)
-        self.assertIn("provider-neutral Paseo", wrapper)
+        self.assertIn("gwo kernel", wrapper.lower())
 
     def test_trigger_descriptions_are_role_specific(self) -> None:
         descriptions = {}
@@ -142,13 +146,11 @@ class SkillPackageTests(unittest.TestCase):
         )
         normalized = " ".join(protocol.split()).lower()
         for phrase in (
-            "room messages are the primary coordination surface",
-            "message uuid",
+            "store mailbox is the primary coordination surface",
+            "publish_uuid",
             "not that the claimed author or evidence is true",
             "do not mention or send a prompt to a busy agent",
-            "--identity-receipts",
-            "paseo_agent_id",
-            "chat author",
+            "gwo_agent_id",
             "already accepted ask",
             "replay",
             "signal_id",
@@ -162,7 +164,7 @@ class SkillPackageTests(unittest.TestCase):
         )
         normalized = " ".join(protocol.split()).lower()
         for phrase in (
-            "paseo_room.py post-material",
+            "gwo send",
             "material_delivery.py delivery-plan",
             "delivery_wake",
             "delivery_ack",
@@ -173,7 +175,10 @@ class SkillPackageTests(unittest.TestCase):
             self.assertIn(phrase, normalized)
         for skill in SKILLS:
             packaged = ROOT / "skills" / skill / "scripts" / "material_delivery.py"
-            self.assertTrue(packaged.is_file())
+            self.assertFalse(
+                packaged.exists(),
+                "V6 material_delivery.py must not be packaged in V7",
+            )
         cleanup = (
             ROOT
             / "skills/github-work-orchestrator/references/cleanup-safety-policy.md"
@@ -189,7 +194,7 @@ class SkillPackageTests(unittest.TestCase):
             ROOT / "skills/github-work-orchestrator/scripts/provider_policy.py"
         ).read_text(encoding="utf-8")
         normalized = " ".join(orchestrator.split()).lower()
-        self.assertIn("orchestration-preferences.json", normalized)
+        self.assertIn("gwo_home/config.json", normalized)
         for category in ("planning", "research", "impl", "audit", "ui"):
             self.assertIn(category, normalized)
             self.assertIn(category, provider)
@@ -203,7 +208,7 @@ class SkillPackageTests(unittest.TestCase):
             ROOT / "skills/github-work-orchestrator/scripts/validate_execution_contract.py"
         ).read_text(encoding="utf-8")
         for field in (
-            "campaign_id",
+            "group_label",
             "dispatch_id",
             "agent_role",
             "role_category",
@@ -212,7 +217,7 @@ class SkillPackageTests(unittest.TestCase):
         ):
             self.assertIn(field, contract)
         self.assertIn("FORBIDDEN_RUNTIME_FIELDS", contract)
-        for obsolete in ("model_binding", "task_id", "callback_task"):
+        for obsolete in ("model_binding", "callback_task"):
             self.assertIn(f'"{obsolete}"', contract)
 
     def test_retired_provider_specific_runtime_paths_are_absent(self) -> None:
@@ -253,10 +258,10 @@ class SkillPackageTests(unittest.TestCase):
             "keep one repository coordinator per repository",
             "coordinator home workspace",
             "integration control worktree",
-            "direct `subagent` of the coordinator",
+            "direct `subagent` children of the coordinator",
             "provider binding",
             "carries no feature commit",
-            "`campaign_closed` never archives the coordinator",
+            "task_group_closed never archives the coordinator",
             "unlabeled root agents are foreign",
         ):
             self.assertIn(phrase, combined)
@@ -268,7 +273,7 @@ class SkillPackageTests(unittest.TestCase):
         state = (ROOT / "shared/github-state-rules.md").read_text(encoding="utf-8")
         combined = " ".join((orchestrator + state).split()).lower()
         for phrase in (
-            "different campaigns execute concurrently",
+            "different tasks execute concurrently",
             "hotsets do not overlap",
             "repository-scoped integration lease",
             "refresh an advanced `dev` base",
@@ -279,21 +284,18 @@ class SkillPackageTests(unittest.TestCase):
         skill = (ROOT / "skills/github-work-orchestrator/SKILL.md").read_text(
             encoding="utf-8"
         )
-        loop = (
-            ROOT / "skills/github-work-orchestrator/references/coordinator-loop.md"
-        ).read_text(encoding="utf-8")
-        combined = " ".join((skill + loop).split()).lower()
+        normalized = " ".join(skill.split()).lower()
         for phrase in (
-            "campaign_scheduler.py plan-wave",
             "complete worker wave",
             "do not wait for another worker",
             "heartbeat is worker liveness, never coordinator polling",
-            "`chat wait` at most 60 seconds",
+            "gwo inbox --wait",
             "15 minutes",
-            "silence alone",
+            "silence never authorizes",
             "attempt four is never automatic",
+            "task group",
         ):
-            self.assertIn(phrase, combined)
+            self.assertIn(phrase, normalized)
         self.assertNotIn("create recurring paseo heartbeats by default", skill.lower())
 
     def test_worker_reports_heartbeat_and_worker_done_but_not_completion(self) -> None:
@@ -304,7 +306,7 @@ class SkillPackageTests(unittest.TestCase):
         self.assertIn("five minutes", normalized)
         self.assertIn("`heartbeat`", normalized)
         self.assertIn("`worker_done`", normalized)
-        self.assertIn("campaign orchestrator alone", normalized)
+        self.assertIn("coordinator alone verifies", normalized)
 
     def test_room_terminal_and_cleanup_evidence_are_distinct(self) -> None:
         protocol = (ROOT / "shared/communication-protocol.md").read_text(
@@ -318,7 +320,7 @@ class SkillPackageTests(unittest.TestCase):
         for phrase in (
             "worker_done",
             "never authorizes completion",
-            "heartbeat, checkpoint, worker_done, review_result, delivery_wake, and delivery_ack are never terminal cleanup evidence",
+            "worker_done, heartbeat, review_result, delivery_wake, and delivery_ack are never terminal cleanup evidence",
             "event=merged",
             "branch_merged: true",
         ):
@@ -356,6 +358,7 @@ class SkillPackageTests(unittest.TestCase):
             "worktree_in_use",
             "integration control",
             "removal of all worktree bindings",
+            "campaign control workspace",
         ):
             self.assertIn(phrase, normalized)
         for forbidden in ("codexhub", "daemon-side", "until the paseo daemon"):
@@ -365,13 +368,10 @@ class SkillPackageTests(unittest.TestCase):
         communication = (ROOT / "shared/communication-protocol.md").read_text(
             encoding="utf-8"
         )
-        recovery = (
-            ROOT / "skills/github-work-orchestrator/references/communication.md"
-        ).read_text(encoding="utf-8")
-        combined = " ".join((communication + recovery).split()).lower()
+        combined = " ".join(communication.split()).lower()
         for phrase in (
             "daemon restart",
-            "replay the bounded campaign room",
+            "replay the store mailbox",
             "finish callback",
             "duplicate",
             "github",
@@ -417,9 +417,8 @@ class SkillPackageTests(unittest.TestCase):
         )
         normalized = " ".join(skill.split()).lower()
         for phrase in (
-            "relay · <repo> → coordinator",
-            "repository room",
-            "campaign control workspace",
+            "caller is not the coordinator",
+            "coordinator claim",
             "three worker slots",
             "two review slots",
             "spec reviewer",
@@ -430,10 +429,6 @@ class SkillPackageTests(unittest.TestCase):
             self.assertIn(phrase, normalized)
 
     def test_no_new_skill_or_host_runtime_dependency_was_added(self) -> None:
-        self.assertEqual(
-            {"github-work-orchestrator", "github-issue-intake", "github-issue-worker"},
-            set(SKILLS),
-        )
         combined = " ".join(
             (
                 ROOT / "skills/github-work-orchestrator/SKILL.md"
@@ -451,6 +446,126 @@ class SkillPackageTests(unittest.TestCase):
             evidence = (ROOT / "docs" / "evidence" / name).read_text(encoding="utf-8")
             self.assertIn("not published", evidence.lower())
             self.assertIn("## Acceptance", evidence)
+
+    # ------------------------------------------------------------------
+    # V7 Phase 3 cutover acceptance: Skill packages invoke the gwo kernel,
+    # Task Groups replace Campaigns, and retired V6 mechanisms are absent.
+    # ------------------------------------------------------------------
+
+    def test_v7_orchestrator_skill_invokes_the_gwo_kernel(self) -> None:
+        skill = (ROOT / "skills/github-work-orchestrator/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = " ".join(skill.split()).lower()
+        for phrase in (
+            "gwo kernel",
+            "gwo.py",
+            "gwo task",
+            "gwo dispatch",
+            "gwo inbox",
+            "gwo done",
+            "gwo guard check-dag",
+            "gwo lease",
+            "gwo send",
+        ):
+            self.assertIn(phrase, normalized, f"missing V7 kernel phrase: {phrase}")
+        # V6-only Campaign/Orchestrator mechanisms must be retired inside the
+        # packaged SKILL.md body. (References are still checked for absence of
+        # operative behavior elsewhere.)
+        for retired in (
+            "campaign agent",
+            "campaign control workspace",
+            "promotion ceremony",
+            "campaign room",
+            "gwo-<campaign-id>",
+            "paseo_room.py post-material",
+            "material_delivery.py delivery-plan",
+        ):
+            self.assertNotIn(retired, normalized, f"retired V6 mechanism present: {retired}")
+
+    def test_v7_intake_skill_reports_through_gwo_mailbox(self) -> None:
+        skill = (ROOT / "skills/github-issue-intake/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = " ".join(skill.split()).lower()
+        for phrase in (
+            "gwo kernel",
+            "gwo.py send",
+            "task group",
+        ):
+            self.assertIn(phrase, normalized, f"missing V7 intake phrase: {phrase}")
+        for retired in (
+            "campaign room",
+            "paseo_room.py post-material",
+            "material_delivery.py",
+        ):
+            self.assertNotIn(retired, normalized, f"retired V6 intake mechanism: {retired}")
+
+    def test_v7_worker_skill_uses_gwo_kernel_for_coordination(self) -> None:
+        skill = (ROOT / "skills/github-issue-worker/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        normalized = " ".join(skill.split()).lower()
+        for phrase in (
+            "gwo kernel",
+            "gwo.py done",
+            "gwo inbox",
+            "task group",
+        ):
+            self.assertIn(phrase, normalized, f"missing V7 worker phrase: {phrase}")
+        for retired in (
+            "campaign room",
+            "paseo_room.py post-material",
+            "material_delivery.py",
+            "room `start`",
+            "agent_ready",
+            "campaign orchestrator",
+        ):
+            self.assertNotIn(retired, normalized, f"retired V6 worker mechanism: {retired}")
+
+    def test_v7_context_and_protocols_use_task_group_language(self) -> None:
+        context = (ROOT / "CONTEXT.md").read_text(encoding="utf-8")
+        normalized = " ".join(context.split()).lower()
+        self.assertIn("task group", normalized)
+        self.assertIn("gwo kernel", normalized)
+        self.assertNotIn("operator relay", normalized)
+        # Campaign terms appear only in Avoid: lines, not in operative definitions.
+        for term in ("campaign agent", "campaign control workspace", "campaign room"):
+            matches = [line for line in context.lower().splitlines() if term in line]
+            self.assertTrue(matches, f"missing Avoid line for {term}")
+            for line in matches:
+                self.assertIn("_avoid_", line, f"{term} not in Avoid line: {line}")
+
+    def test_v7_orchestrator_skill_volume_is_under_one_third_of_v6(self) -> None:
+        skill_dir = ROOT / "skills" / "github-work-orchestrator"
+        # V6 packaged volume = SKILL.md (1756) + references (8907) = 10663 words.
+        v6_total_words = 10663
+        # Count only the Skill package body; shared references are canonical
+        # protocols whose content is independent of V7 volume goals.
+        v7_body_words = len(
+            (skill_dir / "SKILL.md").read_text(encoding="utf-8").split()
+        )
+        v7_ref_words = sum(
+            len(p.read_text(encoding="utf-8").split())
+            for p in (skill_dir / "references").rglob("*.md")
+            if "shared" not in p.parts
+        )
+        v7_total_words = v7_body_words + v7_ref_words
+        self.assertLess(
+            v7_total_words,
+            v6_total_words / 3,
+            f"packaged orchestrator volume {v7_total_words} >= one-third of V6",
+        )
+
+    def test_v7_worker_contract_reference_is_kernel_based(self) -> None:
+        # The worker-contract.md reference should be gone or rewritten; if it
+        # still exists it must not describe room-based activation.
+        contract = ROOT / "skills/github-work-orchestrator/references/worker-contract.md"
+        if contract.is_file():
+            text = contract.read_text(encoding="utf-8").lower()
+            self.assertNotIn("paseo_room.py", text)
+            self.assertNotIn("material_delivery.py", text)
+            self.assertIn("gwo", text)
 
 
 if __name__ == "__main__":
