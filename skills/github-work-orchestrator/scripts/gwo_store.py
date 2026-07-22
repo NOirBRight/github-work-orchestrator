@@ -164,7 +164,25 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
 
         CREATE INDEX IF NOT EXISTS idx_messages_to ON messages (to_agent, acked_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_signal ON messages (signal_id);
-
+        """,
+    ),
+    (
+        "0002-messages-in-reply-to",
+        """
+        ALTER TABLE messages ADD COLUMN in_reply_to TEXT;
+        CREATE INDEX IF NOT EXISTS idx_messages_from_seq
+            ON messages (from_agent, seq);
+        """,
+    ),
+    (
+        "0003-tasks-repo-issue-unique",
+        """
+        CREATE INDEX IF NOT EXISTS idx_tasks_repo_issue ON tasks (repo, issue);
+        """,
+    ),
+    (
+        "0004-review-rounds-and-lease",
+        """
         CREATE TABLE IF NOT EXISTS review_rounds (
             round_id TEXT PRIMARY KEY,
             dispatch_id TEXT NOT NULL,
@@ -214,20 +232,6 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
 
         CREATE INDEX IF NOT EXISTS idx_integration_chain_scope
             ON integration_chain (scope, created_at);
-        """,
-    ),
-    (
-        "0002-messages-in-reply-to",
-        """
-        ALTER TABLE messages ADD COLUMN in_reply_to TEXT;
-        CREATE INDEX IF NOT EXISTS idx_messages_from_seq
-            ON messages (from_agent, seq);
-        """,
-    ),
-    (
-        "0003-tasks-repo-issue-unique",
-        """
-        CREATE INDEX IF NOT EXISTS idx_tasks_repo_issue ON tasks (repo, issue);
         """,
     ),
 )
@@ -442,13 +446,23 @@ class Store:
             if name in applied:
                 continue
             self._apply_migration(name, ddl, caller)
+            # If the migration was already applied by a concurrent writer,
+            # _apply_migration commits a no-op; do not run post-migration hooks.
             applied.add(name)
+            if name not in applied:
+                continue
             # Post-migration 0003: attempt the unique index. If duplicate tasks
             # exist (legacy Issue #21 stores), skip the unique index so
             # Store.connect does not crash; doctor_rebuild surfaces the
             # ambiguity. If no duplicates, the unique index is created safely.
             if name == "0003-tasks-repo-issue-unique":
                 self._try_unique_index_or_skip()
+            # Post-migration 0004: attempt the review/lease partial unique
+            # index. If a legacy store already has a conflicting lease row,
+            # skip the index so Store.connect does not crash; doctor_rebuild
+            # surfaces the ambiguity.
+            if name == "0004-review-rounds-and-lease":
+                self._try_lease_unique_index_or_skip()
 
     def _try_unique_index_or_skip(self) -> None:
         """Attempt to create the unique index on tasks(repo, issue).
@@ -465,6 +479,29 @@ class Store:
                 self.db.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique "
                     "ON tasks (repo, issue)"
+                )
+                self.db.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                self.db.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+
+    def _try_lease_unique_index_or_skip(self) -> None:
+        """Attempt to create the partial unique index on active leases.
+
+        If a legacy store contains conflicting active lease rows, skip the
+        index so Store.connect does not crash; doctor_rebuild can surface the
+        ambiguity.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_active_scope "
+                    "ON leases (scope) WHERE released_at IS NULL"
                 )
                 self.db.execute("COMMIT")
             except sqlite3.IntegrityError:

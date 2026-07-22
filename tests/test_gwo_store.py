@@ -1110,6 +1110,192 @@ class MigrationAtomicityTests(unittest.TestCase):
                 pass
 
 
+class MigrationSafetyTests(unittest.TestCase):
+    """Finding 4: Phase 2 review/lease DDL must live in its own migration so a
+    pre-Phase-2 store (0001-initial, 0002-messages-in-reply-to, and
+    0003-tasks-repo-issue-unique) receives the new tables/indexes cleanly,
+    while fresh stores apply all migrations in order. A failed 0004 rolls back
+    with no partial schema record and leaves existing data intact.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = StoreFixture(self, repo="owner/repo")
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _pre_phase2_tables(self) -> set[str]:
+        return {
+            "coordinator", "agents", "tasks", "dispatches", "messages", "schema_migrations"
+        }
+
+    def _phase2_tables(self) -> set[str]:
+        return {"review_rounds", "review_results", "leases", "integration_chain"}
+
+    def _build_pre_phase2_store(self) -> None:
+        """Manually create a store that has only the first three migrations.
+
+        Uses the *fixture-created* store's state.db, wipes any tables/indexes,
+        then applies only the first three migrations cleanly.
+        """
+        store_mod = self.store_mod
+        # Close the fixture-created store so we can mutate the raw DB.
+        self.store.close()
+        slug = store_mod._repo_slug("owner/repo")
+        db_path = self.fixture.home / slug / "state.db"
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute("PRAGMA foreign_keys=OFF")
+            # Drop every user table/index so we can apply the first three migrations only.
+            master = raw.execute(
+                "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'index') "
+                "AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            for kind, name in master:
+                raw.execute(f"DROP {kind} IF EXISTS {name}")
+            # Re-create schema_migrations first so we can record applied migrations.
+            raw.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY)"
+            )
+            raw.execute("BEGIN IMMEDIATE")
+            for name, ddl in store_mod.MIGRATIONS:
+                if name in {"0001-initial", "0002-messages-in-reply-to", "0003-tasks-repo-issue-unique"}:
+                    for statement in store_mod._split_sql_statements(ddl):
+                        raw.execute(statement)
+                    raw.execute(
+                        "INSERT OR REPLACE INTO schema_migrations (name) VALUES (?)", (name,)
+                    )
+            raw.execute("COMMIT")
+        finally:
+            raw.close()
+
+    def test_pre_phase2_store_lacks_review_and_lease_tables(self) -> None:
+        self._build_pre_phase2_store()
+        raw = sqlite3.connect(str(self.fixture.home / self.store_mod._repo_slug("owner/repo") / "state.db"))
+        try:
+            tables = {
+                str(row[1])
+                for row in raw.execute(
+                    "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'index')"
+                ).fetchall()
+            }
+            self.assertTrue(
+                self._pre_phase2_tables().issubset(tables),
+                "pre-Phase-2 store must have the original tables"
+            )
+            self.assertFalse(
+                self._phase2_tables() & tables,
+                "pre-Phase-2 store must not have review/lease tables yet"
+            )
+            self.assertNotIn("idx_leases_active_scope", tables)
+            self.assertNotIn("idx_integration_chain_scope", tables)
+        finally:
+            raw.close()
+
+    def test_pre_phase2_store_applies_phase2_migration_on_connect(self) -> None:
+        self._build_pre_phase2_store()
+        reopened = self.store_mod.Store.connect(
+            self.fixture.home, "owner/repo", caller_agent_id="coordinator-001"
+        )
+        try:
+            tables = set(reopened.table_names())
+            self.assertTrue(
+                self._phase2_tables().issubset(tables),
+                "Phase 2 tables must appear after connecting a pre-Phase-2 store"
+            )
+            migrations = {
+                str(row[0])
+                for row in reopened.db.execute("SELECT name FROM schema_migrations").fetchall()
+            }
+            self.assertIn("0004-review-rounds-and-lease", migrations)
+            # Existing data path: a task inserted before the migration survives.
+            reopened.claim_coordinator()
+            reopened.create_task(issue=99, group_label="g-99", risk="standard")
+            tasks = reopened.list_tasks()
+            self.assertEqual(1, len(tasks))
+            self.assertEqual(99, tasks[0]["issue"])
+        finally:
+            reopened.close()
+
+    def test_fresh_store_applies_migrations_in_order(self) -> None:
+        migrations = [
+            str(row[0])
+            for row in self.store.db.execute(
+                "SELECT name FROM schema_migrations ORDER BY rowid"
+            ).fetchall()
+        ]
+        self.assertEqual(
+            ["0001-initial", "0002-messages-in-reply-to", "0003-tasks-repo-issue-unique", "0004-review-rounds-and-lease"],
+            migrations,
+        )
+        tables = set(self.store.table_names())
+        self.assertTrue(
+            self._phase2_tables().issubset(tables),
+            "fresh store must contain Phase 2 tables"
+        )
+
+    def test_failed_phase2_migration_rolls_back_no_partial_record(self) -> None:
+        store_mod = self.store_mod
+        original_migrations = store_mod.MIGRATIONS
+        # Start from a fully migrated store, then strip 0004 so we exercise
+        # the real migration path and a deterministic failure.
+        self.store.close()
+        slug = store_mod._repo_slug("owner/repo")
+        db_path = str(self.fixture.home / slug / "state.db")
+        raw = sqlite3.connect(db_path)
+        raw.isolation_level = None
+        try:
+            raw.execute('DELETE FROM schema_migrations WHERE name = "0004-review-rounds-and-lease"')
+            for row in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('review_rounds','review_results','leases','integration_chain')"
+            ).fetchall():
+                raw.execute(f"DROP TABLE {row[0]}")
+            raw.execute("DROP INDEX IF EXISTS idx_leases_active_scope")
+            raw.execute("DROP INDEX IF EXISTS idx_integration_chain_scope")
+            raw.commit()
+        finally:
+            raw.close()
+        broken_migrations = original_migrations[:-1] + (
+            (
+                "0004-review-rounds-and-lease",
+                "CREATE TABLE IF NOT EXISTS review_rounds (id INTEGER PRIMARY KEY); "
+                "CREATE TABLE IF NOT EXISTS review_results (id INTEGER PRIMARY KEY); "
+                "CREATE TABLE IF NOT EXISTS leases (id INTEGER PRIMARY PRIMARY KEY); "
+                "CREATE TABLE IF NOT EXISTS integration_chain (id INTEGER PRIMARY KEY);"
+            ),
+        )
+        store_mod.MIGRATIONS = broken_migrations
+        reopened = None
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                reopened = store_mod.Store.connect(
+                    self.fixture.home, "owner/repo", caller_agent_id="coordinator-001"
+                )
+            raw = sqlite3.connect(db_path)
+            try:
+                records = {
+                    str(row[0])
+                    for row in raw.execute("SELECT name FROM schema_migrations").fetchall()
+                }
+                self.assertNotIn("0004-review-rounds-and-lease", records)
+                tables = {str(row[1]) for row in raw.execute(
+                    "SELECT type, name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()}
+                self.assertNotIn("review_rounds", tables)
+                self.assertNotIn("review_results", tables)
+                self.assertNotIn("leases", tables)
+                self.assertNotIn("integration_chain", tables)
+            finally:
+                raw.close()
+        finally:
+            store_mod.MIGRATIONS = original_migrations
+            if reopened is not None:
+                reopened.close()
+
+
 class MigrationIdentityTests(unittest.TestCase):
     """Finding 3: run_migrations is a public store write and must re-resolve
     GWO_AGENT_ID at migration write time. It must fail when GWO_AGENT_ID is
