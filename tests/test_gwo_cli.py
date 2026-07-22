@@ -23,10 +23,12 @@ class CliFixture:
         self.repo = repo
         self._saved_env = {
             "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_REPOSITORY": os.environ.get("GWO_REPOSITORY"),
             "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
             "PYTHONPATH": os.environ.get("PYTHONPATH"),
         }
         os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_REPOSITORY"] = repo
         os.environ["GWO_AGENT_ID"] = "coordinator-001"
         os.environ["PYTHONPATH"] = SCRIPT_DIR + os.pathsep + os.environ.get("PYTHONPATH", "")
         if claim:
@@ -42,7 +44,7 @@ class CliFixture:
 
     def run(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(GWO_PY), *args],
+            [sys.executable, str(GWO_PY), "--repository", self.repo, *args],
             capture_output=True,
             text=True,
             check=False,
@@ -300,6 +302,54 @@ class CliHelpTests(unittest.TestCase):
         self.assertEqual(0, result.returncode)
         for command in ("coordinator", "task", "dispatch", "done"):
             self.assertIn(command, result.stdout)
+
+
+class CliRepositoryTests(unittest.TestCase):
+    def test_default_repository_is_rejected(self) -> None:
+        """Without --repository or a valid GWO_REPOSITORY, the CLI must fail."""
+        env = os.environ.copy()
+        env.pop("GWO_REPOSITORY", None)
+        env.pop("GWO_HOME", None)
+        result = subprocess.run(
+            [sys.executable, str(GWO_PY), "guard", "check-dag", "--plan", "-"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("repository", result.stderr.lower())
+
+    def test_invalid_gwo_repository_is_rejected(self) -> None:
+        env = os.environ.copy()
+        env["GWO_REPOSITORY"] = "invalid"
+        env.pop("GWO_HOME", None)
+        result = subprocess.run(
+            [sys.executable, str(GWO_PY), "guard", "check-dag", "--plan", "-"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("repository", result.stderr.lower())
+
+    def test_valid_gwo_repository_is_accepted(self) -> None:
+        env = os.environ.copy()
+        env["GWO_REPOSITORY"] = "owner/repo"
+        env["GWO_HOME"] = str(tempfile.mkdtemp())
+        try:
+            result = subprocess.run(
+                [sys.executable, str(GWO_PY), "guard", "check-dag", "--plan", "-"],
+                input="{}",
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            # Guard check-dag is read-only; a valid repository lets it reach the
+            # plan validation layer and reject the empty plan deterministically.
+            self.assertIn("schema-version-mismatch", result.stdout)
+        finally:
+            import shutil
+            shutil.rmtree(env["GWO_HOME"], ignore_errors=True)
 
 
 if __name__ == "__main__":

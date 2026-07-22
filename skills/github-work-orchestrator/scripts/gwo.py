@@ -30,6 +30,7 @@ import gwo_store  # type: ignore[import-not-found]  # noqa: E402
 
 
 REPOSITORY_RE = "^[^/\\s]+/[^/\\s]+$"
+NO_DEFAULT_REPOSITORY = "__REQUIRED__"
 
 
 def _repository(value: str) -> str:
@@ -38,6 +39,18 @@ def _repository(value: str) -> str:
     if not re.fullmatch(REPOSITORY_RE, value.strip()):
         raise argparse.ArgumentTypeError("repository must be owner/repo")
     return value.strip()
+
+
+def _repository_default() -> str | None:
+    """Return the environment fallback only when it is a valid owner/repo."""
+    import re
+
+    value = os.environ.get("GWO_REPOSITORY")
+    if value is None:
+        return NO_DEFAULT_REPOSITORY
+    if re.fullmatch(REPOSITORY_RE, value.strip()):
+        return value.strip()
+    return NO_DEFAULT_REPOSITORY
 
 
 def _store(args: argparse.Namespace) -> gwo_store.Store:
@@ -346,8 +359,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repository",
         type=_repository,
-        default=os.environ.get("GWO_REPOSITORY", "owner/repo"),
-        help="repository as owner/repo",
+        default=_repository_default(),
+        help="repository as owner/repo (default: $GWO_REPOSITORY if valid)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -461,9 +474,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _require_repository(args: argparse.Namespace) -> None:
+    if getattr(args, "repository", None) == NO_DEFAULT_REPOSITORY:
+        raise argparse.ArgumentError(None, "--repository is required unless GWO_REPOSITORY contains a valid owner/repo value")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _require_repository(args)
     gwo_home = args.gwo_home
     if gwo_home is None:
         env_home = os.environ.get("GWO_HOME")

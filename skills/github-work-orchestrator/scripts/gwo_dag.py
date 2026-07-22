@@ -9,7 +9,9 @@ does not mutate lifecycle state.
 
 from __future__ import annotations
 
+import argparse
 import json
+from pathlib import Path
 from typing import Any
 
 from hotset_policy import hotsets_overlap, normalize_hotset
@@ -33,48 +35,48 @@ class DagValidationError(ValueError):
         self.message = message
 
 
-def _nonempty_text(name: str, value: Any) -> str:
+def _nonempty_text(name: str, value: Any, *, code: str | None = None) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{name} must be nonempty text")
+        raise DagValidationError(code or "invalid-text", f"{name} must be nonempty text")
     return value.strip()
 
 
 def _positive_integer(name: str, value: Any) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
+        raise DagValidationError("invalid-positive-integer", f"{name} must be a positive integer")
     return value
 
 
 def _nonnegative_integer(name: str, value: Any) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError(f"{name} must be a nonnegative integer")
+        raise DagValidationError("invalid-nonnegative-integer", f"{name} must be a nonnegative integer")
     return value
 
 
 def _validate_structure(plan: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(plan, dict):
-        raise ValueError("plan must be an object")
+        raise DagValidationError("plan-not-object", "plan must be an object")
     if plan.get("schema_version") != DAG_SCHEMA_VERSION:
         raise DagValidationError("schema-version-mismatch", "schema_version must be 1")
-    repository = _nonempty_text("repository", plan.get("repository"))
+    repository = _nonempty_text("repository", plan.get("repository"), code="repository-missing")
     nodes = plan.get("nodes")
     if not isinstance(nodes, list):
-        raise ValueError("nodes must be a list")
+        raise DagValidationError("nodes-not-list", "nodes must be a list")
     edges = plan.get("edges")
     if not isinstance(edges, list):
-        raise ValueError("edges must be a list")
-    for edge in edges:
+        raise DagValidationError("edges-not-list", "edges must be a list")
+    for index, edge in enumerate(edges):
         if not isinstance(edge, list) or len(edge) != 2 or not all(isinstance(item, str) for item in edge):
-            raise ValueError("edges must be [source, target] text pairs")
+            raise DagValidationError("edge-shape-invalid", f"edges[{index}] must be a [source, target] text pair")
     capacity = plan.get("capacity")
     if not isinstance(capacity, dict):
-        raise ValueError("capacity must be an object")
+        raise DagValidationError("capacity-not-object", "capacity must be an object")
     github_dependencies = plan.get("github_dependencies", {})
     if not isinstance(github_dependencies, dict):
-        raise ValueError("github_dependencies must be an object")
+        raise DagValidationError("github-dependencies-not-object", "github_dependencies must be an object")
     contract_dependencies = plan.get("contract_dependencies", {})
     if not isinstance(contract_dependencies, dict):
-        raise ValueError("contract_dependencies must be an object")
+        raise DagValidationError("contract-dependencies-not-object", "contract_dependencies must be an object")
     return {
         "repository": repository,
         "nodes": nodes,
@@ -89,31 +91,31 @@ def _validate_nodes(nodes: list[Any]) -> dict[str, dict[str, Any]]:
     by_id: dict[str, dict[str, Any]] = {}
     for index, raw in enumerate(nodes):
         if not isinstance(raw, dict):
-            raise ValueError(f"nodes[{index}] must be an object")
+            raise DagValidationError("node-not-object", f"nodes[{index}] must be an object")
         missing = REQUIRED_NODE_FIELDS - set(raw)
         if missing:
-            raise ValueError(f"nodes[{index}] missing required fields: {sorted(missing)}")
-        node_id = _nonempty_text(f"nodes[{index}].id", raw.get("id"))
+            raise DagValidationError("node-fields-missing", f"nodes[{index}] missing required fields: {sorted(missing)}")
+        node_id = _nonempty_text(f"nodes[{index}].id", raw.get("id"), code="node-id-invalid")
         if node_id in by_id:
-            raise ValueError(f"duplicate node id: {node_id}")
-        kind = _nonempty_text(f"nodes[{index}].kind", raw.get("kind"))
+            raise DagValidationError("node-id-duplicate", f"duplicate node id: {node_id}")
+        kind = _nonempty_text(f"nodes[{index}].kind", raw.get("kind"), code="node-kind-invalid")
         if kind not in {"issue", "review", "integration"}:
-            raise ValueError(f"nodes[{index}] has invalid kind")
+            raise DagValidationError("node-kind-invalid", f"nodes[{index}] has invalid kind")
         node: dict[str, Any] = {"id": node_id, "kind": kind}
         if kind == "issue":
             missing = ISSUE_REQUIRED - set(raw)
             if missing:
-                raise ValueError(f"nodes[{index}] missing issue fields: {sorted(missing)}")
+                raise DagValidationError("issue-fields-missing", f"nodes[{index}] missing issue fields: {sorted(missing)}")
             issue = _positive_integer(f"nodes[{index}].issue", raw.get("issue"))
-            group = _nonempty_text(f"nodes[{index}].group", raw.get("group"))
-            risk = _nonempty_text(f"nodes[{index}].risk", raw.get("risk"))
+            group = _nonempty_text(f"nodes[{index}].group", raw.get("group"), code="issue-group-invalid")
+            risk = _nonempty_text(f"nodes[{index}].risk", raw.get("risk"), code="issue-risk-invalid")
             if risk not in VERIFICATION_CLASSES:
-                raise ValueError(f"nodes[{index}] has invalid risk")
+                raise DagValidationError("issue-risk-invalid", f"nodes[{index}] has invalid risk")
             hotset = raw.get("hotset")
             try:
                 normalized_hotset = _normalize_issue_hotset(hotset)
             except ValueError as error:
-                raise ValueError(f"nodes[{index}] hotset invalid: {error}")
+                raise DagValidationError("issue-hotset-invalid", f"nodes[{index}] hotset invalid: {error}")
             node.update({
                 "issue": issue,
                 "group": group,
@@ -123,16 +125,16 @@ def _validate_nodes(nodes: list[Any]) -> dict[str, dict[str, Any]]:
             })
         elif kind == "review":
             target = raw.get("target")
-            axis = _nonempty_text(f"nodes[{index}].axis", raw.get("axis"))
+            axis = _nonempty_text(f"nodes[{index}].axis", raw.get("axis"), code="review-axis-invalid")
             if axis not in {"combined", "spec", "quality"}:
-                raise ValueError(f"nodes[{index}] has invalid review axis")
+                raise DagValidationError("review-axis-invalid", f"nodes[{index}] has invalid review axis")
             if not isinstance(target, str) or not target.strip():
-                _raise_validation("review-target-missing", f"review {node_id} missing target")
+                raise DagValidationError("review-target-missing", f"review {node_id} missing target")
             node.update({"target": target.strip(), "axis": axis})
         elif kind == "integration":
             target = raw.get("target")
             if not isinstance(target, str) or not target.strip():
-                _raise_validation("integration-target-missing", f"integration {node_id} missing target")
+                raise DagValidationError("integration-target-missing", f"integration {node_id} missing target")
             node.update({"target": target.strip()})
         by_id[node_id] = node
     return by_id
@@ -153,24 +155,40 @@ def _validate_edges(edges: list[list[str]], nodes: dict[str, dict[str, Any]]) ->
 
 
 def _detect_cycle(nodes: dict[str, dict[str, Any]], adjacency: dict[str, set[str]]) -> None:
-    """Raise DagValidationError if the directed graph contains a cycle."""
+    """Raise DagValidationError if the directed graph contains a cycle.
+
+    Iterative DFS avoids RecursionError on long chains (e.g. 1500 nodes).
+    """
     WHITE, GRAY, BLACK = 0, 1, 2
     color: dict[str, int] = {node_id: WHITE for node_id in nodes}
+    stack: list[str] = []
+    path: list[str] = []
 
-    def visit(node_id: str, stack: list[str]) -> None:
-        color[node_id] = GRAY
-        for neighbor in sorted(adjacency[node_id]):
+    def _emit_cycle(start_index: int, node_id: str) -> None:
+        cycle = " -> ".join(path[start_index:] + [node_id])
+        raise DagValidationError("dag-cycle", f"cycle detected: {cycle}")
+
+    for start in sorted(nodes):
+        if color[start] != WHITE:
+            continue
+        stack.append((start, iter(sorted(adjacency[start]))))
+        color[start] = GRAY
+        path.append(start)
+        while stack:
+            node_id, neighbors = stack[-1]
+            try:
+                neighbor = next(neighbors)
+            except StopIteration:
+                color[node_id] = BLACK
+                stack.pop()
+                path.pop()
+                continue
             if color[neighbor] == GRAY:
-                cycle_start = stack.index(neighbor)
-                cycle = " -> ".join(stack[cycle_start:] + [neighbor])
-                raise DagValidationError("dag-cycle", f"cycle detected: {cycle}")
+                _emit_cycle(path.index(neighbor), neighbor)
             if color[neighbor] == WHITE:
-                visit(neighbor, stack + [neighbor])
-        color[node_id] = BLACK
-
-    for node_id in sorted(nodes):
-        if color[node_id] == WHITE:
-            visit(node_id, [node_id])
+                color[neighbor] = GRAY
+                stack.append((neighbor, iter(sorted(adjacency[neighbor]))))
+                path.append(neighbor)
 
 
 def _dependency_consistency(
@@ -252,12 +270,12 @@ def _validate_capacity(capacity: dict[str, Any], nodes: dict[str, dict[str, Any]
         raise DagValidationError("capacity-global-already-exceeded", "global_active_agents exceeds global_agent_limit")
     group_limits = capacity.get("group_limits", {})
     if not isinstance(group_limits, dict):
-        raise ValueError("capacity.group_limits must be an object")
+        raise DagValidationError("capacity-group-limits-not-object", "capacity.group_limits must be an object")
     normalized_groups: dict[str, dict[str, int]] = {}
     active_groups = {node["group"] for node in nodes.values() if node["kind"] == "issue"}
     for group, setting in group_limits.items():
         if not isinstance(setting, dict):
-            raise ValueError(f"capacity.group_limits[{group}] must be an object")
+            raise DagValidationError("capacity-group-setting-invalid", f"capacity.group_limits[{group}] must be an object")
         limit_value = setting.get("limit")
         active_value = setting.get("active")
         if not isinstance(limit_value, int) or isinstance(limit_value, bool) or limit_value <= 0:
@@ -373,22 +391,35 @@ def _validate_integration_chain(nodes: dict[str, dict[str, Any]], adjacency: dic
         raise DagValidationError("integration-chain-not-serial", "integration chain is disconnected")
 
 
+def _compute_reachability(adjacency: dict[str, set[str]], start_nodes: set[str]) -> dict[str, set[str]]:
+    """Iteratively compute forward reachability for each start node.
+
+    Avoids recursion so a 1500-node chain does not hit Python's recursion limit.
+    """
+    reachable: dict[str, set[str]] = {node_id: set() for node_id in start_nodes}
+    for start in sorted(start_nodes):
+        stack = list(sorted(adjacency[start]))
+        seen = reachable[start]
+        seen.update(adjacency[start])
+        while stack:
+            current = stack.pop()
+            for neighbor in adjacency[current]:
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        # A node cannot reach itself for ordering comparisons.
+        seen.discard(start)
+    return reachable
+
+
 def _validate_hotsets(nodes: dict[str, dict[str, Any]], adjacency: dict[str, set[str]], case_sensitive_paths: bool = True) -> None:
     """Reject concurrently runnable issue nodes with overlapping Hotsets."""
     # Two issue nodes are concurrently runnable if there is no path from either
     # to the other in either direction. Repository-wide exclusive nodes (empty
     # hotset) conflict with any other issue node.
     issue_nodes = [node for node in nodes.values() if node["kind"] == "issue"]
-    reachable: dict[str, set[str]] = {node["id"]: set() for node in issue_nodes}
-
-    def dfs(start: str, current: str) -> None:
-        for neighbor in adjacency[current]:
-            if neighbor not in reachable[start]:
-                reachable[start].add(neighbor)
-                dfs(start, neighbor)
-
-    for node in issue_nodes:
-        dfs(node["id"], node["id"])
+    issue_ids = {node["id"] for node in issue_nodes}
+    reachable = _compute_reachability(adjacency, issue_ids)
 
     for left in issue_nodes:
         for right in issue_nodes:
@@ -448,7 +479,12 @@ def _ready_frontier(nodes: dict[str, dict[str, Any]], adjacency: dict[str, set[s
 
 
 def check_dag(plan: dict[str, Any]) -> dict[str, Any]:
-    """Validate a DAG plan and return a deterministic structured result."""
+    """Validate a DAG plan and return a deterministic structured result.
+
+    Fail-fast: the first guard failure is returned as a deterministic
+    ``rejection_codes`` list containing exactly that code. The list shape is
+    kept for backward compatibility with callers that expect a collection.
+    """
     try:
         validated = _validate_structure(plan)
         nodes = _validate_nodes(validated["nodes"])
@@ -481,24 +517,58 @@ def check_dag(plan: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-def main(args: Any) -> int:
-    """Entry point for `gwo guard check-dag`."""
-    plan_text = args.plan if args.plan != "-" else args.plan
+def _build_parser() -> "argparse.ArgumentParser":
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="gwo_dag.py",
+        description="GWO V7 DAG plan guard (stdlib-only).",
+    )
+    parser.add_argument(
+        "--plan",
+        required=True,
+        help="path to JSON plan or '-' for stdin",
+    )
+    return parser
+
+
+def _read_plan_text(args: Any) -> str:
+    """Read plan text from file path or stdin."""
     if args.plan == "-":
         import sys
-        plan_text = sys.stdin.read()
+        return sys.stdin.read()
+    return Path(args.plan).read_text(encoding="utf-8")
+
+
+def main(args: Any) -> int:
+    """Entry point for `gwo guard check-dag` and direct python execution."""
+    if args is None:
+        args = _build_parser().parse_args()
+    try:
+        plan_text = _read_plan_text(args)
+    except FileNotFoundError as error:
+        print(json.dumps({
+            "ok": False,
+            "schema_version": DAG_SCHEMA_VERSION,
+            "rejection_codes": ["plan-file-not-found"],
+            "error": str(error),
+        }, sort_keys=True))
+        return 2
+    except OSError as error:
+        print(json.dumps({
+            "ok": False,
+            "schema_version": DAG_SCHEMA_VERSION,
+            "rejection_codes": ["plan-read-error"],
+            "error": str(error),
+        }, sort_keys=True))
+        return 2
     try:
         plan = json.loads(plan_text)
     except json.JSONDecodeError as error:
-        print(json.dumps({"ok": False, "rejection_codes": ["plan-json-invalid"], "error": str(error)}, sort_keys=True))
+        print(json.dumps({"ok": False, "schema_version": DAG_SCHEMA_VERSION, "rejection_codes": ["plan-json-invalid"], "error": str(error)}, sort_keys=True))
         return 2
     result = check_dag(plan)
     print(json.dumps(result, sort_keys=True))
     return 0 if result.get("ok") else 1
-
-
-def _raise_validation(code: str, message: str) -> None:
-    raise DagValidationError(code, message)
 
 
 if __name__ == "__main__":

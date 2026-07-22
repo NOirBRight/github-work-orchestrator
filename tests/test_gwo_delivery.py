@@ -669,15 +669,19 @@ class DoctorRebuildTests(unittest.TestCase):
 class CliFixture:
     """Run gwo.py against an isolated temporary GWO_HOME via subprocess."""
 
+    REPO = "owner/repo"
+
     def __init__(self, *, claim: bool = False) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self._saved_env = {
             "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_REPOSITORY": os.environ.get("GWO_REPOSITORY"),
             "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
             "PYTHONPATH": os.environ.get("PYTHONPATH"),
         }
         os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_REPOSITORY"] = self.REPO
         os.environ["GWO_AGENT_ID"] = "coordinator-001"
         os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
         if claim:
@@ -693,7 +697,7 @@ class CliFixture:
 
     def run(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(GWO_PY), *args],
+            [sys.executable, str(GWO_PY), "--repository", self.REPO, *args],
             capture_output=True,
             text=True,
             check=False,
@@ -2033,15 +2037,19 @@ class NonDestructivePreflightTests(unittest.TestCase):
     before Store.connect or any filesystem/schema mutation.
     """
 
+    REPO = "owner/repo"
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self._saved_env = {
             "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_REPOSITORY": os.environ.get("GWO_REPOSITORY"),
             "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
             "PYTHONPATH": os.environ.get("PYTHONPATH"),
         }
         os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_REPOSITORY"] = self.REPO
         os.environ["GWO_AGENT_ID"] = "coordinator-001"
         os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
 
@@ -2055,7 +2063,7 @@ class NonDestructivePreflightTests(unittest.TestCase):
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(GWO_PY), *args],
+            [sys.executable, str(GWO_PY), "--repository", self.REPO, *args],
             capture_output=True,
             text=True,
             check=False,
@@ -2074,7 +2082,7 @@ class NonDestructivePreflightTests(unittest.TestCase):
     def test_config_check_reports_migration_drift_without_connecting(self) -> None:
         # Create a store with migration drift (drop a migration record).
         store_mod = load_store()
-        store = store_mod.Store.connect(self.home, "owner/repo")
+        store = store_mod.Store.connect(self.home, self.REPO)
         store.claim_coordinator()
         store.db.execute(
             "DELETE FROM schema_migrations WHERE name = '0002-messages-in-reply-to'"
@@ -2604,15 +2612,19 @@ class StoreConstructionErrorTests(unittest.TestCase):
     migration failures) produce structured error output, not tracebacks.
     """
 
+    REPO = "owner/repo"
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self._saved_env = {
             "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_REPOSITORY": os.environ.get("GWO_REPOSITORY"),
             "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
             "PYTHONPATH": os.environ.get("PYTHONPATH"),
         }
         os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_REPOSITORY"] = self.REPO
         os.environ["GWO_AGENT_ID"] = "coordinator-001"
         os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
 
@@ -2626,7 +2638,7 @@ class StoreConstructionErrorTests(unittest.TestCase):
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(GWO_PY), *args],
+            [sys.executable, str(GWO_PY), "--repository", self.REPO, *args],
             capture_output=True,
             text=True,
             check=False,
@@ -2738,15 +2750,19 @@ class CliAgentStatusFileSnapshotTests(unittest.TestCase):
     option), not only in-process set_readback_snapshot.
     """
 
+    REPO = "owner/repo"
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self._saved_env = {
             "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_REPOSITORY": os.environ.get("GWO_REPOSITORY"),
             "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
             "PYTHONPATH": os.environ.get("PYTHONPATH"),
         }
         os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_REPOSITORY"] = self.REPO
         os.environ["GWO_AGENT_ID"] = "coordinator-001"
         os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
 
@@ -2760,7 +2776,7 @@ class CliAgentStatusFileSnapshotTests(unittest.TestCase):
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(GWO_PY), *args],
+            [sys.executable, str(GWO_PY), "--repository", self.REPO, *args],
             capture_output=True,
             text=True,
             check=False,
