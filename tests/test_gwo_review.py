@@ -1,0 +1,462 @@
+from __future__ import annotations
+
+import os
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = ROOT / "skills" / "github-work-orchestrator" / "scripts"
+GWO_PY = SCRIPT_DIR / "gwo.py"
+
+# Imported via importlib in the fixture so tests can reload after source changes.
+
+def load_store():
+    import importlib.util
+    sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location("gwo_store", SCRIPT_DIR / "gwo_store.py")
+    if spec is None or spec.loader is None:
+        raise AssertionError("cannot load gwo_store")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["gwo_store"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class CliFixture:
+    """Run gwo.py against an isolated temporary GWO_HOME."""
+
+    def __init__(self, repo: str = "owner/repo", *, claim: bool = False) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.repo = repo
+        self._saved_env = {
+            "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_REPOSITORY": os.environ.get("GWO_REPOSITORY"),
+            "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
+            "PYTHONPATH": os.environ.get("PYTHONPATH"),
+        }
+        os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_REPOSITORY"] = repo
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        if claim:
+            self.run("coordinator", "claim")
+
+    def cleanup(self) -> None:
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def run(self, *args: str):
+        import subprocess
+        return subprocess.run(
+            [sys.executable, str(GWO_PY), "--repository", self.repo, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
+class StoreFixture:
+    """Open a store against an isolated temporary GWO_HOME."""
+
+    def __init__(self, test_case, *, repo: str = "owner/repo", claim: bool = True):
+        self.test_case = test_case
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self._saved_env = {
+            "GWO_HOME": os.environ.get("GWO_HOME"),
+            "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
+        }
+        os.environ["GWO_HOME"] = str(self.home)
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.store_mod = load_store()
+        self.repo = repo
+        self.store = self.store_mod.Store.connect(self.home, repo, caller_agent_id="coordinator-001")
+        if claim:
+            self.store.claim_coordinator()
+
+    def cleanup(self) -> None:
+        self.store.close()
+        self.tmp.cleanup()
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+class ReviewRoundCliTests(unittest.TestCase):
+    """Red tests for gwo_review CLI review-round issue."""
+
+    def setUp(self) -> None:
+        self.fixture = CliFixture(claim=True)
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _seed_task_and_dispatch(self) -> tuple[str, str]:
+        result = self.fixture.run(
+            "task", "create", "--issue", "24", "--group", "g-24", "--risk", "strict"
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        task_id = result.stdout.strip()
+        import json
+        task_id = json.loads(task_id)["task_id"]
+        self.fixture.run("task", "update", task_id, "--status", "ready")
+        dispatch = self.fixture.run(
+            "dispatch", "create",
+            "--task-id", task_id,
+            "--agent-id", "worker-24",
+            "--worktree", "/tmp/wt-24",
+            "--branch", "work/issue-24",
+        )
+        self.assertEqual(0, dispatch.returncode, dispatch.stderr)
+        dispatch_id = json.loads(dispatch.stdout)["dispatch_id"]
+        return task_id, dispatch_id
+
+    def test_cli_has_review_subcommand(self) -> None:
+        help_result = self.fixture.run("--help")
+        self.assertIn("review", help_result.stdout)
+
+    def test_review_round_create_issues_identity(self) -> None:
+        task_id, dispatch_id = self._seed_task_and_dispatch()
+        result = self.fixture.run(
+            "review", "round-create",
+            "--dispatch-id", dispatch_id,
+            "--round", "1",
+            "--candidate-sha", "a" * 40,
+            "--base-sha", "b" * 40,
+            "--diff-digest", "c" * 64,
+            "--acceptance-digest", "d" * 64,
+            "--scope", "full",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        import json
+        payload = json.loads(result.stdout)
+        self.assertEqual(dispatch_id, payload["dispatch_id"])
+        self.assertEqual(1, payload["round"])
+        self.assertEqual("a" * 40, payload["candidate_sha"])
+        self.assertEqual("coordinator-001", payload["issued_by"])
+        self.assertRegex(payload["round_id"], r"^rr-[0-9a-f]+")
+
+    def test_review_round_create_rejects_supplied_identity(self) -> None:
+        task_id, dispatch_id = self._seed_task_and_dispatch()
+        result = self.fixture.run(
+            "review", "round-create",
+            "--dispatch-id", dispatch_id,
+            "--round", "1",
+            "--candidate-sha", "a" * 40,
+            "--base-sha", "b" * 40,
+            "--diff-digest", "c" * 64,
+            "--acceptance-digest", "d" * 64,
+            "--scope", "full",
+            "--issued-by", "attacker",
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("cannot be caller-supplied", result.stderr.lower())
+
+    def test_review_round_requires_coordinator_claim(self) -> None:
+        task_id, dispatch_id = self._seed_task_and_dispatch()
+        self.fixture.run("coordinator", "release")
+        result = self.fixture.run(
+            "review", "round-create",
+            "--dispatch-id", dispatch_id,
+            "--round", "1",
+            "--candidate-sha", "a" * 40,
+            "--base-sha", "b" * 40,
+            "--diff-digest", "c" * 64,
+            "--acceptance-digest", "d" * 64,
+            "--scope", "full",
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("coordinator", result.stderr.lower())
+
+    def test_review_round_rejects_forger_supplied_round_id(self) -> None:
+        task_id, dispatch_id = self._seed_task_and_dispatch()
+        result = self.fixture.run(
+            "review", "round-create",
+            "--dispatch-id", dispatch_id,
+            "--round", "1",
+            "--candidate-sha", "a" * 40,
+            "--base-sha", "b" * 40,
+            "--diff-digest", "c" * 64,
+            "--acceptance-digest", "d" * 64,
+            "--scope", "full",
+            "--round-id", "rr-forged",
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("cannot be caller-supplied", result.stderr.lower())
+
+    def test_review_result_records_reference_only(self) -> None:
+        task_id, dispatch_id = self._seed_task_and_dispatch()
+        create = self.fixture.run(
+            "review", "round-create",
+            "--dispatch-id", dispatch_id,
+            "--round", "1",
+            "--candidate-sha", "a" * 40,
+            "--base-sha", "b" * 40,
+            "--diff-digest", "c" * 64,
+            "--acceptance-digest", "d" * 64,
+            "--scope", "full",
+        )
+        import json
+        round_id = json.loads(create.stdout)["round_id"]
+        os.environ["GWO_AGENT_ID"] = "reviewer-001"
+        result = self.fixture.run(
+            "review", "result-create",
+            "--round-id", round_id,
+            "--axis", "spec",
+            "--verdict", "approved",
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertEqual(0, result.returncode, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(round_id, payload["round_id"])
+        self.assertEqual("reviewer-001", payload["agent_id"])
+
+    def test_review_result_rejects_forging_lock_fields(self) -> None:
+        task_id, dispatch_id = self._seed_task_and_dispatch()
+        create = self.fixture.run(
+            "review", "round-create",
+            "--dispatch-id", dispatch_id,
+            "--round", "1",
+            "--candidate-sha", "a" * 40,
+            "--base-sha", "b" * 40,
+            "--diff-digest", "c" * 64,
+            "--acceptance-digest", "d" * 64,
+            "--scope", "full",
+        )
+        import json
+        round_id = json.loads(create.stdout)["round_id"]
+        os.environ["GWO_AGENT_ID"] = "reviewer-001"
+        result = self.fixture.run(
+            "review", "result-create",
+            "--round-id", round_id,
+            "--axis", "spec",
+            "--verdict", "approved",
+            "--candidate-sha", "z" * 40,
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("candidate_sha", result.stderr.lower())
+
+    def test_delta_round_requires_prior_round_id(self) -> None:
+        task_id, dispatch_id = self._seed_task_and_dispatch()
+        result = self.fixture.run(
+            "review", "round-create",
+            "--dispatch-id", dispatch_id,
+            "--round", "2",
+            "--candidate-sha", "a" * 40,
+            "--base-sha", "b" * 40,
+            "--diff-digest", "c" * 64,
+            "--acceptance-digest", "d" * 64,
+            "--scope", "delta",
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("prior_round_id", result.stderr.lower())
+
+    def test_delta_round_requires_same_dispatch_prior(self) -> None:
+        task_id, dispatch_id = self._seed_task_and_dispatch()
+        import json
+        first = self.fixture.run(
+            "review", "round-create",
+            "--dispatch-id", dispatch_id,
+            "--round", "1",
+            "--candidate-sha", "a" * 40,
+            "--base-sha", "b" * 40,
+            "--diff-digest", "c" * 64,
+            "--acceptance-digest", "d" * 64,
+            "--scope", "full",
+        )
+        prior = json.loads(first.stdout)["round_id"]
+        task2 = self.fixture.run(
+            "task", "create", "--issue", "25", "--group", "g-25", "--risk", "strict"
+        )
+        t2 = json.loads(task2.stdout)["task_id"]
+        self.fixture.run("task", "update", t2, "--status", "ready")
+        d2 = self.fixture.run(
+            "dispatch", "create",
+            "--task-id", t2,
+            "--agent-id", "worker-25",
+            "--worktree", "/tmp/wt-25",
+            "--branch", "work/issue-25",
+        )
+        d2_id = json.loads(d2.stdout)["dispatch_id"]
+        result = self.fixture.run(
+            "review", "round-create",
+            "--dispatch-id", d2_id,
+            "--round", "2",
+            "--candidate-sha", "e" * 40,
+            "--base-sha", "f" * 40,
+            "--diff-digest", "9" * 64,
+            "--acceptance-digest", "0" * 64,
+            "--scope", "delta",
+            "--prior-round-id", prior,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("same dispatch", result.stderr.lower())
+
+
+class LeaseCliTests(unittest.TestCase):
+    """Red tests for gwo_lease CLI integration lease."""
+
+    def setUp(self) -> None:
+        self.fixture = CliFixture(claim=True)
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_cli_has_lease_subcommand(self) -> None:
+        help_result = self.fixture.run("--help")
+        self.assertIn("lease", help_result.stdout)
+
+    def test_lease_acquire_serializes_integration(self) -> None:
+        os.environ["GWO_AGENT_ID"] = "integrator-001"
+        result = self.fixture.run(
+            "lease", "acquire",
+            "--scope", "repo:owner/repo:integration",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        import json
+        payload = json.loads(result.stdout)
+        self.assertEqual("repo:owner/repo:integration", payload["scope"])
+        self.assertEqual("integrator-001", payload["holder_agent"])
+
+    def test_lease_second_acquire_is_rejected(self) -> None:
+        os.environ["GWO_AGENT_ID"] = "integrator-001"
+        self.fixture.run(
+            "lease", "acquire",
+            "--scope", "repo:owner/repo:integration",
+        )
+        os.environ["GWO_AGENT_ID"] = "integrator-002"
+        result = self.fixture.run(
+            "lease", "acquire",
+            "--scope", "repo:owner/repo:integration",
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("integrator-001", result.stderr)
+
+    def test_lease_release_by_non_holder_rejected(self) -> None:
+        os.environ["GWO_AGENT_ID"] = "integrator-001"
+        self.fixture.run(
+            "lease", "acquire",
+            "--scope", "repo:owner/repo:integration",
+        )
+        os.environ["GWO_AGENT_ID"] = "integrator-002"
+        result = self.fixture.run(
+            "lease", "release",
+            "--scope", "repo:owner/repo:integration",
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("holder", result.stderr.lower())
+
+    def test_lease_release_then_reacquire(self) -> None:
+        os.environ["GWO_AGENT_ID"] = "integrator-001"
+        self.fixture.run(
+            "lease", "acquire",
+            "--scope", "repo:owner/repo:integration",
+        )
+        release = self.fixture.run(
+            "lease", "release",
+            "--scope", "repo:owner/repo:integration",
+        )
+        self.assertEqual(0, release.returncode, release.stderr)
+        os.environ["GWO_AGENT_ID"] = "integrator-002"
+        result = self.fixture.run(
+            "lease", "acquire",
+            "--scope", "repo:owner/repo:integration",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+
+
+class ReviewRoundStoreTests(unittest.TestCase):
+    """Direct store-level red tests for review-round primitives."""
+
+    def setUp(self) -> None:
+        os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        self.fixture = StoreFixture(self)
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _seed_dispatch(self):
+        task = self.store.create_task(issue=24, group_label="g-24", risk="strict")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        dispatch = self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-24",
+            worktree="/tmp/wt-24",
+            branch="work/issue-24",
+        )
+        return task, dispatch
+
+    def test_store_has_issue_review_round(self) -> None:
+        self.assertTrue(hasattr(self.store, "issue_review_round"))
+
+    def test_issue_review_round_creates_identity(self) -> None:
+        task, dispatch = self._seed_dispatch()
+        row = self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+        )
+        self.assertEqual(dispatch["dispatch_id"], row["dispatch_id"])
+        self.assertEqual("coordinator-001", row["issued_by"])
+
+    def test_store_has_submit_review_result(self) -> None:
+        self.assertTrue(hasattr(self.store, "submit_review_result"))
+
+    def test_submit_review_result_rejects_forger_supplied_candidate(self) -> None:
+        task, dispatch = self._seed_dispatch()
+        row = self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+        )
+        os.environ["GWO_AGENT_ID"] = "reviewer-001"
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
+            self.store.submit_review_result(
+                round_id=row["round_id"],
+                axis="spec",
+                verdict="approved",
+                candidate_sha="z" * 40,
+            )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertIn("candidate_sha", str(ctx.exception).lower())
+
+    def test_store_has_acquire_integration_lease(self) -> None:
+        self.assertTrue(hasattr(self.store, "acquire_integration_lease"))
+
+    def test_store_has_release_integration_lease(self) -> None:
+        self.assertTrue(hasattr(self.store, "release_integration_lease"))
+
+    def test_acquired_lease_serializes(self) -> None:
+        lease = self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
+        self.assertEqual("coordinator-001", lease["holder_agent"])
+        holder = self.store.integration_lease_holder("repo:owner/repo:integration")
+        self.assertEqual("coordinator-001", holder)
+
+
+if __name__ == "__main__":
+    unittest.main()
