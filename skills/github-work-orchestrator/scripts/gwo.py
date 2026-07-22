@@ -333,6 +333,86 @@ def cmd_guard(args: argparse.Namespace) -> int:
     return _fail(f"unknown guard action: {args.action}")
 
 
+def cmd_review(args: argparse.Namespace) -> int:
+    store = None
+    try:
+        store = _store(args)
+        if args.action == "round-create":
+            row = store.issue_review_round(
+                dispatch_id=args.dispatch_id,
+                round=args.round,
+                candidate_sha=args.candidate_sha,
+                base_sha=args.base_sha,
+                diff_digest=args.diff_digest,
+                acceptance_digest=args.acceptance_digest,
+                scope=args.scope,
+                prior_round_id=args.prior_round_id,
+                round_id=args.round_id,
+                issued_by=args.issued_by,
+            )
+            _emit(row)
+            return 0
+        if args.action == "result-create":
+            row = store.submit_review_result(
+                round_id=args.round_id,
+                axis=args.axis,
+                verdict=args.verdict,
+                findings=_json_value(args.findings),
+                agent_id=args.agent_id,
+                candidate_sha=args.candidate_sha,
+                base_sha=args.base_sha,
+                diff_digest=args.diff_digest,
+                acceptance_digest=args.acceptance_digest,
+                scope=args.scope,
+                round=args.round,
+                prior_round_id=args.prior_round_id,
+            )
+            _emit(row)
+            return 0
+        return _fail(f"unknown review action: {args.action}")
+    except Exception as error:
+        return _controlled_error(error)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def cmd_lease(args: argparse.Namespace) -> int:
+    store = None
+    try:
+        store = _store(args)
+        if args.action == "acquire":
+            row = store.acquire_integration_lease(
+                scope=args.scope,
+            )
+            _emit(row)
+            return 0
+        if args.action == "release":
+            row = store.release_integration_lease(
+                scope=args.scope,
+            )
+            _emit(row)
+            return 0
+        if args.action == "chain-append":
+            row = store.append_integration_chain(
+                scope=args.scope,
+                candidate_sha=args.candidate_sha,
+                task_id=args.task_id,
+            )
+            _emit(row)
+            return 0
+        if args.action == "chain-list":
+            rows = store.list_integration_chain(scope=args.scope)
+            _emit(rows)
+            return 0
+        return _fail(f"unknown lease action: {args.action}")
+    except Exception as error:
+        return _controlled_error(error)
+    finally:
+        if store is not None:
+            store.close()
+
+
 def _json_list(value: str | None) -> list[str] | None:
     if value is None:
         return None
@@ -470,6 +550,58 @@ def build_parser() -> argparse.ArgumentParser:
     guard_check = guard_sub.add_parser("check-dag", help="validate a DAG plan")
     guard_check.add_argument("--plan", required=True, help="path to JSON plan or '-' for stdin")
     guard_check.set_defaults(func=cmd_guard)
+
+    review = sub.add_parser("review", help="issue and reference review rounds")
+    review_sub = review.add_subparsers(dest="action", required=True)
+    review_create = review_sub.add_parser("round-create", help="issue a review-round identity")
+    review_create.add_argument("--dispatch-id", required=True)
+    review_create.add_argument("--round", type=int, required=True)
+    review_create.add_argument("--candidate-sha", required=True)
+    review_create.add_argument("--base-sha", required=True)
+    review_create.add_argument("--diff-digest", required=True)
+    review_create.add_argument("--acceptance-digest", required=True)
+    review_create.add_argument("--scope", required=True, choices=("full", "delta"))
+    review_create.add_argument("--prior-round-id", default=None, dest="prior_round_id")
+    review_create.add_argument("--issued-by", default=None, help=argparse.SUPPRESS)
+    review_create.add_argument("--round-id", default=None, help=argparse.SUPPRESS)
+    review_create.set_defaults(func=cmd_review)
+
+    review_result = review_sub.add_parser("result-create", help="record a reviewer result")
+    review_result.add_argument("--round-id", required=True)
+    review_result.add_argument("--axis", required=True, choices=("spec", "quality", "combined"))
+    review_result.add_argument("--verdict", required=True, choices=("approved", "rejected", "needs_work", "withdrawn"))
+    review_result.add_argument("--findings", default=None, help="JSON object findings")
+    review_result.add_argument("--agent-id", default=None, help=argparse.SUPPRESS)
+    review_result.add_argument("--candidate-sha", default=None, help=argparse.SUPPRESS)
+    review_result.add_argument("--base-sha", default=None, help=argparse.SUPPRESS)
+    review_result.add_argument("--diff-digest", default=None, help=argparse.SUPPRESS)
+    review_result.add_argument("--acceptance-digest", default=None, help=argparse.SUPPRESS)
+    review_result.add_argument("--scope", default=None, help=argparse.SUPPRESS)
+    review_result.add_argument("--round", type=int, default=None, help=argparse.SUPPRESS)
+    review_result.add_argument("--prior-round-id", default=None, help=argparse.SUPPRESS)
+    review_result.set_defaults(func=cmd_review)
+
+    lease = sub.add_parser("lease", help="repository Integration Lease")
+    lease_sub = lease.add_subparsers(dest="action", required=True)
+    lease_acquire = lease_sub.add_parser("acquire", help="acquire the Integration Lease")
+    lease_acquire.add_argument("--scope", required=True)
+    lease_acquire.add_argument("--agent-id", default=None, help=argparse.SUPPRESS)
+    lease_acquire.set_defaults(func=cmd_lease)
+
+    lease_release = lease_sub.add_parser("release", help="release the Integration Lease")
+    lease_release.add_argument("--scope", required=True)
+    lease_release.add_argument("--agent-id", default=None, help=argparse.SUPPRESS)
+    lease_release.set_defaults(func=cmd_lease)
+
+    lease_chain_append = lease_sub.add_parser("chain-append", help="append an integration chain node")
+    lease_chain_append.add_argument("--scope", required=True)
+    lease_chain_append.add_argument("--candidate-sha", required=True)
+    lease_chain_append.add_argument("--task-id", required=True)
+    lease_chain_append.set_defaults(func=cmd_lease)
+
+    lease_chain_list = lease_sub.add_parser("chain-list", help="list the integration chain")
+    lease_chain_list.add_argument("--scope", required=True)
+    lease_chain_list.set_defaults(func=cmd_lease)
 
     return parser
 

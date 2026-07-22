@@ -83,6 +83,10 @@ class CoordinatorBusy(StoreError):
     """Raised when a second Coordinator claim is attempted."""
 
 
+class LeaseBusy(StoreError):
+    """Raised when a second holder attempts to acquire an active lease."""
+
+
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     (
         "0001-initial",
@@ -160,7 +164,25 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
 
         CREATE INDEX IF NOT EXISTS idx_messages_to ON messages (to_agent, acked_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_signal ON messages (signal_id);
-
+        """,
+    ),
+    (
+        "0002-messages-in-reply-to",
+        """
+        ALTER TABLE messages ADD COLUMN in_reply_to TEXT;
+        CREATE INDEX IF NOT EXISTS idx_messages_from_seq
+            ON messages (from_agent, seq);
+        """,
+    ),
+    (
+        "0003-tasks-repo-issue-unique",
+        """
+        CREATE INDEX IF NOT EXISTS idx_tasks_repo_issue ON tasks (repo, issue);
+        """,
+    ),
+    (
+        "0004-review-rounds-and-lease",
+        """
         CREATE TABLE IF NOT EXISTS review_rounds (
             round_id TEXT PRIMARY KEY,
             dispatch_id TEXT NOT NULL,
@@ -194,20 +216,22 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
             acquired_at REAL,
             released_at REAL
         );
-        """,
-    ),
-    (
-        "0002-messages-in-reply-to",
-        """
-        ALTER TABLE messages ADD COLUMN in_reply_to TEXT;
-        CREATE INDEX IF NOT EXISTS idx_messages_from_seq
-            ON messages (from_agent, seq);
-        """,
-    ),
-    (
-        "0003-tasks-repo-issue-unique",
-        """
-        CREATE INDEX IF NOT EXISTS idx_tasks_repo_issue ON tasks (repo, issue);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_active_scope
+            ON leases (scope) WHERE released_at IS NULL;
+
+        CREATE TABLE IF NOT EXISTS integration_chain (
+            chain_id TEXT PRIMARY KEY,
+            scope TEXT NOT NULL,
+            candidate_sha TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            prior_chain_id TEXT,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (prior_chain_id) REFERENCES integration_chain (chain_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_integration_chain_scope
+            ON integration_chain (scope, created_at);
         """,
     ),
 )
@@ -422,13 +446,23 @@ class Store:
             if name in applied:
                 continue
             self._apply_migration(name, ddl, caller)
+            # If the migration was already applied by a concurrent writer,
+            # _apply_migration commits a no-op; do not run post-migration hooks.
             applied.add(name)
+            if name not in applied:
+                continue
             # Post-migration 0003: attempt the unique index. If duplicate tasks
             # exist (legacy Issue #21 stores), skip the unique index so
             # Store.connect does not crash; doctor_rebuild surfaces the
             # ambiguity. If no duplicates, the unique index is created safely.
             if name == "0003-tasks-repo-issue-unique":
                 self._try_unique_index_or_skip()
+            # Post-migration 0004: attempt the review/lease partial unique
+            # index. If a legacy store already has a conflicting lease row,
+            # skip the index so Store.connect does not crash; doctor_rebuild
+            # surfaces the ambiguity.
+            if name == "0004-review-rounds-and-lease":
+                self._try_lease_unique_index_or_skip()
 
     def _try_unique_index_or_skip(self) -> None:
         """Attempt to create the unique index on tasks(repo, issue).
@@ -445,6 +479,29 @@ class Store:
                 self.db.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique "
                     "ON tasks (repo, issue)"
+                )
+                self.db.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                self.db.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+
+    def _try_lease_unique_index_or_skip(self) -> None:
+        """Attempt to create the partial unique index on active leases.
+
+        If a legacy store contains conflicting active lease rows, skip the
+        index so Store.connect does not crash; doctor_rebuild can surface the
+        ambiguity.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_active_scope "
+                    "ON leases (scope) WHERE released_at IS NULL"
                 )
                 self.db.execute("COMMIT")
             except sqlite3.IntegrityError:
@@ -994,3 +1051,455 @@ class Store:
             adapter_listing=adapter_listing,
             git_worktrees=git_worktrees,
         )
+
+    # --- Phase 2 review rounds / Integration Lease ---------------------------
+
+    def issue_review_round(
+        self,
+        *,
+        dispatch_id: str,
+        round: int,
+        candidate_sha: str,
+        base_sha: str,
+        diff_digest: str,
+        acceptance_digest: str,
+        scope: str,
+        prior_round_id: str | None = None,
+        round_id: Any = None,
+        issued_by: Any = None,
+    ) -> dict[str, Any]:
+        """Issue a review-round identity row. Coordinator-only.
+
+        The CLI is the sole authority that authors candidate/base SHA, diff and
+        acceptance digests, scope, round number, and round identity. Reviewers
+        can only reference an issued round via submit_review_result.
+        """
+        import gwo_review
+
+        actor = self._identity(issued_by, "issued_by")
+        self._reject_supplied_identity(round_id, "round_id")
+        gwo_review.validate_scope(scope)
+        gwo_review.validate_round(round)
+        gwo_review.validate_sha("candidate_sha", candidate_sha)
+        gwo_review.validate_sha("base_sha", base_sha)
+        gwo_review.validate_sha256("diff_digest", diff_digest)
+        gwo_review.validate_sha256("acceptance_digest", acceptance_digest)
+
+        if scope == "full":
+            if round != 1:
+                raise TransitionError("full review must be round 1")
+            if prior_round_id is not None:
+                raise TransitionError("full review must not have a prior_round_id")
+        else:
+            if round < 2:
+                raise TransitionError("delta review requires round >= 2")
+            if prior_round_id is None:
+                raise TransitionError("delta review requires prior_round_id")
+
+        resolved_round_id = _new_id("rr")
+        now = _now()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_coordinator_claim(actor)
+            dispatch = self.db.execute(
+                "SELECT dispatch_id FROM dispatches WHERE dispatch_id = ?",
+                (dispatch_id,),
+            ).fetchone()
+            if dispatch is None:
+                raise TransitionError(f"unknown dispatch {dispatch_id}")
+
+            if prior_round_id is not None:
+                prior = self.db.execute(
+                    "SELECT dispatch_id, candidate_sha FROM review_rounds "
+                    "WHERE round_id = ?",
+                    (prior_round_id,),
+                ).fetchone()
+                if prior is None:
+                    raise TransitionError(
+                        f"prior_round_id {prior_round_id} does not exist"
+                    )
+                if prior["dispatch_id"] != dispatch_id:
+                    raise TransitionError(
+                        "prior_round_id must belong to the same dispatch"
+                    )
+                if prior["candidate_sha"] == candidate_sha:
+                    raise TransitionError(
+                        "delta candidate must differ from prior candidate"
+                    )
+
+            self.db.execute(
+                "INSERT INTO review_rounds ("
+                "round_id, dispatch_id, round, candidate_sha, base_sha, "
+                "diff_digest, acceptance_digest, scope, prior_round_id, "
+                "issued_by, issued_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    resolved_round_id,
+                    dispatch_id,
+                    round,
+                    candidate_sha,
+                    base_sha,
+                    diff_digest,
+                    acceptance_digest,
+                    scope,
+                    prior_round_id,
+                    actor,
+                    now,
+                ),
+            )
+            self.db.execute("COMMIT")
+        except sqlite3.IntegrityError as error:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise TransitionError(
+                f"review round {round} already issued for dispatch {dispatch_id}"
+            ) from error
+        except BaseException:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+        return self._review_round_row(resolved_round_id)
+
+    def _review_round_row(self, round_id: str) -> dict[str, Any]:
+        row = self.db.execute(
+            "SELECT * FROM review_rounds WHERE round_id = ?", (round_id,)
+        ).fetchone()
+        if row is None:
+            raise TransitionError(f"unknown review round {round_id}")
+        return self._review_round_from_row(row)
+
+    @staticmethod
+    def _review_round_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "round_id": row["round_id"],
+            "dispatch_id": row["dispatch_id"],
+            "round": row["round"],
+            "candidate_sha": row["candidate_sha"],
+            "base_sha": row["base_sha"],
+            "diff_digest": row["diff_digest"],
+            "acceptance_digest": row["acceptance_digest"],
+            "scope": row["scope"],
+            "prior_round_id": row["prior_round_id"],
+            "issued_by": row["issued_by"],
+            "issued_at": row["issued_at"],
+        }
+
+    def submit_review_result(
+        self,
+        *,
+        round_id: str,
+        axis: str,
+        verdict: str,
+        agent_id: Any = None,
+        findings: dict[str, Any] | None = None,
+        candidate_sha: Any = None,
+        base_sha: Any = None,
+        diff_digest: Any = None,
+        acceptance_digest: Any = None,
+        scope: Any = None,
+        round: Any = None,
+        prior_round_id: Any = None,
+    ) -> dict[str, Any]:
+        """Record a Reviewer result that references an issued round.
+
+        Reviewers may supply only axis, verdict, and findings. Any attempt to
+        author or override lock identity fields is rejected.
+        """
+        import gwo_review
+
+        resolved = self._identity(agent_id, "agent_id")
+        gwo_review.validate_axis(axis)
+        gwo_review.validate_verdict(verdict)
+        self._reject_supplied_identity(candidate_sha, "candidate_sha")
+        self._reject_supplied_identity(base_sha, "base_sha")
+        self._reject_supplied_identity(diff_digest, "diff_digest")
+        self._reject_supplied_identity(acceptance_digest, "acceptance_digest")
+        self._reject_supplied_identity(scope, "scope")
+        self._reject_supplied_identity(round, "round")
+        self._reject_supplied_identity(prior_round_id, "prior_round_id")
+
+        normalized_findings = gwo_review.normalize_findings(findings)
+        findings_json = json.dumps(normalized_findings)
+        now = _now()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            round_row = self.db.execute(
+                "SELECT round_id FROM review_rounds WHERE round_id = ?",
+                (round_id,),
+            ).fetchone()
+            if round_row is None:
+                raise TransitionError(f"unknown review round {round_id}")
+            existing = self.db.execute(
+                "SELECT axis FROM review_results WHERE round_id = ? AND axis = ?",
+                (round_id, axis),
+            ).fetchone()
+            if existing is not None:
+                raise TransitionError(
+                    f"result for axis {axis} already exists on round {round_id}"
+                )
+            self.db.execute(
+                "INSERT INTO review_results ("
+                "round_id, axis, agent_id, verdict, findings_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (round_id, axis, resolved, verdict, findings_json, now),
+            )
+            self.db.execute("COMMIT")
+        except sqlite3.IntegrityError as error:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise TransitionError(
+                f"result for axis {axis} already exists on round {round_id}"
+            ) from error
+        except BaseException:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+        return self._review_result_row(round_id, axis)
+
+    def _review_result_row(self, round_id: str, axis: str) -> dict[str, Any]:
+        row = self.db.execute(
+            "SELECT * FROM review_results WHERE round_id = ? AND axis = ?",
+            (round_id, axis),
+        ).fetchone()
+        if row is None:
+            raise TransitionError(f"unknown review result {round_id}/{axis}")
+        return {
+            "round_id": row["round_id"],
+            "axis": row["axis"],
+            "agent_id": row["agent_id"],
+            "verdict": row["verdict"],
+            "findings_json": json.loads(row["findings_json"]),
+            "created_at": row["created_at"],
+        }
+
+    def acquire_integration_lease(
+        self,
+        *,
+        scope: str,
+        lease_id: Any = None,
+        holder_agent: Any = None,
+    ) -> dict[str, Any]:
+        """Acquire the repository Integration Lease. Coordinator or holder only.
+
+        The lease row is created or updated in a single SQLite transaction.
+        The partial unique index ``idx_leases_active_scope`` ensures at most
+        one active lease per scope.
+        """
+        import gwo_lease
+
+        actor = self._identity(holder_agent, "holder_agent")
+        self._reject_supplied_identity(lease_id, "lease_id")
+        gwo_lease.validate_scope(scope)
+
+        resolved_lease_id = _new_id("lease")
+        now = _now()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT lease_id, holder_agent, released_at FROM leases "
+                "WHERE scope = ?",
+                (scope,),
+            ).fetchone()
+            if row is not None and row["released_at"] is None:
+                raise LeaseBusy(
+                    f"lease {scope} already held by {row['holder_agent']}"
+                )
+            if row is None:
+                self.db.execute(
+                    "INSERT INTO leases ("
+                    "lease_id, scope, holder_agent, acquired_at, released_at) "
+                    "VALUES (?, ?, ?, ?, NULL)",
+                    (resolved_lease_id, scope, actor, now),
+                )
+            else:
+                resolved_lease_id = row["lease_id"]
+                self.db.execute(
+                    "UPDATE leases SET holder_agent = ?, acquired_at = ?, "
+                    "released_at = NULL WHERE lease_id = ?",
+                    (actor, now, resolved_lease_id),
+                )
+            self.db.execute("COMMIT")
+        except sqlite3.IntegrityError as error:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise LeaseBusy(f"lease {scope} is already held") from error
+        except BaseException:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+        return self._lease_row(resolved_lease_id)
+
+    def integration_lease_holder(self, scope: str) -> str | None:
+        import gwo_lease
+
+        gwo_lease.validate_scope(scope)
+        row = self.db.execute(
+            "SELECT holder_agent FROM leases WHERE scope = ? AND released_at IS NULL",
+            (scope,),
+        ).fetchone()
+        return str(row["holder_agent"]) if row is not None else None
+
+    def release_integration_lease(
+        self,
+        *,
+        scope: str,
+        holder_agent: Any = None,
+    ) -> dict[str, Any]:
+        """Release the Integration Lease. Only the current holder may release."""
+        actor = self._identity(holder_agent, "holder_agent")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT lease_id, holder_agent, released_at FROM leases "
+                "WHERE scope = ?",
+                (scope,),
+            ).fetchone()
+            if row is None or row["released_at"] is not None:
+                raise TransitionError(f"no active lease for {scope}")
+            if row["holder_agent"] != actor:
+                raise TransitionError(
+                    f"only the lease holder may release {scope}"
+                )
+            self.db.execute(
+                "UPDATE leases SET released_at = ? WHERE lease_id = ?",
+                (_now(), row["lease_id"]),
+            )
+            self.db.execute("COMMIT")
+        except BaseException:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+        return self._lease_row(row["lease_id"])
+
+    def _lease_row(self, lease_id: str) -> dict[str, Any]:
+        row = self.db.execute(
+            "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
+        ).fetchone()
+        if row is None:
+            raise TransitionError(f"unknown lease {lease_id}")
+        return {
+            "lease_id": row["lease_id"],
+            "scope": row["scope"],
+            "holder_agent": row["holder_agent"],
+            "acquired_at": row["acquired_at"],
+            "released_at": row["released_at"],
+        }
+
+    def append_integration_chain(
+        self,
+        *,
+        scope: str,
+        candidate_sha: str,
+        task_id: str,
+        prior_chain_id: Any = None,
+        chain_id: Any = None,
+    ) -> dict[str, Any]:
+        """Append one node to the serial integration chain.
+
+        Requires the caller to currently hold the Integration Lease for the
+        same scope. The chain enforces one serial sequence of integration
+        nodes per repository.
+        """
+        import gwo_lease
+        import gwo_review
+
+        gwo_lease.validate_scope(scope)
+        gwo_review.validate_sha("candidate_sha", candidate_sha)
+        gwo_review.validate_identifier("task_id", task_id)
+        self._reject_supplied_identity(chain_id, "chain_id")
+        self._reject_supplied_identity(prior_chain_id, "prior_chain_id")
+
+        holder = self.integration_lease_holder(scope)
+        if holder is None:
+            raise IdentityError(
+                f"active Integration Lease required for {scope}"
+            )
+        caller = self._caller()
+        if holder != caller:
+            raise IdentityError(
+                f"only the lease holder may append to integration chain {scope}"
+            )
+
+        resolved_chain_id = _new_id("chain")
+        now = _now()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            tail = self.db.execute(
+                "SELECT chain_id FROM integration_chain "
+                "WHERE scope = ? ORDER BY created_at DESC LIMIT 1",
+                (scope,),
+            ).fetchone()
+            expected_prior = tail["chain_id"] if tail is not None else None
+            if expected_prior is not None:
+                prior = self.db.execute(
+                    "SELECT chain_id FROM integration_chain WHERE chain_id = ?",
+                    (expected_prior,),
+                ).fetchone()
+                if prior is None:
+                    raise TransitionError(
+                        "integration chain tail missing; cannot append"
+                    )
+            self.db.execute(
+                "INSERT INTO integration_chain ("
+                "chain_id, scope, candidate_sha, task_id, prior_chain_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    resolved_chain_id,
+                    scope,
+                    candidate_sha,
+                    task_id,
+                    expected_prior,
+                    now,
+                ),
+            )
+            self.db.execute("COMMIT")
+        except BaseException:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+        return self._chain_row(resolved_chain_id)
+
+    def list_integration_chain(self, *, scope: str) -> list[dict[str, Any]]:
+        import gwo_lease
+
+        gwo_lease.validate_scope(scope)
+        rows = self.db.execute(
+            "SELECT * FROM integration_chain WHERE scope = ? ORDER BY created_at",
+            (scope,),
+        ).fetchall()
+        return [self._chain_from_row(row) for row in rows]
+
+    def _chain_row(self, chain_id: str) -> dict[str, Any]:
+        row = self.db.execute(
+            "SELECT * FROM integration_chain WHERE chain_id = ?", (chain_id,)
+        ).fetchone()
+        if row is None:
+            raise TransitionError(f"unknown chain node {chain_id}")
+        return self._chain_from_row(row)
+
+    @staticmethod
+    def _chain_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "chain_id": row["chain_id"],
+            "scope": row["scope"],
+            "candidate_sha": row["candidate_sha"],
+            "task_id": row["task_id"],
+            "prior_chain_id": row["prior_chain_id"],
+            "created_at": row["created_at"],
+        }
