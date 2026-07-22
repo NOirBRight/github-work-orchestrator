@@ -349,6 +349,7 @@ def cmd_review(args: argparse.Namespace) -> int:
                 prior_round_id=args.prior_round_id,
                 round_id=args.round_id,
                 issued_by=args.issued_by,
+                assignments=args.assignments,
             )
             _emit(row)
             return 0
@@ -398,6 +399,7 @@ def cmd_lease(args: argparse.Namespace) -> int:
                 scope=args.scope,
                 candidate_sha=args.candidate_sha,
                 task_id=args.task_id,
+                tier=args.tier,
             )
             _emit(row)
             return 0
@@ -562,6 +564,8 @@ def build_parser() -> argparse.ArgumentParser:
     review_create.add_argument("--acceptance-digest", required=True)
     review_create.add_argument("--scope", required=True, choices=("full", "delta"))
     review_create.add_argument("--prior-round-id", default=None, dest="prior_round_id")
+    review_create.add_argument("--assignments", type=_json_value, default=None,
+                               help="JSON object mapping axis -> reviewer agent_id")
     review_create.add_argument("--issued-by", default=None, help=argparse.SUPPRESS)
     review_create.add_argument("--round-id", default=None, help=argparse.SUPPRESS)
     review_create.set_defaults(func=cmd_review)
@@ -597,6 +601,7 @@ def build_parser() -> argparse.ArgumentParser:
     lease_chain_append.add_argument("--scope", required=True)
     lease_chain_append.add_argument("--candidate-sha", required=True)
     lease_chain_append.add_argument("--task-id", required=True)
+    lease_chain_append.add_argument("--tier", choices=("fast", "standard", "strict"), default=None)
     lease_chain_append.set_defaults(func=cmd_lease)
 
     lease_chain_list = lease_sub.add_parser("chain-list", help="list the integration chain")

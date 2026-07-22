@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -120,11 +121,25 @@ class ReviewRoundCliTests(unittest.TestCase):
         )
         self.assertEqual(0, dispatch.returncode, dispatch.stderr)
         dispatch_id = json.loads(dispatch.stdout)["dispatch_id"]
+        # Register the reviewers that strict tier requires.
+        for reviewer in ("reviewer-spec", "reviewer-quality"):
+            reg = self.fixture.run(
+                "agent", "register",
+                "--agent-id", reviewer,
+                "--adapter", "paseo",
+                "--role", "reviewer",
+                "--group-label", "g-24",
+            )
+            self.assertEqual(0, reg.returncode, reg.stderr)
         return task_id, dispatch_id
 
     def test_cli_has_review_subcommand(self) -> None:
         help_result = self.fixture.run("--help")
         self.assertIn("review", help_result.stdout)
+
+    def _strict_assignments(self) -> dict[str, str]:
+        import json
+        return json.dumps({"spec": "reviewer-spec", "quality": "reviewer-quality"})
 
     def test_review_round_create_issues_identity(self) -> None:
         task_id, dispatch_id = self._seed_task_and_dispatch()
@@ -137,6 +152,7 @@ class ReviewRoundCliTests(unittest.TestCase):
             "--diff-digest", "c" * 64,
             "--acceptance-digest", "d" * 64,
             "--scope", "full",
+            "--assignments", self._strict_assignments(),
         )
         self.assertEqual(0, result.returncode, result.stderr)
         import json
@@ -158,6 +174,7 @@ class ReviewRoundCliTests(unittest.TestCase):
             "--diff-digest", "c" * 64,
             "--acceptance-digest", "d" * 64,
             "--scope", "full",
+            "--assignments", self._strict_assignments(),
             "--issued-by", "attacker",
         )
         self.assertNotEqual(0, result.returncode)
@@ -175,6 +192,7 @@ class ReviewRoundCliTests(unittest.TestCase):
             "--diff-digest", "c" * 64,
             "--acceptance-digest", "d" * 64,
             "--scope", "full",
+            "--assignments", self._strict_assignments(),
         )
         self.assertNotEqual(0, result.returncode)
         self.assertIn("coordinator", result.stderr.lower())
@@ -190,6 +208,7 @@ class ReviewRoundCliTests(unittest.TestCase):
             "--diff-digest", "c" * 64,
             "--acceptance-digest", "d" * 64,
             "--scope", "full",
+            "--assignments", self._strict_assignments(),
             "--round-id", "rr-forged",
         )
         self.assertNotEqual(0, result.returncode)
@@ -206,10 +225,11 @@ class ReviewRoundCliTests(unittest.TestCase):
             "--diff-digest", "c" * 64,
             "--acceptance-digest", "d" * 64,
             "--scope", "full",
+            "--assignments", self._strict_assignments(),
         )
         import json
         round_id = json.loads(create.stdout)["round_id"]
-        os.environ["GWO_AGENT_ID"] = "reviewer-001"
+        os.environ["GWO_AGENT_ID"] = "reviewer-spec"
         result = self.fixture.run(
             "review", "result-create",
             "--round-id", round_id,
@@ -220,7 +240,7 @@ class ReviewRoundCliTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(round_id, payload["round_id"])
-        self.assertEqual("reviewer-001", payload["agent_id"])
+        self.assertEqual("reviewer-spec", payload["agent_id"])
 
     def test_review_result_rejects_forging_lock_fields(self) -> None:
         task_id, dispatch_id = self._seed_task_and_dispatch()
@@ -233,10 +253,11 @@ class ReviewRoundCliTests(unittest.TestCase):
             "--diff-digest", "c" * 64,
             "--acceptance-digest", "d" * 64,
             "--scope", "full",
+            "--assignments", self._strict_assignments(),
         )
         import json
         round_id = json.loads(create.stdout)["round_id"]
-        os.environ["GWO_AGENT_ID"] = "reviewer-001"
+        os.environ["GWO_AGENT_ID"] = "reviewer-spec"
         result = self.fixture.run(
             "review", "result-create",
             "--round-id", round_id,
@@ -259,6 +280,7 @@ class ReviewRoundCliTests(unittest.TestCase):
             "--diff-digest", "c" * 64,
             "--acceptance-digest", "d" * 64,
             "--scope", "delta",
+            "--assignments", self._strict_assignments(),
         )
         self.assertNotEqual(0, result.returncode)
         self.assertIn("prior_round_id", result.stderr.lower())
@@ -275,6 +297,7 @@ class ReviewRoundCliTests(unittest.TestCase):
             "--diff-digest", "c" * 64,
             "--acceptance-digest", "d" * 64,
             "--scope", "full",
+            "--assignments", self._strict_assignments(),
         )
         prior = json.loads(first.stdout)["round_id"]
         task2 = self.fixture.run(
@@ -289,6 +312,16 @@ class ReviewRoundCliTests(unittest.TestCase):
             "--worktree", "/tmp/wt-25",
             "--branch", "work/issue-25",
         )
+        # Register reviewers for the second strict dispatch.
+        for reviewer in ("reviewer-25-spec", "reviewer-25-quality"):
+            reg = self.fixture.run(
+                "agent", "register",
+                "--agent-id", reviewer,
+                "--adapter", "paseo",
+                "--role", "reviewer",
+                "--group-label", "g-25",
+            )
+            self.assertEqual(0, reg.returncode, reg.stderr)
         d2_id = json.loads(d2.stdout)["dispatch_id"]
         result = self.fixture.run(
             "review", "round-create",
@@ -300,6 +333,7 @@ class ReviewRoundCliTests(unittest.TestCase):
             "--acceptance-digest", "0" * 64,
             "--scope", "delta",
             "--prior-round-id", prior,
+            "--assignments", json.dumps({"spec": "reviewer-25-spec", "quality": "reviewer-25-quality"}),
         )
         self.assertNotEqual(0, result.returncode)
         self.assertIn("same dispatch", result.stderr.lower())
@@ -319,7 +353,6 @@ class LeaseCliTests(unittest.TestCase):
         self.assertIn("lease", help_result.stdout)
 
     def test_lease_acquire_serializes_integration(self) -> None:
-        os.environ["GWO_AGENT_ID"] = "integrator-001"
         result = self.fixture.run(
             "lease", "acquire",
             "--scope", "repo:owner/repo:integration",
@@ -328,25 +361,23 @@ class LeaseCliTests(unittest.TestCase):
         import json
         payload = json.loads(result.stdout)
         self.assertEqual("repo:owner/repo:integration", payload["scope"])
-        self.assertEqual("integrator-001", payload["holder_agent"])
+        self.assertEqual("coordinator-001", payload["holder_agent"])
 
     def test_lease_second_acquire_is_rejected(self) -> None:
-        os.environ["GWO_AGENT_ID"] = "integrator-001"
         self.fixture.run(
             "lease", "acquire",
             "--scope", "repo:owner/repo:integration",
         )
-        os.environ["GWO_AGENT_ID"] = "integrator-002"
+        # Second acquire by the same coordinator is rejected because the lease
+        # is already held.
         result = self.fixture.run(
             "lease", "acquire",
             "--scope", "repo:owner/repo:integration",
         )
-        os.environ["GWO_AGENT_ID"] = "coordinator-001"
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("integrator-001", result.stderr)
+        self.assertIn("coordinator-001", result.stderr)
 
-    def test_lease_release_by_non_holder_rejected(self) -> None:
-        os.environ["GWO_AGENT_ID"] = "integrator-001"
+    def test_lease_release_by_non_coordinator_rejected(self) -> None:
         self.fixture.run(
             "lease", "acquire",
             "--scope", "repo:owner/repo:integration",
@@ -358,10 +389,9 @@ class LeaseCliTests(unittest.TestCase):
         )
         os.environ["GWO_AGENT_ID"] = "coordinator-001"
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("holder", result.stderr.lower())
+        self.assertIn("coordinator", result.stderr.lower())
 
     def test_lease_release_then_reacquire(self) -> None:
-        os.environ["GWO_AGENT_ID"] = "integrator-001"
         self.fixture.run(
             "lease", "acquire",
             "--scope", "repo:owner/repo:integration",
@@ -371,13 +401,11 @@ class LeaseCliTests(unittest.TestCase):
             "--scope", "repo:owner/repo:integration",
         )
         self.assertEqual(0, release.returncode, release.stderr)
-        os.environ["GWO_AGENT_ID"] = "integrator-002"
         result = self.fixture.run(
             "lease", "acquire",
             "--scope", "repo:owner/repo:integration",
         )
         self.assertEqual(0, result.returncode, result.stderr)
-        os.environ["GWO_AGENT_ID"] = "coordinator-001"
 
 
 class ReviewRoundStoreTests(unittest.TestCase):
@@ -392,8 +420,8 @@ class ReviewRoundStoreTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.fixture.cleanup()
 
-    def _seed_dispatch(self):
-        task = self.store.create_task(issue=24, group_label="g-24", risk="strict")
+    def _seed_dispatch(self, risk: str = "strict"):
+        task = self.store.create_task(issue=24, group_label="g-24", risk=risk)
         self.store.update_task(task_id=task["task_id"], status="ready")
         dispatch = self.store.create_dispatch(
             task_id=task["task_id"],
@@ -403,11 +431,21 @@ class ReviewRoundStoreTests(unittest.TestCase):
         )
         return task, dispatch
 
+    def _register_reviewer(self, agent_id: str):
+        self.store.register_agent(
+            agent_id=agent_id,
+            adapter="paseo",
+            runtime_ref=f"ref-{agent_id}",
+            role="reviewer",
+            group_label="g-24",
+        )
+
     def test_store_has_issue_review_round(self) -> None:
         self.assertTrue(hasattr(self.store, "issue_review_round"))
 
     def test_issue_review_round_creates_identity(self) -> None:
-        task, dispatch = self._seed_dispatch()
+        task, dispatch = self._seed_dispatch("standard")
+        self._register_reviewer("reviewer-combined")
         row = self.store.issue_review_round(
             dispatch_id=dispatch["dispatch_id"],
             round=1,
@@ -416,6 +454,7 @@ class ReviewRoundStoreTests(unittest.TestCase):
             diff_digest="c" * 64,
             acceptance_digest="d" * 64,
             scope="full",
+            assignments={"combined": "reviewer-combined"},
         )
         self.assertEqual(dispatch["dispatch_id"], row["dispatch_id"])
         self.assertEqual("coordinator-001", row["issued_by"])
@@ -424,7 +463,8 @@ class ReviewRoundStoreTests(unittest.TestCase):
         self.assertTrue(hasattr(self.store, "submit_review_result"))
 
     def test_submit_review_result_rejects_forger_supplied_candidate(self) -> None:
-        task, dispatch = self._seed_dispatch()
+        task, dispatch = self._seed_dispatch("standard")
+        self._register_reviewer("reviewer-combined")
         row = self.store.issue_review_round(
             dispatch_id=dispatch["dispatch_id"],
             round=1,
@@ -433,12 +473,13 @@ class ReviewRoundStoreTests(unittest.TestCase):
             diff_digest="c" * 64,
             acceptance_digest="d" * 64,
             scope="full",
+            assignments={"combined": "reviewer-combined"},
         )
-        os.environ["GWO_AGENT_ID"] = "reviewer-001"
+        os.environ["GWO_AGENT_ID"] = "reviewer-combined"
         with self.assertRaises(self.store_mod.IdentityError) as ctx:
             self.store.submit_review_result(
                 round_id=row["round_id"],
-                axis="spec",
+                axis="combined",
                 verdict="approved",
                 candidate_sha="z" * 40,
             )
@@ -456,6 +497,442 @@ class ReviewRoundStoreTests(unittest.TestCase):
         self.assertEqual("coordinator-001", lease["holder_agent"])
         holder = self.store.integration_lease_holder("repo:owner/repo:integration")
         self.assertEqual("coordinator-001", holder)
+
+
+class ReviewAuthorityTests(unittest.TestCase):
+    """Issue #37: only the assigned registered non-archived Reviewer may submit
+    a result for the assigned round and axis.
+    """
+
+    def setUp(self) -> None:
+        os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        self.fixture = StoreFixture(self)
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _seed_strict_dispatch(self):
+        task = self.store.create_task(issue=37, group_label="g-37", risk="strict")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        dispatch = self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-37",
+            worktree="/tmp/wt-37",
+            branch="work/issue-37",
+        )
+        return task, dispatch
+
+    def _register_reviewer(self, agent_id: str, axis: str):
+        self.store.register_agent(
+            agent_id=agent_id,
+            adapter="paseo",
+            runtime_ref=f"ref-{agent_id}",
+            role="reviewer",
+            group_label="g-37",
+        )
+        # assignment is part of round creation in V7
+        return agent_id, axis
+
+    def test_unregistered_reviewer_cannot_submit_result(self) -> None:
+        task, dispatch = self._seed_strict_dispatch()
+        self._register_reviewer("reviewer-spec", "spec")
+        self._register_reviewer("reviewer-quality", "quality")
+        rr = self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+            assignments={"spec": "reviewer-spec", "quality": "reviewer-quality"},
+        )
+        os.environ["GWO_AGENT_ID"] = "reviewer-unregistered"
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
+            self.store.submit_review_result(
+                round_id=rr["round_id"], axis="spec", verdict="approved"
+            )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertIn("registered", str(ctx.exception).lower())
+
+    def test_archived_reviewer_cannot_submit_result(self) -> None:
+        task, dispatch = self._seed_strict_dispatch()
+        self._register_reviewer("reviewer-archived", "spec")
+        self._register_reviewer("reviewer-quality", "quality")
+        rr = self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+            assignments={"spec": "reviewer-archived", "quality": "reviewer-quality"},
+        )
+        self.store.db.execute(
+            "UPDATE agents SET archived_at = ? WHERE agent_id = ?",
+            (time.time(), "reviewer-archived"),
+        )
+        os.environ["GWO_AGENT_ID"] = "reviewer-archived"
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
+            self.store.submit_review_result(
+                round_id=rr["round_id"], axis="spec", verdict="approved"
+            )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertIn("archived", str(ctx.exception).lower())
+
+    def test_reviewer_without_axis_assignment_rejected(self) -> None:
+        task, dispatch = self._seed_strict_dispatch()
+        self._register_reviewer("reviewer-spec", "spec")
+        self._register_reviewer("reviewer-quality", "quality")
+        rr = self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+            assignments={"spec": "reviewer-spec", "quality": "reviewer-quality"},
+        )
+        self.store.register_agent(
+            agent_id="reviewer-unassigned",
+            adapter="paseo",
+            runtime_ref="ref-unassigned",
+            role="reviewer",
+            group_label="g-37",
+        )
+        os.environ["GWO_AGENT_ID"] = "reviewer-unassigned"
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
+            self.store.submit_review_result(
+                round_id=rr["round_id"], axis="spec", verdict="approved"
+            )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertIn("assigned", str(ctx.exception).lower())
+
+
+class ReviewRoundUniquenessTests(unittest.TestCase):
+    """Issue #37: round numbers are unique per dispatch; delta lineage is a
+    single superseding chain; stale/forked/same-candidate/superseded evidence is
+    rejected.
+    """
+
+    def setUp(self) -> None:
+        os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        self.fixture = StoreFixture(self)
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _seed_dispatch(self, issue: int = 37):
+        task = self.store.create_task(issue=issue, group_label=f"g-{issue}", risk="strict")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        dispatch = self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id=f"worker-{issue}",
+            worktree=f"/tmp/wt-{issue}",
+            branch=f"work/issue-{issue}",
+        )
+        return task, dispatch
+
+    def _strict_assignments(self, issue: int = 37):
+        return {
+            "spec": f"reviewer-{issue}-spec",
+            "quality": f"reviewer-{issue}-quality",
+        }
+
+    def _register_strict_reviewers(self, issue: int = 37):
+        for axis, agent_id in self._strict_assignments(issue).items():
+            self.store.register_agent(
+                agent_id=agent_id,
+                adapter="paseo",
+                runtime_ref=f"ref-{agent_id}",
+                role="reviewer",
+                group_label=f"g-{issue}",
+            )
+
+    def test_duplicate_round_one_rejected(self) -> None:
+        task, dispatch = self._seed_dispatch()
+        self._register_strict_reviewers()
+        self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+            assignments=self._strict_assignments(),
+        )
+        with self.assertRaises(self.store_mod.TransitionError) as ctx:
+            self.store.issue_review_round(
+                dispatch_id=dispatch["dispatch_id"],
+                round=1,
+                candidate_sha="e" * 40,
+                base_sha="f" * 40,
+                diff_digest="1" * 64,
+                acceptance_digest="2" * 64,
+                scope="full",
+                assignments=self._strict_assignments(),
+            )
+        self.assertIn("round", str(ctx.exception).lower())
+
+    def test_delta_round_requires_prior_plus_one(self) -> None:
+        task, dispatch = self._seed_dispatch()
+        self._register_strict_reviewers()
+        first = self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+            assignments=self._strict_assignments(),
+        )
+        with self.assertRaises(self.store_mod.TransitionError) as ctx:
+            self.store.issue_review_round(
+                dispatch_id=dispatch["dispatch_id"],
+                round=3,
+                candidate_sha="e" * 40,
+                base_sha="f" * 40,
+                diff_digest="1" * 64,
+                acceptance_digest="2" * 64,
+                scope="delta",
+                prior_round_id=first["round_id"],
+                assignments=self._strict_assignments(),
+            )
+        self.assertIn("round", str(ctx.exception).lower())
+
+    def test_delta_round_requires_different_candidate(self) -> None:
+        task, dispatch = self._seed_dispatch()
+        self._register_strict_reviewers()
+        first = self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+            assignments=self._strict_assignments(),
+        )
+        with self.assertRaises(self.store_mod.TransitionError) as ctx:
+            self.store.issue_review_round(
+                dispatch_id=dispatch["dispatch_id"],
+                round=2,
+                candidate_sha="a" * 40,
+                base_sha="f" * 40,
+                diff_digest="1" * 64,
+                acceptance_digest="2" * 64,
+                scope="delta",
+                prior_round_id=first["round_id"],
+                assignments=self._strict_assignments(),
+            )
+        self.assertIn("candidate", str(ctx.exception).lower())
+
+    def test_stale_round_result_rejected(self) -> None:
+        task, dispatch = self._seed_dispatch()
+        self._register_strict_reviewers()
+        first = self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+            assignments=self._strict_assignments(),
+        )
+        self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=2,
+            candidate_sha="e" * 40,
+            base_sha="f" * 40,
+            diff_digest="1" * 64,
+            acceptance_digest="2" * 64,
+            scope="delta",
+            prior_round_id=first["round_id"],
+            assignments=self._strict_assignments(),
+        )
+        os.environ["GWO_AGENT_ID"] = "reviewer-37-spec"
+        with self.assertRaises(self.store_mod.TransitionError) as ctx:
+            self.store.submit_review_result(
+                round_id=first["round_id"], axis="spec", verdict="approved"
+            )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertIn("stale", str(ctx.exception).lower())
+
+
+class ReviewGateTests(unittest.TestCase):
+    """Issue #37: review gate accepts only the latest round at the current
+    candidate and fails closed for incomplete or rejected evidence.
+    """
+
+    def setUp(self) -> None:
+        os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        self.fixture = StoreFixture(self)
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _seed_standard_dispatch(self):
+        task = self.store.create_task(issue=37, group_label="g-37", risk="standard")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        dispatch = self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-37",
+            worktree="/tmp/wt-37",
+            branch="work/issue-37",
+        )
+        return task, dispatch
+
+    def _seed_strict_dispatch(self):
+        task = self.store.create_task(issue=37, group_label="g-37", risk="strict")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        dispatch = self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-37",
+            worktree="/tmp/wt-37",
+            branch="work/issue-37",
+        )
+        return task, dispatch
+
+    def _register_and_assign(self, agent_id: str, axis: str):
+        self.store.register_agent(
+            agent_id=agent_id,
+            adapter="paseo",
+            runtime_ref=f"ref-{agent_id}",
+            role="reviewer",
+            group_label="g-37",
+        )
+        return agent_id
+
+    def test_gate_has_check_review(self) -> None:
+        self.assertTrue(hasattr(self.store, "check_review_gate"))
+
+    def test_standard_gate_approved_after_combined(self) -> None:
+        task, dispatch = self._seed_standard_dispatch()
+        self._register_and_assign("reviewer-c", "combined")
+        rr = self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+            assignments={"combined": "reviewer-c"},
+        )
+        os.environ["GWO_AGENT_ID"] = "reviewer-c"
+        self.store.submit_review_result(
+            round_id=rr["round_id"], axis="combined", verdict="approved"
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        gate = self.store.check_review_gate(
+            dispatch_id=dispatch["dispatch_id"], candidate_sha="a" * 40
+        )
+        self.assertTrue(gate["approved"])
+
+    def test_standard_gate_rejected_fails_closed(self) -> None:
+        task, dispatch = self._seed_standard_dispatch()
+        self._register_and_assign("reviewer-c", "combined")
+        rr = self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+            assignments={"combined": "reviewer-c"},
+        )
+        os.environ["GWO_AGENT_ID"] = "reviewer-c"
+        self.store.submit_review_result(
+            round_id=rr["round_id"], axis="combined", verdict="rejected"
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        gate = self.store.check_review_gate(
+            dispatch_id=dispatch["dispatch_id"], candidate_sha="a" * 40
+        )
+        self.assertFalse(gate["approved"])
+
+    def test_strict_gate_requires_two_distinct_agents(self) -> None:
+        task, dispatch = self._seed_strict_dispatch()
+        self._register_and_assign("reviewer-spec", "spec")
+        self._register_and_assign("reviewer-quality", "quality")
+        rr = self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+            assignments={"spec": "reviewer-spec", "quality": "reviewer-quality"},
+        )
+        os.environ["GWO_AGENT_ID"] = "reviewer-spec"
+        self.store.submit_review_result(
+            round_id=rr["round_id"], axis="spec", verdict="approved"
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        # Only one axis approved: gate must not open.
+        gate = self.store.check_review_gate(
+            dispatch_id=dispatch["dispatch_id"], candidate_sha="a" * 40
+        )
+        self.assertFalse(gate["approved"])
+
+    def test_strict_gate_opens_with_two_distinct_agents(self) -> None:
+        task, dispatch = self._seed_strict_dispatch()
+        self._register_and_assign("reviewer-spec", "spec")
+        self._register_and_assign("reviewer-quality", "quality")
+        rr = self.store.issue_review_round(
+            dispatch_id=dispatch["dispatch_id"],
+            round=1,
+            candidate_sha="a" * 40,
+            base_sha="b" * 40,
+            diff_digest="c" * 64,
+            acceptance_digest="d" * 64,
+            scope="full",
+            assignments={"spec": "reviewer-spec", "quality": "reviewer-quality"},
+        )
+        os.environ["GWO_AGENT_ID"] = "reviewer-spec"
+        self.store.submit_review_result(
+            round_id=rr["round_id"], axis="spec", verdict="approved"
+        )
+        os.environ["GWO_AGENT_ID"] = "reviewer-quality"
+        self.store.submit_review_result(
+            round_id=rr["round_id"], axis="quality", verdict="approved"
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        gate = self.store.check_review_gate(
+            dispatch_id=dispatch["dispatch_id"], candidate_sha="a" * 40
+        )
+        self.assertTrue(gate["approved"])
+
+    def test_same_agent_dual_axes_strict_rejected(self) -> None:
+        task, dispatch = self._seed_strict_dispatch()
+        self._register_and_assign("reviewer-both", "spec")
+        self._register_and_assign("reviewer-both", "quality")
+        with self.assertRaises(self.store_mod.TransitionError) as ctx:
+            self.store.issue_review_round(
+                dispatch_id=dispatch["dispatch_id"],
+                round=1,
+                candidate_sha="a" * 40,
+                base_sha="b" * 40,
+                diff_digest="c" * 64,
+                acceptance_digest="d" * 64,
+                scope="full",
+                assignments={"spec": "reviewer-both", "quality": "reviewer-both"},
+            )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        self.assertIn("different reviewers", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":

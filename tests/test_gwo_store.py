@@ -45,8 +45,11 @@ class StoreFixture:
             "GWO_HOME": os.environ.get("GWO_HOME"),
             "GWO_AGENT_ID": os.environ.get("GWO_AGENT_ID"),
         }
+        self._saved_path = list(sys.path)
         os.environ["GWO_HOME"] = str(self.home)
         os.environ["GWO_AGENT_ID"] = "coordinator-001"
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
         self.store_mod = load_store()
         self.repo = repo
         self.store = self.store_mod.Store.connect(
@@ -58,6 +61,7 @@ class StoreFixture:
     def cleanup(self) -> None:
         self.store.close()
         self.tmp.cleanup()
+        sys.path[:] = self._saved_path
         for key, value in self._saved_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -1227,7 +1231,13 @@ class MigrationSafetyTests(unittest.TestCase):
             ).fetchall()
         ]
         self.assertEqual(
-            ["0001-initial", "0002-messages-in-reply-to", "0003-tasks-repo-issue-unique", "0004-review-rounds-and-lease"],
+            [
+                "0001-initial",
+                "0002-messages-in-reply-to",
+                "0003-tasks-repo-issue-unique",
+                "0004-review-rounds-and-lease",
+                "0005-review-authority-and-chain-integrity",
+            ],
             migrations,
         )
         tables = set(self.store.table_names())
@@ -1235,6 +1245,7 @@ class MigrationSafetyTests(unittest.TestCase):
             self._phase2_tables().issubset(tables),
             "fresh store must contain Phase 2 tables"
         )
+        self.assertIn("review_assignments", tables)
 
     def test_failed_phase2_migration_rolls_back_no_partial_record(self) -> None:
         store_mod = self.store_mod
@@ -1258,7 +1269,7 @@ class MigrationSafetyTests(unittest.TestCase):
             raw.commit()
         finally:
             raw.close()
-        broken_migrations = original_migrations[:-1] + (
+        broken_migrations = original_migrations[:3] + (
             (
                 "0004-review-rounds-and-lease",
                 "CREATE TABLE IF NOT EXISTS review_rounds (id INTEGER PRIMARY KEY); "
@@ -1794,6 +1805,144 @@ class MigrationStatementParserTests(unittest.TestCase):
             )
         finally:
             store_mod.MIGRATIONS = original_migrations
+
+
+class Migration0005Tests(unittest.TestCase):
+    """Issue #37: migration 0005 adds review authority, round tail, and
+    chain-integrity schema. Pre-existing malformed 0004/0005 schema must roll
+    back atomically without a schema_migrations success record.
+    """
+
+    def setUp(self) -> None:
+        self.fixture = StoreFixture(self, repo="owner/repo")
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _fresh_applied(self) -> set[str]:
+        return {
+            str(row[0])
+            for row in self.store.db.execute("SELECT name FROM schema_migrations").fetchall()
+        }
+
+    def test_fresh_store_applies_migrations_in_order_including_0005(self) -> None:
+        migrations = [
+            str(row[0])
+            for row in self.store.db.execute(
+                "SELECT name FROM schema_migrations ORDER BY rowid"
+            ).fetchall()
+        ]
+        self.assertEqual(
+            [
+                "0001-initial",
+                "0002-messages-in-reply-to",
+                "0003-tasks-repo-issue-unique",
+                "0004-review-rounds-and-lease",
+                "0005-review-authority-and-chain-integrity",
+            ],
+            migrations,
+        )
+
+    def test_0005_adds_review_assignments_table(self) -> None:
+        tables = set(self.store.table_names())
+        self.assertIn("review_assignments", tables)
+
+    def test_0005_adds_integration_chain_position_columns(self) -> None:
+        columns = {
+            str(row[1])
+            for row in self.store.db.execute(
+                "PRAGMA table_info(integration_chain)"
+            ).fetchall()
+        }
+        self.assertIn("position", columns)
+        self.assertIn("head", columns)
+
+    def test_0005_adds_review_rounds_tail_and_axis_columns(self) -> None:
+        columns = {
+            str(row[1])
+            for row in self.store.db.execute(
+                "PRAGMA table_info(review_rounds)"
+            ).fetchall()
+        }
+        self.assertIn("is_current", columns)
+        self.assertIn("assigned_axis", columns)
+
+    def _build_pre_0005_store(self) -> None:
+        """Wipe the fixture database and apply only migrations 0001-0004."""
+        store_mod = self.store_mod
+        self.store.close()
+        slug = store_mod._repo_slug("owner/repo")
+        db_path = str(self.fixture.home / slug / "state.db")
+        raw = sqlite3.connect(db_path)
+        try:
+            raw.execute("PRAGMA foreign_keys=OFF")
+            master = raw.execute(
+                "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') "
+                "AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            for kind, name in master:
+                raw.execute(f"DROP {kind} IF EXISTS {name}")
+            raw.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY)"
+            )
+            raw.execute("BEGIN IMMEDIATE")
+            for name, ddl in store_mod.MIGRATIONS:
+                if name in {
+                    "0001-initial",
+                    "0002-messages-in-reply-to",
+                    "0003-tasks-repo-issue-unique",
+                    "0004-review-rounds-and-lease",
+                }:
+                    for statement in store_mod._split_sql_statements(ddl):
+                        raw.execute(statement)
+                    raw.execute(
+                        "INSERT OR REPLACE INTO schema_migrations (name) VALUES (?)", (name,)
+                    )
+            raw.execute("COMMIT")
+        finally:
+            raw.close()
+
+    def test_0005_malformed_schema_rolls_back_without_record(self) -> None:
+        """A legacy store whose 0004/0005 shape is wrong must roll back and not
+        record 0005 as applied.
+        """
+        store_mod = self.store_mod
+        self._build_pre_0005_store()
+        # Add a wrong-shape column that conflicts with 0005's expected DDL.
+        slug = store_mod._repo_slug("owner/repo")
+        db_path = str(self.fixture.home / slug / "state.db")
+        raw = sqlite3.connect(db_path)
+        raw.isolation_level = None
+        try:
+            raw.execute(
+                "ALTER TABLE review_rounds ADD COLUMN is_current INTEGER NOT NULL DEFAULT 0"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        with self.assertRaises((sqlite3.OperationalError, store_mod.StoreError)):
+            store_mod.Store.connect(
+                self.fixture.home, "owner/repo", caller_agent_id="coordinator-001"
+            )
+        raw = sqlite3.connect(db_path)
+        raw.isolation_level = None
+        try:
+            migrations = {
+                str(row[0])
+                for row in raw.execute("SELECT name FROM schema_migrations").fetchall()
+            }
+            self.assertNotIn("0005-review-authority-and-chain-integrity", migrations)
+            tables = {
+                str(row[1])
+                for row in raw.execute(
+                    "SELECT type, name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            self.assertNotIn("review_assignments", tables)
+        finally:
+            raw.close()
 
 
 if __name__ == "__main__":

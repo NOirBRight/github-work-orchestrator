@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -124,13 +126,13 @@ class LeaseStoreTests(unittest.TestCase):
             self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
         self.assertIn("coordinator-001", str(ctx.exception))
 
-    def test_release_requires_holder(self) -> None:
+    def test_release_requires_coordinator_claim(self) -> None:
         self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
         os.environ["GWO_AGENT_ID"] = "integrator-002"
-        with self.assertRaises(self.store_mod.TransitionError) as ctx:
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
             self.store.release_integration_lease(scope="repo:owner/repo:integration")
         os.environ["GWO_AGENT_ID"] = "coordinator-001"
-        self.assertIn("holder", str(ctx.exception).lower())
+        self.assertIn("coordinator", str(ctx.exception).lower())
 
     def test_release_then_reacquire(self) -> None:
         self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
@@ -203,13 +205,32 @@ class LeaseSerialChainTests(unittest.TestCase):
             )
         self.assertIn("lease", str(ctx.exception).lower())
 
+    def _seed_chain_task(self, issue: int):
+        task = self.store.create_task(issue=issue, group_label=f"g-{issue}", risk="fast")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        dispatch = self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id=f"worker-{issue}",
+            worktree=f"/tmp/wt-{issue}",
+            branch=f"work/issue-{issue}",
+        )
+        return task, dispatch
+
     def test_chain_appends_serially(self) -> None:
+        task1, _ = self._seed_chain_task(24)
+        task2, _ = self._seed_chain_task(25)
         self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
         first = self.store.append_integration_chain(
-            scope="repo:owner/repo:integration", candidate_sha="a" * 40, task_id="t-24"
+            scope="repo:owner/repo:integration",
+            candidate_sha="a" * 40,
+            task_id=task1["task_id"],
+            tier="fast",
         )
         second = self.store.append_integration_chain(
-            scope="repo:owner/repo:integration", candidate_sha="b" * 40, task_id="t-25"
+            scope="repo:owner/repo:integration",
+            candidate_sha="b" * 40,
+            task_id=task2["task_id"],
+            tier="fast",
         )
         chain = self.store.list_integration_chain(scope="repo:owner/repo:integration")
         self.assertEqual(["a" * 40, "b" * 40], [c["candidate_sha"] for c in chain])
@@ -230,7 +251,6 @@ class LeaseCliTests(unittest.TestCase):
         self.assertIn("lease", help_result.stdout)
 
     def test_lease_acquire_serializes(self) -> None:
-        os.environ["GWO_AGENT_ID"] = "integrator-001"
         result = self.fixture.run(
             "lease", "acquire",
             "--scope", "repo:owner/repo:integration",
@@ -239,25 +259,23 @@ class LeaseCliTests(unittest.TestCase):
         import json
         payload = json.loads(result.stdout)
         self.assertEqual("repo:owner/repo:integration", payload["scope"])
-        self.assertEqual("integrator-001", payload["holder_agent"])
+        self.assertEqual("coordinator-001", payload["holder_agent"])
 
     def test_lease_second_acquire_rejected(self) -> None:
-        os.environ["GWO_AGENT_ID"] = "integrator-001"
         self.fixture.run(
             "lease", "acquire",
             "--scope", "repo:owner/repo:integration",
         )
-        os.environ["GWO_AGENT_ID"] = "integrator-002"
+        # Second acquire by the same coordinator is rejected because the lease
+        # is already held.
         result = self.fixture.run(
             "lease", "acquire",
             "--scope", "repo:owner/repo:integration",
         )
-        os.environ["GWO_AGENT_ID"] = "coordinator-001"
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("integrator-001", result.stderr)
+        self.assertIn("coordinator-001", result.stderr)
 
-    def test_lease_release_by_non_holder_rejected(self) -> None:
-        os.environ["GWO_AGENT_ID"] = "integrator-001"
+    def test_lease_release_by_non_coordinator_rejected(self) -> None:
         self.fixture.run(
             "lease", "acquire",
             "--scope", "repo:owner/repo:integration",
@@ -269,7 +287,189 @@ class LeaseCliTests(unittest.TestCase):
         )
         os.environ["GWO_AGENT_ID"] = "coordinator-001"
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("holder", result.stderr.lower())
+        self.assertIn("coordinator", result.stderr.lower())
+
+
+class LeaseScopeTests(unittest.TestCase):
+    """Issue #37: Integration Lease scope is derived as repo:<Store.repo>:integration
+    and both acquire and release require an active Coordinator claim.
+    """
+
+    def setUp(self) -> None:
+        os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        self.fixture = StoreFixture(self)
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_lease_acquire_requires_coordinator_claim(self) -> None:
+        self.store.release_coordinator()
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
+            self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
+        self.assertIn("coordinator", str(ctx.exception).lower())
+
+    def test_lease_acquire_rejects_foreign_repository_scope(self) -> None:
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
+            self.store.acquire_integration_lease(scope="repo:other/repo:integration")
+        self.assertIn("scope", str(ctx.exception).lower())
+
+    def test_lease_release_requires_coordinator_claim(self) -> None:
+        self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
+        self.store.release_coordinator()
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
+            self.store.release_integration_lease(scope="repo:owner/repo:integration")
+        self.assertIn("coordinator", str(ctx.exception).lower())
+
+    def test_unregistered_foreign_scope_lease_rejected(self) -> None:
+        """A caller without active Coordinator claim cannot acquire a lease even
+        with a syntactically valid foreign repository scope.
+        """
+        os.environ["GWO_AGENT_ID"] = "integrator-foreign"
+        foreign = self.store_mod.Store.connect(
+            self.fixture.home, self.fixture.repo
+        )
+        try:
+            with self.assertRaises(self.store_mod.IdentityError) as ctx:
+                foreign.acquire_integration_lease(scope="repo:owner/repo:integration")
+            self.assertIn("coordinator", str(ctx.exception).lower())
+        finally:
+            foreign.close()
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
+
+
+class LeaseChainAppendRaceTests(unittest.TestCase):
+    """Issue #37: integration chain append races must fail closed and maintain a
+    unique position-based serial chain.
+    """
+
+    def setUp(self) -> None:
+        os.environ["PYTHONPATH"] = str(SCRIPT_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        self.fixture = StoreFixture(self)
+        self.store = self.fixture.store
+        self.store_mod = self.fixture.store_mod
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _seed_task(self):
+        task = self.store.create_task(issue=37, group_label="g-37", risk="fast")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        dispatch = self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id="worker-37",
+            worktree="/tmp/wt-37",
+            branch="work/issue-37",
+        )
+        return task, dispatch
+
+    def test_chain_append_requires_active_lease(self) -> None:
+        task, _ = self._seed_task()
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
+            self.store.append_integration_chain(
+                scope="repo:owner/repo:integration",
+                candidate_sha="a" * 40,
+                task_id=task["task_id"],
+            )
+        self.assertIn("lease", str(ctx.exception).lower())
+
+    def test_chain_append_rejects_release_versus_append_race(self) -> None:
+        """If the lease is released concurrently, append must fail closed."""
+        task, _ = self._seed_task()
+        self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
+        self.store.release_integration_lease(scope="repo:owner/repo:integration")
+        with self.assertRaises(self.store_mod.IdentityError) as ctx:
+            self.store.append_integration_chain(
+                scope="repo:owner/repo:integration",
+                candidate_sha="a" * 40,
+                task_id=task["task_id"],
+            )
+        self.assertIn("lease", str(ctx.exception).lower())
+
+    def test_chain_positions_are_monotonic_and_unique(self) -> None:
+        task1, _ = self._seed_task()
+        task2 = self.store.create_task(issue=38, group_label="g-38", risk="fast")
+        self.store.update_task(task_id=task2["task_id"], status="ready")
+        self.store.create_dispatch(
+            task_id=task2["task_id"],
+            agent_id="worker-38",
+            worktree="/tmp/wt-38",
+            branch="work/issue-38",
+        )
+        self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
+        first = self.store.append_integration_chain(
+            scope="repo:owner/repo:integration",
+            candidate_sha="a" * 40,
+            task_id=task1["task_id"],
+            tier="fast",
+        )
+        second = self.store.append_integration_chain(
+            scope="repo:owner/repo:integration",
+            candidate_sha="b" * 40,
+            task_id=task2["task_id"],
+            tier="fast",
+        )
+        self.assertGreater(second["position"], first["position"])
+        chain = self.store.list_integration_chain(scope="repo:owner/repo:integration")
+        positions = [c["position"] for c in chain]
+        self.assertEqual(len(positions), len(set(positions)))
+        self.assertEqual(first["chain_id"], second["prior_chain_id"])
+
+    def test_chain_position_unique_under_preinserted_node(self) -> None:
+        """A pre-inserted chain node must not corrupt the monotonic position
+        sequence. The store append must compute the next position locally and
+        the unique(scope, position) index must reject duplicate positions if
+        a race occurs.
+        """
+        task1, _ = self._seed_task()
+        task2, _ = self._seed_task_with_issue(39)
+        self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
+        slug = self.store_mod._repo_slug("owner/repo")
+        db_path = str(self.fixture.home / slug / "state.db")
+        raw = sqlite3.connect(db_path)
+        raw.isolation_level = None
+        try:
+            # Simulate an external writer that already inserted a node at
+            # position 1 (e.g., a recovery or manual repair). The store must
+            # continue with position 2 and the unique index must prevent a
+            # duplicate position race.
+            raw.execute("BEGIN IMMEDIATE")
+            raw.execute(
+                "INSERT INTO integration_chain (chain_id, scope, candidate_sha, task_id, position, head, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("chain-racer", "repo:owner/repo:integration", "z" * 40, task1["task_id"], 1, "chain-racer", 0.0),
+            )
+            raw.execute("COMMIT")
+            first = self.store.append_integration_chain(
+                scope="repo:owner/repo:integration",
+                candidate_sha="a" * 40,
+                task_id=task2["task_id"],
+                tier="fast",
+            )
+            self.assertEqual(2, first["position"])
+            # Direct duplicate position insert must fail.
+            with self.assertRaises(sqlite3.IntegrityError):
+                raw.execute("BEGIN IMMEDIATE")
+                raw.execute(
+                    "INSERT INTO integration_chain (chain_id, scope, candidate_sha, task_id, position, head, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("chain-dup", "repo:owner/repo:integration", "y" * 40, task2["task_id"], 2, "chain-dup", 0.0),
+                )
+                raw.execute("COMMIT")
+        finally:
+            raw.close()
+
+    def _seed_task_with_issue(self, issue: int):
+        task = self.store.create_task(issue=issue, group_label=f"g-{issue}", risk="fast")
+        self.store.update_task(task_id=task["task_id"], status="ready")
+        dispatch = self.store.create_dispatch(
+            task_id=task["task_id"],
+            agent_id=f"worker-{issue}",
+            worktree=f"/tmp/wt-{issue}",
+            branch=f"work/issue-{issue}",
+        )
+        return task, dispatch
 
 
 if __name__ == "__main__":
