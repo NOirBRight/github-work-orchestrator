@@ -205,7 +205,7 @@ class LeaseSerialChainTests(unittest.TestCase):
             )
         self.assertIn("lease", str(ctx.exception).lower())
 
-    def _seed_chain_task(self, issue: int):
+    def _seed_chain_task(self, issue: int, candidate_sha: str):
         task = self.store.create_task(issue=issue, group_label=f"g-{issue}", risk="fast")
         self.store.update_task(task_id=task["task_id"], status="ready")
         dispatch = self.store.create_dispatch(
@@ -214,11 +214,19 @@ class LeaseSerialChainTests(unittest.TestCase):
             worktree=f"/tmp/wt-{issue}",
             branch=f"work/issue-{issue}",
         )
+        os.environ["GWO_AGENT_ID"] = f"worker-{issue}"
+        self.store.mark_done(
+            task_id=task["task_id"],
+            dispatch_id=dispatch["dispatch_id"],
+            status="done",
+            evidence={"candidate_sha": candidate_sha},
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
         return task, dispatch
 
     def test_chain_appends_serially(self) -> None:
-        task1, _ = self._seed_chain_task(24)
-        task2, _ = self._seed_chain_task(25)
+        task1, _ = self._seed_chain_task(24, "a" * 40)
+        task2, _ = self._seed_chain_task(25, "b" * 40)
         self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
         first = self.store.append_integration_chain(
             scope="repo:owner/repo:integration",
@@ -353,7 +361,7 @@ class LeaseChainAppendRaceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.fixture.cleanup()
 
-    def _seed_task(self):
+    def _seed_task(self, candidate_sha: str = "a" * 40):
         task = self.store.create_task(issue=37, group_label="g-37", risk="fast")
         self.store.update_task(task_id=task["task_id"], status="ready")
         dispatch = self.store.create_dispatch(
@@ -362,6 +370,14 @@ class LeaseChainAppendRaceTests(unittest.TestCase):
             worktree="/tmp/wt-37",
             branch="work/issue-37",
         )
+        os.environ["GWO_AGENT_ID"] = "worker-37"
+        self.store.mark_done(
+            task_id=task["task_id"],
+            dispatch_id=dispatch["dispatch_id"],
+            status="done",
+            evidence={"candidate_sha": candidate_sha},
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
         return task, dispatch
 
     def test_chain_append_requires_active_lease(self) -> None:
@@ -384,19 +400,54 @@ class LeaseChainAppendRaceTests(unittest.TestCase):
                 scope="repo:owner/repo:integration",
                 candidate_sha="a" * 40,
                 task_id=task["task_id"],
-            )
+        )
         self.assertIn("lease", str(ctx.exception).lower())
 
+    def test_fast_chain_append_accepts_done_candidate_evidence(self) -> None:
+        """Integration follows worker completion. A fast-tier append must bind
+        the coordinator-inline tier to the candidate recorded by done evidence.
+        """
+        candidate = "a" * 40
+        task, _ = self._seed_task(candidate)
+        self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
+        node = self.store.append_integration_chain(
+            scope="repo:owner/repo:integration",
+            candidate_sha=candidate,
+            task_id=task["task_id"],
+            tier="fast",
+        )
+        self.assertEqual(candidate, node["candidate_sha"])
+
+    def test_fast_chain_append_rejects_done_candidate_mismatch(self) -> None:
+        task, _ = self._seed_task("a" * 40)
+        self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
+        with self.assertRaises(self.store_mod.TransitionError) as ctx:
+            self.store.append_integration_chain(
+                scope="repo:owner/repo:integration",
+                candidate_sha="b" * 40,
+                task_id=task["task_id"],
+                tier="fast",
+            )
+        self.assertIn("candidate", str(ctx.exception).lower())
+
     def test_chain_positions_are_monotonic_and_unique(self) -> None:
-        task1, _ = self._seed_task()
+        task1, _ = self._seed_task("a" * 40)
         task2 = self.store.create_task(issue=38, group_label="g-38", risk="fast")
         self.store.update_task(task_id=task2["task_id"], status="ready")
-        self.store.create_dispatch(
+        dispatch2 = self.store.create_dispatch(
             task_id=task2["task_id"],
             agent_id="worker-38",
             worktree="/tmp/wt-38",
             branch="work/issue-38",
         )
+        os.environ["GWO_AGENT_ID"] = "worker-38"
+        self.store.mark_done(
+            task_id=task2["task_id"],
+            dispatch_id=dispatch2["dispatch_id"],
+            status="done",
+            evidence={"candidate_sha": "b" * 40},
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
         self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
         first = self.store.append_integration_chain(
             scope="repo:owner/repo:integration",
@@ -422,8 +473,8 @@ class LeaseChainAppendRaceTests(unittest.TestCase):
         the unique(scope, position) index must reject duplicate positions if
         a race occurs.
         """
-        task1, _ = self._seed_task()
-        task2, _ = self._seed_task_with_issue(39)
+        task1, _ = self._seed_task("z" * 40)
+        task2, _ = self._seed_task_with_issue(39, "a" * 40)
         self.store.acquire_integration_lease(scope="repo:owner/repo:integration")
         slug = self.store_mod._repo_slug("owner/repo")
         db_path = str(self.fixture.home / slug / "state.db")
@@ -460,7 +511,7 @@ class LeaseChainAppendRaceTests(unittest.TestCase):
         finally:
             raw.close()
 
-    def _seed_task_with_issue(self, issue: int):
+    def _seed_task_with_issue(self, issue: int, candidate_sha: str):
         task = self.store.create_task(issue=issue, group_label=f"g-{issue}", risk="fast")
         self.store.update_task(task_id=task["task_id"], status="ready")
         dispatch = self.store.create_dispatch(
@@ -469,6 +520,14 @@ class LeaseChainAppendRaceTests(unittest.TestCase):
             worktree=f"/tmp/wt-{issue}",
             branch=f"work/issue-{issue}",
         )
+        os.environ["GWO_AGENT_ID"] = f"worker-{issue}"
+        self.store.mark_done(
+            task_id=task["task_id"],
+            dispatch_id=dispatch["dispatch_id"],
+            status="done",
+            evidence={"candidate_sha": candidate_sha},
+        )
+        os.environ["GWO_AGENT_ID"] = "coordinator-001"
         return task, dispatch
 
 

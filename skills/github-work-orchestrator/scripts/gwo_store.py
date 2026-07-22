@@ -1898,15 +1898,29 @@ class Store:
                     f"integration tier {tier} does not match task risk {task_row['risk']}"
                 )
 
-            # Dispatch check: the supplied task must have an active dispatch with
-            # the same candidate SHA.
+            # Integration follows a completed Worker lifecycle. Bind the append
+            # to the terminal candidate evidence instead of accepting a still
+            # active dispatch, which would permit integration before done.
             dispatch_row = self.db.execute(
-                "SELECT dispatch_id FROM dispatches "
-                "WHERE task_id = ? AND status = 'active'",
+                "SELECT dispatch_id, terminal_evidence_json FROM dispatches "
+                "WHERE task_id = ? AND status = 'done'",
                 (task_id,),
             ).fetchone()
             if dispatch_row is None:
-                raise TransitionError(f"no active dispatch for task {task_id}")
+                raise TransitionError(f"no completed dispatch for task {task_id}")
+            try:
+                terminal_evidence = json.loads(dispatch_row["terminal_evidence_json"] or "{}")
+            except (TypeError, json.JSONDecodeError) as error:
+                raise TransitionError(
+                    f"completed dispatch for task {task_id} has malformed candidate evidence"
+                ) from error
+            if (
+                not isinstance(terminal_evidence, dict)
+                or terminal_evidence.get("candidate_sha") != candidate_sha
+            ):
+                raise TransitionError(
+                    f"completed dispatch candidate does not match {candidate_sha}"
+                )
 
             # Candidate check: the active dispatch must be at the supplied SHA.
             # For the V7 store we validate by comparing against the current review
