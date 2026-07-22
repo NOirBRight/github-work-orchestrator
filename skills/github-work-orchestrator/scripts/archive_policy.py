@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""GWO-internal, provider-neutral cleanup authorization helpers."""
+"""GWO-internal, provider-neutral cleanup authorization helpers.
+
+schema_version: 2. Uses existing Paseo operations to read back state, never to
+authorize cleanup by themselves."""
 
 from __future__ import annotations
 

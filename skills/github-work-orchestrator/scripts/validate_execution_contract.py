@@ -40,6 +40,7 @@ REQUIRED_TEXT = (
     "done_when",
 )
 PASEO_REQUIRED_TEXT = (
+    "group_label",
     "campaign_id",
     "dispatch_id",
     "agent_role",

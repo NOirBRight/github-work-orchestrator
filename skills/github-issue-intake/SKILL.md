@@ -1,6 +1,6 @@
 ---
 name: github-issue-intake
-description: Turn reports, logs, screenshots, and rough ideas into deduplicated GitHub Issues with provider-neutral v3 Paseo execution contracts and one material campaign-room signal. Use for Issue intake, diagnosis, deduplication, or publication.
+description: Turn reports, logs, screenshots, and rough ideas into deduplicated GitHub Issues with provider-neutral v3 Paseo execution contracts. Report the result through the gwo kernel mailbox. Use for Issue intake, diagnosis, deduplication, or publication.
 ---
 
 # GitHub Issue Intake
@@ -31,14 +31,17 @@ the existing Issue owns the same outcome and scope; otherwise link related work.
 Re-read before writes and verify the final GitHub body, labels, dependencies,
 state, and URL after every create/update.
 
-## Report through the campaign room
+## Report through the gwo kernel mailbox
 
-When a campaign room is supplied, pass the packaged room preflight and post one
-material `COMPLETED`, `DISCUSSION_REQUIRED`, or `BLOCKED` event with validated
-Issue evidence through `paseo_room.py post-material` with `worker-dispatch`
-authority and the compiled identity receipts. Run the packaged
-`material_delivery.py`, wake only an idle Campaign
-with the returned signal-only token, record `DELIVERY_WAKE`, and wait for
-`DELIVERY_ACK`. Do not use mention, finish notification, Wake, or ACK as Issue
-proof. Without a room, return the same concise result to the caller; GitHub
-remains the durable record.
+When a Task Group label is supplied, post one material `COMPLETED`,
+`DISCUSSION_REQUIRED`, or `BLOCKED` event with validated Issue evidence through
+the gwo kernel:
+
+```text
+python <skill>/scripts/gwo.py send --to <coordinator> --type status --signal-id <id> --payload <json>
+```
+
+Use the payload fields from the v3 contract and the observed Issue URL/number.
+Do not use mention, finish notification, or a second room as Issue proof. Without
+a Coordinator, return the same concise result to the caller; GitHub remains the
+durable record.

@@ -52,6 +52,7 @@ def contract(**overrides):
         "base_sha": "a" * 40,
         "feature_branch": "work/issue-7-example",
         "pr_target": "dev",
+        "group_label": "issue-7",
         "campaign_id": "campaign-20260718",
         "dispatch_id": "dispatch-issue-7",
         "room": "gwo-campaign-20260718",

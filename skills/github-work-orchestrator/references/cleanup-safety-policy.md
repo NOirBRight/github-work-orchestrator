@@ -1,101 +1,39 @@
-# GWO cleanup safety policy
+# Cleanup safety policy
 
-GWO owns cleanup authorization. It evaluates observed Paseo/Git/worktree/room
-evidence and invokes existing Paseo operations. It is not a daemon adapter and
-requires no host, sidecar, supervisor service, or source modification.
+GWO owns cleanup authorization. Cleanup is staged and fail-closed. An adapter only executes a
+read-backed plan produced by `cleanup-plan` v4.3 with explicit `target_kind`
+and `resource_kind`.
 
-## Typed targets and resources
+## Protected targets
 
-`cleanup-plan` v4.3 keeps output `schema_version: 2` and requires explicit:
+Protected plans contain no actions. Never target the Coordinator, a
+root/sibling/foreign/detached Agent, Coordinator Home, Integration Control
+Worktree, a dirty/active/ambiguous resource, or `main`/`dev`.
 
-| Target | `target_kind` | `resource_kind` |
-|---|---|---|
-| Implementation/Intake/Monitor Worker | `worker` | `issue-worktree` |
-| Spec or Quality Reviewer | `worker` | `none` |
-| New Campaign | `campaign` | `campaign-control` |
-| Legacy v4.2 Campaign | `campaign` | `none` |
-| Probe/forward-test | `ephemeral` | `none` |
+## Cleanup order
 
-Do not infer these fields from role or path. Actor, target, execution, and
-terminal receipt carry exact matching repository/campaign/dispatch identity.
+Archive the Agent first, read back `archived + unbound`, then authorize
+worktree actions. For a Worker with an Issue worktree use
+`worker / issue-worktree`; for a Reviewer with no worktree use `worker / none`.
+Self-archive is forbidden; only a direct idle child may be archived. After all
+direct children are terminal and `TASK_GROUP_CLOSED` is durable, archive the
+Task Group label. There is no Campaign Agent or Campaign Control Workspace. Read
+back the removal of all worktree bindings before any resource action.
 
-## Agent phase
+## Probe cleanup
 
-An Agent may archive only its direct idle child. It cannot force, archive
-itself, a root/sibling/detached/foreign Agent, or a child with uncertain
-identity. A Campaign cleans its Workers and Reviewers. The Coordinator cleans a
-Campaign only after a repository/campaign-scoped direct-child enumeration is
-explicitly read back, all child Agent IDs are absent, and `CAMPAIGN_CLOSED` is
-read back. An omitted/default empty list is not proof. Root retirement is
-human-only after durable handoff.
+For forward tests: `ephemeral / none`, with lifecycle label
+`gwo.lifecycle=ephemeral` and captured result readback.
 
-Target type also fixes ownership: `worker` requires a Campaign actor and a
-Worker/Reviewer role; `campaign` requires the Repository Coordinator and an
-Orchestrator target; `ephemeral` permits only normal probe roles such as
-Monitor/Review/Implementation/Intake and never an Orchestrator. A lifecycle
-label cannot downgrade a Campaign into the ephemeral STOPPED path, and the
-Coordinator cannot bypass the Campaign to clean an ordinary Worker.
+## Evidence
 
-Stable denial codes remain represented by the GWO blockers derived from:
+`worker_done`, heartbeat, `review_result`, `DELIVERY_WAKE`, and `DELIVERY_ACK`
+are never terminal cleanup evidence. Only an explicit `branch_merged: true`
+GitHub/Git readback or durable terminal Agent state authorizes cleanup. The
+terminal cleanup evidence shape is `event=merged` with `branch_merged: true`;
+these events alone do not authorize completion.
 
-- `SELF_ARCHIVE_FORBIDDEN`
-- `ROOT_ARCHIVE_REQUIRES_SUPERVISOR`
-- `ARCHIVE_TARGET_NOT_DIRECT_CHILD`
-- `FORCE_REQUIRES_SUPERVISOR`
-- `AGENT_NOT_IDLE`
+## Failure mode
 
-`SUPERVISOR` names the existing human-authorized caller class; GWO does not add
-a supervisor component.
-
-## Resource phase
-
-Delegated cleanup is staged. The first eligible plan contains only the child
-Agent archive. Execute it, then read back archived Agent state and removal of
-all worktree bindings before a second plan may contain resource actions. Return
-`WORKTREE_IN_USE` for any remaining Agent binding and
-`CONTROL_WORKTREE_PROTECTED` for Coordinator Home, Integration Control, or the
-actor's own worktree.
-
-An Issue worktree must be absolute, clean, durable, uniquely owned, and on
-`work/issue-*`; `event=merged` also requires `branch_merged: true`.
-
-A new Campaign Control Workspace additionally requires:
-
-- every Worker and both Reviewers already cleaned;
-- archived Campaign Agent and no worktree binding;
-- local `gwo/campaign/<id>` branch;
-- exact read-backed worktree slug `campaign-<id>` bound to the same Campaign;
-- clean tracked state, zero unique commits, no push/PR; and
-- separate readbacks after Workspace archive and after local branch deletion.
-
-Never emit Campaign worktree archive and branch deletion in the same pass.
-Archive the Campaign Agent, read back unbound; archive the worktree, read back
-absence; only then delete the exact local control branch and read back absence.
-
-Legacy v4.2 Campaigns explicitly state `campaign_generation=legacy-v4.2`, a
-read-backed `campaign_control_expected: false`, and Agent-only cleanup. New
-Campaigns translate the read-backed `gwo.version=4.3` label to cleanup evidence
-`campaign_generation=v4.3` with control expected true; claiming
-`resource_kind=none` or mismatching generation/resource fails closed.
-
-Ephemeral Probe/forward-test cleanup uses a normal runtime role (usually
-`monitor`) plus `target_kind=ephemeral`; `ephemeral` is not an Agent role. It
-requires a direct idle child, read-backed absence of a worktree, a read-backed
-`gwo.lifecycle=ephemeral` label, exact STOPPED receipt, and result-captured
-readback.
-Provider-native timeline entries are outside GWO ownership and are never
-cleaned through this path.
-
-## Execution rule
-
-`cleanup_policy.py` owns the complete typed plan;
-`archive_policy.py` is its smaller pure Agent/worktree primitive. An eligible
-nonempty plan sets `automatic_execution: true`; execute exactly its ordered
-actions and read back every mutation. A protected plan sets false and returns
-no actions. Missing, contradictory, active, dirty, shared, or foreign evidence
-fails closed without partial actions.
-
-Only `COMPLETED`/`STOPPED` can retire Worker-like targets, and only
-`CAMPAIGN_CLOSED` can retire a Campaign. HEARTBEAT, CHECKPOINT, WORKER_DONE,
-REVIEW_RESULT, DELIVERY_WAKE, and DELIVERY_ACK are never terminal cleanup
-evidence. `CAMPAIGN_CLOSED` never targets the Coordinator.
+Ambiguous ownership, dirty state, missing readback, or force-required actions
+produce a protected plan with no actions. Never use force.

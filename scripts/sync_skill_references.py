@@ -16,6 +16,7 @@ PACKAGES = {
         "issue-contract.md",
         "lifecycle.md",
         "verification-policy.md",
+        "worker-execution.md",
     ),
     "github-issue-intake": (
         "communication-protocol.md",

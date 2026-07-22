@@ -7,7 +7,7 @@ claim, review, integration, and cleanup.
 ## Contract gate
 
 Require one valid v3 contract with exact Issue/repository, `dev` base SHA,
-`work/issue-...` branch, worktree, campaign/dispatch IDs, room, hotset,
+`work/issue-...` branch, worktree, Task Group/dispatch IDs, hotset,
 permissions, verification, and `done_when`. Stop before edits when any field,
 ownership, permission, or architecture decision is unresolved.
 
@@ -18,68 +18,64 @@ separate non-GWO top-level Task, never a child of this Dispatch.
 Also require `relationship: subagent`, exact `parent_agent_id`,
 `notify_on_finish: true`, and the dynamically resolved `runtime_mode_id`. The
 permission profile uses `approval: never` and
-`unexpected_request_fallback: parent`. Before `AGENT_READY`, inspect the live
+`unexpected_request_fallback: parent`. Before `status`, inspect the live
 Agent and fail closed unless parentage and mode match exactly.
 
-## Room preflight and activation
+## Store preflight and activation
 
-Run the packaged repository preflight and:
+Run the packaged repository preflight and verify `PASEO_AGENT_ID` and
+`GWO_AGENT_ID` are available. The Worker identity comes from `GWO_AGENT_ID`;
+the CLI refuses any event whose identity/role pair is not entitled.
 
-```text
-python <skill>/scripts/paseo_room.py preflight \
-  --room <gwo-campaign-id> --require-agent-identity
-```
+Post `status`, then wait. Begin only after a valid `START` event for the same
+dispatch. The initial prompt may contain the contract, but the store mailbox is
+the coordination record.
 
-Post `AGENT_READY`, then wait. Begin only after a valid room `START` event for
-the same dispatch. The initial prompt may contain the contract, but the room is
-the campaign communication record.
-
-Normalize the current Worker and Campaign Agent readbacks, set
-`authority_scope: worker-dispatch`, then run `paseo_room.py identity-plan
---snapshot <json-file> --receipts-output <receipts-json-file>` to compile
-receipts. Replay and wait with `--identity-receipts <compiled-json-file>
---consumer-role worker --dispatch-id <exact-dispatch-id>`. A Worker never
-unscoped-replays Campaign lifecycle or sibling history, and its consumer view
-ignores Campaign-owned `REVIEW_RESULT` events. Missing receipts make in-scope events
-non-actionable. Do not hand-author authority fields or construct evidence from
-room claims.
+Replay and wait with `gwo inbox --agent-id <self> --dispatch-id <exact-dispatch-id>`.
+A Worker never unscoped-replays Task Group lifecycle or sibling history, and its
+consumer view ignores Coordinator-owned `review_result` events. Missing identity
+makes in-scope events non-actionable. Do not hand-author identity columns or
+construct evidence from mailbox claims.
 
 ## Execution
 
-Stay in the assigned worktree and hotset. At safe phase boundaries replay the
-room. Do not use mentions for routine updates or send prompts to busy Agents.
-Post one blocking `ASK` before durable architecture, compatibility,
+Stay in the assigned worktree and hotset. At safe phase boundaries replay your
+inbox. Do not use mentions for routine updates or send prompts to busy Agents.
+Post one blocking `ask` before durable architecture, compatibility,
 security/privacy, migration, or cross-Issue decisions. Resume only after a
-correlated `REPLY` backed by durable GitHub decision readback.
+correlated `reply` backed by durable GitHub decision readback.
 
-Treat any direct user instruction as an `ASK` before acting. An in-contract
-clarification may continue after Campaign REPLY. Scope, Hotset, architecture,
-compatibility, security, or integration expansion requires the GitHub decision
-gate; never broaden authority from a direct prompt alone.
+Treat any direct user instruction as an `ask` before acting. An in-contract
+clarification may continue after Coordinator `reply`. Scope, Hotset,
+architecture, compatibility, security, or integration expansion requires the
+GitHub decision gate; never broaden authority from a direct prompt alone.
 
 Implement the smallest accepted vertical change. Run targeted checks, then the
 required suite/manual evidence exactly once per locally green candidate. The
 Worker does not spawn another work item or perform formal review.
 
-Post `HEARTBEAT` after investigation, after each independent implementation
+Post `heartbeat` after investigation, after each independent implementation
 phase, before and after long verification, and at the next safe boundary when
 five minutes passed without a runtime signal. The five-minute target is not an
-SLA: do not interrupt a running command merely to post. Use `PROGRESS` instead
-when evidence materially changed. HEARTBEAT never advances lifecycle and stops
-after `WORKER_DONE`, `BLOCKED`, or `STOPPED`.
+SLA: do not interrupt a running command merely to post. Use `status` instead
+when evidence materially changed. `heartbeat` never advances lifecycle and stops
+after `worker_done`, `BLOCKED`, or `STOPPED`.
 
 ## Publication
 
 Commit and push the assigned branch, open/update the PR against `dev`, and post
-`PR_OPENED` followed by `WORKER_DONE` with exact evidence. Publish each through
-`paseo_room.py post-material --authority-scope worker-dispatch
---identity-receipts <compiled-json-file>`, then run the
-packaged `material_delivery.py delivery-plan`. Wake only an idle Campaign using
-the exact returned signal-only action, post `DELIVERY_WAKE` after an accepted
-send, and remain in bounded room waits until the Campaign identity-verifies the
-source and posts `DELIVERY_ACK`. A busy Campaign receives no prompt. ACK proves
-receipt only; the Orchestrator still verifies room, Agent, Git, GitHub, and test
-state before it posts `READY_FOR_REVIEW` or `COMPLETED` and before any merge.
+`worker_done` with exact evidence. Publish it through the gwo kernel:
+
+```text
+python <skill>/scripts/gwo.py done --task-id <task> --dispatch-id <dispatch> --status done --evidence <json>
+```
+
+Then run the packaged `material_delivery.py delivery-plan`. Wake only an idle
+Coordinator using the exact returned signal-only action, post `DELIVERY_WAKE`
+after an accepted send, and remain in bounded inbox waits until the Coordinator
+identity-verifies the source and posts `DELIVERY_ACK`. A busy Coordinator receives
+no prompt. ACK proves receipt only; the Coordinator still verifies Agent, Git,
+GitHub, and test state before marking complete and before any merge.
 
 The high-autonomy mode prevents routine prompts. If a Provider still requests
 permission, pause without retrying: Paseo notifies the parent. The parent may

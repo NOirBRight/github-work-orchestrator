@@ -83,4 +83,5 @@ Workspace, then local branch. The direct-child list and each phase require new
 readback; worktree archive and branch deletion are never one action wave. Legacy v4.2 Campaigns
 without control worktree retire Agent-only. Blocked/unsafe state stays visible.
 The Campaign never archives itself; `CAMPAIGN_CLOSED` never archives the
-Coordinator. Coordinator retirement is human-only after durable handoff.
+Coordinator. task_group_closed never archives the Coordinator. Coordinator
+retirement is human-only after durable handoff.
