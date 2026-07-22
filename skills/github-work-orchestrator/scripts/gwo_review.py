@@ -133,9 +133,11 @@ def round_record(
     prior_round_id: str | None,
     issued_by: str,
     issued_at: float,
+    is_current: bool = True,
+    assigned_axis: str | None = None,
 ) -> dict[str, Any]:
     """Return a normalized review-round dict. Does not touch the store."""
-    return {
+    record: dict[str, Any] = {
         "round_id": validate_identifier("round_id", round_id),
         "dispatch_id": validate_identifier("dispatch_id", dispatch_id),
         "round": validate_round(round),
@@ -150,4 +152,22 @@ def round_record(
         ),
         "issued_by": validate_identifier("issued_by", issued_by),
         "issued_at": issued_at,
+        "is_current": int(is_current),
     }
+    if assigned_axis is not None:
+        record["assigned_axis"] = validate_axis(assigned_axis)
+    return record
+
+
+TIER_AXES: dict[str, tuple[str, ...]] = {
+    "fast": (),
+    "standard": ("combined",),
+    "strict": ("spec", "quality"),
+}
+
+
+def tier_axes(risk: str) -> tuple[str, ...]:
+    """Return the required review axes for a risk tier."""
+    if risk not in TIER_AXES:
+        raise ValueError(f"risk must be one of {sorted(TIER_AXES)}")
+    return TIER_AXES[risk]

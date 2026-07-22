@@ -234,6 +234,75 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
             ON integration_chain (scope, created_at);
         """,
     ),
+    (
+        "0005-review-authority-and-chain-integrity",
+        """
+        -- Review authority: axis assignments are authored by the Coordinator.
+        CREATE TABLE IF NOT EXISTS review_assignments (
+            round_id TEXT NOT NULL,
+            axis TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            assigned_at REAL NOT NULL,
+            PRIMARY KEY (round_id, axis),
+            FOREIGN KEY (round_id) REFERENCES review_rounds (round_id)
+                ON DELETE CASCADE,
+            FOREIGN KEY (agent_id) REFERENCES agents (agent_id)
+        );
+
+        -- Review rounds gain a current-tail flag and an assigned_axis metadata
+        -- column so the round issuer can record the intended axis. The
+        -- is_current flag is maintained by triggers during round creation and
+        -- supersession so gate queries always look at the single tail.
+        ALTER TABLE review_rounds ADD COLUMN is_current INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE review_rounds ADD COLUMN assigned_axis TEXT;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_review_rounds_dispatch_round
+            ON review_rounds (dispatch_id, round);
+
+        -- At most one current round per dispatch.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_review_rounds_current_dispatch
+            ON review_rounds (dispatch_id) WHERE is_current = 1;
+
+        -- Integration chain gains a transaction-local monotonic position and a
+        -- head pointer. created_at remains metadata only.
+        ALTER TABLE integration_chain ADD COLUMN position INTEGER;
+        ALTER TABLE integration_chain ADD COLUMN head TEXT;
+
+        -- One root per scope and one successor per prior chain node.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_integration_chain_scope_root
+            ON integration_chain (scope) WHERE prior_chain_id IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_integration_chain_prior_unique
+            ON integration_chain (prior_chain_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_integration_chain_scope_position
+            ON integration_chain (scope, position);
+
+        -- Trigger: when a new round is inserted, supersede any prior current
+        -- round for the same dispatch and clear its is_current flag. This
+        -- keeps the current tail unique per dispatch and links the delta chain.
+        CREATE TRIGGER IF NOT EXISTS trg_supersede_review_round
+        AFTER INSERT ON review_rounds
+        FOR EACH ROW
+        WHEN NEW.prior_round_id IS NOT NULL
+        BEGIN
+            UPDATE review_rounds
+            SET is_current = 0
+            WHERE dispatch_id = NEW.dispatch_id
+              AND is_current = 1
+              AND round_id != NEW.round_id;
+        END;
+
+        -- Trigger: maintain the integration chain head pointer on insert.
+        -- The head is always the latest node for the scope.
+        CREATE TRIGGER IF NOT EXISTS trg_integration_chain_head
+        AFTER INSERT ON integration_chain
+        FOR EACH ROW
+        BEGIN
+            UPDATE integration_chain
+            SET head = NEW.chain_id
+            WHERE scope = NEW.scope;
+        END;
+        """,
+    ),
 )
 
 
@@ -445,11 +514,10 @@ class Store:
         for name, ddl in MIGRATIONS:
             if name in applied:
                 continue
-            self._apply_migration(name, ddl, caller)
+            applied_now = self._apply_migration(name, ddl, caller)
             # If the migration was already applied by a concurrent writer,
             # _apply_migration commits a no-op; do not run post-migration hooks.
-            applied.add(name)
-            if name not in applied:
+            if not applied_now:
                 continue
             # Post-migration 0003: attempt the unique index. If duplicate tasks
             # exist (legacy Issue #21 stores), skip the unique index so
@@ -512,13 +580,17 @@ class Store:
             except sqlite3.OperationalError:
                 pass
 
-    def _apply_migration(self, name: str, ddl: str, caller: str) -> None:
+    def _apply_migration(self, name: str, ddl: str, caller: str) -> bool:
         # Execute each migration and its schema_migrations record in one
         # transaction so a failure in any DDL statement rolls back the whole
         # migration (no DDL left without a record). Re-check the migration row
         # under the same BEGIN IMMEDIATE so two concurrent writers cannot both
         # apply the same migration: the loser sees the row inserted by the
         # winner and skips cleanly instead of raising a uniqueness error.
+        #
+        # Returns True when this call actually applied the migration, False
+        # when it was already present (concurrent application or idempotent
+        # re-run). The post-hook control flow depends on this explicit result.
         statements = _split_sql_statements(ddl)
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -527,19 +599,135 @@ class Store:
             ).fetchone()
             if existing is not None:
                 self.db.execute("ROLLBACK")
-                return
+                return False
+            if name == "0005-review-authority-and-chain-integrity":
+                self._validate_0004_schema()
             for statement in statements:
                 self.db.execute(statement)
+            if name == "0005-review-authority-and-chain-integrity":
+                self._validate_0005_schema()
             self.db.execute(
                 "INSERT INTO schema_migrations (name) VALUES (?)", (name,)
             )
             self.db.execute("COMMIT")
+            return True
         except BaseException:
             try:
                 self.db.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
             raise
+
+    def _require_table_columns(
+        self, table: str, columns: tuple[str, ...]
+    ) -> None:
+        actual = tuple(
+            str(row["name"])
+            for row in self.db.execute(f"PRAGMA table_info({table})").fetchall()
+        )
+        if actual != columns:
+            raise StoreError(
+                f"migration 0005 requires exact {table} columns {columns}, got {actual}"
+            )
+
+    def _require_foreign_keys(
+        self, table: str, expected: set[tuple[str, str, str]]
+    ) -> None:
+        actual = {
+            (str(row["from"]), str(row["table"]), str(row["to"]))
+            for row in self.db.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+        }
+        if actual != expected:
+            raise StoreError(
+                f"migration 0005 requires exact {table} foreign keys"
+            )
+
+    def _require_schema_objects(self, names: set[str]) -> None:
+        actual = {
+            str(row["name"])
+            for row in self.db.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('index', 'trigger')"
+            ).fetchall()
+        }
+        missing = names - actual
+        if missing:
+            raise StoreError(
+                f"migration 0005 missing required schema objects {sorted(missing)}"
+            )
+
+    def _validate_0004_schema(self) -> None:
+        """Reject a legacy or malformed Phase 2 schema before 0005 DDL runs."""
+        self._require_table_columns(
+            "review_rounds",
+            (
+                "round_id", "dispatch_id", "round", "candidate_sha", "base_sha",
+                "diff_digest", "acceptance_digest", "scope", "prior_round_id",
+                "issued_by", "issued_at",
+            ),
+        )
+        self._require_table_columns(
+            "review_results",
+            ("round_id", "axis", "agent_id", "verdict", "findings_json", "created_at"),
+        )
+        self._require_table_columns(
+            "leases",
+            ("lease_id", "scope", "holder_agent", "acquired_at", "released_at"),
+        )
+        self._require_table_columns(
+            "integration_chain",
+            ("chain_id", "scope", "candidate_sha", "task_id", "prior_chain_id", "created_at"),
+        )
+        self._require_foreign_keys(
+            "review_rounds", {("dispatch_id", "dispatches", "dispatch_id")}
+        )
+        self._require_foreign_keys(
+            "review_results", {("round_id", "review_rounds", "round_id")}
+        )
+        self._require_foreign_keys(
+            "integration_chain", {("prior_chain_id", "integration_chain", "chain_id")}
+        )
+        self._require_schema_objects(
+            {"idx_leases_active_scope", "idx_integration_chain_scope"}
+        )
+
+    def _validate_0005_schema(self) -> None:
+        """Require the complete 0005 authority and chain-integrity shape."""
+        self._require_table_columns(
+            "review_rounds",
+            (
+                "round_id", "dispatch_id", "round", "candidate_sha", "base_sha",
+                "diff_digest", "acceptance_digest", "scope", "prior_round_id",
+                "issued_by", "issued_at", "is_current", "assigned_axis",
+            ),
+        )
+        self._require_table_columns(
+            "review_assignments", ("round_id", "axis", "agent_id", "assigned_at")
+        )
+        self._require_table_columns(
+            "integration_chain",
+            (
+                "chain_id", "scope", "candidate_sha", "task_id", "prior_chain_id",
+                "created_at", "position", "head",
+            ),
+        )
+        self._require_foreign_keys(
+            "review_assignments",
+            {
+                ("round_id", "review_rounds", "round_id"),
+                ("agent_id", "agents", "agent_id"),
+            },
+        )
+        self._require_schema_objects(
+            {
+                "idx_review_rounds_dispatch_round",
+                "idx_review_rounds_current_dispatch",
+                "idx_integration_chain_scope_root",
+                "idx_integration_chain_prior_unique",
+                "idx_integration_chain_scope_position",
+                "trg_supersede_review_round",
+                "trg_integration_chain_head",
+            }
+        )
 
     def _identity(self, supplied: Any, field: str) -> str:
         self._reject_supplied_identity(supplied, field)
@@ -1054,6 +1242,19 @@ class Store:
 
     # --- Phase 2 review rounds / Integration Lease ---------------------------
 
+    def _require_registered_reviewer(self, agent_id: str) -> None:
+        """Verify the caller is a registered, non-archived reviewer agent."""
+        row = self.db.execute(
+            "SELECT role, archived_at FROM agents WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+        if row is None:
+            raise IdentityError(f"agent {agent_id} is not registered")
+        if str(row["role"]) != "reviewer":
+            raise IdentityError(f"agent {agent_id} is not a reviewer")
+        if row["archived_at"] is not None:
+            raise IdentityError(f"agent {agent_id} is archived")
+
     def issue_review_round(
         self,
         *,
@@ -1067,12 +1268,14 @@ class Store:
         prior_round_id: str | None = None,
         round_id: Any = None,
         issued_by: Any = None,
+        assignments: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Issue a review-round identity row. Coordinator-only.
 
         The CLI is the sole authority that authors candidate/base SHA, diff and
-        acceptance digests, scope, round number, and round identity. Reviewers
-        can only reference an issued round via submit_review_result.
+        acceptance digests, scope, round number, round identity, and axis
+        assignments. Reviewers can only reference an issued round via
+        submit_review_result.
         """
         import gwo_review
 
@@ -1108,31 +1311,91 @@ class Store:
             if dispatch is None:
                 raise TransitionError(f"unknown dispatch {dispatch_id}")
 
+            # Ensure at most one current round per dispatch; a delta round must
+            # name the current unsuperseded tail for the same dispatch and use
+            # prior.round + 1.
+            current = self.db.execute(
+                "SELECT round_id, round, candidate_sha FROM review_rounds "
+                "WHERE dispatch_id = ? AND is_current = 1",
+                (dispatch_id,),
+            ).fetchone()
+
             if prior_round_id is not None:
                 prior = self.db.execute(
-                    "SELECT dispatch_id, candidate_sha FROM review_rounds "
-                    "WHERE round_id = ?",
+                    "SELECT dispatch_id, round_id, round, candidate_sha, is_current "
+                    "FROM review_rounds WHERE round_id = ?",
                     (prior_round_id,),
                 ).fetchone()
                 if prior is None:
                     raise TransitionError(
                         f"prior_round_id {prior_round_id} does not exist"
                     )
-                if prior["dispatch_id"] != dispatch_id:
+                if str(prior["dispatch_id"]) != dispatch_id:
                     raise TransitionError(
                         "prior_round_id must belong to the same dispatch"
+                    )
+                if not int(prior["is_current"]):
+                    raise TransitionError(
+                        "delta prior_round_id must name the current unsuperseded tail"
+                    )
+                if current is None or current["round_id"] != prior_round_id:
+                    raise TransitionError(
+                        "delta prior_round_id must name the current unsuperseded tail"
+                    )
+                if prior["round"] + 1 != round:
+                    raise TransitionError(
+                        f"delta round must be {prior['round'] + 1}, got {round}"
                     )
                 if prior["candidate_sha"] == candidate_sha:
                     raise TransitionError(
                         "delta candidate must differ from prior candidate"
                     )
+            else:
+                if current is not None:
+                    raise TransitionError(
+                        "round 1 cannot be issued when a current round exists"
+                    )
+
+            # Derive tier from the linked task and validate assignments.
+            task_row = self.db.execute(
+                "SELECT t.risk FROM tasks t JOIN dispatches d ON d.task_id = t.task_id "
+                "WHERE d.dispatch_id = ?",
+                (dispatch_id,),
+            ).fetchone()
+            if task_row is None:
+                raise TransitionError(f"dispatch {dispatch_id} has no task")
+            tier = str(task_row["risk"])
+            if tier == "fast":
+                raise TransitionError("fast issues use coordinator-inline integration, not review rounds")
+            required_axes = gwo_review.tier_axes(tier)
+            if assignments is None:
+                assignments = {}
+            provided_axes = set(assignments.keys())
+            if required_axes and provided_axes != set(required_axes):
+                raise TransitionError(
+                    f"{tier} review requires axes {list(required_axes)}, got {list(provided_axes)}"
+                )
+            if tier == "strict" and len(set(assignments.values())) != 2:
+                raise TransitionError(
+                    "strict review requires spec and quality assignments to different reviewers"
+                )
+
+            # Supersede the prior round before inserting the new one so the
+            # partial unique index idx_review_rounds_current_dispatch does not
+            # reject the insert while the old tail still has is_current=1.
+            if prior_round_id is not None:
+                self.db.execute(
+                    "UPDATE review_rounds SET is_current = 0 "
+                    "WHERE dispatch_id = ? AND is_current = 1 AND round_id != ?",
+                    (dispatch_id, resolved_round_id),
+                )
 
             self.db.execute(
                 "INSERT INTO review_rounds ("
                 "round_id, dispatch_id, round, candidate_sha, base_sha, "
                 "diff_digest, acceptance_digest, scope, prior_round_id, "
-                "issued_by, issued_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "issued_by, issued_at, is_current, assigned_axis) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
                 (
                     resolved_round_id,
                     dispatch_id,
@@ -1145,8 +1408,21 @@ class Store:
                     prior_round_id,
                     actor,
                     now,
+                    # assigned_axis metadata: store the first required axis for
+                    # single-axis tiers; strict stores both via assignments.
+                    required_axes[0] if len(required_axes) == 1 else None,
                 ),
             )
+
+            # Persist axis assignments atomically with the round.
+            for axis, agent_id in assignments.items():
+                self._require_registered_reviewer(agent_id)
+                self.db.execute(
+                    "INSERT INTO review_assignments (round_id, axis, agent_id, assigned_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (resolved_round_id, axis, agent_id, now),
+                )
+
             self.db.execute("COMMIT")
         except sqlite3.IntegrityError as error:
             try:
@@ -1186,6 +1462,8 @@ class Store:
             "prior_round_id": row["prior_round_id"],
             "issued_by": row["issued_by"],
             "issued_at": row["issued_at"],
+            "is_current": bool(row["is_current"]),
+            "assigned_axis": row["assigned_axis"],
         }
 
     def submit_review_result(
@@ -1207,7 +1485,9 @@ class Store:
         """Record a Reviewer result that references an issued round.
 
         Reviewers may supply only axis, verdict, and findings. Any attempt to
-        author or override lock identity fields is rejected.
+        author or override lock identity fields is rejected. The caller must be
+        a registered, non-archified reviewer assigned to exactly this round and
+        axis, and the round must be the current unsuperseded tail.
         """
         import gwo_review
 
@@ -1228,11 +1508,44 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             round_row = self.db.execute(
-                "SELECT round_id FROM review_rounds WHERE round_id = ?",
+                "SELECT dispatch_id, is_current FROM review_rounds WHERE round_id = ?",
                 (round_id,),
             ).fetchone()
             if round_row is None:
                 raise TransitionError(f"unknown review round {round_id}")
+            if not int(round_row["is_current"]):
+                raise TransitionError(
+                    f"round {round_id} is stale or superseded"
+                )
+
+            # Authority check: caller is registered, role=reviewer, not archived,
+            # and assigned to this exact round + axis.
+            self._require_registered_reviewer(resolved)
+            assignment = self.db.execute(
+                "SELECT agent_id FROM review_assignments "
+                "WHERE round_id = ? AND axis = ?",
+                (round_id, axis),
+            ).fetchone()
+            if assignment is None:
+                raise IdentityError(
+                    f"no reviewer assigned to axis {axis} for round {round_id}"
+                )
+            if str(assignment["agent_id"]) != resolved:
+                raise IdentityError(
+                    f"axis {axis} is assigned to a different reviewer"
+                )
+
+            # For strict tiers, reject the same agent submitting both axes.
+            other_result = self.db.execute(
+                "SELECT agent_id FROM review_results "
+                "WHERE round_id = ? AND axis != ?",
+                (round_id, axis),
+            ).fetchone()
+            if other_result is not None and str(other_result["agent_id"]) == resolved:
+                raise TransitionError(
+                    "same agent cannot submit both axes on a strict review"
+                )
+
             existing = self.db.execute(
                 "SELECT axis FROM review_results WHERE round_id = ? AND axis = ?",
                 (round_id, axis),
@@ -1264,6 +1577,108 @@ class Store:
             raise
         return self._review_result_row(round_id, axis)
 
+    def check_review_gate(
+        self,
+        *,
+        dispatch_id: str,
+        candidate_sha: str,
+    ) -> dict[str, Any]:
+        """Evaluate the review gate for a dispatch at a candidate SHA.
+
+        Accepts only the latest (current) round for the dispatch whose candidate
+        matches. Fails closed for missing, stale, rejected, needs_work,
+        withdrawn, wrong-axis, or incomplete evidence.
+        """
+        import gwo_review
+
+        gwo_review.validate_sha("candidate_sha", candidate_sha)
+        round_row = self.db.execute(
+            "SELECT round_id, candidate_sha, assigned_axis FROM review_rounds "
+            "WHERE dispatch_id = ? AND is_current = 1",
+            (dispatch_id,),
+        ).fetchone()
+        if round_row is None:
+            return {"approved": False, "reason": "no current review round"}
+        if str(round_row["candidate_sha"]) != candidate_sha:
+            return {"approved": False, "reason": "candidate mismatch"}
+
+        task_row = self.db.execute(
+            "SELECT t.risk FROM tasks t JOIN dispatches d ON d.task_id = t.task_id "
+            "WHERE d.dispatch_id = ?",
+            (dispatch_id,),
+        ).fetchone()
+        if task_row is None:
+            return {"approved": False, "reason": "dispatch has no task"}
+        tier = str(task_row["risk"])
+        required_axes = gwo_review.tier_axes(tier)
+
+        if not required_axes:
+            return {"approved": False, "reason": "fast tier has no reviewer gate"}
+
+        results = {
+            str(row["axis"]): {
+                "agent_id": str(row["agent_id"]),
+                "verdict": str(row["verdict"]),
+            }
+            for row in self.db.execute(
+                "SELECT axis, agent_id, verdict FROM review_results WHERE round_id = ?",
+                (round_row["round_id"],),
+            ).fetchall()
+        }
+
+        assignments = {
+            str(row["axis"]): str(row["agent_id"])
+            for row in self.db.execute(
+                "SELECT axis, agent_id FROM review_assignments WHERE round_id = ?",
+                (round_row["round_id"],),
+            ).fetchall()
+        }
+
+        if any(
+            r["verdict"] in ("rejected", "needs_work", "withdrawn")
+            for r in results.values()
+        ):
+            return {"approved": False, "reason": "review result is negative"}
+
+        provided_axes = set(results.keys())
+        if provided_axes != set(required_axes):
+            return {
+                "approved": False,
+                "reason": f"missing axes: {set(required_axes) - provided_axes}",
+            }
+
+        if set(assignments) != set(required_axes):
+            return {"approved": False, "reason": "review assignments are incomplete"}
+
+        if any(results[axis]["agent_id"] != assignments[axis] for axis in required_axes):
+            return {"approved": False, "reason": "review result uses wrong axis authority"}
+
+        assigned_agents = tuple(assignments.values())
+        registered = {
+            str(row["agent_id"])
+            for row in self.db.execute(
+                "SELECT agent_id FROM agents WHERE role = 'reviewer' "
+                "AND archived_at IS NULL AND agent_id IN (?, ?)",
+                assigned_agents if len(assigned_agents) == 2 else (assigned_agents[0], assigned_agents[0]),
+            ).fetchall()
+        }
+        if set(assigned_agents) != registered:
+            return {"approved": False, "reason": "assigned reviewer is not active"}
+
+        if not all(r["verdict"] == "approved" for r in results.values()):
+            return {"approved": False, "reason": "not all axes approved"}
+
+        # For strict tier, require two distinct agents.
+        if tier == "strict":
+            agents = {r["agent_id"] for r in results.values()}
+            if len(agents) < 2:
+                return {
+                    "approved": False,
+                    "reason": "strict review requires two distinct agents",
+                }
+
+        return {"approved": True, "round_id": round_row["round_id"]}
+
     def _review_result_row(self, round_id: str, axis: str) -> dict[str, Any]:
         row = self.db.execute(
             "SELECT * FROM review_results WHERE round_id = ? AND axis = ?",
@@ -1280,6 +1695,19 @@ class Store:
             "created_at": row["created_at"],
         }
 
+    def _integration_scope(self, scope: str) -> str:
+        """Return the canonical scope for this repository.
+
+        Lease scope is derived as repo:<Store.repo>:integration. Callers may not
+        supply a foreign repository scope.
+        """
+        expected = f"repo:{self.repo}:integration"
+        if scope != expected:
+            raise IdentityError(
+                f"lease scope must be {expected}, got {scope}"
+            )
+        return expected
+
     def acquire_integration_lease(
         self,
         *,
@@ -1287,37 +1715,40 @@ class Store:
         lease_id: Any = None,
         holder_agent: Any = None,
     ) -> dict[str, Any]:
-        """Acquire the repository Integration Lease. Coordinator or holder only.
+        """Acquire the repository Integration Lease. Coordinator-only.
 
-        The lease row is created or updated in a single SQLite transaction.
-        The partial unique index ``idx_leases_active_scope`` ensures at most
-        one active lease per scope.
+        The lease scope is derived as repo:<Store.repo>:integration and the
+        caller must hold the active Coordinator claim. The partial unique
+        index ``idx_leases_active_scope`` ensures at most one active lease per
+        scope.
         """
         import gwo_lease
 
         actor = self._identity(holder_agent, "holder_agent")
         self._reject_supplied_identity(lease_id, "lease_id")
-        gwo_lease.validate_scope(scope)
+        canonical = self._integration_scope(scope)
+        gwo_lease.validate_scope(canonical)
 
         resolved_lease_id = _new_id("lease")
         now = _now()
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            self._require_coordinator_claim(actor)
             row = self.db.execute(
                 "SELECT lease_id, holder_agent, released_at FROM leases "
                 "WHERE scope = ?",
-                (scope,),
+                (canonical,),
             ).fetchone()
             if row is not None and row["released_at"] is None:
                 raise LeaseBusy(
-                    f"lease {scope} already held by {row['holder_agent']}"
+                    f"lease {canonical} already held by {row['holder_agent']}"
                 )
             if row is None:
                 self.db.execute(
                     "INSERT INTO leases ("
                     "lease_id, scope, holder_agent, acquired_at, released_at) "
                     "VALUES (?, ?, ?, ?, NULL)",
-                    (resolved_lease_id, scope, actor, now),
+                    (resolved_lease_id, canonical, actor, now),
                 )
             else:
                 resolved_lease_id = row["lease_id"]
@@ -1332,7 +1763,7 @@ class Store:
                 self.db.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
-            raise LeaseBusy(f"lease {scope} is already held") from error
+            raise LeaseBusy(f"lease {canonical} is already held") from error
         except BaseException:
             try:
                 self.db.execute("ROLLBACK")
@@ -1342,12 +1773,13 @@ class Store:
         return self._lease_row(resolved_lease_id)
 
     def integration_lease_holder(self, scope: str) -> str | None:
+        canonical = self._integration_scope(scope)
         import gwo_lease
 
-        gwo_lease.validate_scope(scope)
+        gwo_lease.validate_scope(canonical)
         row = self.db.execute(
             "SELECT holder_agent FROM leases WHERE scope = ? AND released_at IS NULL",
-            (scope,),
+            (canonical,),
         ).fetchone()
         return str(row["holder_agent"]) if row is not None else None
 
@@ -1357,20 +1789,22 @@ class Store:
         scope: str,
         holder_agent: Any = None,
     ) -> dict[str, Any]:
-        """Release the Integration Lease. Only the current holder may release."""
+        """Release the Integration Lease. Only the Coordinator holder may release."""
+        canonical = self._integration_scope(scope)
         actor = self._identity(holder_agent, "holder_agent")
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            self._require_coordinator_claim(actor)
             row = self.db.execute(
                 "SELECT lease_id, holder_agent, released_at FROM leases "
                 "WHERE scope = ?",
-                (scope,),
+                (canonical,),
             ).fetchone()
             if row is None or row["released_at"] is not None:
-                raise TransitionError(f"no active lease for {scope}")
+                raise TransitionError(f"no active lease for {canonical}")
             if row["holder_agent"] != actor:
                 raise TransitionError(
-                    f"only the lease holder may release {scope}"
+                    f"only the lease holder may release {canonical}"
                 )
             self.db.execute(
                 "UPDATE leases SET released_at = ? WHERE lease_id = ?",
@@ -1407,66 +1841,178 @@ class Store:
         task_id: str,
         prior_chain_id: Any = None,
         chain_id: Any = None,
+        tier: str | None = None,
     ) -> dict[str, Any]:
         """Append one node to the serial integration chain.
 
-        Requires the caller to currently hold the Integration Lease for the
-        same scope. The chain enforces one serial sequence of integration
-        nodes per repository.
+        Requires the caller to hold the active Coordinator claim and the current
+        Integration Lease for the repository scope. Revalidates task/repo,
+        candidate SHA, and the tier-appropriate review gate inside the same
+        transaction. Uses a transaction-local monotonic position so chain order
+        is independent of wall-clock time.
         """
         import gwo_lease
         import gwo_review
 
-        gwo_lease.validate_scope(scope)
+        canonical = self._integration_scope(scope)
+        gwo_lease.validate_scope(canonical)
         gwo_review.validate_sha("candidate_sha", candidate_sha)
         gwo_review.validate_identifier("task_id", task_id)
+        if tier is not None and tier not in ("fast", "standard", "strict"):
+            raise ValueError("tier must be fast, standard, or strict")
         self._reject_supplied_identity(chain_id, "chain_id")
         self._reject_supplied_identity(prior_chain_id, "prior_chain_id")
-
-        holder = self.integration_lease_holder(scope)
-        if holder is None:
-            raise IdentityError(
-                f"active Integration Lease required for {scope}"
-            )
-        caller = self._caller()
-        if holder != caller:
-            raise IdentityError(
-                f"only the lease holder may append to integration chain {scope}"
-            )
 
         resolved_chain_id = _new_id("chain")
         now = _now()
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            tail = self.db.execute(
-                "SELECT chain_id FROM integration_chain "
-                "WHERE scope = ? ORDER BY created_at DESC LIMIT 1",
-                (scope,),
+            actor = self._caller()
+            self._require_coordinator_claim(actor)
+
+            # Lease check: active and held by caller, in the same transaction.
+            lease = self.db.execute(
+                "SELECT lease_id, holder_agent, released_at FROM leases "
+                "WHERE scope = ?",
+                (canonical,),
             ).fetchone()
-            expected_prior = tail["chain_id"] if tail is not None else None
-            if expected_prior is not None:
-                prior = self.db.execute(
-                    "SELECT chain_id FROM integration_chain WHERE chain_id = ?",
-                    (expected_prior,),
-                ).fetchone()
-                if prior is None:
+            if lease is None or lease["released_at"] is not None:
+                raise IdentityError(f"active Integration Lease required for {canonical}")
+            if str(lease["holder_agent"]) != actor:
+                raise IdentityError(
+                    f"only the lease holder may append to integration chain {canonical}"
+                )
+
+            # Task/repository check.
+            task_row = self.db.execute(
+                "SELECT task_id, risk FROM tasks WHERE task_id = ? AND repo = ?",
+                (task_id, self.repo),
+            ).fetchone()
+            if task_row is None:
+                raise TransitionError(
+                    f"task {task_id} does not exist in repo {self.repo}"
+                )
+            resolved_tier = tier or str(task_row["risk"])
+            if tier is not None and resolved_tier != str(task_row["risk"]):
+                raise TransitionError(
+                    f"integration tier {tier} does not match task risk {task_row['risk']}"
+                )
+
+            # Integration follows a completed Worker lifecycle. Bind the append
+            # to the terminal candidate evidence instead of accepting a still
+            # active dispatch, which would permit integration before done.
+            dispatch_row = self.db.execute(
+                "SELECT dispatch_id, terminal_evidence_json FROM dispatches "
+                "WHERE task_id = ? AND status = 'done'",
+                (task_id,),
+            ).fetchone()
+            if dispatch_row is None:
+                raise TransitionError(f"no completed dispatch for task {task_id}")
+            try:
+                terminal_evidence = json.loads(dispatch_row["terminal_evidence_json"] or "{}")
+            except (TypeError, json.JSONDecodeError) as error:
+                raise TransitionError(
+                    f"completed dispatch for task {task_id} has malformed candidate evidence"
+                ) from error
+            if (
+                not isinstance(terminal_evidence, dict)
+                or terminal_evidence.get("candidate_sha") != candidate_sha
+            ):
+                raise TransitionError(
+                    f"completed dispatch candidate does not match {candidate_sha}"
+                )
+
+            # Candidate check: the active dispatch must be at the supplied SHA.
+            # For the V7 store we validate by comparing against the current review
+            # round or, for fast tier, by an explicit coordinator-inline gate.
+            if resolved_tier == "fast":
+                # Fast tier uses an explicit coordinator-inline tier. The
+                # Coordinator has already verified candidate evidence before
+                # append; no reviewer gate exists.
+                if tier != "fast":
                     raise TransitionError(
-                        "integration chain tail missing; cannot append"
+                        "fast integration requires explicit coordinator-inline tier"
                     )
+            else:
+                gate = self.check_review_gate(
+                    dispatch_id=dispatch_row["dispatch_id"],
+                    candidate_sha=candidate_sha,
+                )
+                if not gate["approved"]:
+                    raise TransitionError(
+                        f"review gate not passed for task {task_id}: {gate.get('reason')}"
+                    )
+
+            # Determine the next position transaction-locally under the chain
+            # lock. created_at is metadata only.
+            tail_row = self.db.execute(
+                "SELECT MAX(position) AS max_position FROM integration_chain "
+                "WHERE scope = ?",
+                (canonical,),
+            ).fetchone()
+            next_position = (int(tail_row["max_position"]) if tail_row["max_position"] is not None else 0) + 1
+
+            # Re-check lease holder inside the same transaction to detect a
+            # release race.
+            current_lease = self.db.execute(
+                "SELECT holder_agent, released_at FROM leases WHERE scope = ?",
+                (canonical,),
+            ).fetchone()
+            if current_lease is None or current_lease["released_at"] is not None:
+                raise IdentityError(
+                    f"lease was released during append for {canonical}"
+                )
+            if str(current_lease["holder_agent"]) != actor:
+                raise IdentityError(
+                    f"lease holder changed during append for {canonical}"
+                )
+
+            expected_prior = self.db.execute(
+                "SELECT chain_id FROM integration_chain "
+                "WHERE scope = ? AND position = ("
+                "SELECT MAX(position) FROM integration_chain WHERE scope = ?)"
+                "AND position < ?",
+                (canonical, canonical, next_position),
+            ).fetchone()
+            prior_value = expected_prior["chain_id"] if expected_prior is not None else None
+
             self.db.execute(
                 "INSERT INTO integration_chain ("
-                "chain_id, scope, candidate_sha, task_id, prior_chain_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "chain_id, scope, candidate_sha, task_id, prior_chain_id, position, head, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     resolved_chain_id,
-                    scope,
+                    canonical,
                     candidate_sha,
                     task_id,
-                    expected_prior,
+                    prior_value,
+                    next_position,
+                    resolved_chain_id,
                     now,
                 ),
             )
+            # Maintain head pointer: every node in the scope points to the new head.
+            self.db.execute(
+                "UPDATE integration_chain SET head = ? WHERE scope = ?",
+                (resolved_chain_id, canonical),
+            )
             self.db.execute("COMMIT")
+        except sqlite3.IntegrityError as error:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise TransitionError(
+                f"integration chain append failed for {canonical}: concurrent append or release"
+            ) from error
+        except sqlite3.OperationalError as error:
+            try:
+                self.db.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise StoreError(
+                f"integration chain append failed for {canonical}: database locked or concurrent race"
+            ) from error
         except BaseException:
             try:
                 self.db.execute("ROLLBACK")
@@ -1476,12 +2022,13 @@ class Store:
         return self._chain_row(resolved_chain_id)
 
     def list_integration_chain(self, *, scope: str) -> list[dict[str, Any]]:
+        canonical = self._integration_scope(scope)
         import gwo_lease
 
-        gwo_lease.validate_scope(scope)
+        gwo_lease.validate_scope(canonical)
         rows = self.db.execute(
-            "SELECT * FROM integration_chain WHERE scope = ? ORDER BY created_at",
-            (scope,),
+            "SELECT * FROM integration_chain WHERE scope = ? ORDER BY position",
+            (canonical,),
         ).fetchall()
         return [self._chain_from_row(row) for row in rows]
 
@@ -1501,5 +2048,7 @@ class Store:
             "candidate_sha": row["candidate_sha"],
             "task_id": row["task_id"],
             "prior_chain_id": row["prior_chain_id"],
+            "position": row["position"],
+            "head": row["head"],
             "created_at": row["created_at"],
         }

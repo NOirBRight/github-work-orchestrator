@@ -37,6 +37,7 @@ EXPECTED_MIGRATIONS = frozenset({
     "0002-messages-in-reply-to",
     "0003-tasks-repo-issue-unique",
     "0004-review-rounds-and-lease",
+    "0005-review-authority-and-chain-integrity",
 })
 
 # Runtime readback source registry. Phase 1 uses an injected/read-only Paseo
