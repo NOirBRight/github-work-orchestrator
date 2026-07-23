@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: amended by ADR-0039
 amends: ADR-0020, ADR-0021
 ---
 

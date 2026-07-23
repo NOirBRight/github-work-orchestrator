@@ -1,6 +1,6 @@
 # GWO V8 roadmap
 
-Status: accepted direction, pre-implementation.
+Status: accepted direction; implementation complete through Phase 2.
 
 This roadmap starts from the production reality: V6.1 is the current writer
 and V7 was never adopted. V8 does not complete or migrate V7. It introduces a
@@ -24,10 +24,12 @@ Scope:
   port only the accepted V8 documents onto it. Do not merge the
   `design/gwo-v8` or `v7-integration` branch histories into the V8
   implementation line.
-- Backport the fourth `frontier` tier and the minimal named Reviewer
-  Role-Binding resolution to V6.1 in one narrow change: validation,
-  configuration, resolution tests, and documentation only. The V6.1
-  Coordinator remains the current manually created session.
+- Backport the fourth `frontier` tier and the named Sol review Runtime Profiles
+  to V6.1 in one narrow change: validation, configuration, resolution tests,
+  and documentation only. V6.1 retains its legacy one-shot Reviewer until
+  cutover; V8 consumes those models through Review Profile selectors rather
+  than a managed Reviewer role. The V6.1 Coordinator remains the current
+  manually created session.
 - Keep the concrete profile configuration global with repository overrides;
   keep semantic risk, review, and check policy versioned with the repository.
 - Record `ready-for-agent` as the Matt workflow handoff, keep `to-spec`
@@ -141,8 +143,12 @@ Scope:
   before publication, except checks explicitly marked hosted-only.
 - Freeze an immutable local candidate only by Result Claim; internal edits and
   test runs do not count as Candidate submissions.
-- Run the full local suite and local exact-SHA review concurrently after the
-  candidate is immutable.
+- Require cheap affected tests, lint, and type checks before spending Review
+  tokens, consuming the edit loop's latest valid results when their observed
+  tree digest matches the Candidate rather than rerunning them solely for this
+  gate. Then run the one full local suite and local exact-SHA Review
+  concurrently after the candidate is immutable and its parent is parked from
+  editing.
 - Derive publication eligibility from one candidate SHA, valid required local
   checks, and blocker-free required review. Do not add another lifecycle state.
 - Push an eligible candidate once, then run hosted CI once against that exact
@@ -150,35 +156,62 @@ Scope:
   the initial run.
 - Publish local Review and compact Check Evidence after the candidate becomes
   durable; do not repeat the analysis merely to publish it.
-- Have one transient parent Reviewer invoke `code-review`, run read-only
-  Standards and Spec Internal Subagents in parallel, and aggregate one typed
-  Review Result with per-axis identity and digests.
-- If one review axis is invalid or absent, retain the valid axis and rerun only
-  the missing axis in a fresh Sol Max session.
+- Compile `review_requirement` into Candidate-bearing Work Node output
+  contracts; do not create Review Plan Nodes, edges, Admissions, Attempts, or
+  Results.
+- Compile low-risk allowlisted work with no LLM Review, standard risk with
+  Standards and Spec axes, and strict risk with those axes plus its concrete
+  specialist or human requirement. Missing canonical Spec input must fail
+  closed before execution.
+- Have the Candidate-producing Work Attempt invoke `code-review` with a
+  history-free fixed packet and run read-only Standards and Spec Internal
+  Subagents in parallel. Standard axes use Sol High; recovery and strict
+  specialist observations use Sol Max.
+- Have the Runtime Adapter observe each review child's fixed input, Runtime
+  identity, output, and digests. Persist each axis independently and assemble
+  one typed Review Evidence envelope without merging or reranking findings.
+- Validate child fork/model settings before dispatch and create no running
+  child record until identity readback. Derive a stable action key from Attempt,
+  Candidate, axis, and recovery ordinal; use readback-first adoption when
+  retrying transient pre-ID or transport failure at most twice after the
+  initial execution without consuming an Attempt or Repair Round.
+- If one review axis is invalid or absent for the same Candidate, retain the
+  valid axis and rerun only the missing axis once in a fresh Sol Max session.
+- Invalidate both axes after any Candidate SHA or diff change. Give both axes
+  the prior findings and compact old-to-new delta, but let them inspect the
+  complete new diff; do not implement cross-SHA axis reuse in V8.0.
 - Implement one Repair Round in the primary Attempt and one fresh
   `worker_frontier` Attempt with one Repair Round.
 - Use explicit Attempt terminal reasons: `rejected`, `no_result`,
   `runtime_lost`, and `superseded`. Only `rejected` and `no_result` consume the
   semantic Recovery Ladder.
-- Treat a valid Reviewer verdict with blockers as a successful Review Result
-  and a rejected implementation candidate, not a failed Reviewer.
+- Treat schema-valid Review Evidence containing hard blockers as a rejected
+  implementation Candidate, not failed Review execution. Keep smells and other
+  judgment calls advisory unless repository policy promotes them.
 - Implement serial Integration and exact target-branch readback.
+- Reuse exact Review Evidence after a clean application; require a new Review
+  Gate after rebase, conflict resolution, or any other diff change.
 - Implement Replan Hold, unchanged-contract Result Adoption, explicit
   supersession, and replacement exclusion.
 
 Exit criteria:
 
 - intermediate SHA values are never pushed merely to obtain feedback;
-- a Reviewer or Coordinator consumes valid Check Evidence without rerunning
-  the command;
+- Review and Integration consume valid Check Evidence without rerunning the
+  command;
 - invalid or absent provenance causes a targeted rerun, not a role-based rerun;
 - one invalid review axis recovers without repeating the other axis;
+- review-axis Runtime readback may bind a different provider/model from the
+  parent and must match the resolved Review Profile;
+- a changed Candidate rechecks both axes using compact delta context;
+- a pre-ID child creation failure leaves no running Agent record and consumes
+  no semantic Attempt;
 - hosted infrastructure failure remains the same candidate and cannot reject
   it;
 - two exhausted semantic Attempts may fail the Plan Node, while repeated
   runtime loss blocks it as runtime unavailable;
 - Plan Node failure wakes the Coordinator for replan and does not
-  automatically fail the Goal.
+  automatically fail the Goal;
 - unchanged Node Key and contract digest adopt the historical verified Result
   without rebinding or rerunning its Attempt.
 
@@ -188,11 +221,13 @@ Scope:
 
 - Admit the full compatible ready frontier in each reconciliation pass.
 - Configure bounded Active Turn pools:
-  eight Worker turns, four Reviewer turns, and one reserved Coordinator turn,
-  further limited by observed provider and Runtime availability.
+  eight Worker turns and one reserved Coordinator turn, further limited by
+  observed provider and Runtime availability.
 - Count only top-level GWO-managed parents in those pools. Internal Subagents
-  delegated by Worker, Reviewer, or Coordinator parents receive no separate
-  Admission or capacity slot.
+  delegated by Worker or Coordinator parents receive no separate Admission or
+  capacity slot. Standard Review has a fixed two-axis fan-out and strict Review
+  may add one specialist. The parent retains its Worker Active Turn Slot while
+  those children execute.
 - Release Active Turn capacity while Attempts are parked on named external
   waits; refill newly available capacity on the next pass.
 - Keep ordinary Write Scope overlap advisory. Hard-exclude only the same Node
@@ -214,7 +249,8 @@ Exit criteria:
 
 - one pass admits `min(compatible ready work, configured and observed
   capacity)`;
-- Reviewer work is bounded without consuming the eight Worker counters;
+- Review fan-out remains bounded per Work Attempt without a separate Reviewer
+  pool;
 - parked CI does not occupy an Agent turn;
 - target-branch mutation remains singular;
 - shadow mode performs no lifecycle, Runtime, or integration mutation;
@@ -230,8 +266,10 @@ Each phase uses the same ownership pattern:
 
 - the implementation Worker produces one immutable candidate and Result Claim;
 - Runtime or Kernel captures the required local Check Evidence once;
-- an independent parent Reviewer reviews that exact candidate, may use internal
-  axis Subagents, and consumes existing Check Evidence;
+- the Candidate-producing Work Attempt invokes independent, history-free
+  review-axis Internal Subagents when its output contract requires them;
+- Runtime observes the axis records and the parent only assembles typed Review
+  Evidence;
 - the Coordinator evaluates the phase exit criteria from those records;
 - hosted CI is the final external check after first publication, not the
   development loop.
@@ -243,8 +281,8 @@ the vertical path.
 ## Suggested implementation issue sequence
 
 1. Supersede the V7 transition decisions and update the normative documents.
-2. Configure the tracker handoff and add the V6.1 fourth-tier Role-Binding
-   backport.
+2. Configure the tracker handoff and add the V6.1 fourth tier plus review
+   Runtime Profile backport.
 3. Implement the ready-ticket-to-Integration in-memory walking skeleton.
 4. Implement durable activation receipt and deterministic recovery.
 5. Implement `/implement-gwo`, Paseo identity, Prompt acceptance, and
@@ -253,10 +291,12 @@ the vertical path.
    continuation.
 7. Implement local check definitions, candidate Evidence, and publication
    eligibility.
-8. Implement transient review, hosted exact-SHA CI, and serial Integration.
+8. Implement Candidate Review Evidence, hosted exact-SHA CI, and serial
+   Integration.
 9. Implement Repair Round, frontier recovery, and terminal-reason
    classification.
-10. Implement bounded 8/4/1 capacity, parking, and refill.
+10. Implement bounded 8/1 top-level capacity, internal review fan-out, parking,
+    and refill.
 11. Implement Store reconstruction, shadow fixtures, and writer fencing.
 12. Run the dedicated canary and cut over from V6.1.
 

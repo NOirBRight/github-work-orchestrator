@@ -1,6 +1,6 @@
 # GWO V8 architecture
 
-Status: accepted design, pre-implementation.
+Status: accepted design; implementation complete through Phase 2.
 
 `CONTEXT.md` is the normative vocabulary. The governing ADR chain preserves
 earlier V7-oriented decisions as superseded history; V8 starts from the actual
@@ -13,8 +13,8 @@ V6.1 production line.
 - Separate Work Item, Plan Node, Admission, Attempt, Runtime Binding, Artifact,
   Evidence, Verification, and Result lifecycles without exposing one shallow
   module per noun.
-- Admit the complete compatible ready frontier and keep bounded Worker and
-  Reviewer capacity productively occupied.
+- Admit the complete compatible ready frontier and keep bounded Worker
+  capacity productively occupied while Review fans out inside those Attempts.
 - Continue a Task Group Goal until verified completion or an explicit blocker
   without requiring a Coordinator Agent to remain alive.
 - Make completion exact-candidate and Evidence based while avoiding routine
@@ -135,8 +135,9 @@ silently falling back or starting planning.
 
 Once inside GWO, neither `implement` nor `implement-gwo` is a valid Plan Node
 Skill Reference. Work nodes use focused execution guidance such as `tdd`,
-`diagnosing-bugs`, `research`, or `prototype`; Review nodes use `code-review`.
-This prevents recursive orchestration and preserves one authoritative Review.
+`diagnosing-bugs`, `research`, or `prototype`. A Candidate-producing Work
+Attempt invokes `code-review` only when its compiled output contract requires
+Review Evidence. This prevents recursive orchestration and duplicate Review.
 
 ## Configuration ownership
 
@@ -154,13 +155,13 @@ The host-local `~/.orch/config.json` owns concrete execution. It contains
 global defaults plus `repositories.<owner/repo>` overrides for:
 
 - Runtime Profiles and Worker-tier bindings;
-- Coordinator and Reviewer role bindings;
+- the auto-created Coordinator role binding and Review Profile selectors;
 - provider, model, thinking, mode, and features;
 - explicit same-or-higher fallbacks;
-- Worker, Reviewer, and Coordinator capacity.
+- Worker and Coordinator capacity.
 
 Repository operational overrides replace complete profiles rather than
-deep-merging model fields. Resolution is:
+deep-merging model fields. Managed Worker and Coordinator resolution is:
 
 ```text
 global host defaults
@@ -171,6 +172,26 @@ global host defaults
 ```
 
 Configuration changes affect new Admissions only.
+
+Review Profile resolution uses the same global-then-repository replacement
+rule when a review child is launched. It is recorded in that axis observation
+rather than a Plan Node Runtime Binding, and a change affects only later child
+launches.
+
+The initial host-local selector shape is:
+
+```json
+{
+  "review_profiles": {
+    "standard_axis": "reviewer_standard",
+    "recovery_axis": "reviewer_recovery",
+    "strict_specialist": "reviewer_strict"
+  }
+}
+```
+
+The values are Runtime Profile IDs. A repository may replace this mapping in
+its host-local override without placing provider or model names in PlanSpec.
 
 ## Deep module layout
 
@@ -185,10 +206,10 @@ compile(plan_intent, source_snapshot, policy_snapshot) -> CompileResult
 
 The pure implementation owns schema validation, semantic normalization, typed
 edge construction, cycle checks, stable Node Keys, contract digests,
-difficulty floors, risk-to-review expansion, serial Integration structure,
-Skill-usage validation, and canonical PlanSpec serialization. It accepts only
-Ready Work Item source snapshots and rejects workflow-command names used as
-execution Skill References.
+difficulty floors, risk-to-review-requirement compilation, serial Integration
+structure, Skill-usage validation, and canonical PlanSpec serialization. It
+accepts only Ready Work Item source snapshots and rejects workflow-command
+names used as execution Skill References.
 
 `CompileResult` is either a `CompiledPlan` containing canonical bytes, digest,
 and Compilation Record or deterministic errors. Nothing else canonicalizes or
@@ -316,10 +337,11 @@ snapshot used by the revision.
 
 A Plan Node contains:
 
-- stable Node Key and kind: `work`, `review`, `decision`, or `integration`;
+- stable Node Key and kind: `work`, `decision`, or `integration`;
 - Goal and Work Item relationship;
 - inputs and the one authoritative typed-edge graph;
-- output contract and required Evidence;
+- output contract, required Evidence, and any compiled
+  `review_requirement`;
 - Effect Contract and resource claims;
 - Runtime Requirements;
 - difficulty, risk, and recovery policy;
@@ -327,6 +349,24 @@ A Plan Node contains:
 
 Concrete Agent, provider, model, Runtime Profile, session, workspace, live
 capacity, token use, elapsed time, and publication state never enter PlanSpec.
+
+For each Candidate-bearing Work Node, the Compiler emits the minimal semantic
+review contract:
+
+```text
+review_requirement:
+  mode: none | dual_axis | strict
+  axes: [] | [standards, spec]
+  specialist_requirements: [stable repository-policy IDs]
+  human_decision_required: true | false
+```
+
+`mode: none` adds no Review Evidence requirement. Other modes require typed
+Review Evidence and exact Candidate and acceptance binding. Provider, model,
+thinking, retry counters, and Review Profile names remain Runtime facts. When
+`human_decision_required` is true, the Compiler also emits the appropriate
+Decision Gate and typed dependency at the repository-policy boundary; it never
+models the human as a Reviewer Agent.
 
 The Plan Revision digest covers the canonical PlanSpec and parent digest. The
 Compilation Record retains source references, source digests, and edge
@@ -354,8 +394,8 @@ The initial bindings are:
 | Worker heavy | Kimi CLI `kimi-code/k3` | high | yolo |
 | Worker frontier | Codex `gpt-5.6-sol` | xhigh | full-access |
 | Auto-created Coordinator | Kimi CLI `kimi-code/k3` | max | yolo |
-| Standard Reviewer | Codex `gpt-5.6-sol` | high | full-access |
-| Strict/recovery Reviewer | Codex `gpt-5.6-sol` | max | full-access |
+| Standard review axis | Codex `gpt-5.6-sol` | high | full-access |
+| Recovery/strict review | Codex `gpt-5.6-sol` | max | full-access |
 
 Codex fast mode is disabled by default.
 
@@ -374,8 +414,9 @@ The initial policy is:
 | complex | heavy | heavy | heavy |
 | frontier | frontier | frontier | frontier |
 
-Review and Coordinator profiles are role bindings, not extra Worker tiers.
-Manual Coordinators retain their actual runtime. Only a missing or
+The Coordinator profile is a Role Binding, while review-axis profiles are
+selectors for Internal Subagents rather than managed roles or extra Worker
+tiers. Manual Coordinators retain their actual runtime. Only a missing or
 irrecoverable Coordinator is auto-created from the configured role profile.
 
 One primary profile may name at most one explicit same-or-higher fallback.
@@ -388,17 +429,20 @@ change routing from those observations automatically.
 
 ### Internal subagent delegation
 
-Worker, Reviewer, and Coordinator parents may delegate bounded work to
-Internal Subagents. GWO manages only the parent: an Internal Subagent receives
-no Plan Node, Admission, Attempt, Role Binding, or GWO Active Turn Slot.
-Configured 8/4/1 capacity therefore counts top-level managed parents only;
-native Runtime and provider limits still apply to internal delegation.
+Worker and Coordinator parents may delegate bounded work to Internal
+Subagents. GWO manages only the parent: an Internal Subagent receives no Plan
+Node, Admission, Attempt, Role Binding, or GWO Active Turn Slot. Configured 8/1
+capacity therefore counts top-level managed parents only; native Runtime and
+provider limits still apply to internal delegation.
 
 Internal Subagents cannot exceed the parent's Effect Contract. They may assist
 with analysis, tests, or scoped workspace changes, but only the parent may
-author authoritative lifecycle transitions, Result Claims, or aggregate Review
-Results. Child failure remains internal to the parent execution and does not
-consume a semantic Attempt or Recovery Ladder step.
+author authoritative lifecycle transitions or Result Claims. Review-axis
+children are read-only, cannot delegate further, and are observed by the
+Runtime Adapter; the parent may only assemble their separate observations into
+Review Evidence without suppressing, merging, or reranking findings. Child
+failure remains internal to the parent execution and does not consume a
+semantic Attempt or Recovery Ladder step.
 
 ## Plan and execution lifecycle
 
@@ -537,15 +581,16 @@ Runtime/provider limit is reached.
 Initial bounded pools are:
 
 - eight active Worker turns;
-- four active Reviewer turns;
 - one reserved Coordinator turn.
 
 These pools count only top-level Agents managed by GWO. Internal Subagents
-created by a parent are not separately admitted or counted. Review does not
-consume the eight Worker counters but remains bounded by its parent Reviewer
-pool and subject to actual provider capacity. Diagnostic work uses Worker
-capacity. Kernel verification, hosted CI, and deterministic Integration consume
-no Agent turn.
+created by a parent are not separately admitted or counted. Each standard
+Review has a fixed fan-out of two axes and strict Review may add one
+specialist. A parent retains its Worker Active Turn Slot while its internal
+review children execute, so eight Worker slots bound concurrent review fan-out;
+actual Runtime and provider capacity supplies further backpressure without a
+separate Reviewer pool. Diagnostic work uses Worker capacity. Kernel
+verification, hosted CI, and deterministic Integration consume no Agent turn.
 
 A parked Attempt may retain its Agent, session, workspace, and necessary
 claims while releasing its Active Turn Slot. Capacity release wakes the Goal
@@ -569,7 +614,7 @@ selector, base sensitivity, and risk.
 The executable-code path is:
 
 ```text
-internal edit and targeted-test loop
+internal edit and cheap affected-test loop
   -> immutable local commit + Result Claim
   -> one repository-equivalent full local suite
      || one exact-SHA local Review
@@ -583,16 +628,24 @@ Publication eligibility is a predicate, not a lifecycle entity. It requires
 one candidate SHA, all required valid local Check Evidence, required Review
 Evidence, and no blocker.
 
-The full local suite and Review may start concurrently after the candidate is
-immutable. The Reviewer consumes Check Evidence and never reruns a valid check.
-The Runtime Adapter may observe local checks directly; otherwise the
-Coordinator or Kernel runs the command. A local result becomes final Check
-Evidence only when its exact candidate, definition, environment, input
-projection, outcome, observer, and log digest or reference can be proven.
+The edit loop's latest cheap affected tests, lint, and type checks must pass and
+their observed tree digest must match the immutable Candidate before it spends
+Review tokens; they are not rerun merely to enter Review. The one full local
+suite and Review may then start concurrently while the Candidate-producing
+parent is parked from further editing. Review consumes valid Check Evidence and
+never reruns it. When the repository-equivalent suite is decomposable, it also
+consumes already valid check components instead of repeating them; a monolithic
+authoritative command runs only once. The Runtime Adapter may observe local
+checks directly; otherwise the Coordinator or Kernel runs the command. A local
+result becomes final Check Evidence only when its exact candidate, definition,
+environment, input projection, outcome, observer, and log digest or reference
+can be proven.
 
-Compact successful records become durable after publication. Full raw logs are
-retained only for failures, strict risk, nondeterminism, contract requirements,
-or expensive results that cannot be reproduced.
+Each valid Review axis is stored locally as soon as it finishes, so recovery
+can retain it for the same Candidate. Compact successful Check and Review
+records become GitHub-durable after publication without rerunning their work.
+Full raw logs are retained only for failures, strict risk, nondeterminism,
+contract requirements, or expensive results that cannot be reproduced.
 
 Cross-SHA check reuse requires equivalent definition, environment, declared
 input projection, base, acceptance, observer, and durable record. Path overlap
@@ -605,23 +658,56 @@ auto-retries remotely; it returns to the local implementation loop.
 
 Review policy is deterministic:
 
-- low risk: objective allowlist and Coordinator inline review;
-- standard risk: one transient parent Reviewer invokes the `code-review`
-  guidance, runs read-only Standards and Spec Internal Subagents in parallel,
-  and aggregates one Review Result;
-- strict risk: the standard review plus the configured specialist or human.
+- low risk: objective allowlist and required checks, with no LLM Review;
+- standard risk: the Candidate-producing Work Attempt invokes `code-review`
+  and runs read-only Standards and Spec Internal Subagents in parallel;
+- strict risk: the standard axes plus the configured specialist or human.
 
 The Compiler may add review requirements but no planner or Agent may remove
-them. A valid Reviewer verdict is a successful Review Result even when it
-contains blockers. Those blockers reject the implementation Candidate. The
-Review Result retains each axis observer, fixed input digest, and output digest.
+them. The Runtime Adapter captures each review child's history-free fixed
+input, provider, model, session, output, and digests. Valid axis observations
+are stored separately and the parent mechanically assembles one typed Review
+Evidence envelope; it cannot merge, suppress, or rerank findings. A hard
+Standards or Spec finding rejects the implementation Candidate, while smells
+and other judgment calls are advisory unless repository policy promotes them.
 Axis Internal Subagents cannot mutate the repository, publish, change tracker
-state, or delegate further.
+state, integrate, or delegate further.
 
-Only an invalid or absent axis invokes Reviewer recovery. A valid axis is
-retained while only the missing axis is rerun in a fresh Sol Max session, after
-which the parent reaggregates the Review Result. The standard parent Reviewer
-uses Sol High, and strict specialists use Sol Max.
+The GWO binding reuses `code-review`'s fixed-point, Standards, Spec, and
+no-reranking guidance, but each axis emits its own schema-valid observation
+directly. The minimal axis payload contains the axis, fixed-input digest,
+runtime source reference, output digest, and findings labelled hard or
+advisory with source and location. Human-readable rendering is a view of those
+records; the parent never parses prose into authority.
+
+Only an invalid or absent axis invokes same-Candidate recovery. A valid axis is
+retained while only the missing axis is rerun once in a fresh Sol Max session.
+Transient pre-ID or transport failure receives the initial execution and at
+most two retries without consuming an Attempt or Repair Round; deterministic
+configuration rejection blocks immediately. Spawn settings are validated
+before dispatch. Each child action key derives from Attempt ID, Candidate SHA,
+axis, and recovery ordinal, so readback-first retry adopts a matching child
+instead of creating a duplicate. No running child record exists until Agent
+identity is read back.
+
+A changed Candidate SHA or diff invalidates both axes. Each axis may receive
+the prior findings and old-to-new delta to reduce prompt size, but it remains
+able to inspect the new complete diff. V8.0 does not add cross-SHA
+unaffected-axis proof. Both axes share the parked clean exact-SHA worktree;
+HEAD and cleanliness are verified before and after Review.
+
+Serial Integration consumes the compiled Review requirement and the exact
+Review Evidence directly; it never invokes another Review merely because it is
+a different consumer. A clean application may reuse the evidence when its
+candidate, diff, acceptance, and base-sensitive inputs remain valid. Rebase,
+conflict resolution, or any other diff change requires a new Review Gate.
+
+The Review Profile selectors map standard axes to Sol High and recovery or
+strict specialists to Sol Max. Missing canonical Spec input fails compilation
+or creates a Decision Gate rather than silently skipping the Spec axis.
+The parent submits bounded axis requests through the Runtime Adapter, which
+resolves the selector and may create a cross-provider Paseo child; a Kimi
+Worker therefore does not need a provider-native Codex subagent facility.
 
 The low-risk allowlist is deterministic and excludes production code,
 workflows, dependencies, schema, authorization, concurrency, public
@@ -633,6 +719,8 @@ Token conservation comes from workflow structure, not from timing out healthy
 work:
 
 - same-session Repair receives only the new findings delta;
+- review axes receive a fixed packet rather than the parent transcript, and a
+  changed Candidate receives prior findings plus the compact SHA delta;
 - a fresh frontier Attempt receives a structured Recovery Packet, normally no
   more than 16k input tokens;
 - the packet contains Goal and acceptance summary, exact SHAs, changed files,
@@ -710,8 +798,12 @@ claims and Runtime resources before another writer generation starts.
 - One repository has one active Plan Revision and one writer generation.
 - One Node Key has at most one non-terminal Admission or Attempt.
 - One Agent has at most one active Attempt.
+- Review is a Candidate output-contract gate and typed Evidence kind, never a
+  Plan Node, Admission, Attempt, or Result.
 - Internal Subagents have no independent Plan Node, Admission, Attempt, Role
   Binding, or GWO capacity slot.
+- Review-axis observations are Runtime-Adapter-observed, kept separate, and
+  cannot be suppressed or reranked by their parent.
 - An Attempt begins only after Runtime Binding and Prompt acceptance readback.
 - Materialization is idempotent, read back before retry, and does not consume
   an Attempt before Prompt acceptance.

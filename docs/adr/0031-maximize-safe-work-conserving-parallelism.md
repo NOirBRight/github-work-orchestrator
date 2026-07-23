@@ -1,5 +1,5 @@
 ---
-status: amended by ADR-0037
+status: amended by ADR-0037 and ADR-0039
 ---
 
 # Maximize safe work-conserving parallelism

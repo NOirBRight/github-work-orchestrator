@@ -130,7 +130,8 @@ _Avoid_: PR opened, merge intended
 
 **Plan Node**:
 One immutable unit of authorized work linked to a Work Item and an explicit
-output contract. V8.0 kinds are work, review, decision, and integration.
+output contract. V8.0 kinds are work, decision, and integration. Review is a
+Candidate Evidence gate inside a Work Node's output contract, not a Plan Node.
 _Avoid_: GitHub Issue, Agent, Attempt
 
 **Node Key**:
@@ -166,6 +167,8 @@ An Agent delegated by a GWO-managed parent Agent inside that parent's assigned
 responsibility. It cannot exceed the parent's Effect Contract and has no
 independent Plan Node, Admission, Attempt, Role Binding, or GWO capacity slot;
 the parent remains accountable for authoritative lifecycle facts and Results.
+Standards, Spec, and specialist review subagents are additionally read-only and
+cannot delegate further.
 _Avoid_: managed top-level Agent, hidden Plan Node, independent Result claimant
 
 **Attempt Terminal Reason**:
@@ -250,9 +253,15 @@ mode, features, and optional fallback.
 _Avoid_: Worker Tier, PlanSpec requirement
 
 **Role Binding**:
-The operational mapping from a runtime role, such as auto-created Coordinator
-or Reviewer, to a Runtime Profile.
+The operational mapping from a managed runtime role, such as auto-created
+Coordinator, to a Runtime Profile.
 _Avoid_: extra Worker tier, Agent identity
+
+**Review Profile**:
+The host-local global or repository mapping from `standard_axis`,
+`recovery_axis`, or `strict_specialist` to a Runtime Profile used for an
+Internal Subagent. It is not a Role Binding or PlanSpec field.
+_Avoid_: Reviewer Role Binding, Worker Tier, managed Reviewer identity
 
 **Runtime Policy**:
 The deterministic policy that resolves Runtime Requirements, Worker Tier,
@@ -317,8 +326,17 @@ definition, environment, input projection, outcome, and durable source.
 _Avoid_: reported pass, mandatory rerun
 
 **Review Evidence**:
-A structured review observation bound to one Candidate and acceptance digest.
-_Avoid_: permanent Reviewer identity, reanalysis by every consumer
+A Runtime-Adapter-observed, exact-Candidate record containing separate
+Standards and Spec axis observations, plus any required specialist observation.
+Each axis retains its fixed input, runtime identity, output, and digest; the
+parent cannot merge or rerank findings.
+_Avoid_: Review Result, permanent Reviewer identity, Worker self-report
+
+**Review Gate**:
+The output-contract requirement that a Candidate carry the risk-required,
+blocker-free Review Evidence before publication or Integration. It has no
+Plan Node, Admission, Attempt, or lifecycle of its own.
+_Avoid_: Review Plan Node, transient parent Reviewer, Coordinator approval
 
 **Evidence Manifest**:
 The compact durable index of required Evidence digests and source references.
@@ -344,11 +362,13 @@ and Review Evidence and no blocker, permitting its first push.
 _Avoid_: lifecycle state, mutable candidate freeze
 
 **Code Review**:
-A transient parent Reviewer aggregates independent Standards and Spec axis
-observations into one Review Result. Axis observers may be Internal Subagents;
-a missing or invalid axis can be recovered without repeating a valid axis. A
-valid blocker verdict is still a successful Review Result.
-_Avoid_: permanent dual Reviewer pair, merge authority
+The Candidate-producing Work Attempt invokes `code-review` with a fixed,
+history-free packet and runs independent read-only Standards and Spec Internal
+Subagents in parallel. The Runtime Adapter observes their outputs and the
+parent mechanically assembles Review Evidence without merging or reranking
+findings. A missing or invalid axis can be recovered without repeating a valid
+axis for the same Candidate.
+_Avoid_: Review Plan Node, Review Result, permanent dual Reviewer pair
 
 ## Durability and transition
 
