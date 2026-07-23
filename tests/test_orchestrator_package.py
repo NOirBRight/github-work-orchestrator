@@ -10,6 +10,7 @@ from conftest import load_module
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "skills" / "orchestrator"
+ENTRY_PACKAGE = ROOT / "skills" / "implement-gwo"
 
 
 def _load(name: str, path: Path):
@@ -20,40 +21,46 @@ def test_quick_validation_and_manifest_are_at_fixed_point():
     quick = _load("quick_validate_v6_test", ROOT / "scripts" / "quick_validate.py")
     sync = _load("sync_orchestrator_v6_test", ROOT / "scripts" / "sync_orchestrator.py")
     assert quick.findings(ROOT) == []
-    assert sync.manifest_drift(PACKAGE) == []
-    manifest = json.loads((PACKAGE / ".skill-package.json").read_text(encoding="utf-8"))
-    assert manifest == {
-        "content_sha256": sync.package_digest(PACKAGE),
-        "schema_version": 1,
-        "skill": "orchestrator",
-        "version": "6.1.0",
-    }
+    for package, skill in (
+        (PACKAGE, "orchestrator"),
+        (ENTRY_PACKAGE, "implement-gwo"),
+    ):
+        assert sync.manifest_drift(package) == []
+        manifest = json.loads(
+            (package / ".skill-package.json").read_text(encoding="utf-8")
+        )
+        assert manifest == {
+            "content_sha256": sync.package_digest(package),
+            "schema_version": 1,
+            "skill": skill,
+            "version": "8.0.0",
+        }
 
 
-def test_only_one_skill_and_no_compatibility_entry_remain():
+def test_phase_two_exposes_implement_gwo_and_one_release_alias_only():
     assert not (ROOT / "SKILL.md").exists()
     assert not (ROOT / "skills" / "agile-orchestrator" / "SKILL.md").exists()
     skill_files = sorted((ROOT / "skills").glob("*/SKILL.md"))
-    assert skill_files == [PACKAGE / "SKILL.md"]
+    assert skill_files == [ENTRY_PACKAGE / "SKILL.md", PACKAGE / "SKILL.md"]
 
 
 def test_skill_description_uses_a_strict_yaml_safe_scalar():
-    lines = (PACKAGE / "SKILL.md").read_text(encoding="utf-8").splitlines()
-    closing_fence = lines.index("---", 1)
-    frontmatter = lines[1:closing_fence]
-    description_line = next(
-        line for line in frontmatter if line.startswith("description: ")
-    )
-    scalar = description_line.removeprefix("description: ")
-
-    assert scalar.startswith('"')
-    assert scalar.endswith('"')
-    assert "repository: preflight" in scalar
+    for package in (PACKAGE, ENTRY_PACKAGE):
+        lines = (package / "SKILL.md").read_text(encoding="utf-8").splitlines()
+        closing_fence = lines.index("---", 1)
+        frontmatter = lines[1:closing_fence]
+        description_line = next(
+            line for line in frontmatter if line.startswith("description: ")
+        )
+        scalar = description_line.removeprefix("description: ")
+        assert scalar.startswith('"')
+        assert scalar.endswith('"')
 
 
 def test_skill_and_templates_keep_lightweight_line_budgets():
     budgets = {
         PACKAGE / "SKILL.md": 220,
+        ENTRY_PACKAGE / "SKILL.md": 120,
         PACKAGE / "templates" / "worker-prompt.md": 60,
         PACKAGE / "templates" / "reviewer-prompt.md": 40,
         ROOT / "docs" / "orchestrator-v6-living-design.md": 220,
@@ -62,9 +69,11 @@ def test_skill_and_templates_keep_lightweight_line_budgets():
         assert len(path.read_text(encoding="utf-8").splitlines()) <= limit
 
 
-def test_skill_forbids_old_control_plane_and_documents_role_profiles():
-    skill = (PACKAGE / "SKILL.md").read_text(encoding="utf-8")
-    compact = " ".join(skill.split())
+def test_entry_is_fail_closed_and_runtime_role_profiles_remain_configured():
+    entry = (ENTRY_PACKAGE / "SKILL.md").read_text(encoding="utf-8")
+    alias = (PACKAGE / "SKILL.md").read_text(encoding="utf-8")
+    compact_entry = " ".join(entry.split())
+    compact_alias = " ".join(alias.split())
     config = (PACKAGE / "references" / "runtime-config.md").read_text(encoding="utf-8")
     compact_config = " ".join(config.split())
     for required in (
@@ -76,13 +85,15 @@ def test_skill_forbids_old_control_plane_and_documents_role_profiles():
     ):
         assert required in compact_config
     for required in (
-        "not a permanent Agent",
-        "never holds a long Lease",
-        "Do not poll busy Workers",
-        "one no-ACK wake",
-        "foreign-parent Agent is a manual candidate",
+        "never fall back to `/implement`",
+        "Retry one unchanged Materialization action at most three executions",
+        "Do not poll Agents",
+        "coordinator_auto",
     ):
-        assert required in compact
+        assert required in compact_entry
+    assert "compatibility alias" in compact_alias
+    assert "$implement-gwo" in compact_alias
+    assert "V8.1" in compact_alias
 
 
 def test_config_example_exposes_the_phase_zero_runtime_profiles():
@@ -121,21 +132,26 @@ def test_config_example_exposes_the_phase_zero_runtime_profiles():
     assert config["repositories"]["owner/repo"]["role_profiles"] == {}
 
 
-def test_skill_ends_dispatch_turn_instead_of_polling_workers():
-    text = (PACKAGE / "SKILL.md").read_text(encoding="utf-8")
-    assert "End the current turn after dispatch or Reviewer creation" in text
-    assert "Never sleep, loop, or poll while waiting for an Agent" in text
+def test_goal_entry_waits_without_polling_or_token_based_progress():
+    text = (ENTRY_PACKAGE / "SKILL.md").read_text(encoding="utf-8")
+    assert "wait on the named condition without an LLM turn" in text
+    assert "treat token use as progress" in text
+    assert "elapsed time to fail" in text
 
 
 def test_openai_metadata_is_explicit_and_invocable():
-    text = (PACKAGE / "agents" / "openai.yaml").read_text(encoding="utf-8")
-    assert 'display_name: "Orchestrator"' in text
-    assert "$orchestrator" in text
-    assert "allow_implicit_invocation: true" in text
+    entry = (ENTRY_PACKAGE / "agents" / "openai.yaml").read_text(encoding="utf-8")
+    alias = (PACKAGE / "agents" / "openai.yaml").read_text(encoding="utf-8")
+    assert 'display_name: "Implement with GWO"' in entry
+    assert "$implement-gwo" in entry
+    assert "allow_implicit_invocation: false" in entry
+    assert 'display_name: "Orchestrator (compatibility alias)"' in alias
+    assert "$orchestrator" in alias
+    assert "$implement-gwo" in alias
+    assert "allow_implicit_invocation: false" in alias
 
 
-def test_v61_parallel_frontier_is_documented_as_one_consistent_model():
-    skill = (PACKAGE / "SKILL.md").read_text(encoding="utf-8")
+def test_v61_parallel_frontier_remains_documented_during_compatibility_release():
     design = (ROOT / "docs" / "orchestrator-v6-living-design.md").read_text(
         encoding="utf-8"
     )
@@ -149,7 +165,6 @@ def test_v61_parallel_frontier_is_documented_as_one_consistent_model():
         "integration WIP",
         "orchestrator:issue:v2",
     ):
-        assert required in skill
         assert required in design
     for term in (
         "Candidate Pool",
@@ -166,7 +181,7 @@ def test_v61_parallel_frontier_is_documented_as_one_consistent_model():
     ).is_file()
 
 
-def test_three_install_surfaces_are_byte_identical_and_cli_smokes(tmp_path):
+def test_three_install_surfaces_receive_both_packages_and_cli_smokes(tmp_path):
     sync = _load(
         "sync_orchestrator_v61_install_test",
         ROOT / "scripts" / "sync_orchestrator.py",
@@ -175,8 +190,9 @@ def test_three_install_surfaces_are_byte_identical_and_cli_smokes(tmp_path):
         tmp_path / surface / "skills" for surface in (".agents", ".codex", ".claude")
     ]
     for root in roots:
-        sync.install_atomic(PACKAGE, root, tmp_path / "backups")
-        assert sync.install_drift(PACKAGE, root) == []
+        for package in (PACKAGE, ENTRY_PACKAGE):
+            sync.install_atomic(package, root, tmp_path / "backups")
+            assert sync.install_drift(package, root) == []
 
     cli = roots[0] / "orchestrator" / "scripts" / "orch.py"
     result = subprocess.run(

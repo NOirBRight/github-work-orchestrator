@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, check, and atomically install the sole Orchestrator Skill package."""
+"""Build, check, and atomically install the GWO V8 Skill packages."""
 
 from __future__ import annotations
 
@@ -13,8 +13,10 @@ import shutil
 import uuid
 
 
-SKILL = "orchestrator"
-VERSION = "6.1.0"
+PACKAGES = {
+    "implement-gwo": "8.0.0",
+    "orchestrator": "8.0.0",
+}
 MANIFEST = ".skill-package.json"
 TEXT_SUFFIXES = {".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
 
@@ -42,11 +44,16 @@ def package_digest(package: Path) -> str:
 
 
 def expected_manifest(package: Path) -> dict[str, object]:
+    skill = package.name
+    try:
+        version = PACKAGES[skill]
+    except KeyError as error:
+        raise ValueError(f"unknown GWO Skill package: {skill}") from error
     return {
         "content_sha256": package_digest(package),
         "schema_version": 1,
-        "skill": SKILL,
-        "version": VERSION,
+        "skill": skill,
+        "version": version,
     }
 
 
@@ -70,7 +77,7 @@ def manifest_drift(package: Path) -> list[str]:
 
 
 def install_drift(source: Path, install_root: Path) -> list[str]:
-    installed = install_root / SKILL
+    installed = install_root / source.name
     if not installed.is_dir():
         return [f"missing installed Skill: {installed}"]
     source_manifest = json.loads((source / MANIFEST).read_text(encoding="utf-8"))
@@ -88,8 +95,11 @@ def install_drift(source: Path, install_root: Path) -> list[str]:
 def install_atomic(source: Path, install_root: Path, backup_root: Path) -> None:
     install_root.mkdir(parents=True, exist_ok=True)
     backup_root.mkdir(parents=True, exist_ok=True)
-    target = install_root / SKILL
-    temporary = install_root / f".{SKILL}.tmp-{uuid.uuid4().hex}"
+    skill = source.name
+    if skill not in PACKAGES:
+        raise ValueError(f"unknown GWO Skill package: {skill}")
+    target = install_root / skill
+    temporary = install_root / f".{skill}.tmp-{uuid.uuid4().hex}"
     shutil.copytree(
         source, temporary, ignore=shutil.ignore_patterns("__pycache__", "*.pyc")
     )
@@ -99,7 +109,7 @@ def install_atomic(source: Path, install_root: Path, backup_root: Path) -> None:
     if target.exists():
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         surface = install_root.parent.name or "skills"
-        backup = backup_root / f"{surface}-{SKILL}-{stamp}-{uuid.uuid4().hex[:8]}"
+        backup = backup_root / f"{surface}-{skill}-{stamp}-{uuid.uuid4().hex[:8]}"
         shutil.move(str(target), str(backup))
     os.replace(temporary, target)
 
@@ -120,26 +130,39 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    source = args.root.resolve() / "skills" / SKILL
+    sources = [
+        args.root.resolve() / "skills" / skill
+        for skill in sorted(PACKAGES)
+    ]
     if not args.check:
-        write_manifest(source)
-    findings = manifest_drift(source)
+        for source in sources:
+            write_manifest(source)
+    findings = [
+        finding
+        for source in sources
+        for finding in manifest_drift(source)
+    ]
+    if args.install and findings:
+        raise SystemExit("refusing to install stale source manifests")
     if args.install:
-        if findings:
-            raise SystemExit("refusing to install a stale source manifest")
+        for source in sources:
+            for root in args.install_root:
+                install_atomic(
+                    source,
+                    root.expanduser().resolve(),
+                    args.backup_root.expanduser().resolve(),
+                )
+    for source in sources:
         for root in args.install_root:
-            install_atomic(
-                source,
-                root.expanduser().resolve(),
-                args.backup_root.expanduser().resolve(),
-            )
-    for root in args.install_root:
-        findings.extend(install_drift(source, root.expanduser().resolve()))
+            findings.extend(install_drift(source, root.expanduser().resolve()))
     if findings:
         for finding in findings:
             print(f"error: {finding}")
         return 1
-    print(f"{SKILL} {VERSION} package synchronized")
+    versions = ", ".join(
+        f"{skill} {version}" for skill, version in sorted(PACKAGES.items())
+    )
+    print(f"{versions} packages synchronized")
     return 0
 
 

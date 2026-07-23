@@ -1,0 +1,7 @@
+interface:
+  display_name: "Implement with GWO"
+  short_description: "Run Ready work through durable GWO V8 orchestration"
+  default_prompt: "Use $implement-gwo to execute the Ready Work Item or accepted Ready set through the durable GWO V8 workflow."
+
+policy:
+  allow_implicit_invocation: false

@@ -1,7 +1,7 @@
 interface:
-  display_name: "Orchestrator"
-  short_description: "Preflight and run parallel rolling GitHub work"
-  default_prompt: "Use $orchestrator to scan the repository frontier, admit decision-complete Issues, and dispatch the next safe parallel wave."
+  display_name: "Orchestrator (compatibility alias)"
+  short_description: "Temporary alias for Implement with GWO"
+  default_prompt: "Use $implement-gwo for this request and note that $orchestrator is removed in V8.1."
 
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

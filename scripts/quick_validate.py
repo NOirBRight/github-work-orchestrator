@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fast syntax, package, metadata, link, and line-budget checks for V6.1."""
+"""Fast syntax, package, metadata, link, and line-budget checks for GWO V8."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ import re
 import sys
 
 
-SKILL = "orchestrator"
+SKILLS = ("implement-gwo", "orchestrator")
+CORE_SKILL = "orchestrator"
 REQUIRED = (
     ".skill-package.json",
     "SKILL.md",
@@ -44,17 +45,25 @@ def _sync_module(root: Path):
 
 def findings(root: Path) -> list[str]:
     errors: list[str] = []
-    package = root / "skills" / SKILL
+    package = root / "skills" / CORE_SKILL
+    entry_package = root / "skills" / "implement-gwo"
     for relative in REQUIRED:
         if not (package / relative).is_file():
-            errors.append(f"missing package file: skills/{SKILL}/{relative}")
+            errors.append(
+                f"missing package file: skills/{CORE_SKILL}/{relative}"
+            )
+    for relative in (".skill-package.json", "SKILL.md", "agents/openai.yaml"):
+        if not (entry_package / relative).is_file():
+            errors.append(
+                f"missing package file: skills/implement-gwo/{relative}"
+            )
     skill_dirs = sorted(
         path.name
         for path in (root / "skills").iterdir()
         if (path / "SKILL.md").is_file()
     )
-    if skill_dirs != [SKILL]:
-        errors.append(f"expected sole Skill {SKILL}, found {skill_dirs}")
+    if skill_dirs != sorted(SKILLS):
+        errors.append(f"expected GWO Skills {sorted(SKILLS)}, found {skill_dirs}")
     if (root / "SKILL.md").exists():
         errors.append("root compatibility SKILL.md must not exist")
     for script in sorted((root / "skills").rglob("*.py")):
@@ -69,9 +78,21 @@ def findings(root: Path) -> list[str]:
         skill_text.startswith("---\n")
         and "\nname: orchestrator\n" in skill_text
         and "\ndescription:" in skill_text
-        and "V6.1" in skill_text
+        and "compatibility alias" in skill_text
     ):
-        errors.append("invalid Orchestrator Skill frontmatter/version")
+        errors.append("invalid Orchestrator compatibility Skill")
+    entry_text = (
+        (entry_package / "SKILL.md").read_text(encoding="utf-8")
+        if entry_package.is_dir()
+        else ""
+    )
+    if not (
+        entry_text.startswith("---\n")
+        and "\nname: implement-gwo\n" in entry_text
+        and "\ndescription:" in entry_text
+        and "ready-for-agent" in entry_text
+    ):
+        errors.append("invalid implement-gwo Skill")
     for relative, maximum in LINE_BUDGETS.items():
         path = package / relative
         if (
@@ -100,6 +121,19 @@ def findings(root: Path) -> list[str]:
         ):
             if required not in text:
                 errors.append(f"agents/openai.yaml missing {required}")
+    entry_yaml = entry_package / "agents" / "openai.yaml"
+    if entry_yaml.is_file():
+        text = entry_yaml.read_text(encoding="utf-8")
+        for required in (
+            "display_name:",
+            "short_description:",
+            "default_prompt:",
+            "$implement-gwo",
+        ):
+            if required not in text:
+                errors.append(
+                    f"implement-gwo agents/openai.yaml missing {required}"
+                )
     markdown = [
         package / "SKILL.md",
         *package.rglob("*.md"),
@@ -113,8 +147,10 @@ def findings(root: Path) -> list[str]:
             clean = target.split("#", 1)[0]
             if clean and not (path.parent / clean).resolve().exists():
                 errors.append(f"broken link: {path.relative_to(root)} -> {target}")
-    if package.is_dir():
-        errors.extend(_sync_module(root).manifest_drift(package))
+    for skill in SKILLS:
+        candidate = root / "skills" / skill
+        if candidate.is_dir():
+            errors.extend(_sync_module(root).manifest_drift(candidate))
     return errors
 
 
