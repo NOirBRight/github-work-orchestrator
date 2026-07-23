@@ -25,7 +25,13 @@ _FRONTIER_SPEC.loader.exec_module(frontier)
 
 
 PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
-TIERS = {"light", "standard", "heavy"}
+TIERS = {"light", "standard", "heavy", "frontier"}
+ROLE_PROFILES = {
+    "coordinator_auto",
+    "reviewer_standard",
+    "reviewer_strict",
+    "reviewer_recovery",
+}
 ISSUE_MARKER_V1 = "<!-- orchestrator:issue:v1 -->"
 ISSUE_MARKER_V2 = "<!-- orchestrator:issue:v2 -->"
 DELIVERY_MARKER = "<!-- orchestrator:delivery:v1 -->"
@@ -1297,23 +1303,12 @@ def coordination_mutex(path: Path, *, timeout_seconds: float = 5.0):
         handle.close()
 
 
-def resolve_runtime(
-    config: dict[str, Any],
+def _validate_resolved_runtime(
+    resolved: dict[str, Any],
     *,
-    repository: str,
-    issue: dict[str, Any],
     coordinator_runtime: dict[str, Any],
     capabilities: dict[str, Any],
 ) -> dict[str, Any]:
-    """Resolve and validate one Worker/Reviewer runtime binding."""
-
-    resolved = resolve_runtime_request(
-        config,
-        repository=repository,
-        issue=issue,
-        coordinator_runtime=coordinator_runtime,
-    )
-    tier = resolved["tier"]
     provider = resolved["provider"]
     settings = dict(resolved["settings"])
 
@@ -1373,7 +1368,34 @@ def resolve_runtime(
             f"features unavailable: {sorted(unknown_features)}",
         )
 
-    return {"tier": tier, "provider": provider, "settings": settings}
+    identity = (
+        {"role": resolved["role"]}
+        if "role" in resolved
+        else {"tier": resolved["tier"]}
+    )
+    return {**identity, "provider": provider, "settings": settings}
+
+
+def resolve_runtime(
+    config: dict[str, Any],
+    *,
+    repository: str,
+    issue: dict[str, Any],
+    coordinator_runtime: dict[str, Any],
+    capabilities: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve and validate one Worker runtime binding."""
+
+    return _validate_resolved_runtime(
+        resolve_runtime_request(
+            config,
+            repository=repository,
+            issue=issue,
+            coordinator_runtime=coordinator_runtime,
+        ),
+        coordinator_runtime=coordinator_runtime,
+        capabilities=capabilities,
+    )
 
 
 def resolve_runtime_request(
@@ -1416,6 +1438,57 @@ def resolve_runtime_request(
             raise PolicyError("RUNTIME_MODEL_MISSING", f"tier {tier} has no model")
 
     return {"tier": tier, "provider": provider, "settings": settings}
+
+
+def resolve_role_runtime_request(
+    config: dict[str, Any],
+    *,
+    repository: str,
+    role: str,
+) -> dict[str, Any]:
+    """Resolve one named operational role independently from Worker tiers."""
+
+    if role not in ROLE_PROFILES:
+        raise PolicyError("RUNTIME_ROLE_INVALID", f"unknown runtime role: {role}")
+    repo = (config.get("repositories") or {}).get(repository) or {}
+    mapping = (repo.get("role_profiles") or {}).get(role)
+    if mapping is None:
+        mapping = (config.get("role_profiles") or {}).get(role)
+    if not isinstance(mapping, dict):
+        raise PolicyError(
+            "RUNTIME_ROLE_PROFILE_MISSING", f"runtime role has no profile: {role}"
+        )
+
+    provider = mapping.get("provider")
+    settings = dict(mapping.get("settings") or {})
+    if not isinstance(provider, str) or not provider:
+        raise PolicyError(
+            "RUNTIME_PROVIDER_MISSING", f"runtime role has no provider: {role}"
+        )
+    if not settings.get("model"):
+        raise PolicyError("RUNTIME_MODEL_MISSING", f"runtime role has no model: {role}")
+    return {"role": role, "provider": provider, "settings": settings}
+
+
+def resolve_role_runtime(
+    config: dict[str, Any],
+    *,
+    repository: str,
+    role: str,
+    coordinator_runtime: dict[str, Any],
+    capabilities: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve and validate one named operational role profile."""
+
+    return _validate_resolved_runtime(
+        resolve_role_runtime_request(
+            config,
+            repository=repository,
+            role=role,
+        ),
+        coordinator_runtime=coordinator_runtime,
+        capabilities=capabilities,
+    )
 
 
 def materialize_worker_action(
@@ -1547,16 +1620,30 @@ def materialize_reviewer_action(
             "REVIEW_WORKSPACE_ID_MISSING",
             "Reviewer requires the read-backed candidate Workspace",
         )
-    tier = (config.get("reviewer_tiers") or {}).get(
-        "strict" if action.get("strength") == "heavy" else "standard",
-        "heavy" if action.get("strength") == "heavy" else "standard",
-    )
-    runtime = resolve_runtime_request(
-        config,
-        repository=repository,
-        issue={"difficulty": tier, "milestone": issue.get("milestone")},
-        coordinator_runtime=coordinator_runtime,
-    )
+    review_level = "strict" if action.get("strength") == "heavy" else "standard"
+    role = f"reviewer_{review_level}"
+    repository_config = (config.get("repositories") or {}).get(repository) or {}
+    configured_roles = {
+        **dict(config.get("role_profiles") or {}),
+        **dict(repository_config.get("role_profiles") or {}),
+    }
+    if role in configured_roles:
+        runtime = resolve_role_runtime_request(
+            config,
+            repository=repository,
+            role=role,
+        )
+    else:
+        tier = (config.get("reviewer_tiers") or {}).get(
+            review_level,
+            "heavy" if review_level == "strict" else "standard",
+        )
+        runtime = resolve_runtime_request(
+            config,
+            repository=repository,
+            issue={"difficulty": tier, "milestone": issue.get("milestone")},
+            coordinator_runtime=coordinator_runtime,
+        )
     claims = contract_change_claims(contract)
     prompt_claims = {
         **claims,
@@ -2667,6 +2754,7 @@ def migrate_v5_config(old: dict[str, Any]) -> dict[str, Any]:
             },
         },
         "tiers": tiers,
+        "role_profiles": {},
         "reviewer_tiers": {"standard": "standard", "strict": "heavy"},
         "repositories": {},
     }
@@ -2689,6 +2777,7 @@ def default_config() -> dict[str, Any]:
             },
         },
         "tiers": {},
+        "role_profiles": {},
         "reviewer_tiers": {"standard": "standard", "strict": "heavy"},
         "repositories": {},
     }
@@ -2699,11 +2788,18 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise PolicyError("CONFIG_SCHEMA_INVALID", "config schema_version must be 1")
     global_config = config.get("global") or {}
     tiers_config = config.get("tiers") or {}
+    role_profiles = config.get("role_profiles", {})
     repositories = config.get("repositories") or {}
     reviewer_tiers = config.get("reviewer_tiers") or {}
     if not all(
         isinstance(value, dict)
-        for value in (global_config, tiers_config, repositories, reviewer_tiers)
+        for value in (
+            global_config,
+            tiers_config,
+            role_profiles,
+            repositories,
+            reviewer_tiers,
+        )
     ):
         raise PolicyError("CONFIG_SCHEMA_INVALID", "config sections must be objects")
     legacy_slots = global_config.get("worker_slots")
@@ -2827,6 +2923,27 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
                 binding.get("settings"), dict
             ):
                 raise PolicyError("RUNTIME_BINDING_INVALID", f"invalid {scope} binding")
+    for scope, mappings in (
+        ("global", role_profiles),
+        *(
+            (f"repository:{repo}", (settings or {}).get("role_profiles") or {})
+            for repo, settings in repositories.items()
+            if isinstance(settings, dict)
+        ),
+    ):
+        for role, binding in mappings.items():
+            if role not in ROLE_PROFILES or not isinstance(binding, dict):
+                raise PolicyError(
+                    "RUNTIME_ROLE_PROFILE_INVALID",
+                    f"invalid {scope} role profile",
+                )
+            if not isinstance(binding.get("provider"), str) or not isinstance(
+                binding.get("settings"), dict
+            ):
+                raise PolicyError(
+                    "RUNTIME_ROLE_PROFILE_INVALID",
+                    f"invalid {scope} role binding",
+                )
     if any(
         not isinstance(tier, str) or tier not in TIERS
         for tier in reviewer_tiers.values()
@@ -2896,6 +3013,14 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise PolicyError(
                 "INTAKE_CONFIG_INVALID",
                 f"repository:{repository} intake must be an object",
+            )
+        repository_role_profiles = settings.get("role_profiles")
+        if repository_role_profiles is not None and not isinstance(
+            repository_role_profiles, dict
+        ):
+            raise PolicyError(
+                "RUNTIME_ROLE_PROFILE_INVALID",
+                f"repository:{repository} role_profiles must be an object",
             )
         validate_intake(
             {

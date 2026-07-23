@@ -21,11 +21,76 @@ stores only Difficulty Tier; concrete runtimes never become repository truth.
   },
   "tiers": {
     "light": {
-      "provider": "provider-id",
+      "provider": "kimi-cli",
       "settings": {
-        "model": "fast-model",
-        "thinkingOptionId": "low",
-        "modeId": "unattended-mode",
+        "model": "kimi-code/kimi-for-coding",
+        "thinkingOptionId": "high",
+        "modeId": "yolo",
+        "features": {}
+      }
+    },
+    "standard": {
+      "provider": "kimi-cli",
+      "settings": {
+        "model": "kimi-code/kimi-for-coding",
+        "thinkingOptionId": "max",
+        "modeId": "yolo",
+        "features": {}
+      }
+    },
+    "heavy": {
+      "provider": "kimi-cli",
+      "settings": {
+        "model": "kimi-code/k3",
+        "thinkingOptionId": "high",
+        "modeId": "yolo",
+        "features": {}
+      }
+    },
+    "frontier": {
+      "provider": "codex",
+      "settings": {
+        "model": "gpt-5.6-sol",
+        "thinkingOptionId": "xhigh",
+        "modeId": "full-access",
+        "features": {}
+      }
+    }
+  },
+  "role_profiles": {
+    "coordinator_auto": {
+      "provider": "kimi-cli",
+      "settings": {
+        "model": "kimi-code/k3",
+        "thinkingOptionId": "max",
+        "modeId": "yolo",
+        "features": {}
+      }
+    },
+    "reviewer_standard": {
+      "provider": "codex",
+      "settings": {
+        "model": "gpt-5.6-sol",
+        "thinkingOptionId": "high",
+        "modeId": "full-access",
+        "features": {}
+      }
+    },
+    "reviewer_strict": {
+      "provider": "codex",
+      "settings": {
+        "model": "gpt-5.6-sol",
+        "thinkingOptionId": "max",
+        "modeId": "full-access",
+        "features": {}
+      }
+    },
+    "reviewer_recovery": {
+      "provider": "codex",
+      "settings": {
+        "model": "gpt-5.6-sol",
+        "thinkingOptionId": "max",
+        "modeId": "full-access",
         "features": {}
       }
     }
@@ -44,6 +109,7 @@ stores only Difficulty Tier; concrete runtimes never become repository truth.
       "default_tier": "standard",
       "milestone_tiers": {"release-name": "heavy"},
       "tiers": {},
+      "role_profiles": {},
       "project_number": null
     }
   }
@@ -113,20 +179,28 @@ only `idle`, `stopped`, `closed`, `finished`, or `completed`; resume accepts
 only `running` or `busy`. A bare `status=succeeded` never releases or reacquires
 execution/integration capacity and Conflict Claims.
 
-Resolution is Issue Tier, Milestone default, repository default, global
+Worker resolution is Issue Tier, Milestone default, repository default, global
 default, then `standard`; runtime mapping is repository Tier, global Tier,
-then the current Coordinator runtime. Missing mode/features may inherit only
-from the same current provider. Every concrete model, thinking option, mode,
-and feature is checked against fresh Paseo capabilities before creation.
-Ambiguous or unsupported combinations fail closed for that action.
+then the current Coordinator runtime. The four Worker tiers are `light`,
+`standard`, `heavy`, and `frontier`.
 
-The Coordinator always uses its current session runtime. There is deliberately
-no `roles.coordinator` binding.
+Operational roles resolve independently through `role_profiles`: repository
+override, then global profile. `coordinator_auto` is only for a future
+automatic fallback; V6.1 continues to use the current manually created
+Coordinator. `reviewer_standard` and `reviewer_strict` select Reviewer
+runtimes without turning Reviewer strength into a Worker tier.
+`reviewer_recovery` is reserved for targeted review recovery in V8.
+
+Missing mode/features may inherit only from the same current provider. Every
+concrete model, thinking option, mode, and feature is checked against fresh
+Paseo capabilities before creation. Ambiguous or unsupported combinations
+fail closed for that action.
 
 If V6.1 finds `~/.orch/providers.json` but no new config, it copies the source to
 `providers.v5.backup.json`, translates model and `thinking` to the new settings
-shape, and atomically installs `config.json`. It ignores V5 role bindings and
-never reads the old file at runtime afterwards.
+shape, and atomically installs `config.json`. It ignores ambiguous V5
+`roles` bindings, initializes an empty `role_profiles` map, and never reads the
+old file at runtime afterwards.
 
 Valid execution slots are 1–5. Integration WIP must be at least execution
 capacity and at most 20. Candidate and Ready Reserve limits are at most 100;

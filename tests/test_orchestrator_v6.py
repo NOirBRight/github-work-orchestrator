@@ -2053,6 +2053,177 @@ def test_config_resolution_order_and_v5_migration_preserve_thinking():
     assert binding["settings"]["model"] == "repo-heavy"
 
 
+def test_frontier_worker_tier_resolves_repository_override():
+    core = load_core()
+    config = core.default_config()
+    config["tiers"]["frontier"] = {
+        "provider": "codex",
+        "settings": {
+            "model": "global-frontier",
+            "thinkingOptionId": "xhigh",
+            "modeId": "full-access",
+            "features": {},
+        },
+    }
+    config["repositories"]["owner/repo"] = {
+        "tiers": {
+            "frontier": {
+                "provider": "codex",
+                "settings": {
+                    "model": "repo-frontier",
+                    "thinkingOptionId": "xhigh",
+                    "modeId": "full-access",
+                    "features": {},
+                },
+            }
+        }
+    }
+
+    core.validate_config(config)
+    resolved = core.resolve_runtime_request(
+        config,
+        repository="owner/repo",
+        issue={"difficulty": "frontier"},
+        coordinator_runtime={
+            "provider": "codex",
+            "settings": {"model": "current", "modeId": "full-access"},
+        },
+    )
+
+    assert resolved == {
+        "tier": "frontier",
+        "provider": "codex",
+        "settings": {
+            "model": "repo-frontier",
+            "thinkingOptionId": "xhigh",
+            "modeId": "full-access",
+            "features": {},
+        },
+    }
+    assert core.validate_contract(_contract(core, difficulty="frontier"))[
+        "difficulty"
+    ] == "frontier"
+
+
+def test_role_profiles_resolve_independently_with_repository_override():
+    core = load_core()
+    config = core.default_config()
+    config["role_profiles"] = {
+        "coordinator_auto": {
+            "provider": "kimi-cli",
+            "settings": {
+                "model": "kimi-code/k3",
+                "thinkingOptionId": "max",
+                "modeId": "yolo",
+                "features": {},
+            },
+        },
+        "reviewer_standard": {
+            "provider": "codex",
+            "settings": {
+                "model": "global-reviewer",
+                "thinkingOptionId": "high",
+                "modeId": "full-access",
+                "features": {},
+            },
+        },
+    }
+    config["repositories"]["owner/repo"] = {
+        "role_profiles": {
+            "reviewer_standard": {
+                "provider": "codex",
+                "settings": {
+                    "model": "repo-reviewer",
+                    "thinkingOptionId": "high",
+                    "modeId": "full-access",
+                    "features": {},
+                },
+            }
+        }
+    }
+
+    core.validate_config(config)
+
+    assert core.resolve_role_runtime_request(
+        config,
+        repository="owner/repo",
+        role="reviewer_standard",
+    ) == {
+        "role": "reviewer_standard",
+        "provider": "codex",
+        "settings": {
+            "model": "repo-reviewer",
+            "thinkingOptionId": "high",
+            "modeId": "full-access",
+            "features": {},
+        },
+    }
+    assert core.resolve_role_runtime_request(
+        config,
+        repository="other/repo",
+        role="coordinator_auto",
+    ) == {
+        "role": "coordinator_auto",
+        "provider": "kimi-cli",
+        "settings": {
+            "model": "kimi-code/k3",
+            "thinkingOptionId": "max",
+            "modeId": "yolo",
+            "features": {},
+        },
+    }
+
+
+def test_role_profile_resolution_fails_closed_against_runtime_capabilities():
+    core = load_core()
+    config = core.default_config()
+    config["role_profiles"]["reviewer_standard"] = {
+        "provider": "codex",
+        "settings": {
+            "model": "gpt-5.6-sol",
+            "thinkingOptionId": "high",
+            "modeId": "full-access",
+            "features": {},
+        },
+    }
+    coordinator = {
+        "provider": "codex",
+        "settings": {
+            "model": "current",
+            "thinkingOptionId": "high",
+            "modeId": "full-access",
+            "features": {},
+        },
+    }
+
+    with pytest.raises(core.PolicyError) as unavailable:
+        core.resolve_role_runtime(
+            config,
+            repository="owner/repo",
+            role="reviewer_standard",
+            coordinator_runtime=coordinator,
+            capabilities={
+                "provider": "codex",
+                "models": {"other-model": {"thinking": ["high"]}},
+                "modes": ["full-access"],
+                "features": [],
+            },
+        )
+
+    assert unavailable.value.code == "RUNTIME_MODEL_UNAVAILABLE"
+
+
+def test_role_profile_configuration_rejects_a_non_object():
+    core = load_core()
+    config = core.default_config()
+    config["role_profiles"] = []
+
+    with pytest.raises(core.PolicyError) as invalid:
+        core.validate_config(config)
+
+    assert invalid.value.code == "CONFIG_SCHEMA_INVALID"
+
+
 def test_config_file_migration_is_atomic_and_keeps_v5_backup(tmp_path):
     core = load_core()
     old_path = tmp_path / "providers.json"
@@ -2342,6 +2513,71 @@ def test_materialized_reviewer_is_one_shot_in_candidate_workspace_and_short():
         in result["initial_prompt"]
     )
     assert "do not modify" in result["initial_prompt"].lower()
+
+
+def test_materialized_reviewer_uses_role_profile_instead_of_worker_tier():
+    core = load_core()
+    contract = _contract(core, risk="strict")
+    config = core.default_config()
+    config["tiers"]["heavy"] = {
+        "provider": "kimi-cli",
+        "settings": {
+            "model": "kimi-code/k3",
+            "thinkingOptionId": "high",
+            "modeId": "yolo",
+            "features": {},
+        },
+    }
+    config["role_profiles"]["reviewer_strict"] = {
+        "provider": "codex",
+        "settings": {
+            "model": "gpt-5.6-sol",
+            "thinkingOptionId": "max",
+            "modeId": "full-access",
+            "features": {},
+        },
+    }
+
+    result = core.materialize_reviewer_action(
+        {
+            "action_id": "create-reviewer-pr-31-aaaaaaaaaaaa-combined",
+            "type": "create_reviewer",
+            "issue": 15,
+            "pr": 31,
+            "axis": "combined",
+            "strength": "heavy",
+            "candidate_sha": "a" * 40,
+        },
+        {
+            "number": 15,
+            "contract": contract,
+            "milestone": None,
+            "dispatch": {"workspace_id": "worker-wt"},
+        },
+        repository="owner/repo",
+        config=config,
+        coordinator_runtime={
+            "agent_id": "root-a",
+            "provider": "codex",
+            "settings": {
+                "model": "current",
+                "thinkingOptionId": "high",
+                "modeId": "full-access",
+                "features": {},
+            },
+        },
+    )
+
+    assert result["runtime_request"] == {
+        "role": "reviewer_strict",
+        "provider": "codex",
+        "settings": {
+            "model": "gpt-5.6-sol",
+            "thinkingOptionId": "max",
+            "modeId": "full-access",
+            "features": {},
+        },
+    }
 
 
 def test_reviewer_requires_the_read_back_candidate_workspace():

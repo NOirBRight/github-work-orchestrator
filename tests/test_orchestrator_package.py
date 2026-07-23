@@ -62,11 +62,19 @@ def test_skill_and_templates_keep_lightweight_line_budgets():
         assert len(path.read_text(encoding="utf-8").splitlines()) <= limit
 
 
-def test_skill_forbids_old_control_plane_and_coordinator_binding():
+def test_skill_forbids_old_control_plane_and_documents_role_profiles():
     skill = (PACKAGE / "SKILL.md").read_text(encoding="utf-8")
     compact = " ".join(skill.split())
     config = (PACKAGE / "references" / "runtime-config.md").read_text(encoding="utf-8")
-    assert "There is deliberately\nno `roles.coordinator` binding" in config
+    compact_config = " ".join(config.split())
+    for required in (
+        '"frontier"',
+        '"role_profiles"',
+        '"coordinator_auto"',
+        '"reviewer_standard"',
+        "current manually created Coordinator",
+    ):
+        assert required in compact_config
     for required in (
         "not a permanent Agent",
         "never holds a long Lease",
@@ -75,6 +83,42 @@ def test_skill_forbids_old_control_plane_and_coordinator_binding():
         "foreign-parent Agent is a manual candidate",
     ):
         assert required in compact
+
+
+def test_config_example_exposes_the_phase_zero_runtime_profiles():
+    config = json.loads(
+        (PACKAGE / "templates" / "config.example.json").read_text(encoding="utf-8")
+    )
+
+    assert {
+        name: (
+            binding["provider"],
+            binding["settings"]["model"],
+            binding["settings"]["thinkingOptionId"],
+            binding["settings"]["modeId"],
+        )
+        for name, binding in config["tiers"].items()
+    } == {
+        "light": ("kimi-cli", "kimi-code/kimi-for-coding", "high", "yolo"),
+        "standard": ("kimi-cli", "kimi-code/kimi-for-coding", "max", "yolo"),
+        "heavy": ("kimi-cli", "kimi-code/k3", "high", "yolo"),
+        "frontier": ("codex", "gpt-5.6-sol", "xhigh", "full-access"),
+    }
+    assert {
+        name: (
+            binding["provider"],
+            binding["settings"]["model"],
+            binding["settings"]["thinkingOptionId"],
+            binding["settings"]["modeId"],
+        )
+        for name, binding in config["role_profiles"].items()
+    } == {
+        "coordinator_auto": ("kimi-cli", "kimi-code/k3", "max", "yolo"),
+        "reviewer_standard": ("codex", "gpt-5.6-sol", "high", "full-access"),
+        "reviewer_strict": ("codex", "gpt-5.6-sol", "max", "full-access"),
+        "reviewer_recovery": ("codex", "gpt-5.6-sol", "max", "full-access"),
+    }
+    assert config["repositories"]["owner/repo"]["role_profiles"] == {}
 
 
 def test_skill_ends_dispatch_turn_instead_of_polling_workers():

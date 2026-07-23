@@ -153,6 +153,7 @@ explicit safety policy may request independent axes. Reviewers are direct,
 read-only, one-shot subagents in the candidate Workspace and submit one
 commit-bound `orchestrator:review:v1` native review. A new SHA invalidates stale
 evidence. Never bypass checks, approvals, queues, deployments, or protection.
+Configured Reviewer Role Profiles resolve independently from Worker Tier.
 
 ```text
 python <skill>/scripts/orch.py integrate --repo owner/repo --pr N --coordinator-context context.json

@@ -117,9 +117,14 @@ language, ADR 0008 owns the architecture, ADR 0009 owns 6.0.1 safety, and ADR
   `notifyOnFinish=true`. Creation is authorization; there is no READY/START.
 - Worker reads one self-contained prompt, creates no Agent, changes no lifecycle
   state, and never merges or cleans up.
-- Difficulty is `light`, `standard`, or `heavy`; Priority and Risk are separate.
-  GitHub stores Tier only. Local repo/global mappings resolve provider, model,
-  thinking, mode, and features, with current Coordinator runtime as fallback.
+- Difficulty is `light`, `standard`, `heavy`, or `frontier`; Priority and Risk
+  are separate. GitHub stores Tier only. Local repo/global mappings resolve
+  provider, model, thinking, mode, and features, with current Coordinator
+  runtime as fallback.
+- Named Reviewer Role Profiles resolve independently from Worker Tier, with
+  repository overrides over global defaults. The manually created Coordinator
+  continues to use its actual runtime; `coordinator_auto` is configuration
+  only in V6.1.
 - Capabilities are read back before creation; invalid values block only that
   Dispatch and never silently downgrade.
 - Original Worker may receive one recovery prompt. A closed/error Worker may be
