@@ -32,6 +32,11 @@ ROLE_PROFILES = {
     "reviewer_strict",
     "reviewer_recovery",
 }
+REVIEW_PROFILE_SELECTORS = {
+    "standard_axis",
+    "recovery_axis",
+    "strict_specialist",
+}
 ISSUE_MARKER_V1 = "<!-- orchestrator:issue:v1 -->"
 ISSUE_MARKER_V2 = "<!-- orchestrator:issue:v2 -->"
 DELIVERY_MARKER = "<!-- orchestrator:delivery:v1 -->"
@@ -2755,6 +2760,7 @@ def migrate_v5_config(old: dict[str, Any]) -> dict[str, Any]:
         },
         "tiers": tiers,
         "role_profiles": {},
+        "review_profiles": {},
         "reviewer_tiers": {"standard": "standard", "strict": "heavy"},
         "repositories": {},
     }
@@ -2821,6 +2827,11 @@ def default_config() -> dict[str, Any]:
                 "codex", "gpt-5.6-sol", "max", "full-access"
             ),
         },
+        "review_profiles": {
+            "standard_axis": "reviewer_standard",
+            "recovery_axis": "reviewer_recovery",
+            "strict_specialist": "reviewer_strict",
+        },
         "reviewer_tiers": {"standard": "standard", "strict": "heavy"},
         "repositories": {},
     }
@@ -2832,6 +2843,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     global_config = config.get("global") or {}
     tiers_config = config.get("tiers") or {}
     role_profiles = config.get("role_profiles", {})
+    review_profiles = config.get("review_profiles", {})
     repositories = config.get("repositories") or {}
     reviewer_tiers = config.get("reviewer_tiers") or {}
     if not all(
@@ -2840,6 +2852,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             global_config,
             tiers_config,
             role_profiles,
+            review_profiles,
             repositories,
             reviewer_tiers,
         )
@@ -2950,6 +2963,9 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         global_config.get("intake"), execution_capacity=slots, scope="global"
     )
     repository_role_profile_mappings: list[tuple[str, dict[str, Any]]] = []
+    repository_review_profile_mappings: list[
+        tuple[str, dict[str, Any], dict[str, Any]]
+    ] = []
     for repository, settings in repositories.items():
         if not isinstance(settings, dict):
             continue
@@ -2961,6 +2977,15 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             )
         repository_role_profile_mappings.append(
             (f"repository:{repository}", mappings)
+        )
+        review_mappings = settings.get("review_profiles") or {}
+        if not isinstance(review_mappings, dict):
+            raise PolicyError(
+                "REVIEW_PROFILE_CONFIG_INVALID",
+                f"repository:{repository} review_profiles must be an object",
+            )
+        repository_review_profile_mappings.append(
+            (f"repository:{repository}", review_mappings, mappings)
         )
     for scope, mappings in (
         ("global", tiers_config),
@@ -2978,7 +3003,33 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(binding.get("provider"), str) or not isinstance(
                 binding.get("settings"), dict
             ):
-                raise PolicyError("RUNTIME_BINDING_INVALID", f"invalid {scope} binding")
+                raise PolicyError(
+                    "RUNTIME_BINDING_INVALID",
+                    f"invalid {scope} binding",
+                )
+    for selector, profile_id in review_profiles.items():
+        if (
+            selector not in REVIEW_PROFILE_SELECTORS
+            or not isinstance(profile_id, str)
+            or not profile_id
+        ):
+            raise PolicyError(
+                "REVIEW_PROFILE_CONFIG_INVALID",
+                "invalid global Review Profile selector",
+            )
+    for scope, mappings, repository_profiles in (
+        repository_review_profile_mappings
+    ):
+        for selector, profile_id in mappings.items():
+            if (
+                selector not in REVIEW_PROFILE_SELECTORS
+                or not isinstance(profile_id, str)
+                or not profile_id
+            ):
+                raise PolicyError(
+                    "REVIEW_PROFILE_CONFIG_INVALID",
+                    f"invalid {scope} Review Profile selector",
+                )
     for scope, mappings in (
         ("global", role_profiles),
         *repository_role_profile_mappings,

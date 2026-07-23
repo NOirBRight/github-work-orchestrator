@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from fnmatch import fnmatchcase
 import hashlib
 import json
 from pathlib import Path
@@ -56,6 +57,133 @@ class RuntimeProfile:
                 "features": self.features,
             }
         )
+
+
+REVIEW_PROFILE_SELECTORS = {
+    "standard_axis",
+    "recovery_axis",
+    "strict_specialist",
+}
+REVIEW_AXES = {"standards", "spec", "specialist"}
+
+
+def _valid_review_axis(value: str) -> bool:
+    return value in {"standards", "spec"} or (
+        re.fullmatch(r"specialist:[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", value) is not None
+    )
+
+
+def resolve_review_profile(
+    config: dict[str, Any],
+    *,
+    repository: str,
+    selector: str,
+) -> RuntimeProfile:
+    """Resolve one host-local Review Profile without creating a Role Binding."""
+
+    if selector not in REVIEW_PROFILE_SELECTORS:
+        raise RuntimeAdapterError(
+            "REVIEW_PROFILE_SELECTOR_INVALID",
+            f"unknown Review Profile selector: {selector}",
+        )
+    if not isinstance(config, dict):
+        raise RuntimeAdapterError(
+            "REVIEW_PROFILE_CONFIG_INVALID",
+            "Runtime configuration must be an object",
+        )
+    repositories = config.get("repositories") or {}
+    if not isinstance(repositories, dict):
+        raise RuntimeAdapterError(
+            "REVIEW_PROFILE_CONFIG_INVALID",
+            "repository Runtime configuration must be an object",
+        )
+    repository_config = repositories.get(repository) or {}
+    if not isinstance(repository_config, dict):
+        raise RuntimeAdapterError(
+            "REVIEW_PROFILE_CONFIG_INVALID",
+            f"repository Runtime configuration is invalid: {repository}",
+        )
+    repository_selectors = repository_config.get("review_profiles") or {}
+    global_selectors = config.get("review_profiles") or {}
+    if not isinstance(repository_selectors, dict) or not isinstance(
+        global_selectors,
+        dict,
+    ):
+        raise RuntimeAdapterError(
+            "REVIEW_PROFILE_CONFIG_INVALID",
+            "Review Profile selectors must be objects",
+        )
+    profile_id = repository_selectors.get(
+        selector,
+        global_selectors.get(selector),
+    )
+    if not isinstance(profile_id, str) or not profile_id:
+        raise RuntimeAdapterError(
+            "REVIEW_PROFILE_MISSING",
+            f"Review Profile selector has no Runtime Profile: {selector}",
+        )
+    repository_profiles = repository_config.get("runtime_profiles")
+    global_profiles = config.get("runtime_profiles")
+    if repository_profiles is None:
+        repository_profiles = repository_config.get("role_profiles") or {}
+    if global_profiles is None:
+        global_profiles = config.get("role_profiles") or {}
+    if not isinstance(repository_profiles, dict) or not isinstance(
+        global_profiles,
+        dict,
+    ):
+        raise RuntimeAdapterError(
+            "REVIEW_PROFILE_CONFIG_INVALID",
+            "Runtime Profiles must be objects",
+        )
+    mapping = repository_profiles.get(
+        profile_id,
+        global_profiles.get(profile_id),
+    )
+    if not isinstance(mapping, dict):
+        raise RuntimeAdapterError(
+            "REVIEW_PROFILE_MISSING",
+            f"Runtime Profile is missing: {profile_id}",
+        )
+    provider = mapping.get("provider")
+    settings = mapping.get("settings")
+    if (
+        not isinstance(provider, str)
+        or not provider
+        or not isinstance(
+            settings,
+            dict,
+        )
+    ):
+        raise RuntimeAdapterError(
+            "REVIEW_PROFILE_INVALID",
+            f"Runtime Profile is invalid: {profile_id}",
+        )
+    model = settings.get("model")
+    thinking = settings.get("thinkingOptionId")
+    mode = settings.get("modeId")
+    features = settings.get("features", {})
+    if (
+        not isinstance(model, str)
+        or not model
+        or not isinstance(thinking, str)
+        or not thinking
+        or not isinstance(mode, str)
+        or not mode
+        or not isinstance(features, dict)
+    ):
+        raise RuntimeAdapterError(
+            "REVIEW_PROFILE_INVALID",
+            f"Runtime Profile settings are incomplete: {profile_id}",
+        )
+    return RuntimeProfile(
+        name=profile_id,
+        provider=provider,
+        model=model,
+        thinking=thinking,
+        mode=mode,
+        features=dict(features),
+    )
 
 
 class SkillCatalog(Protocol):
@@ -131,6 +259,7 @@ class RuntimeBinding:
     thinking: str | None = None
     mode: str | None = None
     features_digest: str | None = None
+    base_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -161,9 +290,7 @@ class RuntimePrompt:
         else:
             skill_name = None
         skill_digest = (
-            None
-            if guidance is None
-            else digest_bytes(guidance.encode("utf-8"))
+            None if guidance is None else digest_bytes(guidance.encode("utf-8"))
         )
         text = canonical_bytes(
             {
@@ -171,9 +298,10 @@ class RuntimePrompt:
                 "result_protocol": {
                     "action_key": node.get("node_key"),
                     "instruction": (
-                        "End the final response with exactly one line "
-                        '`GWO_RESULT {"schema_version":1,"action_key":'
-                        '"<node_key>","candidate_sha":"<40-lowercase-hex>"}`.'
+                        "End with exactly one GWO_RESULT line. Return either "
+                        "a clean immutable candidate with candidate_sha, or "
+                        "a bounded typed terminal_reason=no_result plus a "
+                        "non-empty reason."
                     ),
                     "marker": "GWO_RESULT",
                 },
@@ -196,11 +324,194 @@ class RuntimePrompt:
 
 
 @dataclass(frozen=True)
+class ReviewAxisRequest:
+    repository: str
+    attempt_id: str
+    candidate_sha: str
+    base_sha: str
+    axis: str
+    recovery_ordinal: int
+    workspace: Path
+    diff_command: tuple[str, ...]
+    commit_list: tuple[str, ...]
+    spec_source_ref: str
+    spec_text: str
+    standards_sources: tuple[str, ...]
+    check_manifest_digest: str
+    prior_findings: tuple[dict[str, Any], ...] = ()
+    candidate_delta: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not self.repository
+            or not self.attempt_id
+            or not _valid_review_axis(self.axis)
+            or re.fullmatch(r"[0-9a-f]{40}", self.candidate_sha) is None
+            or re.fullmatch(r"[0-9a-f]{40}", self.base_sha) is None
+            or not isinstance(self.recovery_ordinal, int)
+            or isinstance(self.recovery_ordinal, bool)
+            or self.recovery_ordinal < 0
+            or not self.diff_command
+            or any(not isinstance(part, str) or not part for part in self.diff_command)
+            or not self.spec_source_ref
+            or not self.spec_text
+            or any(
+                not isinstance(source, str) or not source
+                for source in self.standards_sources
+            )
+            or re.fullmatch(r"[0-9a-f]{64}", self.check_manifest_digest) is None
+        ):
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_REQUEST_INVALID",
+                "Review axis request is incomplete or invalid",
+            )
+
+    @property
+    def action_key(self) -> str:
+        identity = {
+            "attempt_id": self.attempt_id,
+            "candidate_sha": self.candidate_sha,
+            "axis": self.axis,
+            "recovery_ordinal": self.recovery_ordinal,
+        }
+        return f"review:{digest_value(identity)[:32]}"
+
+    @property
+    def fixed_input(self) -> dict[str, Any]:
+        return {
+            "repository": self.repository,
+            "attempt_id": self.attempt_id,
+            "candidate_sha": self.candidate_sha,
+            "base_sha": self.base_sha,
+            "axis": self.axis,
+            "recovery_ordinal": self.recovery_ordinal,
+            "diff_command": list(self.diff_command),
+            "commit_list": list(self.commit_list),
+            "spec": {
+                "source_ref": self.spec_source_ref,
+                "text": self.spec_text,
+            },
+            "standards_sources": list(self.standards_sources),
+            "check_manifest_digest": self.check_manifest_digest,
+            "prior_findings": list(self.prior_findings),
+            "candidate_delta": self.candidate_delta,
+        }
+
+    @property
+    def fixed_input_digest(self) -> str:
+        return digest_value(self.fixed_input)
+
+    @property
+    def spec_digest(self) -> str:
+        return digest_value(
+            {
+                "source_ref": self.spec_source_ref,
+                "text": self.spec_text,
+            }
+        )
+
+    def to_prompt(self) -> RuntimePrompt:
+        payload = {
+            "skill_guidance": {
+                "name": "code-review",
+                "axis": self.axis,
+                "instruction": (
+                    "Apply the fixed-point Standards or Spec review axis "
+                    "without merging or reranking the other axis."
+                ),
+            },
+            "review_axis": {
+                **self.fixed_input,
+                "action_key": self.action_key,
+                "rules": {
+                    "authority": "read-only",
+                    "history": "none",
+                    "may_delegate": False,
+                    "may_mutate": False,
+                },
+            },
+            "output_protocol": {
+                "marker": "GWO_REVIEW_AXIS",
+                "schema_version": 1,
+                "required_fields": [
+                    "schema_version",
+                    "action_key",
+                    "candidate_sha",
+                    "axis",
+                    "fixed_input_digest",
+                    "findings",
+                ],
+                "finding_fields": [
+                    "severity",
+                    "code",
+                    "source",
+                    "location",
+                    "message",
+                ],
+                "severity": ["hard", "advisory"],
+            },
+        }
+        text = canonical_bytes(payload).decode("utf-8")
+        return RuntimePrompt(
+            text=text,
+            digest=digest_bytes(text.encode("utf-8")),
+            authority_digest=self.fixed_input_digest,
+        )
+
+
+@dataclass(frozen=True)
+class ReviewAxisBinding:
+    action_key: str
+    axis: str
+    candidate_sha: str
+    fixed_input_digest: str
+    runtime_id: str
+    agent_id: str
+    session_id: str
+    workspace_id: str
+    workspace: str
+    parent_agent_id: str | None
+    runtime_profile: str
+    profile_digest: str
+    provider: str
+    model: str
+    thinking: str
+    mode: str
+    prompt_digest: str
+
+
+@dataclass(frozen=True)
+class ReviewAxisObservation:
+    lifecycle: str
+    axis: str
+    attempt_id: str
+    candidate_sha: str
+    base_sha: str
+    recovery_ordinal: int
+    spec_digest: str
+    check_manifest_digest: str
+    fixed_input_digest: str
+    action_key: str
+    runtime_id: str
+    agent_id: str
+    session_id: str
+    profile_digest: str
+    provider: str
+    model: str
+    thinking: str
+    mode: str
+    output_digest: str | None
+    findings: tuple[dict[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
 class RuntimeObservation:
     binding: RuntimeBinding
     lifecycle: str
     result_claim: ResultClaim | None
     evidence: tuple[TypedEvidence, ...]
+    terminal_reason: str | None = None
+    terminal_detail: str | None = None
 
 
 class RuntimeAdapter(Protocol):
@@ -220,9 +531,7 @@ class RuntimeAdapter(Protocol):
         prompt: RuntimePrompt | None = None,
     ) -> RuntimeBinding | None: ...
 
-    def accept_prompt(
-        self, binding: RuntimeBinding, prompt: RuntimePrompt
-    ) -> None: ...
+    def accept_prompt(self, binding: RuntimeBinding, prompt: RuntimePrompt) -> None: ...
 
     def attach_attempt(
         self,
@@ -233,6 +542,16 @@ class RuntimeAdapter(Protocol):
     def resume(self, binding: RuntimeBinding) -> None: ...
 
     def observe(self, binding: RuntimeBinding) -> RuntimeObservation: ...
+
+    def defer_repository_checks(self, binding: RuntimeBinding) -> None: ...
+
+    def capture_deferred_checks(
+        self,
+        binding: RuntimeBinding,
+        observation: RuntimeObservation,
+    ) -> RuntimeObservation: ...
+
+    def repair(self, binding: RuntimeBinding, prompt: RuntimePrompt) -> None: ...
 
     def interrupt(self, binding: RuntimeBinding) -> None: ...
 
@@ -258,6 +577,40 @@ def _run(command: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _environment_snapshot(
+    requirements: tuple[str, ...],
+    *,
+    cwd: Path,
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {"platform": sys.platform}
+    executable_aliases = {
+        "python": sys.executable,
+        "rust": "rustc",
+        "nodejs": "node",
+    }
+    for requirement in requirements:
+        tool = re.split(r"[\s<>=!~]", requirement, maxsplit=1)[0].lower()
+        executable = executable_aliases.get(tool, tool)
+        try:
+            result = _run([executable, "--version"], cwd=cwd)
+        except OSError as error:
+            raise RuntimeAdapterError(
+                "CHECK_ENVIRONMENT_UNAVAILABLE",
+                f"required check toolchain is unavailable: {requirement}",
+            ) from error
+        version = (result.stdout or result.stderr).strip()
+        if result.returncode != 0 or not version:
+            raise RuntimeAdapterError(
+                "CHECK_ENVIRONMENT_UNAVAILABLE",
+                f"required check toolchain cannot be identified: {requirement}",
+            )
+        snapshot[requirement] = {
+            "executable": executable,
+            "version": version,
+        }
+    return snapshot
+
+
 def _git(repository: Path, *args: str) -> str:
     result = _run(["git", *args], cwd=repository)
     if result.returncode != 0:
@@ -266,6 +619,43 @@ def _git(repository: Path, *args: str) -> str:
             result.stderr.strip() or result.stdout.strip() or "git failed",
         )
     return result.stdout.strip()
+
+
+def _input_projection_digest(
+    repository: Path,
+    candidate_sha: str,
+    selectors: tuple[str, ...],
+) -> str:
+    entries: list[dict[str, str]] = []
+    listing = _git(
+        repository,
+        "ls-tree",
+        "-r",
+        "--full-tree",
+        candidate_sha,
+    )
+    for line in listing.splitlines():
+        metadata, separator, path = line.partition("\t")
+        parts = metadata.split()
+        if not separator or len(parts) != 3:
+            continue
+        mode, kind, object_id = parts
+        if any(fnmatchcase(path, selector) for selector in selectors):
+            entries.append(
+                {
+                    "path": path,
+                    "mode": mode,
+                    "kind": kind,
+                    "object_id": object_id,
+                }
+            )
+    return digest_value(
+        {
+            "candidate_sha": candidate_sha,
+            "selectors": list(selectors),
+            "entries": entries,
+        }
+    )
 
 
 def _now() -> str:
@@ -338,7 +728,9 @@ class PaseoAgentRecord:
 class PaseoClient(Protocol):
     """Host boundary used by the production Paseo Runtime Adapter."""
 
-    def find_by_labels(self, labels: dict[str, str]) -> tuple[PaseoAgentRecord, ...]: ...
+    def find_by_labels(
+        self, labels: dict[str, str]
+    ) -> tuple[PaseoAgentRecord, ...]: ...
 
     def create(self, request: PaseoCreateRequest) -> PaseoAgentRecord: ...
 
@@ -400,9 +792,7 @@ class InMemoryPaseoClient:
                     failure_class="ambiguous",
                 )
             return existing[0]
-        failure = (
-            None if not self._create_failures else self._create_failures.pop(0)
-        )
+        failure = None if not self._create_failures else self._create_failures.pop(0)
         if failure == "transient":
             raise RuntimeAdapterError(
                 "PASEO_CREATE_TRANSIENT",
@@ -470,6 +860,7 @@ class InMemoryPaseoClient:
             record,
             labels={**record.labels, "gwo.prompt_digest": prompt.digest},
             lifecycle="running",
+            output_text=None,
         )
 
     def update_labels(self, agent_id: str, labels: dict[str, str]) -> None:
@@ -652,9 +1043,7 @@ class PaseoCliClient:
         provider = payload.get("Provider") or payload.get("provider")
         model = payload.get("Model") or payload.get("model")
         runtime_settings = (
-            payload.get("RuntimeSettings")
-            or payload.get("runtimeSettings")
-            or {}
+            payload.get("RuntimeSettings") or payload.get("runtimeSettings") or {}
         )
         if not isinstance(runtime_settings, dict):
             runtime_settings = {}
@@ -664,9 +1053,7 @@ class PaseoCliClient:
             or runtime_settings.get("thinkingOptionId")
         )
         mode = (
-            payload.get("Mode")
-            or payload.get("mode")
-            or runtime_settings.get("modeId")
+            payload.get("Mode") or payload.get("mode") or runtime_settings.get("modeId")
         )
         features = runtime_settings.get("features") or {}
         if not isinstance(features, dict):
@@ -917,6 +1304,11 @@ class PaseoRuntimeAdapter:
     def __init__(self, client: PaseoClient):
         self.client = client
         self._prompts: dict[str, RuntimePrompt] = {}
+        self._worker_observations: dict[
+            str,
+            tuple[str, RuntimeObservation],
+        ] = {}
+        self._deferred_repository_checks: set[str] = set()
 
     @staticmethod
     def _identity_labels(admission: RuntimeAdmission) -> dict[str, str]:
@@ -925,6 +1317,7 @@ class PaseoRuntimeAdapter:
             "gwo.plan": admission.plan_digest,
             "gwo.node": admission.node_key,
             "gwo.admission": admission.admission_id,
+            "gwo.base_sha": admission.base_sha,
         }
 
     def _find_one(
@@ -944,7 +1337,10 @@ class PaseoRuntimeAdapter:
     def _binding(agent: PaseoAgentRecord) -> RuntimeBinding:
         labels = agent.labels
         required = ("gwo.repository", "gwo.plan", "gwo.node", "gwo.admission")
-        if any(not isinstance(labels.get(name), str) or not labels[name] for name in required):
+        if any(
+            not isinstance(labels.get(name), str) or not labels[name]
+            for name in required
+        ):
             raise RuntimeAdapterError(
                 "RUNTIME_IDENTITY_MISMATCH",
                 "Paseo Agent lacks GWO identity labels",
@@ -974,6 +1370,7 @@ class PaseoRuntimeAdapter:
             thinking=agent.thinking,
             mode=agent.mode,
             features_digest=digest_value(agent.features),
+            base_sha=labels.get("gwo.base_sha"),
         )
 
     @staticmethod
@@ -994,6 +1391,7 @@ class PaseoRuntimeAdapter:
             or binding.profile_digest != profile.digest
             or binding.provider != profile.provider
             or binding.model != profile.model
+            or binding.base_sha != admission.base_sha
             or binding.thinking != profile.thinking
             or binding.mode != profile.mode
             or binding.features_digest != digest_value(profile.features)
@@ -1083,9 +1481,7 @@ class PaseoRuntimeAdapter:
                 )
             labels = {
                 **self._identity_labels(admission),
-                "gwo.repository_path": str(
-                    Path(admission.repository_path).resolve()
-                ),
+                "gwo.repository_path": str(Path(admission.repository_path).resolve()),
                 "gwo.runtime_profile": profile.name,
                 "gwo.profile_digest": profile.digest,
             }
@@ -1178,7 +1574,10 @@ class PaseoRuntimeAdapter:
             binding.agent_id,
             {"gwo.attempt": attempt_id},
         )
-        if self.client.inspect(binding.agent_id).labels.get("gwo.attempt") != attempt_id:
+        if (
+            self.client.inspect(binding.agent_id).labels.get("gwo.attempt")
+            != attempt_id
+        ):
             raise RuntimeAdapterError(
                 "ATTEMPT_READBACK_FAILED",
                 "Paseo did not round-trip the Attempt identity",
@@ -1194,6 +1593,177 @@ class PaseoRuntimeAdapter:
                 failure_class="ambiguous",
             )
         self.client.resume(binding.agent_id)
+
+    def defer_repository_checks(self, binding: RuntimeBinding) -> None:
+        if binding.agent_id is None:
+            raise RuntimeAdapterError(
+                "RUNTIME_BINDING_UNKNOWN",
+                "Paseo Binding has no Agent identity",
+                failure_class="ambiguous",
+            )
+        self._deferred_repository_checks.add(binding.agent_id)
+
+    @staticmethod
+    def _capture_declared_checks(
+        observed: RuntimeBinding,
+        candidate_sha: str,
+        evidence: tuple[TypedEvidence, ...],
+        checks: Any,
+        *,
+        defer_repository: bool,
+    ) -> tuple[TypedEvidence, ...]:
+        captured = list(evidence)
+        captured_ids = {
+            item.payload.get("check_id") for item in captured if item.kind == "check"
+        }
+        for check in checks or ():
+            if (
+                not isinstance(check, dict)
+                or not isinstance(check.get("check_id"), str)
+                or not isinstance(check.get("command"), list)
+                or not all(isinstance(part, str) and part for part in check["command"])
+            ):
+                raise RuntimeAdapterError(
+                    "CHECK_CONTRACT_INVALID",
+                    "frozen Prompt contains an invalid check",
+                )
+            if (
+                check.get("hosted_only") is True
+                or check["check_id"] in captured_ids
+                or (defer_repository and check.get("suite") == "repository")
+            ):
+                continue
+            result = _run(
+                list(check["command"]),
+                cwd=Path(observed.workspace),
+            )
+            environment_requirements = tuple(
+                str(item) for item in check.get("environment_requirements") or ()
+            )
+            environment = _environment_snapshot(
+                environment_requirements,
+                cwd=Path(observed.workspace),
+            )
+            base_sha = observed.base_sha
+            base_tree = None
+            if check.get("base_sensitive") is True:
+                if (
+                    not isinstance(base_sha, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None
+                ):
+                    raise RuntimeAdapterError(
+                        "CHECK_BASE_PROVENANCE_MISSING",
+                        "base-sensitive check lacks the admitted base SHA",
+                    )
+                base_tree = _git(
+                    Path(observed.workspace),
+                    "rev-parse",
+                    f"{base_sha}^{{tree}}",
+                )
+            post_check_head = _git(
+                Path(observed.workspace),
+                "rev-parse",
+                "HEAD",
+            )
+            post_check_status = _git(
+                Path(observed.workspace),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            )
+            post_check_tree = _git(
+                Path(observed.workspace),
+                "rev-parse",
+                "HEAD^{tree}",
+            )
+            if post_check_head != candidate_sha or post_check_status:
+                raise RuntimeAdapterError(
+                    "CHECK_CANDIDATE_MUTATED",
+                    (
+                        "declared check changed Candidate HEAD, index, "
+                        "worktree, or untracked inputs"
+                    ),
+                    failure_class="ambiguous",
+                )
+            captured.append(
+                TypedEvidence._capture(
+                    kind="check",
+                    subject=candidate_sha,
+                    observer_type="runtime_adapter",
+                    observer_id=observed.runtime_id,
+                    observed_at=_now(),
+                    source_ref=(
+                        f"paseo://agent/{observed.agent_id}/check/{check['check_id']}"
+                    ),
+                    payload={
+                        "check_id": check["check_id"],
+                        "definition_digest": check.get("definition_digest"),
+                        "command_digest": digest_value(check["command"]),
+                        "observed_tree_digest": post_check_tree,
+                        "environment_requirements": list(environment_requirements),
+                        "environment_identity": environment,
+                        "environment_digest": digest_value(environment),
+                        **(
+                            {
+                                "base_sha": base_sha,
+                                "observed_base_tree_digest": base_tree,
+                            }
+                            if check.get("base_sensitive") is True
+                            else {}
+                        ),
+                        "input_projection_digest": _input_projection_digest(
+                            Path(observed.workspace),
+                            candidate_sha,
+                            tuple(check.get("input_selector") or ()),
+                        ),
+                        "exit_code": result.returncode,
+                        "outcome": ("passed" if result.returncode == 0 else "failed"),
+                        "stdout_digest": digest_bytes(result.stdout.encode("utf-8")),
+                        "stderr_digest": digest_bytes(result.stderr.encode("utf-8")),
+                        "log_digest": digest_bytes(
+                            (f"{result.stdout}\n{result.stderr}").encode("utf-8")
+                        ),
+                    },
+                )
+            )
+        return tuple(captured)
+
+    def capture_deferred_checks(
+        self,
+        binding: RuntimeBinding,
+        observation: RuntimeObservation,
+    ) -> RuntimeObservation:
+        if binding.agent_id is None or observation.result_claim is None:
+            return observation
+        prompt = self._prompts.get(binding.admission_id)
+        try:
+            payload = None if prompt is None else json.loads(prompt.text)
+        except json.JSONDecodeError as error:
+            raise RuntimeAdapterError(
+                "PROMPT_SNAPSHOT_INVALID",
+                "frozen Paseo Prompt is not valid JSON",
+            ) from error
+        node = payload.get("node") if isinstance(payload, dict) else None
+        contract = node.get("output_contract") if isinstance(node, dict) else None
+        checks = contract.get("checks") if isinstance(contract, dict) else ()
+        completed = replace(
+            observation,
+            evidence=self._capture_declared_checks(
+                observation.binding,
+                observation.result_claim.candidate_sha,
+                observation.evidence,
+                checks,
+                defer_repository=False,
+            ),
+        )
+        self._deferred_repository_checks.discard(binding.agent_id)
+        output = self.client.read_output(binding.agent_id)
+        if output is not None:
+            self._worker_observations[binding.agent_id] = (
+                digest_bytes(output.encode("utf-8")),
+                completed,
+            )
+        return completed
 
     def observe(self, binding: RuntimeBinding) -> RuntimeObservation:
         if binding.agent_id is None:
@@ -1214,6 +1784,39 @@ class PaseoRuntimeAdapter:
                 "Paseo observation changed GWO identity",
                 failure_class="ambiguous",
             )
+        output_text = self.client.read_output(binding.agent_id)
+        output_identity = (
+            None if output_text is None else digest_bytes(output_text.encode("utf-8"))
+        )
+        cached = self._worker_observations.get(binding.agent_id)
+        if (
+            output_identity is not None
+            and cached is not None
+            and cached[0] == output_identity
+        ):
+            cached_observation = cached[1]
+            if cached_observation.result_claim is not None:
+                workspace_head = _git(
+                    Path(observed.workspace),
+                    "rev-parse",
+                    "HEAD",
+                )
+                workspace_status = _git(
+                    Path(observed.workspace),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                )
+                if (
+                    workspace_head != cached_observation.result_claim.candidate_sha
+                    or workspace_status
+                ):
+                    raise RuntimeAdapterError(
+                        "PASEO_RESULT_READBACK_FAILED",
+                        "cached Candidate no longer matches clean Workspace HEAD",
+                        failure_class="ambiguous",
+                    )
+            return replace(cached_observation, binding=observed)
         result_claim = agent.result_claim
         evidence = agent.evidence
         if (
@@ -1222,11 +1825,47 @@ class PaseoRuntimeAdapter:
             and agent.lifecycle in {"idle", "completed", "ready"}
         ):
             envelope = read_bounded_outcome(
-                self.client.read_output(binding.agent_id),
+                output_text,
                 marker="GWO_RESULT",
                 action_key=binding.node_key,
             )
             if envelope is not None:
+                if envelope.get("terminal_reason") == "no_result":
+                    reason = envelope.get("reason")
+                    if (
+                        not isinstance(reason, str)
+                        or not reason.strip()
+                        or len(reason.encode("utf-8")) > 8_192
+                    ):
+                        raise RuntimeAdapterError(
+                            "PASEO_NO_RESULT_INVALID",
+                            "typed no_result requires one bounded reason",
+                        )
+                    return RuntimeObservation(
+                        binding=observed,
+                        lifecycle="completed",
+                        result_claim=None,
+                        evidence=(
+                            TypedEvidence._capture(
+                                kind="runtime",
+                                subject=str(observed.attempt_id),
+                                observer_type="runtime_adapter",
+                                observer_id=observed.runtime_id,
+                                observed_at=_now(),
+                                source_ref=(
+                                    f"paseo://agent/{binding.agent_id}/no-result"
+                                ),
+                                payload={
+                                    "terminal_reason": "no_result",
+                                    "reason_digest": digest_bytes(
+                                        reason.encode("utf-8")
+                                    ),
+                                },
+                            ),
+                        ),
+                        terminal_reason="no_result",
+                        terminal_detail=reason,
+                    )
                 candidate_sha = envelope.get("candidate_sha")
                 if (
                     not isinstance(candidate_sha, str)
@@ -1247,6 +1886,11 @@ class PaseoRuntimeAdapter:
                     "--porcelain=v1",
                     "--untracked-files=all",
                 )
+                workspace_tree = _git(
+                    Path(observed.workspace),
+                    "rev-parse",
+                    "HEAD^{tree}",
+                )
                 if workspace_head != candidate_sha or workspace_status:
                     raise RuntimeAdapterError(
                         "PASEO_RESULT_READBACK_FAILED",
@@ -1262,9 +1906,7 @@ class PaseoRuntimeAdapter:
                     candidate_sha=candidate_sha,
                     assertions={
                         "paseo_action_key": observed.node_key,
-                        "output_digest": digest_bytes(
-                            canonical_bytes(envelope)
-                        ),
+                        "output_digest": digest_bytes(canonical_bytes(envelope)),
                     },
                 )
                 evidence = (
@@ -1281,14 +1923,13 @@ class PaseoRuntimeAdapter:
                         payload={
                             "workspace": observed.workspace,
                             "head": workspace_head,
+                            "tree_sha": workspace_tree,
                         },
                     ),
                 )
                 prompt = self._prompts.get(observed.admission_id)
                 try:
-                    prompt_payload = (
-                        None if prompt is None else json.loads(prompt.text)
-                    )
+                    prompt_payload = None if prompt is None else json.loads(prompt.text)
                 except json.JSONDecodeError as error:
                     raise RuntimeAdapterError(
                         "PROMPT_SNAPSHOT_INVALID",
@@ -1300,95 +1941,363 @@ class PaseoRuntimeAdapter:
                     else None
                 )
                 output_contract = (
-                    node.get("output_contract")
-                    if isinstance(node, dict)
-                    else None
+                    node.get("output_contract") if isinstance(node, dict) else None
                 )
                 checks = (
                     output_contract.get("checks")
                     if isinstance(output_contract, dict)
                     else ()
                 )
-                captured = list(evidence)
-                for check in checks or ():
-                    if (
-                        not isinstance(check, dict)
-                        or not isinstance(check.get("check_id"), str)
-                        or not isinstance(check.get("command"), list)
-                        or not all(
-                            isinstance(part, str) and part
-                            for part in check["command"]
-                        )
-                    ):
-                        raise RuntimeAdapterError(
-                            "CHECK_CONTRACT_INVALID",
-                            "frozen Prompt contains an invalid check",
-                        )
-                    result = _run(
-                        list(check["command"]),
-                        cwd=Path(observed.workspace),
-                    )
-                    post_check_head = _git(
-                        Path(observed.workspace),
-                        "rev-parse",
-                        "HEAD",
-                    )
-                    post_check_status = _git(
-                        Path(observed.workspace),
-                        "status",
-                        "--porcelain=v1",
-                        "--untracked-files=all",
-                    )
-                    if (
-                        post_check_head != candidate_sha
-                        or post_check_status
-                    ):
-                        raise RuntimeAdapterError(
-                            "CHECK_CANDIDATE_MUTATED",
-                            (
-                                "declared check changed Candidate HEAD, index, "
-                                "worktree, or untracked inputs"
-                            ),
-                            failure_class="ambiguous",
-                        )
-                    captured.append(
-                        TypedEvidence._capture(
-                            kind="check",
-                            subject=candidate_sha,
-                            observer_type="runtime_adapter",
-                            observer_id=observed.runtime_id,
-                            observed_at=_now(),
-                            source_ref=(
-                                f"paseo://agent/{binding.agent_id}/"
-                                f"check/{check['check_id']}"
-                            ),
-                            payload={
-                                "check_id": check["check_id"],
-                                "command_digest": digest_value(
-                                    check["command"]
-                                ),
-                                "exit_code": result.returncode,
-                                "outcome": (
-                                    "passed"
-                                    if result.returncode == 0
-                                    else "failed"
-                                ),
-                                "stdout_digest": digest_bytes(
-                                    result.stdout.encode("utf-8")
-                                ),
-                                "stderr_digest": digest_bytes(
-                                    result.stderr.encode("utf-8")
-                                ),
-                            },
-                        )
-                    )
-                evidence = tuple(captured)
-        return RuntimeObservation(
+                evidence = self._capture_declared_checks(
+                    observed,
+                    candidate_sha,
+                    evidence,
+                    checks,
+                    defer_repository=(
+                        binding.agent_id in self._deferred_repository_checks
+                    ),
+                )
+        runtime_observation = RuntimeObservation(
             binding=observed,
             lifecycle=agent.lifecycle,
             result_claim=result_claim,
             evidence=evidence,
         )
+        if output_identity is not None and result_claim is not None:
+            self._worker_observations[binding.agent_id] = (
+                output_identity,
+                runtime_observation,
+            )
+        return runtime_observation
+
+    def repair(self, binding: RuntimeBinding, prompt: RuntimePrompt) -> None:
+        if binding.agent_id is None or binding.attempt_id is None:
+            raise RuntimeAdapterError(
+                "REPAIR_BINDING_INVALID",
+                "Repair requires one Prompt-bound Attempt identity",
+            )
+        prior_output = self.client.read_output(binding.agent_id)
+        self.client.send_prompt(
+            binding.agent_id,
+            prompt,
+            action_key=f"{binding.attempt_id}:repair:{prompt.digest}",
+        )
+        if binding.prompt_digest is not None:
+            self.client.update_labels(
+                binding.agent_id,
+                {"gwo.prompt_digest": binding.prompt_digest},
+            )
+        self._worker_observations.pop(binding.agent_id, None)
+        if (
+            prior_output is not None
+            and self.client.read_output(binding.agent_id) == prior_output
+        ):
+            raise RuntimeAdapterError(
+                "REPAIR_PROMPT_NOT_ACCEPTED",
+                "Runtime did not move beyond the previous bounded output",
+                failure_class="ambiguous",
+            )
+
+    @staticmethod
+    def _assert_review_workspace(request: ReviewAxisRequest) -> None:
+        workspace = Path(request.workspace).resolve()
+        head = _git(workspace, "rev-parse", "HEAD")
+        status = _git(
+            workspace,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        )
+        if head != request.candidate_sha or status:
+            raise RuntimeAdapterError(
+                "REVIEW_CANDIDATE_NOT_CLEAN",
+                "Review requires a clean exact-Candidate workspace",
+                failure_class="ambiguous",
+            )
+
+    @staticmethod
+    def _review_binding(
+        agent: PaseoAgentRecord,
+        request: ReviewAxisRequest,
+        profile: RuntimeProfile,
+        prompt: RuntimePrompt,
+        parent_agent_id: str | None,
+    ) -> ReviewAxisBinding:
+        labels = agent.labels
+        if (
+            labels.get("gwo.action_key") != request.action_key
+            or labels.get("gwo.review_attempt") != request.attempt_id
+            or labels.get("gwo.review_candidate") != request.candidate_sha
+            or labels.get("gwo.review_axis") != request.axis
+            or labels.get("gwo.review_recovery") != str(request.recovery_ordinal)
+            or labels.get("gwo.review_input") != request.fixed_input_digest
+            or labels.get("gwo.prompt_digest") != prompt.digest
+            or labels.get("gwo.runtime_profile") != profile.name
+            or labels.get("gwo.profile_digest") != profile.digest
+            or agent.parent_agent_id != parent_agent_id
+            or agent.profile_digest != profile.digest
+            or agent.provider != profile.provider
+            or agent.model != profile.model
+            or agent.thinking != profile.thinking
+            or agent.mode != profile.mode
+            or digest_value(agent.features) != digest_value(profile.features)
+        ):
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_IDENTITY_MISMATCH",
+                "Review child readback does not match request and profile",
+                failure_class="ambiguous",
+            )
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                agent.agent_id,
+                agent.session_id,
+                agent.workspace_id,
+                agent.workspace,
+            )
+        ):
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_IDENTITY_MISSING",
+                "Review child has no complete Runtime identity",
+                failure_class="ambiguous",
+            )
+        return ReviewAxisBinding(
+            action_key=request.action_key,
+            axis=request.axis,
+            candidate_sha=request.candidate_sha,
+            fixed_input_digest=request.fixed_input_digest,
+            runtime_id=agent.agent_id,
+            agent_id=agent.agent_id,
+            session_id=agent.session_id,
+            workspace_id=agent.workspace_id,
+            workspace=agent.workspace,
+            parent_agent_id=agent.parent_agent_id,
+            runtime_profile=profile.name,
+            profile_digest=profile.digest,
+            provider=profile.provider,
+            model=profile.model,
+            thinking=profile.thinking,
+            mode=profile.mode,
+            prompt_digest=prompt.digest,
+        )
+
+    def materialize_review_axis(
+        self,
+        request: ReviewAxisRequest,
+        profile: RuntimeProfile,
+        *,
+        parent_agent_id: str | None,
+    ) -> ReviewAxisBinding:
+        """Create or adopt one read-backed Review child with bounded transport retry."""
+
+        self._assert_review_workspace(request)
+        prompt = request.to_prompt()
+        labels = {
+            "gwo.action_key": request.action_key,
+            "gwo.repository": request.repository,
+            "gwo.review_attempt": request.attempt_id,
+            "gwo.review_candidate": request.candidate_sha,
+            "gwo.review_axis": request.axis,
+            "gwo.review_recovery": str(request.recovery_ordinal),
+            "gwo.review_input": request.fixed_input_digest,
+            "gwo.runtime_profile": profile.name,
+            "gwo.profile_digest": profile.digest,
+            "gwo.prompt_digest": prompt.digest,
+        }
+        if parent_agent_id is not None:
+            labels["gwo.parent_agent"] = parent_agent_id
+        last_error: RuntimeAdapterError | None = None
+        for execution in range(3):
+            try:
+                agent = self._find_one({"gwo.action_key": request.action_key})
+                if agent is None:
+                    self.client.create(
+                        PaseoCreateRequest(
+                            action_key=request.action_key,
+                            title=(
+                                f"GWO Review {request.axis} "
+                                f"{request.candidate_sha[:12]}"
+                            ),
+                            labels=labels,
+                            prompt=prompt,
+                            repository_path=str(Path(request.workspace).resolve()),
+                            base_sha=request.candidate_sha,
+                            profile=profile,
+                            parent_agent_id=parent_agent_id,
+                        )
+                    )
+                agent = self._find_one(labels)
+                if agent is None:
+                    raise RuntimeAdapterError(
+                        "REVIEW_AXIS_READBACK_MISSING",
+                        "Review child creation has no exact identity readback",
+                        failure_class="ambiguous",
+                    )
+                readback = self.client.inspect(agent.agent_id)
+                return self._review_binding(
+                    readback,
+                    request,
+                    profile,
+                    prompt,
+                    parent_agent_id,
+                )
+            except RuntimeAdapterError as error:
+                last_error = error
+                if error.failure_class == "permanent":
+                    raise
+                if execution == 2:
+                    break
+        assert last_error is not None
+        raise RuntimeAdapterError(
+            "REVIEW_AXIS_MATERIALIZATION_RETRIES_EXHAUSTED",
+            "review child initial execution plus two transport retries failed",
+            failure_class=last_error.failure_class,
+        ) from last_error
+
+    def observe_review_axis(
+        self,
+        request: ReviewAxisRequest,
+        binding: ReviewAxisBinding,
+    ) -> ReviewAxisObservation:
+        """Capture one typed axis record directly from the child output."""
+
+        self._assert_review_workspace(request)
+        if (
+            binding.action_key != request.action_key
+            or binding.axis != request.axis
+            or binding.candidate_sha != request.candidate_sha
+            or binding.fixed_input_digest != request.fixed_input_digest
+        ):
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_IDENTITY_MISMATCH",
+                "Review axis Binding does not match the fixed request",
+                failure_class="ambiguous",
+            )
+        agent = self.client.inspect(binding.agent_id)
+        if (
+            agent.agent_id != binding.agent_id
+            or agent.session_id != binding.session_id
+            or agent.profile_digest != binding.profile_digest
+            or agent.provider != binding.provider
+            or agent.model != binding.model
+            or agent.thinking != binding.thinking
+            or agent.mode != binding.mode
+        ):
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_IDENTITY_MISMATCH",
+                "Review child Runtime identity changed",
+                failure_class="ambiguous",
+            )
+        output = self.client.read_output(binding.agent_id)
+        envelope = read_bounded_outcome(
+            output,
+            marker="GWO_REVIEW_AXIS",
+            action_key=request.action_key,
+        )
+        if envelope is None:
+            if agent.lifecycle in {"running", "queued", "active"}:
+                return ReviewAxisObservation(
+                    lifecycle="running",
+                    axis=request.axis,
+                    attempt_id=request.attempt_id,
+                    candidate_sha=request.candidate_sha,
+                    base_sha=request.base_sha,
+                    recovery_ordinal=request.recovery_ordinal,
+                    spec_digest=request.spec_digest,
+                    check_manifest_digest=request.check_manifest_digest,
+                    fixed_input_digest=request.fixed_input_digest,
+                    action_key=request.action_key,
+                    runtime_id=binding.runtime_id,
+                    agent_id=binding.agent_id,
+                    session_id=binding.session_id,
+                    profile_digest=binding.profile_digest,
+                    provider=binding.provider,
+                    model=binding.model,
+                    thinking=binding.thinking,
+                    mode=binding.mode,
+                    output_digest=None,
+                )
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_OUTPUT_MISSING",
+                "terminal Review child returned no typed axis observation",
+            )
+        expected_fields = {
+            "schema_version",
+            "action_key",
+            "candidate_sha",
+            "axis",
+            "fixed_input_digest",
+            "findings",
+        }
+        findings = envelope.get("findings")
+        if (
+            set(envelope) != expected_fields
+            or envelope.get("candidate_sha") != request.candidate_sha
+            or envelope.get("axis") != request.axis
+            or envelope.get("fixed_input_digest") != request.fixed_input_digest
+            or not isinstance(findings, list)
+        ):
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_OUTPUT_INVALID",
+                "Review child returned an invalid typed axis envelope",
+            )
+        finding_fields = {
+            "severity",
+            "code",
+            "source",
+            "location",
+            "message",
+        }
+        normalized: list[dict[str, str]] = []
+        for finding in findings:
+            if (
+                not isinstance(finding, dict)
+                or set(finding) != finding_fields
+                or finding.get("severity") not in {"hard", "advisory"}
+                or any(
+                    not isinstance(finding.get(field), str) or not finding[field]
+                    for field in finding_fields - {"severity"}
+                )
+            ):
+                raise RuntimeAdapterError(
+                    "REVIEW_AXIS_OUTPUT_INVALID",
+                    "Review child returned an invalid typed finding",
+                )
+            normalized.append(
+                {field: str(finding[field]) for field in sorted(finding_fields)}
+            )
+        self._assert_review_workspace(request)
+        return ReviewAxisObservation(
+            lifecycle="completed",
+            axis=request.axis,
+            attempt_id=request.attempt_id,
+            candidate_sha=request.candidate_sha,
+            base_sha=request.base_sha,
+            recovery_ordinal=request.recovery_ordinal,
+            spec_digest=request.spec_digest,
+            check_manifest_digest=request.check_manifest_digest,
+            fixed_input_digest=request.fixed_input_digest,
+            action_key=request.action_key,
+            runtime_id=binding.runtime_id,
+            agent_id=binding.agent_id,
+            session_id=binding.session_id,
+            profile_digest=binding.profile_digest,
+            provider=binding.provider,
+            model=binding.model,
+            thinking=binding.thinking,
+            mode=binding.mode,
+            output_digest=digest_value(envelope),
+            findings=tuple(normalized),
+        )
+
+    def retire_review_axis(self, binding: ReviewAxisBinding) -> None:
+        self.client.archive(binding.agent_id)
+        if not self.client.inspect(binding.agent_id).archived:
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_RETIRE_READBACK_FAILED",
+                "Review child did not read back retired",
+                failure_class="ambiguous",
+            )
 
     def interrupt(self, binding: RuntimeBinding) -> None:
         if binding.agent_id is None:
@@ -1514,6 +2423,7 @@ class InMemoryRuntimeAdapter:
                 if admission.runtime_profile is None
                 else digest_value(admission.runtime_profile.features)
             ),
+            base_sha=admission.base_sha,
         )
         self._states[admission.admission_id] = _RuntimeState(binding=binding)
         if prompt is not None:
@@ -1549,7 +2459,9 @@ class InMemoryRuntimeAdapter:
         try:
             payload = json.loads(prompt.text)
         except json.JSONDecodeError as error:
-            raise RuntimeAdapterError("PROMPT_INVALID", "Prompt is not readable") from error
+            raise RuntimeAdapterError(
+                "PROMPT_INVALID", "Prompt is not readable"
+            ) from error
         node = payload.get("node") if isinstance(payload, dict) else None
         if not isinstance(node, dict) or node.get("node_key") != binding.node_key:
             raise RuntimeAdapterError(
@@ -1596,6 +2508,23 @@ class InMemoryRuntimeAdapter:
             result_claim=state.result_claim,
             evidence=state.evidence,
         )
+
+    def defer_repository_checks(self, binding: RuntimeBinding) -> None:
+        self._state_for(binding)
+
+    def capture_deferred_checks(
+        self,
+        binding: RuntimeBinding,
+        observation: RuntimeObservation,
+    ) -> RuntimeObservation:
+        self._state_for(binding)
+        return observation
+
+    def repair(self, binding: RuntimeBinding, prompt: RuntimePrompt) -> None:
+        state = self._state_for(binding)
+        state.prompt = prompt
+        state.result_claim = None
+        state.evidence = ()
 
     def interrupt(self, binding: RuntimeBinding) -> None:
         self._state_for(binding)
@@ -1657,10 +2586,33 @@ class InMemoryRuntimeAdapter:
                 raise RuntimeAdapterError(
                     "RUNTIME_CHECK_INVALID", "check command must be an argument list"
                 )
+            if check.get("hosted_only") is True:
+                continue
             command = [str(part) for part in check["command"]]
             result = _run(command, cwd=workspace)
             log = f"{result.stdout}\n{result.stderr}".encode("utf-8")
-            environment = {"python": sys.version, "platform": sys.platform}
+            environment_requirements = tuple(
+                str(item) for item in check.get("environment_requirements") or ()
+            )
+            environment = _environment_snapshot(
+                environment_requirements,
+                cwd=workspace,
+            )
+            base_tree = None
+            if check.get("base_sensitive") is True:
+                if (
+                    not isinstance(binding.base_sha, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", binding.base_sha) is None
+                ):
+                    raise RuntimeAdapterError(
+                        "CHECK_BASE_PROVENANCE_MISSING",
+                        "base-sensitive check lacks the admitted base SHA",
+                    )
+                base_tree = _git(
+                    workspace,
+                    "rev-parse",
+                    f"{binding.base_sha}^{{tree}}",
+                )
             evidence.append(
                 TypedEvidence._capture(
                     kind="check",
@@ -1674,11 +2626,26 @@ class InMemoryRuntimeAdapter:
                     ),
                     payload={
                         "check_id": check.get("check_id"),
-                        "command": command,
+                        "definition_digest": check.get("definition_digest"),
+                        "command_digest": digest_value(command),
+                        "observed_tree_digest": tree_sha,
+                        "input_projection_digest": _input_projection_digest(
+                            workspace,
+                            candidate_sha,
+                            tuple(check.get("input_selector") or ()),
+                        ),
                         "outcome": "passed" if result.returncode == 0 else "failed",
                         "exit_code": result.returncode,
-                        "environment_digest": digest_bytes(
-                            canonical_bytes(environment)
+                        "environment_requirements": list(environment_requirements),
+                        "environment_identity": environment,
+                        "environment_digest": digest_value(environment),
+                        **(
+                            {
+                                "base_sha": binding.base_sha,
+                                "observed_base_tree_digest": base_tree,
+                            }
+                            if check.get("base_sensitive") is True
+                            else {}
                         ),
                         "log_digest": hashlib.sha256(log).hexdigest(),
                     },
@@ -1691,9 +2658,7 @@ class InMemoryRuntimeAdapter:
             assertions={
                 "done": True,
                 "checks": [
-                    check.get("check_id")
-                    for check in checks
-                    if isinstance(check, dict)
+                    check.get("check_id") for check in checks if isinstance(check, dict)
                 ],
             },
         )

@@ -89,6 +89,11 @@
       }
     }
   },
+  "review_profiles": {
+    "standard_axis": "reviewer_standard",
+    "recovery_axis": "reviewer_recovery",
+    "strict_specialist": "reviewer_strict"
+  },
   "reviewer_tiers": {
     "standard": "standard",
     "strict": "heavy"
@@ -104,6 +109,7 @@
       "milestone_tiers": {},
       "tiers": {},
       "role_profiles": {},
+      "review_profiles": {},
       "project_number": null
     }
   }
