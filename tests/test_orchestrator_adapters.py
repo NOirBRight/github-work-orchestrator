@@ -1718,8 +1718,8 @@ def test_frontier_admit_validates_the_entire_plan_before_any_github_write(
     class FakeGitHub:
         def frontier_candidates(self, _repo, _limit, _labels):
             return [
-                {"number": 1, "labels": [], "comments": []},
-                {"number": 2, "labels": [], "comments": []},
+                {"number": 1, "labels": ["ready-for-agent"], "comments": []},
+                {"number": 2, "labels": ["ready-for-agent"], "comments": []},
             ]
 
         def snapshot(self, repo, _branch):
@@ -1727,7 +1727,12 @@ def test_frontier_admit_validates_the_entire_plan_before_any_github_write(
 
         def issues_by_number(self, _repo, numbers):
             return [
-                {"number": number, "labels": [], "comments": []} for number in numbers
+                {
+                    "number": number,
+                    "labels": ["ready-for-agent"],
+                    "comments": [],
+                }
+                for number in numbers
             ]
 
         def admit(self, repo, candidate, contract):
@@ -1814,7 +1819,9 @@ def test_admission_rejects_a_dependency_cycle_through_existing_managed_work():
         cli._validate_admission_plan(
             plan,
             repository="owner/repo",
-            candidates=[{"number": 2, "labels": [], "comments": []}],
+            candidates=[
+                {"number": 2, "labels": ["ready-for-agent"], "comments": []}
+            ],
             managed_issues=[
                 {
                     "number": 1,
@@ -1827,7 +1834,37 @@ def test_admission_rejects_a_dependency_cycle_through_existing_managed_work():
     assert error.value.code == "CONTRACT_DEPENDENCY_CYCLE"
 
 
-def test_admission_preflight_rejects_an_unlabeled_partial_record_with_other_contract():
+@pytest.mark.parametrize(
+    "labels",
+    [
+        [],
+        ["needs-triage"],
+        ["needs-info"],
+        ["ready-for-human"],
+        ["wontfix"],
+        ["ready-for-agent", "needs-info"],
+    ],
+)
+def test_admission_requires_an_unambiguous_ready_for_agent_label(labels):
+    core, cli = _modules()
+    contract = _contract_v2(core)
+    plan = {
+        "schema_version": 1,
+        "repository": "owner/repo",
+        "admissions": [{"issue": 2, "contract": contract}],
+    }
+
+    with pytest.raises(core.PolicyError) as error:
+        cli._validate_admission_plan(
+            plan,
+            repository="owner/repo",
+            candidates=[{"number": 2, "labels": labels, "comments": []}],
+        )
+
+    assert error.value.code == "ADMISSION_ISSUE_NOT_READY"
+
+
+def test_admission_preflight_rejects_a_partial_record_with_other_contract():
     core, cli = _modules()
     desired = _contract_v2(core, path="src/desired")
     existing = _contract_v2(core, path="src/existing")
@@ -1838,7 +1875,7 @@ def test_admission_preflight_rejects_an_unlabeled_partial_record_with_other_cont
     }
     candidate = {
         "number": 2,
-        "labels": [],
+        "labels": ["ready-for-agent"],
         "comments": [
             {
                 "id": 90,

@@ -2105,6 +2105,41 @@ def test_frontier_worker_tier_resolves_repository_override():
     ] == "frontier"
 
 
+def test_fresh_default_config_contains_the_phase_zero_runtime_profiles():
+    core = load_core()
+
+    config = core.default_config()
+
+    assert {
+        name: (
+            binding["provider"],
+            binding["settings"]["model"],
+            binding["settings"]["thinkingOptionId"],
+            binding["settings"]["modeId"],
+        )
+        for name, binding in config["tiers"].items()
+    } == {
+        "light": ("kimi-cli", "kimi-code/kimi-for-coding", "high", "yolo"),
+        "standard": ("kimi-cli", "kimi-code/kimi-for-coding", "max", "yolo"),
+        "heavy": ("kimi-cli", "kimi-code/k3", "high", "yolo"),
+        "frontier": ("codex", "gpt-5.6-sol", "xhigh", "full-access"),
+    }
+    assert {
+        name: (
+            binding["provider"],
+            binding["settings"]["model"],
+            binding["settings"]["thinkingOptionId"],
+            binding["settings"]["modeId"],
+        )
+        for name, binding in config["role_profiles"].items()
+    } == {
+        "coordinator_auto": ("kimi-cli", "kimi-code/k3", "max", "yolo"),
+        "reviewer_standard": ("codex", "gpt-5.6-sol", "high", "full-access"),
+        "reviewer_strict": ("codex", "gpt-5.6-sol", "max", "full-access"),
+        "reviewer_recovery": ("codex", "gpt-5.6-sol", "max", "full-access"),
+    }
+
+
 def test_role_profiles_resolve_independently_with_repository_override():
     core = load_core()
     config = core.default_config()
@@ -2222,6 +2257,17 @@ def test_role_profile_configuration_rejects_a_non_object():
         core.validate_config(config)
 
     assert invalid.value.code == "CONFIG_SCHEMA_INVALID"
+
+
+def test_repository_role_profile_configuration_rejects_a_non_object():
+    core = load_core()
+    config = core.default_config()
+    config["repositories"]["owner/repo"] = {"role_profiles": ["invalid"]}
+
+    with pytest.raises(core.PolicyError) as invalid:
+        core.validate_config(config)
+
+    assert invalid.value.code == "RUNTIME_ROLE_PROFILE_INVALID"
 
 
 def test_config_file_migration_is_atomic_and_keeps_v5_backup(tmp_path):
@@ -2442,7 +2488,16 @@ def test_materialized_worker_action_is_atomic_direct_and_short():
         "branch": "work/issue-15",
         "base_sha": "a" * 40,
     }
-    assert result["runtime_request"]["settings"]["thinkingOptionId"] == "high"
+    assert result["runtime_request"] == {
+        "tier": "standard",
+        "provider": "kimi-cli",
+        "settings": {
+            "model": "kimi-code/kimi-for-coding",
+            "thinkingOptionId": "max",
+            "modeId": "yolo",
+            "features": {},
+        },
+    }
     assert result["labels"]["orch.creator"] == "root-a"
     assert len(result["initial_prompt"].splitlines()) <= 60
     assert "orchestrator:delivery:v1" in result["initial_prompt"]

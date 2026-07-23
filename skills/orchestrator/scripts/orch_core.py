@@ -2760,6 +2760,23 @@ def migrate_v5_config(old: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _initial_runtime_binding(
+    provider: str,
+    model: str,
+    thinking: str,
+    mode: str,
+) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "settings": {
+            "model": model,
+            "thinkingOptionId": thinking,
+            "modeId": mode,
+            "features": {},
+        },
+    }
+
+
 def default_config() -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -2776,8 +2793,34 @@ def default_config() -> dict[str, Any]:
                 "ready_reserve_target": 6,
             },
         },
-        "tiers": {},
-        "role_profiles": {},
+        "tiers": {
+            "light": _initial_runtime_binding(
+                "kimi-cli", "kimi-code/kimi-for-coding", "high", "yolo"
+            ),
+            "standard": _initial_runtime_binding(
+                "kimi-cli", "kimi-code/kimi-for-coding", "max", "yolo"
+            ),
+            "heavy": _initial_runtime_binding(
+                "kimi-cli", "kimi-code/k3", "high", "yolo"
+            ),
+            "frontier": _initial_runtime_binding(
+                "codex", "gpt-5.6-sol", "xhigh", "full-access"
+            ),
+        },
+        "role_profiles": {
+            "coordinator_auto": _initial_runtime_binding(
+                "kimi-cli", "kimi-code/k3", "max", "yolo"
+            ),
+            "reviewer_standard": _initial_runtime_binding(
+                "codex", "gpt-5.6-sol", "high", "full-access"
+            ),
+            "reviewer_strict": _initial_runtime_binding(
+                "codex", "gpt-5.6-sol", "max", "full-access"
+            ),
+            "reviewer_recovery": _initial_runtime_binding(
+                "codex", "gpt-5.6-sol", "max", "full-access"
+            ),
+        },
         "reviewer_tiers": {"standard": "standard", "strict": "heavy"},
         "repositories": {},
     }
@@ -2906,6 +2949,19 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     validate_intake(
         global_config.get("intake"), execution_capacity=slots, scope="global"
     )
+    repository_role_profile_mappings: list[tuple[str, dict[str, Any]]] = []
+    for repository, settings in repositories.items():
+        if not isinstance(settings, dict):
+            continue
+        mappings = settings.get("role_profiles") or {}
+        if not isinstance(mappings, dict):
+            raise PolicyError(
+                "RUNTIME_ROLE_PROFILE_INVALID",
+                f"repository:{repository} role_profiles must be an object",
+            )
+        repository_role_profile_mappings.append(
+            (f"repository:{repository}", mappings)
+        )
     for scope, mappings in (
         ("global", tiers_config),
         *(
@@ -2925,11 +2981,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
                 raise PolicyError("RUNTIME_BINDING_INVALID", f"invalid {scope} binding")
     for scope, mappings in (
         ("global", role_profiles),
-        *(
-            (f"repository:{repo}", (settings or {}).get("role_profiles") or {})
-            for repo, settings in repositories.items()
-            if isinstance(settings, dict)
-        ),
+        *repository_role_profile_mappings,
     ):
         for role, binding in mappings.items():
             if role not in ROLE_PROFILES or not isinstance(binding, dict):
@@ -3013,14 +3065,6 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise PolicyError(
                 "INTAKE_CONFIG_INVALID",
                 f"repository:{repository} intake must be an object",
-            )
-        repository_role_profiles = settings.get("role_profiles")
-        if repository_role_profiles is not None and not isinstance(
-            repository_role_profiles, dict
-        ):
-            raise PolicyError(
-                "RUNTIME_ROLE_PROFILE_INVALID",
-                f"repository:{repository} role_profiles must be an object",
             )
         validate_intake(
             {

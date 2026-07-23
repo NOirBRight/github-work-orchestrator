@@ -32,7 +32,7 @@ Scope:
   keep semantic risk, review, and check policy versioned with the repository.
 - Record `ready-for-agent` as the Matt workflow handoff, keep `to-spec`
   optional when a canonical specification already exists, and exclude all
-  other triage states from executable Plan Intent.
+  other triage states from compilation into executable Plan Nodes.
 - Fix one V8 base commit after the V6.1 patch and documentation correction are
   reproducible.
 
@@ -113,7 +113,7 @@ Scope:
 - Compile the Prompt once per Admission, resolve the then-current optional
   Skill, and reuse the Prompt snapshot for delivery retries.
 - Add the host `/goal`-like Goal Driver, semantic-input digest, durable
-  Coordinator outcomes, Wait Conditions, and Decision Gates.
+  Coordinator Turn Observations, Wait Conditions, and Decision Gates.
 - Prefer a manually created Coordinator. Auto-create Kimi K3 Max only when no
   usable Coordinator exists or the prior Coordinator session is irrecoverable.
 

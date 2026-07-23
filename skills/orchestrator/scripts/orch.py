@@ -2265,6 +2265,13 @@ def _validate_admission_plan(
     seen: set[int] = set()
     dependency_graph: dict[int, set[int]] = {}
     core_labels = {"orch:ready", "orch:active", "orch:blocked"}
+    canonical_triage_labels = {
+        "needs-triage",
+        "needs-info",
+        "ready-for-agent",
+        "ready-for-human",
+        "wontfix",
+    }
     for admission in admissions:
         if not isinstance(admission, dict):
             raise core.PolicyError(
@@ -2287,6 +2294,12 @@ def _validate_admission_plan(
                 "ADMISSION_ISSUE_MISSING",
                 f"Issue #{number} is outside the Candidate Pool",
             )
+        candidate_labels = _candidate_label_names(candidate)
+        if candidate_labels & canonical_triage_labels != {"ready-for-agent"}:
+            raise core.PolicyError(
+                "ADMISSION_ISSUE_NOT_READY",
+                f"Issue #{number} must be unambiguously ready-for-agent",
+            )
         contract = admission.get("contract")
         core.validate_contract(contract)
         if core.contract_version(contract) != 2:
@@ -2303,7 +2316,7 @@ def _validate_admission_plan(
                 f"Issue #{number} cannot depend on itself",
             )
         dependency_graph[number] = dependencies
-        core_states = _candidate_label_names(candidate) & core_labels
+        core_states = candidate_labels & core_labels
         marker_comments = [
             comment
             for comment in candidate.get("comments") or []
