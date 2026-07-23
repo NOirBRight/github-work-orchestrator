@@ -310,7 +310,12 @@ class GitHubDurableGoalControl:
     ) -> str | None:
         value = self._read(repository, "facts", reference)
         if value is None:
-            return None
+            prefix = f"github://{repository}/refs/heads/{self.branch}/"
+            if not reference.startswith(prefix):
+                return None
+            path = reference[len(prefix) :]
+            blob = self.client.read(repository, self.branch, path)
+            return None if blob is None else digest_bytes(blob.content)
         try:
             content = base64.b64decode(
                 value["content_base64"],

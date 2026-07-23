@@ -22,6 +22,7 @@ from gwo_v8 import (  # noqa: E402
     DurablePlanRecord,
     GitHubContent,
     GitHubDurablePlanControl,
+    GitHubDurableGoalControl,
     CoordinatorSession,
     CoordinatorTurnObservation,
     DurableWake,
@@ -424,6 +425,27 @@ def test_github_control_branch_preserves_exact_compiler_bytes_and_cas(tmp_path):
         compiled.repository,
         outcome.activation_id,
     ).plan_digest == compiled.digest
+
+
+def test_github_goal_control_reads_existing_control_record_as_durable_fact():
+    client = _MemoryGitHubContentClient()
+    repository = "local/phase-two"
+    path = ".gwo/v8/plans/example.json"
+    content = b'{"plan_digest":"example"}'
+    client.compare_and_swap(
+        repository,
+        "gwo-control",
+        path,
+        content,
+        expected_blob_sha=None,
+        message="fixture",
+    )
+    control = GitHubDurableGoalControl(client, branch="gwo-control")
+
+    assert control.read_fact_digest(
+        repository,
+        f"github://{repository}/refs/heads/gwo-control/{path}",
+    ) == hashlib.sha256(content).hexdigest()
 
 
 def test_paseo_adapter_round_trips_identity_prompt_lifecycle_and_retirement(
