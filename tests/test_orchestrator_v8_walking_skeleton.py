@@ -192,19 +192,39 @@ def test_plan_compiler_rejects_recursive_workflow_skill_bindings(skill):
     assert rejected.value.code == "WORKFLOW_SKILL_RECURSION"
 
 
-def test_plan_compiler_rejects_runtime_facts_in_planspec():
+@pytest.mark.parametrize(
+    "location",
+    [
+        "node.provider",
+        "node.runtime_requirements.model",
+        "node.inputs.workspace",
+        "goal.live_capacity",
+        "work_item.provider",
+    ],
+)
+def test_plan_compiler_rejects_runtime_facts_anywhere_in_planspec(location):
     intent = _plan_intent()
-    intent["nodes"][0]["provider"] = "codex"
+    source = _ready_source()
+    if location == "node.provider":
+        intent["nodes"][0]["provider"] = "codex"
+    elif location == "node.runtime_requirements.model":
+        intent["nodes"][0]["runtime_requirements"]["model"] = "gpt-5.6-sol"
+    elif location == "node.inputs.workspace":
+        intent["nodes"][0]["inputs"]["workspace"] = "worker-1"
+    elif location == "goal.live_capacity":
+        intent["goals"][0]["live_capacity"] = 8
+    else:
+        source["work_items"][0]["provider"] = "codex"
 
     with pytest.raises(CompileError) as rejected:
-        PlanCompiler().compile(intent, _ready_source(), {"version": 1})
+        PlanCompiler().compile(intent, source, {"version": 1})
 
-    assert rejected.value.code == "PLAN_NODE_FIELD_INVALID"
+    assert rejected.value.code == "PLAN_FIELD_INVALID"
 
 
 def test_plan_compiler_rejects_work_outside_the_effect_contract():
     intent = _plan_intent()
-    intent["nodes"][0]["inputs"]["file_changes"][0]["path"] = "other.txt"
+    intent["nodes"][0]["effect_contract"]["write_scopes"] = ["other.txt"]
 
     with pytest.raises(CompileError) as rejected:
         PlanCompiler().compile(intent, _ready_source(), {"version": 1})

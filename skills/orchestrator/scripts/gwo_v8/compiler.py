@@ -11,6 +11,16 @@ from ._effects import EffectContractError, authorized_file_changes
 
 
 WORKFLOW_SKILLS = {"implement", "implement-gwo", "orchestrator"}
+PLAN_INTENT_FIELDS = {"parent_plan_digest", "goals", "nodes", "edges"}
+SOURCE_SNAPSHOT_FIELDS = {"repository", "work_items"}
+GOAL_FIELDS = {"goal_key", "objective", "acceptance"}
+WORK_ITEM_FIELDS = {
+    "work_item_key",
+    "tracker_state",
+    "source_ref",
+    "title",
+    "outcome_contract",
+}
 PLAN_NODE_FIELDS = {
     "goal_key",
     "work_item_key",
@@ -25,6 +35,15 @@ PLAN_NODE_FIELDS = {
     "recovery_policy",
     "skill_reference",
 }
+INPUT_FIELDS = {"file_changes"}
+FILE_CHANGE_FIELDS = {"path", "content"}
+OUTPUT_CONTRACT_FIELDS = {"required_evidence", "checks"}
+EVIDENCE_REQUIREMENT_FIELDS = {"kind", "check_id"}
+CHECK_FIELDS = {"check_id", "command"}
+EFFECT_CONTRACT_FIELDS = {"write_scopes", "external_effects"}
+RUNTIME_REQUIREMENT_FIELDS = {"capabilities"}
+RECOVERY_POLICY_FIELDS = {"semantic_attempts", "repair_rounds"}
+OUTCOME_CONTRACT_FIELDS = {"path", "content"}
 
 
 class CompileError(ValueError):
@@ -81,6 +100,134 @@ def _validate_effect_contract(proposal: dict[str, Any]) -> None:
         raise CompileError("EFFECT_CONTRACT_VIOLATION", str(error)) from error
 
 
+def _require_object(
+    value: Any,
+    *,
+    fields: set[str],
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CompileError("COMPILE_INPUT_INVALID", f"{label} must be an object")
+    unknown = set(value) - fields
+    if unknown:
+        raise CompileError(
+            "PLAN_FIELD_INVALID",
+            f"{label} contains unsupported fields: {sorted(unknown)}",
+        )
+    return value
+
+
+def _require_string_list(value: Any, *, label: str) -> list[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        raise CompileError("COMPILE_INPUT_INVALID", f"{label} must be string list")
+    return value
+
+
+def _validate_plan_fields(
+    plan_intent: dict[str, Any],
+    source_snapshot: dict[str, Any],
+    goal: dict[str, Any],
+    work_item: dict[str, Any],
+    proposal: dict[str, Any],
+) -> None:
+    _require_object(
+        plan_intent, fields=PLAN_INTENT_FIELDS, label="Plan Intent"
+    )
+    _require_object(
+        source_snapshot,
+        fields=SOURCE_SNAPSHOT_FIELDS,
+        label="source snapshot",
+    )
+    _require_object(goal, fields=GOAL_FIELDS, label="Goal")
+    _require_object(work_item, fields=WORK_ITEM_FIELDS, label="Work Item")
+    _require_object(proposal, fields=PLAN_NODE_FIELDS, label="Plan Node")
+
+    _require_string_list(goal.get("acceptance"), label="Goal acceptance")
+    outcome_contract = _require_object(
+        work_item.get("outcome_contract"),
+        fields=OUTCOME_CONTRACT_FIELDS,
+        label="Work Item outcome contract",
+    )
+    inputs = _require_object(
+        proposal.get("inputs"), fields=INPUT_FIELDS, label="Plan Node inputs"
+    )
+    changes = inputs.get("file_changes")
+    if not isinstance(changes, list) or not changes:
+        raise CompileError(
+            "COMPILE_INPUT_INVALID", "file_changes must be a non-empty list"
+        )
+    for change in changes:
+        _require_object(
+            change, fields=FILE_CHANGE_FIELDS, label="file change"
+        )
+    expected_change = {
+        "path": outcome_contract.get("path"),
+        "content": outcome_contract.get("content"),
+    }
+    if changes != [expected_change]:
+        raise CompileError(
+            "PLAN_RELATION_INVALID",
+            "Plan Node work must match the Ready Work Item outcome contract",
+        )
+
+    output_contract = _require_object(
+        proposal.get("output_contract"),
+        fields=OUTPUT_CONTRACT_FIELDS,
+        label="output contract",
+    )
+    requirements = output_contract.get("required_evidence")
+    checks = output_contract.get("checks")
+    if not isinstance(requirements, list) or not isinstance(checks, list):
+        raise CompileError(
+            "COMPILE_INPUT_INVALID", "Evidence requirements and checks must be lists"
+        )
+    for requirement in requirements:
+        _require_object(
+            requirement,
+            fields=EVIDENCE_REQUIREMENT_FIELDS,
+            label="Evidence requirement",
+        )
+    for check in checks:
+        checked = _require_object(check, fields=CHECK_FIELDS, label="check")
+        _require_string_list(checked.get("command"), label="check command")
+
+    effect_contract = _require_object(
+        proposal.get("effect_contract"),
+        fields=EFFECT_CONTRACT_FIELDS,
+        label="Effect Contract",
+    )
+    _require_string_list(
+        effect_contract.get("write_scopes"), label="Write Scopes"
+    )
+    _require_string_list(
+        effect_contract.get("external_effects"), label="external effects"
+    )
+    runtime_requirements = _require_object(
+        proposal.get("runtime_requirements"),
+        fields=RUNTIME_REQUIREMENT_FIELDS,
+        label="Runtime Requirements",
+    )
+    _require_string_list(
+        runtime_requirements.get("capabilities"),
+        label="Runtime capabilities",
+    )
+    _require_object(
+        proposal.get("recovery_policy"),
+        fields=RECOVERY_POLICY_FIELDS,
+        label="recovery policy",
+    )
+    _require_string_list(
+        proposal.get("resource_claims"), label="Resource Claims"
+    )
+    if plan_intent.get("edges") != []:
+        raise CompileError(
+            "PLAN_FIELD_INVALID",
+            "Phase 1 accepts no proposed edges; the Compiler owns Integration edges",
+        )
+
+
 class PlanCompiler:
     """Compile one Ready Work Item into the minimal executable V8 graph."""
 
@@ -95,6 +242,14 @@ class PlanCompiler:
             for value in (plan_intent, source_snapshot, policy_snapshot)
         ):
             raise CompileError("COMPILE_INPUT_INVALID", "compiler inputs must be objects")
+        _require_object(
+            plan_intent, fields=PLAN_INTENT_FIELDS, label="Plan Intent"
+        )
+        _require_object(
+            source_snapshot,
+            fields=SOURCE_SNAPSHOT_FIELDS,
+            label="source snapshot",
+        )
 
         repository = source_snapshot.get("repository")
         work_items = source_snapshot.get("work_items")
@@ -124,12 +279,13 @@ class PlanCompiler:
         proposal = proposed_nodes[0]
         if not isinstance(goal, dict) or not isinstance(proposal, dict):
             raise CompileError("COMPILE_INPUT_INVALID", "semantic entries must be objects")
-        unknown_fields = set(proposal) - PLAN_NODE_FIELDS
-        if unknown_fields:
-            raise CompileError(
-                "PLAN_NODE_FIELD_INVALID",
-                f"Plan Node contains unsupported fields: {sorted(unknown_fields)}",
-            )
+        _validate_plan_fields(
+            plan_intent,
+            source_snapshot,
+            goal,
+            work_item,
+            proposal,
+        )
         if proposal.get("kind") != "work":
             raise CompileError("NODE_KIND_INVALID", "Phase 1 requires a work node")
         _validate_effect_contract(proposal)
