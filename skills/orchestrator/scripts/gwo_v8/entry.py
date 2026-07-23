@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
+
+from .activation import ActivationOutcome, LocalPlanPublication
+from .compiler import PlanCompiler
+from .goal_driver import GoalDirective, GoalDriver, GoalSnapshot
 
 
 class ImplementGwoInputError(ValueError):
@@ -20,6 +24,13 @@ class ImplementGwoDecision:
     execution_entry: str | None
     work_item_keys: tuple[str, ...]
     fallbacks: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ImplementGwoLaunchOutcome:
+    decision: ImplementGwoDecision
+    activation: ActivationOutcome | None
+    directive: GoalDirective | None
 
 
 class ImplementGwoEntry:
@@ -95,9 +106,84 @@ class ImplementGwoEntry:
                 "IMPLEMENT_GWO_INPUT_INVALID",
                 "work_item entry accepts exactly one Ready Work Item",
             )
+        if len(keys) > 1:
+            return ImplementGwoDecision(
+                status="planning_required",
+                next_action="compile-ready-set",
+                execution_entry="implement-gwo",
+                work_item_keys=tuple(keys),
+            )
         return ImplementGwoDecision(
             status="ready",
             next_action=None,
             execution_entry="implement-gwo",
             work_item_keys=tuple(keys),
+        )
+
+
+class ImplementGwoLauncher:
+    """Execute the Phase 2 vertical path after the Ready-only gate."""
+
+    def __init__(
+        self,
+        *,
+        compiler: PlanCompiler,
+        publication: LocalPlanPublication,
+        goal_driver: GoalDriver,
+        writer_generation: str,
+        entry: ImplementGwoEntry | None = None,
+    ):
+        self.compiler = compiler
+        self.publication = publication
+        self.goal_driver = goal_driver
+        self.writer_generation = writer_generation
+        self.entry = entry or ImplementGwoEntry()
+
+    def launch(
+        self,
+        request: dict[str, Any],
+        *,
+        plan_intent: dict[str, Any],
+        source_snapshot: dict[str, Any],
+        policy_snapshot: dict[str, Any],
+        goal_snapshot: GoalSnapshot,
+        expected_active_digest: str | None,
+    ) -> ImplementGwoLaunchOutcome:
+        decision = self.entry.route(request)
+        if decision.status != "ready":
+            return ImplementGwoLaunchOutcome(
+                decision=decision,
+                activation=None,
+                directive=None,
+            )
+        source_keys = tuple(
+            item.get("work_item_key")
+            for item in source_snapshot.get("work_items", ())
+            if isinstance(item, dict)
+        )
+        if source_keys != decision.work_item_keys:
+            raise ImplementGwoInputError(
+                "IMPLEMENT_GWO_SOURCE_MISMATCH",
+                "Ready entry and authoritative source snapshot name different Work Items",
+            )
+        compiled = self.compiler.compile(
+            plan_intent,
+            source_snapshot,
+            policy_snapshot,
+        )
+        activation = self.publication.publish_and_activate(
+            compiled,
+            expected_active_digest=expected_active_digest,
+            writer_generation=self.writer_generation,
+        )
+        directive = self.goal_driver.run_once(
+            replace(
+                goal_snapshot,
+                plan_digest=compiled.digest,
+            )
+        )
+        return ImplementGwoLaunchOutcome(
+            decision=decision,
+            activation=activation,
+            directive=directive,
         )

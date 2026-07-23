@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+import json
 from pathlib import Path
 import sqlite3
-from typing import Protocol
+from typing import Any, Protocol
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
+from .activation import GitHubContentClient
 from .kernel import ReconcileOutcome
 from .runtime import (
     PaseoClient,
@@ -33,6 +35,10 @@ class GoalSnapshot:
     plan_digest: str
     work_items: tuple[tuple[str, str], ...]
     decision_inputs: tuple[tuple[str, str], ...]
+    node_states: tuple[tuple[str, str], ...] = ()
+    evidence_manifests: tuple[tuple[str, str], ...] = ()
+    capability_configuration_digest: str | None = None
+    base_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +69,9 @@ class GoalDirective:
     semantic_input_digest: str
     session_id: str | None = None
     wait_condition: str | None = None
+    wait_source_ref: str | None = None
+    wait_event_identity: str | None = None
+    next_check_at: str | None = None
     decision_gate: str | None = None
     corrective: bool = False
     runtime_profile: str | None = None
@@ -78,7 +87,208 @@ class GoalDriverStatus:
     session_id: str | None
     last_observation_ref: str | None
     wait_condition: str | None
+    wait_source_ref: str | None
+    wait_event_identity: str | None
+    next_check_at: str | None
     last_wake_reference: str | None
+
+
+@dataclass(frozen=True)
+class DurableWake:
+    goal_key: str
+    semantic_input_digest: str
+    wait_condition: str
+    source_ref: str
+    event_identity: str
+    durable_reference: str
+
+
+class DurableGoalControl(Protocol):
+    """Read exact immutable Coordinator outcomes and wake events."""
+
+    def read_observation(
+        self,
+        repository: str,
+        reference: str,
+    ) -> CoordinatorTurnObservation | None: ...
+
+    def read_wake(
+        self,
+        repository: str,
+        reference: str,
+    ) -> DurableWake | None: ...
+
+
+class InMemoryDurableGoalControl:
+    """Contract fake that still requires publish-then-readback semantics."""
+
+    def __init__(self):
+        self._observations: dict[
+            tuple[str, str], CoordinatorTurnObservation
+        ] = {}
+        self._wakes: dict[tuple[str, str], DurableWake] = {}
+
+    def publish_observation(
+        self,
+        repository: str,
+        observation: CoordinatorTurnObservation,
+    ) -> None:
+        key = (repository, observation.durable_reference)
+        existing = self._observations.get(key)
+        if existing is not None and existing != observation:
+            raise GoalDriverError(
+                "DURABLE_OBSERVATION_IMMUTABLE",
+                "Coordinator observation reference cannot be rewritten",
+            )
+        self._observations[key] = observation
+
+    def publish_wake(self, repository: str, wake: DurableWake) -> None:
+        key = (repository, wake.durable_reference)
+        existing = self._wakes.get(key)
+        if existing is not None and existing != wake:
+            raise GoalDriverError(
+                "DURABLE_WAKE_IMMUTABLE",
+                "wake reference cannot be rewritten",
+            )
+        self._wakes[key] = wake
+
+    def read_observation(
+        self,
+        repository: str,
+        reference: str,
+    ) -> CoordinatorTurnObservation | None:
+        return self._observations.get((repository, reference))
+
+    def read_wake(
+        self,
+        repository: str,
+        reference: str,
+    ) -> DurableWake | None:
+        return self._wakes.get((repository, reference))
+
+
+class GitHubDurableGoalControl:
+    """Immutable Goal events stored on the same GitHub control branch."""
+
+    def __init__(
+        self,
+        client: GitHubContentClient,
+        *,
+        branch: str = "gwo-control",
+        root: str = ".gwo/v8/goals",
+    ):
+        self.client = client
+        self.branch = branch
+        self.root = root.strip("/")
+
+    def _path(self, kind: str, reference: str) -> str:
+        return f"{self.root}/{kind}/{digest_value(reference)}.json"
+
+    def _publish(
+        self,
+        repository: str,
+        kind: str,
+        reference: str,
+        value: dict[str, Any],
+    ) -> None:
+        path = self._path(kind, reference)
+        content = canonical_bytes(value)
+        existing = self.client.read(repository, self.branch, path)
+        if existing is not None:
+            if existing.content != content:
+                raise GoalDriverError(
+                    "DURABLE_GOAL_EVENT_IMMUTABLE",
+                    f"{kind} reference cannot be rewritten",
+                )
+            return
+        self.client.compare_and_swap(
+            repository,
+            self.branch,
+            path,
+            content,
+            expected_blob_sha=None,
+            message=f"Publish GWO {kind} {digest_value(reference)[:12]}",
+        )
+
+    def publish_observation(
+        self,
+        repository: str,
+        observation: CoordinatorTurnObservation,
+    ) -> None:
+        self._publish(
+            repository,
+            "observations",
+            observation.durable_reference,
+            asdict(observation),
+        )
+
+    def publish_wake(self, repository: str, wake: DurableWake) -> None:
+        self._publish(
+            repository,
+            "wakes",
+            wake.durable_reference,
+            asdict(wake),
+        )
+
+    def _read(
+        self,
+        repository: str,
+        kind: str,
+        reference: str,
+    ) -> dict[str, Any] | None:
+        blob = self.client.read(
+            repository,
+            self.branch,
+            self._path(kind, reference),
+        )
+        if blob is None:
+            return None
+        try:
+            value = json.loads(blob.content)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise GoalDriverError(
+                "DURABLE_GOAL_EVENT_INVALID",
+                f"durable {kind} record is invalid",
+            ) from error
+        if not isinstance(value, dict):
+            raise GoalDriverError(
+                "DURABLE_GOAL_EVENT_INVALID",
+                f"durable {kind} record is not an object",
+            )
+        return value
+
+    def read_observation(
+        self,
+        repository: str,
+        reference: str,
+    ) -> CoordinatorTurnObservation | None:
+        value = self._read(repository, "observations", reference)
+        if value is None:
+            return None
+        try:
+            observation = CoordinatorTurnObservation(**value)
+        except TypeError as error:
+            raise GoalDriverError(
+                "DURABLE_OBSERVATION_INVALID",
+                "durable Coordinator observation fields are invalid",
+            ) from error
+        return observation
+
+    def read_wake(
+        self,
+        repository: str,
+        reference: str,
+    ) -> DurableWake | None:
+        value = self._read(repository, "wakes", reference)
+        if value is None:
+            return None
+        try:
+            return DurableWake(**value)
+        except TypeError as error:
+            raise GoalDriverError(
+                "DURABLE_WAKE_INVALID",
+                "durable wake fields are invalid",
+            ) from error
 
 
 class Reconciler(Protocol):
@@ -355,11 +565,13 @@ class GoalDriver:
         reconciler: Reconciler,
         coordinators: CoordinatorRuntime,
         auto_profile: RuntimeProfile,
+        durable: DurableGoalControl | None = None,
     ):
         self.store_path = Path(store_path)
         self.reconciler = reconciler
         self.coordinators = coordinators
         self.auto_profile = auto_profile
+        self.durable = durable or InMemoryDurableGoalControl()
         if (
             auto_profile.provider != "kimi-cli"
             or auto_profile.model != "kimi-code/k3"
@@ -382,11 +594,29 @@ class GoalDriver:
                     session_id TEXT,
                     last_observation_ref TEXT,
                     wait_condition TEXT,
+                    wait_source_ref TEXT,
+                    wait_event_identity TEXT,
+                    next_check_at TEXT,
                     last_wake_reference TEXT,
                     PRIMARY KEY (repository, goal_key)
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(v8_goal_driver_state)"
+                )
+            }
+            for column in (
+                "wait_source_ref",
+                "wait_event_identity",
+                "next_check_at",
+            ):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE v8_goal_driver_state ADD COLUMN {column} TEXT"
+                    )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.store_path)
@@ -406,6 +636,14 @@ class GoalDriver:
                 "decision_inputs": [
                     list(item) for item in snapshot.decision_inputs
                 ],
+                "node_states": [list(item) for item in snapshot.node_states],
+                "evidence_manifests": [
+                    list(item) for item in snapshot.evidence_manifests
+                ],
+                "capability_configuration_digest": (
+                    snapshot.capability_configuration_digest
+                ),
+                "base_identity": snapshot.base_identity,
             }
         )
 
@@ -423,6 +661,9 @@ class GoalDriver:
             session_id=None,
             last_observation_ref=None,
             wait_condition=None,
+            wait_source_ref=None,
+            wait_event_identity=None,
+            next_check_at=None,
             last_wake_reference=None,
         )
 
@@ -461,6 +702,21 @@ class GoalDriver:
                 if row["wait_condition"] is None
                 else str(row["wait_condition"])
             ),
+            wait_source_ref=(
+                None
+                if row["wait_source_ref"] is None
+                else str(row["wait_source_ref"])
+            ),
+            wait_event_identity=(
+                None
+                if row["wait_event_identity"] is None
+                else str(row["wait_event_identity"])
+            ),
+            next_check_at=(
+                None
+                if row["next_check_at"] is None
+                else str(row["next_check_at"])
+            ),
             last_wake_reference=(
                 None
                 if row["last_wake_reference"] is None
@@ -481,8 +737,11 @@ class GoalDriver:
                     session_id,
                     last_observation_ref,
                     wait_condition,
+                    wait_source_ref,
+                    wait_event_identity,
+                    next_check_at,
                     last_wake_reference
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repository, goal_key) DO UPDATE SET
                     semantic_input_digest = excluded.semantic_input_digest,
                     zero_outcomes = excluded.zero_outcomes,
@@ -490,6 +749,9 @@ class GoalDriver:
                     session_id = excluded.session_id,
                     last_observation_ref = excluded.last_observation_ref,
                     wait_condition = excluded.wait_condition,
+                    wait_source_ref = excluded.wait_source_ref,
+                    wait_event_identity = excluded.wait_event_identity,
+                    next_check_at = excluded.next_check_at,
                     last_wake_reference = excluded.last_wake_reference
                 """,
                 (
@@ -501,6 +763,9 @@ class GoalDriver:
                     status.session_id,
                     status.last_observation_ref,
                     status.wait_condition,
+                    status.wait_source_ref,
+                    status.wait_event_identity,
+                    status.next_check_at,
                     status.last_wake_reference,
                 ),
             )
@@ -510,7 +775,15 @@ class GoalDriver:
         status: GoalDriverStatus,
         observation: CoordinatorTurnObservation,
     ) -> GoalDriverStatus:
+        durable = self.durable.read_observation(
+            status.repository,
+            observation.durable_reference,
+        )
         if (
+            not status.continuation_outstanding
+            or observation.durable_reference == status.last_observation_ref
+            or durable != observation
+            or
             observation.goal_key != status.goal_key
             or observation.semantic_input_digest
             != status.semantic_input_digest
@@ -535,6 +808,9 @@ class GoalDriver:
             session_id=status.session_id,
             last_observation_ref=observation.durable_reference,
             wait_condition=status.wait_condition,
+            wait_source_ref=status.wait_source_ref,
+            wait_event_identity=status.wait_event_identity,
+            next_check_at=status.next_check_at,
             last_wake_reference=status.last_wake_reference,
         )
 
@@ -577,18 +853,39 @@ class GoalDriver:
         if status is None or status.semantic_input_digest != digest:
             status = self._new_status(snapshot, digest)
         if status.wait_condition is not None:
+            wake = (
+                None
+                if wake_reference is None
+                else self.durable.read_wake(
+                    snapshot.repository,
+                    wake_reference,
+                )
+            )
             if (
                 wake_reference is None
                 or wake_reference == status.last_wake_reference
+                or wake is None
+                or wake.durable_reference != wake_reference
+                or wake.goal_key != status.goal_key
+                or wake.semantic_input_digest != status.semantic_input_digest
+                or wake.wait_condition != status.wait_condition
+                or wake.source_ref != status.wait_source_ref
+                or wake.event_identity != status.wait_event_identity
             ):
                 return self._directive(
                     "wait",
                     status,
                     wait_condition=status.wait_condition,
+                    wait_source_ref=status.wait_source_ref,
+                    wait_event_identity=status.wait_event_identity,
+                    next_check_at=status.next_check_at,
                 )
             status = replace(
                 status,
                 wait_condition=None,
+                wait_source_ref=None,
+                wait_event_identity=None,
+                next_check_at=None,
                 last_wake_reference=wake_reference,
             )
             self._write_status(status)
@@ -623,12 +920,18 @@ class GoalDriver:
                 status,
                 continuation_outstanding=False,
                 wait_condition=outcome.wait_condition,
+                wait_source_ref=outcome.wait_source_ref,
+                wait_event_identity=outcome.wait_event_identity,
+                next_check_at=outcome.next_check_at,
             )
             self._write_status(status)
             return self._directive(
                 "wait",
                 status,
                 wait_condition=outcome.wait_condition,
+                wait_source_ref=outcome.wait_source_ref,
+                wait_event_identity=outcome.wait_event_identity,
+                next_check_at=outcome.next_check_at,
             )
         if status.zero_outcomes >= 2:
             self._write_status(status)
@@ -662,6 +965,9 @@ class GoalDriver:
             session_id=session.session_id,
             last_observation_ref=status.last_observation_ref,
             wait_condition=None,
+            wait_source_ref=None,
+            wait_event_identity=None,
+            next_check_at=None,
             last_wake_reference=status.last_wake_reference,
         )
         self._write_status(status)

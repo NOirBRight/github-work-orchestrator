@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 import sys
@@ -17,21 +18,29 @@ sys.path.insert(0, str(SCRIPTS))
 from gwo_v8 import (  # noqa: E402
     ActivationCheckpointCrash,
     ActivationError,
+    ActivationReceipt,
+    DurablePlanRecord,
     GitHubContent,
     GitHubDurablePlanControl,
     CoordinatorSession,
     CoordinatorTurnObservation,
+    DurableWake,
     EvidenceVerifier,
     GoalDriver,
+    GoalDriverError,
     GoalSnapshot,
+    InMemoryDurableGoalControl,
     InMemoryDurablePlanControl,
+    InMemoryRuntimeAdapter,
     InMemoryPaseoClient,
     InMemorySkillCatalog,
     InstalledSkillCatalog,
     ImplementGwoEntry,
+    ImplementGwoLauncher,
     Kernel,
     LocalPlanPublication,
     PaseoRuntimeAdapter,
+    PaseoCliClient,
     PaseoCoordinatorRuntime,
     PlanCompiler,
     RuntimeAdmission,
@@ -319,6 +328,57 @@ def test_writer_generation_fences_activation_and_admission(tmp_path):
     )
 
 
+def test_remote_writer_takeover_fences_stale_local_store(tmp_path):
+    compiled = _compiled()
+    successor_intent = _plan_intent()
+    successor_intent["goals"][0]["objective"] = (
+        "Integrate one durably activated successor candidate."
+    )
+    successor = PlanCompiler().compile(
+        successor_intent,
+        _ready_source(),
+        {"version": 2},
+    )
+    durable = InMemoryDurablePlanControl()
+    owner = LocalPlanPublication(tmp_path / "owner.sqlite3", durable=durable)
+    owner.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="v8-generation-1",
+    )
+    record_ref = durable.plan_record_ref(
+        successor.repository,
+        successor.digest,
+    )
+    durable.publish_plan(
+        DurablePlanRecord(
+            repository=successor.repository,
+            plan_digest=successor.digest,
+            canonical_bytes=successor.canonical_bytes,
+            compilation_record=successor.compilation_record,
+            record_ref=record_ref,
+        )
+    )
+    durable.publish_activation(
+        ActivationReceipt(
+            schema_version=1,
+            repository=successor.repository,
+            writer_generation="v8-generation-2",
+            activation_id="activation:remote-takeover",
+            plan_digest=successor.digest,
+            expected_previous_digest=compiled.digest,
+            plan_record_ref=record_ref,
+            created_at="2026-07-23T00:00:00+00:00",
+        ),
+        expected_previous_digest=compiled.digest,
+    )
+
+    with pytest.raises(ActivationError) as fenced:
+        owner.read_active(compiled.repository)
+
+    assert fenced.value.code == "WRITER_GENERATION_FENCED"
+
+
 def test_durable_activation_receipts_are_immutable(tmp_path):
     compiled = _compiled()
     durable = InMemoryDurablePlanControl()
@@ -567,7 +627,7 @@ def test_materialization_retries_three_executions_without_consuming_attempt(
         "request_decision",
         "request_decision",
     ]
-    assert outcomes[1].runtime_circuit == "paseo:materialize:transient"
+    assert outcomes[1].runtime_circuit == "paseo:create:transient"
     assert all(item.attempt_id is None for item in outcomes)
     assert client.create_count == 3
 
@@ -585,8 +645,47 @@ def test_permanent_materialization_rejection_opens_circuit_immediately(
     assert outcome.directive == "request_decision"
     assert outcome.attempt_id is None
     assert outcome.materialization_executions == 1
-    assert outcome.runtime_circuit == "paseo:materialize:permanent"
+    assert outcome.runtime_circuit == "paseo:create:permanent"
     assert client.create_count == 1
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("TLS certificate verify failed", "permanent"),
+        ("unknown provider kimi-x", "permanent"),
+        ("connection reset by peer", "transient"),
+        ("daemon returned an unspecified error", "ambiguous"),
+    ],
+)
+def test_paseo_cli_classifies_configuration_before_retryable_failures(
+    message,
+    expected,
+):
+    assert (
+        PaseoCliClient.classify_failure(message, default="ambiguous")
+        == expected
+    )
+
+
+def test_paseo_cli_uses_resident_agent_identity_when_inspect_has_no_session():
+    record = PaseoCliClient._agent(
+        {
+            "Id": "agent-123",
+            "Worktree": "gwo-worktree",
+            "Cwd": "D:/repo",
+            "Provider": "kimi",
+            "Model": "kimi-code/k3",
+            "Thinking": "max",
+            "Mode": "yolo",
+            "Status": "running",
+            "Archived": False,
+        }
+    )
+
+    assert record.session_id == "agent-123"
+    assert record.workspace_id == "gwo-worktree"
+    assert record.provider == "kimi-cli"
 
 
 def test_ambiguous_materialization_protects_admission_then_adopts_same_agent(
@@ -701,9 +800,13 @@ def test_implement_gwo_accepts_only_explicit_ready_work_items(kind):
 
     decision = ImplementGwoEntry().route(request)
 
-    assert decision.status == "ready"
+    assert decision.status == (
+        "ready" if len(request["work_items"]) == 1 else "planning_required"
+    )
     assert decision.execution_entry == "implement-gwo"
-    assert decision.next_action is None
+    assert decision.next_action == (
+        None if len(request["work_items"]) == 1 else "compile-ready-set"
+    )
     assert decision.work_item_keys == tuple(
         item["key"] for item in request["work_items"]
     )
@@ -727,6 +830,67 @@ def test_phase_two_skill_surface_has_new_entry_and_alias_only():
     assert "frontier scan" not in alias
 
 
+def test_implement_gwo_launcher_runs_one_ready_item_through_goal_completion(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    durable = InMemoryDurablePlanControl()
+    publication = LocalPlanPublication(
+        tmp_path / "v8.sqlite3",
+        durable=durable,
+    )
+    kernel = Kernel(
+        store_path=tmp_path / "v8.sqlite3",
+        publication=publication,
+        runtime=InMemoryRuntimeAdapter(tmp_path / "workspaces"),
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="v8-generation-1",
+    )
+    driver = GoalDriver(
+        store_path=tmp_path / "v8.sqlite3",
+        reconciler=kernel,
+        coordinators=InMemoryCoordinatorRuntime(),
+        auto_profile=_coordinator_profile(),
+    )
+    launcher = ImplementGwoLauncher(
+        compiler=PlanCompiler(),
+        publication=publication,
+        goal_driver=driver,
+        writer_generation="v8-generation-1",
+    )
+    snapshot = GoalSnapshot(
+        repository="local/phase-two",
+        goal_key="goal:phase-2",
+        objective="Integrate one durably activated candidate.",
+        acceptance=("result.txt contains phase-2",),
+        plan_digest="pending",
+        work_items=(("issue:42", "ready-for-agent"),),
+        decision_inputs=(),
+        base_identity=_git(repository, "rev-parse", "HEAD"),
+    )
+
+    outcome = launcher.launch(
+        {
+            "kind": "work_item",
+            "work_items": [
+                {"key": "issue:42", "tracker_state": "ready-for-agent"}
+            ],
+        },
+        plan_intent=_plan_intent(),
+        source_snapshot=_ready_source(),
+        policy_snapshot={"version": 1},
+        goal_snapshot=snapshot,
+        expected_active_digest=None,
+    )
+
+    assert outcome.activation is not None
+    assert outcome.directive is not None
+    assert outcome.directive.kind == "finish"
+    assert (repository / "result.txt").read_text(encoding="utf-8") == "phase-2\n"
+
+
 class _SequenceReconciler:
     def __init__(self, outcomes: list[ReconcileOutcome]):
         self._outcomes = list(outcomes)
@@ -746,6 +910,8 @@ def _reconcile_outcome(
     status: str = "waiting",
     goal_state: str = "active",
     wait_condition: str | None = None,
+    wait_source_ref: str | None = None,
+    wait_event_identity: str | None = None,
 ) -> ReconcileOutcome:
     return ReconcileOutcome(
         status=status,
@@ -765,6 +931,8 @@ def _reconcile_outcome(
         result_digest=None,
         materialization_executions=1,
         wait_condition=wait_condition,
+        wait_source_ref=wait_source_ref,
+        wait_event_identity=wait_event_identity,
     )
 
 
@@ -851,20 +1019,35 @@ def test_goal_driver_named_wait_is_ineligible_until_new_durable_wake(tmp_path):
             _reconcile_outcome(
                 directive="wait_for_runtime",
                 wait_condition="runtime_result",
+                wait_source_ref="paseo://attempt/1",
+                wait_event_identity="runtime_result",
             ),
             _reconcile_outcome(),
         ]
     )
     coordinators = InMemoryCoordinatorRuntime()
+    durable = InMemoryDurableGoalControl()
     driver = GoalDriver(
         store_path=tmp_path / "driver.sqlite3",
         reconciler=reconciler,
         coordinators=coordinators,
         auto_profile=_coordinator_profile(),
+        durable=durable,
     )
 
     first_wait = driver.run_once(_goal_snapshot())
     unchanged = driver.run_once(_goal_snapshot())
+    durable.publish_wake(
+        _goal_snapshot().repository,
+        DurableWake(
+            goal_key=_goal_snapshot().goal_key,
+            semantic_input_digest=driver.semantic_input_digest(_goal_snapshot()),
+            wait_condition="runtime_result",
+            source_ref="paseo://attempt/1",
+            event_identity="runtime_result",
+            durable_reference="paseo://event/result-1",
+        ),
+    )
     woken = driver.run_once(
         _goal_snapshot(),
         wake_reference="paseo://event/result-1",
@@ -891,41 +1074,47 @@ def test_goal_driver_bounds_unchanged_zero_outcome_then_opens_decision_gate(
             runtime_profile="manual-runtime",
         )
     )
+    durable = InMemoryDurableGoalControl()
     driver = GoalDriver(
         store_path=tmp_path / "driver.sqlite3",
         reconciler=reconciler,
         coordinators=coordinators,
         auto_profile=_coordinator_profile(),
+        durable=durable,
     )
     snapshot = _goal_snapshot()
     digest = driver.semantic_input_digest(snapshot)
 
     first = driver.run_once(snapshot)
+    first_observation = CoordinatorTurnObservation(
+        goal_key=snapshot.goal_key,
+        semantic_input_digest=digest,
+        session_id=first.session_id,
+        outcome="zero_outcome",
+        durable_reference="paseo://turn/1",
+        token_use=100_000,
+        tool_calls=500,
+        agent_liveness="running",
+    )
+    durable.publish_observation(snapshot.repository, first_observation)
     corrective = driver.run_once(
         snapshot,
-        observation=CoordinatorTurnObservation(
-            goal_key=snapshot.goal_key,
-            semantic_input_digest=digest,
-            session_id=first.session_id,
-            outcome="zero_outcome",
-            durable_reference="paseo://turn/1",
-            token_use=100_000,
-            tool_calls=500,
-            agent_liveness="running",
-        ),
+        observation=first_observation,
     )
+    second_observation = CoordinatorTurnObservation(
+        goal_key=snapshot.goal_key,
+        semantic_input_digest=digest,
+        session_id=corrective.session_id,
+        outcome="zero_outcome",
+        durable_reference="paseo://turn/2",
+        token_use=1,
+        tool_calls=0,
+        agent_liveness="idle",
+    )
+    durable.publish_observation(snapshot.repository, second_observation)
     decision = driver.run_once(
         snapshot,
-        observation=CoordinatorTurnObservation(
-            goal_key=snapshot.goal_key,
-            semantic_input_digest=digest,
-            session_id=corrective.session_id,
-            outcome="zero_outcome",
-            durable_reference="paseo://turn/2",
-            token_use=1,
-            tool_calls=0,
-            agent_liveness="idle",
-        ),
+        observation=second_observation,
     )
 
     assert corrective.kind == "continue_coordinator"
@@ -937,6 +1126,58 @@ def test_goal_driver_bounds_unchanged_zero_outcome_then_opens_decision_gate(
     status = driver.read_status(snapshot.repository, snapshot.goal_key)
     assert status.zero_outcomes == 2
     assert status.semantic_input_digest == digest
+
+
+def test_goal_driver_rejects_replayed_or_unpublished_coordinator_outcomes(
+    tmp_path,
+):
+    durable = InMemoryDurableGoalControl()
+    driver = GoalDriver(
+        store_path=tmp_path / "driver.sqlite3",
+        reconciler=_SequenceReconciler([_reconcile_outcome()]),
+        coordinators=InMemoryCoordinatorRuntime(),
+        auto_profile=_coordinator_profile(),
+        durable=durable,
+    )
+    snapshot = _goal_snapshot()
+    first = driver.run_once(snapshot)
+    observation = CoordinatorTurnObservation(
+        goal_key=snapshot.goal_key,
+        semantic_input_digest=driver.semantic_input_digest(snapshot),
+        session_id=first.session_id,
+        outcome="executable_work",
+        durable_reference="github://turn/1",
+    )
+
+    with pytest.raises(GoalDriverError) as unpublished:
+        driver.run_once(snapshot, observation=observation)
+    assert getattr(unpublished.value, "code", None) == (
+        "COORDINATOR_OBSERVATION_INVALID"
+    )
+
+    durable.publish_observation(snapshot.repository, observation)
+    driver.run_once(snapshot, observation=observation)
+    with pytest.raises(GoalDriverError) as replayed:
+        driver.run_once(snapshot, observation=observation)
+    assert getattr(replayed.value, "code", None) == (
+        "COORDINATOR_OBSERVATION_INVALID"
+    )
+
+
+def test_goal_semantic_digest_covers_execution_relevant_state_only():
+    base = _goal_snapshot()
+    driver_digest = GoalDriver.semantic_input_digest
+    variants = [
+        replace(base, node_states=(("node:1", "running"),)),
+        replace(base, evidence_manifests=(("candidate", "digest:1"),)),
+        replace(base, capability_configuration_digest="capabilities:1"),
+        replace(base, base_identity="base:1"),
+    ]
+
+    assert all(
+        driver_digest(variant) != driver_digest(base)
+        for variant in variants
+    )
 
 
 def test_goal_driver_waits_for_outstanding_turn_instead_of_sampling_again(

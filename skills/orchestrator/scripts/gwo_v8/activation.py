@@ -113,6 +113,10 @@ class DurablePlanControl(Protocol):
         self, repository: str, activation_id: str
     ) -> ActivationReceipt | None: ...
 
+    def read_current_activation(
+        self, repository: str
+    ) -> ActivationReceipt | None: ...
+
 
 @dataclass(frozen=True)
 class GitHubContent:
@@ -227,6 +231,25 @@ class InMemoryDurablePlanControl:
         self, repository: str, activation_id: str
     ) -> ActivationReceipt | None:
         return self._receipts.get((repository, activation_id))
+
+    def read_current_activation(
+        self, repository: str
+    ) -> ActivationReceipt | None:
+        active_digest = self._active.get(repository)
+        if active_digest is None:
+            return None
+        matches = [
+            receipt
+            for (candidate_repository, _activation_id), receipt in self._receipts.items()
+            if candidate_repository == repository
+            and receipt.plan_digest == active_digest
+        ]
+        if len(matches) != 1:
+            raise ActivationError(
+                "ACTIVATION_LOG_INVALID",
+                "durable active Plan lacks one exact Activation Receipt",
+            )
+        return matches[0]
 
     def activation_count(self, repository: str) -> int:
         return sum(key[0] == repository for key in self._receipts)
@@ -530,6 +553,26 @@ class GitHubDurablePlanControl:
                 "GitHub activation log contains duplicate receipt identities",
             )
         return None if not matches else matches[0]
+
+    def read_current_activation(
+        self, repository: str
+    ) -> ActivationReceipt | None:
+        payload, _blob_sha = self._read_activation_log(repository)
+        active_digest = payload.get("active_plan_digest")
+        if active_digest is None:
+            return None
+        matches = [
+            ActivationReceipt.from_dict(item)
+            for item in payload["receipts"]
+            if isinstance(item, dict)
+            and item.get("plan_digest") == active_digest
+        ]
+        if len(matches) != 1:
+            raise ActivationError(
+                "ACTIVATION_LOG_INVALID",
+                "GitHub active Plan lacks one exact Activation Receipt",
+            )
+        return matches[0]
 
 
 def _now() -> str:
@@ -978,7 +1021,7 @@ class LocalPlanPublication:
                 "ACTIVATION_RECEIPT_MISSING",
                 "active Plan lacks a durable receipt identity",
             )
-        return PublishedPlan(
+        published = PublishedPlan(
             repository=repository,
             plan_digest=str(row["plan_digest"]),
             canonical_bytes=bytes(row["canonical_bytes"]),
@@ -986,3 +1029,30 @@ class LocalPlanPublication:
             writer_generation=str(row["writer_generation"]),
             activation_id=str(row["activation_id"]),
         )
+        self.assert_writer(
+            repository,
+            writer_generation=published.writer_generation,
+            plan_digest=published.plan_digest,
+            activation_id=published.activation_id,
+        )
+        return published
+
+    def assert_writer(
+        self,
+        repository: str,
+        *,
+        writer_generation: str,
+        plan_digest: str,
+        activation_id: str,
+    ) -> None:
+        durable = self.durable.read_current_activation(repository)
+        if (
+            durable is None
+            or durable.writer_generation != writer_generation
+            or durable.plan_digest != plan_digest
+            or durable.activation_id != activation_id
+        ):
+            raise ActivationError(
+                "WRITER_GENERATION_FENCED",
+                "durable control no longer authorizes this writer and Plan",
+            )

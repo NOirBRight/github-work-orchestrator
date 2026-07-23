@@ -1,4 +1,4 @@
-"""Public Phase 1 surfaces for the V8 walking skeleton."""
+"""Public V8 orchestration surfaces."""
 
 from .activation import (
     ActivationCheckpointCrash,
@@ -16,7 +16,13 @@ from .activation import (
     PublishedPlan,
 )
 from .compiler import CompiledPlan, CompileError, PlanCompiler
-from .entry import ImplementGwoDecision, ImplementGwoEntry, ImplementGwoInputError
+from .entry import (
+    ImplementGwoDecision,
+    ImplementGwoEntry,
+    ImplementGwoInputError,
+    ImplementGwoLauncher,
+    ImplementGwoLaunchOutcome,
+)
 from .evidence import (
     EvidenceVerifier,
     ResultClaim,
@@ -27,12 +33,16 @@ from .goal_driver import (
     CoordinatorRuntime,
     CoordinatorSession,
     CoordinatorTurnObservation,
+    DurableGoalControl,
+    DurableWake,
+    GitHubDurableGoalControl,
     GoalDirective,
     GoalDriver,
     GoalDriverError,
     GoalDriverStatus,
     GoalSnapshot,
     InMemoryCoordinatorRuntime,
+    InMemoryDurableGoalControl,
     PaseoCoordinatorRuntime,
     Reconciler,
 )
@@ -74,12 +84,16 @@ __all__ = [
     "CoordinatorRuntime",
     "CoordinatorSession",
     "CoordinatorTurnObservation",
+    "DurableGoalControl",
+    "DurableWake",
+    "GitHubDurableGoalControl",
     "GoalDirective",
     "GoalDriver",
     "GoalDriverError",
     "GoalDriverStatus",
     "GoalSnapshot",
     "InMemoryDurablePlanControl",
+    "InMemoryDurableGoalControl",
     "InMemoryCoordinatorRuntime",
     "PaseoCoordinatorRuntime",
     "InMemoryRuntimeAdapter",
@@ -89,6 +103,8 @@ __all__ = [
     "ImplementGwoDecision",
     "ImplementGwoEntry",
     "ImplementGwoInputError",
+    "ImplementGwoLauncher",
+    "ImplementGwoLaunchOutcome",
     "Kernel",
     "KernelError",
     "LocalPlanPublication",

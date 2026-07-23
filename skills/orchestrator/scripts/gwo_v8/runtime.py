@@ -1,4 +1,4 @@
-"""Capability-oriented Runtime seam and explicit in-memory Phase 1 fake."""
+"""Capability-oriented Runtime seam and explicit deterministic test fake."""
 
 from __future__ import annotations
 
@@ -195,7 +195,7 @@ class RuntimeObservation:
 
 
 class RuntimeAdapter(Protocol):
-    """Evolvable Paseo-shaped capabilities consumed by the Phase 1 Kernel."""
+    """Evolvable Paseo-shaped capabilities consumed by the V8 Kernel."""
 
     adapter_name: str
 
@@ -205,13 +205,21 @@ class RuntimeAdapter(Protocol):
         prompt: RuntimePrompt | None = None,
     ) -> RuntimeBinding: ...
 
-    def read_binding(self, admission_id: str) -> RuntimeBinding | None: ...
+    def read_binding(
+        self,
+        admission: RuntimeAdmission | str,
+        prompt: RuntimePrompt | None = None,
+    ) -> RuntimeBinding | None: ...
 
     def accept_prompt(
         self, binding: RuntimeBinding, prompt: RuntimePrompt
     ) -> None: ...
 
-    def attach_attempt(self, binding: RuntimeBinding, attempt_id: str) -> None: ...
+    def attach_attempt(
+        self,
+        binding: RuntimeBinding,
+        attempt_id: str,
+    ) -> RuntimeBinding: ...
 
     def resume(self, binding: RuntimeBinding) -> None: ...
 
@@ -443,8 +451,43 @@ class PaseoCliClient:
 
     def __init__(self, executable: str = "paseo"):
         self.executable = executable
+        self._known_labels: dict[str, dict[str, str]] = {}
 
-    def _run(self, args: list[str]) -> Any:
+    @staticmethod
+    def classify_failure(message: str, *, default: str = "transient") -> str:
+        lowered = message.casefold()
+        permanent_markers = (
+            "unauthorized",
+            "forbidden",
+            "authentication",
+            "permission denied",
+            "invalid configuration",
+            "unknown provider",
+            "unknown model",
+            "certificate",
+            "tls",
+        )
+        if any(marker in lowered for marker in permanent_markers):
+            return "permanent"
+        transient_markers = (
+            "temporarily unavailable",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection refused",
+            "busy",
+            "rate limit",
+        )
+        if any(marker in lowered for marker in transient_markers):
+            return "transient"
+        return default
+
+    def _run(
+        self,
+        args: list[str],
+        *,
+        failure_class: str = "transient",
+    ) -> Any:
         result = subprocess.run(
             [self.executable, *args],
             capture_output=True,
@@ -452,12 +495,18 @@ class PaseoCliClient:
             encoding="utf-8",
         )
         if result.returncode != 0:
-            raise RuntimeAdapterError(
-                "PASEO_OPERATION_FAILED",
+            detail = (
                 result.stderr.strip()
                 or result.stdout.strip()
-                or "Paseo operation failed",
-                failure_class="transient",
+                or "Paseo operation failed"
+            )
+            raise RuntimeAdapterError(
+                "PASEO_OPERATION_FAILED",
+                detail,
+                failure_class=self.classify_failure(
+                    detail,
+                    default=failure_class,
+                ),
             )
         try:
             return json.loads(result.stdout)
@@ -497,19 +546,27 @@ class PaseoCliClient:
             payload.get("SessionId")
             or payload.get("sessionId")
             or payload.get("ProviderSessionId")
+            or agent_id
         )
         worktree = payload.get("Worktree") or payload.get("worktree") or {}
         workspace_id = (
-            worktree.get("Id")
-            or worktree.get("id")
+            (
+                worktree.get("Id") or worktree.get("id")
+                if isinstance(worktree, dict)
+                else worktree
+            )
             or payload.get("WorkspaceId")
             or payload.get("workspaceId")
+            or agent_id
         )
         workspace = (
             payload.get("Cwd")
             or payload.get("cwd")
-            or worktree.get("Path")
-            or worktree.get("path")
+            or (
+                worktree.get("Path") or worktree.get("path")
+                if isinstance(worktree, dict)
+                else None
+            )
         )
         provider = payload.get("Provider") or payload.get("provider")
         model = payload.get("Model") or payload.get("model")
@@ -538,7 +595,9 @@ class PaseoCliClient:
                 failure_class="ambiguous",
             )
         labels = cls._labels(payload.get("Labels") or payload.get("labels"))
-        profile_digest = labels.get("gwo.profile_digest")
+        if provider == "kimi":
+            provider = "kimi-cli"
+        profile_digest = labels.get("gwo.profile_digest", "")
         if not all(
             isinstance(value, str) and value
             for value in (
@@ -550,7 +609,6 @@ class PaseoCliClient:
                 model,
                 thinking,
                 mode,
-                profile_digest,
             )
         ):
             raise RuntimeAdapterError(
@@ -609,6 +667,21 @@ class PaseoCliClient:
                     failure_class="ambiguous",
                 )
             records.append(self.inspect(agent_id))
+            self._known_labels[agent_id] = {
+                **self._known_labels.get(agent_id, {}),
+                **labels,
+            }
+            records[-1] = replace(
+                records[-1],
+                labels={
+                    **records[-1].labels,
+                    **self._known_labels[agent_id],
+                },
+                profile_digest=self._known_labels[agent_id].get(
+                    "gwo.profile_digest",
+                    records[-1].profile_digest,
+                ),
+            )
         return tuple(records)
 
     def create(self, request: PaseoCreateRequest) -> PaseoAgentRecord:
@@ -619,7 +692,11 @@ class PaseoCliClient:
             "--title",
             request.title,
             "--provider",
-            request.profile.provider,
+            (
+                "kimi"
+                if request.profile.provider == "kimi-cli"
+                else request.profile.provider
+            ),
             "--model",
             request.profile.model,
             "--thinking",
@@ -633,15 +710,10 @@ class PaseoCliClient:
             "--cwd",
             request.repository_path,
         ]
-        for key, value in sorted(
-            {
-                **request.labels,
-                "gwo.prompt_digest": request.prompt.digest,
-            }.items()
-        ):
+        for key, value in sorted(request.labels.items()):
             command.extend(["--label", f"{key}={value}"])
         command.extend(["--json", request.prompt.text])
-        payload = self._run(command)
+        payload = self._run(command, failure_class="ambiguous")
         if not isinstance(payload, dict):
             raise RuntimeAdapterError(
                 "PASEO_READBACK_INVALID",
@@ -662,7 +734,23 @@ class PaseoCliClient:
                 "Paseo creation did not return an Agent ID",
                 failure_class="ambiguous",
             )
-        return self.inspect(agent_id)
+        self.update_labels(
+            agent_id,
+            {"gwo.prompt_digest": request.prompt.digest},
+        )
+        expected_labels = {
+            **request.labels,
+            "gwo.prompt_digest": request.prompt.digest,
+        }
+        matches = self.find_by_labels(expected_labels)
+        exact = [item for item in matches if item.agent_id == agent_id]
+        if len(exact) != 1:
+            raise RuntimeAdapterError(
+                "PASEO_READBACK_INVALID",
+                "Paseo creation did not read back exact identity labels",
+                failure_class="ambiguous",
+            )
+        return exact[0]
 
     def inspect(self, agent_id: str) -> PaseoAgentRecord:
         payload = self._run(["inspect", agent_id, "--json"])
@@ -672,7 +760,16 @@ class PaseoCliClient:
                 "Paseo inspect returned an invalid Agent",
                 failure_class="ambiguous",
             )
-        return self._agent(payload)
+        record = self._agent(payload)
+        known = self._known_labels.get(agent_id, {})
+        return replace(
+            record,
+            labels={**record.labels, **known},
+            profile_digest=known.get(
+                "gwo.profile_digest",
+                record.profile_digest,
+            ),
+        )
 
     def send_prompt(
         self,
@@ -682,7 +779,10 @@ class PaseoCliClient:
         action_key: str,
     ) -> None:
         del action_key
-        self._run(["send", "--no-wait", "--json", agent_id, prompt.text])
+        self._run(
+            ["send", "--no-wait", "--json", agent_id, prompt.text],
+            failure_class="ambiguous",
+        )
         self.update_labels(agent_id, {"gwo.prompt_digest": prompt.digest})
 
     def update_labels(self, agent_id: str, labels: dict[str, str]) -> None:
@@ -691,6 +791,10 @@ class PaseoCliClient:
             command.extend(["--label", f"{key}={value}"])
         command.append("--json")
         self._run(command)
+        self._known_labels[agent_id] = {
+            **self._known_labels.get(agent_id, {}),
+            **labels,
+        }
 
     def stop(self, agent_id: str) -> None:
         self._run(["stop", agent_id, "--json"])
@@ -727,8 +831,11 @@ class PaseoRuntimeAdapter:
             "gwo.admission": admission.admission_id,
         }
 
-    def _find_one(self, admission_id: str) -> PaseoAgentRecord | None:
-        matches = self.client.find_by_labels({"gwo.admission": admission_id})
+    def _find_one(
+        self,
+        labels: dict[str, str],
+    ) -> PaseoAgentRecord | None:
+        matches = self.client.find_by_labels(labels)
         if len(matches) > 1:
             raise RuntimeAdapterError(
                 "MATERIALIZATION_AMBIGUOUS",
@@ -817,14 +924,14 @@ class PaseoRuntimeAdapter:
                 "PROMPT_MISSING",
                 "Paseo Materialization requires the frozen initial Prompt",
             )
-        existing = self._find_one(admission.admission_id)
+        labels = {
+            **self._identity_labels(admission),
+            "gwo.repository_path": str(Path(admission.repository_path).resolve()),
+            "gwo.runtime_profile": admission.runtime_profile.name,
+            "gwo.profile_digest": admission.runtime_profile.digest,
+        }
+        existing = self._find_one(labels)
         if existing is None:
-            labels = {
-                **self._identity_labels(admission),
-                "gwo.repository_path": str(Path(admission.repository_path).resolve()),
-                "gwo.runtime_profile": admission.runtime_profile.name,
-                "gwo.profile_digest": admission.runtime_profile.digest,
-            }
             existing = self.client.create(
                 PaseoCreateRequest(
                     action_key=f"{admission.admission_id}:materialize",
@@ -837,15 +944,92 @@ class PaseoRuntimeAdapter:
                     parent_agent_id=admission.parent_agent_id,
                 )
             )
+        accepted = self._find_one(
+            {
+                "gwo.admission": admission.admission_id,
+                "gwo.prompt_digest": prompt.digest,
+            }
+        )
+        if accepted is not None:
+            existing = replace(
+                existing,
+                labels={
+                    **existing.labels,
+                    "gwo.prompt_digest": prompt.digest,
+                },
+            )
         binding = self._binding(self.client.inspect(existing.agent_id))
+        binding = replace(
+            binding,
+            prompt_accepted=accepted is not None,
+            prompt_digest=(prompt.digest if accepted is not None else None),
+        )
         self._assert_admission_identity(admission, binding, prompt)
         return binding
 
-    def read_binding(self, admission_id: str) -> RuntimeBinding | None:
-        agent = self._find_one(admission_id)
+    def read_binding(
+        self,
+        admission: RuntimeAdmission | str,
+        prompt: RuntimePrompt | None = None,
+    ) -> RuntimeBinding | None:
+        if isinstance(admission, str):
+            labels = {"gwo.admission": admission}
+            expected_admission = None
+        else:
+            profile = admission.runtime_profile
+            if profile is None:
+                raise RuntimeAdapterError(
+                    "RUNTIME_PROFILE_MISSING",
+                    "Paseo readback requires the resolved Runtime Profile",
+                )
+            labels = {
+                **self._identity_labels(admission),
+                "gwo.repository_path": str(
+                    Path(admission.repository_path).resolve()
+                ),
+                "gwo.runtime_profile": profile.name,
+                "gwo.profile_digest": profile.digest,
+            }
+            expected_admission = admission
+        agent = self._find_one(labels)
         if agent is None:
             return None
-        return self._binding(self.client.inspect(agent.agent_id))
+        readback = self.client.inspect(agent.agent_id)
+        readback = replace(
+            readback,
+            labels={**readback.labels, **labels},
+            profile_digest=labels.get(
+                "gwo.profile_digest",
+                readback.profile_digest,
+            ),
+        )
+        if prompt is not None:
+            accepted = self._find_one(
+                {
+                    "gwo.admission": (
+                        admission
+                        if isinstance(admission, str)
+                        else admission.admission_id
+                    ),
+                    "gwo.prompt_digest": prompt.digest,
+                }
+            )
+            if accepted is not None:
+                readback = replace(
+                    readback,
+                    labels={
+                        **readback.labels,
+                        "gwo.prompt_digest": prompt.digest,
+                    },
+                )
+        binding = self._binding(readback)
+        if expected_admission is not None and prompt is not None:
+            self._assert_admission_identity(
+                expected_admission,
+                binding,
+                prompt,
+            )
+        return binding
 
     def accept_prompt(self, binding: RuntimeBinding, prompt: RuntimePrompt) -> None:
         if binding.prompt_accepted:
@@ -862,20 +1046,20 @@ class PaseoRuntimeAdapter:
                 "Paseo Binding has no Agent identity",
                 failure_class="ambiguous",
             )
-        self.client.send_prompt(
-            binding.agent_id,
-            prompt,
-            action_key=f"{binding.admission_id}:prompt",
+        raise RuntimeAdapterError(
+            "PROMPT_ACCEPTANCE_AMBIGUOUS",
+            (
+                "Paseo Agent exists without the immutable initial-Prompt "
+                "acknowledgement; automatic resend could execute it twice"
+            ),
+            failure_class="ambiguous",
         )
-        accepted = self._binding(self.client.inspect(binding.agent_id))
-        if not accepted.prompt_accepted or accepted.prompt_digest != prompt.digest:
-            raise RuntimeAdapterError(
-                "PROMPT_READBACK_FAILED",
-                "Paseo did not confirm the exact Prompt",
-                failure_class="ambiguous",
-            )
 
-    def attach_attempt(self, binding: RuntimeBinding, attempt_id: str) -> None:
+    def attach_attempt(
+        self,
+        binding: RuntimeBinding,
+        attempt_id: str,
+    ) -> RuntimeBinding:
         if binding.agent_id is None or not binding.prompt_accepted:
             raise RuntimeAdapterError(
                 "PROMPT_NOT_ACCEPTED",
@@ -898,6 +1082,7 @@ class PaseoRuntimeAdapter:
                 "Paseo did not round-trip the Attempt identity",
                 failure_class="ambiguous",
             )
+        return replace(binding, attempt_id=attempt_id)
 
     def resume(self, binding: RuntimeBinding) -> None:
         if binding.agent_id is None:
@@ -1064,7 +1249,15 @@ class InMemoryRuntimeAdapter:
             self.accept_prompt(binding, prompt)
         return self._states[admission.admission_id].binding
 
-    def read_binding(self, admission_id: str) -> RuntimeBinding | None:
+    def read_binding(
+        self,
+        admission: RuntimeAdmission | str,
+        prompt: RuntimePrompt | None = None,
+    ) -> RuntimeBinding | None:
+        del prompt
+        admission_id = (
+            admission if isinstance(admission, str) else admission.admission_id
+        )
         state = self._states.get(admission_id)
         return None if state is None else state.binding
 
@@ -1099,7 +1292,11 @@ class InMemoryRuntimeAdapter:
             prompt_digest=prompt.digest,
         )
 
-    def attach_attempt(self, binding: RuntimeBinding, attempt_id: str) -> None:
+    def attach_attempt(
+        self,
+        binding: RuntimeBinding,
+        attempt_id: str,
+    ) -> RuntimeBinding:
         state = self._state_for(binding)
         if not binding.prompt_accepted:
             raise RuntimeAdapterError(
@@ -1108,6 +1305,7 @@ class InMemoryRuntimeAdapter:
         if not isinstance(attempt_id, str) or not attempt_id:
             raise RuntimeAdapterError("ATTEMPT_ID_INVALID", "Attempt ID is required")
         state.binding = replace(binding, attempt_id=attempt_id)
+        return state.binding
 
     def resume(self, binding: RuntimeBinding) -> None:
         state = self._state_for(binding)

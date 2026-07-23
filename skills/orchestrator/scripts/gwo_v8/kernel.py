@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -49,6 +49,9 @@ class ReconcileOutcome:
     materialization_executions: int
     wait_condition: str | None
     runtime_circuit: str | None = None
+    wait_source_ref: str | None = None
+    wait_event_identity: str | None = None
+    next_check_at: str | None = None
 
 
 def _now() -> str:
@@ -110,6 +113,42 @@ class Kernel:
                     repository TEXT PRIMARY KEY,
                     holder TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS v8_admissions (
+                    admission_id TEXT PRIMARY KEY,
+                    repository TEXT NOT NULL,
+                    plan_digest TEXT NOT NULL,
+                    node_key TEXT NOT NULL,
+                    goal_key TEXT NOT NULL,
+                    state TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS v8_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    repository TEXT NOT NULL,
+                    plan_digest TEXT NOT NULL,
+                    node_key TEXT NOT NULL,
+                    admission_id TEXT NOT NULL,
+                    state TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS v8_resource_claims (
+                    repository TEXT NOT NULL,
+                    resource_key TEXT NOT NULL,
+                    admission_id TEXT,
+                    attempt_id TEXT,
+                    PRIMARY KEY (repository, resource_key)
+                );
+                CREATE TABLE IF NOT EXISTS v8_goal_holds (
+                    repository TEXT NOT NULL,
+                    goal_key TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    PRIMARY KEY (repository, goal_key)
+                );
+                CREATE TABLE IF NOT EXISTS v8_node_states (
+                    repository TEXT NOT NULL,
+                    plan_digest TEXT NOT NULL,
+                    node_key TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    PRIMARY KEY (repository, plan_digest, node_key)
+                );
                 """
             )
 
@@ -133,24 +172,343 @@ class Kernel:
     def _write_state(
         self, repository: str, plan_digest: str, state: dict[str, Any]
     ) -> None:
-        rendered = json.dumps(
+        rendered = self._render_state(state)
+        with self._connect() as connection:
+            self._upsert_state(
+                connection,
+                repository=repository,
+                plan_digest=plan_digest,
+                rendered=rendered,
+            )
+
+    @staticmethod
+    def _render_state(state: dict[str, Any]) -> str:
+        return json.dumps(
             state,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
         )
+
+    @staticmethod
+    def _upsert_state(
+        connection: sqlite3.Connection,
+        *,
+        repository: str,
+        plan_digest: str,
+        rendered: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO v8_execution_state (
+                repository,
+                plan_digest,
+                state_json
+            ) VALUES (?, ?, ?)
+            ON CONFLICT(repository, plan_digest) DO UPDATE SET
+                state_json = excluded.state_json
+            """,
+            (repository, plan_digest, rendered),
+        )
+
+    def _commit_admission(
+        self,
+        state: dict[str, Any],
+        work_node: dict[str, Any],
+        *,
+        activation_id: str,
+        dependency_keys: tuple[str, ...] = (),
+    ) -> None:
+        claims = work_node.get("resource_claims") or []
+        if not isinstance(claims, list) or any(
+            not isinstance(claim, str) or not claim for claim in claims
+        ):
+            raise KernelError(
+                "RESOURCE_CLAIMS_INVALID",
+                "Plan Node Resource Claims are invalid",
+            )
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT plan_digest, writer_generation, activation_id
+                FROM v8_active_plans
+                WHERE repository = ?
+                """,
+                (state["repository"],),
+            ).fetchone()
+            pending = connection.execute(
+                """
+                SELECT 1
+                FROM v8_pending_activations
+                WHERE repository = ?
+                """,
+                (state["repository"],),
+            ).fetchone()
+            hold = connection.execute(
+                """
+                SELECT reason
+                FROM v8_goal_holds
+                WHERE repository = ? AND goal_key = ?
+                """,
+                (state["repository"], state["goal_key"]),
+            ).fetchone()
+            if (
+                active is None
+                or active["plan_digest"] != state["plan_digest"]
+                or active["writer_generation"] != self.writer_generation
+                or active["activation_id"] != activation_id
+                or pending is not None
+            ):
+                raise KernelError(
+                    "ADMISSION_PLAN_FENCED",
+                    "active Plan or writer changed before Admission commit",
+                )
+            if hold is not None:
+                raise KernelError(
+                    "GOAL_ON_REPLAN_HOLD",
+                    str(hold["reason"]),
+                )
+            for dependency_key in dependency_keys:
+                predecessor = connection.execute(
+                    """
+                    SELECT state FROM v8_node_states
+                    WHERE repository = ? AND plan_digest = ? AND node_key = ?
+                    """,
+                    (
+                        state["repository"],
+                        state["plan_digest"],
+                        dependency_key,
+                    ),
+                ).fetchone()
+                if predecessor is None or predecessor["state"] not in {
+                    "verified",
+                    "integrated",
+                    "complete",
+                }:
+                    raise KernelError(
+                        "ADMISSION_DEPENDENCY_UNSATISFIED",
+                        f"Plan Node dependency is not satisfied: {dependency_key}",
+                    )
+            existing = connection.execute(
+                """
+                SELECT admission_id, state
+                FROM v8_admissions
+                WHERE repository = ? AND node_key = ?
+                  AND state NOT IN ('consumed', 'abandoned')
+                """,
+                (state["repository"], state["node_key"]),
+            ).fetchone()
+            attempt = connection.execute(
+                """
+                SELECT attempt_id
+                FROM v8_attempts
+                WHERE repository = ? AND node_key = ?
+                  AND state NOT IN ('verified', 'terminal')
+                """,
+                (state["repository"], state["node_key"]),
+            ).fetchone()
+            if existing is not None or attempt is not None:
+                raise KernelError(
+                    "ADMISSION_ALREADY_EXISTS",
+                    "Plan Node already has non-terminal execution",
+                )
+            for claim in sorted(set(claims)):
+                occupied = connection.execute(
+                    """
+                    SELECT admission_id, attempt_id
+                    FROM v8_resource_claims
+                    WHERE repository = ? AND resource_key = ?
+                    """,
+                    (state["repository"], claim),
+                ).fetchone()
+                if occupied is not None:
+                    raise KernelError(
+                        "RESOURCE_CLAIM_UNAVAILABLE",
+                        f"Resource Claim is already reserved: {claim}",
+                    )
             connection.execute(
                 """
-                INSERT INTO v8_execution_state (
+                INSERT INTO v8_admissions (
+                    admission_id,
                     repository,
                     plan_digest,
-                    state_json
-                ) VALUES (?, ?, ?)
-                ON CONFLICT(repository, plan_digest) DO UPDATE SET
-                    state_json = excluded.state_json
+                    node_key,
+                    goal_key,
+                    state
+                ) VALUES (?, ?, ?, ?, ?, 'materializing')
                 """,
-                (repository, plan_digest, rendered),
+                (
+                    state["admission_id"],
+                    state["repository"],
+                    state["plan_digest"],
+                    state["node_key"],
+                    state["goal_key"],
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO v8_node_states (
+                    repository, plan_digest, node_key, state
+                ) VALUES (?, ?, ?, 'materializing')
+                ON CONFLICT(repository, plan_digest, node_key) DO UPDATE SET
+                    state = excluded.state
+                """,
+                (
+                    state["repository"],
+                    state["plan_digest"],
+                    state["node_key"],
+                ),
+            )
+            for claim in sorted(set(claims)):
+                connection.execute(
+                    """
+                    INSERT INTO v8_resource_claims (
+                        repository,
+                        resource_key,
+                        admission_id,
+                        attempt_id
+                    ) VALUES (?, ?, ?, NULL)
+                    """,
+                    (state["repository"], claim, state["admission_id"]),
+                )
+            self._upsert_state(
+                connection,
+                repository=state["repository"],
+                plan_digest=state["plan_digest"],
+                rendered=self._render_state(state),
+            )
+
+    def _commit_attempt(
+        self,
+        state: dict[str, Any],
+        *,
+        attempt_id: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT plan_digest, writer_generation, activation_id
+                FROM v8_active_plans
+                WHERE repository = ?
+                """,
+                (state["repository"],),
+            ).fetchone()
+            pending = connection.execute(
+                """
+                SELECT 1 FROM v8_pending_activations WHERE repository = ?
+                """,
+                (state["repository"],),
+            ).fetchone()
+            admission = connection.execute(
+                """
+                SELECT state FROM v8_admissions
+                WHERE admission_id = ? AND repository = ? AND plan_digest = ?
+                """,
+                (
+                    state["admission_id"],
+                    state["repository"],
+                    state["plan_digest"],
+                ),
+            ).fetchone()
+            if (
+                active is None
+                or active["plan_digest"] != state["plan_digest"]
+                or active["writer_generation"] != self.writer_generation
+                or active["activation_id"] != state["activation_id"]
+                or pending is not None
+            ):
+                raise KernelError(
+                    "ATTEMPT_PLAN_FENCED",
+                    "active Plan or writer changed before Attempt commit",
+                )
+            if admission is None or admission["state"] != "materializing":
+                raise KernelError(
+                    "ADMISSION_NOT_CONSUMABLE",
+                    "Admission is not available for one atomic Attempt transition",
+                )
+            connection.execute(
+                """
+                INSERT INTO v8_attempts (
+                    attempt_id, repository, plan_digest, node_key,
+                    admission_id, state
+                ) VALUES (?, ?, ?, ?, ?, 'running')
+                """,
+                (
+                    attempt_id,
+                    state["repository"],
+                    state["plan_digest"],
+                    state["node_key"],
+                    state["admission_id"],
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE v8_admissions SET state = 'consumed'
+                WHERE admission_id = ? AND state = 'materializing'
+                """,
+                (state["admission_id"],),
+            )
+            connection.execute(
+                """
+                UPDATE v8_node_states SET state = 'running'
+                WHERE repository = ? AND plan_digest = ? AND node_key = ?
+                """,
+                (
+                    state["repository"],
+                    state["plan_digest"],
+                    state["node_key"],
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE v8_resource_claims
+                SET admission_id = NULL, attempt_id = ?
+                WHERE repository = ? AND admission_id = ?
+                """,
+                (attempt_id, state["repository"], state["admission_id"]),
+            )
+            self._upsert_state(
+                connection,
+                repository=state["repository"],
+                plan_digest=state["plan_digest"],
+                rendered=self._render_state(state),
+            )
+
+    def _release_attempt_claims(self, state: dict[str, Any]) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE v8_attempts SET state = 'verified'
+                WHERE attempt_id = ? AND state = 'running'
+                """,
+                (state["attempt_id"],),
+            )
+            connection.execute(
+                """
+                DELETE FROM v8_resource_claims
+                WHERE repository = ? AND attempt_id = ?
+                """,
+                (state["repository"], state["attempt_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE v8_node_states SET state = 'verified'
+                WHERE repository = ? AND plan_digest = ? AND node_key = ?
+                """,
+                (
+                    state["repository"],
+                    state["plan_digest"],
+                    state["node_key"],
+                ),
+            )
+            self._upsert_state(
+                connection,
+                repository=state["repository"],
+                plan_digest=state["plan_digest"],
+                rendered=self._render_state(state),
             )
 
     def _acquire_integration_lease(self, repository: str, holder: str) -> None:
@@ -213,11 +571,22 @@ class Kernel:
         self,
         state: dict[str, Any],
         error: RuntimeAdapterError,
+        *,
+        operation: str,
     ) -> ReconcileOutcome:
-        executions = int(state["materialization_executions"])
-        circuit_key = (
-            f"{self.runtime.adapter_name}:materialize:{error.failure_class}"
+        actions = state.setdefault("materialization_actions", {})
+        executions = int(actions.get(operation, 0))
+        circuit_key = f"{self.runtime.adapter_name}:{operation}:{error.failure_class}"
+        circuits = state.setdefault("runtime_circuits", {})
+        previous = circuits.get(circuit_key)
+        consecutive = (
+            int(previous.get("consecutive_failures", 0)) + 1
+            if isinstance(previous, dict)
+            else 1
         )
+        next_check_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=30)
+        ).isoformat()
         if error.failure_class == "ambiguous":
             state.update(
                 {
@@ -225,17 +594,23 @@ class Kernel:
                     "directive": "wait_for_runtime_readback",
                     "admission_state": "materialization_ambiguous",
                     "wait_condition": "runtime_identity_readback",
+                    "wait_source_ref": (
+                        f"{self.runtime.adapter_name}://"
+                        f"admission/{state['admission_id']}"
+                    ),
+                    "wait_event_identity": f"{operation}:identity_readback",
+                    "next_check_at": next_check_at,
                 }
             )
         elif error.failure_class == "transient" and executions < 3:
-            previous = state.get("runtime_circuit_state")
-            consecutive = (
-                int(previous.get("consecutive_failures", 0)) + 1
-                if isinstance(previous, dict)
-                and previous.get("key") == circuit_key
-                else 1
-            )
             opened = consecutive >= 2
+            circuit_state = {
+                "key": circuit_key,
+                "state": "open" if opened else "closed",
+                "consecutive_failures": consecutive,
+                "probe_executed": False,
+            }
+            circuits[circuit_key] = circuit_state
             state.update(
                 {
                     "status": "waiting",
@@ -251,15 +626,23 @@ class Kernel:
                         else "runtime_retry_due"
                     ),
                     "runtime_circuit": circuit_key,
-                    "runtime_circuit_state": {
-                        "key": circuit_key,
-                        "state": "open" if opened else "closed",
-                        "consecutive_failures": consecutive,
-                        "probe_executed": False,
-                    },
+                    "runtime_circuit_state": circuit_state,
+                    "wait_source_ref": (
+                        f"{self.runtime.adapter_name}://"
+                        f"admission/{state['admission_id']}"
+                    ),
+                    "wait_event_identity": f"{operation}:retry",
+                    "next_check_at": next_check_at,
                 }
             )
         else:
+            circuit_state = {
+                "key": circuit_key,
+                "state": "open",
+                "consecutive_failures": consecutive,
+                "probe_executed": True,
+            }
+            circuits[circuit_key] = circuit_state
             state.update(
                 {
                     "status": "blocked",
@@ -267,12 +650,10 @@ class Kernel:
                     "admission_state": "materialization_blocked",
                     "wait_condition": None,
                     "runtime_circuit": circuit_key,
-                    "runtime_circuit_state": {
-                        "key": circuit_key,
-                        "state": "open",
-                        "consecutive_failures": 1,
-                        "probe_executed": True,
-                    },
+                    "runtime_circuit_state": circuit_state,
+                    "wait_source_ref": None,
+                    "wait_event_identity": None,
+                    "next_check_at": None,
                 }
             )
         state["last_runtime_error"] = {
@@ -312,9 +693,14 @@ class Kernel:
             "candidate_sha": None,
             "result_digest": None,
             "materialization_executions": 0,
+            "materialization_actions": {"create": 0, "prompt": 0},
             "wait_condition": None,
             "runtime_circuit": None,
             "runtime_circuit_state": None,
+            "runtime_circuits": {},
+            "wait_source_ref": None,
+            "wait_event_identity": None,
+            "next_check_at": None,
             "base_sha": _git(
                 self.repository_path,
                 "rev-parse",
@@ -385,9 +771,13 @@ class Kernel:
             parent_agent_id=self.parent_agent_id,
         )
         try:
-            binding = self.runtime.read_binding(admission.admission_id)
+            binding = self.runtime.read_binding(admission, prompt)
         except RuntimeAdapterError as error:
-            return None, self._materialization_failure(state, error)
+            return None, self._materialization_failure(
+                state,
+                error,
+                operation="read_binding",
+            )
 
         if binding is None:
             if state["admission_state"] == "materialization_ambiguous":
@@ -396,6 +786,14 @@ class Kernel:
                         "status": "waiting",
                         "directive": "wait_for_runtime_readback",
                         "wait_condition": "runtime_identity_readback",
+                        "wait_source_ref": (
+                            f"{self.runtime.adapter_name}://"
+                            f"admission/{state['admission_id']}"
+                        ),
+                        "wait_event_identity": "create:identity_readback",
+                        "next_check_at": (
+                            datetime.now(timezone.utc) + timedelta(seconds=30)
+                        ).isoformat(),
                     }
                 )
                 self._write_state(
@@ -404,27 +802,40 @@ class Kernel:
                     state,
                 )
                 return None, self._outcome(state)
-            if int(state["materialization_executions"]) >= 3:
+            actions = state.setdefault("materialization_actions", {})
+            if int(actions.get("create", 0)) >= 3:
                 blocked = RuntimeAdapterError(
                     "MATERIALIZATION_RETRIES_EXHAUSTED",
                     "three unchanged Materialization executions were exhausted",
                 )
-                return None, self._materialization_failure(state, blocked)
-            circuit = state.get("runtime_circuit_state")
+                return None, self._materialization_failure(
+                    state,
+                    blocked,
+                    operation="create",
+                )
+            circuit_key = f"{self.runtime.adapter_name}:create:transient"
+            circuit = state.get("runtime_circuits", {}).get(circuit_key)
             if isinstance(circuit, dict) and circuit.get("state") == "open":
                 if circuit.get("probe_executed"):
                     blocked = RuntimeAdapterError(
                         "RUNTIME_CIRCUIT_PROBE_EXHAUSTED",
                         "the single Runtime circuit probe was already used",
                     )
-                    return None, self._materialization_failure(state, blocked)
-                state["runtime_circuit_state"] = {
+                    return None, self._materialization_failure(
+                        state,
+                        blocked,
+                        operation="create",
+                    )
+                updated_circuit = {
                     **circuit,
                     "state": "half_open",
                     "probe_executed": True,
                 }
-            state["materialization_executions"] = (
-                int(state["materialization_executions"]) + 1
+                state["runtime_circuits"][circuit_key] = updated_circuit
+                state["runtime_circuit_state"] = updated_circuit
+            actions["create"] = int(actions.get("create", 0)) + 1
+            state["materialization_executions"] = sum(
+                int(value) for value in actions.values()
             )
             state.update(
                 {
@@ -432,21 +843,32 @@ class Kernel:
                     "directive": "run_again",
                     "admission_state": "materializing",
                     "wait_condition": None,
+                    "wait_source_ref": None,
+                    "wait_event_identity": None,
+                    "next_check_at": None,
                 }
             )
             self._write_state(state["repository"], state["plan_digest"], state)
             try:
                 self.runtime.materialize(admission, prompt)
-                binding = self.runtime.read_binding(admission.admission_id)
+                binding = self.runtime.read_binding(admission, prompt)
             except RuntimeAdapterError as error:
-                return None, self._materialization_failure(state, error)
+                return None, self._materialization_failure(
+                    state,
+                    error,
+                    operation="create",
+                )
             if binding is None:
                 ambiguous = RuntimeAdapterError(
                     "MATERIALIZATION_READBACK_MISSING",
                     "Runtime creation acknowledgement has no identity readback",
                     failure_class="ambiguous",
                 )
-                return None, self._materialization_failure(state, ambiguous)
+                return None, self._materialization_failure(
+                    state,
+                    ambiguous,
+                    operation="create",
+                )
 
         if (
             binding.repository != admission.repository
@@ -459,24 +881,38 @@ class Kernel:
                 "Runtime Binding did not round-trip Admission identity",
                 failure_class="ambiguous",
             )
-            return None, self._materialization_failure(state, ambiguous)
+            return None, self._materialization_failure(
+                state,
+                ambiguous,
+                operation="read_binding",
+            )
 
         if not binding.prompt_accepted:
-            if int(state["materialization_executions"]) >= 3:
+            actions = state.setdefault("materialization_actions", {})
+            if int(actions.get("prompt", 0)) >= 3:
                 blocked = RuntimeAdapterError(
                     "PROMPT_DELIVERY_RETRIES_EXHAUSTED",
-                    "three unchanged Materialization executions were exhausted",
+                    "three unchanged Prompt executions were exhausted",
                 )
-                return None, self._materialization_failure(state, blocked)
-            state["materialization_executions"] = (
-                int(state["materialization_executions"]) + 1
+                return None, self._materialization_failure(
+                    state,
+                    blocked,
+                    operation="prompt",
+                )
+            actions["prompt"] = int(actions.get("prompt", 0)) + 1
+            state["materialization_executions"] = sum(
+                int(value) for value in actions.values()
             )
             self._write_state(state["repository"], state["plan_digest"], state)
             try:
                 self.runtime.accept_prompt(binding, prompt)
-                binding = self.runtime.read_binding(admission.admission_id)
+                binding = self.runtime.read_binding(admission, prompt)
             except RuntimeAdapterError as error:
-                return None, self._materialization_failure(state, error)
+                return None, self._materialization_failure(
+                    state,
+                    error,
+                    operation="prompt",
+                )
         if (
             binding is None
             or not binding.prompt_accepted
@@ -487,9 +923,16 @@ class Kernel:
                 "Runtime did not confirm the exact frozen Prompt",
                 failure_class="ambiguous",
             )
-            return None, self._materialization_failure(state, ambiguous)
+            return None, self._materialization_failure(
+                state,
+                ambiguous,
+                operation="prompt",
+            )
         state["runtime_circuit"] = None
         state["runtime_circuit_state"] = None
+        state["wait_source_ref"] = None
+        state["wait_event_identity"] = None
+        state["next_check_at"] = None
         self._write_state(state["repository"], state["plan_digest"], state)
         return binding, None
 
@@ -518,12 +961,14 @@ class Kernel:
                     "status": "running",
                     "directive": "run_again",
                     "wait_condition": None,
+                    "wait_source_ref": None,
+                    "wait_event_identity": None,
+                    "next_check_at": None,
                 }
             )
-            self._write_state(state["repository"], state["plan_digest"], state)
+            self._commit_attempt(state, attempt_id=attempt_id)
         if binding.attempt_id is None:
-            self.runtime.attach_attempt(binding, attempt_id)
-            binding = self.runtime.read_binding(state["admission_id"])
+            binding = self.runtime.attach_attempt(binding, attempt_id)
         if binding is None or binding.attempt_id != attempt_id:
             raise KernelError(
                 "ATTEMPT_READBACK_FAILED",
@@ -557,7 +1002,19 @@ class Kernel:
                 work_item=work_item,
                 work_node=work_node,
             )
-            self._write_state(repository, active.plan_digest, state)
+            state["activation_id"] = active.activation_id
+            self._commit_admission(
+                state,
+                work_node,
+                activation_id=active.activation_id,
+                dependency_keys=tuple(
+                    str(edge["from_node"])
+                    for edge in plan.get("edges") or ()
+                    if isinstance(edge, dict)
+                    and edge.get("to_node") == work_node["node_key"]
+                    and isinstance(edge.get("from_node"), str)
+                ),
+            )
         elif (
             state.get("repository") != repository
             or state.get("plan_digest") != active.plan_digest
@@ -568,6 +1025,12 @@ class Kernel:
                 "Store execution state does not match active Plan",
             )
 
+        self.publication.assert_writer(
+            repository=repository,
+            writer_generation=self.writer_generation,
+            plan_digest=active.plan_digest,
+            activation_id=active.activation_id,
+        )
         binding, terminal = self._adopt_or_materialize(state, work_node)
         if terminal is not None:
             return terminal
@@ -592,6 +1055,14 @@ class Kernel:
                     "directive": "wait_for_runtime",
                     "attempt_state": "running",
                     "wait_condition": "runtime_observation",
+                    "wait_source_ref": (
+                        f"{self.runtime.adapter_name}://"
+                        f"attempt/{state['attempt_id']}"
+                    ),
+                    "wait_event_identity": "runtime_observation",
+                    "next_check_at": (
+                        datetime.now(timezone.utc) + timedelta(seconds=30)
+                    ).isoformat(),
                     "last_runtime_error": {
                         "code": error.code,
                         "failure_class": error.failure_class,
@@ -608,6 +1079,14 @@ class Kernel:
                     "directive": "wait_for_runtime",
                     "attempt_state": "running",
                     "wait_condition": "runtime_result",
+                    "wait_source_ref": (
+                        f"{self.runtime.adapter_name}://"
+                        f"attempt/{state['attempt_id']}"
+                    ),
+                    "wait_event_identity": "runtime_result",
+                    "next_check_at": (
+                        datetime.now(timezone.utc) + timedelta(seconds=30)
+                    ).isoformat(),
                 }
             )
             self._write_state(repository, active.plan_digest, state)
@@ -618,6 +1097,9 @@ class Kernel:
                 "candidate_sha": observation.result_claim.candidate_sha,
                 "attempt_state": "result_submitted",
                 "wait_condition": None,
+                "wait_source_ref": None,
+                "wait_event_identity": None,
+                "next_check_at": None,
             }
         )
         self._write_state(repository, active.plan_digest, state)
@@ -645,6 +1127,25 @@ class Kernel:
                         if decision.status == "waiting"
                         else None
                     ),
+                    "wait_source_ref": (
+                        f"{self.runtime.adapter_name}://"
+                        f"attempt/{state['attempt_id']}/evidence"
+                        if decision.status == "waiting"
+                        else None
+                    ),
+                    "wait_event_identity": (
+                        f"evidence:{observation.result_claim.candidate_sha}"
+                        if decision.status == "waiting"
+                        else None
+                    ),
+                    "next_check_at": (
+                        (
+                            datetime.now(timezone.utc)
+                            + timedelta(seconds=30)
+                        ).isoformat()
+                        if decision.status == "waiting"
+                        else None
+                    ),
                 }
             )
             self._write_state(repository, active.plan_digest, state)
@@ -653,7 +1154,7 @@ class Kernel:
         state["result_digest"] = decision.result.result_digest
         state["status"] = "verified"
         state["attempt_state"] = "verified"
-        self._write_state(repository, active.plan_digest, state)
+        self._release_attempt_claims(state)
 
         lease_holder = integration_node["node_key"]
         self._acquire_integration_lease(repository, lease_holder)
@@ -700,6 +1201,9 @@ class Kernel:
                     "goal_state": "completed",
                     "work_item_state": "integrated",
                     "wait_condition": None,
+                    "wait_source_ref": None,
+                    "wait_event_identity": None,
+                    "next_check_at": None,
                     "integration_evidence_digest": (
                         integration_evidence.content_digest
                     ),
