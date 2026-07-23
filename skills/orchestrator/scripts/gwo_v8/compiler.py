@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 from typing import Any
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
@@ -11,6 +12,8 @@ from ._effects import EffectContractError, authorized_file_changes
 
 
 WORKFLOW_SKILLS = {"implement", "implement-gwo", "orchestrator"}
+DIFFICULTIES = {"light", "standard", "heavy", "frontier"}
+RISKS = {"low", "standard", "strict"}
 PLAN_INTENT_FIELDS = {"parent_plan_digest", "goals", "nodes", "edges"}
 SOURCE_SNAPSHOT_FIELDS = {"repository", "work_items"}
 GOAL_FIELDS = {"goal_key", "objective", "acceptance"}
@@ -121,7 +124,26 @@ def _require_string_list(value: Any, *, label: str) -> list[str]:
     if not isinstance(value, list) or any(
         not isinstance(item, str) or not item for item in value
     ):
-        raise CompileError("COMPILE_INPUT_INVALID", f"{label} must be string list")
+        raise CompileError("PLAN_FIELD_INVALID", f"{label} must be string list")
+    return value
+
+
+def _require_string(
+    value: Any,
+    *,
+    label: str,
+    allow_empty: bool = False,
+) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise CompileError("PLAN_FIELD_INVALID", f"{label} must be a string")
+    return value
+
+
+def _require_nonnegative_int(value: Any, *, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise CompileError(
+            "PLAN_FIELD_INVALID", f"{label} must be a non-negative integer"
+        )
     return value
 
 
@@ -132,24 +154,52 @@ def _validate_plan_fields(
     work_item: dict[str, Any],
     proposal: dict[str, Any],
 ) -> None:
-    _require_object(
-        plan_intent, fields=PLAN_INTENT_FIELDS, label="Plan Intent"
-    )
-    _require_object(
-        source_snapshot,
-        fields=SOURCE_SNAPSHOT_FIELDS,
-        label="source snapshot",
-    )
     _require_object(goal, fields=GOAL_FIELDS, label="Goal")
     _require_object(work_item, fields=WORK_ITEM_FIELDS, label="Work Item")
     _require_object(proposal, fields=PLAN_NODE_FIELDS, label="Plan Node")
 
+    parent_digest = plan_intent.get("parent_plan_digest")
+    if parent_digest is not None and (
+        not isinstance(parent_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", parent_digest) is None
+    ):
+        raise CompileError(
+            "PLAN_FIELD_INVALID",
+            "parent_plan_digest must be null or a 64-hex digest",
+        )
+    _require_string(goal.get("goal_key"), label="Goal key")
+    _require_string(goal.get("objective"), label="Goal objective")
     _require_string_list(goal.get("acceptance"), label="Goal acceptance")
+    _require_string(work_item.get("work_item_key"), label="Work Item key")
+    _require_string(work_item.get("tracker_state"), label="tracker state")
+    _require_string(work_item.get("source_ref"), label="source reference")
+    _require_string(work_item.get("title"), label="Work Item title")
     outcome_contract = _require_object(
         work_item.get("outcome_contract"),
         fields=OUTCOME_CONTRACT_FIELDS,
         label="Work Item outcome contract",
     )
+    _require_string(outcome_contract.get("path"), label="outcome path")
+    _require_string(
+        outcome_contract.get("content"),
+        label="outcome content",
+        allow_empty=True,
+    )
+    _require_string(proposal.get("goal_key"), label="Plan Node Goal key")
+    _require_string(
+        proposal.get("work_item_key"), label="Plan Node Work Item key"
+    )
+    kind = _require_string(proposal.get("kind"), label="Plan Node kind")
+    if kind != "work":
+        raise CompileError("PLAN_FIELD_INVALID", "Phase 1 Plan Node kind must be work")
+    difficulty = _require_string(
+        proposal.get("difficulty"), label="Worker difficulty"
+    )
+    if difficulty not in DIFFICULTIES:
+        raise CompileError("PLAN_FIELD_INVALID", "Worker difficulty is invalid")
+    risk = _require_string(proposal.get("risk"), label="risk")
+    if risk not in RISKS:
+        raise CompileError("PLAN_FIELD_INVALID", "risk is invalid")
     inputs = _require_object(
         proposal.get("inputs"), fields=INPUT_FIELDS, label="Plan Node inputs"
     )
@@ -159,8 +209,14 @@ def _validate_plan_fields(
             "COMPILE_INPUT_INVALID", "file_changes must be a non-empty list"
         )
     for change in changes:
-        _require_object(
+        checked_change = _require_object(
             change, fields=FILE_CHANGE_FIELDS, label="file change"
+        )
+        _require_string(checked_change.get("path"), label="file change path")
+        _require_string(
+            checked_change.get("content"),
+            label="file change content",
+            allow_empty=True,
         )
     expected_change = {
         "path": outcome_contract.get("path"),
@@ -184,13 +240,30 @@ def _validate_plan_fields(
             "COMPILE_INPUT_INVALID", "Evidence requirements and checks must be lists"
         )
     for requirement in requirements:
-        _require_object(
+        checked_requirement = _require_object(
             requirement,
             fields=EVIDENCE_REQUIREMENT_FIELDS,
             label="Evidence requirement",
         )
+        evidence_kind = _require_string(
+            checked_requirement.get("kind"), label="Evidence kind"
+        )
+        if evidence_kind not in {"candidate", "check"}:
+            raise CompileError(
+                "PLAN_FIELD_INVALID", "work Evidence kind is invalid"
+            )
+        if evidence_kind == "check":
+            _require_string(
+                checked_requirement.get("check_id"), label="Evidence check ID"
+            )
+        elif checked_requirement.get("check_id") is not None:
+            raise CompileError(
+                "PLAN_FIELD_INVALID",
+                "candidate Evidence cannot name a check",
+            )
     for check in checks:
         checked = _require_object(check, fields=CHECK_FIELDS, label="check")
+        _require_string(checked.get("check_id"), label="check ID")
         _require_string_list(checked.get("command"), label="check command")
 
     effect_contract = _require_object(
@@ -213,10 +286,16 @@ def _validate_plan_fields(
         runtime_requirements.get("capabilities"),
         label="Runtime capabilities",
     )
-    _require_object(
+    recovery = _require_object(
         proposal.get("recovery_policy"),
         fields=RECOVERY_POLICY_FIELDS,
         label="recovery policy",
+    )
+    _require_nonnegative_int(
+        recovery.get("semantic_attempts"), label="semantic attempts"
+    )
+    _require_nonnegative_int(
+        recovery.get("repair_rounds"), label="repair rounds"
     )
     _require_string_list(
         proposal.get("resource_claims"), label="Resource Claims"
@@ -286,8 +365,6 @@ class PlanCompiler:
             work_item,
             proposal,
         )
-        if proposal.get("kind") != "work":
-            raise CompileError("NODE_KIND_INVALID", "Phase 1 requires a work node")
         _validate_effect_contract(proposal)
 
         skill_reference = _skill_name(proposal.get("skill_reference"))

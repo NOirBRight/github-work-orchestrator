@@ -222,6 +222,39 @@ def test_plan_compiler_rejects_runtime_facts_anywhere_in_planspec(location):
     assert rejected.value.code == "PLAN_FIELD_INVALID"
 
 
+@pytest.mark.parametrize(
+    "location",
+    [
+        "parent_plan_digest",
+        "goal.objective",
+        "work_item.title",
+        "node.difficulty",
+        "evidence.kind",
+    ],
+)
+def test_plan_compiler_rejects_runtime_objects_hidden_in_scalar_fields(location):
+    intent = _plan_intent()
+    source = _ready_source()
+    injected = {"provider": "codex"}
+    if location == "parent_plan_digest":
+        intent["parent_plan_digest"] = injected
+    elif location == "goal.objective":
+        intent["goals"][0]["objective"] = injected
+    elif location == "work_item.title":
+        source["work_items"][0]["title"] = injected
+    elif location == "node.difficulty":
+        intent["nodes"][0]["difficulty"] = injected
+    else:
+        intent["nodes"][0]["output_contract"]["required_evidence"][0][
+            "kind"
+        ] = injected
+
+    with pytest.raises(CompileError) as rejected:
+        PlanCompiler().compile(intent, source, {"version": 1})
+
+    assert rejected.value.code == "PLAN_FIELD_INVALID"
+
+
 def test_plan_compiler_rejects_work_outside_the_effect_contract():
     intent = _plan_intent()
     intent["nodes"][0]["effect_contract"]["write_scopes"] = ["other.txt"]
