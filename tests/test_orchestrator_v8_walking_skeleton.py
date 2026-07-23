@@ -86,7 +86,7 @@ def _plan_intent(*, skill_reference: str | None = None) -> dict:
                 },
                 "resource_claims": [],
                 "runtime_requirements": {"capabilities": ["git", "local_check"]},
-                "difficulty": "light",
+                "difficulty": "routine",
                 "risk": "low",
                 "recovery_policy": {"semantic_attempts": 1, "repair_rounds": 0},
                 "skill_reference": skill_reference,
@@ -263,6 +263,16 @@ def test_plan_compiler_rejects_work_outside_the_effect_contract():
         PlanCompiler().compile(intent, _ready_source(), {"version": 1})
 
     assert rejected.value.code == "EFFECT_CONTRACT_VIOLATION"
+
+
+def test_plan_compiler_does_not_confuse_worker_tier_with_difficulty():
+    intent = _plan_intent()
+    intent["nodes"][0]["difficulty"] = "light"
+
+    with pytest.raises(CompileError) as rejected:
+        PlanCompiler().compile(intent, _ready_source(), {"version": 1})
+
+    assert rejected.value.code == "PLAN_FIELD_INVALID"
 
 
 def test_local_plan_publication_consumes_compiled_bytes_unchanged(tmp_path):

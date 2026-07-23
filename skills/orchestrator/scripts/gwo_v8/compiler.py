@@ -12,7 +12,7 @@ from ._effects import EffectContractError, authorized_file_changes
 
 
 WORKFLOW_SKILLS = {"implement", "implement-gwo", "orchestrator"}
-DIFFICULTIES = {"light", "standard", "heavy", "frontier"}
+DIFFICULTIES = {"routine", "standard", "complex", "frontier"}
 RISKS = {"low", "standard", "strict"}
 PLAN_INTENT_FIELDS = {"parent_plan_digest", "goals", "nodes", "edges"}
 SOURCE_SNAPSHOT_FIELDS = {"repository", "work_items"}
@@ -409,7 +409,7 @@ class PlanCompiler:
                 },
                 "resource_claims": [f"integration_lease:{repository}"],
                 "runtime_requirements": {"capabilities": []},
-                "difficulty": "light",
+                "difficulty": "routine",
                 "risk": "low",
                 "recovery_policy": {"semantic_attempts": 1, "repair_rounds": 0},
                 "skill_reference": None,
