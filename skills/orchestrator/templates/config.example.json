@@ -94,6 +94,10 @@
     "recovery_axis": "reviewer_recovery",
     "strict_specialist": "reviewer_strict"
   },
+  "active_turn_pools": {
+    "workers": 8,
+    "coordinators": 1
+  },
   "reviewer_tiers": {
     "standard": "standard",
     "strict": "heavy"
@@ -110,6 +114,7 @@
       "tiers": {},
       "role_profiles": {},
       "review_profiles": {},
+      "active_turn_pools": {},
       "project_number": null
     }
   }

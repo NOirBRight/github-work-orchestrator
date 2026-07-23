@@ -50,6 +50,7 @@ from .goal_driver import (
     Reconciler,
 )
 from .runtime import (
+    ActiveTurnPools,
     InMemoryRuntimeAdapter,
     InMemoryPaseoClient,
     InMemorySkillCatalog,
@@ -70,6 +71,7 @@ from .runtime import (
     RuntimeProfile,
     RuntimePrompt,
     SkillCatalog,
+    resolve_active_turn_pools,
     resolve_review_profile,
 )
 from .kernel import (
@@ -92,6 +94,7 @@ __all__ = [
     "ActivationCheckpointCrash",
     "ActivationOutcome",
     "ActivationReceipt",
+    "ActiveTurnPools",
     "CandidatePublication",
     "CompiledPlan",
     "CompileError",
@@ -159,6 +162,7 @@ __all__ = [
     "RuntimeProfile",
     "RuntimePrompt",
     "SkillCatalog",
+    "resolve_active_turn_pools",
     "resolve_review_profile",
     "ReconcileOutcome",
     "Reconciler",

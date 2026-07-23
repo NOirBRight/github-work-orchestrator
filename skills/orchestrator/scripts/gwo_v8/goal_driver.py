@@ -16,9 +16,11 @@ from .kernel import ReconcileOutcome
 from .runtime import (
     PaseoClient,
     PaseoCreateRequest,
+    RuntimeAdapterError,
     RuntimeProfile,
     RuntimePrompt,
     read_bounded_outcome,
+    resolve_active_turn_pools,
 )
 
 
@@ -150,9 +152,7 @@ class InMemoryDurableGoalControl:
     """Contract fake that still requires publish-then-readback semantics."""
 
     def __init__(self):
-        self._observations: dict[
-            tuple[str, str], CoordinatorTurnObservation
-        ] = {}
+        self._observations: dict[tuple[str, str], CoordinatorTurnObservation] = {}
         self._wakes: dict[tuple[str, str], DurableWake] = {}
         self._facts: dict[tuple[str, str], tuple[bytes, str]] = {}
 
@@ -448,6 +448,8 @@ class InMemoryCoordinatorRuntime:
         self.continue_count = 0
         self.auto_create_count = 0
         self.auto_profiles: list[RuntimeProfile] = []
+        self._continued_actions: set[tuple[str, str]] = set()
+        self._auto_actions: dict[str, CoordinatorSession] = {}
 
     def find_manual(self, goal_key: str) -> CoordinatorSession | None:
         del goal_key
@@ -467,14 +469,17 @@ class InMemoryCoordinatorRuntime:
         corrective: bool,
         action_key: str,
     ) -> None:
-        del snapshot, corrective, action_key
+        del snapshot, corrective
         current = self.inspect(session.session_id)
         if current is None or not current.usable:
             raise GoalDriverError(
                 "COORDINATOR_UNUSABLE",
                 "Coordinator session cannot be continued",
             )
-        self.continue_count += 1
+        identity = (session.session_id, action_key)
+        if identity not in self._continued_actions:
+            self._continued_actions.add(identity)
+            self.continue_count += 1
 
     def create_auto(
         self,
@@ -483,7 +488,9 @@ class InMemoryCoordinatorRuntime:
         *,
         action_key: str,
     ) -> CoordinatorSession:
-        del action_key
+        existing = self._auto_actions.get(action_key)
+        if existing is not None:
+            return existing
         self.auto_create_count += 1
         self.continue_count += 1
         self.auto_profiles.append(profile)
@@ -502,6 +509,7 @@ class InMemoryCoordinatorRuntime:
             runtime_profile=profile.name,
         )
         self._sessions[session.session_id] = session
+        self._auto_actions[action_key] = session
         return session
 
     def read_observation(
@@ -791,11 +799,13 @@ class GoalDriver:
         coordinators: CoordinatorRuntime,
         auto_profile: RuntimeProfile,
         durable: DurableGoalControl | None = None,
+        runtime_config: dict[str, Any] | None = None,
     ):
         self.store_path = Path(store_path)
         self.reconciler = reconciler
         self.coordinators = coordinators
         self.auto_profile = auto_profile
+        self.runtime_config = runtime_config
         if durable is None and isinstance(coordinators, PaseoCoordinatorRuntime):
             raise GoalDriverError(
                 "DURABLE_GOAL_CONTROL_REQUIRED",
@@ -835,9 +845,7 @@ class GoalDriver:
             )
             columns = {
                 str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(v8_goal_driver_state)"
-                )
+                for row in connection.execute("PRAGMA table_info(v8_goal_driver_state)")
             }
             for column in (
                 "wait_source_ref",
@@ -871,9 +879,7 @@ class GoalDriver:
                 "acceptance": list(snapshot.acceptance),
                 "plan_digest": snapshot.plan_digest,
                 "work_items": [list(item) for item in snapshot.work_items],
-                "decision_inputs": [
-                    list(item) for item in snapshot.decision_inputs
-                ],
+                "decision_inputs": [list(item) for item in snapshot.decision_inputs],
                 "node_states": [list(item) for item in snapshot.node_states],
                 "evidence_manifests": [
                     list(item) for item in snapshot.evidence_manifests
@@ -929,23 +935,17 @@ class GoalDriver:
             zero_outcomes=int(row["zero_outcomes"]),
             turn_sequence=int(row["turn_sequence"]),
             continuation_outstanding=bool(row["continuation_outstanding"]),
-            session_id=(
-                None if row["session_id"] is None else str(row["session_id"])
-            ),
+            session_id=(None if row["session_id"] is None else str(row["session_id"])),
             last_observation_ref=(
                 None
                 if row["last_observation_ref"] is None
                 else str(row["last_observation_ref"])
             ),
             wait_condition=(
-                None
-                if row["wait_condition"] is None
-                else str(row["wait_condition"])
+                None if row["wait_condition"] is None else str(row["wait_condition"])
             ),
             wait_source_ref=(
-                None
-                if row["wait_source_ref"] is None
-                else str(row["wait_source_ref"])
+                None if row["wait_source_ref"] is None else str(row["wait_source_ref"])
             ),
             wait_event_identity=(
                 None
@@ -953,9 +953,7 @@ class GoalDriver:
                 else str(row["wait_event_identity"])
             ),
             next_check_at=(
-                None
-                if row["next_check_at"] is None
-                else str(row["next_check_at"])
+                None if row["next_check_at"] is None else str(row["next_check_at"])
             ),
             last_wake_reference=(
                 None
@@ -964,54 +962,61 @@ class GoalDriver:
             ),
         )
 
+    @staticmethod
+    def _upsert_status(
+        connection: sqlite3.Connection,
+        status: GoalDriverStatus,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO v8_goal_driver_state (
+                repository,
+                goal_key,
+                semantic_input_digest,
+                zero_outcomes,
+                turn_sequence,
+                continuation_outstanding,
+                session_id,
+                last_observation_ref,
+                wait_condition,
+                wait_source_ref,
+                wait_event_identity,
+                next_check_at,
+                last_wake_reference
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(repository, goal_key) DO UPDATE SET
+                semantic_input_digest = excluded.semantic_input_digest,
+                zero_outcomes = excluded.zero_outcomes,
+                turn_sequence = excluded.turn_sequence,
+                continuation_outstanding = excluded.continuation_outstanding,
+                session_id = excluded.session_id,
+                last_observation_ref = excluded.last_observation_ref,
+                wait_condition = excluded.wait_condition,
+                wait_source_ref = excluded.wait_source_ref,
+                wait_event_identity = excluded.wait_event_identity,
+                next_check_at = excluded.next_check_at,
+                last_wake_reference = excluded.last_wake_reference
+            """,
+            (
+                status.repository,
+                status.goal_key,
+                status.semantic_input_digest,
+                status.zero_outcomes,
+                status.turn_sequence,
+                int(status.continuation_outstanding),
+                status.session_id,
+                status.last_observation_ref,
+                status.wait_condition,
+                status.wait_source_ref,
+                status.wait_event_identity,
+                status.next_check_at,
+                status.last_wake_reference,
+            ),
+        )
+
     def _write_status(self, status: GoalDriverStatus) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO v8_goal_driver_state (
-                    repository,
-                    goal_key,
-                    semantic_input_digest,
-                    zero_outcomes,
-                    turn_sequence,
-                    continuation_outstanding,
-                    session_id,
-                    last_observation_ref,
-                    wait_condition,
-                    wait_source_ref,
-                    wait_event_identity,
-                    next_check_at,
-                    last_wake_reference
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(repository, goal_key) DO UPDATE SET
-                    semantic_input_digest = excluded.semantic_input_digest,
-                    zero_outcomes = excluded.zero_outcomes,
-                    turn_sequence = excluded.turn_sequence,
-                    continuation_outstanding = excluded.continuation_outstanding,
-                    session_id = excluded.session_id,
-                    last_observation_ref = excluded.last_observation_ref,
-                    wait_condition = excluded.wait_condition,
-                    wait_source_ref = excluded.wait_source_ref,
-                    wait_event_identity = excluded.wait_event_identity,
-                    next_check_at = excluded.next_check_at,
-                    last_wake_reference = excluded.last_wake_reference
-                """,
-                (
-                    status.repository,
-                    status.goal_key,
-                    status.semantic_input_digest,
-                    status.zero_outcomes,
-                    status.turn_sequence,
-                    int(status.continuation_outstanding),
-                    status.session_id,
-                    status.last_observation_ref,
-                    status.wait_condition,
-                    status.wait_source_ref,
-                    status.wait_event_identity,
-                    status.next_check_at,
-                    status.last_wake_reference,
-                ),
-            )
+            self._upsert_status(connection, status)
 
     def _apply_observation(
         self,
@@ -1026,10 +1031,8 @@ class GoalDriver:
             not status.continuation_outstanding
             or observation.durable_reference == status.last_observation_ref
             or durable != observation
-            or
-            observation.goal_key != status.goal_key
-            or observation.semantic_input_digest
-            != status.semantic_input_digest
+            or observation.goal_key != status.goal_key
+            or observation.semantic_input_digest != status.semantic_input_digest
             or observation.outcome not in self._OUTCOMES
             or not observation.durable_reference
             or status.session_id != observation.session_id
@@ -1058,9 +1061,7 @@ class GoalDriver:
             goal_key=status.goal_key,
             semantic_input_digest=status.semantic_input_digest,
             zero_outcomes=(
-                status.zero_outcomes + 1
-                if effective_outcome == "zero_outcome"
-                else 0
+                status.zero_outcomes + 1 if effective_outcome == "zero_outcome" else 0
             ),
             turn_sequence=status.turn_sequence,
             continuation_outstanding=False,
@@ -1082,9 +1083,7 @@ class GoalDriver:
                 else status.wait_event_identity
             ),
             next_check_at=(
-                None
-                if effective_outcome != "zero_outcome"
-                else status.next_check_at
+                None if effective_outcome != "zero_outcome" else status.next_check_at
             ),
             last_wake_reference=status.last_wake_reference,
         )
@@ -1127,13 +1126,16 @@ class GoalDriver:
 
     @staticmethod
     def _turn_action_key(status: GoalDriverStatus) -> str:
-        return "coordinator-turn:" + digest_value(
-            {
-                "goal_key": status.goal_key,
-                "semantic_input_digest": status.semantic_input_digest,
-                "ordinal": status.turn_sequence + 1,
-            }
-        )[:24]
+        return (
+            "coordinator-turn:"
+            + digest_value(
+                {
+                    "goal_key": status.goal_key,
+                    "semantic_input_digest": status.semantic_input_digest,
+                    "ordinal": status.turn_sequence + 1,
+                }
+            )[:24]
+        )
 
     @staticmethod
     def _turn_reference(
@@ -1147,6 +1149,75 @@ class GoalDriver:
             }
         )
 
+    def _reserve_coordinator_turn(
+        self,
+        status: GoalDriverStatus,
+    ) -> tuple[GoalDriverStatus | None, bool]:
+        try:
+            capacity = resolve_active_turn_pools(
+                self.runtime_config,
+                repository=status.repository,
+            ).coordinators
+        except RuntimeAdapterError as error:
+            raise GoalDriverError(error.code, error.detail) from error
+        action_key = self._turn_action_key(status)
+        wait_source_ref = self._turn_reference(status, action_key)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                """
+                SELECT semantic_input_digest, continuation_outstanding
+                FROM v8_goal_driver_state
+                WHERE repository = ? AND goal_key = ?
+                """,
+                (status.repository, status.goal_key),
+            ).fetchone()
+            if (
+                current is not None
+                and current["semantic_input_digest"] == status.semantic_input_digest
+                and bool(current["continuation_outstanding"])
+            ):
+                return None, True
+            occupied = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM v8_goal_driver_state
+                    WHERE repository = ? AND goal_key != ?
+                      AND continuation_outstanding = 1
+                    """,
+                    (status.repository, status.goal_key),
+                ).fetchone()[0]
+            )
+            if occupied >= capacity:
+                waiting = replace(
+                    status,
+                    continuation_outstanding=False,
+                    wait_condition="coordinator_capacity",
+                    wait_source_ref=(
+                        f"store://coordinator-capacity/{status.repository}"
+                    ),
+                    wait_event_identity="coordinator-capacity",
+                    next_check_at=(
+                        datetime.now(timezone.utc) + timedelta(seconds=30)
+                    ).isoformat(),
+                )
+                self._upsert_status(connection, waiting)
+                return None, False
+            reserved = replace(
+                status,
+                turn_sequence=status.turn_sequence + 1,
+                continuation_outstanding=True,
+                wait_condition="coordinator_turn",
+                wait_source_ref=wait_source_ref,
+                wait_event_identity=action_key,
+                next_check_at=(
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat(),
+            )
+            self._upsert_status(connection, reserved)
+            return reserved, False
+
     def run_once(
         self,
         snapshot: GoalSnapshot,
@@ -1158,6 +1229,31 @@ class GoalDriver:
         status = self.read_status(snapshot.repository, snapshot.goal_key)
         if status is None or status.semantic_input_digest != digest:
             status = self._new_status(snapshot, digest)
+        if (
+            status.wait_condition == "coordinator_turn"
+            and status.continuation_outstanding
+            and status.session_id is None
+        ):
+            action_key = status.wait_event_identity
+            if action_key is None:
+                raise GoalDriverError(
+                    "COORDINATOR_WAIT_INVALID",
+                    "reserved Coordinator turn has no durable action identity",
+                )
+            session, created = self._select_coordinator(
+                snapshot,
+                status,
+                action_key=action_key,
+            )
+            if not created:
+                self.coordinators.continue_session(
+                    session,
+                    snapshot,
+                    corrective=status.zero_outcomes == 1,
+                    action_key=action_key,
+                )
+            status = replace(status, session_id=session.session_id)
+            self._write_status(status)
         if (
             status.wait_condition == "coordinator_turn"
             and status.continuation_outstanding
@@ -1224,6 +1320,22 @@ class GoalDriver:
                     wait_source_ref=status.wait_source_ref,
                     wait_event_identity=status.wait_event_identity,
                 )
+        elif status.wait_condition in {
+            "coordinator_capacity",
+            "integration_lease",
+            "integration_turn",
+            "kernel_sweep",
+            "recovery_dispatch",
+            "worker_capacity",
+        }:
+            status = replace(
+                status,
+                wait_condition=None,
+                wait_source_ref=None,
+                wait_event_identity=None,
+                next_check_at=None,
+            )
+            self._write_status(status)
         elif status.wait_condition is not None:
             wake = (
                 None
@@ -1279,10 +1391,13 @@ class GoalDriver:
                 }
             )
             self._write_status(status)
+            completed_work_items = set(outcome.completed_work_item_keys) or {
+                outcome.work_item_key
+            }
             remaining = [
                 work_item_key
                 for work_item_key, work_item_state in snapshot.work_items
-                if work_item_key != outcome.work_item_key
+                if work_item_key not in completed_work_items
                 and work_item_state not in {"integrated", "completed"}
             ]
             if remaining:
@@ -1335,37 +1450,48 @@ class GoalDriver:
                 ).isoformat(),
             )
 
-        action_key = self._turn_action_key(status)
-        wait_source_ref = self._turn_reference(status, action_key)
-        session, created = self._select_coordinator(
-            snapshot,
-            status,
-            action_key=action_key,
-        )
+        reserved, already_reserved = self._reserve_coordinator_turn(status)
+        if reserved is None:
+            waiting = self.read_status(snapshot.repository, snapshot.goal_key)
+            assert waiting is not None
+            if already_reserved:
+                return self._directive(
+                    "wait",
+                    waiting,
+                    session_id=waiting.session_id,
+                    wait_condition=waiting.wait_condition,
+                    wait_source_ref=waiting.wait_source_ref,
+                    wait_event_identity=waiting.wait_event_identity,
+                    next_check_at=waiting.next_check_at,
+                )
+            return self._directive(
+                "wait",
+                waiting,
+                wait_condition="coordinator_capacity",
+                wait_source_ref=(f"store://coordinator-capacity/{snapshot.repository}"),
+                wait_event_identity="coordinator-capacity",
+                next_check_at=waiting.next_check_at,
+            )
+        action_key = str(reserved.wait_event_identity)
         corrective = status.zero_outcomes == 1
-        if not created:
-            self.coordinators.continue_session(
-                session,
+        try:
+            session, created = self._select_coordinator(
                 snapshot,
-                corrective=corrective,
+                reserved,
                 action_key=action_key,
             )
-        status = GoalDriverStatus(
-            repository=status.repository,
-            goal_key=status.goal_key,
-            semantic_input_digest=status.semantic_input_digest,
-            zero_outcomes=status.zero_outcomes,
-            turn_sequence=status.turn_sequence + 1,
-            continuation_outstanding=True,
+            if not created:
+                self.coordinators.continue_session(
+                    session,
+                    snapshot,
+                    corrective=corrective,
+                    action_key=action_key,
+                )
+        except GoalDriverError:
+            raise
+        status = replace(
+            reserved,
             session_id=session.session_id,
-            last_observation_ref=status.last_observation_ref,
-            wait_condition="coordinator_turn",
-            wait_source_ref=wait_source_ref,
-            wait_event_identity=action_key,
-            next_check_at=(
-                datetime.now(timezone.utc) + timedelta(seconds=30)
-            ).isoformat(),
-            last_wake_reference=status.last_wake_reference,
         )
         self._write_status(status)
         return self._directive(

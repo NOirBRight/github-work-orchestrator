@@ -59,6 +59,73 @@ class RuntimeProfile:
         )
 
 
+@dataclass(frozen=True)
+class ActiveTurnPools:
+    workers: int
+    coordinators: int
+
+
+def resolve_active_turn_pools(
+    config: dict[str, Any] | None,
+    *,
+    repository: str,
+) -> ActiveTurnPools:
+    value = {} if config is None else config
+    if not isinstance(value, dict):
+        raise RuntimeAdapterError(
+            "ACTIVE_TURN_CONFIG_INVALID",
+            "Runtime configuration must be an object",
+        )
+    global_pools = value.get("active_turn_pools")
+    if global_pools is None:
+        global_pools = {"workers": 8, "coordinators": 1}
+    repositories = value.get("repositories")
+    if repositories is None:
+        repositories = {}
+    if not isinstance(global_pools, dict) or not isinstance(repositories, dict):
+        raise RuntimeAdapterError(
+            "ACTIVE_TURN_CONFIG_INVALID",
+            "Active Turn pools and repository overrides must be objects",
+        )
+    repository_config = repositories.get(repository)
+    if repository_config is None:
+        repository_config = {}
+    if not isinstance(repository_config, dict):
+        raise RuntimeAdapterError(
+            "ACTIVE_TURN_CONFIG_INVALID",
+            "repository Runtime configuration must be an object",
+        )
+    repository_pools = repository_config.get("active_turn_pools")
+    if repository_pools is None:
+        repository_pools = {}
+    if not isinstance(repository_pools, dict):
+        raise RuntimeAdapterError(
+            "ACTIVE_TURN_CONFIG_INVALID",
+            "repository Active Turn pools must be an object",
+        )
+    workers = repository_pools.get("workers", global_pools.get("workers"))
+    coordinators = repository_pools.get(
+        "coordinators",
+        global_pools.get("coordinators"),
+    )
+    if (
+        not isinstance(workers, int)
+        or isinstance(workers, bool)
+        or workers < 1
+        or not isinstance(coordinators, int)
+        or isinstance(coordinators, bool)
+        or coordinators < 1
+    ):
+        raise RuntimeAdapterError(
+            "ACTIVE_TURN_CONFIG_INVALID",
+            "Worker and Coordinator Active Turn capacities must be positive",
+        )
+    return ActiveTurnPools(
+        workers=workers,
+        coordinators=coordinators,
+    )
+
+
 REVIEW_PROFILE_SELECTORS = {
     "standard_axis",
     "recovery_axis",
@@ -754,15 +821,32 @@ class PaseoClient(Protocol):
 
     def archive(self, agent_id: str) -> None: ...
 
+    def observed_worker_turn_capacity(
+        self,
+        profile: RuntimeProfile | None,
+    ) -> int | None: ...
+
 
 class InMemoryPaseoClient:
     """Deterministic contract fake for Paseo lifecycle capabilities."""
 
-    def __init__(self, *, create_failures: tuple[str, ...] = ()):
+    def __init__(
+        self,
+        *,
+        create_failures: tuple[str, ...] = (),
+        worker_turn_capacity: int | None = None,
+    ):
         self._agents: dict[str, PaseoAgentRecord] = {}
         self._create_failures = list(create_failures)
+        self._worker_turn_capacity = worker_turn_capacity
         self.create_count = 0
         self.create_prompt_digests: list[str] = []
+
+    def observed_worker_turn_capacity(
+        self,
+        _profile: RuntimeProfile | None,
+    ) -> int | None:
+        return self._worker_turn_capacity
 
     def set_output(self, agent_id: str, output_text: str) -> None:
         record = self.inspect(agent_id)
@@ -1309,6 +1393,17 @@ class PaseoRuntimeAdapter:
             tuple[str, RuntimeObservation],
         ] = {}
         self._deferred_repository_checks: set[str] = set()
+
+    def observed_worker_turn_capacity(
+        self,
+        profile: RuntimeProfile | None,
+    ) -> int | None:
+        observe = getattr(
+            self.client,
+            "observed_worker_turn_capacity",
+            None,
+        )
+        return None if not callable(observe) else observe(profile)
 
     @staticmethod
     def _identity_labels(admission: RuntimeAdmission) -> dict[str, str]:

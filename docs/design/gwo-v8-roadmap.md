@@ -1,6 +1,6 @@
 # GWO V8 roadmap
 
-Status: accepted direction; implementation complete through Phase 2.
+Status: accepted direction; implementation complete through Phase 4A.
 
 This roadmap starts from the production reality: V6.1 is the current writer
 and V7 was never adopted. V8 does not complete or migrate V7. It introduces a
@@ -215,7 +215,7 @@ Exit criteria:
 - unchanged Node Key and contract digest adopt the historical verified Result
   without rebinding or rerunning its Attempt.
 
-## Phase 4 — Parallel capacity, shadow, canary, and cutover
+## Phase 4A — Parallel capacity, parking, refill, and serial Integration
 
 Scope:
 
@@ -233,10 +233,45 @@ Scope:
 - Keep ordinary Write Scope overlap advisory. Hard-exclude only the same Node
   Key, non-shareable runtime resources, explicit external resources, and the
   target Integration branch.
+- Prove the capacity contract with a deterministic three-to-five-node local
+  end-to-end fixture before adding reconstruction or cutover behavior.
+
+Exit criteria:
+
+- one pass admits `min(compatible ready work, configured and observed
+  capacity)`;
+- Review fan-out remains bounded per Work Attempt without a separate Reviewer
+  pool;
+- parked CI does not occupy an Agent turn and the next pass refills every
+  released compatible slot;
+- ordinary Write Scope overlap does not block independent Admission;
+- hosted CI and deterministic Integration consume no Agent turn;
+- target-branch mutation remains singular.
+
+## Phase 4B — Store reconstruction and read-only shadow
+
+Scope:
+
 - Rebuild a fresh V8 Store generation from GitHub, Runtime, Git, and check
   readback.
 - Run read-only shadow acceptance against real repository snapshots: idle
   repository, ready frontier, CI wait, and integration conflict.
+- Prove that shadow evaluation may compile plans and proposed Admissions but
+  cannot create lifecycle, Runtime, publication, or integration mutations.
+
+Exit criteria:
+
+- a fresh Store reconstructs the same authoritative lifecycle identities from
+  durable readback;
+- idle, ready-frontier, CI-wait, and integration-conflict snapshots produce
+  deterministic shadow decisions;
+- shadow mode performs no lifecycle, Runtime, publication, or integration
+  mutation.
+
+## Phase 4C — Canary, writer cutover, and rollback
+
+Scope:
+
 - Use a dedicated lightweight GitHub canary repository whose hosted CI
   completes in roughly two minutes and whose three to five independent modules
   can safely exercise failure and conflict scenarios.
@@ -247,13 +282,6 @@ Scope:
 
 Exit criteria:
 
-- one pass admits `min(compatible ready work, configured and observed
-  capacity)`;
-- Review fan-out remains bounded per Work Attempt without a separate Reviewer
-  pool;
-- parked CI does not occupy an Agent turn;
-- target-branch mutation remains singular;
-- shadow mode performs no lifecycle, Runtime, or integration mutation;
 - the canary passes contract, failure, concurrency, parking, refill, and
   rollback acceptance;
 - V6.1 and V8 are never simultaneous writers;

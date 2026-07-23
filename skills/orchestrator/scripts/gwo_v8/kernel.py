@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -30,6 +31,7 @@ from .runtime import (
     _environment_snapshot,
     _input_projection_digest,
     _run,
+    resolve_active_turn_pools,
     resolve_review_profile,
 )
 
@@ -117,7 +119,8 @@ class InMemoryDeliveryControl:
             )
         self._hosted_outcomes = list(hosted_outcomes)
         self._last_hosted_outcome = hosted_outcomes[-1]
-        self._publication: CandidatePublication | None = None
+        self._publications: dict[tuple[str, str], CandidatePublication] = {}
+        self._last_publication: CandidatePublication | None = None
         self.publication_count = 0
         self.hosted_retry_count = 0
         self.hosted_read_candidates: list[str] = []
@@ -125,24 +128,18 @@ class InMemoryDeliveryControl:
 
     @property
     def published_candidate_sha(self) -> str | None:
-        return None if self._publication is None else self._publication.candidate_sha
+        return (
+            None
+            if self._last_publication is None
+            else self._last_publication.candidate_sha
+        )
 
     def read_publication(
         self,
         repository: str,
         candidate_sha: str,
     ) -> CandidatePublication | None:
-        if self._publication is None:
-            return None
-        if (
-            self._publication.repository != repository
-            or self._publication.candidate_sha != candidate_sha
-        ):
-            raise DeliveryControlError(
-                "PUBLICATION_IDENTITY_CONFLICT",
-                "another Candidate already owns the publication action",
-            )
-        return self._publication
+        return self._publications.get((repository, candidate_sha))
 
     def publish_once(
         self,
@@ -159,13 +156,15 @@ class InMemoryDeliveryControl:
                 )
             return existing
         self.publication_count += 1
-        self._publication = CandidatePublication(
+        publication = CandidatePublication(
             repository=repository,
             candidate_sha=candidate_sha,
             evidence_manifest_digest=evidence_manifest_digest,
             source_ref=f"memory://publication/{candidate_sha}",
         )
-        return self._publication
+        self._publications[(repository, candidate_sha)] = publication
+        self._last_publication = publication
+        return publication
 
     def read_hosted_checks(
         self,
@@ -736,6 +735,12 @@ class ReconcileOutcome:
     publication_ref: str | None = None
     hosted_check_state: str | None = None
     hosted_retry_count: int = 0
+    admitted_node_keys: tuple[str, ...] = field(default=(), compare=False)
+    active_worker_turns: int = 0
+    worker_turn_capacity: int = 1
+    coordinator_turn_capacity: int = 1
+    node_outcomes: tuple[ReconcileOutcome, ...] = ()
+    completed_work_item_keys: tuple[str, ...] = ()
 
 
 def _now() -> str:
@@ -798,6 +803,13 @@ class Kernel:
                     plan_digest TEXT NOT NULL,
                     state_json TEXT NOT NULL,
                     PRIMARY KEY (repository, plan_digest)
+                );
+                CREATE TABLE IF NOT EXISTS v8_node_execution_state (
+                    repository TEXT NOT NULL,
+                    plan_digest TEXT NOT NULL,
+                    node_key TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    PRIMARY KEY (repository, plan_digest, node_key)
                 );
                 CREATE TABLE IF NOT EXISTS v8_integration_leases (
                     repository TEXT PRIMARY KEY,
@@ -885,16 +897,64 @@ class Kernel:
         connection.row_factory = sqlite3.Row
         return connection
 
-    def _read_state(self, repository: str, plan_digest: str) -> dict[str, Any] | None:
+    def _read_states(
+        self,
+        repository: str,
+        plan_digest: str,
+    ) -> tuple[dict[str, Any], ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT state_json
+                FROM v8_node_execution_state
+                WHERE repository = ? AND plan_digest = ?
+                ORDER BY node_key
+                """,
+                (repository, plan_digest),
+            ).fetchall()
+            if not rows:
+                legacy = connection.execute(
+                    """
+                    SELECT state_json
+                    FROM v8_execution_state
+                    WHERE repository = ? AND plan_digest = ?
+                    """,
+                    (repository, plan_digest),
+                ).fetchone()
+                rows = [] if legacy is None else [legacy]
+        return tuple(json.loads(row["state_json"]) for row in rows)
+
+    def _read_state(
+        self,
+        repository: str,
+        plan_digest: str,
+        node_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        if node_key is None:
+            states = self._read_states(repository, plan_digest)
+            return None if not states else states[0]
         with self._connect() as connection:
             row = connection.execute(
                 """
                 SELECT state_json
-                FROM v8_execution_state
-                WHERE repository = ? AND plan_digest = ?
+                FROM v8_node_execution_state
+                WHERE repository = ? AND plan_digest = ? AND node_key = ?
                 """,
-                (repository, plan_digest),
+                (repository, plan_digest, node_key),
             ).fetchone()
+            if row is None:
+                legacy = connection.execute(
+                    """
+                    SELECT state_json
+                    FROM v8_execution_state
+                    WHERE repository = ? AND plan_digest = ?
+                    """,
+                    (repository, plan_digest),
+                ).fetchone()
+                if legacy is not None:
+                    value = json.loads(legacy["state_json"])
+                    if value.get("node_key") == node_key:
+                        return value
         return None if row is None else json.loads(row["state_json"])
 
     def _write_state(
@@ -923,18 +983,18 @@ class Kernel:
                 "DECISION_WRITER_FENCED",
                 "human decision requires the active writer generation",
             )
-        state = self._read_state(repository, active.plan_digest)
-        if (
-            state is None
-            or state.get("candidate_sha") != candidate_sha
-            or state.get("wait_condition") != "human_decision"
-            or not isinstance(approved, bool)
-            or not source_ref
-        ):
+        matches = [
+            state
+            for state in self._read_states(repository, active.plan_digest)
+            if state.get("candidate_sha") == candidate_sha
+            and state.get("wait_condition") == "human_decision"
+        ]
+        if len(matches) != 1 or not isinstance(approved, bool) or not source_ref:
             raise KernelError(
                 "HUMAN_DECISION_INVALID",
                 "decision does not bind the waiting exact Candidate",
             )
+        state = matches[0]
         state["human_decision"] = {
             "candidate_sha": candidate_sha,
             "approved": approved,
@@ -1015,16 +1075,21 @@ class Kernel:
                 "SUPERSESSION_WRITER_FENCED",
                 "explicit supersession requires the active writer and source",
             )
-        state = self._read_state(repository, plan_digest)
+        states = [
+            state
+            for state in self._read_states(repository, plan_digest)
+            if state.get("attempt_id") == attempt_id
+        ]
         if (
-            state is None
-            or state.get("attempt_id") != attempt_id
-            or state.get("attempt_state") in {"terminal", "verified", "superseded"}
+            len(states) != 1
+            or states[0].get("attempt_id") != attempt_id
+            or states[0].get("attempt_state") in {"terminal", "verified", "superseded"}
         ):
             raise KernelError(
                 "SUPERSESSION_INVALID",
                 "supersession does not identify one non-terminal Attempt",
             )
+        state = states[0]
         prompt = self._prompt_from_state(state)
         admission = RuntimeAdmission(
             repository=repository,
@@ -1120,10 +1185,10 @@ class Kernel:
                 )
             state_row = connection.execute(
                 """
-                SELECT state_json FROM v8_execution_state
-                WHERE repository = ? AND plan_digest = ?
+                SELECT state_json FROM v8_node_execution_state
+                WHERE repository = ? AND plan_digest = ? AND node_key = ?
                 """,
-                (repository, plan_digest),
+                (repository, plan_digest, node_key),
             ).fetchone()
             if state_row is not None:
                 state = json.loads(state_row["state_json"])
@@ -1155,17 +1220,25 @@ class Kernel:
         plan_digest: str,
         rendered: str,
     ) -> None:
+        state = json.loads(rendered)
+        node_key = state.get("node_key")
+        if not isinstance(node_key, str) or not node_key:
+            raise KernelError(
+                "EXECUTION_STATE_IDENTITY_MISSING",
+                "node execution state has no Node Key",
+            )
         connection.execute(
             """
-            INSERT INTO v8_execution_state (
+            INSERT INTO v8_node_execution_state (
                 repository,
                 plan_digest,
+                node_key,
                 state_json
-            ) VALUES (?, ?, ?)
-            ON CONFLICT(repository, plan_digest) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(repository, plan_digest, node_key) DO UPDATE SET
                 state_json = excluded.state_json
             """,
-            (repository, plan_digest, rendered),
+            (repository, plan_digest, node_key, rendered),
         )
 
     def _commit_admission(
@@ -1175,6 +1248,7 @@ class Kernel:
         *,
         activation_id: str,
         dependency_keys: tuple[str, ...] = (),
+        worker_turn_capacity: int = 1,
     ) -> None:
         claims = work_node.get("resource_claims") or []
         if not isinstance(claims, list) or any(
@@ -1226,13 +1300,47 @@ class Kernel:
                     "GOAL_ON_REPLAN_HOLD",
                     str(hold["reason"]),
                 )
+            active_turn_states = connection.execute(
+                """
+                SELECT state_json
+                FROM v8_node_execution_state
+                WHERE repository = ?
+                  AND NOT (plan_digest = ? AND node_key = ?)
+                """,
+                (
+                    state["repository"],
+                    state["plan_digest"],
+                    state["node_key"],
+                ),
+            ).fetchall()
+            active_turns = 0
+            for active_turn_row in active_turn_states:
+                try:
+                    active_turn_state = json.loads(active_turn_row["state_json"])
+                except json.JSONDecodeError as error:
+                    raise KernelError(
+                        "CAPACITY_STATE_INVALID",
+                        "Worker Active Turn occupancy cannot be read",
+                    ) from error
+                if self._state_holds_worker_turn(active_turn_state):
+                    active_turns += 1
+            if active_turns >= worker_turn_capacity:
+                raise KernelError(
+                    "WORKER_CAPACITY_UNAVAILABLE",
+                    "configured or observed Worker Active Turn capacity is full",
+                )
             prior_states = connection.execute(
                 """
                 SELECT plan_digest, state_json
-                FROM v8_execution_state
-                WHERE repository = ? AND plan_digest != ?
+                FROM v8_node_execution_state
+                WHERE repository = ?
+                  AND NOT (plan_digest = ? AND node_key = ?)
                 """,
-                (state["repository"], state["plan_digest"]),
+                (
+                    state["repository"],
+                    state["plan_digest"],
+                    state["node_key"],
+                ),
             ).fetchall()
             for prior_row in prior_states:
                 try:
@@ -1528,10 +1636,338 @@ class Kernel:
     def _outcome(state: dict[str, Any]) -> ReconcileOutcome:
         return ReconcileOutcome(
             **{
-                field: state.get(field)
+                field: state[field]
                 for field in ReconcileOutcome.__dataclass_fields__
+                if field in state
             }
         )
+
+    @staticmethod
+    def _kernel_sweep_allowed(
+        outcomes: tuple[ReconcileOutcome, ...],
+    ) -> bool:
+        pending = tuple(
+            outcome
+            for outcome in outcomes
+            if outcome.status not in {"complete", "failed", "superseded"}
+            and outcome.wait_condition is not None
+        )
+        has_runnable = any(
+            outcome.status not in {"complete", "failed", "superseded"}
+            and outcome.wait_condition is None
+            for outcome in outcomes
+        )
+        has_semantic_directive = any(
+            outcome.directive
+            in {
+                "invoke_coordinator",
+                "request_decision",
+                "wait_for_decision",
+            }
+            for outcome in pending
+        )
+        return len(pending) > 1 and not has_runnable and not has_semantic_directive
+
+    @staticmethod
+    def _representative_outcome(
+        outcomes: tuple[ReconcileOutcome, ...],
+    ) -> ReconcileOutcome:
+        return next(
+            (
+                outcome
+                for outcome in outcomes
+                if outcome.directive
+                in {
+                    "invoke_coordinator",
+                    "request_decision",
+                    "wait_for_decision",
+                }
+            ),
+            next(
+                (
+                    outcome
+                    for outcome in outcomes
+                    if outcome.status not in {"complete", "failed", "superseded"}
+                    and outcome.wait_condition is None
+                ),
+                next(
+                    (
+                        outcome
+                        for outcome in outcomes
+                        if outcome.status
+                        not in {"complete", "failed", "superseded"}
+                    ),
+                    outcomes[0],
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _state_holds_worker_turn(state: dict[str, Any]) -> bool:
+        if state.get("status") in {"complete", "failed", "superseded"}:
+            return False
+        if state.get("attempt_state") in {
+            "integration_refresh_required",
+            "integration_wait",
+            "parked",
+            "verified",
+        }:
+            return False
+        if state.get("wait_condition") in {
+            "evidence_source",
+            "hosted_ci",
+            "hosted_ci_cancelled",
+            "human_decision",
+            "integration_lease",
+            "integration_refresh",
+            "integration_turn",
+            "runtime_available",
+            "worker_capacity",
+        }:
+            return False
+        return state.get("admission_state") not in {
+            "adopted",
+            "materialization_blocked",
+        }
+
+    def _other_active_worker_turns(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        repository: str,
+        plan_digest: str,
+        node_key: str,
+    ) -> int:
+        rows = connection.execute(
+            """
+            SELECT state_json
+            FROM v8_node_execution_state
+            WHERE repository = ?
+              AND NOT (plan_digest = ? AND node_key = ?)
+            """,
+            (repository, plan_digest, node_key),
+        ).fetchall()
+        active_turns = 0
+        for row in rows:
+            try:
+                other = json.loads(row["state_json"])
+            except json.JSONDecodeError as error:
+                raise KernelError(
+                    "CAPACITY_STATE_INVALID",
+                    "Worker Active Turn occupancy cannot be read",
+                ) from error
+            if self._state_holds_worker_turn(other):
+                active_turns += 1
+        return active_turns
+
+    def _reserve_or_park_recovery_turn(
+        self,
+        state: dict[str, Any],
+        *,
+        worker_turn_capacity: int,
+    ) -> str:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT state_json
+                FROM v8_node_execution_state
+                WHERE repository = ? AND plan_digest = ? AND node_key = ?
+                """,
+                (
+                    state["repository"],
+                    state["plan_digest"],
+                    state["node_key"],
+                ),
+            ).fetchone()
+            if row is None:
+                raise KernelError(
+                    "RECOVERY_STATE_MISSING",
+                    "recovery reservation has no durable Node state",
+                )
+            try:
+                current = json.loads(row["state_json"])
+            except json.JSONDecodeError as error:
+                raise KernelError(
+                    "RECOVERY_STATE_INVALID",
+                    "recovery reservation state cannot be read",
+                ) from error
+            if (
+                current.get("attempt_id") == state.get("attempt_id")
+                and current.get("attempt_state") == "recovery_reserved"
+            ):
+                reserved_at = current.get("recovery_reserved_at")
+                try:
+                    still_owned = (
+                        reserved_at is not None
+                        and datetime.fromisoformat(str(reserved_at))
+                        > datetime.now(timezone.utc) - timedelta(seconds=30)
+                    )
+                except ValueError:
+                    still_owned = False
+                if still_owned:
+                    state.clear()
+                    state.update(current)
+                    return "adopted"
+            if (
+                current.get("attempt_id") == state.get("attempt_id")
+                and current.get("attempt_state")
+                not in {"candidate_rejected", "recovery_reserved"}
+            ):
+                state.clear()
+                state.update(current)
+                return "adopted"
+            available = (
+                self._other_active_worker_turns(
+                    connection,
+                    repository=state["repository"],
+                    plan_digest=state["plan_digest"],
+                    node_key=state["node_key"],
+                )
+                < worker_turn_capacity
+            )
+            if available:
+                state.update(
+                    {
+                        "status": "waiting",
+                        "directive": "reconcile_again",
+                        "attempt_state": "recovery_reserved",
+                        "recovery_reserved_at": _now(),
+                        "wait_condition": "recovery_dispatch",
+                        "wait_source_ref": (
+                            f"store://recovery-dispatch/{state['attempt_id']}"
+                        ),
+                        "wait_event_identity": (
+                            f"recovery-dispatch:{state['attempt_id']}"
+                        ),
+                        "next_check_at": (
+                            datetime.now(timezone.utc) + timedelta(seconds=30)
+                        ).isoformat(),
+                    }
+                )
+            else:
+                state.update(
+                    {
+                        "status": "waiting",
+                        "directive": "wait_for_capacity",
+                        "attempt_state": "candidate_rejected",
+                        "recovery_reserved_at": None,
+                        "wait_condition": "worker_capacity",
+                        "wait_source_ref": (
+                            f"capacity://{state['repository']}/workers"
+                        ),
+                        "wait_event_identity": (
+                            f"worker-capacity:{state['attempt_id']}"
+                        ),
+                        "next_check_at": None,
+                    }
+                )
+            self._upsert_state(
+                connection,
+                repository=state["repository"],
+                plan_digest=state["plan_digest"],
+                rendered=self._render_state(state),
+            )
+            return "reserved" if available else "parked"
+
+    def _reacquire_waiting_worker_turns(
+        self,
+        states: dict[str, dict[str, Any]],
+        *,
+        worker_turn_capacity: int,
+    ) -> None:
+        for node_key in sorted(states):
+            state = states[node_key]
+            if state.get("wait_condition") != "worker_capacity":
+                continue
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if (
+                    self._other_active_worker_turns(
+                        connection,
+                        repository=state["repository"],
+                        plan_digest=state["plan_digest"],
+                        node_key=node_key,
+                    )
+                    >= worker_turn_capacity
+                ):
+                    continue
+                state.update(
+                    {
+                        "status": "rejected",
+                        "directive": "invoke_coordinator",
+                        "wait_condition": None,
+                        "wait_source_ref": None,
+                        "wait_event_identity": None,
+                        "next_check_at": None,
+                    }
+                )
+                self._upsert_state(
+                    connection,
+                    repository=state["repository"],
+                    plan_digest=state["plan_digest"],
+                    rendered=self._render_state(state),
+                )
+
+    def _turn_capacities(self, repository: str) -> tuple[int, int]:
+        try:
+            pools = resolve_active_turn_pools(
+                self.runtime_config,
+                repository=repository,
+            )
+        except RuntimeAdapterError as error:
+            raise KernelError(error.code, error.detail) from error
+        workers = pools.workers
+        observed = getattr(
+            type(self.runtime),
+            "observed_worker_turn_capacity",
+            None,
+        )
+        if callable(observed):
+            runtime_capacity = observed(self.runtime, self.runtime_profile)
+            if runtime_capacity is not None:
+                if (
+                    not isinstance(runtime_capacity, int)
+                    or isinstance(runtime_capacity, bool)
+                    or runtime_capacity < 0
+                ):
+                    raise KernelError(
+                        "RUNTIME_CAPACITY_INVALID",
+                        "Runtime Worker capacity observation is invalid",
+                    )
+                workers = min(workers, runtime_capacity)
+        return workers, pools.coordinators
+
+    def _materialize_admitted_frontier(
+        self,
+        repository: str,
+        plan_digest: str,
+        work_nodes: tuple[dict[str, Any], ...],
+        *,
+        worker_turn_capacity: int,
+    ) -> None:
+        def materialize(work_node: dict[str, Any]) -> None:
+            state = self._read_state(
+                repository,
+                plan_digest,
+                str(work_node["node_key"]),
+            )
+            if state is None:
+                raise KernelError(
+                    "ADMISSION_STATE_MISSING",
+                    "committed Admission has no execution state",
+                )
+            self._adopt_or_materialize(state, work_node)
+
+        if len(work_nodes) <= 1:
+            return
+        with ThreadPoolExecutor(
+            max_workers=min(worker_turn_capacity, len(work_nodes)),
+            thread_name_prefix="gwo-materialize",
+        ) as executor:
+            futures = tuple(executor.submit(materialize, node) for node in work_nodes)
+            for future in futures:
+                future.result()
 
     @staticmethod
     def _prompt_from_state(state: dict[str, Any]) -> RuntimePrompt:
@@ -1724,7 +2160,9 @@ class Kernel:
             "work_item_state": "active",
             "node_key": work_node["node_key"],
             "contract_digest": work_node["contract_digest"],
-            "admission_id": f"admission:{plan_digest[:20]}",
+            "admission_id": (
+                f"admission:{plan_digest[:12]}:{work_node['node_key'][-12:]}"
+            ),
             "admission_state": "materializing",
             "attempt_id": None,
             "attempt_state": None,
@@ -2145,9 +2583,17 @@ class Kernel:
         return plan
 
     @staticmethod
-    def _nodes(
+    def _work_units(
         plan: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    ) -> tuple[
+        tuple[
+            dict[str, Any],
+            dict[str, Any],
+            dict[str, Any],
+            dict[str, Any],
+        ],
+        ...,
+    ]:
         work_nodes = [
             node for node in plan.get("nodes") or [] if node.get("kind") == "work"
         ]
@@ -2156,16 +2602,53 @@ class Kernel:
             for node in plan.get("nodes") or []
             if node.get("kind") == "integration"
         ]
-        if len(work_nodes) != 1 or len(integration_nodes) != 1:
+        goals = {
+            goal.get("goal_key"): goal
+            for goal in plan.get("goals") or ()
+            if isinstance(goal, dict) and isinstance(goal.get("goal_key"), str)
+        }
+        work_items = {
+            work_item.get("work_item_key"): work_item
+            for work_item in plan.get("work_items") or ()
+            if isinstance(work_item, dict)
+            and isinstance(work_item.get("work_item_key"), str)
+        }
+        integration_by_item: dict[str, dict[str, Any]] = {}
+        for integration in integration_nodes:
+            work_item_key = integration.get("work_item_key")
+            if (
+                not isinstance(work_item_key, str)
+                or work_item_key in integration_by_item
+            ):
+                raise KernelError(
+                    "ACTIVE_PLAN_INVALID",
+                    "Integration Plan Nodes must map one-to-one to Work Items",
+                )
+            integration_by_item[work_item_key] = integration
+        if not work_nodes or len(work_nodes) != len(integration_nodes):
             raise KernelError(
                 "ACTIVE_PLAN_UNSUPPORTED",
-                "the walking skeleton requires one work and one integration Plan Node",
+                "each Work Plan Node requires one Integration Plan Node",
             )
-        goal = (plan.get("goals") or [None])[0]
-        work_item = (plan.get("work_items") or [None])[0]
-        if not isinstance(goal, dict) or not isinstance(work_item, dict):
-            raise KernelError("ACTIVE_PLAN_INVALID", "Goal or Work Item is missing")
-        return work_nodes[0], integration_nodes[0], goal, work_item
+        units = []
+        for work_node in sorted(work_nodes, key=lambda node: node["node_key"]):
+            goal = goals.get(work_node.get("goal_key"))
+            work_item = work_items.get(work_node.get("work_item_key"))
+            integration = integration_by_item.get(
+                str(work_node.get("work_item_key") or "")
+            )
+            if (
+                not isinstance(goal, dict)
+                or not isinstance(work_item, dict)
+                or not isinstance(integration, dict)
+                or integration.get("goal_key") != work_node.get("goal_key")
+            ):
+                raise KernelError(
+                    "ACTIVE_PLAN_INVALID",
+                    "Work, Goal, Work Item, and Integration identities do not agree",
+                )
+            units.append((work_node, integration, goal, work_item))
+        return tuple(units)
 
     def _adopt_or_materialize(
         self,
@@ -2361,7 +2844,10 @@ class Kernel:
         binding,
     ):
         attempt_ordinal = int(state.get("attempt_ordinal", 1))
-        attempt_id = f"attempt:{state['plan_digest'][:20]}:{attempt_ordinal}"
+        attempt_id = (
+            f"attempt:{state['plan_digest'][:12]}:"
+            f"{state['node_key'][-12:]}:{attempt_ordinal}"
+        )
         if binding.attempt_id not in {None, attempt_id}:
             raise KernelError(
                 "ATTEMPT_IDENTITY_MISMATCH",
@@ -2649,6 +3135,7 @@ class Kernel:
                     "status": "waiting",
                     "directive": "wait_for_runtime",
                     "attempt_state": "repairing",
+                    "recovery_reserved_at": None,
                     "repair_rounds_used": repair_rounds_used + 1,
                     "attempt_terminal_reason": None,
                     "candidate_sha": None,
@@ -2712,11 +3199,13 @@ class Kernel:
                     "status": "running",
                     "directive": "run_again",
                     "admission_id": (
-                        f"admission:{state['plan_digest'][:20]}:{next_ordinal}"
+                        f"admission:{state['plan_digest'][:12]}:"
+                        f"{state['node_key'][-12:]}:{next_ordinal}"
                     ),
                     "admission_state": "materializing",
                     "attempt_id": None,
                     "attempt_state": None,
+                    "recovery_reserved_at": None,
                     "attempt_ordinal": next_ordinal,
                     "repair_rounds_used": 0,
                     "attempt_terminal_reason": None,
@@ -3318,6 +3807,9 @@ class Kernel:
                 not isinstance(decision, dict)
                 or decision.get("candidate_sha") != candidate_sha
             ):
+                if not state.get("worker_parked_for_decision"):
+                    self.runtime.interrupt(binding)
+                    state["worker_parked_for_decision"] = True
                 state.update(
                     {
                         "status": "waiting",
@@ -3648,21 +4140,24 @@ class Kernel:
         )
         return self._outcome(state)
 
-    def reconcile_once(self, repository: str) -> ReconcileOutcome:
-        active = self.publication.read_active(repository)
-        if active is None:
-            raise KernelError(
-                "PLAN_NOT_ACTIVE", "repository has no active Plan Revision"
-            )
-        if active.writer_generation != self.writer_generation:
-            raise KernelError(
-                "WRITER_GENERATION_MISMATCH",
-                "Kernel does not own the active writer generation",
-            )
-        plan = self._validate_plan(repository, active.canonical_bytes)
-        work_node, integration_node, goal, work_item = self._nodes(plan)
-
-        state = self._read_state(repository, active.plan_digest)
+    def _reconcile_work_unit(
+        self,
+        repository: str,
+        *,
+        active: Any,
+        plan: dict[str, Any],
+        work_node: dict[str, Any],
+        integration_node: dict[str, Any],
+        goal: dict[str, Any],
+        work_item: dict[str, Any],
+        worker_turn_capacity: int,
+        integration_budget: list[int],
+    ) -> ReconcileOutcome:
+        state = self._read_state(
+            repository,
+            active.plan_digest,
+            work_node["node_key"],
+        )
         if state is not None and (
             state.get("status") in {"complete", "failed", "superseded"}
             or (
@@ -3686,6 +4181,7 @@ class Kernel:
                 state,
                 work_node,
                 activation_id=active.activation_id,
+                worker_turn_capacity=worker_turn_capacity,
                 dependency_keys=tuple(
                     str(edge["from_node"])
                     for edge in plan.get("edges") or ()
@@ -4041,6 +4537,12 @@ class Kernel:
         )
         if delivery_terminal is not None:
             if delivery_terminal.status == "rejected":
+                recovery_reservation = self._reserve_or_park_recovery_turn(
+                    state,
+                    worker_turn_capacity=worker_turn_capacity,
+                )
+                if recovery_reservation != "reserved":
+                    return self._outcome(state)
                 return self._handle_semantic_rejection(
                     state,
                     work_node,
@@ -4061,8 +4563,48 @@ class Kernel:
         state["attempt_state"] = "verified"
         self._release_attempt_claims(state)
 
+        if integration_budget[0] <= 0:
+            state.update(
+                {
+                    "status": "waiting",
+                    "directive": "reconcile_again",
+                    "attempt_state": "integration_wait",
+                    "wait_condition": "integration_turn",
+                    "wait_source_ref": (
+                        f"git://{repository}/{self.integration_branch}"
+                    ),
+                    "wait_event_identity": "next-integration-turn",
+                    "next_check_at": (
+                        datetime.now(timezone.utc) + timedelta(seconds=1)
+                    ).isoformat(),
+                }
+            )
+            self._write_state(repository, active.plan_digest, state)
+            return self._outcome(state)
+        integration_budget[0] -= 1
         lease_holder = integration_node["node_key"]
-        self._acquire_integration_lease(repository, lease_holder)
+        try:
+            self._acquire_integration_lease(repository, lease_holder)
+        except KernelError as error:
+            if error.code != "INTEGRATION_LEASE_UNAVAILABLE":
+                raise
+            state.update(
+                {
+                    "status": "waiting",
+                    "directive": "wait_for_integration",
+                    "attempt_state": "integration_wait",
+                    "wait_condition": "integration_lease",
+                    "wait_source_ref": (
+                        f"git://{repository}/{self.integration_branch}"
+                    ),
+                    "wait_event_identity": "integration-lease",
+                    "next_check_at": (
+                        datetime.now(timezone.utc) + timedelta(seconds=5)
+                    ).isoformat(),
+                }
+            )
+            self._write_state(repository, active.plan_digest, state)
+            return self._outcome(state)
         try:
             self.publication.assert_writer(
                 repository=repository,
@@ -4071,6 +4613,53 @@ class Kernel:
                 activation_id=active.activation_id,
             )
             remote_integration = None
+            current_branch = _git(
+                self.repository_path,
+                "rev-parse",
+                "--abbrev-ref",
+                "HEAD",
+            )
+            if current_branch != self.integration_branch:
+                raise KernelError(
+                    "INTEGRATION_BRANCH_MISMATCH",
+                    "repository is not on the configured Integration branch",
+                )
+            current_head = _git(self.repository_path, "rev-parse", "HEAD")
+            candidate_sha = observation.result_claim.candidate_sha
+            if current_head != candidate_sha:
+                ancestry = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(self.repository_path),
+                        "merge-base",
+                        "--is-ancestor",
+                        current_head,
+                        candidate_sha,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                )
+                if ancestry.returncode != 0:
+                    state.update(
+                        {
+                            "status": "waiting",
+                            "directive": "invoke_coordinator",
+                            "attempt_state": "integration_refresh_required",
+                            "wait_condition": "integration_refresh",
+                            "wait_source_ref": (
+                                f"git://{repository}/{self.integration_branch}"
+                            ),
+                            "wait_event_identity": (
+                                f"integration-refresh:{current_head}"
+                            ),
+                            "next_check_at": None,
+                            "integration_target_head": current_head,
+                        }
+                    )
+                    self._write_state(repository, active.plan_digest, state)
+                    return self._outcome(state)
             if self.delivery_control is not None:
                 remote_integration = self.delivery_control.integrate_serially(
                     repository,
@@ -4086,15 +4675,6 @@ class Kernel:
                         "REMOTE_INTEGRATION_READBACK_FAILED",
                         "remote Integration changed Candidate or target branch",
                     )
-            current_branch = _git(
-                self.repository_path, "rev-parse", "--abbrev-ref", "HEAD"
-            )
-            if current_branch != self.integration_branch:
-                raise KernelError(
-                    "INTEGRATION_BRANCH_MISMATCH",
-                    "repository is not on the configured Integration branch",
-                )
-            current_head = _git(self.repository_path, "rev-parse", "HEAD")
             if current_head != observation.result_claim.candidate_sha:
                 _git(
                     self.repository_path,
@@ -4156,3 +4736,200 @@ class Kernel:
 
         self.runtime.retire(binding)
         return self._outcome(state)
+
+    def reconcile_once(self, repository: str) -> ReconcileOutcome:
+        active = self.publication.read_active(repository)
+        if active is None:
+            raise KernelError(
+                "PLAN_NOT_ACTIVE",
+                "repository has no active Plan Revision",
+            )
+        if active.writer_generation != self.writer_generation:
+            raise KernelError(
+                "WRITER_GENERATION_MISMATCH",
+                "Kernel does not own the active writer generation",
+            )
+        plan = self._validate_plan(repository, active.canonical_bytes)
+        units = self._work_units(plan)
+        worker_capacity, coordinator_capacity = self._turn_capacities(repository)
+        existing = {
+            str(state["node_key"]): state
+            for state in self._read_states(repository, active.plan_digest)
+            if isinstance(state.get("node_key"), str)
+        }
+        self._reacquire_waiting_worker_turns(
+            existing,
+            worker_turn_capacity=worker_capacity,
+        )
+        active_turns = sum(
+            1 for state in existing.values() if self._state_holds_worker_turn(state)
+        )
+        available = max(0, worker_capacity - active_turns)
+        admitted_node_keys: list[str] = []
+        compatible_units = []
+        held_error: KernelError | None = None
+        deferrable = {
+            "ADMISSION_DEPENDENCY_UNSATISFIED",
+            "GOAL_ON_REPLAN_HOLD",
+            "REPLACEMENT_PREDECESSOR_ACTIVE",
+            "RESOURCE_CLAIM_UNAVAILABLE",
+            "WORKER_CAPACITY_UNAVAILABLE",
+        }
+        for work_node, integration_node, goal, work_item in units:
+            node_key = str(work_node["node_key"])
+            state = existing.get(node_key)
+            if state is None:
+                if available <= 0:
+                    continue
+                state = self._initial_state(
+                    repository=repository,
+                    plan_digest=active.plan_digest,
+                    goal=goal,
+                    work_item=work_item,
+                    work_node=work_node,
+                )
+                state["activation_id"] = active.activation_id
+                if not self._adopt_verified_result(state, work_node):
+                    try:
+                        self._commit_admission(
+                            state,
+                            work_node,
+                            activation_id=active.activation_id,
+                            worker_turn_capacity=worker_capacity,
+                            dependency_keys=tuple(
+                                str(edge["from_node"])
+                                for edge in plan.get("edges") or ()
+                                if isinstance(edge, dict)
+                                and edge.get("to_node") == node_key
+                                and isinstance(edge.get("from_node"), str)
+                            ),
+                        )
+                    except KernelError as error:
+                        if error.code in deferrable:
+                            if error.code == "GOAL_ON_REPLAN_HOLD":
+                                held_error = error
+                            continue
+                        raise
+                    admitted_node_keys.append(node_key)
+                    available -= 1
+                existing[node_key] = state
+            compatible_units.append((work_node, integration_node, goal, work_item))
+
+        if not compatible_units and held_error is not None:
+            raise held_error
+
+        admitted = set(admitted_node_keys)
+        self._materialize_admitted_frontier(
+            repository,
+            active.plan_digest,
+            tuple(
+                work_node
+                for work_node, _integration, _goal, _work_item in compatible_units
+                if work_node["node_key"] in admitted
+            ),
+            worker_turn_capacity=worker_capacity,
+        )
+
+        integration_budget = [1]
+        outcomes = tuple(
+            self._reconcile_work_unit(
+                repository,
+                active=active,
+                plan=plan,
+                work_node=work_node,
+                integration_node=integration_node,
+                goal=goal,
+                work_item=work_item,
+                worker_turn_capacity=worker_capacity,
+                integration_budget=integration_budget,
+            )
+            for work_node, integration_node, goal, work_item in compatible_units
+        )
+        states_after = self._read_states(repository, active.plan_digest)
+        active_after = sum(
+            1 for state in states_after if self._state_holds_worker_turn(state)
+        )
+        if not outcomes:
+            work_node, _integration_node, goal, work_item = units[0]
+            waiting = self._initial_state(
+                repository=repository,
+                plan_digest=active.plan_digest,
+                goal=goal,
+                work_item=work_item,
+                work_node=work_node,
+            )
+            waiting.update(
+                {
+                    "status": "waiting",
+                    "directive": "wait_for_capacity",
+                    "admission_state": "capacity_wait",
+                    "wait_condition": "worker_capacity",
+                }
+            )
+            representative = self._outcome(waiting)
+        else:
+            representative = self._representative_outcome(outcomes)
+        pending_waits = tuple(
+            outcome
+            for outcome in outcomes
+            if outcome.status not in {"complete", "failed", "superseded"}
+            and outcome.wait_condition is not None
+        )
+        if self._kernel_sweep_allowed(outcomes):
+            scheduled = sorted(
+                str(outcome.next_check_at)
+                for outcome in pending_waits
+                if outcome.next_check_at is not None
+            )
+            wait_identity = digest_value(
+                sorted(
+                    (
+                        outcome.node_key,
+                        outcome.wait_condition,
+                        outcome.wait_event_identity,
+                    )
+                    for outcome in pending_waits
+                )
+            )[:24]
+            representative = replace(
+                representative,
+                status="waiting",
+                directive="reconcile_again",
+                wait_condition="kernel_sweep",
+                wait_source_ref=f"store://kernel-sweep/{repository}",
+                wait_event_identity=f"kernel-sweep:{wait_identity}",
+                next_check_at=(
+                    scheduled[0]
+                    if scheduled
+                    else (
+                        datetime.now(timezone.utc) + timedelta(seconds=30)
+                    ).isoformat()
+                ),
+            )
+        all_complete = len(states_after) == len(units) and all(
+            state.get("status") == "complete" for state in states_after
+        )
+        if all_complete:
+            representative = replace(
+                representative,
+                status="complete",
+                directive="goal_complete",
+                goal_state="completed",
+                wait_condition=None,
+            )
+        return replace(
+            representative,
+            admitted_node_keys=tuple(admitted_node_keys),
+            active_worker_turns=active_after,
+            worker_turn_capacity=worker_capacity,
+            coordinator_turn_capacity=coordinator_capacity,
+            node_outcomes=outcomes,
+            completed_work_item_keys=tuple(
+                sorted(
+                    str(state["work_item_key"])
+                    for state in states_after
+                    if state.get("status") == "complete"
+                    and isinstance(state.get("work_item_key"), str)
+                )
+            ),
+        )

@@ -1374,9 +1374,7 @@ def _validate_resolved_runtime(
         )
 
     identity = (
-        {"role": resolved["role"]}
-        if "role" in resolved
-        else {"tier": resolved["tier"]}
+        {"role": resolved["role"]} if "role" in resolved else {"tier": resolved["tier"]}
     )
     return {**identity, "provider": provider, "settings": settings}
 
@@ -2761,6 +2759,7 @@ def migrate_v5_config(old: dict[str, Any]) -> dict[str, Any]:
         "tiers": tiers,
         "role_profiles": {},
         "review_profiles": {},
+        "active_turn_pools": {"workers": 8, "coordinators": 1},
         "reviewer_tiers": {"standard": "standard", "strict": "heavy"},
         "repositories": {},
     }
@@ -2832,6 +2831,7 @@ def default_config() -> dict[str, Any]:
             "recovery_axis": "reviewer_recovery",
             "strict_specialist": "reviewer_strict",
         },
+        "active_turn_pools": {"workers": 8, "coordinators": 1},
         "reviewer_tiers": {"standard": "standard", "strict": "heavy"},
         "repositories": {},
     }
@@ -2844,6 +2844,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     tiers_config = config.get("tiers") or {}
     role_profiles = config.get("role_profiles", {})
     review_profiles = config.get("review_profiles", {})
+    active_turn_pools = config.get("active_turn_pools") or {
+        "workers": 8,
+        "coordinators": 1,
+    }
     repositories = config.get("repositories") or {}
     reviewer_tiers = config.get("reviewer_tiers") or {}
     if not all(
@@ -2853,6 +2857,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             tiers_config,
             role_profiles,
             review_profiles,
+            active_turn_pools,
             repositories,
             reviewer_tiers,
         )
@@ -2975,9 +2980,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
                 "RUNTIME_ROLE_PROFILE_INVALID",
                 f"repository:{repository} role_profiles must be an object",
             )
-        repository_role_profile_mappings.append(
-            (f"repository:{repository}", mappings)
-        )
+        repository_role_profile_mappings.append((f"repository:{repository}", mappings))
         review_mappings = settings.get("review_profiles") or {}
         if not isinstance(review_mappings, dict):
             raise PolicyError(
@@ -3017,9 +3020,14 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
                 "REVIEW_PROFILE_CONFIG_INVALID",
                 "invalid global Review Profile selector",
             )
-    for scope, mappings, repository_profiles in (
-        repository_review_profile_mappings
-    ):
+    for pool in ("workers", "coordinators"):
+        value = active_turn_pools.get(pool)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise PolicyError(
+                "ACTIVE_TURN_CAPACITY_INVALID",
+                f"global Active Turn pool is invalid: {pool}",
+            )
+    for scope, mappings, repository_profiles in repository_review_profile_mappings:
         for selector, profile_id in mappings.items():
             if (
                 selector not in REVIEW_PROFILE_SELECTORS
@@ -3073,6 +3081,23 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise PolicyError(
                 "WORKSPACE_CONFIG_INVALID", "configured Workspace ID invalid"
             )
+        repository_pools = settings.get("active_turn_pools") or {}
+        if not isinstance(repository_pools, dict):
+            raise PolicyError(
+                "ACTIVE_TURN_CAPACITY_INVALID",
+                "repository Active Turn pools must be an object",
+            )
+        for pool, value in repository_pools.items():
+            if (
+                pool not in {"workers", "coordinators"}
+                or not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 1
+            ):
+                raise PolicyError(
+                    "ACTIVE_TURN_CAPACITY_INVALID",
+                    f"repository Active Turn pool is invalid: {pool}",
+                )
         repository_legacy_slots = settings.get("worker_slots")
         repository_slots = settings.get(
             "execution_slots",

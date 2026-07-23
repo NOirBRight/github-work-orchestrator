@@ -865,12 +865,14 @@ def test_kernel_runs_standard_review_inside_candidate_work_attempt(tmp_path):
     waiting_for_review = kernel.reconcile_once("local/phase-three")
 
     assert waiting_for_review.wait_condition == "review_axis"
+    assert waiting_for_review.active_worker_turns == 1
     review_agents = client.find_by_labels({"gwo.review_candidate": candidate_sha})
     assert {agent.labels["gwo.review_axis"] for agent in review_agents} == {
         "standards",
         "spec",
     }
     assert all(agent.parent_agent_id == worker.agent_id for agent in review_agents)
+    assert len(review_agents) == 2
     for agent in review_agents:
         findings = [] if agent.labels["gwo.review_axis"] == "spec" else None
         payload = {
@@ -1824,6 +1826,7 @@ def test_strict_review_adds_specialist_then_waits_for_bound_human_decision(
 
     decision_wait = kernel.reconcile_once("local/phase-three")
     assert decision_wait.wait_condition == "human_decision"
+    assert decision_wait.active_worker_turns == 0
     kernel.record_human_decision(
         repository="local/phase-three",
         candidate_sha=candidate_sha,

@@ -570,58 +570,19 @@ def _compiled_review_requirement(
 
 
 class PlanCompiler:
-    """Compile one Ready Work Item into the minimal executable V8 graph."""
+    """Compile the compatible Ready Work Item set into one executable graph."""
 
-    def compile(
-        self,
+    @staticmethod
+    def _compile_work_unit(
+        *,
+        repository: str,
         plan_intent: dict[str, Any],
         source_snapshot: dict[str, Any],
         policy_snapshot: dict[str, Any],
-    ) -> CompiledPlan:
-        if not all(
-            isinstance(value, dict)
-            for value in (plan_intent, source_snapshot, policy_snapshot)
-        ):
-            raise CompileError(
-                "COMPILE_INPUT_INVALID", "compiler inputs must be objects"
-            )
-        _require_object(plan_intent, fields=PLAN_INTENT_FIELDS, label="Plan Intent")
-        _require_object(
-            source_snapshot,
-            fields=SOURCE_SNAPSHOT_FIELDS,
-            label="source snapshot",
-        )
-
-        repository = source_snapshot.get("repository")
-        work_items = source_snapshot.get("work_items")
-        goals = plan_intent.get("goals")
-        proposed_nodes = plan_intent.get("nodes")
-        if not isinstance(repository, str) or "/" not in repository:
-            raise CompileError("REPOSITORY_INVALID", "repository identity is invalid")
-        if not isinstance(work_items, list) or len(work_items) != 1:
-            raise CompileError(
-                "WORK_ITEM_SET_INVALID", "Phase 1 requires one Work Item"
-            )
-        if not isinstance(goals, list) or len(goals) != 1:
-            raise CompileError("GOAL_SET_INVALID", "Phase 1 requires one Goal")
-        if not isinstance(proposed_nodes, list) or len(proposed_nodes) != 1:
-            raise CompileError("NODE_SET_INVALID", "Phase 1 requires one work node")
-
-        work_item = work_items[0]
-        if (
-            not isinstance(work_item, dict)
-            or work_item.get("tracker_state") != "ready-for-agent"
-        ):
-            raise CompileError(
-                "WORK_ITEM_NOT_READY",
-                "only ready-for-agent Work Items may compile into executable work",
-            )
-        goal = goals[0]
-        proposal = proposed_nodes[0]
-        if not isinstance(goal, dict) or not isinstance(proposal, dict):
-            raise CompileError(
-                "COMPILE_INPUT_INVALID", "semantic entries must be objects"
-            )
+        goal: dict[str, Any],
+        work_item: dict[str, Any],
+        proposal: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         _validate_plan_fields(
             plan_intent,
             source_snapshot,
@@ -630,7 +591,6 @@ class PlanCompiler:
             proposal,
         )
         _validate_effect_contract(proposal)
-
         skill_reference = _skill_name(proposal.get("skill_reference"))
         if skill_reference in WORKFLOW_SKILLS:
             raise CompileError(
@@ -649,14 +609,15 @@ class PlanCompiler:
             or proposal.get("goal_key") != goal_key
         ):
             raise CompileError(
-                "PLAN_RELATION_INVALID", "Goal, Work Item, and node links must agree"
+                "PLAN_RELATION_INVALID",
+                "Goal, Work Item, and node links must agree",
             )
-
         if proposal["risk"] != "low" and not goal.get("acceptance"):
             raise CompileError(
                 "SPEC_INPUT_MISSING",
                 "reviewed executable work requires canonical acceptance input",
             )
+
         review_requirement = _compiled_review_requirement(
             proposal,
             policy_snapshot,
@@ -690,7 +651,7 @@ class PlanCompiler:
             if proposal["risk"] != "low" and "affected" not in local_suites:
                 raise CompileError(
                     "AFFECTED_CHECK_MISSING",
-                    ("reviewed V8 work requires a cheap affected Check before Review"),
+                    "reviewed V8 work requires a cheap affected Check before Review",
                 )
         hosted_only_ids = {
             check["check_id"]
@@ -723,16 +684,15 @@ class PlanCompiler:
                 required_check_ids.add(check["check_id"])
         if review_requirement["mode"] != "none":
             required_evidence.append({"kind": "review"})
-        compiled_output_contract = {
-            "required_evidence": required_evidence,
-            "checks": compiled_checks,
-            "review_requirement": review_requirement,
-            "delivery_required": _policy_version(policy_snapshot) >= 3,
-        }
         work_node = _node(
             {
                 **proposal,
-                "output_contract": compiled_output_contract,
+                "output_contract": {
+                    "required_evidence": required_evidence,
+                    "checks": compiled_checks,
+                    "review_requirement": review_requirement,
+                    "delivery_required": _policy_version(policy_snapshot) >= 3,
+                },
                 "skill_reference": skill_reference,
             }
         )
@@ -784,14 +744,11 @@ class PlanCompiler:
                 "skill_reference": None,
             }
         )
-        nodes = sorted(
-            [
-                work_node,
-                integration_node,
-                *([] if decision_node is None else [decision_node]),
-            ],
-            key=lambda node: (node["kind"], node["node_key"]),
-        )
+        nodes = [
+            work_node,
+            integration_node,
+            *([] if decision_node is None else [decision_node]),
+        ]
         if decision_node is None:
             edges = [
                 {
@@ -813,17 +770,137 @@ class PlanCompiler:
                     "type": "decision_required",
                 },
             ]
+        return nodes, edges
+
+    def compile(
+        self,
+        plan_intent: dict[str, Any],
+        source_snapshot: dict[str, Any],
+        policy_snapshot: dict[str, Any],
+    ) -> CompiledPlan:
+        if not all(
+            isinstance(value, dict)
+            for value in (plan_intent, source_snapshot, policy_snapshot)
+        ):
+            raise CompileError(
+                "COMPILE_INPUT_INVALID",
+                "compiler inputs must be objects",
+            )
+        _require_object(
+            plan_intent,
+            fields=PLAN_INTENT_FIELDS,
+            label="Plan Intent",
+        )
+        _require_object(
+            source_snapshot,
+            fields=SOURCE_SNAPSHOT_FIELDS,
+            label="source snapshot",
+        )
+        repository = source_snapshot.get("repository")
+        work_items = source_snapshot.get("work_items")
+        goals = plan_intent.get("goals")
+        proposed_nodes = plan_intent.get("nodes")
+        if not isinstance(repository, str) or "/" not in repository:
+            raise CompileError("REPOSITORY_INVALID", "repository identity is invalid")
+        if not isinstance(work_items, list) or not work_items:
+            raise CompileError(
+                "WORK_ITEM_SET_INVALID",
+                "at least one Ready Work Item is required",
+            )
+        if not isinstance(goals, list) or len(goals) != 1:
+            raise CompileError(
+                "GOAL_SET_INVALID",
+                "Phase 4A requires one Goal for the Ready frontier",
+            )
+        if (
+            not isinstance(proposed_nodes, list)
+            or not proposed_nodes
+            or len(proposed_nodes) != len(work_items)
+        ):
+            raise CompileError(
+                "NODE_SET_INVALID",
+                "each Ready Work Item requires exactly one proposed work node",
+            )
+        goal = goals[0]
+        if not isinstance(goal, dict):
+            raise CompileError(
+                "COMPILE_INPUT_INVALID",
+                "Goal must be an object",
+            )
+        work_item_by_key: dict[str, dict[str, Any]] = {}
+        for work_item in work_items:
+            if (
+                not isinstance(work_item, dict)
+                or work_item.get("tracker_state") != "ready-for-agent"
+            ):
+                raise CompileError(
+                    "WORK_ITEM_NOT_READY",
+                    "only ready-for-agent Work Items may compile into executable work",
+                )
+            key = work_item.get("work_item_key")
+            if not isinstance(key, str) or not key or key in work_item_by_key:
+                raise CompileError(
+                    "WORK_ITEM_SET_INVALID",
+                    "Ready Work Item keys must be unique non-empty strings",
+                )
+            work_item_by_key[key] = work_item
+
+        proposal_by_key: dict[str, dict[str, Any]] = {}
+        for proposal in proposed_nodes:
+            if not isinstance(proposal, dict):
+                raise CompileError(
+                    "COMPILE_INPUT_INVALID",
+                    "Plan Node must be an object",
+                )
+            key = proposal.get("work_item_key")
+            if (
+                not isinstance(key, str)
+                or key not in work_item_by_key
+                or key in proposal_by_key
+            ):
+                raise CompileError(
+                    "PLAN_RELATION_INVALID",
+                    "proposed work nodes must map one-to-one to Ready Work Items",
+                )
+            proposal_by_key[key] = proposal
+        if set(proposal_by_key) != set(work_item_by_key):
+            raise CompileError(
+                "PLAN_RELATION_INVALID",
+                "every Ready Work Item must have one proposed work node",
+            )
+
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        for key in sorted(work_item_by_key):
+            unit_nodes, unit_edges = self._compile_work_unit(
+                repository=repository,
+                plan_intent=plan_intent,
+                source_snapshot=source_snapshot,
+                policy_snapshot=policy_snapshot,
+                goal=goal,
+                work_item=work_item_by_key[key],
+                proposal=proposal_by_key[key],
+            )
+            nodes.extend(unit_nodes)
+            edges.extend(unit_edges)
+        nodes.sort(key=lambda node: (node["kind"], node["node_key"]))
         plan_spec = {
             "schema_version": 2,
             "repository": repository,
             "parent_plan_digest": plan_intent.get("parent_plan_digest"),
             "goals": [_semantic_snapshot(goal)],
-            "work_items": [_semantic_snapshot(work_item)],
+            "work_items": [
+                _semantic_snapshot(work_item_by_key[key])
+                for key in sorted(work_item_by_key)
+            ],
             "nodes": nodes,
             "edges": edges,
         }
         canonical = canonical_bytes(plan_spec)
         digest = digest_bytes(canonical)
+        decision_keys = {
+            node["node_key"] for node in nodes if node["kind"] == "decision"
+        }
         compilation_record = {
             "source_digest": digest_value(source_snapshot),
             "policy_digest": digest_value(policy_snapshot),
@@ -832,7 +909,8 @@ class PlanCompiler:
                     **edge,
                     "source": (
                         "compiler:strict-human-decision"
-                        if decision_node is not None
+                        if edge["from_node"] in decision_keys
+                        or edge["to_node"] in decision_keys
                         else "compiler:serial-integration"
                     ),
                 }
