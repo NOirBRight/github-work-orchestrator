@@ -916,6 +916,7 @@ class PaseoRuntimeAdapter:
 
     def __init__(self, client: PaseoClient):
         self.client = client
+        self._prompts: dict[str, RuntimePrompt] = {}
 
     @staticmethod
     def _identity_labels(admission: RuntimeAdmission) -> dict[str, str]:
@@ -1062,6 +1063,7 @@ class PaseoRuntimeAdapter:
             prompt_digest=(prompt.digest if accepted is not None else None),
         )
         self._assert_admission_identity(admission, binding, prompt)
+        self._prompts[admission.admission_id] = prompt
         return binding
 
     def read_binding(
@@ -1128,6 +1130,7 @@ class PaseoRuntimeAdapter:
                 binding,
                 prompt,
             )
+            self._prompts[expected_admission.admission_id] = prompt
         return binding
 
     def accept_prompt(self, binding: RuntimeBinding, prompt: RuntimePrompt) -> None:
@@ -1259,8 +1262,8 @@ class PaseoRuntimeAdapter:
                     TypedEvidence._capture(
                         kind="candidate",
                         subject=candidate_sha,
-                        observer_type="runtime-adapter",
-                        observer_id=binding.agent_id,
+                        observer_type="runtime_adapter",
+                        observer_id=observed.runtime_id,
                         observed_at=_now(),
                         source_ref=(
                             f"paseo://agent/{binding.agent_id}/"
@@ -1272,6 +1275,82 @@ class PaseoRuntimeAdapter:
                         },
                     ),
                 )
+                prompt = self._prompts.get(observed.admission_id)
+                try:
+                    prompt_payload = (
+                        None if prompt is None else json.loads(prompt.text)
+                    )
+                except json.JSONDecodeError as error:
+                    raise RuntimeAdapterError(
+                        "PROMPT_SNAPSHOT_INVALID",
+                        "frozen Paseo Prompt is not valid JSON",
+                    ) from error
+                node = (
+                    prompt_payload.get("node")
+                    if isinstance(prompt_payload, dict)
+                    else None
+                )
+                output_contract = (
+                    node.get("output_contract")
+                    if isinstance(node, dict)
+                    else None
+                )
+                checks = (
+                    output_contract.get("checks")
+                    if isinstance(output_contract, dict)
+                    else ()
+                )
+                captured = list(evidence)
+                for check in checks or ():
+                    if (
+                        not isinstance(check, dict)
+                        or not isinstance(check.get("check_id"), str)
+                        or not isinstance(check.get("command"), list)
+                        or not all(
+                            isinstance(part, str) and part
+                            for part in check["command"]
+                        )
+                    ):
+                        raise RuntimeAdapterError(
+                            "CHECK_CONTRACT_INVALID",
+                            "frozen Prompt contains an invalid check",
+                        )
+                    result = _run(
+                        list(check["command"]),
+                        cwd=Path(observed.workspace),
+                    )
+                    captured.append(
+                        TypedEvidence._capture(
+                            kind="check",
+                            subject=candidate_sha,
+                            observer_type="runtime_adapter",
+                            observer_id=observed.runtime_id,
+                            observed_at=_now(),
+                            source_ref=(
+                                f"paseo://agent/{binding.agent_id}/"
+                                f"check/{check['check_id']}"
+                            ),
+                            payload={
+                                "check_id": check["check_id"],
+                                "command_digest": digest_value(
+                                    check["command"]
+                                ),
+                                "exit_code": result.returncode,
+                                "outcome": (
+                                    "passed"
+                                    if result.returncode == 0
+                                    else "failed"
+                                ),
+                                "stdout_digest": digest_bytes(
+                                    result.stdout.encode("utf-8")
+                                ),
+                                "stderr_digest": digest_bytes(
+                                    result.stderr.encode("utf-8")
+                                ),
+                            },
+                        )
+                    )
+                evidence = tuple(captured)
         return RuntimeObservation(
             binding=observed,
             lifecycle=agent.lifecycle,

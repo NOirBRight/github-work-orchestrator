@@ -554,7 +554,68 @@ def test_paseo_adapter_reads_bounded_worker_result_and_git_head(tmp_path):
     assert observation.result_claim is not None
     assert observation.result_claim.attempt_id == binding.attempt_id
     assert observation.result_claim.candidate_sha == candidate_sha
-    assert [item.kind for item in observation.evidence] == ["candidate"]
+    assert [item.kind for item in observation.evidence] == [
+        "candidate",
+        "check",
+    ]
+    assert (
+        EvidenceVerifier()
+        .verify(
+            observation.result_claim,
+            node["output_contract"],
+            observation,
+        )
+        .status
+        == "accepted"
+    )
+
+
+def test_production_paseo_adapter_completes_kernel_vertical_path(tmp_path):
+    compiled = _compiled()
+    client = InMemoryPaseoClient()
+    kernel = _paseo_kernel(tmp_path, compiled, client=client)
+
+    waiting = kernel.reconcile_once(compiled.repository)
+    agent = client.find_by_labels(
+        {"gwo.admission": waiting.admission_id}
+    )[0]
+    workspace = Path(agent.workspace)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(kernel.repository_path),
+            "worktree",
+            "add",
+            "--detach",
+            str(workspace),
+            "HEAD",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    (workspace / "result.txt").write_text("phase-2\n", encoding="utf-8")
+    _git(workspace, "add", "result.txt")
+    _git(workspace, "commit", "-m", "paseo candidate")
+    candidate_sha = _git(workspace, "rev-parse", "HEAD")
+    client.set_output(
+        agent.agent_id,
+        "GWO_RESULT "
+        + json.dumps(
+            {
+                "schema_version": 1,
+                "action_key": waiting.node_key,
+                "candidate_sha": candidate_sha,
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    completed = kernel.reconcile_once(compiled.repository)
+
+    assert completed.status == "complete"
+    assert completed.goal_state == "completed"
+    assert _git(kernel.repository_path, "rev-parse", "HEAD") == candidate_sha
 
 
 def test_prompt_snapshot_resolves_current_optional_skill_without_authority():
@@ -1036,7 +1097,10 @@ def test_implement_gwo_launcher_executes_explicit_ready_set_serially_in_phase_tw
         expected_active_digest=None,
     )
 
-    assert [item.kind for item in outcome.directives] == ["finish", "finish"]
+    assert [item.kind for item in outcome.directives] == [
+        "run_next",
+        "finish",
+    ]
     assert len(outcome.activations) == 2
     assert (repository / "result.txt").read_text(encoding="utf-8") == "phase-2\n"
     assert (
@@ -1343,6 +1407,73 @@ def test_goal_driver_assigns_unique_durable_identity_to_each_turn(tmp_path):
     assert second.kind == "continue_coordinator"
     assert second.wait_source_ref != first.wait_source_ref
     assert second.wait_event_identity != first.wait_event_identity
+
+
+def test_goal_driver_counts_unreadable_nonzero_outcomes_as_zero(tmp_path):
+    durable = InMemoryDurableGoalControl()
+    driver = GoalDriver(
+        store_path=tmp_path / "driver.sqlite3",
+        reconciler=_SequenceReconciler([_reconcile_outcome()]),
+        coordinators=InMemoryCoordinatorRuntime(),
+        auto_profile=_coordinator_profile(),
+        durable=durable,
+    )
+    snapshot = _goal_snapshot()
+    first = driver.run_once(snapshot)
+    first_claim = CoordinatorTurnObservation(
+        goal_key=snapshot.goal_key,
+        semantic_input_digest=driver.semantic_input_digest(snapshot),
+        session_id=first.session_id,
+        outcome="executable_work",
+        durable_reference=first.wait_source_ref,
+    )
+    durable.publish_observation(snapshot.repository, first_claim)
+    corrective = driver.run_once(snapshot, observation=first_claim)
+    second_claim = replace(
+        first_claim,
+        durable_reference=corrective.wait_source_ref,
+    )
+    durable.publish_observation(snapshot.repository, second_claim)
+
+    decision = driver.run_once(snapshot, observation=second_claim)
+
+    assert corrective.corrective is True
+    assert decision.kind == "decision"
+    assert decision.decision_gate == "coordinator_zero_outcome"
+
+
+def test_goal_driver_accepts_nonzero_outcome_with_exact_durable_fact(tmp_path):
+    durable = InMemoryDurableGoalControl()
+    driver = GoalDriver(
+        store_path=tmp_path / "driver.sqlite3",
+        reconciler=_SequenceReconciler([_reconcile_outcome()]),
+        coordinators=InMemoryCoordinatorRuntime(),
+        auto_profile=_coordinator_profile(),
+        durable=durable,
+    )
+    snapshot = _goal_snapshot()
+    first = driver.run_once(snapshot)
+    fact_reference = "github://facts/plan-revision-2"
+    fact_digest = durable.publish_fact(
+        snapshot.repository,
+        fact_reference,
+        b'{"plan_digest":"b"}',
+    )
+    observation = CoordinatorTurnObservation(
+        goal_key=snapshot.goal_key,
+        semantic_input_digest=driver.semantic_input_digest(snapshot),
+        session_id=first.session_id,
+        outcome="executable_work",
+        durable_reference=first.wait_source_ref,
+        fact_reference=fact_reference,
+        fact_digest=fact_digest,
+    )
+    durable.publish_observation(snapshot.repository, observation)
+
+    continued = driver.run_once(snapshot, observation=observation)
+
+    assert continued.kind == "continue_coordinator"
+    assert continued.corrective is False
 
 
 def test_goal_semantic_digest_covers_execution_relevant_state_only():

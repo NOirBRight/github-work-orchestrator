@@ -321,11 +321,22 @@ class ImplementGwoLauncher:
                 replace(
                     goal_snapshot,
                     plan_digest=compiled.digest,
+                    work_items=tuple(
+                        (
+                            key,
+                            (
+                                "integrated"
+                                if key in completed
+                                else work_item_state
+                            ),
+                        )
+                        for key, work_item_state in goal_snapshot.work_items
+                    ),
                 )
             )
             activations.append(activation)
             directives.append(directive)
-            if directive.kind != "finish":
+            if directive.kind not in {"run_next", "finish"}:
                 break
             completed.add(work_item_key)
             state.update(

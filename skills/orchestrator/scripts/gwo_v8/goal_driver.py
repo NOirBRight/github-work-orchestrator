@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
+import base64
 import json
 from pathlib import Path
 import sqlite3
@@ -50,6 +51,8 @@ class CoordinatorTurnObservation:
     session_id: str
     outcome: str
     durable_reference: str
+    fact_reference: str | None = None
+    fact_digest: str | None = None
     token_use: int | None = None
     tool_calls: int | None = None
     agent_liveness: str | None = None
@@ -129,6 +132,19 @@ class DurableGoalControl(Protocol):
 
     def publish_wake(self, repository: str, wake: DurableWake) -> None: ...
 
+    def publish_fact(
+        self,
+        repository: str,
+        reference: str,
+        content: bytes,
+    ) -> str: ...
+
+    def read_fact_digest(
+        self,
+        repository: str,
+        reference: str,
+    ) -> str | None: ...
+
 
 class InMemoryDurableGoalControl:
     """Contract fake that still requires publish-then-readback semantics."""
@@ -138,6 +154,7 @@ class InMemoryDurableGoalControl:
             tuple[str, str], CoordinatorTurnObservation
         ] = {}
         self._wakes: dict[tuple[str, str], DurableWake] = {}
+        self._facts: dict[tuple[str, str], tuple[bytes, str]] = {}
 
     def publish_observation(
         self,
@@ -176,6 +193,31 @@ class InMemoryDurableGoalControl:
         reference: str,
     ) -> DurableWake | None:
         return self._wakes.get((repository, reference))
+
+    def publish_fact(
+        self,
+        repository: str,
+        reference: str,
+        content: bytes,
+    ) -> str:
+        digest = digest_bytes(content)
+        key = (repository, reference)
+        existing = self._facts.get(key)
+        if existing is not None and existing != (content, digest):
+            raise GoalDriverError(
+                "DURABLE_FACT_IMMUTABLE",
+                "semantic fact reference cannot be rewritten",
+            )
+        self._facts[key] = (bytes(content), digest)
+        return digest
+
+    def read_fact_digest(
+        self,
+        repository: str,
+        reference: str,
+    ) -> str | None:
+        fact = self._facts.get((repository, reference))
+        return None if fact is None else fact[1]
 
 
 class GitHubDurableGoalControl:
@@ -240,6 +282,56 @@ class GitHubDurableGoalControl:
             wake.durable_reference,
             asdict(wake),
         )
+
+    def publish_fact(
+        self,
+        repository: str,
+        reference: str,
+        content: bytes,
+    ) -> str:
+        digest = digest_bytes(content)
+        self._publish(
+            repository,
+            "facts",
+            reference,
+            {
+                "schema_version": 1,
+                "reference": reference,
+                "content_base64": base64.b64encode(content).decode("ascii"),
+                "content_digest": digest,
+            },
+        )
+        return digest
+
+    def read_fact_digest(
+        self,
+        repository: str,
+        reference: str,
+    ) -> str | None:
+        value = self._read(repository, "facts", reference)
+        if value is None:
+            return None
+        try:
+            content = base64.b64decode(
+                value["content_base64"],
+                validate=True,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise GoalDriverError(
+                "DURABLE_FACT_INVALID",
+                "durable semantic fact is malformed",
+            ) from error
+        digest = digest_bytes(content)
+        if (
+            value.get("schema_version") != 1
+            or value.get("reference") != reference
+            or value.get("content_digest") != digest
+        ):
+            raise GoalDriverError(
+                "DURABLE_FACT_INVALID",
+                "durable semantic fact failed exact readback",
+            )
+        return digest
 
     def _read(
         self,
@@ -535,7 +627,11 @@ class PaseoCoordinatorRuntime:
                         "End the final response with exactly one line "
                         '`GWO_COORDINATOR_OUTCOME {"schema_version":1,'
                         f'"action_key":"{action_key}",'
-                        '"outcome":"<allowed_outcome>"}`.'
+                        '"outcome":"<allowed_outcome>",'
+                        '"fact_reference":"<durable-ref-or-null>",'
+                        '"fact_digest":"<sha256-or-null>"}`. '
+                        "Any non-zero outcome without an exact durable fact "
+                        "reference and digest is counted as zero_outcome."
                     ),
                     "marker": "GWO_COORDINATOR_OUTCOME",
                 },
@@ -658,6 +754,16 @@ class PaseoCoordinatorRuntime:
             session_id=session.session_id,
             outcome=str(outcome),
             durable_reference=durable_reference,
+            fact_reference=(
+                str(envelope["fact_reference"])
+                if isinstance(envelope.get("fact_reference"), str)
+                else None
+            ),
+            fact_digest=(
+                str(envelope["fact_digest"])
+                if isinstance(envelope.get("fact_digest"), str)
+                else None
+            ),
         )
 
 
@@ -927,13 +1033,28 @@ class GoalDriver:
                 "COORDINATOR_OBSERVATION_INVALID",
                 "Coordinator Turn Observation does not match outstanding semantic input",
             )
+        effective_outcome = observation.outcome
+        if observation.outcome != "zero_outcome":
+            durable_fact_digest = (
+                None
+                if observation.fact_reference is None
+                else self.durable.read_fact_digest(
+                    status.repository,
+                    observation.fact_reference,
+                )
+            )
+            if (
+                durable_fact_digest is None
+                or observation.fact_digest != durable_fact_digest
+            ):
+                effective_outcome = "zero_outcome"
         return GoalDriverStatus(
             repository=status.repository,
             goal_key=status.goal_key,
             semantic_input_digest=status.semantic_input_digest,
             zero_outcomes=(
                 status.zero_outcomes + 1
-                if observation.outcome == "zero_outcome"
+                if effective_outcome == "zero_outcome"
                 else 0
             ),
             turn_sequence=status.turn_sequence,
@@ -1128,6 +1249,14 @@ class GoalDriver:
                 }
             )
             self._write_status(status)
+            remaining = [
+                work_item_key
+                for work_item_key, work_item_state in snapshot.work_items
+                if work_item_key != outcome.work_item_key
+                and work_item_state not in {"integrated", "completed"}
+            ]
+            if remaining:
+                return self._directive("run_next", status)
             return self._directive("finish", status)
         if outcome.status == "blocked" or outcome.directive == "request_decision":
             self._write_status(status)
