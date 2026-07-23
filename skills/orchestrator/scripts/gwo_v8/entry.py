@@ -248,6 +248,22 @@ class ImplementGwoLauncher:
                 "repository": repository,
                 "work_item_keys": list(decision.work_item_keys),
                 "goal_key": goal_snapshot.goal_key,
+                "plan_intent_digest": digest_value(plan_intent),
+                "source_contract_digest": digest_value(
+                    [
+                        {
+                            key: item.get(key)
+                            for key in (
+                                "work_item_key",
+                                "source_ref",
+                                "title",
+                                "outcome_contract",
+                            )
+                        }
+                        for item in source_items.values()
+                    ]
+                ),
+                "policy_snapshot_digest": digest_value(policy_snapshot),
             }
         )
         state = self._read_ready_set_state(repository, set_digest)

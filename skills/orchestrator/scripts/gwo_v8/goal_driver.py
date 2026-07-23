@@ -85,6 +85,7 @@ class GoalDriverStatus:
     goal_key: str
     semantic_input_digest: str
     zero_outcomes: int
+    turn_sequence: int
     continuation_outstanding: bool
     session_id: str | None
     last_observation_ref: str | None
@@ -708,6 +709,7 @@ class GoalDriver:
                     goal_key TEXT NOT NULL,
                     semantic_input_digest TEXT NOT NULL,
                     zero_outcomes INTEGER NOT NULL,
+                    turn_sequence INTEGER NOT NULL DEFAULT 0,
                     continuation_outstanding INTEGER NOT NULL,
                     session_id TEXT,
                     last_observation_ref TEXT,
@@ -735,6 +737,13 @@ class GoalDriver:
                     connection.execute(
                         f"ALTER TABLE v8_goal_driver_state ADD COLUMN {column} TEXT"
                     )
+            if "turn_sequence" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE v8_goal_driver_state
+                    ADD COLUMN turn_sequence INTEGER NOT NULL DEFAULT 0
+                    """
+                )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.store_path)
@@ -775,6 +784,7 @@ class GoalDriver:
             goal_key=snapshot.goal_key,
             semantic_input_digest=digest,
             zero_outcomes=0,
+            turn_sequence=0,
             continuation_outstanding=False,
             session_id=None,
             last_observation_ref=None,
@@ -806,6 +816,7 @@ class GoalDriver:
             goal_key=str(row["goal_key"]),
             semantic_input_digest=str(row["semantic_input_digest"]),
             zero_outcomes=int(row["zero_outcomes"]),
+            turn_sequence=int(row["turn_sequence"]),
             continuation_outstanding=bool(row["continuation_outstanding"]),
             session_id=(
                 None if row["session_id"] is None else str(row["session_id"])
@@ -851,6 +862,7 @@ class GoalDriver:
                     goal_key,
                     semantic_input_digest,
                     zero_outcomes,
+                    turn_sequence,
                     continuation_outstanding,
                     session_id,
                     last_observation_ref,
@@ -859,10 +871,11 @@ class GoalDriver:
                     wait_event_identity,
                     next_check_at,
                     last_wake_reference
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repository, goal_key) DO UPDATE SET
                     semantic_input_digest = excluded.semantic_input_digest,
                     zero_outcomes = excluded.zero_outcomes,
+                    turn_sequence = excluded.turn_sequence,
                     continuation_outstanding = excluded.continuation_outstanding,
                     session_id = excluded.session_id,
                     last_observation_ref = excluded.last_observation_ref,
@@ -877,6 +890,7 @@ class GoalDriver:
                     status.goal_key,
                     status.semantic_input_digest,
                     status.zero_outcomes,
+                    status.turn_sequence,
                     int(status.continuation_outstanding),
                     status.session_id,
                     status.last_observation_ref,
@@ -922,6 +936,7 @@ class GoalDriver:
                 if observation.outcome == "zero_outcome"
                 else 0
             ),
+            turn_sequence=status.turn_sequence,
             continuation_outstanding=False,
             session_id=status.session_id,
             last_observation_ref=observation.durable_reference,
@@ -974,15 +989,18 @@ class GoalDriver:
             {
                 "goal_key": status.goal_key,
                 "semantic_input_digest": status.semantic_input_digest,
-                "ordinal": status.zero_outcomes + 1,
+                "ordinal": status.turn_sequence + 1,
             }
         )[:24]
 
-    @classmethod
-    def _turn_reference(cls, status: GoalDriverStatus) -> str:
+    @staticmethod
+    def _turn_reference(
+        status: GoalDriverStatus,
+        action_key: str,
+    ) -> str:
         return "gwo-observation://" + digest_value(
             {
-                "action_key": cls._turn_action_key(status),
+                "action_key": action_key,
                 "repository": status.repository,
             }
         )
@@ -1003,8 +1021,13 @@ class GoalDriver:
             and status.continuation_outstanding
             and status.session_id is not None
         ):
-            expected_reference = self._turn_reference(status)
-            action_key = self._turn_action_key(status)
+            expected_reference = status.wait_source_ref
+            action_key = status.wait_event_identity
+            if expected_reference is None or action_key is None:
+                raise GoalDriverError(
+                    "COORDINATOR_WAIT_INVALID",
+                    "outstanding Coordinator turn lacks a durable action identity",
+                )
             if observation is None:
                 observation = self.durable.read_observation(
                     snapshot.repository,
@@ -1140,7 +1163,7 @@ class GoalDriver:
             )
         if status.continuation_outstanding and observation is None:
             action_key = self._turn_action_key(status)
-            source_ref = self._turn_reference(status)
+            source_ref = self._turn_reference(status, action_key)
             return self._directive(
                 "wait",
                 status,
@@ -1154,7 +1177,7 @@ class GoalDriver:
             )
 
         action_key = self._turn_action_key(status)
-        wait_source_ref = self._turn_reference(status)
+        wait_source_ref = self._turn_reference(status, action_key)
         session, created = self._select_coordinator(
             snapshot,
             status,
@@ -1173,6 +1196,7 @@ class GoalDriver:
             goal_key=status.goal_key,
             semantic_input_digest=status.semantic_input_digest,
             zero_outcomes=status.zero_outcomes,
+            turn_sequence=status.turn_sequence + 1,
             continuation_outstanding=True,
             session_id=session.session_id,
             last_observation_ref=status.last_observation_ref,

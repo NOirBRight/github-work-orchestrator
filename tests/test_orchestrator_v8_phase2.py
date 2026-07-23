@@ -1318,6 +1318,33 @@ def test_goal_driver_rejects_replayed_or_unpublished_coordinator_outcomes(
     )
 
 
+def test_goal_driver_assigns_unique_durable_identity_to_each_turn(tmp_path):
+    durable = InMemoryDurableGoalControl()
+    driver = GoalDriver(
+        store_path=tmp_path / "driver.sqlite3",
+        reconciler=_SequenceReconciler([_reconcile_outcome()]),
+        coordinators=InMemoryCoordinatorRuntime(),
+        auto_profile=_coordinator_profile(),
+        durable=durable,
+    )
+    snapshot = _goal_snapshot()
+    first = driver.run_once(snapshot)
+    observation = CoordinatorTurnObservation(
+        goal_key=snapshot.goal_key,
+        semantic_input_digest=driver.semantic_input_digest(snapshot),
+        session_id=first.session_id,
+        outcome="executable_work",
+        durable_reference=first.wait_source_ref,
+    )
+    durable.publish_observation(snapshot.repository, observation)
+
+    second = driver.run_once(snapshot, observation=observation)
+
+    assert second.kind == "continue_coordinator"
+    assert second.wait_source_ref != first.wait_source_ref
+    assert second.wait_event_identity != first.wait_event_identity
+
+
 def test_goal_semantic_digest_covers_execution_relevant_state_only():
     base = _goal_snapshot()
     driver_digest = GoalDriver.semantic_input_digest
