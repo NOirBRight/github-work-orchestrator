@@ -1241,10 +1241,19 @@ class PaseoRuntimeAdapter:
                     "rev-parse",
                     "HEAD",
                 )
-                if workspace_head != candidate_sha:
+                workspace_status = _git(
+                    Path(observed.workspace),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                )
+                if workspace_head != candidate_sha or workspace_status:
                     raise RuntimeAdapterError(
                         "PASEO_RESULT_READBACK_FAILED",
-                        "Paseo Worker Candidate does not match Workspace HEAD",
+                        (
+                            "Paseo Worker Candidate does not match a clean "
+                            "Workspace HEAD"
+                        ),
                         failure_class="ambiguous",
                     )
                 result_claim = ResultClaim(
@@ -1319,6 +1328,29 @@ class PaseoRuntimeAdapter:
                         list(check["command"]),
                         cwd=Path(observed.workspace),
                     )
+                    post_check_head = _git(
+                        Path(observed.workspace),
+                        "rev-parse",
+                        "HEAD",
+                    )
+                    post_check_status = _git(
+                        Path(observed.workspace),
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                    )
+                    if (
+                        post_check_head != candidate_sha
+                        or post_check_status
+                    ):
+                        raise RuntimeAdapterError(
+                            "CHECK_CANDIDATE_MUTATED",
+                            (
+                                "declared check changed Candidate HEAD, index, "
+                                "worktree, or untracked inputs"
+                            ),
+                            failure_class="ambiguous",
+                        )
                     captured.append(
                         TypedEvidence._capture(
                             kind="check",

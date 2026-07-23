@@ -45,6 +45,7 @@ from gwo_v8 import (  # noqa: E402
     PaseoCoordinatorRuntime,
     PlanCompiler,
     RuntimeAdmission,
+    RuntimeAdapterError,
     RuntimeProfile,
     RuntimePrompt,
     ReconcileOutcome,
@@ -590,6 +591,13 @@ def test_paseo_adapter_reads_bounded_worker_result_and_git_head(tmp_path):
         .status
         == "accepted"
     )
+    (workspace / "untracked-after-candidate.txt").write_text(
+        "dirty\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeAdapterError) as dirty:
+        adapter.observe(binding)
+    assert dirty.value.code == "PASEO_RESULT_READBACK_FAILED"
 
 
 def test_production_paseo_adapter_completes_kernel_vertical_path(tmp_path):
@@ -1492,10 +1500,22 @@ def test_goal_driver_accepts_nonzero_outcome_with_exact_durable_fact(tmp_path):
     )
     durable.publish_observation(snapshot.repository, observation)
 
-    continued = driver.run_once(snapshot, observation=observation)
+    waiting = driver.run_once(snapshot, observation=observation)
+    unchanged = driver.run_once(snapshot)
+    refreshed = driver.run_once(
+        replace(
+            snapshot,
+            decision_inputs=(("durable_fact", fact_digest),),
+        )
+    )
 
-    assert continued.kind == "continue_coordinator"
-    assert continued.corrective is False
+    assert waiting.kind == "wait"
+    assert waiting.wait_condition == "semantic_input_refresh"
+    assert waiting.wait_source_ref == fact_reference
+    assert unchanged.kind == "wait"
+    assert unchanged.semantic_input_digest == waiting.semantic_input_digest
+    assert refreshed.kind == "continue_coordinator"
+    assert refreshed.semantic_input_digest != waiting.semantic_input_digest
 
 
 def test_goal_semantic_digest_covers_execution_relevant_state_only():

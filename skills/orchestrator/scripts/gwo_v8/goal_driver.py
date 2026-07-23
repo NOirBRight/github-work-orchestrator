@@ -1066,10 +1066,26 @@ class GoalDriver:
             continuation_outstanding=False,
             session_id=status.session_id,
             last_observation_ref=observation.durable_reference,
-            wait_condition=status.wait_condition,
-            wait_source_ref=status.wait_source_ref,
-            wait_event_identity=status.wait_event_identity,
-            next_check_at=status.next_check_at,
+            wait_condition=(
+                "semantic_input_refresh"
+                if effective_outcome != "zero_outcome"
+                else status.wait_condition
+            ),
+            wait_source_ref=(
+                observation.fact_reference
+                if effective_outcome != "zero_outcome"
+                else status.wait_source_ref
+            ),
+            wait_event_identity=(
+                observation.fact_digest
+                if effective_outcome != "zero_outcome"
+                else status.wait_event_identity
+            ),
+            next_check_at=(
+                None
+                if effective_outcome != "zero_outcome"
+                else status.next_check_at
+            ),
             last_wake_reference=status.last_wake_reference,
         )
 
@@ -1190,15 +1206,24 @@ class GoalDriver:
                     "Coordinator observation does not match the outstanding action",
                 )
             status = self._apply_observation(status, observation)
-            status = replace(
-                status,
-                wait_condition=None,
-                wait_source_ref=None,
-                wait_event_identity=None,
-                next_check_at=None,
-            )
+            if status.wait_condition != "semantic_input_refresh":
+                status = replace(
+                    status,
+                    wait_condition=None,
+                    wait_source_ref=None,
+                    wait_event_identity=None,
+                    next_check_at=None,
+                )
             observation = None
             self._write_status(status)
+            if status.wait_condition == "semantic_input_refresh":
+                return self._directive(
+                    "wait",
+                    status,
+                    wait_condition=status.wait_condition,
+                    wait_source_ref=status.wait_source_ref,
+                    wait_event_identity=status.wait_event_identity,
+                )
         elif status.wait_condition is not None:
             wake = (
                 None
