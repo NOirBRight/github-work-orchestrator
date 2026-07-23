@@ -494,6 +494,69 @@ def test_paseo_adapter_round_trips_identity_prompt_lifecycle_and_retirement(
     assert adapter.read_binding(admission.admission_id) is None
 
 
+def test_paseo_adapter_reads_bounded_worker_result_and_git_head(tmp_path):
+    compiled = _compiled()
+    node = next(
+        item
+        for item in json.loads(compiled.canonical_bytes)["nodes"]
+        if item["kind"] == "work"
+    )
+    profile = RuntimeProfile(
+        name="worker-standard",
+        provider="kimi-cli",
+        model="kimi-code/kimi-for-coding",
+        thinking="max",
+        mode="yolo",
+        features={},
+    )
+    admission = RuntimeAdmission(
+        repository=compiled.repository,
+        plan_digest=compiled.digest,
+        node_key=node["node_key"],
+        admission_id="admission:bounded-result",
+        repository_path=tmp_path,
+        base_sha="a" * 40,
+        runtime_profile=profile,
+    )
+    prompt = RuntimePrompt.from_node(node)
+    client = InMemoryPaseoClient()
+    adapter = PaseoRuntimeAdapter(client)
+    binding = adapter.materialize(admission, prompt)
+    binding = adapter.attach_attempt(binding, "attempt:bounded-result:1")
+    workspace = Path(binding.workspace)
+    workspace.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(workspace)],
+        check=True,
+        capture_output=True,
+    )
+    _git(workspace, "config", "user.name", "Phase Two")
+    _git(workspace, "config", "user.email", "phase-two@example.invalid")
+    (workspace / "result.txt").write_text("phase-2\n", encoding="utf-8")
+    _git(workspace, "add", "result.txt")
+    _git(workspace, "commit", "-m", "candidate")
+    candidate_sha = _git(workspace, "rev-parse", "HEAD")
+    client.set_output(
+        binding.agent_id,
+        "done\nGWO_RESULT "
+        + json.dumps(
+            {
+                "schema_version": 1,
+                "action_key": node["node_key"],
+                "candidate_sha": candidate_sha,
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    observation = adapter.observe(binding)
+
+    assert observation.result_claim is not None
+    assert observation.result_claim.attempt_id == binding.attempt_id
+    assert observation.result_claim.candidate_sha == candidate_sha
+    assert [item.kind for item in observation.evidence] == ["candidate"]
+
+
 def test_prompt_snapshot_resolves_current_optional_skill_without_authority():
     compiled = PlanCompiler().compile(
         _plan_intent(skill_reference="tdd"),
@@ -800,13 +863,9 @@ def test_implement_gwo_accepts_only_explicit_ready_work_items(kind):
 
     decision = ImplementGwoEntry().route(request)
 
-    assert decision.status == (
-        "ready" if len(request["work_items"]) == 1 else "planning_required"
-    )
+    assert decision.status == "ready"
     assert decision.execution_entry == "implement-gwo"
-    assert decision.next_action == (
-        None if len(request["work_items"]) == 1 else "compile-ready-set"
-    )
+    assert decision.next_action is None
     assert decision.work_item_keys == tuple(
         item["key"] for item in request["work_items"]
     )
@@ -889,6 +948,100 @@ def test_implement_gwo_launcher_runs_one_ready_item_through_goal_completion(
     assert outcome.directive is not None
     assert outcome.directive.kind == "finish"
     assert (repository / "result.txt").read_text(encoding="utf-8") == "phase-2\n"
+
+
+def test_implement_gwo_launcher_executes_explicit_ready_set_serially_in_phase_two(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    source = _ready_source()
+    source["work_items"].append(
+        {
+            "work_item_key": "issue:43",
+            "tracker_state": "ready-for-agent",
+            "source_ref": "synthetic://issue/43",
+            "title": "Write the second phase-two artifact",
+            "outcome_contract": {
+                "path": "result-2.txt",
+                "content": "phase-2-second\n",
+            },
+        }
+    )
+    intent = _plan_intent()
+    second_node = json.loads(json.dumps(intent["nodes"][0]))
+    second_node["work_item_key"] = "issue:43"
+    second_node["inputs"]["file_changes"] = [
+        {"path": "result-2.txt", "content": "phase-2-second\n"}
+    ]
+    second_node["effect_contract"]["write_scopes"] = ["result-2.txt"]
+    second_node["output_contract"]["checks"][0]["command"] = [
+        "python",
+        "-c",
+        (
+            "from pathlib import Path; "
+            "assert Path('result-2.txt').read_text() == 'phase-2-second\\n'"
+        ),
+    ]
+    intent["nodes"].append(second_node)
+    durable = InMemoryDurablePlanControl()
+    publication = LocalPlanPublication(
+        tmp_path / "v8.sqlite3",
+        durable=durable,
+    )
+    kernel = Kernel(
+        store_path=tmp_path / "v8.sqlite3",
+        publication=publication,
+        runtime=InMemoryRuntimeAdapter(tmp_path / "workspaces"),
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="v8-generation-1",
+    )
+    launcher = ImplementGwoLauncher(
+        compiler=PlanCompiler(),
+        publication=publication,
+        goal_driver=GoalDriver(
+            store_path=tmp_path / "v8.sqlite3",
+            reconciler=kernel,
+            coordinators=InMemoryCoordinatorRuntime(),
+            auto_profile=_coordinator_profile(),
+        ),
+        writer_generation="v8-generation-1",
+    )
+
+    outcome = launcher.launch(
+        {
+            "kind": "ready_set",
+            "work_items": [
+                {"key": "issue:42", "tracker_state": "ready-for-agent"},
+                {"key": "issue:43", "tracker_state": "ready-for-agent"},
+            ],
+        },
+        plan_intent=intent,
+        source_snapshot=source,
+        policy_snapshot={"version": 1},
+        goal_snapshot=GoalSnapshot(
+            repository="local/phase-two",
+            goal_key="goal:phase-2",
+            objective="Integrate the explicit Ready Set.",
+            acceptance=("Both Ready Work Items are integrated.",),
+            plan_digest="pending",
+            work_items=(
+                ("issue:42", "ready-for-agent"),
+                ("issue:43", "ready-for-agent"),
+            ),
+            decision_inputs=(),
+            base_identity=_git(repository, "rev-parse", "HEAD"),
+        ),
+        expected_active_digest=None,
+    )
+
+    assert [item.kind for item in outcome.directives] == ["finish", "finish"]
+    assert len(outcome.activations) == 2
+    assert (repository / "result.txt").read_text(encoding="utf-8") == "phase-2\n"
+    assert (
+        repository / "result-2.txt"
+    ).read_text(encoding="utf-8") == "phase-2-second\n"
 
 
 class _SequenceReconciler:
@@ -977,6 +1130,7 @@ def test_goal_driver_resumes_manual_coordinator_when_campaign_stops_silently(
         reconciler=reconciler,
         coordinators=coordinators,
         auto_profile=_coordinator_profile(),
+        durable=InMemoryDurableGoalControl(),
     )
 
     directive = driver.run_once(_goal_snapshot())
@@ -1091,7 +1245,7 @@ def test_goal_driver_bounds_unchanged_zero_outcome_then_opens_decision_gate(
         semantic_input_digest=digest,
         session_id=first.session_id,
         outcome="zero_outcome",
-        durable_reference="paseo://turn/1",
+        durable_reference=first.wait_source_ref,
         token_use=100_000,
         tool_calls=500,
         agent_liveness="running",
@@ -1106,7 +1260,7 @@ def test_goal_driver_bounds_unchanged_zero_outcome_then_opens_decision_gate(
         semantic_input_digest=digest,
         session_id=corrective.session_id,
         outcome="zero_outcome",
-        durable_reference="paseo://turn/2",
+        durable_reference=corrective.wait_source_ref,
         token_use=1,
         tool_calls=0,
         agent_liveness="idle",
@@ -1146,7 +1300,7 @@ def test_goal_driver_rejects_replayed_or_unpublished_coordinator_outcomes(
         semantic_input_digest=driver.semantic_input_digest(snapshot),
         session_id=first.session_id,
         outcome="executable_work",
-        durable_reference="github://turn/1",
+        durable_reference=first.wait_source_ref,
     )
 
     with pytest.raises(GoalDriverError) as unpublished:
@@ -1189,6 +1343,7 @@ def test_goal_driver_waits_for_outstanding_turn_instead_of_sampling_again(
         reconciler=_SequenceReconciler([_reconcile_outcome()]),
         coordinators=coordinators,
         auto_profile=_coordinator_profile(),
+        durable=InMemoryDurableGoalControl(),
     )
 
     first = driver.run_once(_goal_snapshot())
@@ -1233,6 +1388,7 @@ def test_goal_driver_production_paseo_coordinator_reads_back_auto_profile(
         reconciler=_SequenceReconciler([_reconcile_outcome()]),
         coordinators=coordinators,
         auto_profile=_coordinator_profile(),
+        durable=InMemoryDurableGoalControl(),
     )
 
     directive = driver.run_once(_goal_snapshot())
@@ -1249,6 +1405,61 @@ def test_goal_driver_production_paseo_coordinator_reads_back_auto_profile(
     assert len(agents) == 1
     assert agents[0].provider == "kimi-cli"
     assert agents[0].model == "kimi-code/k3"
+
+
+def test_goal_driver_recovers_paseo_outcome_by_deterministic_readback(tmp_path):
+    repository = _temporary_repository(tmp_path)
+    client = InMemoryPaseoClient()
+    durable = InMemoryDurableGoalControl()
+    driver = GoalDriver(
+        store_path=tmp_path / "driver.sqlite3",
+        reconciler=_SequenceReconciler(
+            [
+                _reconcile_outcome(),
+                _reconcile_outcome(
+                    directive="goal_complete",
+                    status="complete",
+                    goal_state="completed",
+                ),
+            ]
+        ),
+        coordinators=PaseoCoordinatorRuntime(
+            client,
+            repository_path=repository,
+            base_sha=_git(repository, "rev-parse", "HEAD"),
+        ),
+        auto_profile=_coordinator_profile(),
+        durable=durable,
+    )
+    snapshot = _goal_snapshot()
+
+    first = driver.run_once(snapshot)
+    agent = client.find_by_labels(
+        {
+            "gwo.goal": snapshot.goal_key,
+            "gwo.role": "coordinator",
+        }
+    )[0]
+    client.set_output(
+        agent.agent_id,
+        "GWO_COORDINATOR_OUTCOME "
+        + json.dumps(
+            {
+                "schema_version": 1,
+                "action_key": first.wait_event_identity,
+                "outcome": "executable_work",
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    recovered = driver.run_once(snapshot)
+
+    assert recovered.kind == "finish"
+    assert durable.read_observation(
+        snapshot.repository,
+        first.wait_source_ref,
+    ) is not None
 
 
 def test_goal_driver_finishes_only_from_verified_kernel_completion(tmp_path):

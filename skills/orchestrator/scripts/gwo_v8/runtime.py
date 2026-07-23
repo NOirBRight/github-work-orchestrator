@@ -168,6 +168,15 @@ class RuntimePrompt:
         text = canonical_bytes(
             {
                 "node": node,
+                "result_protocol": {
+                    "action_key": node.get("node_key"),
+                    "instruction": (
+                        "End the final response with exactly one line "
+                        '`GWO_RESULT {"schema_version":1,"action_key":'
+                        '"<node_key>","candidate_sha":"<40-lowercase-hex>"}`.'
+                    ),
+                    "marker": "GWO_RESULT",
+                },
                 "skill_guidance": guidance,
                 "skill_name": skill_name,
             }
@@ -263,6 +272,36 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def read_bounded_outcome(
+    output: str | None,
+    *,
+    marker: str,
+    action_key: str,
+) -> dict[str, Any] | None:
+    """Return the latest small, schema-bound outcome for one exact action."""
+
+    if not output:
+        return None
+    prefix = f"{marker} "
+    for line in reversed(output[-262_144:].splitlines()):
+        if not line.startswith(prefix):
+            continue
+        encoded = line[len(prefix) :]
+        if len(encoded.encode("utf-8")) > 16_384:
+            continue
+        try:
+            value = json.loads(encoded)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(value, dict)
+            and value.get("schema_version") == 1
+            and value.get("action_key") == action_key
+        ):
+            return value
+    return None
+
+
 @dataclass(frozen=True)
 class PaseoCreateRequest:
     action_key: str
@@ -293,6 +332,7 @@ class PaseoAgentRecord:
     archived: bool = False
     result_claim: ResultClaim | None = None
     evidence: tuple[TypedEvidence, ...] = ()
+    output_text: str | None = None
 
 
 class PaseoClient(Protocol):
@@ -314,6 +354,8 @@ class PaseoClient(Protocol):
 
     def update_labels(self, agent_id: str, labels: dict[str, str]) -> None: ...
 
+    def read_output(self, agent_id: str) -> str | None: ...
+
     def stop(self, agent_id: str) -> None: ...
 
     def resume(self, agent_id: str) -> None: ...
@@ -329,6 +371,14 @@ class InMemoryPaseoClient:
         self._create_failures = list(create_failures)
         self.create_count = 0
         self.create_prompt_digests: list[str] = []
+
+    def set_output(self, agent_id: str, output_text: str) -> None:
+        record = self.inspect(agent_id)
+        self._agents[agent_id] = replace(
+            record,
+            output_text=output_text,
+            lifecycle="idle",
+        )
 
     def find_by_labels(self, labels: dict[str, str]) -> tuple[PaseoAgentRecord, ...]:
         return tuple(
@@ -429,6 +479,9 @@ class InMemoryPaseoClient:
             labels={**record.labels, **labels},
         )
 
+    def read_output(self, agent_id: str) -> str | None:
+        return self.inspect(agent_id).output_text
+
     def stop(self, agent_id: str) -> None:
         record = self.inspect(agent_id)
         self._agents[agent_id] = replace(record, lifecycle="idle")
@@ -516,6 +569,34 @@ class PaseoCliClient:
                 "Paseo returned non-JSON lifecycle data",
                 failure_class="ambiguous",
             ) from error
+
+    def _run_text(
+        self,
+        args: list[str],
+        *,
+        failure_class: str = "transient",
+    ) -> str:
+        result = subprocess.run(
+            [self.executable, *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if result.returncode != 0:
+            detail = (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "Paseo operation failed"
+            )
+            raise RuntimeAdapterError(
+                "PASEO_OPERATION_FAILED",
+                detail,
+                failure_class=self.classify_failure(
+                    detail,
+                    default=failure_class,
+                ),
+            )
+        return result.stdout
 
     @staticmethod
     def _labels(value: Any) -> dict[str, str]:
@@ -681,6 +762,10 @@ class PaseoCliClient:
                     "gwo.profile_digest",
                     records[-1].profile_digest,
                 ),
+                parent_agent_id=self._known_labels[agent_id].get(
+                    "gwo.parent_agent",
+                    records[-1].parent_agent_id,
+                ),
             )
         return tuple(records)
 
@@ -769,6 +854,10 @@ class PaseoCliClient:
                 "gwo.profile_digest",
                 record.profile_digest,
             ),
+            parent_agent_id=known.get(
+                "gwo.parent_agent",
+                record.parent_agent_id,
+            ),
         )
 
     def send_prompt(
@@ -795,6 +884,12 @@ class PaseoCliClient:
             **self._known_labels.get(agent_id, {}),
             **labels,
         }
+
+    def read_output(self, agent_id: str) -> str | None:
+        output = self._run_text(
+            ["logs", agent_id, "--tail", "200"],
+        )
+        return output[-262_144:] if output else None
 
     def stop(self, agent_id: str) -> None:
         self._run(["stop", agent_id, "--json"])
@@ -930,6 +1025,8 @@ class PaseoRuntimeAdapter:
             "gwo.runtime_profile": admission.runtime_profile.name,
             "gwo.profile_digest": admission.runtime_profile.digest,
         }
+        if admission.parent_agent_id is not None:
+            labels["gwo.parent_agent"] = admission.parent_agent_id
         existing = self._find_one(labels)
         if existing is None:
             existing = self.client.create(
@@ -990,6 +1087,8 @@ class PaseoRuntimeAdapter:
                 "gwo.runtime_profile": profile.name,
                 "gwo.profile_digest": profile.digest,
             }
+            if admission.parent_agent_id is not None:
+                labels["gwo.parent_agent"] = admission.parent_agent_id
             expected_admission = admission
         agent = self._find_one(labels)
         if agent is None:
@@ -1112,11 +1211,72 @@ class PaseoRuntimeAdapter:
                 "Paseo observation changed GWO identity",
                 failure_class="ambiguous",
             )
+        result_claim = agent.result_claim
+        evidence = agent.evidence
+        if (
+            result_claim is None
+            and observed.attempt_id is not None
+            and agent.lifecycle in {"idle", "completed", "ready"}
+        ):
+            envelope = read_bounded_outcome(
+                self.client.read_output(binding.agent_id),
+                marker="GWO_RESULT",
+                action_key=binding.node_key,
+            )
+            if envelope is not None:
+                candidate_sha = envelope.get("candidate_sha")
+                if (
+                    not isinstance(candidate_sha, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", candidate_sha) is None
+                ):
+                    raise RuntimeAdapterError(
+                        "PASEO_RESULT_INVALID",
+                        "Paseo Worker returned an invalid Candidate SHA",
+                    )
+                workspace_head = _git(
+                    Path(observed.workspace),
+                    "rev-parse",
+                    "HEAD",
+                )
+                if workspace_head != candidate_sha:
+                    raise RuntimeAdapterError(
+                        "PASEO_RESULT_READBACK_FAILED",
+                        "Paseo Worker Candidate does not match Workspace HEAD",
+                        failure_class="ambiguous",
+                    )
+                result_claim = ResultClaim(
+                    attempt_id=observed.attempt_id,
+                    node_key=observed.node_key,
+                    candidate_sha=candidate_sha,
+                    assertions={
+                        "paseo_action_key": observed.node_key,
+                        "output_digest": digest_bytes(
+                            canonical_bytes(envelope)
+                        ),
+                    },
+                )
+                evidence = (
+                    TypedEvidence._capture(
+                        kind="candidate",
+                        subject=candidate_sha,
+                        observer_type="runtime-adapter",
+                        observer_id=binding.agent_id,
+                        observed_at=_now(),
+                        source_ref=(
+                            f"paseo://agent/{binding.agent_id}/"
+                            f"result/{observed.node_key}"
+                        ),
+                        payload={
+                            "workspace": observed.workspace,
+                            "head": workspace_head,
+                        },
+                    ),
+                )
         return RuntimeObservation(
             binding=observed,
             lifecycle=agent.lifecycle,
-            result_claim=agent.result_claim,
-            evidence=agent.evidence,
+            result_claim=result_claim,
+            evidence=evidence,
         )
 
     def interrupt(self, binding: RuntimeBinding) -> None:

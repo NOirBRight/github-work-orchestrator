@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -16,6 +17,7 @@ from .runtime import (
     PaseoCreateRequest,
     RuntimeProfile,
     RuntimePrompt,
+    read_bounded_outcome,
 )
 
 
@@ -117,6 +119,14 @@ class DurableGoalControl(Protocol):
         repository: str,
         reference: str,
     ) -> DurableWake | None: ...
+
+    def publish_observation(
+        self,
+        repository: str,
+        observation: CoordinatorTurnObservation,
+    ) -> None: ...
+
+    def publish_wake(self, repository: str, wake: DurableWake) -> None: ...
 
 
 class InMemoryDurableGoalControl:
@@ -306,13 +316,26 @@ class CoordinatorRuntime(Protocol):
         snapshot: GoalSnapshot,
         *,
         corrective: bool,
+        action_key: str,
     ) -> None: ...
 
     def create_auto(
         self,
         snapshot: GoalSnapshot,
         profile: RuntimeProfile,
+        *,
+        action_key: str,
     ) -> CoordinatorSession: ...
+
+    def read_observation(
+        self,
+        session: CoordinatorSession,
+        snapshot: GoalSnapshot,
+        *,
+        action_key: str,
+        semantic_input_digest: str,
+        durable_reference: str,
+    ) -> CoordinatorTurnObservation | None: ...
 
 
 class InMemoryCoordinatorRuntime:
@@ -344,8 +367,9 @@ class InMemoryCoordinatorRuntime:
         snapshot: GoalSnapshot,
         *,
         corrective: bool,
+        action_key: str,
     ) -> None:
-        del snapshot, corrective
+        del snapshot, corrective, action_key
         current = self.inspect(session.session_id)
         if current is None or not current.usable:
             raise GoalDriverError(
@@ -358,7 +382,10 @@ class InMemoryCoordinatorRuntime:
         self,
         snapshot: GoalSnapshot,
         profile: RuntimeProfile,
+        *,
+        action_key: str,
     ) -> CoordinatorSession:
+        del action_key
         self.auto_create_count += 1
         self.continue_count += 1
         self.auto_profiles.append(profile)
@@ -378,6 +405,24 @@ class InMemoryCoordinatorRuntime:
         )
         self._sessions[session.session_id] = session
         return session
+
+    def read_observation(
+        self,
+        session: CoordinatorSession,
+        snapshot: GoalSnapshot,
+        *,
+        action_key: str,
+        semantic_input_digest: str,
+        durable_reference: str,
+    ) -> CoordinatorTurnObservation | None:
+        del (
+            session,
+            snapshot,
+            action_key,
+            semantic_input_digest,
+            durable_reference,
+        )
+        return None
 
 
 class PaseoCoordinatorRuntime:
@@ -457,7 +502,12 @@ class PaseoCoordinatorRuntime:
         )
 
     @staticmethod
-    def _prompt(snapshot: GoalSnapshot, *, corrective: bool) -> RuntimePrompt:
+    def _prompt(
+        snapshot: GoalSnapshot,
+        *,
+        corrective: bool,
+        action_key: str,
+    ) -> RuntimePrompt:
         text = canonical_bytes(
             {
                 "goal": {
@@ -477,6 +527,17 @@ class PaseoCoordinatorRuntime:
                     if corrective
                     else "Continue the incomplete Goal and produce one concrete outcome."
                 ),
+                "outcome_protocol": {
+                    "action_key": action_key,
+                    "allowed_outcomes": sorted(GoalDriver._OUTCOMES),
+                    "instruction": (
+                        "End the final response with exactly one line "
+                        '`GWO_COORDINATOR_OUTCOME {"schema_version":1,'
+                        f'"action_key":"{action_key}",'
+                        '"outcome":"<allowed_outcome>"}`.'
+                    ),
+                    "marker": "GWO_COORDINATOR_OUTCOME",
+                },
             }
         ).decode("utf-8")
         return RuntimePrompt(
@@ -490,6 +551,7 @@ class PaseoCoordinatorRuntime:
         snapshot: GoalSnapshot,
         *,
         corrective: bool,
+        action_key: str,
     ) -> None:
         current = self.inspect(session.session_id)
         if current is None or not current.usable:
@@ -497,7 +559,11 @@ class PaseoCoordinatorRuntime:
                 "COORDINATOR_UNUSABLE",
                 "Paseo Coordinator session cannot be continued",
             )
-        prompt = self._prompt(snapshot, corrective=corrective)
+        prompt = self._prompt(
+            snapshot,
+            corrective=corrective,
+            action_key=action_key,
+        )
         self.client.send_prompt(
             current.agent_id,
             prompt,
@@ -508,8 +574,14 @@ class PaseoCoordinatorRuntime:
         self,
         snapshot: GoalSnapshot,
         profile: RuntimeProfile,
+        *,
+        action_key: str,
     ) -> CoordinatorSession:
-        prompt = self._prompt(snapshot, corrective=False)
+        prompt = self._prompt(
+            snapshot,
+            corrective=False,
+            action_key=action_key,
+        )
         agent = self.client.create(
             PaseoCreateRequest(
                 action_key=f"{snapshot.goal_key}:coordinator:auto",
@@ -521,6 +593,11 @@ class PaseoCoordinatorRuntime:
                     "gwo.auto": "true",
                     "gwo.runtime_profile": profile.name,
                     "gwo.profile_digest": profile.digest,
+                    **(
+                        {}
+                        if self.parent_agent_id is None
+                        else {"gwo.parent_agent": self.parent_agent_id}
+                    ),
                 },
                 prompt=prompt,
                 repository_path=str(self.repository_path),
@@ -545,6 +622,42 @@ class PaseoCoordinatorRuntime:
                 "Paseo auto-Coordinator identity or runtime profile changed",
             )
         return self._session(readback, manually_created=False)
+
+    def read_observation(
+        self,
+        session: CoordinatorSession,
+        snapshot: GoalSnapshot,
+        *,
+        action_key: str,
+        semantic_input_digest: str,
+        durable_reference: str,
+    ) -> CoordinatorTurnObservation | None:
+        current = self.inspect(session.session_id)
+        if current is None or not current.usable:
+            return None
+        agent = self.client.inspect(current.agent_id)
+        if agent.lifecycle not in {"idle", "completed", "ready"}:
+            return None
+        envelope = read_bounded_outcome(
+            self.client.read_output(current.agent_id),
+            marker="GWO_COORDINATOR_OUTCOME",
+            action_key=action_key,
+        )
+        if envelope is None:
+            return None
+        outcome = envelope.get("outcome")
+        if outcome not in GoalDriver._OUTCOMES:
+            raise GoalDriverError(
+                "COORDINATOR_OUTCOME_INVALID",
+                "Paseo Coordinator returned an unsupported bounded outcome",
+            )
+        return CoordinatorTurnObservation(
+            goal_key=snapshot.goal_key,
+            semantic_input_digest=semantic_input_digest,
+            session_id=session.session_id,
+            outcome=str(outcome),
+            durable_reference=durable_reference,
+        )
 
 
 class GoalDriver:
@@ -571,6 +684,11 @@ class GoalDriver:
         self.reconciler = reconciler
         self.coordinators = coordinators
         self.auto_profile = auto_profile
+        if durable is None and isinstance(coordinators, PaseoCoordinatorRuntime):
+            raise GoalDriverError(
+                "DURABLE_GOAL_CONTROL_REQUIRED",
+                "production Paseo continuation requires durable Goal control",
+            )
         self.durable = durable or InMemoryDurableGoalControl()
         if (
             auto_profile.provider != "kimi-cli"
@@ -831,6 +949,8 @@ class GoalDriver:
         self,
         snapshot: GoalSnapshot,
         status: GoalDriverStatus,
+        *,
+        action_key: str,
     ) -> tuple[CoordinatorSession, bool]:
         if status.session_id is not None:
             existing = self.coordinators.inspect(status.session_id)
@@ -839,7 +959,33 @@ class GoalDriver:
         manual = self.coordinators.find_manual(snapshot.goal_key)
         if manual is not None and manual.usable:
             return manual, False
-        return self.coordinators.create_auto(snapshot, self.auto_profile), True
+        return (
+            self.coordinators.create_auto(
+                snapshot,
+                self.auto_profile,
+                action_key=action_key,
+            ),
+            True,
+        )
+
+    @staticmethod
+    def _turn_action_key(status: GoalDriverStatus) -> str:
+        return "coordinator-turn:" + digest_value(
+            {
+                "goal_key": status.goal_key,
+                "semantic_input_digest": status.semantic_input_digest,
+                "ordinal": status.zero_outcomes + 1,
+            }
+        )[:24]
+
+    @classmethod
+    def _turn_reference(cls, status: GoalDriverStatus) -> str:
+        return "gwo-observation://" + digest_value(
+            {
+                "action_key": cls._turn_action_key(status),
+                "repository": status.repository,
+            }
+        )
 
     def run_once(
         self,
@@ -852,7 +998,59 @@ class GoalDriver:
         status = self.read_status(snapshot.repository, snapshot.goal_key)
         if status is None or status.semantic_input_digest != digest:
             status = self._new_status(snapshot, digest)
-        if status.wait_condition is not None:
+        if (
+            status.wait_condition == "coordinator_turn"
+            and status.continuation_outstanding
+            and status.session_id is not None
+        ):
+            expected_reference = self._turn_reference(status)
+            action_key = self._turn_action_key(status)
+            if observation is None:
+                observation = self.durable.read_observation(
+                    snapshot.repository,
+                    expected_reference,
+                )
+            if observation is None:
+                session = self.coordinators.inspect(status.session_id)
+                if session is not None and session.usable:
+                    observation = self.coordinators.read_observation(
+                        session,
+                        snapshot,
+                        action_key=action_key,
+                        semantic_input_digest=status.semantic_input_digest,
+                        durable_reference=expected_reference,
+                    )
+                    if observation is not None:
+                        self.durable.publish_observation(
+                            snapshot.repository,
+                            observation,
+                        )
+            if observation is None:
+                return self._directive(
+                    "wait",
+                    status,
+                    session_id=status.session_id,
+                    wait_condition=status.wait_condition,
+                    wait_source_ref=status.wait_source_ref,
+                    wait_event_identity=status.wait_event_identity,
+                    next_check_at=status.next_check_at,
+                )
+            if observation.durable_reference != expected_reference:
+                raise GoalDriverError(
+                    "COORDINATOR_OBSERVATION_INVALID",
+                    "Coordinator observation does not match the outstanding action",
+                )
+            status = self._apply_observation(status, observation)
+            status = replace(
+                status,
+                wait_condition=None,
+                wait_source_ref=None,
+                wait_event_identity=None,
+                next_check_at=None,
+            )
+            observation = None
+            self._write_status(status)
+        elif status.wait_condition is not None:
             wake = (
                 None
                 if wake_reference is None
@@ -941,20 +1139,34 @@ class GoalDriver:
                 decision_gate="coordinator_zero_outcome",
             )
         if status.continuation_outstanding and observation is None:
+            action_key = self._turn_action_key(status)
+            source_ref = self._turn_reference(status)
             return self._directive(
                 "wait",
                 status,
                 session_id=status.session_id,
                 wait_condition="coordinator_turn",
+                wait_source_ref=source_ref,
+                wait_event_identity=action_key,
+                next_check_at=(
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat(),
             )
 
-        session, created = self._select_coordinator(snapshot, status)
+        action_key = self._turn_action_key(status)
+        wait_source_ref = self._turn_reference(status)
+        session, created = self._select_coordinator(
+            snapshot,
+            status,
+            action_key=action_key,
+        )
         corrective = status.zero_outcomes == 1
         if not created:
             self.coordinators.continue_session(
                 session,
                 snapshot,
                 corrective=corrective,
+                action_key=action_key,
             )
         status = GoalDriverStatus(
             repository=status.repository,
@@ -964,10 +1176,12 @@ class GoalDriver:
             continuation_outstanding=True,
             session_id=session.session_id,
             last_observation_ref=status.last_observation_ref,
-            wait_condition=None,
-            wait_source_ref=None,
-            wait_event_identity=None,
-            next_check_at=None,
+            wait_condition="coordinator_turn",
+            wait_source_ref=wait_source_ref,
+            wait_event_identity=action_key,
+            next_check_at=(
+                datetime.now(timezone.utc) + timedelta(seconds=30)
+            ).isoformat(),
             last_wake_reference=status.last_wake_reference,
         )
         self._write_status(status)
@@ -977,4 +1191,8 @@ class GoalDriver:
             session_id=session.session_id,
             corrective=corrective,
             runtime_profile=session.runtime_profile,
+            wait_condition=status.wait_condition,
+            wait_source_ref=status.wait_source_ref,
+            wait_event_identity=status.wait_event_identity,
+            next_check_at=status.next_check_at,
         )

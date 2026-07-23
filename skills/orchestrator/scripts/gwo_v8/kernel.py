@@ -602,13 +602,20 @@ class Kernel:
                     "next_check_at": next_check_at,
                 }
             )
-        elif error.failure_class == "transient" and executions < 3:
+        elif (
+            error.failure_class == "transient"
+            and consecutive < 3
+            and (operation not in {"create", "prompt"} or executions < 3)
+        ):
             opened = consecutive >= 2
             circuit_state = {
                 "key": circuit_key,
                 "state": "open" if opened else "closed",
                 "consecutive_failures": consecutive,
-                "probe_executed": False,
+                "probe_executed": bool(
+                    isinstance(previous, dict)
+                    and previous.get("probe_executed")
+                ),
             }
             circuits[circuit_key] = circuit_state
             state.update(
@@ -662,6 +669,58 @@ class Kernel:
         }
         self._write_state(state["repository"], state["plan_digest"], state)
         return self._outcome(state)
+
+    def _prepare_runtime_operation(
+        self,
+        state: dict[str, Any],
+        operation: str,
+    ) -> ReconcileOutcome | None:
+        prefix = f"{self.runtime.adapter_name}:{operation}:"
+        circuits = state.setdefault("runtime_circuits", {})
+        for key, circuit in tuple(circuits.items()):
+            if (
+                not key.startswith(prefix)
+                or not isinstance(circuit, dict)
+                or circuit.get("state") != "open"
+            ):
+                continue
+            if circuit.get("probe_executed"):
+                return self._materialization_failure(
+                    state,
+                    RuntimeAdapterError(
+                        "RUNTIME_CIRCUIT_PROBE_EXHAUSTED",
+                        f"the single {operation} circuit probe was already used",
+                    ),
+                    operation=operation,
+                )
+            updated = {
+                **circuit,
+                "state": "half_open",
+                "probe_executed": True,
+            }
+            circuits[key] = updated
+            state["runtime_circuit"] = key
+            state["runtime_circuit_state"] = updated
+            self._write_state(
+                state["repository"],
+                state["plan_digest"],
+                state,
+            )
+        return None
+
+    def _clear_runtime_operation(
+        self,
+        state: dict[str, Any],
+        operation: str,
+    ) -> None:
+        prefix = f"{self.runtime.adapter_name}:{operation}:"
+        circuits = state.setdefault("runtime_circuits", {})
+        for key in tuple(circuits):
+            if key.startswith(prefix):
+                del circuits[key]
+        if str(state.get("runtime_circuit") or "").startswith(prefix):
+            state["runtime_circuit"] = None
+            state["runtime_circuit_state"] = None
 
     def _initial_state(
         self,
@@ -770,6 +829,12 @@ class Kernel:
             runtime_profile=self.runtime_profile,
             parent_agent_id=self.parent_agent_id,
         )
+        circuit_outcome = self._prepare_runtime_operation(
+            state,
+            "read_binding",
+        )
+        if circuit_outcome is not None:
+            return None, circuit_outcome
         try:
             binding = self.runtime.read_binding(admission, prompt)
         except RuntimeAdapterError as error:
@@ -778,6 +843,7 @@ class Kernel:
                 error,
                 operation="read_binding",
             )
+        self._clear_runtime_operation(state, "read_binding")
 
         if binding is None:
             if state["admission_state"] == "materialization_ambiguous":
@@ -813,26 +879,12 @@ class Kernel:
                     blocked,
                     operation="create",
                 )
-            circuit_key = f"{self.runtime.adapter_name}:create:transient"
-            circuit = state.get("runtime_circuits", {}).get(circuit_key)
-            if isinstance(circuit, dict) and circuit.get("state") == "open":
-                if circuit.get("probe_executed"):
-                    blocked = RuntimeAdapterError(
-                        "RUNTIME_CIRCUIT_PROBE_EXHAUSTED",
-                        "the single Runtime circuit probe was already used",
-                    )
-                    return None, self._materialization_failure(
-                        state,
-                        blocked,
-                        operation="create",
-                    )
-                updated_circuit = {
-                    **circuit,
-                    "state": "half_open",
-                    "probe_executed": True,
-                }
-                state["runtime_circuits"][circuit_key] = updated_circuit
-                state["runtime_circuit_state"] = updated_circuit
+            circuit_outcome = self._prepare_runtime_operation(
+                state,
+                "create",
+            )
+            if circuit_outcome is not None:
+                return None, circuit_outcome
             actions["create"] = int(actions.get("create", 0)) + 1
             state["materialization_executions"] = sum(
                 int(value) for value in actions.values()
@@ -851,6 +903,7 @@ class Kernel:
             self._write_state(state["repository"], state["plan_digest"], state)
             try:
                 self.runtime.materialize(admission, prompt)
+                self._clear_runtime_operation(state, "create")
                 binding = self.runtime.read_binding(admission, prompt)
             except RuntimeAdapterError as error:
                 return None, self._materialization_failure(
@@ -899,6 +952,12 @@ class Kernel:
                     blocked,
                     operation="prompt",
                 )
+            circuit_outcome = self._prepare_runtime_operation(
+                state,
+                "prompt",
+            )
+            if circuit_outcome is not None:
+                return None, circuit_outcome
             actions["prompt"] = int(actions.get("prompt", 0)) + 1
             state["materialization_executions"] = sum(
                 int(value) for value in actions.values()
@@ -906,6 +965,7 @@ class Kernel:
             self._write_state(state["repository"], state["plan_digest"], state)
             try:
                 self.runtime.accept_prompt(binding, prompt)
+                self._clear_runtime_operation(state, "prompt")
                 binding = self.runtime.read_binding(admission, prompt)
             except RuntimeAdapterError as error:
                 return None, self._materialization_failure(
