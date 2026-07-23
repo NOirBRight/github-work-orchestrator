@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 from typing import Any, Callable, Protocol
 
-from ._canonical import canonical_bytes, digest_value
+from ._canonical import canonical_bytes, digest_bytes, digest_value
 from .compiler import CompiledPlan
 
 
@@ -116,6 +116,31 @@ class DurablePlanControl(Protocol):
     def read_current_activation(
         self, repository: str
     ) -> ActivationReceipt | None: ...
+
+
+class WriterAuthorityControl(Protocol):
+    """Optional second fence required by every privileged V8 mutation."""
+
+    def allows(
+        self,
+        repository: str,
+        writer_generation: str,
+        activation_id: str,
+    ) -> bool: ...
+
+    def capacity_limits(
+        self,
+        repository: str,
+        writer_generation: str,
+        activation_id: str,
+    ) -> tuple[int, int]: ...
+
+    def allows_new_work(
+        self,
+        repository: str,
+        writer_generation: str,
+        activation_id: str,
+    ) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -602,10 +627,12 @@ class LocalPlanPublication:
         store_path: Path,
         *,
         durable: DurablePlanControl | None = None,
+        writer_authority: WriterAuthorityControl | None = None,
         checkpoint: Callable[[str], None] | None = None,
     ):
         self.store_path = Path(store_path)
         self.durable = durable or InMemoryDurablePlanControl()
+        self.writer_authority = writer_authority
         self._checkpoint = checkpoint or (lambda _name: None)
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
@@ -636,6 +663,12 @@ class LocalPlanPublication:
                 CREATE TABLE IF NOT EXISTS v8_writer_generations (
                     repository TEXT PRIMARY KEY,
                     writer_generation TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS v8_writer_fences (
+                    repository TEXT PRIMARY KEY,
+                    writer_generation TEXT NOT NULL,
+                    activation_id TEXT NOT NULL,
+                    state TEXT NOT NULL
                 );
                 """
             )
@@ -1037,6 +1070,214 @@ class LocalPlanPublication:
         )
         return published
 
+    def reconstruct_active_from_readback(
+        self,
+        record: DurablePlanRecord,
+        receipt: ActivationReceipt,
+        *,
+        populate: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> PublishedPlan:
+        """Restore one fresh local generation from exact durable readback."""
+        if (
+            record.repository != receipt.repository
+            or record.plan_digest != receipt.plan_digest
+            or record.record_ref != receipt.plan_record_ref
+            or digest_bytes(record.canonical_bytes) != record.plan_digest
+        ):
+            raise ActivationError(
+                "RECONSTRUCTION_PLAN_IDENTITY_MISMATCH",
+                "durable Plan and Activation identities do not agree",
+            )
+        if (
+            self.durable.read_plan(record.repository, record.plan_digest) != record
+            or self.durable.read_activation(
+                receipt.repository,
+                receipt.activation_id,
+            )
+            != receipt
+            or self.durable.read_current_activation(receipt.repository) != receipt
+        ):
+            raise ActivationError(
+                "RECONSTRUCTION_DURABLE_READBACK_MISMATCH",
+                "durable Plan or Activation Receipt is not authoritative",
+            )
+        compilation_record = json.dumps(
+            record.compilation_record,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT 1 FROM v8_active_plans WHERE repository = ?
+                UNION ALL
+                SELECT 1 FROM v8_pending_activations WHERE repository = ?
+                LIMIT 1
+                """,
+                (record.repository, record.repository),
+            ).fetchone()
+            if existing is not None:
+                raise ActivationError(
+                    "RECONSTRUCTION_STORE_NOT_FRESH",
+                    "Store generation already has activation state",
+                )
+            if populate is not None:
+                populate(connection)
+            connection.execute(
+                """
+                INSERT INTO v8_plan_revisions (
+                    repository,
+                    plan_digest,
+                    canonical_bytes,
+                    compilation_record,
+                    writer_generation
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    record.repository,
+                    record.plan_digest,
+                    record.canonical_bytes,
+                    compilation_record,
+                    receipt.writer_generation,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO v8_writer_generations (
+                    repository,
+                    writer_generation
+                ) VALUES (?, ?)
+                """,
+                (record.repository, receipt.writer_generation),
+            )
+            connection.execute(
+                """
+                INSERT INTO v8_active_plans (
+                    repository,
+                    plan_digest,
+                    writer_generation,
+                    activation_id
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    record.repository,
+                    record.plan_digest,
+                    receipt.writer_generation,
+                    receipt.activation_id,
+                ),
+            )
+        active = self.read_active(record.repository)
+        if active is None:
+            raise ActivationError(
+                "RECONSTRUCTION_READBACK_MISSING",
+                "reconstructed active Plan did not read back",
+            )
+        return active
+
+    def finalize_pending_from_readback(
+        self,
+        record: DurablePlanRecord,
+        receipt: ActivationReceipt,
+    ) -> PublishedPlan:
+        """Roll forward a receipt-backed local reservation before compensation."""
+        if (
+            record.repository != receipt.repository
+            or record.plan_digest != receipt.plan_digest
+            or digest_bytes(record.canonical_bytes) != record.plan_digest
+            or self.durable.read_plan(record.repository, record.plan_digest)
+            != record
+            or self.durable.read_activation(
+                receipt.repository,
+                receipt.activation_id,
+            )
+            != receipt
+            or self.durable.read_current_activation(receipt.repository)
+            != receipt
+        ):
+            raise ActivationError(
+                "PENDING_FINALIZE_READBACK_MISMATCH",
+                "pending finalization requires exact durable Plan and Receipt",
+            )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT plan_digest, writer_generation, activation_id
+                FROM v8_active_plans WHERE repository = ?
+                """,
+                (record.repository,),
+            ).fetchone()
+            if active is not None:
+                if (
+                    active["plan_digest"] != record.plan_digest
+                    or active["writer_generation"] != receipt.writer_generation
+                    or active["activation_id"] != receipt.activation_id
+                ):
+                    raise ActivationError(
+                        "PENDING_FINALIZE_ACTIVE_CONFLICT",
+                        "local active Activation differs from durable Receipt",
+                    )
+            else:
+                pending = connection.execute(
+                    """
+                    SELECT plan_digest, writer_generation, activation_id
+                    FROM v8_pending_activations WHERE repository = ?
+                    """,
+                    (record.repository,),
+                ).fetchone()
+                revision = connection.execute(
+                    """
+                    SELECT canonical_bytes, writer_generation
+                    FROM v8_plan_revisions
+                    WHERE repository = ? AND plan_digest = ?
+                    """,
+                    (record.repository, record.plan_digest),
+                ).fetchone()
+                if (
+                    pending is None
+                    or pending["plan_digest"] != record.plan_digest
+                    or pending["writer_generation"] != receipt.writer_generation
+                    or pending["activation_id"] != receipt.activation_id
+                    or revision is None
+                    or bytes(revision["canonical_bytes"])
+                    != record.canonical_bytes
+                    or revision["writer_generation"]
+                    != receipt.writer_generation
+                ):
+                    raise ActivationError(
+                        "PENDING_FINALIZE_LOCAL_MISMATCH",
+                        "local reservation differs from durable Receipt",
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO v8_active_plans (
+                        repository, plan_digest, writer_generation, activation_id
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        record.repository,
+                        record.plan_digest,
+                        receipt.writer_generation,
+                        receipt.activation_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM v8_pending_activations
+                    WHERE repository = ? AND activation_id = ?
+                    """,
+                    (record.repository, receipt.activation_id),
+                )
+        active_plan = self.read_active(record.repository)
+        if active_plan is None:
+            raise ActivationError(
+                "PENDING_FINALIZE_READBACK_MISSING",
+                "rolled-forward local Activation did not read back",
+            )
+        return active_plan
+
     def assert_writer(
         self,
         repository: str,
@@ -1051,8 +1292,191 @@ class LocalPlanPublication:
             or durable.writer_generation != writer_generation
             or durable.plan_digest != plan_digest
             or durable.activation_id != activation_id
+            or (
+                self.writer_authority is not None
+                and not self.writer_authority.allows(
+                    repository,
+                    writer_generation,
+                    activation_id,
+                )
+            )
         ):
             raise ActivationError(
                 "WRITER_GENERATION_FENCED",
                 "durable control no longer authorizes this writer and Plan",
             )
+
+    def assert_new_work(
+        self,
+        repository: str,
+        *,
+        writer_generation: str,
+        activation_id: str,
+    ) -> None:
+        durable = self.durable.read_current_activation(repository)
+        if durable is None:
+            raise ActivationError(
+                "WRITER_NEW_WORK_FENCED",
+                "writer has no durable current Activation",
+            )
+        self.assert_writer(
+            repository,
+            writer_generation=writer_generation,
+            plan_digest=durable.plan_digest,
+            activation_id=activation_id,
+        )
+        if (
+            self.writer_authority is not None
+            and not self.writer_authority.allows_new_work(
+                repository,
+                writer_generation,
+                activation_id,
+            )
+        ):
+            raise ActivationError(
+                "WRITER_NEW_WORK_FENCED",
+                "writer is draining and cannot begin new privileged work",
+            )
+
+    def begin_writer_drain(
+        self,
+        repository: str,
+        *,
+        writer_generation: str,
+        activation_id: str,
+    ) -> None:
+        """Atomically fence new local privileged transactions before rollback."""
+        durable = self.durable.read_current_activation(repository)
+        if (
+            durable is None
+            or durable.writer_generation != writer_generation
+            or durable.activation_id != activation_id
+            or (
+                self.writer_authority is not None
+                and not self.writer_authority.allows(
+                    repository,
+                    writer_generation,
+                    activation_id,
+                )
+            )
+        ):
+            raise ActivationError(
+                "WRITER_DRAIN_IDENTITY_MISMATCH",
+                "only the currently authorized writer can begin draining",
+            )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT writer_generation, activation_id
+                FROM v8_active_plans WHERE repository = ?
+                """,
+                (repository,),
+            ).fetchone()
+            existing = connection.execute(
+                """
+                SELECT writer_generation, activation_id, state
+                FROM v8_writer_fences WHERE repository = ?
+                """,
+                (repository,),
+            ).fetchone()
+            if (
+                active is None
+                or active["writer_generation"] != writer_generation
+                or active["activation_id"] != activation_id
+            ):
+                raise ActivationError(
+                    "WRITER_DRAIN_LOCAL_IDENTITY_MISMATCH",
+                    "local active writer changed before drain fencing",
+                )
+            if existing is not None and (
+                existing["writer_generation"] != writer_generation
+                or existing["activation_id"] != activation_id
+                or existing["state"] != "draining"
+            ):
+                raise ActivationError(
+                    "WRITER_DRAIN_CONFLICT",
+                    "another local writer fence already exists",
+                )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO v8_writer_fences (
+                    repository, writer_generation, activation_id, state
+                ) VALUES (?, ?, ?, 'draining')
+                """,
+                (repository, writer_generation, activation_id),
+            )
+
+    def abandon_pending_activation(
+        self,
+        repository: str,
+        *,
+        writer_generation: str,
+        plan_digest: str,
+    ) -> None:
+        """Discard a locally reserved Activation after durable rollback fencing."""
+        if self.writer_authority is not None:
+            current = self.writer_authority.capacity_limits(
+                repository,
+                writer_generation,
+                "",
+            )
+            if current != (0, 0):
+                raise ActivationError(
+                    "PENDING_ABANDON_NOT_FENCED",
+                    "pending Activation can be abandoned only after capacity is zero",
+                )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                "SELECT 1 FROM v8_active_plans WHERE repository = ?",
+                (repository,),
+            ).fetchone()
+            pending = connection.execute(
+                """
+                SELECT writer_generation, plan_digest
+                FROM v8_pending_activations WHERE repository = ?
+                """,
+                (repository,),
+            ).fetchone()
+            if active is not None:
+                raise ActivationError(
+                    "PENDING_ABANDON_ACTIVE_CONFLICT",
+                    "an active Activation cannot be abandoned as pending",
+                )
+            if pending is None:
+                return
+            if (
+                pending["writer_generation"] != writer_generation
+                or pending["plan_digest"] != plan_digest
+            ):
+                raise ActivationError(
+                    "PENDING_ABANDON_IDENTITY_MISMATCH",
+                    "pending Activation identity changed before rollback",
+                )
+            connection.execute(
+                "DELETE FROM v8_pending_activations WHERE repository = ?",
+                (repository,),
+            )
+            connection.execute(
+                """
+                DELETE FROM v8_writer_generations
+                WHERE repository = ? AND writer_generation = ?
+                """,
+                (repository, writer_generation),
+            )
+
+    def capacity_limits(
+        self,
+        repository: str,
+        *,
+        writer_generation: str,
+        activation_id: str,
+    ) -> tuple[int, int] | None:
+        if self.writer_authority is None:
+            return None
+        return self.writer_authority.capacity_limits(
+            repository,
+            writer_generation,
+            activation_id,
+        )

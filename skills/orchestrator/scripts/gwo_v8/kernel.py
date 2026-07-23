@@ -743,6 +743,20 @@ class ReconcileOutcome:
     completed_work_item_keys: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class KernelPreviewAction:
+    kind: str
+    node_key: str | None
+    source_ref: str
+
+
+@dataclass(frozen=True)
+class KernelReconciliationPlan:
+    plan_digest: str
+    actions: tuple[KernelPreviewAction, ...]
+    admissible_node_keys: tuple[str, ...]
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -796,106 +810,214 @@ class Kernel:
         self.parent_agent_id = parent_agent_id
         self.skill_catalog = skill_catalog
         with self._connect() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS v8_execution_state (
-                    repository TEXT NOT NULL,
-                    plan_digest TEXT NOT NULL,
-                    state_json TEXT NOT NULL,
-                    PRIMARY KEY (repository, plan_digest)
-                );
-                CREATE TABLE IF NOT EXISTS v8_node_execution_state (
-                    repository TEXT NOT NULL,
-                    plan_digest TEXT NOT NULL,
-                    node_key TEXT NOT NULL,
-                    state_json TEXT NOT NULL,
-                    PRIMARY KEY (repository, plan_digest, node_key)
-                );
-                CREATE TABLE IF NOT EXISTS v8_integration_leases (
-                    repository TEXT PRIMARY KEY,
-                    holder TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS v8_admissions (
-                    admission_id TEXT PRIMARY KEY,
-                    repository TEXT NOT NULL,
-                    plan_digest TEXT NOT NULL,
-                    node_key TEXT NOT NULL,
-                    goal_key TEXT NOT NULL,
-                    state TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS v8_attempts (
-                    attempt_id TEXT PRIMARY KEY,
-                    repository TEXT NOT NULL,
-                    plan_digest TEXT NOT NULL,
-                    node_key TEXT NOT NULL,
-                    admission_id TEXT NOT NULL,
-                    state TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS v8_resource_claims (
-                    repository TEXT NOT NULL,
-                    resource_key TEXT NOT NULL,
-                    admission_id TEXT,
-                    attempt_id TEXT,
-                    PRIMARY KEY (repository, resource_key)
-                );
-                CREATE TABLE IF NOT EXISTS v8_goal_holds (
-                    repository TEXT NOT NULL,
-                    goal_key TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    PRIMARY KEY (repository, goal_key)
-                );
-                CREATE TABLE IF NOT EXISTS v8_node_states (
-                    repository TEXT NOT NULL,
-                    plan_digest TEXT NOT NULL,
-                    node_key TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    PRIMARY KEY (repository, plan_digest, node_key)
-                );
-                CREATE TABLE IF NOT EXISTS v8_verified_results (
-                    repository TEXT NOT NULL,
-                    plan_digest TEXT NOT NULL,
-                    node_key TEXT NOT NULL,
-                    contract_digest TEXT NOT NULL,
-                    candidate_sha TEXT NOT NULL,
-                    result_digest TEXT NOT NULL,
-                    base_sha TEXT NOT NULL,
-                    evidence_manifest_digest TEXT,
-                    evidence_json TEXT,
-                    superseded INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (
-                        repository,
-                        plan_digest,
-                        node_key,
-                        candidate_sha
-                    )
-                );
-                """
-            )
-            result_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(v8_verified_results)"
-                ).fetchall()
-            }
-            if "evidence_manifest_digest" not in result_columns:
-                connection.execute(
-                    """
-                    ALTER TABLE v8_verified_results
-                    ADD COLUMN evidence_manifest_digest TEXT
-                    """
-                )
-            if "evidence_json" not in result_columns:
-                connection.execute(
-                    """
-                    ALTER TABLE v8_verified_results
-                    ADD COLUMN evidence_json TEXT
-                    """
-                )
+            self.ensure_store_schema(connection)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.store_path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @staticmethod
+    def ensure_store_schema(connection: sqlite3.Connection) -> None:
+        """Create the one native Store schema used by live and reconstructed Kernel."""
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS v8_execution_state (
+                repository TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                PRIMARY KEY (repository, plan_digest)
+            );
+            CREATE TABLE IF NOT EXISTS v8_node_execution_state (
+                repository TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                node_key TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                PRIMARY KEY (repository, plan_digest, node_key)
+            );
+            CREATE TABLE IF NOT EXISTS v8_integration_leases (
+                repository TEXT PRIMARY KEY,
+                holder TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS v8_admissions (
+                admission_id TEXT PRIMARY KEY,
+                repository TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                node_key TEXT NOT NULL,
+                goal_key TEXT NOT NULL,
+                state TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS v8_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                repository TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                node_key TEXT NOT NULL,
+                admission_id TEXT NOT NULL,
+                state TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS v8_resource_claims (
+                repository TEXT NOT NULL,
+                resource_key TEXT NOT NULL,
+                admission_id TEXT,
+                attempt_id TEXT,
+                PRIMARY KEY (repository, resource_key)
+            );
+            CREATE TABLE IF NOT EXISTS v8_goal_holds (
+                repository TEXT NOT NULL,
+                goal_key TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                PRIMARY KEY (repository, goal_key)
+            );
+            CREATE TABLE IF NOT EXISTS v8_node_states (
+                repository TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                node_key TEXT NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (repository, plan_digest, node_key)
+            );
+            CREATE TABLE IF NOT EXISTS v8_verified_results (
+                repository TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                node_key TEXT NOT NULL,
+                contract_digest TEXT NOT NULL,
+                candidate_sha TEXT NOT NULL,
+                result_digest TEXT NOT NULL,
+                base_sha TEXT NOT NULL,
+                evidence_manifest_digest TEXT,
+                evidence_json TEXT,
+                superseded INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (
+                    repository,
+                    plan_digest,
+                    node_key,
+                    candidate_sha
+                )
+            );
+            """
+        )
+        result_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(v8_verified_results)"
+            ).fetchall()
+        }
+        if "evidence_manifest_digest" not in result_columns:
+            connection.execute(
+                """
+                ALTER TABLE v8_verified_results
+                ADD COLUMN evidence_manifest_digest TEXT
+                """
+            )
+        if "evidence_json" not in result_columns:
+            connection.execute(
+                """
+                ALTER TABLE v8_verified_results
+                ADD COLUMN evidence_json TEXT
+                """
+            )
+
+    @classmethod
+    def drain_store_ownership(
+        cls,
+        store_path: Path,
+        *,
+        repository: str,
+        source_ref: str,
+    ) -> None:
+        """Supersede active native execution through one Kernel-owned transaction."""
+        if not source_ref:
+            raise KernelError(
+                "DRAIN_SOURCE_MISSING",
+                "writer drain requires a durable transition source",
+            )
+        connection = sqlite3.connect(Path(store_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cls.ensure_store_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT plan_digest, node_key, state_json
+                FROM v8_node_execution_state
+                WHERE repository = ?
+                """,
+                (repository,),
+            ).fetchall()
+            for row in rows:
+                state = json.loads(row["state_json"])
+                if state.get("status") in {
+                    "complete",
+                    "failed",
+                    "superseded",
+                }:
+                    continue
+                state.update(
+                    {
+                        "status": "superseded",
+                        "directive": "invoke_coordinator",
+                        "supersession_source_ref": source_ref,
+                        "wait_condition": None,
+                        "wait_source_ref": None,
+                        "wait_event_identity": None,
+                        "next_check_at": None,
+                    }
+                )
+                if state.get("attempt_id"):
+                    state["attempt_state"] = "superseded"
+                    state["attempt_terminal_reason"] = "superseded"
+                elif state.get("admission_id"):
+                    state["admission_state"] = "abandoned"
+                cls._upsert_state(
+                    connection,
+                    repository=repository,
+                    plan_digest=str(row["plan_digest"]),
+                    rendered=cls._render_state(state),
+                )
+                connection.execute(
+                    """
+                    UPDATE v8_node_states SET state = 'superseded'
+                    WHERE repository = ? AND plan_digest = ? AND node_key = ?
+                    """,
+                    (
+                        repository,
+                        row["plan_digest"],
+                        row["node_key"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE v8_verified_results SET superseded = 1
+                    WHERE repository = ? AND plan_digest = ? AND node_key = ?
+                    """,
+                    (
+                        repository,
+                        row["plan_digest"],
+                        row["node_key"],
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE v8_attempts SET state = 'terminal'
+                WHERE repository = ?
+                  AND state NOT IN ('verified', 'terminal')
+                """,
+                (repository,),
+            )
+            connection.execute(
+                """
+                UPDATE v8_admissions SET state = 'abandoned'
+                WHERE repository = ?
+                  AND state NOT IN ('consumed', 'abandoned')
+                """,
+                (repository,),
+            )
+            connection.execute(
+                "DELETE FROM v8_resource_claims WHERE repository = ?",
+                (repository,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
     def _read_states(
         self,
@@ -1250,6 +1372,11 @@ class Kernel:
         dependency_keys: tuple[str, ...] = (),
         worker_turn_capacity: int = 1,
     ) -> None:
+        self.publication.assert_new_work(
+            state["repository"],
+            writer_generation=self.writer_generation,
+            activation_id=activation_id,
+        )
         claims = work_node.get("resource_claims") or []
         if not isinstance(claims, list) or any(
             not isinstance(claim, str) or not claim for claim in claims
@@ -1276,6 +1403,18 @@ class Kernel:
                 """,
                 (state["repository"],),
             ).fetchone()
+            fence = connection.execute(
+                """
+                SELECT state FROM v8_writer_fences
+                WHERE repository = ? AND writer_generation = ?
+                  AND activation_id = ?
+                """,
+                (
+                    state["repository"],
+                    self.writer_generation,
+                    activation_id,
+                ),
+            ).fetchone()
             hold = connection.execute(
                 """
                 SELECT reason
@@ -1290,6 +1429,7 @@ class Kernel:
                 or active["writer_generation"] != self.writer_generation
                 or active["activation_id"] != activation_id
                 or pending is not None
+                or (fence is not None and fence["state"] == "draining")
             ):
                 raise KernelError(
                     "ADMISSION_PLAN_FENCED",
@@ -1476,6 +1616,11 @@ class Kernel:
         *,
         attempt_id: str,
     ) -> None:
+        self.publication.assert_new_work(
+            state["repository"],
+            writer_generation=self.writer_generation,
+            activation_id=state["activation_id"],
+        )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             active = connection.execute(
@@ -1491,6 +1636,18 @@ class Kernel:
                 SELECT 1 FROM v8_pending_activations WHERE repository = ?
                 """,
                 (state["repository"],),
+            ).fetchone()
+            fence = connection.execute(
+                """
+                SELECT state FROM v8_writer_fences
+                WHERE repository = ? AND writer_generation = ?
+                  AND activation_id = ?
+                """,
+                (
+                    state["repository"],
+                    self.writer_generation,
+                    state["activation_id"],
+                ),
             ).fetchone()
             admission = connection.execute(
                 """
@@ -1509,6 +1666,7 @@ class Kernel:
                 or active["writer_generation"] != self.writer_generation
                 or active["activation_id"] != state["activation_id"]
                 or pending is not None
+                or (fence is not None and fence["state"] == "draining")
             ):
                 raise KernelError(
                     "ATTEMPT_PLAN_FENCED",
@@ -1602,9 +1760,40 @@ class Kernel:
                 rendered=self._render_state(state),
             )
 
-    def _acquire_integration_lease(self, repository: str, holder: str) -> None:
+    def _acquire_integration_lease(
+        self,
+        repository: str,
+        holder: str,
+        *,
+        activation_id: str,
+    ) -> None:
         try:
             with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                active = connection.execute(
+                    """
+                    SELECT writer_generation, activation_id
+                    FROM v8_active_plans WHERE repository = ?
+                    """,
+                    (repository,),
+                ).fetchone()
+                fence = connection.execute(
+                    """
+                    SELECT writer_generation, activation_id, state
+                    FROM v8_writer_fences WHERE repository = ?
+                    """,
+                    (repository,),
+                ).fetchone()
+                if (
+                    active is None
+                    or active["writer_generation"] != self.writer_generation
+                    or active["activation_id"] != activation_id
+                    or fence is not None
+                ):
+                    raise KernelError(
+                        "WRITER_NEW_WORK_FENCED",
+                        "integration lease acquisition crossed a writer drain",
+                    )
                 connection.execute(
                     """
                     INSERT INTO v8_integration_leases (repository, holder)
@@ -1876,38 +2065,53 @@ class Kernel:
         *,
         worker_turn_capacity: int,
     ) -> None:
-        for node_key in sorted(states):
-            state = states[node_key]
+        projected = self._project_reacquired_worker_turns(
+            states,
+            worker_turn_capacity=worker_turn_capacity,
+        )
+        for node_key, state in projected.items():
+            if state == states[node_key]:
+                continue
+            self._write_state(
+                state["repository"],
+                state["plan_digest"],
+                state,
+            )
+        states.clear()
+        states.update(projected)
+
+    @classmethod
+    def _project_reacquired_worker_turns(
+        cls,
+        states: dict[str, dict[str, Any]],
+        *,
+        worker_turn_capacity: int,
+    ) -> dict[str, dict[str, Any]]:
+        projected = {
+            node_key: dict(state) for node_key, state in states.items()
+        }
+        for node_key in sorted(projected):
+            state = projected[node_key]
             if state.get("wait_condition") != "worker_capacity":
                 continue
-            with self._connect() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                if (
-                    self._other_active_worker_turns(
-                        connection,
-                        repository=state["repository"],
-                        plan_digest=state["plan_digest"],
-                        node_key=node_key,
-                    )
-                    >= worker_turn_capacity
-                ):
-                    continue
-                state.update(
-                    {
-                        "status": "rejected",
-                        "directive": "invoke_coordinator",
-                        "wait_condition": None,
-                        "wait_source_ref": None,
-                        "wait_event_identity": None,
-                        "next_check_at": None,
-                    }
-                )
-                self._upsert_state(
-                    connection,
-                    repository=state["repository"],
-                    plan_digest=state["plan_digest"],
-                    rendered=self._render_state(state),
-                )
+            other_turns = sum(
+                cls._state_holds_worker_turn(other)
+                for other_key, other in projected.items()
+                if other_key != node_key
+            )
+            if other_turns >= worker_turn_capacity:
+                continue
+            state.update(
+                {
+                    "status": "rejected",
+                    "directive": "invoke_coordinator",
+                    "wait_condition": None,
+                    "wait_source_ref": None,
+                    "wait_event_identity": None,
+                    "next_check_at": None,
+                }
+            )
+        return projected
 
     def _turn_capacities(self, repository: str) -> tuple[int, int]:
         try:
@@ -1918,6 +2122,21 @@ class Kernel:
         except RuntimeAdapterError as error:
             raise KernelError(error.code, error.detail) from error
         workers = pools.workers
+        coordinators = pools.coordinators
+        active = self.publication.read_active(repository)
+        if active is None:
+            raise KernelError(
+                "PLAN_NOT_ACTIVE",
+                "repository has no active Plan Revision",
+            )
+        authority_limits = self.publication.capacity_limits(
+            repository,
+            writer_generation=self.writer_generation,
+            activation_id=active.activation_id,
+        )
+        if authority_limits is not None:
+            workers = min(workers, authority_limits[0])
+            coordinators = min(coordinators, authority_limits[1])
         observed = getattr(
             type(self.runtime),
             "observed_worker_turn_capacity",
@@ -1936,7 +2155,7 @@ class Kernel:
                         "Runtime Worker capacity observation is invalid",
                     )
                 workers = min(workers, runtime_capacity)
-        return workers, pools.coordinators
+        return workers, coordinators
 
     def _materialize_admitted_frontier(
         self,
@@ -2650,6 +2869,180 @@ class Kernel:
             units.append((work_node, integration, goal, work_item))
         return tuple(units)
 
+    def plan_reconciliation(
+        self,
+        repository: str,
+    ) -> KernelReconciliationPlan:
+        """Plan the same Admission frontier consumed by ``reconcile_once``."""
+        active = self.publication.read_active(repository)
+        if active is None:
+            raise KernelError(
+                "PLAN_NOT_ACTIVE",
+                "repository has no active Plan Revision",
+            )
+        if active.writer_generation != self.writer_generation:
+            raise KernelError(
+                "WRITER_GENERATION_MISMATCH",
+                "Kernel does not own the active writer generation",
+            )
+        plan = self._validate_plan(repository, active.canonical_bytes)
+        units = self._work_units(plan)
+        worker_capacity, _coordinator_capacity = self._turn_capacities(repository)
+        existing = {
+            str(state["node_key"]): state
+            for state in self._read_states(repository, active.plan_digest)
+            if isinstance(state.get("node_key"), str)
+        }
+        existing = self._project_reacquired_worker_turns(
+            existing,
+            worker_turn_capacity=worker_capacity,
+        )
+        active_turns = sum(
+            self._state_holds_worker_turn(state)
+            for state in existing.values()
+        )
+        with self._connect() as connection:
+            holds = {
+                str(row["goal_key"])
+                for row in connection.execute(
+                    """
+                    SELECT goal_key FROM v8_goal_holds WHERE repository = ?
+                    """,
+                    (repository,),
+                ).fetchall()
+            }
+            node_states = {
+                str(row["node_key"]): str(row["state"])
+                for row in connection.execute(
+                    """
+                    SELECT node_key, state FROM v8_node_states
+                    WHERE repository = ? AND plan_digest = ?
+                    """,
+                    (repository, active.plan_digest),
+                ).fetchall()
+            }
+            occupied_claims = {
+                str(row["resource_key"])
+                for row in connection.execute(
+                    """
+                    SELECT resource_key FROM v8_resource_claims
+                    WHERE repository = ?
+                    """,
+                    (repository,),
+                ).fetchall()
+            }
+            open_nodes = {
+                str(row["node_key"])
+                for row in connection.execute(
+                    """
+                    SELECT node_key FROM v8_admissions
+                    WHERE repository = ?
+                      AND state NOT IN ('consumed', 'abandoned')
+                    UNION
+                    SELECT node_key FROM v8_attempts
+                    WHERE repository = ?
+                      AND state NOT IN ('verified', 'terminal')
+                    """,
+                    (repository, repository),
+                ).fetchall()
+            }
+        dependencies = {
+            str(node["node_key"]): tuple(
+                str(edge["from_node"])
+                for edge in plan.get("edges") or ()
+                if isinstance(edge, dict)
+                and edge.get("to_node") == node["node_key"]
+                and isinstance(edge.get("from_node"), str)
+            )
+            for node, _integration, _goal, _work_item in units
+        }
+        actions: list[KernelPreviewAction] = []
+        admissible: list[str] = []
+        projected_claims = set(occupied_claims)
+        for work_node, _integration, goal, work_item in units:
+            node_key = str(work_node["node_key"])
+            state = existing.get(node_key)
+            if state is not None:
+                if state.get("status") == "complete":
+                    continue
+                wait_condition = state.get("wait_condition")
+                kind = {
+                    "hosted_ci": "would_wait_for_hosted_ci",
+                    "integration_refresh": "would_request_integration_refresh",
+                }.get(
+                    str(wait_condition),
+                    "would_wait" if wait_condition else "would_reconcile",
+                )
+                actions.append(
+                    KernelPreviewAction(
+                        kind=kind,
+                        node_key=node_key,
+                        source_ref=str(
+                            state.get("wait_source_ref")
+                            or f"store://state/{node_key}"
+                        ),
+                    )
+                )
+                continue
+            blockers: list[str] = []
+            if active_turns >= worker_capacity:
+                blockers.append("worker_capacity")
+            if str(goal["goal_key"]) in holds:
+                blockers.append("goal_hold")
+            if node_key in open_nodes:
+                blockers.append("existing_execution")
+            if any(
+                node_states.get(key)
+                not in {"verified", "integrated", "complete"}
+                for key in dependencies[node_key]
+            ):
+                blockers.append("dependency")
+            claims = {
+                str(claim) for claim in work_node.get("resource_claims") or ()
+            }
+            if claims & projected_claims:
+                blockers.append("resource_claim")
+            if any(
+                prior.get("work_item_key") == work_item["work_item_key"]
+                and prior.get("status")
+                not in {"complete", "failed", "superseded"}
+                for prior in existing.values()
+            ):
+                blockers.append("replacement")
+            if blockers:
+                actions.append(
+                    KernelPreviewAction(
+                        kind="would_wait",
+                        node_key=node_key,
+                        source_ref=f"store://admission/{blockers[0]}",
+                    )
+                )
+                continue
+            admissible.append(node_key)
+            active_turns += 1
+            projected_claims.update(claims)
+            actions.append(
+                KernelPreviewAction(
+                    kind="would_admit",
+                    node_key=node_key,
+                    source_ref=f"plan://{node_key}",
+                )
+            )
+        return KernelReconciliationPlan(
+            plan_digest=active.plan_digest,
+            actions=tuple(
+                actions
+                or (
+                    KernelPreviewAction(
+                        kind="idle",
+                        node_key=None,
+                        source_ref="plan://idle",
+                    ),
+                )
+            ),
+            admissible_node_keys=tuple(admissible),
+        )
+
     def _adopt_or_materialize(
         self,
         state: dict[str, Any],
@@ -2888,7 +3281,6 @@ class Kernel:
         work_node: dict[str, Any],
         *,
         old_attempt_id: str,
-        terminal_reason: str,
     ) -> None:
         claims = sorted(set(work_node.get("resource_claims") or ()))
         with self._connect() as connection:
@@ -2914,7 +3306,7 @@ class Kernel:
                 UPDATE v8_attempts SET state = ?
                 WHERE attempt_id = ? AND state = 'running'
                 """,
-                (f"terminal:{terminal_reason}", old_attempt_id),
+                ("terminal", old_attempt_id),
             )
             connection.execute(
                 """
@@ -2985,8 +3377,6 @@ class Kernel:
     def _mark_plan_node_failed(
         self,
         state: dict[str, Any],
-        *,
-        terminal_reason: str,
     ) -> None:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2996,7 +3386,7 @@ class Kernel:
                 WHERE attempt_id = ? AND state = 'running'
                 """,
                 (
-                    f"terminal:{terminal_reason}",
+                    "terminal",
                     state["attempt_id"],
                 ),
             )
@@ -3252,7 +3642,6 @@ class Kernel:
                 state,
                 work_node,
                 old_attempt_id=old_attempt_id,
-                terminal_reason=terminal_reason,
             )
             self.runtime.retire(binding)
             return self._outcome(state)
@@ -3291,10 +3680,7 @@ class Kernel:
                 "next_check_at": None,
             }
         )
-        self._mark_plan_node_failed(
-            state,
-            terminal_reason=terminal_reason,
-        )
+        self._mark_plan_node_failed(state)
         self.runtime.retire(binding)
         return self._outcome(state)
 
@@ -4583,8 +4969,17 @@ class Kernel:
             return self._outcome(state)
         integration_budget[0] -= 1
         lease_holder = integration_node["node_key"]
+        self.publication.assert_new_work(
+            repository,
+            writer_generation=self.writer_generation,
+            activation_id=active.activation_id,
+        )
         try:
-            self._acquire_integration_lease(repository, lease_holder)
+            self._acquire_integration_lease(
+                repository,
+                lease_holder,
+                activation_id=active.activation_id,
+            )
         except KernelError as error:
             if error.code != "INTEGRATION_LEASE_UNAVAILABLE":
                 raise
@@ -4738,6 +5133,7 @@ class Kernel:
         return self._outcome(state)
 
     def reconcile_once(self, repository: str) -> ReconcileOutcome:
+        planned = self.plan_reconciliation(repository)
         active = self.publication.read_active(repository)
         if active is None:
             raise KernelError(
@@ -4765,6 +5161,12 @@ class Kernel:
             1 for state in existing.values() if self._state_holds_worker_turn(state)
         )
         available = max(0, worker_capacity - active_turns)
+        admissible = set(planned.admissible_node_keys)
+        planned_actions = {
+            action.node_key: action
+            for action in planned.actions
+            if action.node_key is not None
+        }
         admitted_node_keys: list[str] = []
         compatible_units = []
         held_error: KernelError | None = None
@@ -4779,7 +5181,16 @@ class Kernel:
             node_key = str(work_node["node_key"])
             state = existing.get(node_key)
             if state is None:
-                if available <= 0:
+                if node_key not in admissible or available <= 0:
+                    action = planned_actions.get(node_key)
+                    if (
+                        action is not None
+                        and action.source_ref == "store://admission/goal_hold"
+                    ):
+                        held_error = KernelError(
+                            "GOAL_ON_REPLAN_HOLD",
+                            "Goal has an active Replan Hold",
+                        )
                     continue
                 state = self._initial_state(
                     repository=repository,

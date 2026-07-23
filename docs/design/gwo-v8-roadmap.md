@@ -1,6 +1,8 @@
 # GWO V8 roadmap
 
-Status: accepted direction; implementation complete through Phase 4A.
+Status: accepted direction; code implementation complete through Phase 4C.
+The live canary and production writer transition remain an explicit operational
+release action and have not been executed by repository implementation work.
 
 This roadmap starts from the production reality: V6.1 is the current writer
 and V7 was never adopted. V8 does not complete or migrate V7. It introduces a
@@ -271,6 +273,14 @@ Exit criteria:
 ## Phase 4C — Canary, writer cutover, and rollback
 
 Scope:
+
+The repository implementation provides the canary Evidence verifier, durable
+GitHub writer-transition control, V6.1 fencing/readback seam, cutover protocol,
+canonical canary-manifest readback, capacity-zero pending/draining fences, and
+append-only rollback compensation. Invoking that protocol against a live
+repository still requires an explicitly selected canary repository and
+maintenance window; implementation alone does not authorize production
+cutover.
 
 - Use a dedicated lightweight GitHub canary repository whose hosted CI
   completes in roughly two minutes and whose three to five independent modules
