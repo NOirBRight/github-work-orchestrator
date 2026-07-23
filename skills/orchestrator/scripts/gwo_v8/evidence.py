@@ -3,23 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import hashlib
-import json
 import re
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any
+
+from ._canonical import digest_value
+
+if TYPE_CHECKING:
+    from .runtime import RuntimeObservation
 
 
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
-_TRUSTED_OBSERVERS = {"kernel", "runtime_adapter"}
-
-
-def _canonical_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -42,7 +35,7 @@ class TypedEvidence:
     content_digest: str
 
     @classmethod
-    def observe(
+    def _capture(
         cls,
         *,
         kind: str,
@@ -62,7 +55,7 @@ class TypedEvidence:
             "source_ref": source_ref,
             "payload": payload,
         }
-        return cls(**body, content_digest=hashlib.sha256(_canonical_bytes(body)).hexdigest())
+        return cls(**body, content_digest=digest_value(body))
 
     def has_valid_digest(self) -> bool:
         body = {
@@ -74,7 +67,7 @@ class TypedEvidence:
             "source_ref": self.source_ref,
             "payload": self.payload,
         }
-        return self.content_digest == hashlib.sha256(_canonical_bytes(body)).hexdigest()
+        return self.content_digest == digest_value(body)
 
 
 @dataclass(frozen=True)
@@ -100,7 +93,7 @@ class EvidenceVerifier:
         self,
         result_claim: ResultClaim,
         output_contract: dict[str, Any],
-        evidence_set: Iterable[TypedEvidence],
+        observation: RuntimeObservation | None,
     ) -> VerificationDecision:
         if not _SHA40.fullmatch(result_claim.candidate_sha):
             return VerificationDecision(
@@ -109,13 +102,39 @@ class EvidenceVerifier:
                 findings=("candidate SHA is invalid",),
             )
 
+        if observation is None:
+            evidence_set: tuple[TypedEvidence, ...] = ()
+            binding = None
+        else:
+            evidence_set = observation.evidence
+            binding = observation.binding
+            if observation.result_claim != result_claim:
+                return VerificationDecision(
+                    status="rejected",
+                    result=None,
+                    findings=("Runtime observation and Result Claim do not agree",),
+                )
+            if (
+                result_claim.attempt_id != binding.attempt_id
+                or result_claim.node_key != binding.node_key
+            ):
+                return VerificationDecision(
+                    status="rejected",
+                    result=None,
+                    findings=("Result Claim is not bound to the active Attempt",),
+                )
+
         valid: list[TypedEvidence] = []
         findings: list[str] = []
         for evidence in evidence_set:
             if not isinstance(evidence, TypedEvidence):
                 findings.append("Evidence envelope is invalid")
                 continue
-            if evidence.observer_type not in _TRUSTED_OBSERVERS:
+            if (
+                binding is None
+                or evidence.observer_type != "runtime_adapter"
+                or evidence.observer_id != binding.runtime_id
+            ):
                 findings.append(f"{evidence.kind} Evidence observer is not authoritative")
                 continue
             if not evidence.has_valid_digest():
@@ -176,7 +195,7 @@ class EvidenceVerifier:
         }
         result = VerifiedResult(
             **result_body,
-            result_digest=hashlib.sha256(_canonical_bytes(result_body)).hexdigest(),
+            result_digest=digest_value(result_body),
         )
         return VerificationDecision(
             status="accepted",

@@ -3,13 +3,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 from typing import Any
 
+from ._canonical import canonical_bytes, digest_bytes, digest_value
+from ._effects import EffectContractError, authorized_file_changes
+
 
 WORKFLOW_SKILLS = {"implement", "implement-gwo", "orchestrator"}
-PLAN_KINDS = {"work", "review", "decision", "integration"}
+PLAN_NODE_FIELDS = {
+    "goal_key",
+    "work_item_key",
+    "kind",
+    "inputs",
+    "output_contract",
+    "effect_contract",
+    "resource_claims",
+    "runtime_requirements",
+    "difficulty",
+    "risk",
+    "recovery_policy",
+    "skill_reference",
+}
 
 
 class CompileError(ValueError):
@@ -30,30 +45,22 @@ class CompiledPlan:
     digest: str
     compilation_record: dict[str, Any]
 
+    def has_valid_digest(self) -> bool:
+        """Validate Compiler-owned bytes without creating another plan identity."""
 
-def _canonical_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-
-
-def _digest(value: Any) -> str:
-    return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+        return digest_bytes(self.canonical_bytes) == self.digest
 
 
 def _semantic_snapshot(value: dict[str, Any]) -> dict[str, Any]:
-    snapshot = json.loads(_canonical_bytes(value))
-    snapshot["semantic_digest"] = _digest(value)
+    snapshot = json.loads(canonical_bytes(value))
+    snapshot["semantic_digest"] = digest_value(value)
     return snapshot
 
 
 def _node(value: dict[str, Any]) -> dict[str, Any]:
-    contract_digest = _digest(value)
+    contract_digest = digest_value(value)
     return {
-        **json.loads(_canonical_bytes(value)),
+        **json.loads(canonical_bytes(value)),
         "contract_digest": contract_digest,
         "node_key": f"node:{contract_digest[:24]}",
     }
@@ -65,6 +72,13 @@ def _skill_name(value: Any) -> str | None:
     if not isinstance(value, str) or not value.strip():
         raise CompileError("SKILL_REFERENCE_INVALID", "Skill Reference must be a name")
     return value.strip().lstrip("/$").casefold()
+
+
+def _validate_effect_contract(proposal: dict[str, Any]) -> None:
+    try:
+        authorized_file_changes(proposal)
+    except EffectContractError as error:
+        raise CompileError("EFFECT_CONTRACT_VIOLATION", str(error)) from error
 
 
 class PlanCompiler:
@@ -110,10 +124,15 @@ class PlanCompiler:
         proposal = proposed_nodes[0]
         if not isinstance(goal, dict) or not isinstance(proposal, dict):
             raise CompileError("COMPILE_INPUT_INVALID", "semantic entries must be objects")
+        unknown_fields = set(proposal) - PLAN_NODE_FIELDS
+        if unknown_fields:
+            raise CompileError(
+                "PLAN_NODE_FIELD_INVALID",
+                f"Plan Node contains unsupported fields: {sorted(unknown_fields)}",
+            )
         if proposal.get("kind") != "work":
             raise CompileError("NODE_KIND_INVALID", "Phase 1 requires a work node")
-        if proposal.get("kind") not in PLAN_KINDS:
-            raise CompileError("NODE_KIND_INVALID", "unknown Plan Node kind")
+        _validate_effect_contract(proposal)
 
         skill_reference = _skill_name(proposal.get("skill_reference"))
         if skill_reference in WORKFLOW_SKILLS:
@@ -183,11 +202,11 @@ class PlanCompiler:
             "nodes": nodes,
             "edges": edges,
         }
-        canonical = _canonical_bytes(plan_spec)
-        digest = hashlib.sha256(canonical).hexdigest()
+        canonical = canonical_bytes(plan_spec)
+        digest = digest_bytes(canonical)
         compilation_record = {
-            "source_digest": _digest(source_snapshot),
-            "policy_digest": _digest(policy_snapshot),
+            "source_digest": digest_value(source_snapshot),
+            "policy_digest": digest_value(policy_snapshot),
             "edge_provenance": [
                 {
                     **edges[0],

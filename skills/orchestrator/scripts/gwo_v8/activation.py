@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -75,10 +74,7 @@ class LocalPlanPublication:
         expected_active_digest: str | None,
         writer_generation: str,
     ) -> ActivationOutcome:
-        if (
-            hashlib.sha256(compiled_plan.canonical_bytes).hexdigest()
-            != compiled_plan.digest
-        ):
+        if not compiled_plan.has_valid_digest():
             raise ActivationError(
                 "COMPILED_PLAN_DIGEST_MISMATCH",
                 "CompiledPlan bytes do not match the Compiler digest",

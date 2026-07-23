@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -23,6 +24,7 @@ from gwo_v8 import (  # noqa: E402
     PlanCompiler,
     ResultClaim,
     RuntimeAdmission,
+    RuntimePrompt,
 )
 
 
@@ -190,6 +192,26 @@ def test_plan_compiler_rejects_recursive_workflow_skill_bindings(skill):
     assert rejected.value.code == "WORKFLOW_SKILL_RECURSION"
 
 
+def test_plan_compiler_rejects_runtime_facts_in_planspec():
+    intent = _plan_intent()
+    intent["nodes"][0]["provider"] = "codex"
+
+    with pytest.raises(CompileError) as rejected:
+        PlanCompiler().compile(intent, _ready_source(), {"version": 1})
+
+    assert rejected.value.code == "PLAN_NODE_FIELD_INVALID"
+
+
+def test_plan_compiler_rejects_work_outside_the_effect_contract():
+    intent = _plan_intent()
+    intent["nodes"][0]["inputs"]["file_changes"][0]["path"] = "other.txt"
+
+    with pytest.raises(CompileError) as rejected:
+        PlanCompiler().compile(intent, _ready_source(), {"version": 1})
+
+    assert rejected.value.code == "EFFECT_CONTRACT_VIOLATION"
+
+
 def test_local_plan_publication_consumes_compiled_bytes_unchanged(tmp_path):
     compiled = PlanCompiler().compile(
         _plan_intent(), _ready_source(), {"version": 1}
@@ -232,7 +254,7 @@ def test_worker_assertion_alone_cannot_verify_a_result():
                 {"kind": "check", "check_id": "result-content"},
             ]
         },
-        [],
+        None,
     )
 
     assert decision.status == "waiting"
@@ -255,33 +277,50 @@ def test_in_memory_runtime_observes_candidate_and_local_check(tmp_path):
         plan_digest=compiled.digest,
         node_key=work_node["node_key"],
         admission_id="admission:1",
-        attempt_id="attempt:1",
         repository_path=repository,
         base_sha=_git(repository, "rev-parse", "HEAD"),
     )
     runtime = InMemoryRuntimeAdapter(tmp_path / "runtime")
 
     binding = runtime.materialize(admission)
-    execution = runtime.execute(binding, work_node)
+    assert binding.attempt_id is None
+    assert binding.prompt_accepted is False
+    runtime.accept_prompt(binding, RuntimePrompt.from_node(work_node))
+    binding = runtime.read_binding(admission.admission_id)
+    assert binding is not None
+    assert binding.prompt_accepted is True
+    runtime.attach_attempt(binding, "attempt:1")
+    binding = runtime.read_binding(admission.admission_id)
+    assert binding is not None
+    assert binding.attempt_id == "attempt:1"
+    runtime.resume(binding)
+    observation = runtime.observe(binding)
+    assert observation.result_claim is not None
     decision = EvidenceVerifier().verify(
-        execution.result_claim,
+        observation.result_claim,
         work_node["output_contract"],
-        execution.evidence,
+        observation,
     )
 
     assert binding.repository == admission.repository
     assert binding.plan_digest == admission.plan_digest
     assert binding.node_key == admission.node_key
     assert binding.admission_id == admission.admission_id
-    assert binding.attempt_id == admission.attempt_id
-    assert execution.result_claim.candidate_sha == _git(
+    assert observation.result_claim.candidate_sha == _git(
         Path(binding.workspace), "rev-parse", "HEAD"
     )
-    assert {evidence.kind for evidence in execution.evidence} == {
+    assert {evidence.kind for evidence in observation.evidence} == {
         "candidate",
         "check",
     }
     assert decision.status == "accepted"
+    misbound = replace(observation.result_claim, attempt_id="attempt:other")
+    assert (
+        EvidenceVerifier()
+        .verify(misbound, work_node["output_contract"], observation)
+        .status
+        == "rejected"
+    )
     runtime.retire(binding)
 
 
@@ -310,6 +349,8 @@ def test_reconcile_once_completes_the_single_node_walking_skeleton(tmp_path):
     outcome = kernel.reconcile_once("local/walking-skeleton")
 
     assert outcome.directive == "goal_complete"
+    assert outcome.admission_state == "consumed"
+    assert outcome.attempt_state == "verified"
     assert outcome.goal_state == "completed"
     assert outcome.work_item_state == "integrated"
     assert outcome.plan_digest == compiled.digest

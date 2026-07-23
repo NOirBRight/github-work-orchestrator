@@ -12,7 +12,7 @@ from typing import Any
 
 from .activation import LocalPlanPublication
 from .evidence import EvidenceVerifier, TypedEvidence
-from .runtime import InMemoryRuntimeAdapter, RuntimeAdmission
+from .runtime import RuntimeAdapter, RuntimeAdmission, RuntimePrompt
 
 
 class KernelError(RuntimeError):
@@ -33,7 +33,10 @@ class ReconcileOutcome:
     work_item_key: str
     work_item_state: str
     node_key: str
+    admission_id: str
+    admission_state: str
     attempt_id: str | None
+    attempt_state: str | None
     candidate_sha: str | None
     result_digest: str | None
 
@@ -65,7 +68,7 @@ class Kernel:
         *,
         store_path: Path,
         publication: LocalPlanPublication,
-        runtime: InMemoryRuntimeAdapter,
+        runtime: RuntimeAdapter,
         verifier: EvidenceVerifier,
         repository_path: Path,
         integration_branch: str,
@@ -218,7 +221,6 @@ class Kernel:
             raise KernelError("ACTIVE_PLAN_INVALID", "Goal or Work Item is missing")
 
         admission_id = f"admission:{active.plan_digest[:20]}"
-        attempt_id = f"attempt:{active.plan_digest[:20]}:1"
         state = {
             "status": "running",
             "directive": "run_again",
@@ -229,7 +231,10 @@ class Kernel:
             "work_item_key": work_item["work_item_key"],
             "work_item_state": "active",
             "node_key": work_node["node_key"],
-            "attempt_id": attempt_id,
+            "admission_id": admission_id,
+            "admission_state": "materializing",
+            "attempt_id": None,
+            "attempt_state": None,
             "candidate_sha": None,
             "result_digest": None,
         }
@@ -241,22 +246,87 @@ class Kernel:
             plan_digest=active.plan_digest,
             node_key=work_node["node_key"],
             admission_id=admission_id,
-            attempt_id=attempt_id,
             repository_path=self.repository_path,
             base_sha=base_sha,
         )
-        binding = self.runtime.materialize(admission)
-        execution = self.runtime.execute(binding, work_node)
-        decision = self.verifier.verify(
-            execution.result_claim,
-            work_node["output_contract"],
-            execution.evidence,
+        self.runtime.materialize(admission)
+        binding = self.runtime.read_binding(admission_id)
+        if (
+            binding is None
+            or binding.repository != repository
+            or binding.plan_digest != active.plan_digest
+            or binding.node_key != work_node["node_key"]
+            or binding.admission_id != admission_id
+            or binding.prompt_accepted
+            or binding.attempt_id is not None
+        ):
+            raise KernelError(
+                "MATERIALIZATION_READBACK_FAILED",
+                "Runtime Binding did not round-trip the Admission identity",
+            )
+        prompt = RuntimePrompt.from_node(work_node)
+        self.runtime.accept_prompt(binding, prompt)
+        binding = self.runtime.read_binding(admission_id)
+        if (
+            binding is None
+            or not binding.prompt_accepted
+            or binding.prompt_digest != prompt.digest
+            or binding.attempt_id is not None
+        ):
+            raise KernelError(
+                "PROMPT_READBACK_FAILED",
+                "Runtime did not confirm the exact initial Prompt",
+            )
+
+        attempt_id = f"attempt:{active.plan_digest[:20]}:1"
+        state.update(
+            {
+                "admission_state": "consumed",
+                "attempt_id": attempt_id,
+                "attempt_state": "running",
+            }
         )
-        state["candidate_sha"] = execution.result_claim.candidate_sha
+        self._write_state(repository, active.plan_digest, state)
+        self.runtime.attach_attempt(binding, attempt_id)
+        binding = self.runtime.read_binding(admission_id)
+        if binding is None or binding.attempt_id != attempt_id:
+            raise KernelError(
+                "ATTEMPT_READBACK_FAILED",
+                "Runtime Binding did not round-trip the Attempt identity",
+            )
+        self.runtime.resume(binding)
+        observation = self.runtime.observe(binding)
+        if observation.result_claim is None:
+            state.update(
+                {
+                    "status": "waiting",
+                    "directive": "wait_for_runtime",
+                    "attempt_state": "running",
+                }
+            )
+            self._write_state(repository, active.plan_digest, state)
+            return self._outcome(state)
+        state.update(
+            {
+                "candidate_sha": observation.result_claim.candidate_sha,
+                "attempt_state": "result_submitted",
+            }
+        )
+        self._write_state(repository, active.plan_digest, state)
+        decision = self.verifier.verify(
+            observation.result_claim,
+            work_node["output_contract"],
+            observation,
+        )
         if decision.status != "accepted" or decision.result is None:
             state.update(
                 {
                     "status": decision.status,
+                    "attempt_state": (
+                        "result_submitted"
+                        if decision.status == "waiting"
+                        else "candidate_rejected"
+                    ),
                     "directive": (
                         "wait_for_evidence"
                         if decision.status == "waiting"
@@ -269,6 +339,7 @@ class Kernel:
 
         state["result_digest"] = decision.result.result_digest
         state["status"] = "verified"
+        state["attempt_state"] = "verified"
         self._write_state(repository, active.plan_digest, state)
 
         lease_holder = integration_node["node_key"]
@@ -283,20 +354,20 @@ class Kernel:
                     "repository is not on the configured Integration branch",
                 )
             current_head = _git(self.repository_path, "rev-parse", "HEAD")
-            if current_head != execution.result_claim.candidate_sha:
+            if current_head != observation.result_claim.candidate_sha:
                 _git(
                     self.repository_path,
                     "merge",
                     "--ff-only",
-                    execution.result_claim.candidate_sha,
+                    observation.result_claim.candidate_sha,
                 )
             integrated_sha = _git(self.repository_path, "rev-parse", "HEAD")
-            if integrated_sha != execution.result_claim.candidate_sha:
+            if integrated_sha != observation.result_claim.candidate_sha:
                 raise KernelError(
                     "INTEGRATION_READBACK_FAILED",
                     "Integration branch did not reach the Candidate",
                 )
-            integration_evidence = TypedEvidence.observe(
+            integration_evidence = TypedEvidence._capture(
                 kind="integration",
                 subject=integrated_sha,
                 observer_type="kernel",

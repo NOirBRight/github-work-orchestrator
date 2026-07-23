@@ -10,7 +10,6 @@ from .compiler import CompiledPlan, CompileError, PlanCompiler
 from .evidence import (
     EvidenceVerifier,
     ResultClaim,
-    TypedEvidence,
     VerificationDecision,
     VerifiedResult,
 )
@@ -20,7 +19,8 @@ from .runtime import (
     RuntimeAdapterError,
     RuntimeAdmission,
     RuntimeBinding,
-    RuntimeExecution,
+    RuntimeObservation,
+    RuntimePrompt,
 )
 from .kernel import Kernel, KernelError, ReconcileOutcome
 
@@ -41,9 +41,9 @@ __all__ = [
     "RuntimeAdapterError",
     "RuntimeAdmission",
     "RuntimeBinding",
-    "RuntimeExecution",
+    "RuntimeObservation",
+    "RuntimePrompt",
     "ReconcileOutcome",
-    "TypedEvidence",
     "VerificationDecision",
     "VerifiedResult",
 ]
