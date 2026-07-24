@@ -292,6 +292,12 @@ repository still requires an explicitly selected canary repository and
 maintenance window; implementation alone does not authorize production
 cutover.
 
+The production V6.1 fence uses one append-only, action-keyed GitHub control
+record. All V6.1 mutation commands check it inside the repository coordination
+mutex before their first external write. Cutover readback combines that fence
+with GitHub Dispatch, mutex, and Paseo Worker authority; installing the code
+does not publish the fence or activate V8.
+
 - Use a dedicated lightweight GitHub canary repository whose hosted CI
   completes in roughly two minutes and whose three to five independent modules
   can safely exercise failure and conflict scenarios.

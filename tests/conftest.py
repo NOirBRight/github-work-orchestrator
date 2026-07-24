@@ -35,4 +35,8 @@ def load_modules():
     """Load a fresh (orch_core, orch.py) pair with the CLI bound to that core."""
 
     core = load_module("orch_core", CORE_PATH, register=True)
-    return core, load_module("orch_cli_test", CLI_PATH)
+    cli = load_module("orch_cli_test", CLI_PATH)
+    # Unit tests inject GitHub/Paseo collaborators and must not inherit a
+    # developer's authenticated gh session. Fence-specific tests override this.
+    cli._legacy_writer_stopped = lambda _repository: False
+    return core, cli

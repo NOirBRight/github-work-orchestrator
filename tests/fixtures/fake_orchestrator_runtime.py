@@ -126,6 +126,13 @@ def _gh_frontier(args: list[str], state: dict) -> int:
 
 def _gh(args: list[str]) -> int:
     state = _load_state()
+    if (
+        args[:3] == ["api", "--method", "GET"]
+        and len(args) > 3
+        and "/contents/.gwo-v8/legacy-writer-fence.json" in args[3]
+    ):
+        print("HTTP 404: Not Found", file=sys.stderr)
+        return 1
     if state.get("scenario") == "frontier":
         return _gh_frontier(args, state)
     if args[:2] == ["api", "graphql"]:

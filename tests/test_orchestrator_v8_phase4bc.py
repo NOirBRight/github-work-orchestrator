@@ -23,6 +23,7 @@ from gwo_v8 import (  # noqa: E402
     ExecutionBudgetReadback,
     GitHubCanaryEvidenceControl,
     GitHubContent,
+    GitHubLegacyWriterControl,
     GitHubWriterTransitionControl,
     InMemoryCanaryEvidenceControl,
     InMemoryDurablePlanControl,
@@ -33,6 +34,7 @@ from gwo_v8 import (  # noqa: E402
     Kernel,
     KernelError,
     LocalPlanPublication,
+    LegacyWriterReadback,
     PlanCompiler,
     ReviewAxisBinding,
     ReviewAxisObservation,
@@ -89,6 +91,57 @@ class _FailFinalTransitionOnce(InMemoryWriterTransitionControl):
             self.failed = True
             raise RuntimeError("simulated final transition CAS conflict")
         super().publish(record)
+
+
+def test_production_legacy_writer_fence_survives_restart_and_preserves_readback():
+    client = _GitHubContentClient()
+    observed = LegacyWriterReadback(
+        repository="owner/repo",
+        stopped=False,
+        active_dispatches=("dispatch-7",),
+        integration_lease=True,
+        active_workers=("agent-7",),
+    )
+    control = GitHubLegacyWriterControl(
+        client,
+        branch="gwo-control",
+        execution_readback=lambda repository: replace(
+            observed,
+            repository=repository,
+        ),
+    )
+
+    control.stop("owner/repo", action_key="stop-v61:owner-repo")
+    control.stop("owner/repo", action_key="stop-v61:owner-repo")
+    assert client.writes == 1
+
+    recovered = GitHubLegacyWriterControl(
+        client,
+        branch="gwo-control",
+        execution_readback=lambda repository: replace(
+            observed,
+            repository=repository,
+        ),
+    )
+    assert recovered.readback("owner/repo") == replace(observed, stopped=True)
+
+    recovered.restore("owner/repo", action_key="restore-v61:owner-repo")
+    recovered.restore("owner/repo", action_key="restore-v61:owner-repo")
+    assert client.writes == 2
+    assert control.readback("owner/repo") == observed
+    durable = json.loads(
+        client.contents[
+            (
+                "owner/repo",
+                "gwo-control",
+                ".gwo-v8/legacy-writer-fence.json",
+            )
+        ].content
+    )
+    assert [event["operation"] for event in durable["events"]] == [
+        "stop",
+        "restore",
+    ]
 
 
 def _compiled(
