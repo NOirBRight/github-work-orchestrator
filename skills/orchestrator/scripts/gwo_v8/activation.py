@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import sqlite3
 import subprocess
+import time
 from typing import Any, Callable, Protocol
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
@@ -303,26 +304,37 @@ class GitHubCliContentClient:
             encoding="utf-8",
         )
 
+    @staticmethod
+    def _wait_for_read_retry() -> None:
+        time.sleep(1)
+
     def read(
         self,
         repository: str,
         branch: str,
         path: str,
     ) -> GitHubContent | None:
-        result = self._run(
-            [
-                "api",
-                "--method",
-                "GET",
-                f"repos/{repository}/contents/{path}",
-                "-f",
-                f"ref={branch}",
-            ]
-        )
-        if result.returncode != 0:
+        result = None
+        for attempt in range(3):
+            result = self._run(
+                [
+                    "api",
+                    "--method",
+                    "GET",
+                    f"repos/{repository}/contents/{path}",
+                    "-f",
+                    f"ref={branch}",
+                ]
+            )
+            if result.returncode == 0:
+                break
             lowered = f"{result.stdout}\n{result.stderr}".casefold()
             if "404" in lowered or "not found" in lowered:
                 return None
+            if attempt < 2:
+                self._wait_for_read_retry()
+        assert result is not None
+        if result.returncode != 0:
             raise ActivationError(
                 "DURABLE_READ_FAILED",
                 result.stderr.strip()

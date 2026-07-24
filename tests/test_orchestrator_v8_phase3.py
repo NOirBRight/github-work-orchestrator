@@ -1372,6 +1372,12 @@ class _FakeGitHubDelivery(GitHubCliDeliveryControl):
         self.manifest_digest = None
         self.reruns = []
         self.runs = []
+        self.manifest_visibility_delay = 0
+        self.manifest_reads = 0
+
+    @staticmethod
+    def _wait_for_publication_readback():
+        return None
 
     def _command(self, command):
         returncode = 0
@@ -1397,8 +1403,12 @@ class _FakeGitHubDelivery(GitHubCliDeliveryControl):
                 if item.startswith("description=")
             )
         elif command[:2] == ["gh", "api"]:
+            self.manifest_reads += 1
             statuses = []
-            if self.manifest_digest is not None:
+            if (
+                self.manifest_digest is not None
+                and self.manifest_reads > self.manifest_visibility_delay
+            ):
                 statuses.append(
                     {
                         "context": self.evidence_context,
@@ -1413,6 +1423,25 @@ class _FakeGitHubDelivery(GitHubCliDeliveryControl):
         else:
             raise AssertionError(command)
         return subprocess.CompletedProcess(command, returncode, stdout, "")
+
+
+def test_github_delivery_retries_eventually_consistent_publication_readback(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    candidate_sha = _git(repository, "rev-parse", "HEAD")
+    delivery = _FakeGitHubDelivery(repository, candidate_sha)
+    delivery.manifest_visibility_delay = 2
+
+    publication = delivery.publish_once(
+        "owner/repository",
+        candidate_sha,
+        "e" * 64,
+    )
+
+    assert publication.candidate_sha == candidate_sha
+    assert publication.evidence_manifest_digest == "e" * 64
+    assert delivery.manifest_reads == 3
 
 
 def test_github_delivery_treats_timeout_as_candidate_failure(tmp_path):

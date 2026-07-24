@@ -3,6 +3,10 @@
 Status: accepted direction; code implementation complete through Phase 4C.
 The live canary and production writer transition remain an explicit operational
 release action and have not been executed by repository implementation work.
+The dedicated GitHub-boundary smoke has passed; the three-node live acceptance
+is paused before AI dispatch because exact-SHA fast-forward Integration would
+force repeated Candidate refresh, Review, and hosted CI. See
+`docs/e2e/gwo-v8-canary.md`.
 
 This roadmap starts from the production reality: V6.1 is the current writer
 and V7 was never adopted. V8 does not complete or migrate V7. It introduces a

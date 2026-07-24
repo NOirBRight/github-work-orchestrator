@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from dataclasses import replace
@@ -21,6 +22,7 @@ from gwo_v8 import (  # noqa: E402
     ActivationReceipt,
     DurablePlanRecord,
     GitHubContent,
+    GitHubCliContentClient,
     GitHubDurablePlanControl,
     GitHubDurableGoalControl,
     CoordinatorSession,
@@ -87,6 +89,50 @@ class _MemoryGitHubContentClient:
         )
         self._blobs[key] = written
         return written
+
+
+class _EventuallyReadableGitHubClient(GitHubCliContentClient):
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    @staticmethod
+    def _wait_for_read_retry():
+        return None
+
+    def _run(self, args, *, input_text=None):
+        del input_text
+        self.reads += 1
+        if self.reads < 3:
+            return subprocess.CompletedProcess(
+                args,
+                1,
+                "",
+                "connection timed out",
+            )
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            json.dumps(
+                {
+                    "content": base64.b64encode(b"durable").decode("ascii"),
+                    "sha": "blob:durable",
+                }
+            ),
+            "",
+        )
+
+
+def test_github_content_read_retries_transient_transport_failure():
+    client = _EventuallyReadableGitHubClient()
+
+    content = client.read("owner/repository", "gwo-control", "state.json")
+
+    assert content == GitHubContent(
+        content=b"durable",
+        blob_sha="blob:durable",
+    )
+    assert client.reads == 3
 
 
 def _ready_source(*, state: str = "ready-for-agent") -> dict:

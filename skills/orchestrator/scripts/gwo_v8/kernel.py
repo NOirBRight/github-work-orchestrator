@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
+import time
 from typing import Any, Protocol
 from urllib.parse import quote
 
@@ -259,6 +260,10 @@ class GitHubCliDeliveryControl:
         return result.stdout.strip()
 
     @staticmethod
+    def _wait_for_publication_readback() -> None:
+        time.sleep(1)
+
+    @staticmethod
     def _branch(candidate_sha: str) -> str:
         return f"gwo/candidates/{candidate_sha}"
 
@@ -373,7 +378,13 @@ class GitHubCliDeliveryControl:
                 f"description={evidence_manifest_digest}",
             ]
         )
-        receipt = self.read_publication(repository, candidate_sha)
+        receipt = None
+        for attempt in range(5):
+            receipt = self.read_publication(repository, candidate_sha)
+            if receipt is not None:
+                break
+            if attempt < 4:
+                self._wait_for_publication_readback()
         if receipt is None:
             raise DeliveryControlError(
                 "PUBLICATION_READBACK_FAILED",
