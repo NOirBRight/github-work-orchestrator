@@ -1,6 +1,6 @@
 ---
-status: accepted
-superseded-by: 0008-flatten-supervision-into-a-dynamic-task-dag.md
+status: superseded
+superseded-by: 0007-adopt-v5-lightweight-orchestration.md
 ---
 
 # Separate Paseo supervision from Workspace visibility and review axes

@@ -1,6 +1,6 @@
 ---
-status: accepted
-superseded-by: 0007-move-invariants-into-a-stateful-gwo-cli.md
+status: superseded
+superseded-by: 0007-adopt-v5-lightweight-orchestration.md
 ---
 
 # Require acknowledged delivery for material Campaign Room events

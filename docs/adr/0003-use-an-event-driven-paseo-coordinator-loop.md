@@ -1,6 +1,6 @@
 ---
-status: accepted
-amended-by: 0007-move-invariants-into-a-stateful-gwo-cli.md
+status: superseded
+superseded-by: 0007-adopt-v5-lightweight-orchestration.md
 ---
 
 # Use an event-driven Paseo Coordinator loop inside GWO
