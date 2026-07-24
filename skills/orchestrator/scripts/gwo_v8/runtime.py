@@ -61,6 +61,22 @@ class RuntimeProfile:
         )
 
 
+def runtime_thinking_matches(
+    provider: str,
+    model: str,
+    requested: str,
+    observed: str,
+) -> bool:
+    """Match exact Runtime thinking plus Paseo's K3 on-to-high normalization."""
+
+    return requested == observed or (
+        provider == "kimi-cli"
+        and model == "kimi-code/k3"
+        and requested == "on"
+        and observed == "high"
+    )
+
+
 @dataclass(frozen=True)
 class ActiveTurnPools:
     workers: int
@@ -1619,7 +1635,12 @@ class PaseoRuntimeAdapter:
             or binding.provider != profile.provider
             or binding.model != profile.model
             or binding.base_sha != admission.base_sha
-            or binding.thinking != profile.thinking
+            or not runtime_thinking_matches(
+                profile.provider,
+                profile.model,
+                profile.thinking,
+                binding.thinking,
+            )
             or binding.mode != profile.mode
             or binding.features_digest != digest_value(profile.features)
             or binding.prompt_digest != prompt.digest
@@ -2259,7 +2280,12 @@ class PaseoRuntimeAdapter:
             or agent.profile_digest != profile.digest
             or agent.provider != profile.provider
             or agent.model != profile.model
-            or agent.thinking != profile.thinking
+            or not runtime_thinking_matches(
+                profile.provider,
+                profile.model,
+                profile.thinking,
+                agent.thinking,
+            )
             or agent.mode != profile.mode
             or digest_value(agent.features) != digest_value(profile.features)
         ):

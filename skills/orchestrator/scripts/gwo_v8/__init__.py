@@ -73,6 +73,7 @@ from .runtime import (
     RuntimePrompt,
     SkillCatalog,
     resolve_active_turn_pools,
+    runtime_thinking_matches,
     resolve_review_profile,
 )
 from .kernel import (
@@ -241,6 +242,7 @@ __all__ = [
     "WriterTransitionRecord",
     "WriterAuthorityControl",
     "resolve_active_turn_pools",
+    "runtime_thinking_matches",
     "resolve_review_profile",
     "ReconcileOutcome",
     "Reconciler",

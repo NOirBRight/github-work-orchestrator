@@ -21,6 +21,7 @@ from .runtime import (
     RuntimePrompt,
     read_bounded_outcome,
     resolve_active_turn_pools,
+    runtime_thinking_matches,
 )
 
 
@@ -722,7 +723,12 @@ class PaseoCoordinatorRuntime:
             or readback.profile_digest != profile.digest
             or readback.provider != profile.provider
             or readback.model != profile.model
-            or readback.thinking != profile.thinking
+            or not runtime_thinking_matches(
+                profile.provider,
+                profile.model,
+                profile.thinking,
+                readback.thinking,
+            )
             or readback.mode != profile.mode
             or readback.features != profile.features
             or readback.labels.get("gwo.goal") != snapshot.goal_key

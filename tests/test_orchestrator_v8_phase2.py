@@ -123,6 +123,14 @@ class _EventuallyReadableGitHubClient(GitHubCliContentClient):
         )
 
 
+class _K3NormalizedPaseoClient(InMemoryPaseoClient):
+    def create(self, request):
+        record = super().create(request)
+        normalized = replace(record, thinking="high")
+        self._agents[record.agent_id] = normalized
+        return normalized
+
+
 def test_github_content_read_retries_transient_transport_failure():
     client = _EventuallyReadableGitHubClient()
 
@@ -1681,7 +1689,7 @@ def test_goal_driver_production_paseo_coordinator_reads_back_auto_profile(
     tmp_path,
 ):
     repository = _temporary_repository(tmp_path)
-    client = InMemoryPaseoClient()
+    client = _K3NormalizedPaseoClient()
     coordinators = PaseoCoordinatorRuntime(
         client,
         repository_path=repository,
