@@ -1,8 +1,14 @@
 ---
-status: superseded by 0007
+status: superseded
+superseded-by: 0007-adopt-v5-lightweight-orchestration.md
 ---
 
 # Separate Paseo supervision from Workspace visibility and review axes
+
+Superseded by ADR 0008 for the V7 design (supervision and workspace
+decisions); review-axis independence, the Coordinator Home / Integration
+Control Worktree separation, and the provider-native exclusion carry forward
+unchanged. Operative until roadmap Phases 2–3 land.
 
 Keep the supervision tree `Repository Coordinator → Campaign →
 Worker/Reviewer`, but give each new Campaign its own local Campaign Control
