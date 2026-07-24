@@ -1456,6 +1456,73 @@ def test_hosted_cancellation_waits_without_rejecting_candidate(tmp_path):
     assert waiting.attempt_ordinal == 1
 
 
+class _AmbiguousPublicationDelivery(InMemoryDeliveryControl):
+    def __init__(self):
+        super().__init__(hosted_outcomes=("passed",))
+        self.publish_attempts = 0
+
+    def publish_once(
+        self,
+        repository,
+        candidate_sha,
+        evidence_manifest_digest,
+        *,
+        target_branch=None,
+    ):
+        self.publish_attempts += 1
+        if self.publish_attempts == 1:
+            raise DeliveryControlError(
+                "PULL_REQUEST_CREATE_AMBIGUOUS",
+                "pull request creation has no authoritative readback yet",
+            )
+        return super().publish_once(
+            repository,
+            candidate_sha,
+            evidence_manifest_digest,
+            target_branch=target_branch,
+        )
+
+
+def test_kernel_reconciles_again_after_ambiguous_publication_readback(tmp_path):
+    repository = _temporary_repository(tmp_path)
+    compiled = PlanCompiler().compile(
+        _plan_intent(),
+        _ready_source(),
+        _policy_snapshot(),
+    )
+    store_path = tmp_path / "v8.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-3",
+    )
+    delivery = _AmbiguousPublicationDelivery()
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=InMemoryRuntimeAdapter(tmp_path / "runtime"),
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-3",
+        delivery_control=delivery,
+    )
+
+    waiting = kernel.reconcile_once("local/phase-three")
+
+    assert waiting.status == "waiting"
+    assert waiting.directive == "reconcile_again"
+    assert waiting.attempt_state == "batch_wait"
+    assert waiting.wait_condition == "publication_readback"
+    assert waiting.wait_event_identity.startswith("publication-readback:")
+
+    completed = kernel.reconcile_once("local/phase-three")
+
+    assert completed.status == "complete"
+    assert delivery.publish_attempts == 2
+
+
 class _FakeGitHubDelivery(GitHubCliDeliveryControl):
     def __init__(self, repository_path: Path, candidate_sha: str):
         super().__init__(repository_path=repository_path)
@@ -1471,6 +1538,7 @@ class _FakeGitHubDelivery(GitHubCliDeliveryControl):
         self.pull_request_visible_after_failed_create = False
         self.pull_request_visibility_delay = 0
         self.pull_request_reads = 0
+        self.pull_request_read_failures = set()
         self.manifest_visibility_delay = 0
         self.manifest_reads = 0
 
@@ -1514,7 +1582,10 @@ class _FakeGitHubDelivery(GitHubCliDeliveryControl):
             and command[4].endswith("/pulls")
         ):
             self.pull_request_reads += 1
-            if self.pull_request_reads > self.pull_request_visibility_delay:
+            if self.pull_request_reads in self.pull_request_read_failures:
+                returncode = 1
+                stderr = "temporary pull request readback failure"
+            elif self.pull_request_reads > self.pull_request_visibility_delay:
                 stdout = json.dumps(self.pull_requests)
             else:
                 stdout = json.dumps([])
@@ -1522,30 +1593,37 @@ class _FakeGitHubDelivery(GitHubCliDeliveryControl):
             command[:4] == ["gh", "api", "--method", "POST"]
             and command[4].endswith("/pulls")
         ):
-            returncode = self.pull_request_create_returncode
-            if returncode == 0 or self.pull_request_visible_after_failed_create:
-                fields = {
-                    item.split("=", 1)[0]: item.split("=", 1)[1]
-                    for item in command
-                    if "=" in item
-                }
-                pull_request = {
-                    "state": "open",
-                    "merged_at": None,
-                    "html_url": "https://github.invalid/pull/1",
-                    "head": {
-                        "ref": fields["head"],
-                        "sha": self.candidate_sha,
-                    },
-                    "base": {"ref": fields["base"]},
-                }
-                self.pull_requests.append(pull_request)
-                if returncode == 0:
-                    stdout = json.dumps(pull_request)
+            if self.pull_requests:
+                returncode = 1
+                stderr = "a pull request for this Candidate already exists"
+            else:
+                returncode = self.pull_request_create_returncode
+                if (
+                    returncode == 0
+                    or self.pull_request_visible_after_failed_create
+                ):
+                    fields = {
+                        item.split("=", 1)[0]: item.split("=", 1)[1]
+                        for item in command
+                        if "=" in item
+                    }
+                    pull_request = {
+                        "state": "open",
+                        "merged_at": None,
+                        "html_url": "https://github.invalid/pull/1",
+                        "head": {
+                            "ref": fields["head"],
+                            "sha": self.candidate_sha,
+                        },
+                        "base": {"ref": fields["base"]},
+                    }
+                    self.pull_requests.append(pull_request)
+                    if returncode == 0:
+                        stdout = json.dumps(pull_request)
+                    else:
+                        stderr = "connection reset after create"
                 else:
                     stderr = "connection reset after create"
-            else:
-                stderr = "connection reset after create"
         elif (
             command[:4] == ["gh", "api", "--method", "GET"]
             and "/actions/runs/" in command[4]
@@ -1653,6 +1731,71 @@ def test_github_delivery_retries_eventually_consistent_pull_request_readback(
     delivery = _FakeGitHubDelivery(repository, candidate_sha)
     delivery.pull_request_visibility_delay = 2
 
+    with pytest.raises(DeliveryControlError) as ambiguous:
+        delivery.publish_once(
+            "owner/repository",
+            candidate_sha,
+            "e" * 64,
+            target_branch="dev",
+        )
+    publication = delivery.publish_once(
+        "owner/repository",
+        candidate_sha,
+        "e" * 64,
+        target_branch="dev",
+    )
+
+    assert ambiguous.value.code == "PULL_REQUEST_CREATE_AMBIGUOUS"
+    assert publication.source_ref == "https://github.invalid/pull/1"
+    assert len(delivery.pull_requests) == 1
+    assert delivery.pull_request_reads == 3
+
+
+def test_github_delivery_retries_transient_pull_request_readback_failure(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    candidate_sha = _git(repository, "rev-parse", "HEAD")
+    delivery = _FakeGitHubDelivery(repository, candidate_sha)
+    delivery.pull_request_read_failures = {2}
+
+    with pytest.raises(DeliveryControlError) as ambiguous:
+        delivery.publish_once(
+            "owner/repository",
+            candidate_sha,
+            "e" * 64,
+            target_branch="dev",
+        )
+    publication = delivery.publish_once(
+        "owner/repository",
+        candidate_sha,
+        "e" * 64,
+        target_branch="dev",
+    )
+
+    assert ambiguous.value.code == "PULL_REQUEST_CREATE_AMBIGUOUS"
+    assert publication.source_ref == "https://github.invalid/pull/1"
+    assert len(delivery.pull_requests) == 1
+    assert delivery.pull_request_reads == 3
+
+
+def test_github_delivery_adopts_pull_request_after_bounded_readback_exhaustion(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    candidate_sha = _git(repository, "rev-parse", "HEAD")
+    delivery = _FakeGitHubDelivery(repository, candidate_sha)
+    delivery.pull_request_visibility_delay = 6
+
+    for _attempt in range(3):
+        with pytest.raises(DeliveryControlError) as ambiguous:
+            delivery.publish_once(
+                "owner/repository",
+                candidate_sha,
+                "e" * 64,
+                target_branch="dev",
+            )
+        assert ambiguous.value.code == "PULL_REQUEST_CREATE_AMBIGUOUS"
     publication = delivery.publish_once(
         "owner/repository",
         candidate_sha,
@@ -1662,7 +1805,27 @@ def test_github_delivery_retries_eventually_consistent_pull_request_readback(
 
     assert publication.source_ref == "https://github.invalid/pull/1"
     assert len(delivery.pull_requests) == 1
-    assert delivery.pull_request_reads == 3
+    assert delivery.pull_request_reads == 7
+
+
+def test_github_delivery_surfaces_initial_pull_request_readback_as_ambiguous(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    candidate_sha = _git(repository, "rev-parse", "HEAD")
+    delivery = _FakeGitHubDelivery(repository, candidate_sha)
+    delivery.pull_request_read_failures = {1}
+
+    with pytest.raises(DeliveryControlError) as ambiguous:
+        delivery.publish_once(
+            "owner/repository",
+            candidate_sha,
+            "e" * 64,
+            target_branch="dev",
+        )
+
+    assert ambiguous.value.code == "PULL_REQUEST_READBACK_AMBIGUOUS"
+    assert delivery.pull_requests == []
 
 
 def test_github_delivery_fails_closed_on_candidate_pull_request_conflict(

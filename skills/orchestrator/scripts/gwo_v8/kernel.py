@@ -344,21 +344,28 @@ class GitHubCliDeliveryControl:
     ) -> str | None:
         branch = self._branch(candidate_sha)
         owner = repository.split("/", 1)[0]
-        rendered = self._checked(
-            [
-                self.executable,
-                "api",
-                "--method",
-                "GET",
-                f"repos/{repository}/pulls",
-                "-f",
-                "state=all",
-                "-f",
-                f"head={owner}:{branch}",
-                "-f",
-                "per_page=100",
-            ]
-        )
+        command = [
+            self.executable,
+            "api",
+            "--method",
+            "GET",
+            f"repos/{repository}/pulls",
+            "-f",
+            "state=all",
+            "-f",
+            f"head={owner}:{branch}",
+            "-f",
+            "per_page=100",
+        ]
+        result = self._command(command)
+        if result.returncode != 0:
+            raise DeliveryControlError(
+                "PULL_REQUEST_READBACK_AMBIGUOUS",
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "Candidate pull request readback failed",
+            )
+        rendered = result.stdout.strip()
         try:
             payload = json.loads(rendered)
         except json.JSONDecodeError as error:
@@ -452,16 +459,23 @@ class GitHubCliDeliveryControl:
                 ),
             ]
         )
-        for attempt in range(5):
+        try:
             readback = self._read_candidate_pull_request(
                 repository,
                 candidate_sha,
                 target_branch,
             )
-            if readback is not None:
-                return readback
-            if attempt < 4:
-                self._wait_for_publication_readback()
+        except DeliveryControlError as error:
+            if error.code != "PULL_REQUEST_READBACK_AMBIGUOUS":
+                raise
+            raise DeliveryControlError(
+                "PULL_REQUEST_CREATE_AMBIGUOUS",
+                result.stderr.strip()
+                or result.stdout.strip()
+                or error.detail,
+            ) from error
+        if readback is not None:
+            return readback
         detail = (
             result.stderr.strip()
             or result.stdout.strip()
@@ -5003,18 +5017,48 @@ class Kernel:
                         "Integration Batch publication changed exact identity",
                     )
             except DeliveryControlError as error:
-                batch_state["state"] = "blocked"
+                readback_ambiguous = error.code in {
+                    "PULL_REQUEST_CREATE_AMBIGUOUS",
+                    "PULL_REQUEST_READBACK_AMBIGUOUS",
+                }
+                batch_state["state"] = (
+                    "waiting" if readback_ambiguous else "blocked"
+                )
                 batch_state["last_delivery_error"] = {"code": error.code}
                 for state in member_states.values():
-                    state.update(
-                        {
-                            "status": "blocked",
-                            "directive": "request_decision",
-                            "attempt_state": "publication_blocked",
-                            "wait_condition": None,
-                            "last_delivery_error": {"code": error.code},
-                        }
-                    )
+                    if readback_ambiguous:
+                        state.update(
+                            {
+                                "status": "waiting",
+                                "directive": "reconcile_again",
+                                "attempt_state": "batch_wait",
+                                "wait_condition": "publication_readback",
+                                "wait_source_ref": (
+                                    f"delivery://publication/{batch_sha}"
+                                ),
+                                "wait_event_identity": (
+                                    f"publication-readback:{batch_sha}"
+                                ),
+                                "next_check_at": (
+                                    datetime.now(timezone.utc)
+                                    + timedelta(seconds=30)
+                                ).isoformat(),
+                                "last_delivery_error": {"code": error.code},
+                            }
+                        )
+                    else:
+                        state.update(
+                            {
+                                "status": "blocked",
+                                "directive": "request_decision",
+                                "attempt_state": "publication_blocked",
+                                "wait_condition": None,
+                                "wait_source_ref": None,
+                                "wait_event_identity": None,
+                                "next_check_at": None,
+                                "last_delivery_error": {"code": error.code},
+                            }
+                        )
                 self._write_integration_batch(
                     repository,
                     active.plan_digest,
