@@ -378,6 +378,140 @@ class InMemoryLegacyWriterControl:
         )
 
 
+class GitHubLegacyWriterControl:
+    """Durable V6.1 fence combined with authoritative execution readback."""
+
+    _PATH = ".gwo-v8/legacy-writer-fence.json"
+
+    def __init__(
+        self,
+        client: GitHubContentClient,
+        *,
+        branch: str,
+        execution_readback: Callable[[str], LegacyWriterReadback],
+    ):
+        if not branch:
+            raise ValueError("legacy writer fence branch is required")
+        self.client = client
+        self.branch = branch
+        self.execution_readback = execution_readback
+
+    def _read_fence(
+        self,
+        repository: str,
+    ) -> tuple[dict | None, str | None]:
+        content = self.client.read(repository, self.branch, self._PATH)
+        if content is None:
+            return None, None
+        try:
+            value = json.loads(content.content)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError("durable legacy writer fence is invalid") from error
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version") != 1
+            or value.get("repository") != repository
+            or not isinstance(value.get("stopped"), bool)
+            or not isinstance(value.get("events"), list)
+        ):
+            raise ValueError("durable legacy writer fence is malformed")
+        action_operations: dict[str, str] = {}
+        for event in value["events"]:
+            if (
+                not isinstance(event, dict)
+                or event.get("operation") not in {"stop", "restore"}
+                or not isinstance(event.get("action_key"), str)
+                or not event["action_key"]
+            ):
+                raise ValueError("durable legacy writer fence event is malformed")
+            previous = action_operations.setdefault(
+                event["action_key"],
+                event["operation"],
+            )
+            if previous != event["operation"]:
+                raise ValueError("legacy writer action key was reused")
+        expected_stopped = bool(
+            value["events"] and value["events"][-1]["operation"] == "stop"
+        )
+        if value["stopped"] != expected_stopped:
+            raise ValueError("durable legacy writer fence state is contradictory")
+        return value, content.blob_sha
+
+    def _set(
+        self,
+        repository: str,
+        *,
+        action_key: str,
+        operation: str,
+    ) -> None:
+        if not action_key:
+            raise ValueError("legacy writer action key is required")
+        value, blob_sha = self._read_fence(repository)
+        if value is None:
+            value = {
+                "schema_version": 1,
+                "repository": repository,
+                "stopped": False,
+                "events": [],
+            }
+        matching = [
+            event
+            for event in value["events"]
+            if event["action_key"] == action_key
+        ]
+        if matching:
+            if matching[0]["operation"] != operation:
+                raise ValueError("legacy writer action key was reused")
+            return
+        target_stopped = operation == "stop"
+        if value["stopped"] == target_stopped:
+            return
+        value["events"].append(
+            {
+                "action_key": action_key,
+                "operation": operation,
+            }
+        )
+        value["stopped"] = target_stopped
+        rendered = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        written = self.client.compare_and_swap(
+            repository,
+            self.branch,
+            self._PATH,
+            rendered,
+            expected_blob_sha=blob_sha,
+            message=f"GWO V6.1 writer {operation} {action_key}",
+        )
+        readback, _readback_sha = self._read_fence(repository)
+        if (
+            written.content != rendered
+            or readback is None
+            or readback["stopped"] != target_stopped
+        ):
+            raise ValueError("legacy writer fence did not read back")
+
+    def stop(self, repository: str, *, action_key: str) -> None:
+        self._set(repository, action_key=action_key, operation="stop")
+
+    def restore(self, repository: str, *, action_key: str) -> None:
+        self._set(repository, action_key=action_key, operation="restore")
+
+    def readback(self, repository: str) -> LegacyWriterReadback:
+        fence, _blob_sha = self._read_fence(repository)
+        execution = self.execution_readback(repository)
+        if execution.repository != repository:
+            raise ValueError("legacy execution readback repository changed")
+        return replace(
+            execution,
+            stopped=bool(fence and fence["stopped"]),
+        )
+
+
 @dataclass(frozen=True)
 class V8OwnershipReadback:
     active_admissions: tuple[str, ...]

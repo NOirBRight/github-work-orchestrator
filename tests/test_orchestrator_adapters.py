@@ -1776,6 +1776,166 @@ def test_frontier_admit_validates_the_entire_plan_before_any_github_write(
     assert writes == []
 
 
+def test_v61_stop_fence_blocks_admission_before_the_first_github_write(
+    tmp_path, monkeypatch
+):
+    core, cli = _modules()
+    writes = []
+    contract = _contract_v2(core)
+    plan = tmp_path / "admission.json"
+    plan.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "repository": "owner/repo",
+                "admissions": [{"issue": 1, "contract": contract}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeGitHub:
+        def frontier_candidates(self, _repo, _limit, _labels):
+            return [
+                {"number": 1, "labels": ["ready-for-agent"], "comments": []}
+            ]
+
+        def snapshot(self, repo, _branch):
+            return {"repository": repo, "issues": [], "closed_issues": []}
+
+        def issues_by_number(self, _repo, _numbers):
+            return [
+                {"number": 1, "labels": ["ready-for-agent"], "comments": []}
+            ]
+
+        def admit(self, *_args):
+            writes.append("admit")
+
+    repo_config = {
+        "repository": "owner/repo",
+        "integration_branch": "dev",
+        "execution_slots": 3,
+        "integration_wip_limit": 6,
+        "worker_slots": 3,
+        "intake": {},
+    }
+    monkeypatch.setattr(cli, "GitHub", FakeGitHub)
+    monkeypatch.setattr(
+        cli, "_load_config", lambda *_args, **_kwargs: core.default_config()
+    )
+    monkeypatch.setattr(
+        cli,
+        "_coordinator_preflight",
+        lambda *_args: (repo_config, {"status": "stable"}),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_legacy_writer_stopped",
+        lambda repository: repository == "owner/repo",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_resolved_read_only_config",
+        lambda *_args: repo_config,
+    )
+    args = cli.parse_args(
+        [
+            "frontier",
+            "admit",
+            "--repo",
+            "owner/repo",
+            "--plan",
+            str(plan),
+            "--coordinator-context",
+            "context.json",
+        ]
+    )
+
+    with pytest.raises(core.PolicyError) as error:
+        cli._frontier(args)
+
+    assert error.value.code == "V61_WRITER_STOPPED"
+    assert writes == []
+    read_only = cli._frontier(
+        cli.parse_args(["frontier", "scan", "--repo", "owner/repo"])
+    )
+    assert read_only["status"] == "needs-admission"
+    assert writes == []
+
+    def unavailable(_repository):
+        raise ValueError("contradictory durable fence")
+
+    monkeypatch.setattr(cli, "_legacy_writer_stopped", unavailable)
+    with pytest.raises(core.PolicyError) as unavailable_error:
+        cli._frontier(args)
+    assert unavailable_error.value.code == "V61_WRITER_FENCE_UNAVAILABLE"
+    assert writes == []
+
+
+def test_production_legacy_writer_readback_uses_github_and_paseo_authority(
+    monkeypatch,
+):
+    _, cli = _modules()
+
+    class FakeContentClient:
+        def read(self, _repository, _branch, _path):
+            return None
+
+    class FakeGitHub:
+        def snapshot(self, repo, branch):
+            assert (repo, branch) == ("owner/repo", "dev")
+            return {
+                "repository": repo,
+                "issues": [
+                    {
+                        "dispatch": {
+                            "id": "dispatch-issue-7-a1",
+                            "status": "claiming",
+                        }
+                    },
+                    {
+                        "dispatch": {
+                            "id": "dispatch-issue-8-a1",
+                            "status": "retired",
+                        }
+                    },
+                ],
+            }
+
+    class FakePaseo:
+        def agents_for_labels(self, labels):
+            assert labels == {
+                "orch.repository": "owner/repo",
+                "orch.role": "worker",
+            }
+            return [
+                {"id": "agent-7", "status": "idle", "archivedAt": None},
+                {
+                    "id": "agent-old",
+                    "status": "closed",
+                    "archivedAt": "2026-07-24T00:00:00Z",
+                },
+            ]
+
+    monkeypatch.setattr(cli, "GitHub", FakeGitHub)
+    monkeypatch.setattr(cli, "Paseo", FakePaseo)
+    monkeypatch.setattr(
+        cli,
+        "GitHubCliContentClient",
+        lambda **_kwargs: FakeContentClient(),
+    )
+
+    control = cli.production_legacy_writer_control(
+        {"integration_branch": "dev"}
+    )
+    readback = control.readback("owner/repo")
+
+    assert readback.active_dispatches == ("dispatch-issue-7-a1",)
+    assert readback.integration_lease is False
+    assert readback.active_workers == ("agent-7",)
+
+
 def test_github_admit_writes_a_v2_record_then_reads_back_ready_state():
     core, cli = _modules()
     contract = _contract_v2(core)

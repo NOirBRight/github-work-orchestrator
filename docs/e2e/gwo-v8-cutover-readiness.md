@@ -4,23 +4,23 @@
 
 检查日期：2026-07-24
 
-本报告只做读取、配置校验和一次性 Runtime smoke。它没有发布生产
-Activation、创建 V8 Store、停止 V6.1、修改 Issue 状态或执行 writer
-cutover。
+本报告记录读取、配置校验、一次性 Runtime smoke，以及 PR 合并后的
+frontier 清理。它没有发布生产 Activation、创建 V8 Store、发布
+V6.1 stop fence 或执行 writer cutover。
 
 ## 已通过
 
 ### 实现与交付
 
-- V8 Phase 0–4C 和 Integration Batch 已落在 `dev`。
-- PR `#53` 已创建并解决与 `main` 的 V7 历史文档冲突：
+- V8 Phase 0–4C 和 Integration Batch 已合入 `main`。
+- PR `#53` 已合并：
   `https://github.com/NOirBRight/github-work-orchestrator/pull/53`。
-- 合并冲突修正和模型配置验证所针对的实现 head 为
-  `a6f3246700b46769f274b432542444b4b4c6ad0d`，GitHub 回读为
-  `MERGEABLE/CLEAN`；本报告和 CI workflow 将作为后续文档提交加入
-  同一 PR。
+- merge commit 为 `e247294e1a8a7f5147989dd97bcfb0691c8eb172`；
+  PR exact-head CI 与合并后的 `main` push CI 均通过。
 - 专用 canary 的三节点 Batch E2E 已通过，详见
   `docs/e2e/gwo-v8-canary.md`。
+- `#39`–`#50` 与 `#52` 已按合并证据关闭；`#51` 保留为最终生产
+  cutover 的人工 Decision Gate。
 - 本地仓库验收和 Skill package quick validation 已通过。
 
 ### Runtime 配置
@@ -65,10 +65,9 @@ Fail-closed 的只读决定为：
   "mutations": 0,
   "decision": "blocked",
   "proposed_actions": [
-    "merge_pr_53",
-    "reconcile_completed_v8_tickets",
+    "merge_issue_54_production_fence",
     "select_and_compile_one_real_low_risk_plan",
-    "implement_and_read_back_the_production_v61_fence",
+    "create_control_branch_and_run_pre_cutover_shadow",
     "publish_writer_and_activation_only_after_explicit_cutover_authorization"
   ]
 }
@@ -79,34 +78,35 @@ Fail-closed 的只读决定为：
 
 ## 当前阻塞项
 
-### 1. Issue frontier 仍包含已完成的 V8 实现 Tickets
+### 1. 生产 fence 尚未发布
 
-真实仓库当前有 15 个开放的 `ready-for-agent` Issues，其中
-`#45`–`#52` 对应的能力已经由 PR `#53` 实现。`#39`–`#44` 也仍然
-开放，只是被标记为 `ready-for-human`。
+`#54` 已拆出为唯一 V8 可执行下一步。本变更候选实现了生产
+`GitHubLegacyWriterControl`、V6.1 mutation guard，以及 GitHub/Paseo
+权威 readback；在它合并前，生产线仍只有已合并的 protocol 和
+InMemory fake。
 
-在 PR 合并并对这些 Tickets 做完成核对前，V8 Intake 会把已完成工作
-重新视为候选。这些 Issues 应在合并时关闭或移除 executable triage
-状态，不能靠 Kernel 猜测“代码可能已经完成”。
+即使代码合并，安装本身也不会创建 `gwo-control` 或发布 stop fence。
+这两个动作属于后续 cutover 窗口。
 
-### 2. V6.1 writer 尚未排空
+### 2. V6.1 已清理逻辑残留，但尚未执行 durable stop
 
-- Issue `#26` 仍带 `orch:active`。
+- `dispatch-issue-26-a1` 已以原身份标为 `retired`；它从未创建 Worker、
+  Workspace、branch、PR 或 Candidate。
+- `#26`、`#27`、`#31` 已作为被 V8 取代的 V7 工作关闭。
 - V7 Orchestrator Agent
-  `5007c7f3-feb4-4a54-9fbb-b4f13e77e517` 仍为 idle、未归档。
-- `v7-integration` Workspace/branch 仍存在。
+  `5007c7f3-feb4-4a54-9fbb-b4f13e77e517` 已软归档。
+- 两个 V7 审计 worktree 仍保留，没有 Agent 绑定，也没有被删除。
 
-时间经过或 Agent idle 都不能证明 writer 已停止。切换前需要真实
-V6.1 stop/readback，确认没有 active Dispatch、Integration lease 或
-Worker 写权限。
+`#54` candidate 的生产 readback 已对真实仓库执行一次只读验证：
+`stopped=false`、`active_dispatches=[]`、`integration_lease=false`、
+`active_workers=[]`。这说明执行残留已排空，同时也正确证明 durable
+stop 尚未发生。
 
-### 3. 生产 LegacyWriterControl 适配器尚未落地
+这些事实消除了已知 active execution，但不等于 durable stop。切换时
+仍必须发布并回读 fence，并再次证明没有 non-terminal Dispatch、
+Integration command 或未归档 Worker。
 
-V8 已有 `LegacyWriterControl` 协议、cutover 状态机和失败测试，但当前
-只有 `InMemoryLegacyWriterControl`。没有生产适配器时，代码无法证明
-V6.1 已停止；因此不能调用 `WriterCutoverController.cutover()`。
-
-### 4. 还没有首个真实 canonical Plan Revision
+### 3. 还没有首个真实 canonical Plan Revision
 
 生产切换需要一个已经通过 `/to-spec` 或等价确定性入口生成的低风险
 PlanSpec。它必须在切换窗口中按顺序完成：
@@ -118,17 +118,15 @@ PlanSpec。它必须在切换窗口中按顺序完成：
 
 ## 最短可行切换路径
 
-1. 等 PR `#53` 的最终 CI 通过并合并。
-2. 依据合并结果关闭或重新分类 `#39`–`#52`，得到真实的新工作
-   frontier。
-3. 实现一个窄的生产 `LegacyWriterControl`，只负责 stop、restore 和
-   authoritative readback，不引入新的状态机。
-4. 从一个真实、低风险、文件范围明确的 Ready Ticket 生成首个
+1. 完成 `#54` 的本地验收、一次 PR CI 和合并。
+2. 创建专用 `gwo-control`，但此时仍不发布 Activation 或 Admission。
+3. 从一个真实、低风险、文件范围明确的 Ready Ticket 生成首个
    canonical PlanSpec。
-5. 再次运行只读 Shadow；预期从 `blocked` 变为 `would_admit`，且
+4. 再次运行只读 Shadow；预期从 `blocked` 变为 `would_admit`，且
    GitHub、Git、Paseo 和 Store 写入计数仍为零。
-6. 向用户展示 exact Plan digest、V6.1 fence readback 和 rollback
-   目标，取得单独授权后才执行生产 writer cutover。
+5. 向用户展示 exact Plan digest、预期 V6.1 fence action 和 rollback
+   目标，取得单独授权。
+6. 在授权窗口内发布 stop fence，回读 V6.1 零执行权，再由
+   `WriterCutoverController` 发布 writer generation 与 Activation。
 
-在上述六步完成前，不建议创建生产 V8 Activation，也不建议关闭或
-归档现有 Coordinator。
+在上述六步完成前，不得创建生产 V8 Activation。
