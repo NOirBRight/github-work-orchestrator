@@ -452,22 +452,25 @@ class GitHubCliDeliveryControl:
                 ),
             ]
         )
-        readback = self._read_candidate_pull_request(
-            repository,
-            candidate_sha,
-            target_branch,
+        for attempt in range(5):
+            readback = self._read_candidate_pull_request(
+                repository,
+                candidate_sha,
+                target_branch,
+            )
+            if readback is not None:
+                return readback
+            if attempt < 4:
+                self._wait_for_publication_readback()
+        detail = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or "pull request creation did not read back"
         )
-        if readback is None:
-            detail = (
-                result.stderr.strip()
-                or result.stdout.strip()
-                or "pull request creation did not read back"
-            )
-            raise DeliveryControlError(
-                "PULL_REQUEST_CREATE_AMBIGUOUS",
-                detail,
-            )
-        return readback
+        raise DeliveryControlError(
+            "PULL_REQUEST_CREATE_AMBIGUOUS",
+            detail,
+        )
 
     def _read_publication_status(
         self,
@@ -662,10 +665,21 @@ class GitHubCliDeliveryControl:
             for check in required_checks
         }
         if expected:
+
+            def _is_simple_workflow_name(run_name: Any) -> bool:
+                return isinstance(run_name, str) and " / " not in run_name
+
             observations = [
                 run
                 for run in runs
-                if run.get("name") in expected or run.get("workflowName") in expected
+                if (
+                    _is_simple_workflow_name(run.get("name"))
+                    and run.get("name") in expected
+                )
+                or (
+                    _is_simple_workflow_name(run.get("workflowName"))
+                    and run.get("workflowName") in expected
+                )
             ]
             matched_names = {
                 str(run.get("name"))

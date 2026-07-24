@@ -1469,6 +1469,8 @@ class _FakeGitHubDelivery(GitHubCliDeliveryControl):
         self.pull_requests = []
         self.pull_request_create_returncode = 0
         self.pull_request_visible_after_failed_create = False
+        self.pull_request_visibility_delay = 0
+        self.pull_request_reads = 0
         self.manifest_visibility_delay = 0
         self.manifest_reads = 0
 
@@ -1511,7 +1513,11 @@ class _FakeGitHubDelivery(GitHubCliDeliveryControl):
             command[:4] == ["gh", "api", "--method", "GET"]
             and command[4].endswith("/pulls")
         ):
-            stdout = json.dumps(self.pull_requests)
+            self.pull_request_reads += 1
+            if self.pull_request_reads > self.pull_request_visibility_delay:
+                stdout = json.dumps(self.pull_requests)
+            else:
+                stdout = json.dumps([])
         elif (
             command[:4] == ["gh", "api", "--method", "POST"]
             and command[4].endswith("/pulls")
@@ -1637,6 +1643,26 @@ def test_github_delivery_adopts_pull_request_after_ambiguous_create(tmp_path):
 
     assert publication.source_ref == "https://github.invalid/pull/1"
     assert len(delivery.pull_requests) == 1
+
+
+def test_github_delivery_retries_eventually_consistent_pull_request_readback(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    candidate_sha = _git(repository, "rev-parse", "HEAD")
+    delivery = _FakeGitHubDelivery(repository, candidate_sha)
+    delivery.pull_request_visibility_delay = 2
+
+    publication = delivery.publish_once(
+        "owner/repository",
+        candidate_sha,
+        "e" * 64,
+        target_branch="dev",
+    )
+
+    assert publication.source_ref == "https://github.invalid/pull/1"
+    assert len(delivery.pull_requests) == 1
+    assert delivery.pull_request_reads == 3
 
 
 def test_github_delivery_fails_closed_on_candidate_pull_request_conflict(
@@ -1869,6 +1895,40 @@ def test_github_delivery_matches_exact_workflow_job_name(tmp_path):
     assert hosted.status == "passed"
     assert hosted.source_ref == "https://github.invalid/actions/runs/51/job/1"
     assert hosted.definition_digests == ("d" * 64,)
+
+
+def test_github_delivery_does_not_match_combined_name_at_workflow_level(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    candidate_sha = _git(repository, "rev-parse", "HEAD")
+    delivery = _FakeGitHubDelivery(repository, candidate_sha)
+    delivery.runs = [
+        {
+            "databaseId": 51,
+            "status": "completed",
+            "conclusion": "success",
+            "url": "https://github.invalid/actions/runs/51",
+            "headSha": candidate_sha,
+            "name": "GWO CI / acceptance",
+            "workflowName": "GWO CI / acceptance",
+        }
+    ]
+    required = (
+        {
+            "check_id": "hosted-required",
+            "hosted_name": "GWO CI / acceptance",
+            "definition_digest": "d" * 64,
+        },
+    )
+
+    hosted = delivery.read_hosted_checks(
+        "owner/repository",
+        candidate_sha,
+        required,
+    )
+
+    assert hosted.status == "pending"
 
 
 def test_github_delivery_does_not_match_job_from_another_sha(tmp_path):
