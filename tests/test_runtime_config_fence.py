@@ -357,3 +357,28 @@ def test_migration_does_not_clobber_backup_created_concurrently(tmp_path, monkey
     assert error.value.code == "CONFIG_MIGRATION_BACKUP_CONFLICT"
     assert backup.read_bytes() == concurrent_bytes
     assert not config.exists()
+
+
+def test_migration_does_not_publish_mutated_predictable_temporary(
+    tmp_path, monkeypatch
+):
+    legacy = tmp_path / "providers.json"
+    config = tmp_path / "config.json"
+    predictable_temporary = tmp_path / "config.json.tmp"
+    injected = b'{"unvalidated": true}'
+    _legacy(legacy)
+
+    real_link = os.link
+
+    def mutate_predictable_temporary(src, dst):
+        if Path(dst) == tmp_path / "providers.v5.backup.json":
+            predictable_temporary.write_bytes(injected)
+        return real_link(src, dst)
+
+    monkeypatch.setattr(os, "link", mutate_predictable_temporary)
+
+    migrated = core.migrate_config_file(legacy, config)
+    installed = json.loads(config.read_text(encoding="utf-8"))
+
+    assert core.validate_config(installed) == migrated
+    assert config.read_bytes() != injected

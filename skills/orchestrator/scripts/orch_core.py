@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import os
 import re
+import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -3227,6 +3228,25 @@ def load_or_migrate_config(
     return validate_config(default_config())
 
 
+def _write_unique_temporary(target: Path, content: bytes) -> Path:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+    except Exception:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+    return temporary
+
+
 def migrate_config_file(old_path: Path, new_path: Path) -> dict[str, Any]:
     old_path, new_path = Path(old_path), Path(new_path)
     if new_path.exists():
@@ -3248,18 +3268,17 @@ def migrate_config_file(old_path: Path, new_path: Path) -> dict[str, Any]:
             "legacy configuration backup already exists with different bytes",
         )
 
-    config_temporary = new_path.with_suffix(new_path.suffix + ".tmp")
-    backup_temporary = backup.with_suffix(backup.suffix + ".tmp")
+    config_bytes = (
+        json.dumps(migrated, indent=2, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    config_temporary = _write_unique_temporary(new_path, config_bytes)
+    backup_temporary: Path | None = None
     config_created = False
     backup_created = False
     try:
-        config_temporary.write_text(
-            json.dumps(migrated, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
         validate_config(json.loads(config_temporary.read_text(encoding="utf-8")))
         if not backup.exists():
-            backup_temporary.write_bytes(source_bytes)
+            backup_temporary = _write_unique_temporary(backup, source_bytes)
             try:
                 os.link(backup_temporary, backup)
             except FileExistsError as error:
@@ -3287,7 +3306,8 @@ def migrate_config_file(old_path: Path, new_path: Path) -> dict[str, Any]:
         raise
     finally:
         config_temporary.unlink(missing_ok=True)
-        backup_temporary.unlink(missing_ok=True)
+        if backup_temporary is not None:
+            backup_temporary.unlink(missing_ok=True)
 
 
 def project_result(*, permission: bool, drift: list[str]) -> dict[str, Any]:
