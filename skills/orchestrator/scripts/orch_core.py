@@ -1409,6 +1409,23 @@ def resolve_runtime(
     )
 
 
+def _frontier_profile_complete(mapping: Any) -> bool:
+    if not isinstance(mapping, dict):
+        return False
+    settings = mapping.get("settings")
+    if not isinstance(settings, dict):
+        return False
+    concrete_values = (
+        mapping.get("provider"),
+        settings.get("model"),
+        settings.get("thinkingOptionId"),
+        settings.get("modeId"),
+    )
+    return all(
+        isinstance(value, str) and bool(value.strip()) for value in concrete_values
+    ) and isinstance(settings.get("features"), dict)
+
+
 def resolve_runtime_request(
     config: dict[str, Any],
     *,
@@ -1440,20 +1457,7 @@ def resolve_runtime_request(
                 "RUNTIME_FRONTIER_PROFILE_MISSING",
                 "frontier tier has no configured profile",
             )
-        settings = mapping.get("settings") if isinstance(mapping, dict) else {}
-        if (
-            not isinstance(mapping, dict)
-            or not isinstance(mapping.get("provider"), str)
-            or not mapping.get("provider")
-            or not isinstance(settings, dict)
-            or not isinstance(settings.get("model"), str)
-            or not settings.get("model")
-            or not isinstance(settings.get("thinkingOptionId"), str)
-            or not settings.get("thinkingOptionId")
-            or not isinstance(settings.get("modeId"), str)
-            or not settings.get("modeId")
-            or not isinstance(settings.get("features"), dict)
-        ):
+        if not _frontier_profile_complete(mapping):
             raise PolicyError(
                 "RUNTIME_FRONTIER_PROFILE_INVALID",
                 "frontier tier profile is incomplete",
@@ -3033,6 +3037,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         ),
     ):
         for tier, binding in mappings.items():
+            if tier == "frontier" and not _frontier_profile_complete(binding):
+                raise PolicyError(
+                    "RUNTIME_FRONTIER_PROFILE_INVALID",
+                    f"invalid {scope} frontier profile",
+                )
             if tier not in TIERS or not isinstance(binding, dict):
                 raise PolicyError(
                     "RUNTIME_BINDING_INVALID", f"invalid {scope} tier mapping"

@@ -236,8 +236,11 @@ def test_kimi_and_codex_launch_and_adoption_leave_config_bytes_unchanged(tmp_pat
     "settings",
     [
         {"model": "", "thinkingOptionId": "xhigh", "modeId": "full-access", "features": {}},
+        {"model": "   ", "thinkingOptionId": "xhigh", "modeId": "full-access", "features": {}},
         {"model": "gpt-5.6-sol", "thinkingOptionId": "", "modeId": "full-access", "features": {}},
+        {"model": "gpt-5.6-sol", "thinkingOptionId": "\t", "modeId": "full-access", "features": {}},
         {"model": "gpt-5.6-sol", "thinkingOptionId": "xhigh", "modeId": "", "features": {}},
+        {"model": "gpt-5.6-sol", "thinkingOptionId": "xhigh", "modeId": "\n", "features": {}},
         {"model": "gpt-5.6-sol", "thinkingOptionId": "xhigh", "modeId": "full-access", "features": []},
     ],
 )
@@ -259,10 +262,11 @@ def test_frontier_worker_rejects_empty_or_wrong_type_profile_fields(settings):
     assert invalid.value.code == "RUNTIME_FRONTIER_PROFILE_INVALID"
 
 
-def test_frontier_worker_rejects_empty_provider():
+@pytest.mark.parametrize("provider", ["", " ", "\t"])
+def test_frontier_worker_rejects_empty_provider(provider):
     config = core.default_config()
     config["tiers"]["frontier"] = {
-        "provider": "",
+        "provider": provider,
         "settings": {
             "model": "gpt-5.6-sol",
             "thinkingOptionId": "xhigh",
@@ -281,6 +285,27 @@ def test_frontier_worker_rejects_empty_provider():
                 "settings": {"model": "gpt-5.6-sol", "modeId": "full-access"},
             },
         )
+
+    assert invalid.value.code == "RUNTIME_FRONTIER_PROFILE_INVALID"
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        [],
+        {"provider": "codex", "settings": []},
+    ],
+)
+def test_file_backed_frontier_profile_uses_precise_validation_error(
+    tmp_path, mapping
+):
+    config = core.default_config()
+    config["tiers"]["frontier"] = mapping
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(core.PolicyError) as invalid:
+        core.load_or_migrate_config(config_path)
 
     assert invalid.value.code == "RUNTIME_FRONTIER_PROFILE_INVALID"
 
