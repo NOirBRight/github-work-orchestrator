@@ -179,7 +179,7 @@ def test_frontier_worker_rejects_an_incomplete_profile(mapping):
     assert invalid.value.code == "RUNTIME_FRONTIER_PROFILE_INVALID"
 
 
-def test_kimi_and_codex_launch_and_adoption_leave_config_bytes_unchanged(tmp_path):
+def test_kimi_and_codex_launch_and_readback_leave_config_bytes_unchanged(tmp_path):
     config_path = tmp_path / "config.json"
     config = core.default_config()
     config["global"]["unrelated_override"] = "preserve"
@@ -226,9 +226,9 @@ def test_kimi_and_codex_launch_and_adoption_leave_config_bytes_unchanged(tmp_pat
         prompt = RuntimePrompt(text=f"work-{ordinal}", digest=f"{ordinal}" * 64)
 
         launched = adapter.materialize(admission, prompt)
-        adopted = adapter.read_binding(admission, prompt)
+        read_back = adapter.read_binding(admission, prompt)
 
-        assert adopted == launched
+        assert read_back == launched
         assert config_path.read_bytes() == original
 
 
