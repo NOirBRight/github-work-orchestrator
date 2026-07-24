@@ -47,7 +47,7 @@ def test_paseo_cli_client_resolves_windows_command_trampoline(monkeypatch):
     assert PaseoCliClient().executable == resolved
 
 
-def test_paseo_cli_create_atomically_labels_prompt_and_accepts_agent_id(
+def test_paseo_cli_create_publishes_prompt_digest_after_activity_readback(
     monkeypatch,
 ):
     client = PaseoCliClient(executable="paseo")
@@ -72,10 +72,7 @@ def test_paseo_cli_create_atomically_labels_prompt_and_accepts_agent_id(
         thinking=profile.thinking,
         mode=profile.mode,
         features={},
-        labels={
-            "gwo.action_key": "action-1",
-            "gwo.prompt_digest": prompt.digest,
-        },
+        labels={},
         lifecycle="running",
         archived=False,
     )
@@ -83,24 +80,22 @@ def test_paseo_cli_create_atomically_labels_prompt_and_accepts_agent_id(
 
     def run(command, **_kwargs):
         commands.append(command)
-        return {"agentId": record.agent_id}
+        if command[0] == "run":
+            return {"agentId": record.agent_id}
+        if command[:2] == ["agent", "update"]:
+            return {"status": "updated"}
+        raise AssertionError(command)
 
     monkeypatch.setattr(client, "_run", run)
     monkeypatch.setattr(
         client,
-        "find_by_labels",
-        lambda labels: (
-            record
-            if labels["gwo.prompt_digest"] == prompt.digest
-            else None
-        ,),
+        "_run_text",
+        lambda *_args, **_kwargs: f"[User] {prompt.text}\n",
     )
     monkeypatch.setattr(
         client,
-        "update_labels",
-        lambda *_args, **_kwargs: pytest.fail(
-            "prompt identity must be atomic with create"
-        ),
+        "find_by_labels",
+        lambda labels: (replace(record, labels=dict(labels)),),
     )
 
     created = client.create(
@@ -118,8 +113,10 @@ def test_paseo_cli_create_atomically_labels_prompt_and_accepts_agent_id(
 
     assert created.agent_id == record.agent_id
     prompt_label = f"gwo.prompt_digest={prompt.digest}"
-    assert prompt_label in commands[0]
-    assert commands[0].index(prompt_label) < commands[0].index("--json")
+    assert prompt_label not in commands[0]
+    assert prompt.text == commands[0][-1]
+    assert prompt_label in commands[1]
+    assert created.labels["gwo.prompt_digest"] == prompt.digest
 
 
 def _ready_source() -> dict:
@@ -2328,6 +2325,42 @@ def test_changed_candidate_review_request_carries_bounded_prior_context(
     assert request.candidate_delta is not None
     assert "result.txt" in request.candidate_delta
     assert len(request.candidate_delta) <= 4000
+
+
+def test_review_request_references_large_outcome_contents_by_digest(tmp_path):
+    _node, _runtime, binding, observation = _execute_candidate(
+        tmp_path,
+        risk="standard",
+    )
+    content = "large frozen source payload\n" * 20_000
+    request = Kernel._review_request(
+        state={
+            "repository": "local/phase-three",
+            "base_sha": _git(Path(binding.workspace), "rev-parse", "HEAD^"),
+        },
+        goal={"acceptance": ["materialize the exact declared file"]},
+        work_item={
+            "source_ref": "synthetic://issue/large",
+            "outcome_contract": {
+                "file_changes": [
+                    {"path": "result.txt", "content": content},
+                ]
+            },
+        },
+        binding=binding,
+        observation=observation,
+        axis="spec",
+        recovery_ordinal=0,
+    )
+
+    spec = json.loads(request.spec_text)
+    reference = spec["outcome_contract"]["file_changes"][0]
+    assert reference == {
+        "path": "result.txt",
+        "content_digest": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "content_bytes": len(content.encode("utf-8")),
+    }
+    assert content not in request.to_prompt().text
 
 
 def test_strict_review_adds_specialist_then_waits_for_bound_human_decision(

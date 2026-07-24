@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import errno
 from fnmatch import fnmatchcase
 import hashlib
 import json
@@ -13,6 +14,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from typing import Any, Protocol
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
@@ -22,6 +25,12 @@ from ._effects import (
     normalized_relative_path,
 )
 from .evidence import ResultClaim, TypedEvidence
+
+
+PASEO_INLINE_PROMPT_MAX_BYTES = 8_192
+PASEO_PROMPT_ACTIVITY_TAIL = 200
+PASEO_BOOTSTRAP_WAIT_SECONDS = 30.0
+PASEO_BOOTSTRAP_POLL_SECONDS = 0.25
 
 
 class RuntimeAdapterError(RuntimeError):
@@ -886,6 +895,12 @@ class PaseoClient(Protocol):
         action_key: str,
     ) -> None: ...
 
+    def prompt_acceptance_count(
+        self,
+        agent_id: str,
+        prompt: RuntimePrompt,
+    ) -> int: ...
+
     def update_labels(self, agent_id: str, labels: dict[str, str]) -> None: ...
 
     def read_output(self, agent_id: str) -> str | None: ...
@@ -909,12 +924,16 @@ class InMemoryPaseoClient:
         self,
         *,
         create_failures: tuple[str, ...] = (),
+        send_acceptances: tuple[bool, ...] = (),
         worker_turn_capacity: int | None = None,
     ):
         self._agents: dict[str, PaseoAgentRecord] = {}
         self._create_failures = list(create_failures)
+        self._send_acceptances = list(send_acceptances)
+        self._accepted_prompt_digests: dict[str, list[str]] = {}
         self._worker_turn_capacity = worker_turn_capacity
         self.create_count = 0
+        self.send_count = 0
         self.create_prompt_digests: list[str] = []
 
     def observed_worker_turn_capacity(
@@ -983,11 +1002,11 @@ class InMemoryPaseoClient:
             labels={
                 **request.labels,
                 "gwo.action_key": request.action_key,
-                "gwo.prompt_digest": request.prompt.digest,
             },
             lifecycle="running",
         )
         self._agents[agent_id] = record
+        self._accepted_prompt_digests[agent_id] = [request.prompt.digest]
         if failure == "ambiguous_after_create":
             raise RuntimeAdapterError(
                 "PASEO_CREATE_AMBIGUOUS",
@@ -1014,12 +1033,31 @@ class InMemoryPaseoClient:
         action_key: str,
     ) -> None:
         del action_key
+        self.send_count += 1
         record = self.inspect(agent_id)
+        accepted = (
+            True
+            if not self._send_acceptances
+            else self._send_acceptances.pop(0)
+        )
+        if accepted:
+            self._accepted_prompt_digests.setdefault(agent_id, []).append(
+                prompt.digest
+            )
         self._agents[agent_id] = replace(
             record,
-            labels={**record.labels, "gwo.prompt_digest": prompt.digest},
-            lifecycle="running",
+            lifecycle="running" if accepted else "idle",
             output_text=None,
+        )
+
+    def prompt_acceptance_count(
+        self,
+        agent_id: str,
+        prompt: RuntimePrompt,
+    ) -> int:
+        self.inspect(agent_id)
+        return self._accepted_prompt_digests.get(agent_id, []).count(
+            prompt.digest
         )
 
     def update_labels(self, agent_id: str, labels: dict[str, str]) -> None:
@@ -1094,8 +1132,6 @@ class PaseoCliClient:
                     "PASEO_NODE_ENV": "production",
                     "PASEO_DESKTOP_MANAGED": "1",
                 }
-        self._known_labels: dict[str, dict[str, str]] = {}
-
     @staticmethod
     def classify_failure(message: str, *, default: str = "transient") -> str:
         lowered = message.casefold()
@@ -1125,6 +1161,39 @@ class PaseoCliClient:
             return "transient"
         return default
 
+    def _raise_process_start_error(
+        self,
+        error: OSError,
+        *,
+        failure_class: str,
+    ) -> None:
+        detail = str(error).casefold()
+        if (
+            getattr(error, "winerror", None) == 206
+            or error.errno == errno.E2BIG
+            or "argument list too long" in detail
+            or "command line is too long" in detail
+            or "filename or extension is too long" in detail
+        ):
+            raise RuntimeAdapterError(
+                "PASEO_COMMAND_LINE_OVERFLOW",
+                "Paseo process command line exceeded the host limit",
+                failure_class="permanent",
+            ) from error
+        if isinstance(error, FileNotFoundError) or getattr(
+            error, "winerror", None
+        ) in {2, 3}:
+            raise RuntimeAdapterError(
+                "PASEO_EXECUTABLE_UNAVAILABLE",
+                f"Paseo executable cannot start: {self.executable}",
+                failure_class="permanent",
+            ) from error
+        raise RuntimeAdapterError(
+            "PASEO_PROCESS_START_FAILED",
+            f"Paseo process could not start: {error}",
+            failure_class=failure_class,
+        ) from error
+
     def _run(
         self,
         args: list[str],
@@ -1140,11 +1209,10 @@ class PaseoCliClient:
                 env=self._command_environment,
             )
         except OSError as error:
-            raise RuntimeAdapterError(
-                "PASEO_EXECUTABLE_UNAVAILABLE",
-                f"Paseo executable cannot start: {self.executable}",
-                failure_class="permanent",
-            ) from error
+            self._raise_process_start_error(
+                error,
+                failure_class=failure_class,
+            )
         if result.returncode != 0:
             detail = (
                 result.stderr.strip()
@@ -1183,11 +1251,10 @@ class PaseoCliClient:
                 env=self._command_environment,
             )
         except OSError as error:
-            raise RuntimeAdapterError(
-                "PASEO_EXECUTABLE_UNAVAILABLE",
-                f"Paseo executable cannot start: {self.executable}",
-                failure_class="permanent",
-            ) from error
+            self._raise_process_start_error(
+                error,
+                failure_class=failure_class,
+            )
         if result.returncode != 0:
             detail = (
                 result.stderr.strip()
@@ -1349,24 +1416,22 @@ class PaseoCliClient:
                     "Paseo Agent listing omitted an identity",
                     failure_class="ambiguous",
                 )
-            records.append(self.inspect(agent_id))
-            self._known_labels[agent_id] = {
-                **self._known_labels.get(agent_id, {}),
-                **labels,
-            }
-            records[-1] = replace(
-                records[-1],
-                labels={
-                    **records[-1].labels,
-                    **self._known_labels[agent_id],
-                },
-                profile_digest=self._known_labels[agent_id].get(
-                    "gwo.profile_digest",
-                    records[-1].profile_digest,
-                ),
-                parent_agent_id=self._known_labels[agent_id].get(
-                    "gwo.parent_agent",
-                    records[-1].parent_agent_id,
+            record = self.inspect(agent_id)
+            records.append(
+                replace(
+                    record,
+                    labels={
+                        **record.labels,
+                        **labels,
+                    },
+                    profile_digest=labels.get(
+                        "gwo.profile_digest",
+                        record.profile_digest,
+                    ),
+                    parent_agent_id=labels.get(
+                        "gwo.parent_agent",
+                        record.parent_agent_id,
+                    ),
                 ),
             )
         return tuple(records)
@@ -1375,8 +1440,19 @@ class PaseoCliClient:
         worktree = f"gwo-{digest_bytes(request.action_key.encode('utf-8'))[:16]}"
         creation_labels = {
             **request.labels,
-            "gwo.prompt_digest": request.prompt.digest,
+            "gwo.action_key": request.action_key,
         }
+        prompt_bytes = request.prompt.text.encode("utf-8")
+        inline = len(prompt_bytes) <= PASEO_INLINE_PROMPT_MAX_BYTES
+        initial_prompt = (
+            request.prompt.text
+            if inline
+            else (
+                "GWO transport bootstrap "
+                f"{request.action_key}. Wait for the frozen Prompt; "
+                "do not inspect or modify files yet."
+            )
+        )
         command = [
             "run",
             "--detach",
@@ -1403,7 +1479,7 @@ class PaseoCliClient:
         ]
         for key, value in sorted(creation_labels.items()):
             command.extend(["--label", f"{key}={value}"])
-        command.extend(["--json", request.prompt.text])
+        command.extend(["--json", initial_prompt])
         payload = self._run(command, failure_class="ambiguous")
         if not isinstance(payload, dict):
             raise RuntimeAdapterError(
@@ -1432,10 +1508,46 @@ class PaseoCliClient:
             )
         matches = self.find_by_labels(creation_labels)
         exact = [item for item in matches if item.agent_id == agent_id]
-        if len(exact) != 1:
+        if len(matches) != 1 or len(exact) != 1:
             raise RuntimeAdapterError(
                 "PASEO_READBACK_INVALID",
                 "Paseo creation did not read back exact identity labels",
+                failure_class="ambiguous",
+            )
+        record = exact[0]
+        if not inline:
+            deadline = time.monotonic() + PASEO_BOOTSTRAP_WAIT_SECONDS
+            while record.lifecycle not in {"idle", "completed"}:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(PASEO_BOOTSTRAP_POLL_SECONDS)
+                record = self.inspect(agent_id)
+            if record.lifecycle in {"idle", "completed"}:
+                self.send_prompt(
+                    agent_id,
+                    request.prompt,
+                    action_key=request.action_key,
+                )
+        if self.prompt_acceptance_count(agent_id, request.prompt) == 1:
+            self.update_labels(
+                agent_id,
+                {"gwo.prompt_digest": request.prompt.digest},
+            )
+            accepted = self.find_by_labels(
+                {
+                    **creation_labels,
+                    "gwo.prompt_digest": request.prompt.digest,
+                }
+            )
+            exact = [item for item in accepted if item.agent_id == agent_id]
+            if len(accepted) == 1 and len(exact) == 1:
+                return exact[0]
+        pending = self.find_by_labels(creation_labels)
+        exact = [item for item in pending if item.agent_id == agent_id]
+        if len(pending) != 1 or len(exact) != 1:
+            raise RuntimeAdapterError(
+                "PASEO_READBACK_INVALID",
+                "Paseo creation identity became ambiguous",
                 failure_class="ambiguous",
             )
         return exact[0]
@@ -1448,20 +1560,7 @@ class PaseoCliClient:
                 "Paseo inspect returned an invalid Agent",
                 failure_class="ambiguous",
             )
-        record = self._agent(payload)
-        known = self._known_labels.get(agent_id, {})
-        return replace(
-            record,
-            labels={**record.labels, **known},
-            profile_digest=known.get(
-                "gwo.profile_digest",
-                record.profile_digest,
-            ),
-            parent_agent_id=known.get(
-                "gwo.parent_agent",
-                record.parent_agent_id,
-            ),
-        )
+        return self._agent(payload)
 
     def send_prompt(
         self,
@@ -1471,11 +1570,65 @@ class PaseoCliClient:
         action_key: str,
     ) -> None:
         del action_key
-        self._run(
-            ["send", "--no-wait", "--json", agent_id, prompt.text],
+        descriptor, prompt_path = tempfile.mkstemp(
+            prefix="gwo-prompt-",
+            suffix=".txt",
+        )
+        try:
+            with os.fdopen(
+                descriptor,
+                "w",
+                encoding="utf-8",
+                newline="",
+            ) as stream:
+                stream.write(prompt.text)
+            payload = self._run(
+                [
+                    "send",
+                    agent_id,
+                    "--prompt-file",
+                    prompt_path,
+                    "--no-wait",
+                    "--json",
+                ],
+                failure_class="ambiguous",
+            )
+        finally:
+            Path(prompt_path).unlink(missing_ok=True)
+        status = (
+            payload.get("status") or payload.get("Status")
+            if isinstance(payload, dict)
+            else None
+        )
+        if not isinstance(status, str) or status.casefold() != "sent":
+            raise RuntimeAdapterError(
+                "PASEO_PROMPT_ACK_INVALID",
+                "Paseo did not acknowledge the bounded Prompt send",
+                failure_class="ambiguous",
+            )
+
+    def prompt_acceptance_count(
+        self,
+        agent_id: str,
+        prompt: RuntimePrompt,
+    ) -> int:
+        activity = self._run_text(
+            ["logs", agent_id, "--tail", str(PASEO_PROMPT_ACTIVITY_TAIL)],
             failure_class="ambiguous",
         )
-        self.update_labels(agent_id, {"gwo.prompt_digest": prompt.digest})
+        needle = f"[User] {prompt.text}"
+        count = 0
+        offset = 0
+        while True:
+            index = activity.find(needle, offset)
+            if index < 0:
+                return count
+            starts_at_boundary = index == 0 or activity[index - 1] in "\r\n"
+            end = index + len(needle)
+            ends_at_boundary = end == len(activity) or activity[end] in "\r\n"
+            if starts_at_boundary and ends_at_boundary:
+                count += 1
+            offset = index + len("[User] ")
 
     def update_labels(self, agent_id: str, labels: dict[str, str]) -> None:
         command = ["agent", "update", agent_id]
@@ -1483,10 +1636,14 @@ class PaseoCliClient:
             command.extend(["--label", f"{key}={value}"])
         command.append("--json")
         self._run(command)
-        self._known_labels[agent_id] = {
-            **self._known_labels.get(agent_id, {}),
-            **labels,
-        }
+        matches = self.find_by_labels(labels)
+        exact = [record for record in matches if record.agent_id == agent_id]
+        if len(exact) != 1:
+            raise RuntimeAdapterError(
+                "PASEO_LABEL_READBACK_FAILED",
+                "Paseo did not read back the exact Agent label update",
+                failure_class="ambiguous",
+            )
 
     def read_output(self, agent_id: str) -> str | None:
         output = self._run_text(
@@ -1560,6 +1717,100 @@ class PaseoRuntimeAdapter:
             )
         return None if not matches else matches[0]
 
+    def _find_exact(
+        self,
+        agent_id: str,
+        labels: dict[str, str],
+        *,
+        code: str = "RUNTIME_IDENTITY_MISMATCH",
+    ) -> PaseoAgentRecord:
+        matches = self.client.find_by_labels(labels)
+        exact = [record for record in matches if record.agent_id == agent_id]
+        if len(matches) != 1 or len(exact) != 1:
+            raise RuntimeAdapterError(
+                code,
+                "Paseo authoritative label readback did not identify one Agent",
+                failure_class="ambiguous",
+            )
+        return exact[0]
+
+    def _prompt_is_accepted(
+        self,
+        agent_id: str,
+        prompt: RuntimePrompt,
+        identity_labels: dict[str, str],
+    ) -> bool:
+        published = self.client.find_by_labels(
+            {
+                **identity_labels,
+                "gwo.prompt_digest": prompt.digest,
+            }
+        )
+        if published:
+            exact = [record for record in published if record.agent_id == agent_id]
+            if len(published) != 1 or len(exact) != 1:
+                raise RuntimeAdapterError(
+                    "PROMPT_IDENTITY_MISMATCH",
+                    "Prompt digest label identifies a different or duplicate Agent",
+                    failure_class="ambiguous",
+                )
+            return True
+        count = self.client.prompt_acceptance_count(agent_id, prompt)
+        if count > 1:
+            raise RuntimeAdapterError(
+                "PROMPT_ACCEPTANCE_DUPLICATE",
+                "Paseo activity contains the exact Prompt more than once",
+                failure_class="ambiguous",
+            )
+        if count == 0:
+            return False
+        self.client.update_labels(
+            agent_id,
+            {"gwo.prompt_digest": prompt.digest},
+        )
+        self._find_exact(
+            agent_id,
+            {
+                **identity_labels,
+                "gwo.prompt_digest": prompt.digest,
+            },
+            code="PROMPT_LABEL_READBACK_FAILED",
+        )
+        return True
+
+    @staticmethod
+    def _binding_labels(
+        binding: RuntimeBinding,
+        *,
+        include_prompt: bool = True,
+        include_attempt: bool = True,
+    ) -> dict[str, str]:
+        labels = {
+            "gwo.repository": binding.repository,
+            "gwo.plan": binding.plan_digest,
+            "gwo.node": binding.node_key,
+            "gwo.admission": binding.admission_id,
+        }
+        optional = {
+            "gwo.repository_path": binding.repository_path,
+            "gwo.runtime_profile": binding.runtime_profile,
+            "gwo.profile_digest": binding.profile_digest,
+            "gwo.parent_agent": binding.parent_agent_id,
+            "gwo.base_sha": binding.base_sha,
+            "gwo.prompt_digest": (
+                binding.prompt_digest if include_prompt else None
+            ),
+            "gwo.attempt": binding.attempt_id if include_attempt else None,
+        }
+        labels.update(
+            {
+                key: value
+                for key, value in optional.items()
+                if isinstance(value, str) and value
+            }
+        )
+        return labels
+
     @staticmethod
     def _binding(agent: PaseoAgentRecord) -> RuntimeBinding:
         labels = agent.labels
@@ -1622,7 +1873,14 @@ class PaseoRuntimeAdapter:
             or binding.thinking != profile.thinking
             or binding.mode != profile.mode
             or binding.features_digest != digest_value(profile.features)
-            or binding.prompt_digest != prompt.digest
+            or (
+                binding.prompt_accepted
+                and binding.prompt_digest != prompt.digest
+            )
+            or (
+                not binding.prompt_accepted
+                and binding.prompt_digest is not None
+            )
         ):
             raise RuntimeAdapterError(
                 "RUNTIME_IDENTITY_MISMATCH",
@@ -1667,26 +1925,23 @@ class PaseoRuntimeAdapter:
                     parent_agent_id=admission.parent_agent_id,
                 )
             )
-        accepted = self._find_one(
+        accepted = self._prompt_is_accepted(
+            existing.agent_id,
+            prompt,
+            {"gwo.admission": admission.admission_id},
+        )
+        existing = self._find_exact(
+            existing.agent_id,
             {
-                "gwo.admission": admission.admission_id,
-                "gwo.prompt_digest": prompt.digest,
-            }
+                **labels,
+                **(
+                    {"gwo.prompt_digest": prompt.digest}
+                    if accepted
+                    else {}
+                ),
+            },
         )
-        if accepted is not None:
-            existing = replace(
-                existing,
-                labels={
-                    **existing.labels,
-                    "gwo.prompt_digest": prompt.digest,
-                },
-            )
-        binding = self._binding(self.client.inspect(existing.agent_id))
-        binding = replace(
-            binding,
-            prompt_accepted=accepted is not None,
-            prompt_digest=(prompt.digest if accepted is not None else None),
-        )
+        binding = self._binding(existing)
         self._assert_admission_identity(admission, binding, prompt)
         self._prompts[admission.admission_id] = prompt
         return binding
@@ -1718,34 +1973,30 @@ class PaseoRuntimeAdapter:
         agent = self._find_one(labels)
         if agent is None:
             return None
-        readback = self.client.inspect(agent.agent_id)
-        readback = replace(
-            readback,
-            labels={**readback.labels, **labels},
-            profile_digest=labels.get(
-                "gwo.profile_digest",
-                readback.profile_digest,
-            ),
-        )
+        accepted = False
         if prompt is not None:
-            accepted = self._find_one(
+            accepted = self._prompt_is_accepted(
+                agent.agent_id,
+                prompt,
                 {
                     "gwo.admission": (
                         admission
                         if isinstance(admission, str)
                         else admission.admission_id
-                    ),
-                    "gwo.prompt_digest": prompt.digest,
-                }
+                    )
+                },
             )
-            if accepted is not None:
-                readback = replace(
-                    readback,
-                    labels={
-                        **readback.labels,
-                        "gwo.prompt_digest": prompt.digest,
-                    },
-                )
+        readback = self._find_exact(
+            agent.agent_id,
+            {
+                **labels,
+                **(
+                    {"gwo.prompt_digest": prompt.digest}
+                    if accepted and prompt is not None
+                    else {}
+                ),
+            },
+        )
         binding = self._binding(readback)
         if expected_admission is not None and prompt is not None:
             self._assert_admission_identity(
@@ -1771,14 +2022,45 @@ class PaseoRuntimeAdapter:
                 "Paseo Binding has no Agent identity",
                 failure_class="ambiguous",
             )
-        raise RuntimeAdapterError(
-            "PROMPT_ACCEPTANCE_AMBIGUOUS",
-            (
-                "Paseo Agent exists without the immutable initial-Prompt "
-                "acknowledgement; automatic resend could execute it twice"
+        identity_labels = {"gwo.admission": binding.admission_id}
+        agent = self._find_exact(
+            binding.agent_id,
+            self._binding_labels(
+                binding,
+                include_prompt=False,
+                include_attempt=False,
             ),
-            failure_class="ambiguous",
         )
+        if self._prompt_is_accepted(
+            binding.agent_id,
+            prompt,
+            identity_labels,
+        ):
+            return
+        if agent.lifecycle not in {"idle", "completed"}:
+            raise RuntimeAdapterError(
+                "PROMPT_DELIVERY_BUSY",
+                "Paseo Agent is not idle at the exact Prompt boundary",
+                failure_class="transient",
+            )
+        self.client.send_prompt(
+            binding.agent_id,
+            prompt,
+            action_key=f"{binding.admission_id}:prompt",
+        )
+        if not self._prompt_is_accepted(
+            binding.agent_id,
+            prompt,
+            identity_labels,
+        ):
+            raise RuntimeAdapterError(
+                "PROMPT_ACCEPTANCE_AMBIGUOUS",
+                (
+                    "Paseo acknowledged the Prompt send without exact "
+                    "activity/message-boundary readback"
+                ),
+                failure_class="ambiguous",
+            )
 
     def attach_attempt(
         self,
@@ -1790,7 +2072,12 @@ class PaseoRuntimeAdapter:
                 "PROMPT_NOT_ACCEPTED",
                 "Attempt cannot bind before Paseo Prompt readback",
             )
-        existing = self.client.inspect(binding.agent_id).labels.get("gwo.attempt")
+        labels = self._binding_labels(
+            binding,
+            include_attempt=False,
+        )
+        agent = self._find_exact(binding.agent_id, labels)
+        existing = agent.labels.get("gwo.attempt")
         if existing not in {None, attempt_id}:
             raise RuntimeAdapterError(
                 "ATTEMPT_IDENTITY_MISMATCH",
@@ -1801,15 +2088,11 @@ class PaseoRuntimeAdapter:
             binding.agent_id,
             {"gwo.attempt": attempt_id},
         )
-        if (
-            self.client.inspect(binding.agent_id).labels.get("gwo.attempt")
-            != attempt_id
-        ):
-            raise RuntimeAdapterError(
-                "ATTEMPT_READBACK_FAILED",
-                "Paseo did not round-trip the Attempt identity",
-                failure_class="ambiguous",
-            )
+        self._find_exact(
+            binding.agent_id,
+            {**labels, "gwo.attempt": attempt_id},
+            code="ATTEMPT_READBACK_FAILED",
+        )
         return replace(binding, attempt_id=attempt_id)
 
     def resume(self, binding: RuntimeBinding) -> None:
@@ -1998,7 +2281,10 @@ class PaseoRuntimeAdapter:
                 "Paseo Binding has no Agent identity",
                 failure_class="ambiguous",
             )
-        agent = self.client.inspect(binding.agent_id)
+        agent = self._find_exact(
+            binding.agent_id,
+            self._binding_labels(binding),
+        )
         observed = self._binding(agent)
         if (
             observed.admission_id != binding.admission_id
@@ -2323,7 +2609,6 @@ class PaseoRuntimeAdapter:
             "gwo.review_input": request.fixed_input_digest,
             "gwo.runtime_profile": profile.name,
             "gwo.profile_digest": profile.digest,
-            "gwo.prompt_digest": prompt.digest,
         }
         if parent_agent_id is not None:
             labels["gwo.parent_agent"] = parent_agent_id
@@ -2354,7 +2639,48 @@ class PaseoRuntimeAdapter:
                         "Review child creation has no exact identity readback",
                         failure_class="ambiguous",
                     )
-                readback = self.client.inspect(agent.agent_id)
+                accepted = self._prompt_is_accepted(
+                    agent.agent_id,
+                    prompt,
+                    {"gwo.action_key": request.action_key},
+                )
+                if not accepted:
+                    if agent.lifecycle not in {"idle", "completed"}:
+                        raise RuntimeAdapterError(
+                            "REVIEW_AXIS_PROMPT_BUSY",
+                            (
+                                "Review child is not idle at the exact "
+                                "Prompt boundary"
+                            ),
+                            failure_class="transient",
+                        )
+                    self.client.send_prompt(
+                        agent.agent_id,
+                        prompt,
+                        action_key=request.action_key,
+                    )
+                    accepted = self._prompt_is_accepted(
+                        agent.agent_id,
+                        prompt,
+                        {"gwo.action_key": request.action_key},
+                    )
+                    if not accepted:
+                        raise RuntimeAdapterError(
+                            "REVIEW_AXIS_PROMPT_AMBIGUOUS",
+                            (
+                                "Review Prompt acknowledgement has no exact "
+                                "activity/message-boundary readback"
+                            ),
+                            failure_class="ambiguous",
+                        )
+                readback = self._find_exact(
+                    agent.agent_id,
+                    {
+                        **labels,
+                        "gwo.prompt_digest": prompt.digest,
+                    },
+                    code="REVIEW_AXIS_READBACK_MISSING",
+                )
                 return self._review_binding(
                     readback,
                     request,
@@ -2394,7 +2720,25 @@ class PaseoRuntimeAdapter:
                 "Review axis Binding does not match the fixed request",
                 failure_class="ambiguous",
             )
-        agent = self.client.inspect(binding.agent_id)
+        labels = {
+            "gwo.action_key": request.action_key,
+            "gwo.repository": request.repository,
+            "gwo.review_attempt": request.attempt_id,
+            "gwo.review_candidate": request.candidate_sha,
+            "gwo.review_axis": request.axis,
+            "gwo.review_recovery": str(request.recovery_ordinal),
+            "gwo.review_input": request.fixed_input_digest,
+            "gwo.runtime_profile": binding.runtime_profile,
+            "gwo.profile_digest": binding.profile_digest,
+            "gwo.prompt_digest": binding.prompt_digest,
+        }
+        if binding.parent_agent_id is not None:
+            labels["gwo.parent_agent"] = binding.parent_agent_id
+        agent = self._find_exact(
+            binding.agent_id,
+            labels,
+            code="REVIEW_AXIS_IDENTITY_MISMATCH",
+        )
         if (
             agent.agent_id != binding.agent_id
             or agent.session_id != binding.session_id

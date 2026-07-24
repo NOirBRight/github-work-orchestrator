@@ -4239,6 +4239,32 @@ class Kernel:
         return ReviewAxisObservation(**body)
 
     @staticmethod
+    def _compact_review_contract(value: Any) -> Any:
+        """Replace authoritative file payloads with exact workspace references."""
+
+        if isinstance(value, list):
+            return [
+                Kernel._compact_review_contract(item)
+                for item in value
+            ]
+        if not isinstance(value, dict):
+            return value
+        path = value.get("path")
+        content = value.get("content")
+        compacted = {
+            str(key): Kernel._compact_review_contract(item)
+            for key, item in value.items()
+            if key != "content"
+        }
+        if isinstance(path, str) and path and isinstance(content, str):
+            encoded = content.encode("utf-8")
+            compacted["content_digest"] = digest_bytes(encoded)
+            compacted["content_bytes"] = len(encoded)
+        elif "content" in value:
+            compacted["content"] = Kernel._compact_review_contract(content)
+        return compacted
+
+    @staticmethod
     def _review_request(
         *,
         state: dict[str, Any],
@@ -4271,7 +4297,9 @@ class Kernel:
         spec_text = canonical_bytes(
             {
                 "goal_acceptance": goal.get("acceptance") or [],
-                "outcome_contract": work_item.get("outcome_contract") or {},
+                "outcome_contract": Kernel._compact_review_contract(
+                    work_item.get("outcome_contract") or {}
+                ),
             }
         ).decode("utf-8")
         prior_context = state.get("prior_review_context") or {}

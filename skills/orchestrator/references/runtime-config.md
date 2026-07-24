@@ -202,6 +202,58 @@ K2.7 `kimi-cli` value `on` as a narrow discovery compatibility exception. K3
 continues to use its native `high/max` levels. This does not weaken capability
 validation for another provider, model, or thinking value.
 
+## V8 Paseo Prompt transport and readback
+
+Worker and Review initial Prompts use the same bounded transport contract. An
+initial Prompt of at most 8 KiB may be passed to `paseo run`; the limit is
+deliberately below the Windows process command-line limit. A larger Prompt
+creates the Agent with a short action-keyed bootstrap, waits for the Agent to
+become idle, then uses `paseo send <agent> --prompt-file <temporary-path>
+--no-wait --json`. Follow-up Worker and Review sends use the same temporary
+UTF-8 Prompt-file path. The adapter closes the file before Paseo reads it and
+removes it immediately after the command returns.
+
+A successful create response or `status: sent` is transport acknowledgement,
+not Prompt acceptance. The adapter reads the Agent activity and requires one
+exact `[User] <frozen-prompt>` message boundary. Only then does it publish
+`gwo.prompt_digest=<sha256>`, and it reads that label back through a Paseo
+label-filtered listing. More than one exact activity boundary is
+`PROMPT_ACCEPTANCE_DUPLICATE` and remains ambiguous rather than being treated
+as success.
+
+`paseo inspect` may omit labels. Fresh Coordinator processes therefore rebuild
+Worker and Review identity from authoritative `paseo ls --label ...` queries
+using Admission or Review action identity, runtime profile, Candidate, parent,
+and Prompt digest. Process-local label caches are not part of correctness.
+After an acknowledgement loss, reconciliation queries the exact digest first:
+an accepted Prompt is adopted without another send. An acknowledged-but-dropped
+Prompt is replayed only when the same Agent is idle, with the same action key;
+the Admission or Review action never creates a replacement Agent while that
+identity exists.
+
+Process-start failures distinguish `PASEO_COMMAND_LINE_OVERFLOW` from
+`PASEO_EXECUTABLE_UNAVAILABLE`. The former identifies a host command-line
+limit and must not be reported as a missing installation.
+
+Review still receives the canonical Spec authority, but large declared file
+contents are projected as `{path, content_digest, content_bytes}` references.
+Each axis reads the exact Candidate workspace and diff for the materialized
+content instead of receiving the same source payload again.
+
+The installed-daemon Windows E2E is intentionally opt-in because it creates
+one live Worker and two live Review Agents:
+
+```text
+python scripts/run_paseo_transport_e2e.py --live
+```
+
+Provider, model, thinking, mode, executable, and timeout are configurable
+flags. `GWO_RUN_PASEO_TRANSPORT_E2E=1` is the automation equivalent of
+`--live`. The runner uses a Worker Prompt above 300 KiB, two Review Prompts
+above 170 KiB, replaces the Coordinator client twice, proves one exact Prompt
+boundary per Agent, and archives every Agent it created. It does not run
+hosted checks.
+
 Legacy migration is an explicit configuration operation:
 
 ```text
