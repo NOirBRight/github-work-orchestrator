@@ -32,7 +32,15 @@ PASEO_BOOTSTRAP_WAIT_SECONDS = 30.0
 PASEO_BOOTSTRAP_POLL_SECONDS = 0.25
 PASEO_PROMPT_SETTLE_SECONDS = 1.0
 PASEO_PROMPT_DELIVERY_ATTEMPTS = 3
-PASEO_PROMPT_DELIVERY_PHASES = ("prepared", "acked", "idle", "dropped")
+PASEO_PROMPT_DELIVERY_PHASES = (
+    "prepared",
+    "acked",
+    "rejected",
+    # Read legacy phases conservatively. Neither phase proves that an
+    # acknowledged asynchronous send was absent from Paseo's queue.
+    "idle",
+    "dropped",
+)
 
 
 class RuntimeAdapterError(RuntimeError):
@@ -1519,7 +1527,7 @@ class PaseoCliClient:
         record = exact[0]
         if not inline:
             deadline = time.monotonic() + PASEO_BOOTSTRAP_WAIT_SECONDS
-            while record.lifecycle not in {"idle", "completed"}:
+            while record.lifecycle != "idle":
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(PASEO_BOOTSTRAP_POLL_SECONDS)
@@ -1582,6 +1590,21 @@ class PaseoCliClient:
             if isinstance(payload, dict)
             else None
         )
+        enqueued = (
+            payload.get("enqueued", payload.get("Enqueued"))
+            if isinstance(payload, dict)
+            else None
+        )
+        if (
+            isinstance(status, str)
+            and status.casefold() in {"rejected", "not-sent", "not_sent"}
+            and enqueued is False
+        ):
+            raise RuntimeAdapterError(
+                "PASEO_PROMPT_REJECTED",
+                "Paseo explicitly rejected the Prompt before enqueue",
+                failure_class="transient",
+            )
         if not isinstance(status, str) or status.casefold() != "sent":
             raise RuntimeAdapterError(
                 "PASEO_PROMPT_ACK_INVALID",
@@ -1870,6 +1893,7 @@ class PaseoRuntimeAdapter:
             identity_labels,
             action_key,
         )
+        send_authorized = False
         while time.monotonic() < deadline:
             if self._prompt_is_accepted(
                 agent_id,
@@ -1879,8 +1903,8 @@ class PaseoRuntimeAdapter:
                 return
             agent = self._find_exact(agent_id, agent_labels)
             if state is None:
-                if agent.lifecycle not in {"idle", "completed"}:
-                    time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
+                if agent.lifecycle != "idle":
+                    time.sleep(PASEO_BOOTSTRAP_POLL_SECONDS)
                     continue
                 state = self._publish_delivery_state(
                     agent_id,
@@ -1889,92 +1913,91 @@ class PaseoRuntimeAdapter:
                     phase="prepared",
                     ordinal=0,
                 )
+                send_authorized = True
             phase, ordinal = state
-            if phase in {"prepared", "acked"}:
-                if phase == "prepared":
-                    try:
-                        self.client.send_prompt(
-                            agent_id,
-                            prompt,
-                            action_key=action_key,
-                        )
-                    except RuntimeAdapterError as error:
-                        if error.failure_class == "permanent":
-                            raise
-                    else:
-                        state = self._publish_delivery_state(
-                            agent_id,
-                            identity_labels,
-                            action_key,
-                            phase="acked",
-                            ordinal=ordinal,
-                        )
-                        if self._prompt_is_accepted(
-                            agent_id,
-                            prompt,
-                            identity_labels,
-                        ):
-                            return
+            if phase == "prepared" and not send_authorized:
+                # The process that published this receipt may already have
+                # invoked Paseo. Recovery cannot distinguish that case from a
+                # crash immediately before invocation, so it must not resend.
                 time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
-                agent = self._find_exact(agent_id, agent_labels)
-                if agent.lifecycle not in {"idle", "completed"}:
+                continue
+            if phase not in {"prepared", "rejected"}:
+                # Acknowledged and legacy finite-settlement phases all mean
+                # that Paseo may still surface the first exact boundary. Idle
+                # and elapsed time cannot prove that an asynchronous send was
+                # absent from the queue.
+                time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
+                continue
+
+            if phase == "rejected":
+                if ordinal + 1 >= PASEO_PROMPT_DELIVERY_ATTEMPTS:
+                    raise RuntimeAdapterError(
+                        "PROMPT_DELIVERY_REJECTIONS_EXHAUSTED",
+                        (
+                            "three explicit pre-enqueue Prompt rejections "
+                            "were exhausted"
+                        ),
+                        failure_class="transient",
+                    )
+                if agent.lifecycle != "idle":
+                    time.sleep(PASEO_BOOTSTRAP_POLL_SECONDS)
                     continue
+                ordinal += 1
                 state = self._publish_delivery_state(
                     agent_id,
                     identity_labels,
                     action_key,
-                    phase="idle",
+                    phase="prepared",
                     ordinal=ordinal,
                 )
-                continue
-            if phase == "idle":
-                time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
-                if self._prompt_is_accepted(
+                send_authorized = True
+
+            send_authorized = False
+            try:
+                self.client.send_prompt(
                     agent_id,
                     prompt,
-                    identity_labels,
-                ):
-                    return
-                agent = self._find_exact(agent_id, agent_labels)
-                if agent.lifecycle not in {"idle", "completed"}:
-                    continue
+                    action_key=action_key,
+                )
+            except RuntimeAdapterError as error:
+                if error.code != "PASEO_PROMPT_REJECTED":
+                    raise RuntimeAdapterError(
+                        "PROMPT_DELIVERY_AMBIGUOUS",
+                        (
+                            "Paseo Prompt send may have been enqueued; "
+                            "authoritative acceptance remains unresolved"
+                        ),
+                        failure_class="ambiguous",
+                    ) from error
                 state = self._publish_delivery_state(
                     agent_id,
                     identity_labels,
                     action_key,
-                    phase="dropped",
+                    phase="rejected",
                     ordinal=ordinal,
                 )
                 continue
-            if ordinal + 1 >= PASEO_PROMPT_DELIVERY_ATTEMPTS:
-                raise RuntimeAdapterError(
-                    "PROMPT_DELIVERY_RETRIES_EXHAUSTED",
-                    (
-                        "three bounded Prompt sends lacked one exact "
-                        "acceptance boundary"
-                    ),
-                    failure_class="ambiguous",
-                )
+
+            state = self._publish_delivery_state(
+                agent_id,
+                identity_labels,
+                action_key,
+                phase="acked",
+                ordinal=ordinal,
+            )
             if self._prompt_is_accepted(
                 agent_id,
                 prompt,
                 identity_labels,
             ):
                 return
-            agent = self._find_exact(agent_id, agent_labels)
-            if agent.lifecycle not in {"idle", "completed"}:
-                time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
-                continue
-            state = self._publish_delivery_state(
-                agent_id,
-                identity_labels,
-                action_key,
-                phase="prepared",
-                ordinal=ordinal + 1,
-            )
+            time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
         raise RuntimeAdapterError(
-            "PROMPT_DELIVERY_READBACK_TIMEOUT",
-            "Prompt delivery ambiguity did not resolve before the bounded timeout",
+            "PROMPT_DELIVERY_AMBIGUOUS",
+            (
+                "Paseo Prompt delivery has no exact acceptance boundary; "
+                "the same Agent and action remain ambiguous"
+            ),
             failure_class="ambiguous",
         )
 

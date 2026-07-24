@@ -227,14 +227,16 @@ Worker and Review identity from authoritative `paseo ls --label ...` queries
 using Admission or Review action identity, runtime profile, Candidate, parent,
 and Prompt digest. Process-local label caches are not part of correctness.
 After an acknowledgement loss, reconciliation queries the exact digest first:
-an accepted Prompt is adopted without another send. An acknowledged-but-dropped
-Prompt records an action-keyed `gwo.prompt_delivery` phase and ordinal on the
-same Agent. Acknowledged or uncertain sends must then survive two later
-authoritative activity/idle readbacks that still show no exact boundary before
-the state can advance through `idle` to `dropped`. Only a later pass may replay
-that resolved drop, with the same Agent and action key. Three sends are the
-hard bound. The Admission or Review action never creates a replacement Agent
-while that identity exists.
+an accepted Prompt is adopted without another send. Before the one large
+Prompt-file send, the adapter requires authoritative bootstrap-idle readback
+and publishes an action-keyed `gwo.prompt_delivery` receipt on the same Agent.
+Once the send may have been invoked, acknowledgement, elapsed time, and later
+idle observations cannot prove it was absent from Paseo's asynchronous queue.
+Without an exact acceptance boundary, the same Agent and action therefore
+remain ambiguous indefinitely; reconciliation never replays from timing or
+idle heuristics. A retry is permitted only after an explicit pre-acceptance
+transport rejection proves that no enqueue occurred. The Admission or Review
+action never creates a replacement Agent while that identity exists.
 
 Process-start failures distinguish `PASEO_COMMAND_LINE_OVERFLOW` from
 `PASEO_EXECUTABLE_UNAVAILABLE`. The former identifies a host command-line

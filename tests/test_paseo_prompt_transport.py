@@ -204,6 +204,36 @@ def test_windows_command_line_overflow_is_not_executable_absence(monkeypatch):
     assert captured.value.code == "PASEO_EXECUTABLE_UNAVAILABLE"
 
 
+def test_cli_only_classifies_explicit_no_enqueue_as_retryable(monkeypatch):
+    client = PaseoCliClient(executable="paseo")
+    prompt = _prompt(310_000)
+    monkeypatch.setattr(
+        client,
+        "_run",
+        lambda *_args, **_kwargs: {
+            "status": "rejected",
+            "enqueued": False,
+        },
+    )
+
+    with pytest.raises(RuntimeAdapterError) as rejected:
+        client.send_prompt("agent-1", prompt, action_key="action-1")
+
+    assert rejected.value.code == "PASEO_PROMPT_REJECTED"
+    assert rejected.value.failure_class == "transient"
+
+    monkeypatch.setattr(
+        client,
+        "_run",
+        lambda *_args, **_kwargs: {"status": "rejected"},
+    )
+    with pytest.raises(RuntimeAdapterError) as ambiguous:
+        client.send_prompt("agent-1", prompt, action_key="action-1")
+
+    assert ambiguous.value.code == "PASEO_PROMPT_ACK_INVALID"
+    assert ambiguous.value.failure_class == "ambiguous"
+
+
 class RestartBlindPaseoClient:
     """Paseo-shaped fake whose inspect surface never returns labels."""
 
@@ -283,6 +313,13 @@ class RestartBlindPaseoClient:
     def prompt_acceptance_count(self, agent_id, prompt):
         return self._accepted[agent_id].count(prompt.digest)
 
+    def accept_prompt(self, agent_id, prompt):
+        self._accepted[agent_id].append(prompt.digest)
+        self._records[agent_id] = replace(
+            self._records[agent_id],
+            lifecycle="running",
+        )
+
     def update_labels(self, agent_id, labels):
         self._labels[agent_id].update(labels)
 
@@ -309,7 +346,7 @@ class RestartBlindPaseoClient:
         )
 
 
-def test_worker_restart_replays_dropped_ack_on_same_agent_exactly_once(tmp_path):
+def test_worker_restart_never_replays_an_acknowledged_send(tmp_path, monkeypatch):
     prompt = _prompt(310_000, name="worker")
     profile = _profile()
     admission = RuntimeAdmission(
@@ -321,7 +358,7 @@ def test_worker_restart_replays_dropped_ack_on_same_agent_exactly_once(tmp_path)
         base_sha="b" * 40,
         runtime_profile=profile,
     )
-    client = RestartBlindPaseoClient(send_acceptances=(False, True))
+    client = RestartBlindPaseoClient(send_acceptances=(False,))
     first_adapter = PaseoRuntimeAdapter(client)
 
     pending = first_adapter.materialize(admission, prompt)
@@ -348,15 +385,24 @@ def test_worker_restart_replays_dropped_ack_on_same_agent_exactly_once(tmp_path)
     assert adopted.prompt_accepted is False
     assert client.inspect(adopted.agent_id).labels == {}
 
-    restarted.accept_prompt(adopted, prompt)
+    monkeypatch.setattr("gwo_v8.runtime.PASEO_BOOTSTRAP_WAIT_SECONDS", 0.0)
+    with pytest.raises(RuntimeAdapterError) as ambiguous:
+        restarted.accept_prompt(adopted, prompt)
+    assert ambiguous.value.code == "PROMPT_DELIVERY_AMBIGUOUS"
+    assert ambiguous.value.failure_class == "ambiguous"
+    assert client.create_count == 1
+    assert client.send_count == 1
+    assert client.sent_action_keys == [action_key]
+
+    client.accept_prompt(adopted.agent_id, prompt)
     accepted = restarted.read_binding(admission, prompt)
     assert accepted is not None
     assert accepted.agent_id == pending.agent_id
     assert accepted.prompt_accepted is True
     assert accepted.prompt_digest == prompt.digest
     assert client.create_count == 1
-    assert client.send_count == 2
-    assert client.sent_action_keys == [action_key, action_key]
+    assert client.send_count == 1
+    assert client.sent_action_keys == [action_key]
     assert client.prompt_acceptance_count(accepted.agent_id, prompt) == 1
 
     second_restart = PaseoRuntimeAdapter(client)
@@ -364,7 +410,7 @@ def test_worker_restart_replays_dropped_ack_on_same_agent_exactly_once(tmp_path)
     assert readback is not None
     assert readback.agent_id == pending.agent_id
     assert readback.prompt_accepted is True
-    assert client.send_count == 2
+    assert client.send_count == 1
 
 
 class DelayedAcceptancePaseoClient(RestartBlindPaseoClient):
@@ -397,7 +443,7 @@ class DelayedAcceptancePaseoClient(RestartBlindPaseoClient):
         return super().prompt_acceptance_count(agent_id, prompt)
 
 
-def test_stale_idle_ack_waits_for_activity_before_replay(tmp_path):
+def test_arbitrarily_delayed_first_boundary_never_replays(tmp_path, monkeypatch):
     prompt = _prompt(310_000, name="delayed")
     profile = _profile()
     admission = RuntimeAdmission(
@@ -409,7 +455,55 @@ def test_stale_idle_ack_waits_for_activity_before_replay(tmp_path):
         base_sha="b" * 40,
         runtime_profile=profile,
     )
-    client = DelayedAcceptancePaseoClient(visibility_reads=3)
+    client = DelayedAcceptancePaseoClient(visibility_reads=100)
+    adapter = PaseoRuntimeAdapter(client)
+    pending = adapter.materialize(admission, prompt)
+
+    monkeypatch.setattr("gwo_v8.runtime.PASEO_PROMPT_SETTLE_SECONDS", 0.0)
+    adapter.accept_prompt(pending, prompt)
+    accepted = adapter.read_binding(admission, prompt)
+
+    assert accepted is not None
+    assert accepted.prompt_accepted is True
+    assert client.send_count == 1
+    assert client.prompt_acceptance_count(accepted.agent_id, prompt) == 1
+
+
+class RejectedOncePaseoClient(RestartBlindPaseoClient):
+    def __init__(self):
+        super().__init__()
+        self._rejected = False
+
+    def send_prompt(self, agent_id, prompt, *, action_key):
+        if not self._rejected:
+            self._rejected = True
+            self.sent_action_keys.append(action_key)
+            self.send_count += 1
+            raise RuntimeAdapterError(
+                "PASEO_PROMPT_REJECTED",
+                "synthetic explicit pre-enqueue rejection",
+                failure_class="transient",
+            )
+        super().send_prompt(
+            agent_id,
+            prompt,
+            action_key=action_key,
+        )
+
+
+def test_explicit_pre_enqueue_rejection_permits_one_retry(tmp_path):
+    prompt = _prompt(310_000, name="rejected")
+    profile = _profile()
+    admission = RuntimeAdmission(
+        repository="local/rejected",
+        plan_digest="r" * 64,
+        node_key="node:rejected",
+        admission_id="admission:rejected",
+        repository_path=tmp_path,
+        base_sha="b" * 40,
+        runtime_profile=profile,
+    )
+    client = RejectedOncePaseoClient()
     adapter = PaseoRuntimeAdapter(client)
     pending = adapter.materialize(admission, prompt)
 
@@ -418,7 +512,11 @@ def test_stale_idle_ack_waits_for_activity_before_replay(tmp_path):
 
     assert accepted is not None
     assert accepted.prompt_accepted is True
-    assert client.send_count == 1
+    assert client.send_count == 2
+    assert client.sent_action_keys == [
+        f"{admission.admission_id}:prompt",
+        f"{admission.admission_id}:prompt",
+    ]
     assert client.prompt_acceptance_count(accepted.agent_id, prompt) == 1
 
 
