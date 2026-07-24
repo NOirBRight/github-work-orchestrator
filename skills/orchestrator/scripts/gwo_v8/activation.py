@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
@@ -10,7 +11,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import time
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterator, Protocol
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
 from .compiler import CompiledPlan
@@ -287,8 +288,16 @@ class InMemoryDurablePlanControl:
 class GitHubCliContentClient:
     """Production GitHub Contents client using authenticated ``gh api``."""
 
-    def __init__(self, executable: str = "gh"):
+    def __init__(
+        self,
+        executable: str = "gh",
+        *,
+        command_timeout_seconds: int = 30,
+    ):
+        if command_timeout_seconds < 1:
+            raise ValueError("GitHub command timeout must be positive")
         self.executable = executable
+        self.command_timeout_seconds = command_timeout_seconds
 
     def _run(
         self,
@@ -296,13 +305,26 @@ class GitHubCliContentClient:
         *,
         input_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [self.executable, *args],
-            input=input_text,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
+        command = [self.executable, *args]
+        try:
+            return subprocess.run(
+                command,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=self.command_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(
+                command,
+                124,
+                stdout="",
+                stderr=(
+                    "GitHub command timed out after "
+                    f"{self.command_timeout_seconds} seconds"
+                ),
+            )
 
     @staticmethod
     def _wait_for_read_retry() -> None:
@@ -646,6 +668,8 @@ class LocalPlanPublication:
         self.durable = durable or InMemoryDurablePlanControl()
         self.writer_authority = writer_authority
         self._checkpoint = checkpoint or (lambda _name: None)
+        self._durable_snapshots: dict[str, ActivationReceipt | None] = {}
+        self._durable_snapshot_depths: dict[str, int] = {}
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(
@@ -699,6 +723,37 @@ class LocalPlanPublication:
         connection = sqlite3.connect(self.store_path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @contextmanager
+    def pin_durable_activation(
+        self,
+        repository: str,
+    ) -> Iterator[ActivationReceipt | None]:
+        """Use one fail-closed durable witness throughout one reconcile pass."""
+
+        if repository not in self._durable_snapshots:
+            self._durable_snapshots[repository] = (
+                self.durable.read_current_activation(repository)
+            )
+            self._durable_snapshot_depths[repository] = 0
+        self._durable_snapshot_depths[repository] += 1
+        try:
+            yield self._durable_snapshots[repository]
+        finally:
+            depth = self._durable_snapshot_depths[repository] - 1
+            if depth == 0:
+                del self._durable_snapshot_depths[repository]
+                del self._durable_snapshots[repository]
+            else:
+                self._durable_snapshot_depths[repository] = depth
+
+    def _current_durable_activation(
+        self,
+        repository: str,
+    ) -> ActivationReceipt | None:
+        if repository in self._durable_snapshots:
+            return self._durable_snapshots[repository]
+        return self.durable.read_current_activation(repository)
 
     @staticmethod
     def _record_json(compiled_plan: CompiledPlan) -> str:
@@ -1298,7 +1353,7 @@ class LocalPlanPublication:
         plan_digest: str,
         activation_id: str,
     ) -> None:
-        durable = self.durable.read_current_activation(repository)
+        durable = self._current_durable_activation(repository)
         if (
             durable is None
             or durable.writer_generation != writer_generation
@@ -1325,7 +1380,7 @@ class LocalPlanPublication:
         writer_generation: str,
         activation_id: str,
     ) -> None:
-        durable = self.durable.read_current_activation(repository)
+        durable = self._current_durable_activation(repository)
         if durable is None:
             raise ActivationError(
                 "WRITER_NEW_WORK_FENCED",

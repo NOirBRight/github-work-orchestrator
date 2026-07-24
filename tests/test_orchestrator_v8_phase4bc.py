@@ -545,6 +545,94 @@ def test_fresh_store_atomically_reconstructs_native_kernel_state(tmp_path):
         ).fetchone()[0] == 0
 
 
+def test_reconstruction_preserves_integration_batch_identity(tmp_path):
+    compiled, durable = _durable_readback(tmp_path, count=2)
+    first = _node(
+        compiled,
+        1,
+        status="complete",
+        wait_condition=None,
+        integrated_sha="f" * 40,
+    )
+    second_original = _node(
+        compiled,
+        2,
+        status="complete",
+        wait_condition=None,
+        integrated_sha="f" * 40,
+    )
+    second = replace(
+        second_original,
+        base_sha=first.base_sha,
+        runtime_binding=replace(
+            second_original.runtime_binding,
+            base_sha=first.base_sha,
+        ),
+    )
+    batch_id = "batch:" + "b" * 24
+    member_node_keys = [first.node_key, second.node_key]
+
+    def with_batch(node):
+        evidence = _capture(
+            kind="integration",
+            subject="f" * 40,
+            observer_type="kernel",
+            observer_id="v8-canary",
+            source_ref="git://local/phase-four-bc/main",
+            payload={
+                "integration_batch_id": batch_id,
+                "batch_sha": "f" * 40,
+                "candidate_sha": node.candidate_sha,
+                "member_node_keys": member_node_keys,
+                "branch": "main",
+            },
+        )
+        return replace(
+            node,
+            integration_batch_id=batch_id,
+            integration_batch_sha="f" * 40,
+            integration_source_ref="git://local/phase-four-bc/main",
+            integration_evidence=evidence,
+        )
+
+    readback = AuthoritativeRepositoryReadback.from_durable(
+        durable,
+        compiled.repository,
+        nodes=(with_batch(first), with_batch(second)),
+    )
+    destination = tmp_path / "batch-reconstructed.sqlite3"
+
+    result = StoreReconstructor().reconstruct(readback, destination)
+
+    assert result.status == "reconstructed", result.blockers
+    with sqlite3.connect(destination) as connection:
+        batch = json.loads(
+            connection.execute(
+                """
+                SELECT state_json FROM v8_integration_batches
+                WHERE repository = ? AND plan_digest = ? AND batch_id = ?
+                """,
+                (compiled.repository, compiled.digest, batch_id),
+            ).fetchone()[0]
+        )
+        states = [
+            json.loads(row[0])
+            for row in connection.execute(
+                """
+                SELECT state_json FROM v8_node_execution_state
+                WHERE repository = ? AND plan_digest = ?
+                ORDER BY node_key
+                """,
+                (compiled.repository, compiled.digest),
+            )
+        ]
+    assert batch["state"] == "integrated"
+    assert batch["batch_sha"] == "f" * 40
+    assert batch["member_node_keys"] == sorted(member_node_keys)
+    assert {state["integration_batch_id"] for state in states} == {batch_id}
+    assert {state["integrated_sha"] for state in states} == {"f" * 40}
+
+
 def test_reconstruction_preserves_publication_hosted_and_resume_progress(tmp_path):
     compiled = _compiled(1, hosted=True)
     durable = InMemoryDurablePlanControl()

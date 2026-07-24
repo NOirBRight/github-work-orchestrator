@@ -84,6 +84,9 @@ class AuthoritativeNodeReadback:
     integrated_sha: str | None
     candidate_source_ref: str | None = None
     integration_source_ref: str | None = None
+    integration_batch_id: str | None = None
+    integration_batch_sha: str | None = None
+    integration_evidence: TypedEvidence | None = None
 
     def result_claim(self) -> ResultClaim | None:
         if self.attempt_id is None or self.candidate_sha is None:
@@ -196,6 +199,21 @@ class AuthoritativeNodeReadback:
             "review_children_retired": False,
             "integrated_sha": self.integrated_sha,
             "integration_source_ref": self.integration_source_ref,
+            "integration_batch_id": self.integration_batch_id,
+            "integration_batch_sha": self.integration_batch_sha,
+            "integration_batch_hosted_check_evidence": [
+                asdict(item) for item in self.hosted_check_evidence
+            ],
+            "integration_evidence": (
+                None
+                if self.integration_evidence is None
+                else asdict(self.integration_evidence)
+            ),
+            "integration_evidence_digest": (
+                None
+                if self.integration_evidence is None
+                else self.integration_evidence.content_digest
+            ),
         }
 
 
@@ -530,9 +548,24 @@ class StoreReconstructor:
                 if isinstance(check, dict)
                 and check.get("hosted_only") is True
             )
+            batch_identity_present = (
+                node.integration_batch_id is not None
+                or node.integration_batch_sha is not None
+            )
+            if batch_identity_present and (
+                not node.integration_batch_id
+                or _SHA40.fullmatch(str(node.integration_batch_sha or ""))
+                is None
+            ):
+                blockers.add("INTEGRATION_BATCH_IDENTITY_INVALID")
+            integration_subject = (
+                node.integration_batch_sha
+                if node.integration_batch_sha is not None
+                else node.candidate_sha
+            )
             if node.hosted_check_evidence:
                 hosted_findings = self.verifier.verify_hosted_checks(
-                    str(node.candidate_sha or ""),
+                    str(integration_subject or ""),
                     hosted_definitions,
                     node.hosted_check_evidence,
                 )
@@ -747,7 +780,7 @@ class StoreReconstructor:
                 node.directive != "goal_complete"
                 or node.candidate_sha is None
                 or result_digest is None
-                or node.integrated_sha != node.candidate_sha
+                or node.integrated_sha != integration_subject
                 or node.attempt_state != "verified"
             ):
                 blockers.add("COMPLETION_FACTS_MISSING")
@@ -758,10 +791,80 @@ class StoreReconstructor:
                 blockers.add("LIFECYCLE_RELATION_CONTRADICTION")
             if node.integrated_sha is not None and (
                 node.status != "complete"
-                or node.integrated_sha != node.candidate_sha
+                or node.integrated_sha != integration_subject
                 or not node.integration_source_ref
             ):
                 blockers.add("INTEGRATION_IDENTITY_INVALID")
+            if node.integration_evidence is not None:
+                evidence = node.integration_evidence
+                expected_payload = {
+                    "integration_batch_id": node.integration_batch_id,
+                    "batch_sha": node.integration_batch_sha,
+                    "candidate_sha": node.candidate_sha,
+                }
+                if (
+                    node.integrated_sha is None
+                    or evidence.kind != "integration"
+                    or evidence.subject != node.integrated_sha
+                    or evidence.source_ref != node.integration_source_ref
+                    or any(
+                        evidence.payload.get(key) != value
+                        for key, value in expected_payload.items()
+                        if value is not None
+                    )
+                ):
+                    blockers.add("INTEGRATION_EVIDENCE_INVALID")
+            elif node.integration_batch_id is not None and node.status == "complete":
+                blockers.add("INTEGRATION_EVIDENCE_MISSING")
+        batches: dict[str, tuple[str, str | None, set[str], set[str]]] = {}
+        for node in readback.nodes:
+            if node.integration_batch_id is None:
+                continue
+            batch_id = node.integration_batch_id
+            batch_sha = str(node.integration_batch_sha or "")
+            current = batches.get(batch_id)
+            if current is None:
+                batches[batch_id] = (
+                    batch_sha,
+                    node.integration_source_ref,
+                    {node.node_key},
+                    {str(node.candidate_sha or "")},
+                )
+                continue
+            expected_sha, expected_source, members, candidates = current
+            if (
+                expected_sha != batch_sha
+                or expected_source != node.integration_source_ref
+            ):
+                blockers.add("INTEGRATION_BATCH_RELATION_INVALID")
+            members.add(node.node_key)
+            candidates.add(str(node.candidate_sha or ""))
+        for batch_id, (batch_sha, _source, members, candidates) in batches.items():
+            batch_nodes = [
+                node
+                for node in readback.nodes
+                if node.integration_batch_id == batch_id
+            ]
+            if (
+                len(candidates) != len(batch_nodes)
+                or len({node.base_sha for node in batch_nodes}) != 1
+                or len({node.publication_state for node in batch_nodes}) != 1
+                or len({node.publication_ref for node in batch_nodes}) != 1
+                or len({node.hosted_check_state for node in batch_nodes}) != 1
+                or len({node.integrated_sha for node in batch_nodes}) != 1
+            ):
+                blockers.add("INTEGRATION_BATCH_RELATION_INVALID")
+            for node in batch_nodes:
+                evidence = node.integration_evidence
+                if evidence is None:
+                    continue
+                payload_members = set(evidence.payload.get("member_node_keys") or ())
+                if (
+                    evidence.payload.get("batch_sha") != batch_sha
+                    or payload_members != members
+                    or evidence.payload.get("candidate_sha") not in candidates
+                ):
+                    blockers.add("INTEGRATION_BATCH_RELATION_INVALID")
         return tuple(sorted(blockers)), work_nodes, results
 
     def reconstruct(
@@ -914,6 +1017,82 @@ class StoreReconstructor:
                             evidence_json,
                         ),
                     )
+            batch_groups: dict[str, list[AuthoritativeNodeReadback]] = {}
+            for node in readback.nodes:
+                if node.integration_batch_id is not None:
+                    batch_groups.setdefault(
+                        node.integration_batch_id,
+                        [],
+                    ).append(node)
+            for batch_id, members in sorted(batch_groups.items()):
+                first = members[0]
+                hosted_by_digest: dict[str, dict[str, Any]] = {}
+                for member in members:
+                    output_contract = (
+                        work_nodes[member.node_key].get("output_contract") or {}
+                    )
+                    for definition in output_contract.get("checks") or ():
+                        if (
+                            isinstance(definition, dict)
+                            and definition.get("hosted_only") is True
+                        ):
+                            hosted_by_digest[
+                                str(definition["definition_digest"])
+                            ] = definition
+                batch_state = {
+                    "repository": readback.repository,
+                    "plan_digest": readback.receipt.plan_digest,
+                    "batch_id": batch_id,
+                    "base_sha": first.base_sha,
+                    "batch_sha": first.integration_batch_sha,
+                    "member_node_keys": sorted(
+                        member.node_key for member in members
+                    ),
+                    "candidate_shas": sorted(
+                        str(member.candidate_sha) for member in members
+                    ),
+                    "candidate_evidence_manifest_digests": sorted(
+                        digest_value(
+                            sorted(
+                                item.content_digest
+                                for item in member.evidence
+                            )
+                        )
+                        for member in members
+                    ),
+                    "hosted_definitions": [
+                        hosted_by_digest[key] for key in sorted(hosted_by_digest)
+                    ],
+                    "state": (
+                        "integrated"
+                        if all(member.status == "complete" for member in members)
+                        else "waiting"
+                    ),
+                    "publication_state": first.publication_state,
+                    "publication_ref": first.publication_ref,
+                    "hosted_check_state": first.hosted_check_state,
+                    "hosted_retry_count": max(
+                        member.budgets.hosted_retry_count for member in members
+                    ),
+                    "integrated_sha": first.integrated_sha,
+                    "integration_source_ref": first.integration_source_ref,
+                    "hosted_check_evidence": [
+                        asdict(item) for item in first.hosted_check_evidence
+                    ],
+                }
+                connection.execute(
+                    """
+                    INSERT INTO v8_integration_batches (
+                        repository, plan_digest, batch_id, state_json
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        readback.repository,
+                        readback.receipt.plan_digest,
+                        batch_id,
+                        canonical_bytes(batch_state).decode("utf-8"),
+                    ),
+                )
             connection.execute(
                 """
                 INSERT INTO v8_reconstruction_audit (

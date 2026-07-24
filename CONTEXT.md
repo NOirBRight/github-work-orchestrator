@@ -310,6 +310,17 @@ An immutable local Artifact submitted by Result Claim for Verification.
 Internal edits and test runs are not Candidates.
 _Avoid_: working tree, intermediate SHA
 
+**Integration Batch**:
+An immutable Kernel-owned aggregate of compatible, locally accepted Candidates
+that share one target base and cross the remote publication, hosted-check, and
+target-branch Integration boundary together.
+_Avoid_: Plan Node, wave, merge queue, Batch Agent
+
+**Batch Evidence**:
+Typed Evidence mapping every member Candidate and Integration Node to one
+Integration Batch SHA, its hosted Check result, and target-branch readback.
+_Avoid_: per-Candidate hosted Check Evidence, repeated Review Evidence
+
 **Candidate Rejected**:
 A Verification decision that a submitted Candidate does not satisfy its
 Evidence or acceptance contract.
@@ -358,16 +369,18 @@ _Avoid_: Result copy, Attempt rebinding
 
 **Publication Eligibility**:
 The derived fact that one exact Candidate has all required valid local Check
-and Review Evidence and no blocker, permitting its first push.
+and Review Evidence and no blocker, permitting membership in an Integration
+Batch and that Batch's first push.
 _Avoid_: lifecycle state, mutable candidate freeze
 
 **Code Review**:
-The Candidate-producing Work Attempt invokes `code-review` with a fixed,
-history-free packet and runs independent read-only Standards and Spec Internal
-Subagents in parallel. The Runtime Adapter observes their outputs and the
-parent mechanically assembles Review Evidence without merging or reranking
-findings. A missing or invalid axis can be recovered without repeating a valid
-axis for the same Candidate.
+After Candidate readback, the Kernel binds `code-review` guidance into fixed,
+history-free packets and materializes independent read-only Standards and Spec
+children under the Work Attempt identity. The Worker does not invoke Review.
+The Runtime Adapter observes their outputs and the Kernel mechanically
+assembles Review Evidence without merging or reranking findings. A missing or
+invalid axis can be recovered without repeating a valid axis for the same
+Candidate.
 _Avoid_: Review Plan Node, Review Result, permanent dual Reviewer pair
 
 ## Durability and transition

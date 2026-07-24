@@ -1,6 +1,8 @@
 # GWO V8 architecture
 
-Status: accepted design; implementation complete through Phase 2.
+Status: accepted design; implementation complete through Phase 4C. The
+dedicated three-node live Batch canary passed; production writer cutover
+remains an explicit operational action.
 
 `CONTEXT.md` is the normative vocabulary. The governing ADR chain preserves
 earlier V7-oriented decisions as superseded history; V8 starts from the actual
@@ -135,9 +137,11 @@ silently falling back or starting planning.
 
 Once inside GWO, neither `implement` nor `implement-gwo` is a valid Plan Node
 Skill Reference. Work nodes use focused execution guidance such as `tdd`,
-`diagnosing-bugs`, `research`, or `prototype`. A Candidate-producing Work
-Attempt invokes `code-review` only when its compiled output contract requires
-Review Evidence. This prevents recursive orchestration and duplicate Review.
+`diagnosing-bugs`, `research`, or `prototype`. After Candidate readback, the
+Kernel binds `code-review` guidance and materializes Review-axis children only
+when the compiled output contract requires Review Evidence. The Worker never
+invokes Review itself. This prevents recursive orchestration and duplicate
+Review.
 
 ## Configuration ownership
 
@@ -256,6 +260,12 @@ a Wait Condition. A conflicting active digest returns `ActivationConflict`
 with the new active identity and a compact semantic delta; it is never
 auto-merged or queued. No Admission is possible while activation is pending or
 unfinalized.
+
+At the start of each reconciliation pass, the Kernel reads and pins one exact
+durable Activation Receipt as that pass's writer witness. Every internal writer
+assertion in the pass uses the same witness; the next pass rereads GitHub. This
+removes repeated network calls without introducing a TTL cache or mixing
+authority snapshots inside one deterministic pass.
 
 The control branch does not run product CI. Git history retains prior Plan and
 activation records.
@@ -583,11 +593,11 @@ Initial bounded pools are:
 - eight active Worker turns;
 - one reserved Coordinator turn.
 
-These pools count only top-level Agents managed by GWO. Internal Subagents
-created by a parent are not separately admitted or counted. Each standard
-Review has a fixed fan-out of two axes and strict Review may add one
-specialist. A parent retains its Worker Active Turn Slot while its internal
-review children execute, so eight Worker slots bound concurrent review fan-out;
+These pools count only top-level Work Attempts and Coordinators managed by GWO.
+Internal Subagents and Kernel-bound Review children are not separately admitted
+or counted. Each standard Review has a fixed fan-out of two axes and strict
+Review may add one specialist. A Work Attempt retains its Worker Active Turn
+Slot while its review children execute, so eight Worker slots bound concurrent review fan-out;
 actual Runtime and provider capacity supplies further backpressure without a
 separate Reviewer pool. Diagnostic work uses Worker capacity. Kernel
 verification, hosted CI, and deterministic Integration consume no Agent turn.
@@ -614,25 +624,44 @@ selector, base sensitivity, and risk.
 The executable-code path is:
 
 ```text
-internal edit and cheap affected-test loop
+internal edit and narrow diagnostic loop
   -> immutable local commit + Result Claim
+  -> Runtime Adapter captures cheap affected Check Evidence once
   -> one repository-equivalent full local suite
      || one exact-SHA local Review
   -> derived publication eligibility
-  -> first push of that candidate
-  -> exact-SHA hosted CI
-  -> Verification and serial Integration
+  -> Kernel closes the compatible Integration Batch
+  -> one combined immutable Batch SHA
+  -> first and only push of that Batch SHA
+  -> one exact-Batch-SHA hosted CI
+  -> one serial target-branch fast-forward
 ```
 
 Publication eligibility is a predicate, not a lifecycle entity. It requires
 one candidate SHA, all required valid local Check Evidence, required Review
 Evidence, and no blocker.
 
-The edit loop's latest cheap affected tests, lint, and type checks must pass and
-their observed tree digest must match the immutable Candidate before it spends
-Review tokens; they are not rerun merely to enter Review. The one full local
-suite and Review may then start concurrently while the Candidate-producing
-parent is parked from further editing. Review consumes valid Check Evidence and
+Candidate eligibility does not itself trigger remote work. A locally accepted
+Candidate waits as `batch_ready` while the Kernel refills the compatible
+frontier. The Kernel closes a Batch only after active Workers and Review
+children in that frontier have drained and no immediately admissible Work Node
+is excluded merely by Worker capacity. This allows eight independent Workers
+to feed one remote validation boundary instead of creating eight CI queues.
+
+The Integration Batch is one deep Kernel module with a small `prepare`
+interface. It sorts member Node keys, requires one shared base, composes the
+exact Candidate commits in an isolated Git worktree, and records a
+content-derived ref so retry is readback-first and idempotent. It is not a
+PlanSpec node, Agent, Admission, Attempt, Result, or second state machine. The
+existing per-Work-Item Integration Nodes remain the acceptance graph; one
+Batch Evidence record may satisfy several of them.
+
+The Worker Prompt is a role projection: it exposes implementation authority and
+only affected diagnostics, while the frozen full output contract remains with
+the Kernel and Runtime Adapter. After Result Claim readback, the Adapter
+captures affected tests, lint, and type checks once against the immutable
+Candidate. The one full local suite and Review may then start concurrently
+while the Work Attempt is parked from further editing. Review consumes valid Check Evidence and
 never reruns it. When the repository-equivalent suite is decomposable, it also
 consumes already valid check components instead of repeating them; a monolithic
 authoritative command runs only once. The Runtime Adapter may observe local
@@ -643,7 +672,8 @@ can be proven.
 
 Each valid Review axis is stored locally as soon as it finishes, so recovery
 can retain it for the same Candidate. Compact successful Check and Review
-records become GitHub-durable after publication without rerunning their work.
+records become GitHub-durable with Batch publication without rerunning their
+work.
 Full raw logs are retained only for failures, strict risk, nondeterminism,
 contract requirements, or expensive results that cannot be reproduced.
 
@@ -651,22 +681,26 @@ Cross-SHA check reuse requires equivalent definition, environment, declared
 input projection, base, acceptance, observer, and durable record. Path overlap
 alone is insufficient.
 
-Hosted CI begins only after the first eligible push. A classified runner,
-network, rate, TLS, registry, or platform failure may retry the same SHA twice
-after the initial run. Candidate, test, lint, or build failure never
-auto-retries remotely; it returns to the local implementation loop.
+Hosted CI begins only after the first eligible Batch push. Required hosted
+workflow names from all members are deduplicated into one Batch Check
+Manifest. A classified runner, network, rate, TLS, registry, or platform
+failure may retry the same Batch SHA twice after the initial run. A test,
+lint, build, or contract failure is not blindly retried and does not send
+every member through another Worker/Review/push cycle; the Batch blocks for
+targeted diagnosis. Only a member whose diff changes loses its Candidate and
+Review Evidence.
 
 Review policy is deterministic:
 
 - low risk: objective allowlist and required checks, with no LLM Review;
-- standard risk: the Candidate-producing Work Attempt invokes `code-review`
-  and runs read-only Standards and Spec Internal Subagents in parallel;
+- standard risk: the Kernel binds `code-review` guidance and runs read-only
+  Standards and Spec children in parallel under the Work Attempt identity;
 - strict risk: the standard axes plus the configured specialist or human.
 
 The Compiler may add review requirements but no planner or Agent may remove
 them. The Runtime Adapter captures each review child's history-free fixed
 input, provider, model, session, output, and digests. Valid axis observations
-are stored separately and the parent mechanically assembles one typed Review
+are stored separately and the Kernel mechanically assembles one typed Review
 Evidence envelope; it cannot merge, suppress, or rerank findings. A hard
 Standards or Spec finding rejects the implementation Candidate, while smells
 and other judgment calls are advisory unless repository policy promotes them.
@@ -698,9 +732,11 @@ HEAD and cleanliness are verified before and after Review.
 
 Serial Integration consumes the compiled Review requirement and the exact
 Review Evidence directly; it never invokes another Review merely because it is
-a different consumer. A clean application may reuse the evidence when its
-candidate, diff, acceptance, and base-sensitive inputs remain valid. Rebase,
-conflict resolution, or any other diff change requires a new Review Gate.
+a different consumer. Clean composition into a Batch reuses that Evidence and
+records the mapping from every member Candidate SHA to the Batch SHA. A
+composition conflict or changed target head blocks for deterministic conflict
+handling; rebase, conflict resolution, or any other member-diff change requires
+a new Review Gate only for the changed member.
 
 The Review Profile selectors map standard axes to Sol High and recovery or
 strict specialists to Sol Max. Missing canonical Spec input fails compilation
@@ -782,8 +818,9 @@ measured by acceptance coverage rather than elapsed time.
 
 The first live canary uses a dedicated lightweight repository with three to
 five independent work nodes and roughly two-minute hosted CI. It proves
-parallel Admission, parking, refill, review, and serial Integration before the
-configured eight-Worker capacity opens.
+parallel Admission, parking, refill, review, one Integration Batch publication,
+and one serial target-branch Integration before the configured eight-Worker
+capacity opens.
 
 Rollback never deletes a durable Activation Receipt. Before execution it may
 abandon only the new Store generation through a new durable compensating

@@ -7,8 +7,10 @@ from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any, Protocol
@@ -337,6 +339,7 @@ class RuntimePrompt:
     skill_name: str | None = None
     skill_digest: str | None = None
     warnings: tuple[str, ...] = ()
+    contract_node: dict[str, Any] | None = None
 
     @classmethod
     def from_node(
@@ -359,18 +362,67 @@ class RuntimePrompt:
         skill_digest = (
             None if guidance is None else digest_bytes(guidance.encode("utf-8"))
         )
+        contract_node = json.loads(canonical_bytes(node))
+        worker_node = json.loads(canonical_bytes(node))
+        output_contract = worker_node.get("output_contract")
+        if isinstance(output_contract, dict):
+            worker_node["output_contract"] = {
+                "checks": [
+                    check
+                    for check in output_contract.get("checks") or ()
+                    if isinstance(check, dict)
+                    and check.get("hosted_only") is not True
+                    and check.get("suite") in {"affected", "local"}
+                ],
+                "note": (
+                    "Worker-visible affected diagnostics only; Kernel retains "
+                    "the full Evidence and Review contract."
+                ),
+            }
         text = canonical_bytes(
             {
-                "node": node,
+                "execution_scope": {
+                    "role": "worker",
+                    "responsibilities": [
+                        "implement the frozen Plan Node",
+                        (
+                            "use only narrow affected diagnostics needed while "
+                            "implementing"
+                        ),
+                        (
+                            "before GWO_RESULT, make candidate_sha the Workspace "
+                            "HEAD and leave git status --porcelain empty"
+                        ),
+                    ],
+                    "prohibited": [
+                        "do not invoke review skills",
+                        "do not create reviewer subagents",
+                        (
+                            "do not rerun repository-wide acceptance suites; "
+                            "the Runtime Adapter captures contract Evidence"
+                        ),
+                        "do not run hosted-only checks",
+                    ],
+                    "review_owner": (
+                        "Kernel materializes independent Review after Candidate "
+                        "readback; review requirements are not Worker work."
+                    ),
+                },
+                "node": worker_node,
                 "result_protocol": {
                     "action_key": node.get("node_key"),
                     "instruction": (
-                        "End with exactly one GWO_RESULT line. Return either "
-                        "a clean immutable candidate with candidate_sha, or "
-                        "a bounded typed terminal_reason=no_result plus a "
-                        "non-empty reason."
+                        "End with exactly one compact JSON line and no code "
+                        "fence. Success schema: GWO_RESULT "
+                        '{"schema_version":1,"action_key":"'
+                        f'{node.get("node_key")}","candidate_sha":"<40-hex-sha>"'
+                        "}. No-result schema: GWO_RESULT "
+                        '{"schema_version":1,"action_key":"'
+                        f'{node.get("node_key")}","terminal_reason":"no_result",'
+                        '"reason":"<non-empty bounded reason>"}.'
                     ),
                     "marker": "GWO_RESULT",
+                    "schema_version": 1,
                 },
                 "skill_guidance": guidance,
                 "skill_name": skill_name,
@@ -387,7 +439,20 @@ class RuntimePrompt:
             skill_name=skill_name,
             skill_digest=skill_digest,
             warnings=warnings,
+            contract_node=contract_node,
         )
+
+
+def _contract_node_from_prompt(
+    prompt: RuntimePrompt | None,
+) -> dict[str, Any] | None:
+    if prompt is None:
+        return None
+    if isinstance(prompt.contract_node, dict):
+        return prompt.contract_node
+    payload = json.loads(prompt.text)
+    node = payload.get("node") if isinstance(payload, dict) else None
+    return node if isinstance(node, dict) else None
 
 
 @dataclass(frozen=True)
@@ -500,6 +565,16 @@ class ReviewAxisRequest:
             "output_protocol": {
                 "marker": "GWO_REVIEW_AXIS",
                 "schema_version": 1,
+                "instruction": (
+                    "End with exactly one compact JSON line and no code fence: "
+                    "GWO_REVIEW_AXIS "
+                    '{"schema_version":1,"action_key":"'
+                    f'{self.action_key}","candidate_sha":"{self.candidate_sha}",'
+                    f'"axis":"{self.axis}","fixed_input_digest":"'
+                    f'{self.fixed_input_digest}","findings":[]}}. '
+                    "Replace findings with schema-valid finding objects only "
+                    "when evidence supports them."
+                ),
                 "required_fields": [
                     "schema_version",
                     "action_key",
@@ -978,7 +1053,47 @@ class PaseoCliClient:
     """Concrete Paseo client for the public CLI lifecycle surface."""
 
     def __init__(self, executable: str = "paseo"):
-        self.executable = executable
+        self.executable = shutil.which(executable) or executable
+        self._command_prefix = (self.executable,)
+        self._command_environment: dict[str, str] | None = None
+        if sys.platform == "win32" and Path(self.executable).suffix.lower() in {
+            ".bat",
+            ".cmd",
+        }:
+            install_root = Path(
+                os.environ.get("ProgramFiles", r"C:\Program Files")
+            ) / "Paseo"
+            app_executable = install_root / "Paseo.exe"
+            resources = install_root / "resources"
+            runner = (
+                resources
+                / "app.asar.unpacked"
+                / "dist"
+                / "daemon"
+                / "node-entrypoint-runner.js"
+            )
+            if app_executable.is_file() and runner.is_file():
+                self._command_prefix = (
+                    str(app_executable),
+                    "--disable-warning=DEP0040",
+                    str(runner),
+                    "node-script",
+                    str(
+                        resources
+                        / "app.asar"
+                        / "node_modules"
+                        / "@getpaseo"
+                        / "cli"
+                        / "dist"
+                        / "index.js"
+                    ),
+                )
+                self._command_environment = {
+                    **os.environ,
+                    "ELECTRON_RUN_AS_NODE": "1",
+                    "PASEO_NODE_ENV": "production",
+                    "PASEO_DESKTOP_MANAGED": "1",
+                }
         self._known_labels: dict[str, dict[str, str]] = {}
 
     @staticmethod
@@ -1016,12 +1131,20 @@ class PaseoCliClient:
         *,
         failure_class: str = "transient",
     ) -> Any:
-        result = subprocess.run(
-            [self.executable, *args],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
+        try:
+            result = subprocess.run(
+                [*self._command_prefix, *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=self._command_environment,
+            )
+        except OSError as error:
+            raise RuntimeAdapterError(
+                "PASEO_EXECUTABLE_UNAVAILABLE",
+                f"Paseo executable cannot start: {self.executable}",
+                failure_class="permanent",
+            ) from error
         if result.returncode != 0:
             detail = (
                 result.stderr.strip()
@@ -1051,12 +1174,20 @@ class PaseoCliClient:
         *,
         failure_class: str = "transient",
     ) -> str:
-        result = subprocess.run(
-            [self.executable, *args],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
+        try:
+            result = subprocess.run(
+                [*self._command_prefix, *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=self._command_environment,
+            )
+        except OSError as error:
+            raise RuntimeAdapterError(
+                "PASEO_EXECUTABLE_UNAVAILABLE",
+                f"Paseo executable cannot start: {self.executable}",
+                failure_class="permanent",
+            ) from error
         if result.returncode != 0:
             detail = (
                 result.stderr.strip()
@@ -1242,6 +1373,10 @@ class PaseoCliClient:
 
     def create(self, request: PaseoCreateRequest) -> PaseoAgentRecord:
         worktree = f"gwo-{digest_bytes(request.action_key.encode('utf-8'))[:16]}"
+        creation_labels = {
+            **request.labels,
+            "gwo.prompt_digest": request.prompt.digest,
+        }
         command = [
             "run",
             "--detach",
@@ -1266,7 +1401,7 @@ class PaseoCliClient:
             "--cwd",
             request.repository_path,
         ]
-        for key, value in sorted(request.labels.items()):
+        for key, value in sorted(creation_labels.items()):
             command.extend(["--label", f"{key}={value}"])
         command.extend(["--json", request.prompt.text])
         payload = self._run(command, failure_class="ambiguous")
@@ -1283,22 +1418,19 @@ class PaseoCliClient:
                 "Paseo creation returned an invalid Agent",
                 failure_class="ambiguous",
             )
-        agent_id = agent_payload.get("id") or agent_payload.get("Id")
+        agent_id = (
+            agent_payload.get("id")
+            or agent_payload.get("Id")
+            or agent_payload.get("agentId")
+            or agent_payload.get("AgentId")
+        )
         if not isinstance(agent_id, str) or not agent_id:
             raise RuntimeAdapterError(
                 "PASEO_READBACK_INVALID",
                 "Paseo creation did not return an Agent ID",
                 failure_class="ambiguous",
             )
-        self.update_labels(
-            agent_id,
-            {"gwo.prompt_digest": request.prompt.digest},
-        )
-        expected_labels = {
-            **request.labels,
-            "gwo.prompt_digest": request.prompt.digest,
-        }
-        matches = self.find_by_labels(expected_labels)
+        matches = self.find_by_labels(creation_labels)
         exact = [item for item in matches if item.agent_id == agent_id]
         if len(exact) != 1:
             raise RuntimeAdapterError(
@@ -1832,13 +1964,12 @@ class PaseoRuntimeAdapter:
             return observation
         prompt = self._prompts.get(binding.admission_id)
         try:
-            payload = None if prompt is None else json.loads(prompt.text)
+            node = _contract_node_from_prompt(prompt)
         except json.JSONDecodeError as error:
             raise RuntimeAdapterError(
                 "PROMPT_SNAPSHOT_INVALID",
                 "frozen Paseo Prompt is not valid JSON",
             ) from error
-        node = payload.get("node") if isinstance(payload, dict) else None
         contract = node.get("output_contract") if isinstance(node, dict) else None
         checks = contract.get("checks") if isinstance(contract, dict) else ()
         completed = replace(
@@ -2024,17 +2155,12 @@ class PaseoRuntimeAdapter:
                 )
                 prompt = self._prompts.get(observed.admission_id)
                 try:
-                    prompt_payload = None if prompt is None else json.loads(prompt.text)
+                    node = _contract_node_from_prompt(prompt)
                 except json.JSONDecodeError as error:
                     raise RuntimeAdapterError(
                         "PROMPT_SNAPSHOT_INVALID",
                         "frozen Paseo Prompt is not valid JSON",
                     ) from error
-                node = (
-                    prompt_payload.get("node")
-                    if isinstance(prompt_payload, dict)
-                    else None
-                )
                 output_contract = (
                     node.get("output_contract") if isinstance(node, dict) else None
                 )
@@ -2563,7 +2689,11 @@ class InMemoryRuntimeAdapter:
                 "PROMPT_IDENTITY_MISMATCH", "Prompt does not describe this Plan Node"
             )
         state.prompt = prompt
-        state.node = node
+        state.node = (
+            prompt.contract_node
+            if isinstance(prompt.contract_node, dict)
+            else node
+        )
         state.binding = replace(
             binding,
             prompt_accepted=True,

@@ -1,11 +1,9 @@
 # GWO V8 roadmap
 
 Status: accepted direction; code implementation complete through Phase 4C.
-The live canary and production writer transition remain an explicit operational
-release action and have not been executed by repository implementation work.
-The dedicated GitHub-boundary smoke has passed; the three-node live acceptance
-is paused before AI dispatch because exact-SHA fast-forward Integration would
-force repeated Candidate refresh, Review, and hosted CI. See
+The dedicated GitHub-boundary smoke and three-node live Integration Batch
+acceptance have passed. Production writer transition remains a separate,
+explicitly authorized operational release action. See
 `docs/e2e/gwo-v8-canary.md`.
 
 This roadmap starts from the production reality: V6.1 is the current writer
@@ -157,9 +155,10 @@ Scope:
   editing.
 - Derive publication eligibility from one candidate SHA, valid required local
   checks, and blocker-free required review. Do not add another lifecycle state.
-- Push an eligible candidate once, then run hosted CI once against that exact
-  SHA. Retry only classified infrastructure failure, at most two retries after
-  the initial run.
+- Keep eligible Candidates local until the compatible frontier drains. Compose
+  them into one immutable Integration Batch, push that Batch SHA once, and run
+  hosted CI once against it. Retry only classified infrastructure failure, at
+  most two retries after the initial run.
 - Publish local Review and compact Check Evidence after the candidate becomes
   durable; do not repeat the analysis merely to publish it.
 - Compile `review_requirement` into Candidate-bearing Work Node output
@@ -169,10 +168,10 @@ Scope:
   Standards and Spec axes, and strict risk with those axes plus its concrete
   specialist or human requirement. Missing canonical Spec input must fail
   closed before execution.
-- Have the Candidate-producing Work Attempt invoke `code-review` with a
-  history-free fixed packet and run read-only Standards and Spec Internal
-  Subagents in parallel. Standard axes use Sol High; recovery and strict
-  specialist observations use Sol Max.
+- Have the Kernel bind `code-review` guidance into history-free fixed packets
+  and run read-only Standards and Spec children in parallel under the Work
+  Attempt identity. The Worker does not invoke Review itself. Standard axes use
+  Sol High; recovery and strict specialist observations use Sol Max.
 - Have the Runtime Adapter observe each review child's fixed input, Runtime
   identity, output, and digests. Persist each axis independently and assemble
   one typed Review Evidence envelope without merging or reranking findings.
@@ -194,7 +193,8 @@ Scope:
 - Treat schema-valid Review Evidence containing hard blockers as a rejected
   implementation Candidate, not failed Review execution. Keep smells and other
   judgment calls advisory unless repository policy promotes them.
-- Implement serial Integration and exact target-branch readback.
+- Implement one serial Batch Integration and exact target-branch readback,
+  mapping every member Candidate and Integration Node to the combined SHA.
 - Reuse exact Review Evidence after a clean application; require a new Review
   Gate after rebase, conflict resolution, or any other diff change.
 - Implement Replan Hold, unchanged-contract Result Adoption, explicit
@@ -202,9 +202,12 @@ Scope:
 
 Exit criteria:
 
-- intermediate SHA values are never pushed merely to obtain feedback;
+- intermediate and per-member Candidate SHA values are never pushed merely to
+  obtain feedback;
 - Review and Integration consume valid Check Evidence without rerunning the
   command;
+- several compatible reviewed Candidates produce one publication, one hosted
+  CI boundary, and one target-branch fast-forward;
 - invalid or absent provenance causes a targeted rerun, not a role-based rerun;
 - one invalid review axis recovers without repeating the other axis;
 - review-axis Runtime readback may bind a different provider/model from the
@@ -229,11 +232,11 @@ Scope:
 - Configure bounded Active Turn pools:
   eight Worker turns and one reserved Coordinator turn, further limited by
   observed provider and Runtime availability.
-- Count only top-level GWO-managed parents in those pools. Internal Subagents
-  delegated by Worker or Coordinator parents receive no separate Admission or
-  capacity slot. Standard Review has a fixed two-axis fan-out and strict Review
-  may add one specialist. The parent retains its Worker Active Turn Slot while
-  those children execute.
+- Count only top-level GWO-managed Work Attempts and Coordinators in those
+  pools. Internal Subagents and Kernel-bound Review children receive no
+  separate Admission or capacity slot. Standard Review has a fixed two-axis
+  fan-out and strict Review may add one specialist. The Work Attempt retains
+  its Worker Active Turn Slot while those children execute.
 - Release Active Turn capacity while Attempts are parked on named external
   waits; refill newly available capacity on the next pass.
 - Keep ordinary Write Scope overlap advisory. Hard-exclude only the same Node
@@ -289,8 +292,11 @@ cutover.
 - Use a dedicated lightweight GitHub canary repository whose hosted CI
   completes in roughly two minutes and whose three to five independent modules
   can safely exercise failure and conflict scenarios.
-- Prove parallel Admission, CI parking, refill, review, and serial Integration
-  with three to five canary nodes.
+- Prove parallel Admission, frontier refill, dual-axis review, one combined
+  Batch publication, CI parking, and one serial Integration with three to five
+  canary nodes. This live acceptance passed on 2026-07-24 with three nodes, one
+  bounded Review-triggered repair, one Batch, one hosted run, and zero hosted
+  retries.
 - Fence the V6.1 writer, publish and read back the durable V8 writer generation
   and activation receipt, then open configured capacity to eight Workers.
 
@@ -308,13 +314,13 @@ Each phase uses the same ownership pattern:
 
 - the implementation Worker produces one immutable candidate and Result Claim;
 - Runtime or Kernel captures the required local Check Evidence once;
-- the Candidate-producing Work Attempt invokes independent, history-free
-  review-axis Internal Subagents when its output contract requires them;
-- Runtime observes the axis records and the parent only assembles typed Review
+- the Kernel invokes independent, history-free review-axis children under the
+  Candidate-producing Work Attempt when its output contract requires them;
+- Runtime observes the axis records and the Kernel only assembles typed Review
   Evidence;
 - the Coordinator evaluates the phase exit criteria from those records;
-- hosted CI is the final external check after first publication, not the
-  development loop.
+- hosted CI is the final external check after one Batch publication, not the
+  development loop or a per-Candidate validation cycle.
 
 There is no separate Committer, phase Test Runner, or phase Auditor that repeats
 the same test. Failure injection is added only at a seam already exercised by

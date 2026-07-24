@@ -29,6 +29,8 @@ from gwo_v8 import (  # noqa: E402
     PlanCompiler,
     PaseoRuntimeAdapter,
     ReconcileOutcome,
+    ReviewAxisBinding,
+    ReviewAxisObservation,
     RuntimeAdapterError,
     RuntimeProfile,
     resolve_active_turn_pools,
@@ -252,6 +254,64 @@ class _RepairCountingRuntime(InMemoryRuntimeAdapter):
     def repair(self, binding, prompt) -> None:
         self.repair_count += 1
         super().repair(binding, prompt)
+
+
+class _ReviewingInMemoryRuntime(InMemoryRuntimeAdapter):
+    def materialize_review_axis(
+        self,
+        request,
+        profile,
+        *,
+        parent_agent_id,
+    ):
+        prompt = request.to_prompt()
+        suffix = request.action_key[-12:]
+        return ReviewAxisBinding(
+            action_key=request.action_key,
+            axis=request.axis,
+            candidate_sha=request.candidate_sha,
+            fixed_input_digest=request.fixed_input_digest,
+            runtime_id=f"review:{suffix}",
+            agent_id=f"review:{suffix}",
+            session_id=f"session:{suffix}",
+            workspace_id=f"workspace:{suffix}",
+            workspace=str(request.workspace),
+            parent_agent_id=parent_agent_id,
+            runtime_profile=profile.name,
+            profile_digest=profile.digest,
+            provider=profile.provider,
+            model=profile.model,
+            thinking=profile.thinking,
+            mode=profile.mode,
+            prompt_digest=prompt.digest,
+        )
+
+    def observe_review_axis(self, request, binding):
+        return ReviewAxisObservation(
+            lifecycle="completed",
+            axis=request.axis,
+            attempt_id=request.attempt_id,
+            candidate_sha=request.candidate_sha,
+            base_sha=request.base_sha,
+            recovery_ordinal=request.recovery_ordinal,
+            spec_digest=request.spec_digest,
+            check_manifest_digest=request.check_manifest_digest,
+            fixed_input_digest=request.fixed_input_digest,
+            action_key=request.action_key,
+            runtime_id=binding.runtime_id,
+            agent_id=binding.agent_id,
+            session_id=binding.session_id,
+            profile_digest=binding.profile_digest,
+            provider=binding.provider,
+            model=binding.model,
+            thinking=binding.thinking,
+            mode=binding.mode,
+            output_digest=request.fixed_input_digest,
+            findings=(),
+        )
+
+    def retire_review_axis(self, _binding):
+        return None
 
 
 class _BarrierRuntime(InMemoryRuntimeAdapter):
@@ -543,7 +603,9 @@ def test_active_turn_pools_have_global_defaults_and_repository_overrides():
             resolve_active_turn_pools(invalid, repository="local/phase-four-a")
 
 
-def test_parked_hosted_ci_releases_worker_turns_and_next_pass_refills(tmp_path):
+def test_batch_wait_releases_worker_turns_and_refills_before_one_hosted_ci(
+    tmp_path,
+):
     repository = _temporary_repository(tmp_path)
     intent, source, _policy = _multi_ready_inputs(count=3)
     compiled = PlanCompiler().compile(
@@ -580,13 +642,18 @@ def test_parked_hosted_ci_releases_worker_turns_and_next_pass_refills(tmp_path):
 
     assert len(first.admitted_node_keys) == 2
     assert first.active_worker_turns == 0
-    assert {item.wait_condition for item in first.node_outcomes} == {"hosted_ci"}
+    assert {item.wait_condition for item in first.node_outcomes} == {
+        "integration_batch"
+    }
     assert len(second.admitted_node_keys) == 1
     assert second.active_worker_turns == 0
-    assert delivery.publication_count == 3
+    assert {item.wait_condition for item in second.node_outcomes} == {
+        "hosted_ci"
+    }
+    assert delivery.publication_count == 1
 
 
-def test_parked_worker_reacquires_capacity_before_repair(tmp_path):
+def test_batch_hosted_failure_stops_without_blind_worker_repair(tmp_path):
     repository = _temporary_repository(tmp_path)
     intent, source, _policy = _multi_ready_inputs(count=2)
     compiled = PlanCompiler().compile(
@@ -635,16 +702,18 @@ def test_parked_worker_reacquires_capacity_before_repair(tmp_path):
     assert runtime.repair_count == 0
     assert second.active_worker_turns == 0
     assert {
-        item.wait_condition
-        for item in second.node_outcomes
-        if item.work_item_key == "issue:101"
-    } == {"worker_capacity"}
+        item.wait_condition for item in second.node_outcomes
+    } == {"hosted_ci"}
 
     third = kernel.reconcile_once("local/phase-four-a")
 
-    assert runtime.repair_count == 1
+    assert runtime.repair_count == 0
     assert third.admitted_node_keys == ()
-    assert third.active_worker_turns == 1
+    assert third.active_worker_turns == 0
+    assert {item.status for item in third.node_outcomes} == {"blocked"}
+    assert {item.attempt_state for item in third.node_outcomes} == {
+        "integration_batch_failed"
+    }
 
 
 def test_same_node_recovery_reservation_is_compare_and_swap(tmp_path):
@@ -795,7 +864,7 @@ def test_explicit_non_shareable_resource_hard_excludes_second_admission(tmp_path
     assert outcome.active_worker_turns == 1
 
 
-def test_one_reconciliation_pass_performs_only_one_target_branch_mutation(
+def test_one_batch_performs_only_one_target_branch_mutation(
     tmp_path,
 ):
     repository = _temporary_repository(tmp_path)
@@ -832,16 +901,12 @@ def test_one_reconciliation_pass_performs_only_one_target_branch_mutation(
     outcome = kernel.reconcile_once("local/phase-four-a")
 
     assert len(delivery.integrated_candidates) == 1
+    assert delivery.publication_count == 1
     assert outcome.active_worker_turns == 0
-    assert {item.status for item in outcome.node_outcomes} == {
-        "complete",
-        "waiting",
-    }
-    assert {
-        item.wait_condition
-        for item in outcome.node_outcomes
-        if item.status == "waiting"
-    } == {"integration_turn"}
+    assert {item.status for item in outcome.node_outcomes} == {"complete"}
+    assert len(
+        {item.integration_batch_sha for item in outcome.node_outcomes}
+    ) == 1
 
 
 def test_three_node_e2e_reaches_the_serial_integration_boundary(tmp_path):
@@ -886,23 +951,111 @@ def test_three_node_e2e_reaches_the_serial_integration_boundary(tmp_path):
 
     first = kernel.reconcile_once("local/phase-four-a")
     second = kernel.reconcile_once("local/phase-four-a")
+    third = kernel.reconcile_once("local/phase-four-a")
+    fourth = kernel.reconcile_once("local/phase-four-a")
 
     assert len(first.admitted_node_keys) == 2
     assert first.active_worker_turns == 0
     assert len(second.admitted_node_keys) == 1
-    assert delivery.publication_count == 3
+    assert delivery.publication_count == 1
     assert len(delivery.integrated_candidates) == 1
     assert second.wait_condition == "kernel_sweep"
-    assert second.next_check_at is not None
-    assert {item.status for item in second.node_outcomes} == {
-        "complete",
-        "waiting",
+    assert third.wait_condition == "kernel_sweep"
+    assert fourth.status == "complete"
+    assert {item.status for item in fourth.node_outcomes} == {"complete"}
+    batch_shas = {
+        item.integration_batch_sha for item in fourth.node_outcomes
     }
-    assert {
-        item.wait_condition
-        for item in second.node_outcomes
-        if item.status == "waiting"
-    } == {"hosted_ci", "integration_turn"}
+    assert len(batch_shas) == 1
+    assert next(iter(batch_shas)) == _git(repository, "rev-parse", "main")
+
+
+def test_three_standard_candidates_keep_dual_axis_review_in_one_batch(tmp_path):
+    repository = _temporary_repository(tmp_path)
+    intent, source, _policy = _multi_ready_inputs(count=3)
+    for node in intent["nodes"]:
+        node["risk"] = "standard"
+    policy = _local_first_policy(3)
+    # Every Work Node needs one applicable affected definition. The synthetic
+    # commands are equivalent, so expose the repository definitions as affected
+    # and add one shared repository-equivalent definition per node.
+    for definition in policy["check_definitions"]:
+        if definition["hosted_only"] is not True:
+            definition["suite"] = "affected"
+    for ordinal in range(1, 4):
+        path = f"module-{ordinal}.txt"
+        policy["check_definitions"].append(
+            {
+                "check_id": f"module-{ordinal}-repository",
+                "version": 1,
+                "command": [
+                    "python",
+                    "-c",
+                    f"from pathlib import Path; assert Path('{path}').is_file()",
+                ],
+                "hosted_name": None,
+                "environment_requirements": ["python"],
+                "input_selector": [path],
+                "base_sensitive": False,
+                "risk": "low",
+                "hosted_only": False,
+                "suite": "repository",
+            }
+        )
+    compiled = PlanCompiler().compile(intent, source, policy)
+    store_path = tmp_path / "v8.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-4a",
+    )
+    delivery = InMemoryDeliveryControl(hosted_outcomes=("passed",))
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=_ReviewingInMemoryRuntime(tmp_path / "runtime"),
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        runtime_profile=_runtime_profile(),
+        delivery_control=delivery,
+        runtime_config={
+            "active_turn_pools": {"workers": 3, "coordinators": 1},
+            "repositories": {},
+            "runtime_profiles": {
+                "reviewer_standard": {
+                    "provider": "codex",
+                    "settings": {
+                        "model": "gpt-5.6-sol",
+                        "thinkingOptionId": "high",
+                        "modeId": "full-access",
+                        "features": {},
+                    },
+                }
+            },
+            "review_profiles": {"standard_axis": "reviewer_standard"},
+        },
+    )
+
+    completed = kernel.reconcile_once("local/phase-four-a")
+
+    assert completed.status == "complete"
+    assert delivery.publication_count == 1
+    assert len(delivery.integrated_candidates) == 1
+    states = kernel._read_states("local/phase-four-a", compiled.digest)
+    assert len({state["integration_batch_sha"] for state in states}) == 1
+    for state in states:
+        review = next(
+            item
+            for item in state["candidate_observation"]["evidence"]
+            if item["kind"] == "review"
+        )
+        assert {axis["axis"] for axis in review["payload"]["axes"]} == {
+            "standards",
+            "spec",
+        }
 
 
 def test_saturated_workers_cannot_consume_reserved_coordinator_capacity(

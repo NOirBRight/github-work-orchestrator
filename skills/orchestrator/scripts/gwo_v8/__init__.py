@@ -91,6 +91,12 @@ from .kernel import (
     RecoveryDirective,
     RecoveryLadder,
 )
+from .integration_batch import (
+    GitIntegrationBatchAssembler,
+    IntegrationBatch,
+    IntegrationBatchError,
+    IntegrationBatchMember,
+)
 from .reconstruction import (
     AuthoritativeNodeReadback,
     AuthoritativeRepositoryReadback,
@@ -169,6 +175,10 @@ __all__ = [
     "GoalSnapshot",
     "HostedCheckReadback",
     "IntegrationReadback",
+    "IntegrationBatch",
+    "IntegrationBatchError",
+    "IntegrationBatchMember",
+    "GitIntegrationBatchAssembler",
     "InMemoryDeliveryControl",
     "InMemoryDurablePlanControl",
     "InMemoryDurableGoalControl",

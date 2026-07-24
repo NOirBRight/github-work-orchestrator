@@ -135,6 +135,20 @@ def test_github_content_read_retries_transient_transport_failure():
     assert client.reads == 3
 
 
+def test_github_content_client_bounds_a_hung_cli_command(monkeypatch):
+    def hang(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["gh", "api"], timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", hang)
+
+    result = GitHubCliContentClient(
+        command_timeout_seconds=1
+    )._run(["api", "example"])
+
+    assert result.returncode == 124
+    assert "timed out after 1 seconds" in result.stderr
+
+
 def _ready_source(*, state: str = "ready-for-agent") -> dict:
     return {
         "repository": "local/phase-two",
@@ -267,6 +281,42 @@ def test_activation_commits_durable_receipt_before_store_activation(tmp_path):
         compiled.repository,
         compiled.digest,
     ).canonical_bytes == compiled.canonical_bytes
+
+
+def test_one_reconcile_snapshot_reuses_one_durable_activation_witness(
+    tmp_path,
+    monkeypatch,
+):
+    compiled = _compiled()
+    durable = InMemoryDurablePlanControl()
+    publication = LocalPlanPublication(tmp_path / "v8.sqlite3", durable=durable)
+    outcome = publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="v8-generation-1",
+    )
+    original = durable.read_current_activation
+    calls = 0
+
+    def counted(repository):
+        nonlocal calls
+        calls += 1
+        return original(repository)
+
+    monkeypatch.setattr(durable, "read_current_activation", counted)
+
+    with publication.pin_durable_activation(compiled.repository):
+        publication.read_active(compiled.repository)
+        publication.read_active(compiled.repository)
+        publication.assert_new_work(
+            compiled.repository,
+            writer_generation="v8-generation-1",
+            activation_id=outcome.activation_id,
+        )
+
+    assert calls == 1
+    publication.read_active(compiled.repository)
+    assert calls == 2
 
 
 @pytest.mark.parametrize(
@@ -717,6 +767,14 @@ def test_prompt_snapshot_resolves_current_optional_skill_without_authority():
     assert "First guidance" in first.text
     assert "Updated guidance" not in first.text
     assert first.authority_digest == node["contract_digest"]
+    scope = json.loads(first.text)["execution_scope"]
+    assert scope["role"] == "worker"
+    assert "do not create reviewer subagents" in scope["prohibited"]
+    assert scope["review_owner"].startswith("Kernel materializes")
+    protocol = json.loads(first.text)["result_protocol"]
+    assert protocol["schema_version"] == 1
+    assert '"schema_version":1' in protocol["instruction"]
+    assert f'"action_key":"{node["node_key"]}"' in protocol["instruction"]
 
 
 def test_missing_optional_skill_warns_and_keeps_the_base_prompt():

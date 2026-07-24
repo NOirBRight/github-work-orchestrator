@@ -24,6 +24,9 @@ from gwo_v8 import (  # noqa: E402
     KernelError,
     LocalPlanPublication,
     PlanCompiler,
+    PaseoCliClient,
+    PaseoAgentRecord,
+    PaseoCreateRequest,
     PaseoRuntimeAdapter,
     ReviewAxisRequest,
     RecoveryLadder,
@@ -34,6 +37,88 @@ from gwo_v8 import (  # noqa: E402
     resolve_review_profile,
 )
 import orch_core  # noqa: E402
+
+
+def test_paseo_cli_client_resolves_windows_command_trampoline(monkeypatch):
+    resolved = r"C:\Users\test\.local\bin\paseo.CMD"
+    monkeypatch.setattr("gwo_v8.runtime.shutil.which", lambda _value: resolved)
+
+    assert PaseoCliClient().executable == resolved
+
+
+def test_paseo_cli_create_atomically_labels_prompt_and_accepts_agent_id(
+    monkeypatch,
+):
+    client = PaseoCliClient(executable="paseo")
+    prompt = RuntimePrompt(text="work", digest="a" * 64)
+    profile = RuntimeProfile(
+        name="standard",
+        provider="kimi-cli",
+        model="kimi-code/kimi-for-coding",
+        thinking="on",
+        mode="yolo",
+        features={},
+    )
+    record = PaseoAgentRecord(
+        agent_id="agent-1",
+        session_id="session-1",
+        workspace_id="workspace-1",
+        workspace="C:/worktree",
+        parent_agent_id=None,
+        provider="kimi-cli",
+        model=profile.model,
+        profile_digest=profile.digest,
+        thinking=profile.thinking,
+        mode=profile.mode,
+        features={},
+        labels={
+            "gwo.action_key": "action-1",
+            "gwo.prompt_digest": prompt.digest,
+        },
+        lifecycle="running",
+        archived=False,
+    )
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return {"agentId": record.agent_id}
+
+    monkeypatch.setattr(client, "_run", run)
+    monkeypatch.setattr(
+        client,
+        "find_by_labels",
+        lambda labels: (
+            record
+            if labels["gwo.prompt_digest"] == prompt.digest
+            else None
+        ,),
+    )
+    monkeypatch.setattr(
+        client,
+        "update_labels",
+        lambda *_args, **_kwargs: pytest.fail(
+            "prompt identity must be atomic with create"
+        ),
+    )
+
+    created = client.create(
+        PaseoCreateRequest(
+            action_key="action-1",
+            title="worker",
+            labels={"gwo.action_key": "action-1"},
+            prompt=prompt,
+            repository_path="C:/repository",
+            base_sha="b" * 40,
+            profile=profile,
+            parent_agent_id=None,
+        )
+    )
+
+    assert created.agent_id == record.agent_id
+    prompt_label = f"gwo.prompt_digest={prompt.digest}"
+    assert prompt_label in commands[0]
+    assert commands[0].index(prompt_label) < commands[0].index("--json")
 
 
 def _ready_source() -> dict:
@@ -628,6 +713,12 @@ def test_runtime_materializes_cross_provider_typed_review_axis(tmp_path):
     assert client.create_count == 1
     assert client.inspect(binding.agent_id).labels["gwo.review_axis"] == "standards"
     assert "transcript" not in request.to_prompt().text
+    output_protocol = json.loads(request.to_prompt().text)["output_protocol"]
+    assert output_protocol["schema_version"] == 1
+    assert f'"action_key":"{request.action_key}"' in output_protocol["instruction"]
+    assert output_protocol["instruction"].startswith(
+        "End with exactly one compact JSON line"
+    )
 
     client.set_output(
         binding.agent_id,
@@ -1359,7 +1450,7 @@ def test_hosted_cancellation_waits_without_rejecting_candidate(tmp_path):
 
     assert waiting.status == "waiting"
     assert waiting.directive == "request_decision"
-    assert waiting.attempt_state == "parked"
+    assert waiting.attempt_state == "batch_wait"
     assert waiting.wait_condition == "hosted_ci_cancelled"
     assert waiting.attempt_ordinal == 1
 
@@ -1703,9 +1794,16 @@ def test_kernel_reuses_store_persisted_checks_after_adapter_restart(tmp_path):
     completed = restarted_kernel.reconcile_once("local/phase-three")
 
     assert completed.status == "complete"
-    cached = next(iter(restarted_adapter._worker_observations.values()))[1]
+    completed_state = restarted_kernel._read_state(
+        "local/phase-three",
+        compiled.digest,
+    )
     assert (
-        next(item for item in cached.evidence if item.kind == "check").content_digest
+        next(
+            item["content_digest"]
+            for item in completed_state["candidate_observation"]["evidence"]
+            if item["kind"] == "check"
+        )
         == persisted_check_digest
     )
 

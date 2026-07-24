@@ -1,7 +1,7 @@
 # GWO V8 live canary
 
-Status: GitHub-boundary smoke passed; full three-node acceptance is pending an
-Integration refresh decision.
+Status: GitHub-boundary smoke and automated three-node Integration Batch
+acceptance passed on 2026-07-24.
 
 ## Dedicated repository
 
@@ -55,24 +55,89 @@ The intentionally retained failed hosted run is:
 `https://github.com/NOirBRight/gwo-v8-canary/actions/runs/30057815190`.
 It is valid failure evidence for a missing CI dependency and was not rerun.
 
-## Full-canary blocker
+## Full-canary Batch contract
 
-The first full canary must admit three independent Work Nodes in parallel and
-integrate them serially. Today all three Candidates start from the same target
-head, while `GitHubCliDeliveryControl` only permits exact-SHA fast-forward
-Integration. Therefore:
+The full canary admits three independent Work Nodes and completes their local
+checks and dual-axis Reviews in parallel. The Kernel waits for that compatible
+frontier to drain, composes the three same-base Candidates in deterministic
+Node-key order, and records one immutable Integration Batch SHA.
 
-1. the first Candidate can integrate;
-2. the other two deterministically enter `integration_refresh`;
-3. each refreshed Candidate gets a new SHA and repeats Review and hosted CI;
-4. the last Candidate can require another refresh after the second integrates.
+Acceptance requires:
 
-Starting that run now would knowingly repeat Agent work, Review, and CI rather
-than test an uncertain condition. Full acceptance remains closed until the
-Integration policy chooses and specifies one of these options:
+1. three distinct reviewed local Candidate SHAs and one shared base SHA;
+2. one Batch SHA containing all three module changes;
+3. one remote Candidate-namespace publication for the Batch SHA;
+4. one `GWO Canary CI` run on that exact Batch SHA;
+5. one remote and local `main` fast-forward to the Batch SHA;
+6. Batch Evidence mapping all three Candidate SHAs and Integration Nodes to
+   that result, with no `integration_refresh`, repeated Review, or per-member
+   hosted CI.
 
-- retain exact-SHA fast-forward and authorize bounded automatic refresh;
-- define compositional Integration for disjoint Effect Contracts, including
-  which Evidence may be reused and which combined-tree check is required;
-- serialize Candidate production, which gives up the required parallel
-  Admission behavior and is therefore not recommended.
+## Full-canary result
+
+The automated Paseo-backed run completed successfully:
+
+- Run: `20260724035522`
+- Elapsed time: 889.325 seconds
+- Activation:
+  `activation:ccdc7a60d2658fde8e123c4f`
+- Plan:
+  `4fab0ff6f5850534c96ed80898d98e2b8a793dd0964dc29d5ba135ba72bf44c1`
+- Candidate SHAs:
+  `578eb7512b48b786c13b0a31da6ffd0d9773d737`,
+  `843d3b3108c9bdfc59f1fd69e0577b35569e47ec`, and
+  `ae28302b193c5b6d5e86ac8db8f7fe256865ee76`
+- Integration Batch:
+  `9748c4792dbf39976c56d064dd4fd795491ba926ddfb3d4ccb3c7d30d4b3d516`
+- Batch and integrated SHA:
+  `8a8673cb2bba9d70003eb9c4305b89789122224b`
+- Hosted run:
+  `https://github.com/NOirBRight/gwo-v8-canary/actions/runs/30066004877`
+- Hosted result: passed
+- Hosted retry count: zero
+
+All three Work Nodes were admitted concurrently, produced distinct local
+Candidates, and received separate Standards and Spec observations. One first
+Candidate passed its checks but Spec Review found an extra newline against the
+exact content contract. The same semantic Attempt used its one bounded repair
+round, produced `ae28302b...`, and passed a fresh dual-axis Review. This
+validated that check success does not bypass Spec acceptance.
+
+Only the final Batch SHA was published for CI. The three member Candidates did
+not each start hosted CI, no `integration_refresh` occurred, and local and
+remote `main` both read back exactly as the Batch SHA.
+
+## Full-canary findings fixed
+
+The automated Paseo run found several protocol and efficiency defects before
+the Batch boundary:
+
+1. Windows `.cmd` invocation exceeded the command-line trampoline limit for a
+   frozen Prompt. The adapter now resolves the packaged Electron CLI entrypoint
+   directly while preserving the public Paseo command surface.
+2. Prompt identity was added after Agent creation and could race provider
+   startup. `gwo.prompt_digest` is now part of the atomic create labels, and the
+   CLI's actual `agentId` response field is accepted.
+3. Worker and Review output instructions named markers without defining the
+   exact JSON envelope. Both now include compact, action-bound success and
+   no-result schemas; unparseable prose remains fail-closed.
+4. The Worker could see the full machine output contract, so it repeated the
+   repository suite and invoked `code-review` itself. Worker Prompt projection
+   now exposes only implementation authority and affected diagnostics. Kernel
+   and Runtime retain the full Check and Review contract.
+5. A terminal Reviewer without typed output correctly permits one recovery,
+   but the underspecified schema caused unnecessary recovery fan-out. The exact
+   Review schema removes that false recovery; standard Review remains exactly
+   two axes.
+6. Store reconstruction previously assumed every integrated SHA equalled its
+   member Candidate SHA. Reconstruction now restores Integration Batch
+   identity, member mapping, hosted evidence, and the combined integrated SHA.
+7. One reconcile repeatedly reread the same GitHub activation receipt.
+   Reconciliation now pins one fail-closed durable witness for the pass and
+   rereads authority at the next pass.
+
+Paseo 0.1.110 currently advertises Kimi K2.7 `low/high/max`, while its daemon
+rejects `high` and `max` and accepts the older `on` value. The canary runner
+therefore requires an explicit test-only `--worker-thinking-override on`.
+Repository defaults remain K2.7 Max; the canary does not claim that configured
+thinking level was exercised.

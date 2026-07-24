@@ -17,6 +17,11 @@ from urllib.parse import quote
 from ._canonical import canonical_bytes, digest_bytes, digest_value
 from .activation import LocalPlanPublication
 from .evidence import EvidenceVerifier, ResultClaim, TypedEvidence
+from .integration_batch import (
+    GitIntegrationBatchAssembler,
+    IntegrationBatchError,
+    IntegrationBatchMember,
+)
 from .runtime import (
     ReviewAxisBinding,
     ReviewAxisObservation,
@@ -746,6 +751,8 @@ class ReconcileOutcome:
     publication_ref: str | None = None
     hosted_check_state: str | None = None
     hosted_retry_count: int = 0
+    integration_batch_id: str | None = None
+    integration_batch_sha: str | None = None
     admitted_node_keys: tuple[str, ...] = field(default=(), compare=False)
     active_worker_turns: int = 0
     worker_turn_capacity: int = 1
@@ -770,6 +777,14 @@ class KernelReconciliationPlan:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _runtime_error_record(error: RuntimeAdapterError) -> dict[str, str]:
+    return {
+        "code": error.code,
+        "failure_class": error.failure_class,
+        "detail": error.detail[:1_024],
+    }
 
 
 def _git(repository: Path, *args: str) -> str:
@@ -903,6 +918,13 @@ class Kernel:
                     node_key,
                     candidate_sha
                 )
+            );
+            CREATE TABLE IF NOT EXISTS v8_integration_batches (
+                repository TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                PRIMARY KEY (repository, plan_digest, batch_id)
             );
             """
         )
@@ -1100,6 +1122,43 @@ class Kernel:
                 repository=repository,
                 plan_digest=plan_digest,
                 rendered=rendered,
+            )
+
+    def _read_integration_batch(
+        self,
+        repository: str,
+        plan_digest: str,
+        batch_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT state_json
+                FROM v8_integration_batches
+                WHERE repository = ? AND plan_digest = ? AND batch_id = ?
+                """,
+                (repository, plan_digest, batch_id),
+            ).fetchone()
+        return None if row is None else json.loads(row["state_json"])
+
+    def _write_integration_batch(
+        self,
+        repository: str,
+        plan_digest: str,
+        batch_id: str,
+        state: dict[str, Any],
+    ) -> None:
+        rendered = self._render_state(state)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO v8_integration_batches (
+                    repository, plan_digest, batch_id, state_json
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(repository, plan_digest, batch_id) DO UPDATE SET
+                    state_json = excluded.state_json
+                """,
+                (repository, plan_digest, batch_id, rendered),
             )
 
     def record_human_decision(
@@ -1906,7 +1965,11 @@ class Kernel:
     def _state_holds_worker_turn(state: dict[str, Any]) -> bool:
         if state.get("status") in {"complete", "failed", "superseded"}:
             return False
+        if state.get("status") == "blocked" and state.get("wait_condition") is None:
+            return False
         if state.get("attempt_state") in {
+            "batch_ready",
+            "batch_wait",
             "integration_refresh_required",
             "integration_wait",
             "parked",
@@ -2214,6 +2277,11 @@ class Kernel:
             skill_name=snapshot.get("skill_name"),
             skill_digest=snapshot.get("skill_digest"),
             warnings=tuple(snapshot.get("warnings") or ()),
+            contract_node=(
+                snapshot.get("contract_node")
+                if isinstance(snapshot.get("contract_node"), dict)
+                else None
+            ),
         )
 
     def _materialization_failure(
@@ -2307,10 +2375,7 @@ class Kernel:
                     "next_check_at": None,
                 }
             )
-        state["last_runtime_error"] = {
-            "code": error.code,
-            "failure_class": error.failure_class,
-        }
+        state["last_runtime_error"] = _runtime_error_record(error)
         self._write_state(state["repository"], state["plan_digest"], state)
         return self._outcome(state)
 
@@ -2406,6 +2471,8 @@ class Kernel:
             "publication_ref": None,
             "hosted_check_state": None,
             "hosted_retry_count": 0,
+            "integration_batch_id": None,
+            "integration_batch_sha": None,
             "materialization_executions": 0,
             "materialization_actions": {"create": 0, "prompt": 0},
             "wait_condition": None,
@@ -2428,6 +2495,7 @@ class Kernel:
                 "skill_name": prompt.skill_name,
                 "skill_digest": prompt.skill_digest,
                 "warnings": list(prompt.warnings),
+                "contract_node": prompt.contract_node,
             },
             "resume_sent": False,
         }
@@ -2544,6 +2612,71 @@ class Kernel:
                     if isinstance(value, dict)
                 ),
             )
+            if hosted_definitions and hosted_findings:
+                batch_record = evidence_record.get("integration_batch")
+                try:
+                    batch_sha = str(batch_record["batch_sha"])
+                    batch_hosted = tuple(
+                        TypedEvidence(**value)
+                        for value in batch_record["hosted_check_evidence"]
+                        if isinstance(value, dict)
+                    )
+                    batch_integration = TypedEvidence(
+                        **batch_record["integration_evidence"]
+                    )
+                except (KeyError, TypeError):
+                    batch_sha = ""
+                    batch_hosted = ()
+                    batch_integration = None
+                batch_ancestry = (
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(self.repository_path),
+                            "merge-base",
+                            "--is-ancestor",
+                            batch_sha,
+                            current_base,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                    )
+                    if batch_sha
+                    else None
+                )
+                expected_hosted_names = {
+                    str(definition["hosted_name"])
+                    for definition in hosted_definitions
+                }
+                observed_hosted_names = {
+                    str(item.payload.get("hosted_name"))
+                    for item in batch_hosted
+                    if item.kind == "check"
+                    and item.subject == batch_sha
+                    and item.payload.get("candidate_sha") == batch_sha
+                    and item.payload.get("outcome") == "passed"
+                    and item.has_valid_digest()
+                }
+                batch_is_valid = (
+                    batch_ancestry is not None
+                    and batch_ancestry.returncode == 0
+                    and batch_integration is not None
+                    and batch_integration.kind == "integration"
+                    and batch_integration.subject == batch_sha
+                    and batch_integration.payload.get("candidate_sha")
+                    == candidate_sha
+                    and state["node_key"]
+                    in (
+                        batch_integration.payload.get("member_node_keys")
+                        or ()
+                    )
+                    and batch_integration.has_valid_digest()
+                    and expected_hosted_names <= observed_hosted_names
+                )
+                if batch_is_valid:
+                    hosted_findings = ()
             if (
                 verified.status != "accepted"
                 or verified.result is None
@@ -2755,6 +2888,14 @@ class Kernel:
         evidence_record = {
             **candidate_observation,
             "hosted_check_evidence": list(state.get("hosted_check_evidence") or ()),
+            "integration_batch": {
+                "batch_id": state.get("integration_batch_id"),
+                "batch_sha": state.get("integration_batch_sha"),
+                "hosted_check_evidence": list(
+                    state.get("integration_batch_hosted_check_evidence") or ()
+                ),
+                "integration_evidence": state.get("integration_evidence"),
+            },
         }
         evidence_json = self._render_state(evidence_record)
         evidence_manifest_digest = digest_value(evidence_record)
@@ -3441,9 +3582,14 @@ class Kernel:
                     "marker": "GWO_RESULT",
                     "action_key": work_node["node_key"],
                     "instruction": (
-                        "Produce a changed clean Candidate, then return the "
-                        "same bounded GWO_RESULT schema."
+                        "Produce a changed clean Candidate, then end with "
+                        "exactly: GWO_RESULT "
+                        '{"schema_version":1,"action_key":"'
+                        f'{work_node["node_key"]}","candidate_sha":'
+                        '"<40-hex-sha>"}. Use one compact JSON line and no '
+                        "code fence."
                     ),
+                    "schema_version": 1,
                 },
             }
         else:
@@ -3458,6 +3604,7 @@ class Kernel:
             text=text,
             digest=digest_value(payload),
             authority_digest=work_node.get("contract_digest"),
+            contract_node=work_node,
         )
 
     def _handle_semantic_rejection(
@@ -3646,6 +3793,7 @@ class Kernel:
                         "skill_name": prompt.skill_name,
                         "skill_digest": prompt.skill_digest,
                         "warnings": list(prompt.warnings),
+                        "contract_node": prompt.contract_node,
                     },
                 }
             )
@@ -4061,10 +4209,7 @@ class Kernel:
                     "wait_source_ref": None,
                     "wait_event_identity": None,
                     "next_check_at": None,
-                    "last_runtime_error": {
-                        "code": error.code,
-                        "failure_class": error.failure_class,
-                    },
+                    "last_runtime_error": _runtime_error_record(error),
                 }
             )
             self._write_state(
@@ -4106,10 +4251,7 @@ class Kernel:
                         "directive": "request_decision",
                         "attempt_state": "review_recovery_blocked",
                         "wait_condition": None,
-                        "last_runtime_error": {
-                            "code": error.code,
-                            "failure_class": error.failure_class,
-                        },
+                        "last_runtime_error": _runtime_error_record(error),
                     }
                 )
                 self._write_state(
@@ -4180,10 +4322,7 @@ class Kernel:
                         "next_check_at": (
                             datetime.now(timezone.utc) + timedelta(seconds=30)
                         ).isoformat(),
-                        "last_runtime_error": {
-                            "code": error.code,
-                            "failure_class": error.failure_class,
-                        },
+                        "last_runtime_error": _runtime_error_record(error),
                     }
                 )
                 self._write_state(
@@ -4269,273 +4408,708 @@ class Kernel:
             ),
         ), None
 
-    def _ensure_publication_and_hosted_checks(
+    @staticmethod
+    def _batch_hosted_definitions(
+        units: tuple[
+            tuple[
+                dict[str, Any],
+                dict[str, Any],
+                dict[str, Any],
+                dict[str, Any],
+            ],
+            ...,
+        ],
+        member_node_keys: set[str],
+    ) -> tuple[dict[str, Any], ...]:
+        by_name: dict[str, list[dict[str, Any]]] = {}
+        for work_node, _integration, _goal, _work_item in units:
+            if work_node["node_key"] not in member_node_keys:
+                continue
+            for check in (work_node.get("output_contract") or {}).get("checks") or ():
+                if not isinstance(check, dict) or check.get("hosted_only") is not True:
+                    continue
+                hosted_name = str(check["hosted_name"])
+                by_name.setdefault(hosted_name, []).append(check)
+        return tuple(
+            {
+                "check_id": f"integration-batch:{hosted_name}",
+                "hosted_name": hosted_name,
+                "definition_digest": digest_value(
+                    {
+                        "hosted_name": hosted_name,
+                        "member_definition_digests": sorted(
+                            str(check["definition_digest"]) for check in checks
+                        ),
+                    }
+                ),
+                "hosted_only": True,
+                "suite": "hosted",
+            }
+            for hosted_name, checks in sorted(by_name.items())
+        )
+
+    def _write_batch_members(
         self,
-        state: dict[str, Any],
-        binding,
-        observation,
-        eligibility,
-        hosted_check_definitions: tuple[dict[str, Any], ...],
-        delivery_required: bool,
-    ) -> ReconcileOutcome | None:
-        state["publication_eligible"] = bool(eligibility.eligible)
-        if self.delivery_control is None:
-            if delivery_required or hosted_check_definitions:
+        repository: str,
+        plan_digest: str,
+        states: dict[str, dict[str, Any]],
+    ) -> None:
+        for state in states.values():
+            self._write_state(repository, plan_digest, state)
+
+    def _advance_integration_batch(
+        self,
+        repository: str,
+        *,
+        active: Any,
+        units: tuple[
+            tuple[
+                dict[str, Any],
+                dict[str, Any],
+                dict[str, Any],
+                dict[str, Any],
+            ],
+            ...,
+        ],
+    ) -> None:
+        all_states = {
+            str(state["node_key"]): state
+            for state in self._read_states(repository, active.plan_digest)
+        }
+        in_flight_ids = {
+            str(state["integration_batch_id"])
+            for state in all_states.values()
+            if state.get("attempt_state") == "batch_wait"
+            and isinstance(state.get("integration_batch_id"), str)
+        }
+        if len(in_flight_ids) > 1:
+            raise KernelError(
+                "INTEGRATION_BATCH_CONCURRENCY_INVALID",
+                "one Plan Revision cannot have multiple active Integration Batches",
+            )
+        batch_state: dict[str, Any] | None = None
+        member_states: dict[str, dict[str, Any]]
+        hosted_definitions: tuple[dict[str, Any], ...]
+        if in_flight_ids:
+            batch_id = next(iter(in_flight_ids))
+            batch_state = self._read_integration_batch(
+                repository,
+                active.plan_digest,
+                batch_id,
+            )
+            if batch_state is None:
+                raise KernelError(
+                    "INTEGRATION_BATCH_STATE_MISSING",
+                    "member state references an absent Integration Batch",
+                )
+            member_node_keys = set(batch_state["member_node_keys"])
+            member_states = {
+                node_key: all_states[node_key]
+                for node_key in member_node_keys
+                if node_key in all_states
+            }
+            if len(member_states) != len(member_node_keys):
+                raise KernelError(
+                    "INTEGRATION_BATCH_MEMBER_MISSING",
+                    "Integration Batch member state is absent",
+                )
+            hosted_definitions = tuple(batch_state["hosted_definitions"])
+        else:
+            ready = {
+                node_key: state
+                for node_key, state in all_states.items()
+                if state.get("attempt_state") == "batch_ready"
+            }
+            if not ready:
+                return
+            if any(self._state_holds_worker_turn(state) for state in all_states.values()):
+                return
+            refreshed_plan = self.plan_reconciliation(repository)
+            if any(
+                node_key not in all_states
+                for node_key in refreshed_plan.admissible_node_keys
+            ):
+                return
+            integration_by_work = {
+                str(work_node["node_key"]): integration
+                for work_node, integration, _goal, _work_item in units
+            }
+            members = tuple(
+                IntegrationBatchMember(
+                    node_key=node_key,
+                    integration_node_key=str(
+                        integration_by_work[node_key]["node_key"]
+                    ),
+                    candidate_sha=str(state["candidate_sha"]),
+                    base_sha=str(state["base_sha"]),
+                    result_digest=str(state["result_digest"]),
+                    evidence_manifest_digest=str(
+                        state["candidate_evidence_manifest_digest"]
+                    ),
+                )
+                for node_key, state in sorted(ready.items())
+            )
+            try:
+                batch = GitIntegrationBatchAssembler(
+                    self.repository_path
+                ).prepare(
+                    plan_digest=active.plan_digest,
+                    members=members,
+                )
+            except IntegrationBatchError as error:
+                for state in ready.values():
+                    state.update(
+                        {
+                            "status": "blocked",
+                            "directive": "invoke_coordinator",
+                            "attempt_state": "integration_batch_blocked",
+                            "wait_condition": None,
+                            "last_integration_batch_error": {
+                                "code": error.code,
+                            },
+                        }
+                    )
+                self._write_batch_members(
+                    repository,
+                    active.plan_digest,
+                    ready,
+                )
+                return
+            batch_id = batch.batch_id
+            member_node_keys = {member.node_key for member in batch.members}
+            hosted_definitions = self._batch_hosted_definitions(
+                units,
+                member_node_keys,
+            )
+            batch_state = {
+                "repository": repository,
+                "plan_digest": active.plan_digest,
+                "batch_id": batch.batch_id,
+                "base_sha": batch.base_sha,
+                "batch_sha": batch.batch_sha,
+                "member_node_keys": [
+                    member.node_key for member in batch.members
+                ],
+                "candidate_shas": [
+                    member.candidate_sha for member in batch.members
+                ],
+                "candidate_evidence_manifest_digests": [
+                    member.evidence_manifest_digest for member in batch.members
+                ],
+                "hosted_definitions": list(hosted_definitions),
+                "state": "prepared",
+                "publication_state": None,
+                "publication_ref": None,
+                "hosted_check_state": None,
+                "hosted_retry_count": 0,
+            }
+            self._write_integration_batch(
+                repository,
+                active.plan_digest,
+                batch_id,
+                batch_state,
+            )
+            member_states = ready
+            for state in member_states.values():
+                state.update(
+                    {
+                        "status": "waiting",
+                        "directive": "reconcile_again",
+                        "attempt_state": "batch_wait",
+                        "wait_condition": "integration_batch",
+                        "wait_source_ref": batch.source_ref,
+                        "wait_event_identity": f"integration-batch:{batch_id}",
+                        "next_check_at": (
+                            datetime.now(timezone.utc) + timedelta(seconds=1)
+                        ).isoformat(),
+                        "integration_batch_id": batch_id,
+                        "integration_batch_sha": batch.batch_sha,
+                    }
+                )
+            self._write_batch_members(
+                repository,
+                active.plan_digest,
+                member_states,
+            )
+
+        assert batch_state is not None
+        batch_id = str(batch_state["batch_id"])
+        batch_sha = str(batch_state["batch_sha"])
+        delivery_required = bool(hosted_definitions) or any(
+            bool((work_node.get("output_contract") or {}).get("delivery_required"))
+            for work_node, _integration, _goal, _work_item in units
+            if work_node["node_key"] in member_states
+        )
+        if delivery_required and self.delivery_control is None:
+            for state in member_states.values():
                 state.update(
                     {
                         "status": "blocked",
                         "directive": "request_decision",
                         "attempt_state": "delivery_control_missing",
-                        "hosted_check_state": "unavailable",
                         "wait_condition": None,
                     }
                 )
-                self._write_state(
-                    state["repository"],
-                    state["plan_digest"],
-                    state,
-                )
-                return self._outcome(state)
-            return None
-        self.publication.assert_writer(
-            repository=state["repository"],
-            writer_generation=self.writer_generation,
-            plan_digest=state["plan_digest"],
-            activation_id=state["activation_id"],
-        )
-        if not eligibility.eligible or observation.result_claim is None:
-            raise KernelError(
-                "PUBLICATION_NOT_ELIGIBLE",
-                "Candidate cannot publish before derived eligibility is true",
-            )
-        candidate_sha = observation.result_claim.candidate_sha
-        manifest_digest = digest_value(
-            {
-                "candidate_sha": candidate_sha,
-                "check_evidence_digests": list(eligibility.check_evidence_digests),
-                "review_evidence_digest": (eligibility.review_evidence_digest),
+            batch_state["state"] = "blocked"
+            batch_state["last_delivery_error"] = {
+                "code": "DELIVERY_CONTROL_MISSING"
             }
-        )
-        try:
-            receipt = self.delivery_control.read_publication(
-                state["repository"],
-                candidate_sha,
+            self._write_integration_batch(
+                repository,
+                active.plan_digest,
+                batch_id,
+                batch_state,
             )
-            if receipt is None:
-                self.delivery_control.publish_once(
-                    state["repository"],
-                    candidate_sha,
-                    manifest_digest,
-                )
+            self._write_batch_members(
+                repository,
+                active.plan_digest,
+                member_states,
+            )
+            return
+
+        publication_ref = None
+        if self.delivery_control is not None:
+            manifest_digest = digest_value(
+                {
+                    "batch_id": batch_id,
+                    "batch_sha": batch_sha,
+                    "candidate_shas": batch_state["candidate_shas"],
+                    "candidate_evidence_manifest_digests": (
+                        batch_state["candidate_evidence_manifest_digests"]
+                    ),
+                    "hosted_definition_digests": [
+                        definition["definition_digest"]
+                        for definition in hosted_definitions
+                    ],
+                }
+            )
+            try:
                 receipt = self.delivery_control.read_publication(
-                    state["repository"],
-                    candidate_sha,
+                    repository,
+                    batch_sha,
                 )
+                if receipt is None:
+                    receipt = self.delivery_control.publish_once(
+                        repository,
+                        batch_sha,
+                        manifest_digest,
+                    )
+                if (
+                    receipt.candidate_sha != batch_sha
+                    or receipt.evidence_manifest_digest != manifest_digest
+                ):
+                    raise DeliveryControlError(
+                        "PUBLICATION_READBACK_FAILED",
+                        "Integration Batch publication changed exact identity",
+                    )
+            except DeliveryControlError as error:
+                batch_state["state"] = "blocked"
+                batch_state["last_delivery_error"] = {"code": error.code}
+                for state in member_states.values():
+                    state.update(
+                        {
+                            "status": "blocked",
+                            "directive": "request_decision",
+                            "attempt_state": "publication_blocked",
+                            "wait_condition": None,
+                            "last_delivery_error": {"code": error.code},
+                        }
+                    )
+                self._write_integration_batch(
+                    repository,
+                    active.plan_digest,
+                    batch_id,
+                    batch_state,
+                )
+                self._write_batch_members(
+                    repository,
+                    active.plan_digest,
+                    member_states,
+                )
+                return
+            publication_ref = receipt.source_ref
+            batch_state.update(
+                {
+                    "state": "published",
+                    "publication_state": "published",
+                    "publication_ref": publication_ref,
+                    "evidence_manifest_digest": manifest_digest,
+                }
+            )
+            for state in member_states.values():
+                state.update(
+                    {
+                        "publication_state": "published",
+                        "publication_ref": publication_ref,
+                    }
+                )
+
+        hosted_evidence: tuple[TypedEvidence, ...] = ()
+        if hosted_definitions:
+            assert self.delivery_control is not None
+            try:
+                hosted = self.delivery_control.read_hosted_checks(
+                    repository,
+                    batch_sha,
+                    hosted_definitions,
+                )
+            except DeliveryControlError as error:
+                batch_state.update(
+                    {
+                        "state": "waiting",
+                        "hosted_check_state": "unavailable",
+                        "last_delivery_error": {"code": error.code},
+                    }
+                )
+                for state in member_states.values():
+                    state.update(
+                        {
+                            "status": "waiting",
+                            "directive": "wait_for_hosted_ci",
+                            "wait_condition": "hosted_ci",
+                            "wait_source_ref": publication_ref,
+                            "wait_event_identity": f"hosted-ci:{batch_sha}",
+                            "next_check_at": (
+                                datetime.now(timezone.utc)
+                                + timedelta(seconds=30)
+                            ).isoformat(),
+                            "hosted_check_state": "unavailable",
+                        }
+                    )
+                self._write_integration_batch(
+                    repository,
+                    active.plan_digest,
+                    batch_id,
+                    batch_state,
+                )
+                self._write_batch_members(
+                    repository,
+                    active.plan_digest,
+                    member_states,
+                )
+                return
+            expected_digests = tuple(
+                sorted(
+                    str(definition["definition_digest"])
+                    for definition in hosted_definitions
+                )
+            )
             if (
-                receipt is None
-                or receipt.candidate_sha != candidate_sha
-                or receipt.evidence_manifest_digest != manifest_digest
+                hosted.candidate_sha != batch_sha
+                or hosted.definition_digests != expected_digests
             ):
-                raise DeliveryControlError(
-                    "PUBLICATION_READBACK_FAILED",
-                    "Candidate publication did not round-trip exact identity",
+                raise KernelError(
+                    "INTEGRATION_BATCH_HOSTED_IDENTITY_MISMATCH",
+                    "hosted Check readback changed Batch identity or definitions",
                 )
-        except DeliveryControlError as error:
-            state.update(
-                {
-                    "status": "blocked",
-                    "directive": "request_decision",
-                    "attempt_state": "publication_blocked",
-                    "publication_state": "blocked",
-                    "wait_condition": None,
-                    "last_delivery_error": {
-                        "code": error.code,
-                    },
-                }
-            )
-            self._write_state(
-                state["repository"],
-                state["plan_digest"],
-                state,
-            )
-            return self._outcome(state)
-        state.update(
-            {
-                "publication_state": "published",
-                "publication_ref": receipt.source_ref,
-                "evidence_manifest_digest": manifest_digest,
-            }
-        )
-        if not state.get("worker_parked_for_ci"):
-            self.runtime.interrupt(binding)
-            state["worker_parked_for_ci"] = True
-        try:
-            hosted = self.delivery_control.read_hosted_checks(
-                state["repository"],
-                candidate_sha,
-                hosted_check_definitions,
-            )
-        except DeliveryControlError as error:
-            state.update(
-                {
-                    "status": "waiting",
-                    "directive": "wait_for_hosted_ci",
-                    "attempt_state": "parked",
-                    "hosted_check_state": "unavailable",
-                    "wait_condition": "hosted_ci",
-                    "wait_source_ref": receipt.source_ref,
-                    "wait_event_identity": f"hosted-ci:{candidate_sha}",
-                    "next_check_at": (
-                        datetime.now(timezone.utc) + timedelta(seconds=30)
-                    ).isoformat(),
-                    "last_delivery_error": {"code": error.code},
-                }
-            )
-            self._write_state(
-                state["repository"],
-                state["plan_digest"],
-                state,
-            )
-            return self._outcome(state)
-        if hosted.candidate_sha != candidate_sha:
-            raise KernelError(
-                "HOSTED_CHECK_IDENTITY_MISMATCH",
-                "hosted check readback changed Candidate identity",
-            )
-        expected_definition_digests = tuple(
-            sorted(
-                str(check["definition_digest"]) for check in hosted_check_definitions
-            )
-        )
-        if hosted.definition_digests != expected_definition_digests:
-            raise KernelError(
-                "HOSTED_CHECK_DEFINITION_MISMATCH",
-                "hosted check readback changed the compiled Check Definitions",
-            )
-        state["hosted_check_state"] = hosted.status
-        if hosted.status == "passed":
+            batch_state["hosted_check_state"] = hosted.status
+            if hosted.status == "pending":
+                for state in member_states.values():
+                    state.update(
+                        {
+                            "status": "waiting",
+                            "directive": "wait_for_hosted_ci",
+                            "wait_condition": "hosted_ci",
+                            "wait_source_ref": hosted.source_ref,
+                            "wait_event_identity": f"hosted-ci:{batch_sha}",
+                            "next_check_at": (
+                                datetime.now(timezone.utc)
+                                + timedelta(seconds=30)
+                            ).isoformat(),
+                            "hosted_check_state": "pending",
+                        }
+                    )
+                batch_state["state"] = "waiting"
+                self._write_integration_batch(
+                    repository,
+                    active.plan_digest,
+                    batch_id,
+                    batch_state,
+                )
+                self._write_batch_members(
+                    repository,
+                    active.plan_digest,
+                    member_states,
+                )
+                return
+            if hosted.status == "cancelled":
+                batch_state["state"] = "waiting"
+                for state in member_states.values():
+                    state.update(
+                        {
+                            "status": "waiting",
+                            "directive": "request_decision",
+                            "attempt_state": "batch_wait",
+                            "wait_condition": "hosted_ci_cancelled",
+                            "wait_source_ref": hosted.source_ref,
+                            "wait_event_identity": (
+                                f"hosted-ci-cancelled:{batch_sha}"
+                            ),
+                            "next_check_at": None,
+                            "hosted_check_state": "cancelled",
+                        }
+                    )
+                self._write_integration_batch(
+                    repository,
+                    active.plan_digest,
+                    batch_id,
+                    batch_state,
+                )
+                self._write_batch_members(
+                    repository,
+                    active.plan_digest,
+                    member_states,
+                )
+                return
+            if hosted.status == "infrastructure_failure":
+                retries = int(batch_state.get("hosted_retry_count", 0))
+                if retries < 2:
+                    self.delivery_control.retry_hosted_checks(
+                        repository,
+                        batch_sha,
+                    )
+                    batch_state["hosted_retry_count"] = retries + 1
+                    batch_state["state"] = "waiting"
+                    for state in member_states.values():
+                        state.update(
+                            {
+                                "status": "waiting",
+                                "directive": "wait_for_hosted_ci",
+                                "wait_condition": "hosted_ci",
+                                "wait_source_ref": hosted.source_ref,
+                                "wait_event_identity": f"hosted-ci:{batch_sha}",
+                                "next_check_at": (
+                                    datetime.now(timezone.utc)
+                                    + timedelta(seconds=30)
+                                ).isoformat(),
+                                "hosted_check_state": (
+                                    "infrastructure_failure"
+                                ),
+                                "hosted_retry_count": retries + 1,
+                            }
+                        )
+                    self._write_integration_batch(
+                        repository,
+                        active.plan_digest,
+                        batch_id,
+                        batch_state,
+                    )
+                    self._write_batch_members(
+                        repository,
+                        active.plan_digest,
+                        member_states,
+                    )
+                    return
+            if hosted.status != "passed":
+                batch_state["state"] = "blocked"
+                for state in member_states.values():
+                    state.update(
+                        {
+                            "status": "blocked",
+                            "directive": "invoke_coordinator",
+                            "attempt_state": "integration_batch_failed",
+                            "wait_condition": None,
+                            "wait_source_ref": hosted.source_ref,
+                            "hosted_check_state": hosted.status,
+                        }
+                    )
+                self._write_integration_batch(
+                    repository,
+                    active.plan_digest,
+                    batch_id,
+                    batch_state,
+                )
+                self._write_batch_members(
+                    repository,
+                    active.plan_digest,
+                    member_states,
+                )
+                return
             hosted_evidence = tuple(
                 TypedEvidence._capture(
                     kind="check",
-                    subject=candidate_sha,
+                    subject=batch_sha,
                     observer_type="github",
                     observer_id=self.delivery_control.__class__.__name__,
                     observed_at=_now(),
                     source_ref=hosted.source_ref,
                     payload={
-                        "check_id": check["check_id"],
-                        "definition_digest": check["definition_digest"],
-                        "hosted_name": check["hosted_name"],
-                        "candidate_sha": candidate_sha,
+                        "check_id": definition["check_id"],
+                        "definition_digest": definition["definition_digest"],
+                        "hosted_name": definition["hosted_name"],
+                        "candidate_sha": batch_sha,
                         "outcome": "passed",
+                        "integration_batch_id": batch_id,
                     },
                 )
-                for check in hosted_check_definitions
+                for definition in hosted_definitions
             )
-            hosted_findings = self.verifier.verify_hosted_checks(
-                candidate_sha,
-                hosted_check_definitions,
-                hosted_evidence,
+
+        lease_holder = f"integration-batch:{batch_id}"
+        self.publication.assert_new_work(
+            repository,
+            writer_generation=self.writer_generation,
+            activation_id=active.activation_id,
+        )
+        try:
+            self._acquire_integration_lease(
+                repository,
+                lease_holder,
+                activation_id=active.activation_id,
             )
-            if hosted_findings:
-                raise KernelError(
-                    "HOSTED_CHECK_EVIDENCE_INVALID",
-                    "; ".join(hosted_findings),
-                )
-            state["hosted_check_evidence"] = [asdict(item) for item in hosted_evidence]
-            state["attempt_state"] = "result_submitted"
-            state["wait_condition"] = None
-            state["wait_source_ref"] = None
-            state["wait_event_identity"] = None
-            state["next_check_at"] = None
-            self._write_state(
-                state["repository"],
-                state["plan_digest"],
-                state,
-            )
-            return None
-        if hosted.status == "infrastructure_failure":
-            retries = int(state.get("hosted_retry_count", 0))
-            if retries >= 2:
+        except KernelError as error:
+            if error.code != "INTEGRATION_LEASE_UNAVAILABLE":
+                raise
+            for state in member_states.values():
                 state.update(
                     {
-                        "status": "blocked",
-                        "directive": "request_decision",
-                        "attempt_state": "parked",
-                        "wait_condition": None,
+                        "status": "waiting",
+                        "directive": "wait_for_integration",
+                        "wait_condition": "integration_lease",
+                        "next_check_at": (
+                            datetime.now(timezone.utc) + timedelta(seconds=5)
+                        ).isoformat(),
                     }
                 )
-                self._write_state(
-                    state["repository"],
-                    state["plan_digest"],
-                    state,
+            self._write_batch_members(
+                repository,
+                active.plan_digest,
+                member_states,
+            )
+            return
+        try:
+            current_branch = _git(
+                self.repository_path,
+                "rev-parse",
+                "--abbrev-ref",
+                "HEAD",
+            )
+            current_head = _git(self.repository_path, "rev-parse", "HEAD")
+            if current_branch != self.integration_branch:
+                raise KernelError(
+                    "INTEGRATION_BRANCH_MISMATCH",
+                    "repository is not on the configured Integration branch",
                 )
-                return self._outcome(state)
-            self.delivery_control.retry_hosted_checks(
-                state["repository"],
-                candidate_sha,
-            )
-            state["hosted_retry_count"] = retries + 1
-        elif hosted.status == "cancelled":
-            state.update(
+            if current_head not in {batch_state["base_sha"], batch_sha}:
+                for state in member_states.values():
+                    state.update(
+                        {
+                            "status": "blocked",
+                            "directive": "invoke_coordinator",
+                            "attempt_state": "integration_refresh_required",
+                            "wait_condition": "integration_refresh",
+                            "integration_target_head": current_head,
+                        }
+                    )
+                batch_state["state"] = "blocked"
+                self._write_integration_batch(
+                    repository,
+                    active.plan_digest,
+                    batch_id,
+                    batch_state,
+                )
+                self._write_batch_members(
+                    repository,
+                    active.plan_digest,
+                    member_states,
+                )
+                return
+            remote_integration = None
+            if self.delivery_control is not None:
+                remote_integration = self.delivery_control.integrate_serially(
+                    repository,
+                    batch_sha,
+                    self.integration_branch,
+                )
+                if (
+                    remote_integration.candidate_sha != batch_sha
+                    or remote_integration.target_branch != self.integration_branch
+                ):
+                    raise KernelError(
+                        "REMOTE_INTEGRATION_READBACK_FAILED",
+                        "remote Integration changed Batch SHA or target branch",
+                    )
+            if current_head != batch_sha:
+                _git(self.repository_path, "merge", "--ff-only", batch_sha)
+            integrated_sha = _git(self.repository_path, "rev-parse", "HEAD")
+            if integrated_sha != batch_sha:
+                raise KernelError(
+                    "INTEGRATION_READBACK_FAILED",
+                    "Integration branch did not reach the Batch SHA",
+                )
+            for state in member_states.values():
+                integration_evidence = TypedEvidence._capture(
+                    kind="integration",
+                    subject=integrated_sha,
+                    observer_type="kernel",
+                    observer_id=self.writer_generation,
+                    observed_at=_now(),
+                    source_ref=(
+                        f"git://{repository}/{self.integration_branch}"
+                        if remote_integration is None
+                        else remote_integration.source_ref
+                    ),
+                    payload={
+                        "integration_batch_id": batch_id,
+                        "batch_sha": integrated_sha,
+                        "candidate_sha": state["candidate_sha"],
+                        "member_node_keys": batch_state["member_node_keys"],
+                        "branch": self.integration_branch,
+                    },
+                )
+                state.update(
+                    {
+                        "status": "complete",
+                        "directive": "goal_complete",
+                        "goal_state": "completed",
+                        "work_item_state": "integrated",
+                        "attempt_state": "verified",
+                        "wait_condition": None,
+                        "wait_source_ref": None,
+                        "wait_event_identity": None,
+                        "next_check_at": None,
+                        "hosted_check_state": (
+                            "passed" if hosted_definitions else None
+                        ),
+                        "integration_batch_hosted_check_evidence": [
+                            asdict(item) for item in hosted_evidence
+                        ],
+                        "integrated_sha": integrated_sha,
+                        "integration_evidence_digest": (
+                            integration_evidence.content_digest
+                        ),
+                        "integration_evidence": asdict(integration_evidence),
+                    }
+                )
+                self._record_verified_result(
+                    state,
+                    candidate_sha=str(state["candidate_sha"]),
+                    result_digest=str(state["result_digest"]),
+                )
+            batch_state.update(
                 {
-                    "status": "waiting",
-                    "directive": "request_decision",
-                    "attempt_state": "parked",
-                    "wait_condition": "hosted_ci_cancelled",
-                    "wait_source_ref": hosted.source_ref,
-                    "wait_event_identity": f"hosted-ci-cancelled:{candidate_sha}",
-                    "next_check_at": None,
+                    "state": "integrated",
+                    "integrated_sha": integrated_sha,
+                    "integration_source_ref": (
+                        f"git://{repository}/{self.integration_branch}"
+                        if remote_integration is None
+                        else remote_integration.source_ref
+                    ),
                 }
             )
-            self._write_state(
-                state["repository"],
-                state["plan_digest"],
-                state,
+            self._write_integration_batch(
+                repository,
+                active.plan_digest,
+                batch_id,
+                batch_state,
             )
-            return self._outcome(state)
-        elif hosted.status in {"failed", "code_failure", "contract_failure"}:
-            state.update(
-                {
-                    "status": "rejected",
-                    "directive": "invoke_coordinator",
-                    "attempt_state": "candidate_rejected",
-                    "wait_condition": None,
-                    "wait_source_ref": hosted.source_ref,
-                    "wait_event_identity": None,
-                    "next_check_at": None,
-                }
+            self._write_batch_members(
+                repository,
+                active.plan_digest,
+                member_states,
             )
-            self._write_state(
-                state["repository"],
-                state["plan_digest"],
-                state,
-            )
-            return self._outcome(state)
-        elif hosted.status != "pending":
-            raise KernelError(
-                "HOSTED_CHECK_STATUS_INVALID",
-                f"unknown hosted check status: {hosted.status}",
-            )
-        state.update(
-            {
-                "status": "waiting",
-                "directive": "wait_for_hosted_ci",
-                "attempt_state": "parked",
-                "wait_condition": "hosted_ci",
-                "wait_source_ref": hosted.source_ref,
-                "wait_event_identity": f"hosted-ci:{candidate_sha}",
-                "next_check_at": (
-                    datetime.now(timezone.utc) + timedelta(seconds=30)
-                ).isoformat(),
-            }
-        )
-        self._write_state(
-            state["repository"],
-            state["plan_digest"],
-            state,
-        )
-        return self._outcome(state)
+        finally:
+            self._release_integration_lease(repository, lease_holder)
 
     def _reconcile_work_unit(
         self,
@@ -4548,13 +5122,17 @@ class Kernel:
         goal: dict[str, Any],
         work_item: dict[str, Any],
         worker_turn_capacity: int,
-        integration_budget: list[int],
     ) -> ReconcileOutcome:
         state = self._read_state(
             repository,
             active.plan_digest,
             work_node["node_key"],
         )
+        if state is not None and state.get("attempt_state") in {
+            "batch_ready",
+            "batch_wait",
+        }:
+            return self._outcome(state)
         if state is not None and (
             state.get("status") in {"complete", "failed", "superseded"}
             or (
@@ -4657,10 +5235,7 @@ class Kernel:
                         "directive": "request_decision",
                         "attempt_state": "runtime_configuration_blocked",
                         "wait_condition": None,
-                        "last_runtime_error": {
-                            "code": error.code,
-                            "failure_class": error.failure_class,
-                        },
+                        "last_runtime_error": _runtime_error_record(error),
                     }
                 )
                 self._write_state(repository, active.plan_digest, state)
@@ -4690,10 +5265,7 @@ class Kernel:
                     "next_check_at": (
                         datetime.now(timezone.utc) + timedelta(seconds=30)
                     ).isoformat(),
-                    "last_runtime_error": {
-                        "code": error.code,
-                        "failure_class": error.failure_class,
-                    },
+                    "last_runtime_error": _runtime_error_record(error),
                 }
             )
             self._write_state(repository, active.plan_digest, state)
@@ -4919,231 +5491,47 @@ class Kernel:
             work_node["output_contract"],
             observation,
         )
-        delivery_terminal = self._ensure_publication_and_hosted_checks(
-            state,
-            binding,
-            observation,
-            eligibility,
-            tuple(
-                check
-                for check in (work_node.get("output_contract") or {}).get("checks")
-                or ()
-                if isinstance(check, dict) and check.get("hosted_only") is True
-            ),
-            bool((work_node.get("output_contract") or {}).get("delivery_required")),
-        )
-        if delivery_terminal is not None:
-            if delivery_terminal.status == "rejected":
-                recovery_reservation = self._reserve_or_park_recovery_turn(
-                    state,
-                    worker_turn_capacity=worker_turn_capacity,
-                )
-                if recovery_reservation != "reserved":
-                    return self._outcome(state)
-                return self._handle_semantic_rejection(
-                    state,
-                    work_node,
-                    goal,
-                    work_item,
-                    binding,
-                    terminal_reason="rejected",
-                    findings=(
-                        (
-                            "hosted exact-SHA checks rejected "
-                            f"{observation.result_claim.candidate_sha}"
-                        ),
-                    ),
-                )
-            return delivery_terminal
+        if not eligibility.eligible:
+            raise KernelError(
+                "INTEGRATION_BATCH_NOT_ELIGIBLE",
+                "Candidate cannot enter an Integration Batch before local acceptance",
+            )
         state["result_digest"] = decision.result.result_digest
-        state["status"] = "verified"
-        state["attempt_state"] = "verified"
-        self._release_attempt_claims(state)
-
-        if integration_budget[0] <= 0:
-            state.update(
-                {
-                    "status": "waiting",
-                    "directive": "reconcile_again",
-                    "attempt_state": "integration_wait",
-                    "wait_condition": "integration_turn",
-                    "wait_source_ref": (
-                        f"git://{repository}/{self.integration_branch}"
-                    ),
-                    "wait_event_identity": "next-integration-turn",
-                    "next_check_at": (
-                        datetime.now(timezone.utc) + timedelta(seconds=1)
-                    ).isoformat(),
-                }
-            )
-            self._write_state(repository, active.plan_digest, state)
-            return self._outcome(state)
-        integration_budget[0] -= 1
-        lease_holder = integration_node["node_key"]
-        self.publication.assert_new_work(
-            repository,
-            writer_generation=self.writer_generation,
-            activation_id=active.activation_id,
-        )
-        try:
-            self._acquire_integration_lease(
-                repository,
-                lease_holder,
-                activation_id=active.activation_id,
-            )
-        except KernelError as error:
-            if error.code != "INTEGRATION_LEASE_UNAVAILABLE":
-                raise
-            state.update(
-                {
-                    "status": "waiting",
-                    "directive": "wait_for_integration",
-                    "attempt_state": "integration_wait",
-                    "wait_condition": "integration_lease",
-                    "wait_source_ref": (
-                        f"git://{repository}/{self.integration_branch}"
-                    ),
-                    "wait_event_identity": "integration-lease",
-                    "next_check_at": (
-                        datetime.now(timezone.utc) + timedelta(seconds=5)
-                    ).isoformat(),
-                }
-            )
-            self._write_state(repository, active.plan_digest, state)
-            return self._outcome(state)
-        try:
-            self.publication.assert_writer(
-                repository=repository,
-                writer_generation=self.writer_generation,
-                plan_digest=active.plan_digest,
-                activation_id=active.activation_id,
-            )
-            remote_integration = None
-            current_branch = _git(
-                self.repository_path,
-                "rev-parse",
-                "--abbrev-ref",
-                "HEAD",
-            )
-            if current_branch != self.integration_branch:
-                raise KernelError(
-                    "INTEGRATION_BRANCH_MISMATCH",
-                    "repository is not on the configured Integration branch",
-                )
-            current_head = _git(self.repository_path, "rev-parse", "HEAD")
-            candidate_sha = observation.result_claim.candidate_sha
-            if current_head != candidate_sha:
-                ancestry = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(self.repository_path),
-                        "merge-base",
-                        "--is-ancestor",
-                        current_head,
-                        candidate_sha,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                )
-                if ancestry.returncode != 0:
-                    state.update(
-                        {
-                            "status": "waiting",
-                            "directive": "invoke_coordinator",
-                            "attempt_state": "integration_refresh_required",
-                            "wait_condition": "integration_refresh",
-                            "wait_source_ref": (
-                                f"git://{repository}/{self.integration_branch}"
-                            ),
-                            "wait_event_identity": (
-                                f"integration-refresh:{current_head}"
-                            ),
-                            "next_check_at": None,
-                            "integration_target_head": current_head,
-                        }
-                    )
-                    self._write_state(repository, active.plan_digest, state)
-                    return self._outcome(state)
-            if self.delivery_control is not None:
-                remote_integration = self.delivery_control.integrate_serially(
-                    repository,
-                    observation.result_claim.candidate_sha,
-                    self.integration_branch,
-                )
-                if (
-                    remote_integration.candidate_sha
-                    != observation.result_claim.candidate_sha
-                    or remote_integration.target_branch != self.integration_branch
-                ):
-                    raise KernelError(
-                        "REMOTE_INTEGRATION_READBACK_FAILED",
-                        "remote Integration changed Candidate or target branch",
-                    )
-            if current_head != observation.result_claim.candidate_sha:
-                _git(
-                    self.repository_path,
-                    "merge",
-                    "--ff-only",
-                    observation.result_claim.candidate_sha,
-                )
-            integrated_sha = _git(self.repository_path, "rev-parse", "HEAD")
-            if integrated_sha != observation.result_claim.candidate_sha:
-                raise KernelError(
-                    "INTEGRATION_READBACK_FAILED",
-                    "Integration branch did not reach the Candidate",
-                )
-            integration_evidence = TypedEvidence._capture(
-                kind="integration",
-                subject=integrated_sha,
-                observer_type="kernel",
-                observer_id=self.writer_generation,
-                observed_at=_now(),
-                source_ref=(
-                    f"git://{repository}/{self.integration_branch}"
-                    if remote_integration is None
-                    else remote_integration.source_ref
+        state["publication_eligible"] = True
+        state["candidate_evidence_manifest_digest"] = digest_value(
+            {
+                "candidate_sha": observation.result_claim.candidate_sha,
+                "check_evidence_digests": list(
+                    eligibility.check_evidence_digests
                 ),
-                payload={
-                    "integration_node": integration_node["node_key"],
-                    "branch": self.integration_branch,
-                    "head": integrated_sha,
-                    "remote_readback": (
-                        None
-                        if remote_integration is None
-                        else remote_integration.candidate_sha
-                    ),
-                },
-            )
-            state.update(
-                {
-                    "status": "complete",
-                    "directive": "goal_complete",
-                    "goal_state": "completed",
-                    "work_item_state": "integrated",
-                    "wait_condition": None,
-                    "wait_source_ref": None,
-                    "wait_event_identity": None,
-                    "next_check_at": None,
-                    "integration_evidence_digest": (
-                        integration_evidence.content_digest
-                    ),
-                }
-            )
-            self._record_verified_result(
-                state,
-                candidate_sha=observation.result_claim.candidate_sha,
-                result_digest=decision.result.result_digest,
-            )
-            self._write_state(repository, active.plan_digest, state)
-        finally:
-            self._release_integration_lease(repository, lease_holder)
-
+                "review_evidence_digest": eligibility.review_evidence_digest,
+            }
+        )
+        state.update(
+            {
+                "status": "waiting",
+                "directive": "reconcile_again",
+                "attempt_state": "batch_ready",
+                "wait_condition": "integration_batch",
+                "wait_source_ref": (
+                    f"git://{repository}/{observation.result_claim.candidate_sha}"
+                ),
+                "wait_event_identity": "integration-batch-frontier",
+                "next_check_at": (
+                    datetime.now(timezone.utc) + timedelta(seconds=1)
+                ).isoformat(),
+            }
+        )
+        self._release_attempt_claims(state)
         self.runtime.retire(binding)
+        self._write_state(repository, active.plan_digest, state)
         return self._outcome(state)
 
     def reconcile_once(self, repository: str) -> ReconcileOutcome:
+        with self.publication.pin_durable_activation(repository):
+            return self._reconcile_once(repository)
+
+    def _reconcile_once(self, repository: str) -> ReconcileOutcome:
         planned = self.plan_reconciliation(repository)
         active = self.publication.read_active(repository)
         if active is None:
@@ -5252,7 +5640,6 @@ class Kernel:
             worker_turn_capacity=worker_capacity,
         )
 
-        integration_budget = [1]
         outcomes = tuple(
             self._reconcile_work_unit(
                 repository,
@@ -5263,9 +5650,25 @@ class Kernel:
                 goal=goal,
                 work_item=work_item,
                 worker_turn_capacity=worker_capacity,
-                integration_budget=integration_budget,
             )
             for work_node, integration_node, goal, work_item in compatible_units
+        )
+        self._advance_integration_batch(
+            repository,
+            active=active,
+            units=units,
+        )
+        outcomes = tuple(
+            self._outcome(state)
+            for work_node, _integration, _goal, _work_item in compatible_units
+            if (
+                state := self._read_state(
+                    repository,
+                    active.plan_digest,
+                    str(work_node["node_key"]),
+                )
+            )
+            is not None
         )
         states_after = self._read_states(repository, active.plan_digest)
         active_after = sum(
