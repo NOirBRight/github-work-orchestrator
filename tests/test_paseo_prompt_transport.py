@@ -15,10 +15,10 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scr
 sys.path.insert(0, str(SCRIPTS))
 
 from gwo_v8 import (  # noqa: E402
+    InMemoryPaseoClient,
     Kernel,
     PaseoAgentRecord,
     PaseoCliClient,
-    PaseoCreateRequest,
     PaseoRuntimeAdapter,
     ReviewAxisRequest,
     RuntimeAdapterError,
@@ -133,21 +133,22 @@ def test_cli_large_create_uses_bootstrap_then_prompt_file(monkeypatch):
     monkeypatch.setattr(client, "_run_text", lambda *_args, **_kwargs: activity)
     monkeypatch.setattr(client, "find_by_labels", find_by_labels)
 
-    created = client.create(
-        PaseoCreateRequest(
-            action_key="worker:large",
-            title="large worker",
-            labels={
-                "gwo.admission": "admission-1",
-                "gwo.profile_digest": profile.digest,
-            },
-            prompt=prompt,
-            repository_path="C:/repository",
-            base_sha="b" * 40,
-            profile=profile,
-            parent_agent_id=None,
-        )
+    admission = RuntimeAdmission(
+        repository="local/large",
+        plan_digest="p" * 64,
+        node_key="node:large",
+        admission_id="admission-1",
+        repository_path=Path("C:/repository"),
+        base_sha="b" * 40,
+        runtime_profile=profile,
     )
+    adapter = PaseoRuntimeAdapter(client)
+    pending = adapter.materialize(admission, prompt)
+    assert pending.prompt_accepted is False
+    assert all(command[0] != "send" for command in commands)
+
+    adapter.accept_prompt(pending, prompt)
+    accepted = adapter.read_binding(admission, prompt)
 
     run_command = commands[0]
     send_command = next(command for command in commands if command[0] == "send")
@@ -160,7 +161,8 @@ def test_cli_large_create_uses_bootstrap_then_prompt_file(monkeypatch):
     assert sent_contents == [prompt.text]
     assert len(sent_contents[0].encode("utf-8")) > 300_000
     assert all(not path.exists() for path in prompt_paths)
-    assert created.labels["gwo.prompt_digest"] == prompt.digest
+    assert accepted is not None
+    assert accepted.prompt_digest == prompt.digest
     assert client.prompt_acceptance_count(record.agent_id, prompt) == 1
 
 
@@ -212,6 +214,7 @@ class RestartBlindPaseoClient:
         self._send_acceptances = list(send_acceptances)
         self.create_count = 0
         self.send_count = 0
+        self.sent_action_keys: list[str] = []
 
     def observed_worker_turn_capacity(self, _profile):
         return None
@@ -267,7 +270,7 @@ class RestartBlindPaseoClient:
         return replace(self._records[agent_id], labels={}, profile_digest="")
 
     def send_prompt(self, agent_id, prompt, *, action_key):
-        del action_key
+        self.sent_action_keys.append(action_key)
         self.send_count += 1
         accepted = True if not self._send_acceptances else self._send_acceptances.pop(0)
         if accepted:
@@ -323,9 +326,18 @@ def test_worker_restart_replays_dropped_ack_on_same_agent_exactly_once(tmp_path)
 
     pending = first_adapter.materialize(admission, prompt)
     assert pending.prompt_accepted is False
-    with pytest.raises(RuntimeAdapterError) as dropped:
-        first_adapter.accept_prompt(pending, prompt)
-    assert dropped.value.code == "PROMPT_ACCEPTANCE_AMBIGUOUS"
+    action_key = f"{admission.admission_id}:prompt"
+    client.send_prompt(pending.agent_id, prompt, action_key=action_key)
+    client.update_labels(
+        pending.agent_id,
+        {
+            "gwo.prompt_delivery": first_adapter._delivery_label_value(
+                "acked",
+                0,
+                action_key,
+            )
+        },
+    )
     assert client.create_count == 1
     assert client.send_count == 1
 
@@ -344,6 +356,7 @@ def test_worker_restart_replays_dropped_ack_on_same_agent_exactly_once(tmp_path)
     assert accepted.prompt_digest == prompt.digest
     assert client.create_count == 1
     assert client.send_count == 2
+    assert client.sent_action_keys == [action_key, action_key]
     assert client.prompt_acceptance_count(accepted.agent_id, prompt) == 1
 
     second_restart = PaseoRuntimeAdapter(client)
@@ -352,6 +365,91 @@ def test_worker_restart_replays_dropped_ack_on_same_agent_exactly_once(tmp_path)
     assert readback.agent_id == pending.agent_id
     assert readback.prompt_accepted is True
     assert client.send_count == 2
+
+
+class DelayedAcceptancePaseoClient(RestartBlindPaseoClient):
+    def __init__(self, *, visibility_reads: int):
+        super().__init__()
+        self._visibility_reads = visibility_reads
+        self._pending: dict[str, tuple[str, int]] = {}
+
+    def send_prompt(self, agent_id, prompt, *, action_key):
+        self.sent_action_keys.append(action_key)
+        self.send_count += 1
+        self._pending[agent_id] = (
+            prompt.digest,
+            self._visibility_reads,
+        )
+        self._records[agent_id] = replace(
+            self._records[agent_id],
+            lifecycle="idle",
+        )
+
+    def prompt_acceptance_count(self, agent_id, prompt):
+        pending = self._pending.get(agent_id)
+        if pending is not None and pending[0] == prompt.digest:
+            remaining = pending[1] - 1
+            if remaining <= 0:
+                self._accepted[agent_id].append(prompt.digest)
+                self._pending.pop(agent_id)
+            else:
+                self._pending[agent_id] = (prompt.digest, remaining)
+        return super().prompt_acceptance_count(agent_id, prompt)
+
+
+def test_stale_idle_ack_waits_for_activity_before_replay(tmp_path):
+    prompt = _prompt(310_000, name="delayed")
+    profile = _profile()
+    admission = RuntimeAdmission(
+        repository="local/delayed",
+        plan_digest="d" * 64,
+        node_key="node:delayed",
+        admission_id="admission:delayed",
+        repository_path=tmp_path,
+        base_sha="b" * 40,
+        runtime_profile=profile,
+    )
+    client = DelayedAcceptancePaseoClient(visibility_reads=3)
+    adapter = PaseoRuntimeAdapter(client)
+    pending = adapter.materialize(admission, prompt)
+
+    adapter.accept_prompt(pending, prompt)
+    accepted = adapter.read_binding(admission, prompt)
+
+    assert accepted is not None
+    assert accepted.prompt_accepted is True
+    assert client.send_count == 1
+    assert client.prompt_acceptance_count(accepted.agent_id, prompt) == 1
+
+
+def test_late_duplicate_boundary_overrides_published_digest(tmp_path):
+    prompt = _prompt(4_096, name="duplicate")
+    profile = _profile()
+    admission = RuntimeAdmission(
+        repository="local/duplicate",
+        plan_digest="e" * 64,
+        node_key="node:duplicate",
+        admission_id="admission:duplicate",
+        repository_path=tmp_path,
+        base_sha="b" * 40,
+        runtime_profile=profile,
+    )
+    client = InMemoryPaseoClient()
+    adapter = PaseoRuntimeAdapter(client)
+    accepted = adapter.materialize(admission, prompt)
+    assert accepted.prompt_accepted is True
+    client.send_prompt(
+        accepted.agent_id,
+        prompt,
+        action_key="external:duplicate",
+    )
+    assert client.prompt_acceptance_count(accepted.agent_id, prompt) == 2
+
+    with pytest.raises(RuntimeAdapterError) as duplicate:
+        adapter.read_binding(admission, prompt)
+
+    assert duplicate.value.code == "PROMPT_ACCEPTANCE_DUPLICATE"
+    assert duplicate.value.failure_class == "ambiguous"
 
 
 def _git(repository: Path, *args: str) -> str:
@@ -446,6 +544,20 @@ def test_dual_review_axes_above_mcp_limit_adopt_after_restart(tmp_path):
     assert {axis: binding.agent_id for axis, binding in adopted.items()} == {
         axis: binding.agent_id for axis, binding in bindings.items()
     }
+
+    duplicate_request = requests[0]
+    duplicate_binding = adopted[duplicate_request.axis]
+    client.send_prompt(
+        duplicate_binding.agent_id,
+        duplicate_request.to_prompt(),
+        action_key=duplicate_request.action_key,
+    )
+    with pytest.raises(RuntimeAdapterError) as duplicate:
+        restarted.observe_review_axis(
+            duplicate_request,
+            duplicate_binding,
+        )
+    assert duplicate.value.code == "PROMPT_ACCEPTANCE_DUPLICATE"
 
 
 def test_review_prompts_keep_spec_authority_without_repeating_file_contents():

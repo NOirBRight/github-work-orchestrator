@@ -28,9 +28,11 @@ from .evidence import ResultClaim, TypedEvidence
 
 
 PASEO_INLINE_PROMPT_MAX_BYTES = 8_192
-PASEO_PROMPT_ACTIVITY_TAIL = 200
 PASEO_BOOTSTRAP_WAIT_SECONDS = 30.0
 PASEO_BOOTSTRAP_POLL_SECONDS = 0.25
+PASEO_PROMPT_SETTLE_SECONDS = 1.0
+PASEO_PROMPT_DELIVERY_ATTEMPTS = 3
+PASEO_PROMPT_DELIVERY_PHASES = ("prepared", "acked", "idle", "dropped")
 
 
 class RuntimeAdapterError(RuntimeError):
@@ -1522,26 +1524,6 @@ class PaseoCliClient:
                     break
                 time.sleep(PASEO_BOOTSTRAP_POLL_SECONDS)
                 record = self.inspect(agent_id)
-            if record.lifecycle in {"idle", "completed"}:
-                self.send_prompt(
-                    agent_id,
-                    request.prompt,
-                    action_key=request.action_key,
-                )
-        if self.prompt_acceptance_count(agent_id, request.prompt) == 1:
-            self.update_labels(
-                agent_id,
-                {"gwo.prompt_digest": request.prompt.digest},
-            )
-            accepted = self.find_by_labels(
-                {
-                    **creation_labels,
-                    "gwo.prompt_digest": request.prompt.digest,
-                }
-            )
-            exact = [item for item in accepted if item.agent_id == agent_id]
-            if len(accepted) == 1 and len(exact) == 1:
-                return exact[0]
         pending = self.find_by_labels(creation_labels)
         exact = [item for item in pending if item.agent_id == agent_id]
         if len(pending) != 1 or len(exact) != 1:
@@ -1613,7 +1595,7 @@ class PaseoCliClient:
         prompt: RuntimePrompt,
     ) -> int:
         activity = self._run_text(
-            ["logs", agent_id, "--tail", str(PASEO_PROMPT_ACTIVITY_TAIL)],
+            ["logs", agent_id],
             failure_class="ambiguous",
         )
         needle = f"[User] {prompt.text}"
@@ -1754,7 +1736,6 @@ class PaseoRuntimeAdapter:
                     "Prompt digest label identifies a different or duplicate Agent",
                     failure_class="ambiguous",
                 )
-            return True
         count = self.client.prompt_acceptance_count(agent_id, prompt)
         if count > 1:
             raise RuntimeAdapterError(
@@ -1762,6 +1743,17 @@ class PaseoRuntimeAdapter:
                 "Paseo activity contains the exact Prompt more than once",
                 failure_class="ambiguous",
             )
+        if published and count != 1:
+            raise RuntimeAdapterError(
+                "PROMPT_ACCEPTANCE_READBACK_MISMATCH",
+                (
+                    "Prompt digest label exists without exactly one "
+                    "authoritative activity boundary"
+                ),
+                failure_class="ambiguous",
+            )
+        if published:
+            return True
         if count == 0:
             return False
         self.client.update_labels(
@@ -1777,6 +1769,214 @@ class PaseoRuntimeAdapter:
             code="PROMPT_LABEL_READBACK_FAILED",
         )
         return True
+
+    @staticmethod
+    def _delivery_label_value(
+        phase: str,
+        ordinal: int,
+        action_key: str,
+    ) -> str:
+        return (
+            f"{phase}:{ordinal}:"
+            f"{digest_bytes(action_key.encode('utf-8'))[:32]}"
+        )
+
+    def _read_delivery_state(
+        self,
+        agent_id: str,
+        identity_labels: dict[str, str],
+        action_key: str,
+    ) -> tuple[str, int] | None:
+        found: list[tuple[str, int]] = []
+        for ordinal in reversed(range(PASEO_PROMPT_DELIVERY_ATTEMPTS)):
+            for phase in reversed(PASEO_PROMPT_DELIVERY_PHASES):
+                value = self._delivery_label_value(
+                    phase,
+                    ordinal,
+                    action_key,
+                )
+                matches = self.client.find_by_labels(
+                    {
+                        **identity_labels,
+                        "gwo.prompt_delivery": value,
+                    }
+                )
+                if not matches:
+                    continue
+                exact = [
+                    record for record in matches if record.agent_id == agent_id
+                ]
+                if len(matches) != 1 or len(exact) != 1:
+                    raise RuntimeAdapterError(
+                        "PROMPT_DELIVERY_IDENTITY_MISMATCH",
+                        (
+                            "Prompt delivery state identifies a different "
+                            "or duplicate Agent"
+                        ),
+                        failure_class="ambiguous",
+                    )
+                found.append((phase, ordinal))
+        if len(found) > 1:
+            raise RuntimeAdapterError(
+                "PROMPT_DELIVERY_STATE_AMBIGUOUS",
+                "Paseo read back more than one current Prompt delivery state",
+                failure_class="ambiguous",
+            )
+        return None if not found else found[0]
+
+    def _publish_delivery_state(
+        self,
+        agent_id: str,
+        identity_labels: dict[str, str],
+        action_key: str,
+        *,
+        phase: str,
+        ordinal: int,
+    ) -> tuple[str, int]:
+        value = self._delivery_label_value(phase, ordinal, action_key)
+        self.client.update_labels(
+            agent_id,
+            {"gwo.prompt_delivery": value},
+        )
+        self._find_exact(
+            agent_id,
+            {
+                **identity_labels,
+                "gwo.prompt_delivery": value,
+            },
+            code="PROMPT_DELIVERY_STATE_READBACK_FAILED",
+        )
+        return phase, ordinal
+
+    def _converge_prompt_delivery(
+        self,
+        agent_id: str,
+        prompt: RuntimePrompt,
+        *,
+        identity_labels: dict[str, str],
+        agent_labels: dict[str, str],
+        action_key: str,
+    ) -> None:
+        deadline = time.monotonic() + PASEO_BOOTSTRAP_WAIT_SECONDS
+        self._find_exact(agent_id, agent_labels)
+        if self._prompt_is_accepted(
+            agent_id,
+            prompt,
+            identity_labels,
+        ):
+            return
+        state = self._read_delivery_state(
+            agent_id,
+            identity_labels,
+            action_key,
+        )
+        while time.monotonic() < deadline:
+            if self._prompt_is_accepted(
+                agent_id,
+                prompt,
+                identity_labels,
+            ):
+                return
+            agent = self._find_exact(agent_id, agent_labels)
+            if state is None:
+                if agent.lifecycle not in {"idle", "completed"}:
+                    time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
+                    continue
+                state = self._publish_delivery_state(
+                    agent_id,
+                    identity_labels,
+                    action_key,
+                    phase="prepared",
+                    ordinal=0,
+                )
+            phase, ordinal = state
+            if phase in {"prepared", "acked"}:
+                if phase == "prepared":
+                    try:
+                        self.client.send_prompt(
+                            agent_id,
+                            prompt,
+                            action_key=action_key,
+                        )
+                    except RuntimeAdapterError as error:
+                        if error.failure_class == "permanent":
+                            raise
+                    else:
+                        state = self._publish_delivery_state(
+                            agent_id,
+                            identity_labels,
+                            action_key,
+                            phase="acked",
+                            ordinal=ordinal,
+                        )
+                        if self._prompt_is_accepted(
+                            agent_id,
+                            prompt,
+                            identity_labels,
+                        ):
+                            return
+                time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
+                agent = self._find_exact(agent_id, agent_labels)
+                if agent.lifecycle not in {"idle", "completed"}:
+                    continue
+                state = self._publish_delivery_state(
+                    agent_id,
+                    identity_labels,
+                    action_key,
+                    phase="idle",
+                    ordinal=ordinal,
+                )
+                continue
+            if phase == "idle":
+                time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
+                if self._prompt_is_accepted(
+                    agent_id,
+                    prompt,
+                    identity_labels,
+                ):
+                    return
+                agent = self._find_exact(agent_id, agent_labels)
+                if agent.lifecycle not in {"idle", "completed"}:
+                    continue
+                state = self._publish_delivery_state(
+                    agent_id,
+                    identity_labels,
+                    action_key,
+                    phase="dropped",
+                    ordinal=ordinal,
+                )
+                continue
+            if ordinal + 1 >= PASEO_PROMPT_DELIVERY_ATTEMPTS:
+                raise RuntimeAdapterError(
+                    "PROMPT_DELIVERY_RETRIES_EXHAUSTED",
+                    (
+                        "three bounded Prompt sends lacked one exact "
+                        "acceptance boundary"
+                    ),
+                    failure_class="ambiguous",
+                )
+            if self._prompt_is_accepted(
+                agent_id,
+                prompt,
+                identity_labels,
+            ):
+                return
+            agent = self._find_exact(agent_id, agent_labels)
+            if agent.lifecycle not in {"idle", "completed"}:
+                time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
+                continue
+            state = self._publish_delivery_state(
+                agent_id,
+                identity_labels,
+                action_key,
+                phase="prepared",
+                ordinal=ordinal + 1,
+            )
+        raise RuntimeAdapterError(
+            "PROMPT_DELIVERY_READBACK_TIMEOUT",
+            "Prompt delivery ambiguity did not resolve before the bounded timeout",
+            failure_class="ambiguous",
+        )
 
     @staticmethod
     def _binding_labels(
@@ -2015,7 +2215,6 @@ class PaseoRuntimeAdapter:
                     "Paseo accepted a different Prompt snapshot",
                     failure_class="ambiguous",
                 )
-            return
         if binding.agent_id is None:
             raise RuntimeAdapterError(
                 "RUNTIME_BINDING_UNKNOWN",
@@ -2023,44 +2222,17 @@ class PaseoRuntimeAdapter:
                 failure_class="ambiguous",
             )
         identity_labels = {"gwo.admission": binding.admission_id}
-        agent = self._find_exact(
+        self._converge_prompt_delivery(
             binding.agent_id,
-            self._binding_labels(
+            prompt,
+            identity_labels=identity_labels,
+            agent_labels=self._binding_labels(
                 binding,
-                include_prompt=False,
+                include_prompt=binding.prompt_accepted,
                 include_attempt=False,
             ),
-        )
-        if self._prompt_is_accepted(
-            binding.agent_id,
-            prompt,
-            identity_labels,
-        ):
-            return
-        if agent.lifecycle not in {"idle", "completed"}:
-            raise RuntimeAdapterError(
-                "PROMPT_DELIVERY_BUSY",
-                "Paseo Agent is not idle at the exact Prompt boundary",
-                failure_class="transient",
-            )
-        self.client.send_prompt(
-            binding.agent_id,
-            prompt,
             action_key=f"{binding.admission_id}:prompt",
         )
-        if not self._prompt_is_accepted(
-            binding.agent_id,
-            prompt,
-            identity_labels,
-        ):
-            raise RuntimeAdapterError(
-                "PROMPT_ACCEPTANCE_AMBIGUOUS",
-                (
-                    "Paseo acknowledged the Prompt send without exact "
-                    "activity/message-boundary readback"
-                ),
-                failure_class="ambiguous",
-            )
 
     def attach_attempt(
         self,
@@ -2639,40 +2811,13 @@ class PaseoRuntimeAdapter:
                         "Review child creation has no exact identity readback",
                         failure_class="ambiguous",
                     )
-                accepted = self._prompt_is_accepted(
+                self._converge_prompt_delivery(
                     agent.agent_id,
                     prompt,
-                    {"gwo.action_key": request.action_key},
+                    identity_labels={"gwo.action_key": request.action_key},
+                    agent_labels=labels,
+                    action_key=request.action_key,
                 )
-                if not accepted:
-                    if agent.lifecycle not in {"idle", "completed"}:
-                        raise RuntimeAdapterError(
-                            "REVIEW_AXIS_PROMPT_BUSY",
-                            (
-                                "Review child is not idle at the exact "
-                                "Prompt boundary"
-                            ),
-                            failure_class="transient",
-                        )
-                    self.client.send_prompt(
-                        agent.agent_id,
-                        prompt,
-                        action_key=request.action_key,
-                    )
-                    accepted = self._prompt_is_accepted(
-                        agent.agent_id,
-                        prompt,
-                        {"gwo.action_key": request.action_key},
-                    )
-                    if not accepted:
-                        raise RuntimeAdapterError(
-                            "REVIEW_AXIS_PROMPT_AMBIGUOUS",
-                            (
-                                "Review Prompt acknowledgement has no exact "
-                                "activity/message-boundary readback"
-                            ),
-                            failure_class="ambiguous",
-                        )
                 readback = self._find_exact(
                     agent.agent_id,
                     {
@@ -2739,6 +2884,20 @@ class PaseoRuntimeAdapter:
             labels,
             code="REVIEW_AXIS_IDENTITY_MISMATCH",
         )
+        prompt = request.to_prompt()
+        if (
+            binding.prompt_digest != prompt.digest
+            or not self._prompt_is_accepted(
+                binding.agent_id,
+                prompt,
+                {"gwo.action_key": request.action_key},
+            )
+        ):
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_PROMPT_IDENTITY_MISMATCH",
+                "Review child no longer has one exact accepted Prompt",
+                failure_class="ambiguous",
+            )
         if (
             agent.agent_id != binding.agent_id
             or agent.session_id != binding.session_id

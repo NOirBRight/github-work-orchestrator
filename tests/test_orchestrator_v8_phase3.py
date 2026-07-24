@@ -47,7 +47,7 @@ def test_paseo_cli_client_resolves_windows_command_trampoline(monkeypatch):
     assert PaseoCliClient().executable == resolved
 
 
-def test_paseo_cli_create_publishes_prompt_digest_after_activity_readback(
+def test_paseo_cli_create_does_not_publish_prompt_digest_from_create_ack(
     monkeypatch,
 ):
     client = PaseoCliClient(executable="paseo")
@@ -82,16 +82,9 @@ def test_paseo_cli_create_publishes_prompt_digest_after_activity_readback(
         commands.append(command)
         if command[0] == "run":
             return {"agentId": record.agent_id}
-        if command[:2] == ["agent", "update"]:
-            return {"status": "updated"}
         raise AssertionError(command)
 
     monkeypatch.setattr(client, "_run", run)
-    monkeypatch.setattr(
-        client,
-        "_run_text",
-        lambda *_args, **_kwargs: f"[User] {prompt.text}\n",
-    )
     monkeypatch.setattr(
         client,
         "find_by_labels",
@@ -115,8 +108,7 @@ def test_paseo_cli_create_publishes_prompt_digest_after_activity_readback(
     prompt_label = f"gwo.prompt_digest={prompt.digest}"
     assert prompt_label not in commands[0]
     assert prompt.text == commands[0][-1]
-    assert prompt_label in commands[1]
-    assert created.labels["gwo.prompt_digest"] == prompt.digest
+    assert prompt_label not in created.labels
 
 
 def _ready_source() -> dict:
