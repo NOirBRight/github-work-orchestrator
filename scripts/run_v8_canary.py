@@ -400,18 +400,15 @@ def run_full(
     runtime_config = orch_core.default_config()
     runtime_config["active_turn_pools"] = {"workers": 3, "coordinators": 1}
     runtime_config["repositories"] = {}
-    if worker_thinking_override is not None:
-        for tier in runtime_config["tiers"].values():
-            if tier.get("provider") == "kimi-cli":
-                tier["settings"]["thinkingOptionId"] = worker_thinking_override
     worker_mapping = runtime_config["tiers"]["standard"]
     worker_settings = worker_mapping["settings"]
     worker_thinking = worker_settings["thinkingOptionId"]
-    if worker_thinking_override is not None:
-        progress(
-            "full canary: explicit Kimi tier thinking override "
-            f"-> {worker_thinking_override}"
+    if worker_thinking_override not in {None, worker_thinking}:
+        raise ValueError(
+            "--worker-thinking-override is retained for compatibility and "
+            f"must equal the configured value {worker_thinking!r}"
         )
+    progress(f"full canary: configured Kimi thinking -> {worker_thinking}")
     runtime = PaseoRuntimeAdapter(PaseoCliClient())
     kernel = Kernel(
         store_path=store_path,
@@ -621,8 +618,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--worker-thinking-override",
         help=(
-            "explicit canary-only Paseo thinking value; does not alter the "
-            "repository's configured Runtime Profile"
+            "deprecated compatibility option; when supplied it must match the "
+            "configured Kimi thinking value"
         ),
     )
     return parser.parse_args()

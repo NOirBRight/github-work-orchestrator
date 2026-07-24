@@ -815,11 +815,12 @@ class GoalDriver:
         if (
             auto_profile.provider != "kimi-cli"
             or auto_profile.model != "kimi-code/k3"
-            or auto_profile.thinking != "max"
+            or auto_profile.thinking != "on"
         ):
             raise GoalDriverError(
                 "COORDINATOR_PROFILE_INVALID",
-                "automatic Coordinator must use the configured Kimi K3 Max profile",
+                "automatic Coordinator must use the configured Kimi K3 "
+                "thinking-on profile",
             )
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:

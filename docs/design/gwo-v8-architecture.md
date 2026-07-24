@@ -399,11 +399,11 @@ The initial bindings are:
 
 | Binding | Provider/model | Thinking | Mode |
 | --- | --- | --- | --- |
-| Worker light | Kimi CLI `kimi-code/kimi-for-coding` | high | yolo |
-| Worker standard | Kimi CLI `kimi-code/kimi-for-coding` | max | yolo |
-| Worker heavy | Kimi CLI `kimi-code/k3` | high | yolo |
+| Worker light | Kimi CLI `kimi-code/kimi-for-coding` | on | yolo |
+| Worker standard | Kimi CLI `kimi-code/kimi-for-coding` | on | yolo |
+| Worker heavy | Kimi CLI `kimi-code/k3` | on | yolo |
 | Worker frontier | Codex `gpt-5.6-sol` | xhigh | full-access |
-| Auto-created Coordinator | Kimi CLI `kimi-code/k3` | max | yolo |
+| Auto-created Coordinator | Kimi CLI `kimi-code/k3` | on | yolo |
 | Standard review axis | Codex `gpt-5.6-sol` | high | full-access |
 | Recovery/strict review | Codex `gpt-5.6-sol` | max | full-access |
 

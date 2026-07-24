@@ -137,7 +137,7 @@ the Batch boundary:
    rereads authority at the next pass.
 
 Paseo 0.1.110 currently advertises Kimi K2.7 `low/high/max`, while its daemon
-rejects `high` and `max` and accepts the older `on` value. The canary runner
-therefore requires an explicit test-only `--worker-thinking-override on`.
-Repository defaults remain K2.7 Max; the canary does not claim that configured
-thinking level was exercised.
+rejects the tested `high` and `max` values and accepts `on`. The formal Kimi
+Runtime Profiles now use `on`, matching the value exercised by this canary.
+This changes only the provider setting: Worker tiers, K2.7/K3 model selection,
+Yolo mode, and Codex Reviewer thinking levels remain unchanged.

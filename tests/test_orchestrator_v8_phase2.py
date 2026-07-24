@@ -1304,7 +1304,7 @@ def _coordinator_profile() -> RuntimeProfile:
         name="coordinator_auto",
         provider="kimi-cli",
         model="kimi-code/k3",
-        thinking="max",
+        thinking="on",
         mode="yolo",
         features={},
     )
@@ -1660,7 +1660,7 @@ def test_goal_driver_waits_for_outstanding_turn_instead_of_sampling_again(
     assert coordinators.continue_count == 1
 
 
-def test_goal_driver_auto_creation_uses_exact_kimi_k3_max_role_profile(tmp_path):
+def test_goal_driver_auto_creation_uses_exact_kimi_k3_on_role_profile(tmp_path):
     profile = _coordinator_profile()
     coordinators = InMemoryCoordinatorRuntime()
     driver = GoalDriver(

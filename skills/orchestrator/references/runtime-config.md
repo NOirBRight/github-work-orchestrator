@@ -24,7 +24,7 @@ stores only Difficulty Tier; concrete runtimes never become repository truth.
       "provider": "kimi-cli",
       "settings": {
         "model": "kimi-code/kimi-for-coding",
-        "thinkingOptionId": "high",
+        "thinkingOptionId": "on",
         "modeId": "yolo",
         "features": {}
       }
@@ -33,7 +33,7 @@ stores only Difficulty Tier; concrete runtimes never become repository truth.
       "provider": "kimi-cli",
       "settings": {
         "model": "kimi-code/kimi-for-coding",
-        "thinkingOptionId": "max",
+        "thinkingOptionId": "on",
         "modeId": "yolo",
         "features": {}
       }
@@ -42,7 +42,7 @@ stores only Difficulty Tier; concrete runtimes never become repository truth.
       "provider": "kimi-cli",
       "settings": {
         "model": "kimi-code/k3",
-        "thinkingOptionId": "high",
+        "thinkingOptionId": "on",
         "modeId": "yolo",
         "features": {}
       }
@@ -62,7 +62,7 @@ stores only Difficulty Tier; concrete runtimes never become repository truth.
       "provider": "kimi-cli",
       "settings": {
         "model": "kimi-code/k3",
-        "thinkingOptionId": "max",
+        "thinkingOptionId": "on",
         "modeId": "yolo",
         "features": {}
       }
@@ -195,6 +195,11 @@ Missing mode/features may inherit only from the same current provider. Every
 concrete model, thinking option, mode, and feature is checked against fresh
 Paseo capabilities before creation. Ambiguous or unsupported combinations
 fail closed for that action.
+
+Paseo 0.1.110 advertises `low/high/max` for Kimi while its daemon accepts
+`on` and rejects the tested `high/max` values. GWO therefore permits the exact
+`kimi-cli` value `on` as a narrow discovery compatibility exception. It does
+not weaken capability validation for another provider or thinking value.
 
 If V6.1 finds `~/.orch/providers.json` but no new config, it copies the source to
 `providers.v5.backup.json`, translates model and `thinking` to the new settings

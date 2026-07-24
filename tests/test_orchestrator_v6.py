@@ -209,6 +209,34 @@ def test_runtime_resolution_uses_issue_tier_and_validates_thinking_mode_features
     }
 
 
+def test_kimi_thinking_on_tolerates_paseo_discovery_mismatch_only():
+    core = load_core()
+    config = core.default_config()
+    capabilities = {
+        "provider": "kimi-cli",
+        "models": {
+            "kimi-code/kimi-for-coding": {
+                "thinking": ["low", "high", "max"],
+            }
+        },
+        "modes": ["yolo"],
+        "features": [],
+    }
+
+    result = core.resolve_runtime(
+        config,
+        repository="owner/repo",
+        issue={"difficulty": "standard"},
+        coordinator_runtime={
+            "provider": "codex",
+            "settings": {"model": "gpt", "modeId": "full-access"},
+        },
+        capabilities=capabilities,
+    )
+
+    assert result["settings"]["thinkingOptionId"] == "on"
+
+
 def test_runtime_resolution_fails_closed_when_thinking_or_features_are_ambiguous():
     core = load_core()
     config = {
@@ -2119,9 +2147,9 @@ def test_fresh_default_config_contains_the_phase_zero_runtime_profiles():
         )
         for name, binding in config["tiers"].items()
     } == {
-        "light": ("kimi-cli", "kimi-code/kimi-for-coding", "high", "yolo"),
-        "standard": ("kimi-cli", "kimi-code/kimi-for-coding", "max", "yolo"),
-        "heavy": ("kimi-cli", "kimi-code/k3", "high", "yolo"),
+        "light": ("kimi-cli", "kimi-code/kimi-for-coding", "on", "yolo"),
+        "standard": ("kimi-cli", "kimi-code/kimi-for-coding", "on", "yolo"),
+        "heavy": ("kimi-cli", "kimi-code/k3", "on", "yolo"),
         "frontier": ("codex", "gpt-5.6-sol", "xhigh", "full-access"),
     }
     assert {
@@ -2133,7 +2161,7 @@ def test_fresh_default_config_contains_the_phase_zero_runtime_profiles():
         )
         for name, binding in config["role_profiles"].items()
     } == {
-        "coordinator_auto": ("kimi-cli", "kimi-code/k3", "max", "yolo"),
+        "coordinator_auto": ("kimi-cli", "kimi-code/k3", "on", "yolo"),
         "reviewer_standard": ("codex", "gpt-5.6-sol", "high", "full-access"),
         "reviewer_strict": ("codex", "gpt-5.6-sol", "max", "full-access"),
         "reviewer_recovery": ("codex", "gpt-5.6-sol", "max", "full-access"),
@@ -2493,7 +2521,7 @@ def test_materialized_worker_action_is_atomic_direct_and_short():
         "provider": "kimi-cli",
         "settings": {
             "model": "kimi-code/kimi-for-coding",
-            "thinkingOptionId": "max",
+            "thinkingOptionId": "on",
             "modeId": "yolo",
             "features": {},
         },
