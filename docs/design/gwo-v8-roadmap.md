@@ -4,7 +4,10 @@ Status: accepted direction; code implementation complete through Phase 4C.
 The dedicated GitHub-boundary smoke and three-node live Integration Batch
 acceptance have passed. Production writer transition remains a separate,
 explicitly authorized operational release action. See
-`docs/e2e/gwo-v8-canary.md`.
+`docs/e2e/gwo-v8-canary.md`. The first real-repository read-only readiness
+check is fail-closed on stale tracker state, missing canonical production
+PlanSpec, and the missing production V6.1 fence adapter; see
+`docs/e2e/gwo-v8-cutover-readiness.md`.
 
 This roadmap starts from the production reality: V6.1 is the current writer
 and V7 was never adopted. V8 does not complete or migrate V7. It introduces a
