@@ -20,6 +20,7 @@ from gwo_v8 import (  # noqa: E402
     ActivationCheckpointCrash,
     ActivationError,
     ActivationReceipt,
+    CompileError,
     DurablePlanRecord,
     GitHubContent,
     GitHubCliContentClient,
@@ -219,6 +220,248 @@ def _plan_intent(*, skill_reference: str | None = None) -> dict:
 
 def _compiled():
     return PlanCompiler().compile(_plan_intent(), _ready_source(), {"version": 1})
+
+
+def test_plan_compiler_preserves_legacy_single_file_outcome():
+    compiled = _compiled()
+    plan = json.loads(compiled.canonical_bytes)
+    work_node = next(node for node in plan["nodes"] if node["kind"] == "work")
+
+    assert (
+        compiled.digest
+        == "7d0ee68462d321601ed0194a5e3a7f1dec0561161903a0824293dc249fa62dd3"
+    )
+    assert plan["work_items"][0]["outcome_contract"] == {
+        "path": "result.txt",
+        "content": "phase-2\n",
+    }
+    assert work_node["inputs"]["file_changes"] == [
+        {"path": "result.txt", "content": "phase-2\n"}
+    ]
+
+
+def test_plan_compiler_preserves_legacy_noncanonical_path_bytes():
+    source = _ready_source()
+    source["work_items"][0]["outcome_contract"] = {
+        "path": "dir\\result.txt",
+        "content": "phase-2\n",
+    }
+    intent = _plan_intent()
+    intent["nodes"][0]["inputs"]["file_changes"] = [
+        {"path": "dir\\result.txt", "content": "phase-2\n"}
+    ]
+    intent["nodes"][0]["effect_contract"]["write_scopes"] = ["dir"]
+
+    compiled = PlanCompiler().compile(intent, source, {"version": 1})
+
+    assert (
+        compiled.digest
+        == "8530c7fec0eace63b3f436c38fe6225373b09e4e6b198c9f6f80fa67cd7d5599"
+    )
+
+
+def test_plan_compiler_accepts_one_multi_file_work_item_outcome():
+    source = _ready_source()
+    changes = [
+        {"path": "src/result.txt", "content": "phase-2\n"},
+        {"path": "tests/result.txt", "content": "verified\n"},
+    ]
+    source["work_items"][0]["outcome_contract"] = {
+        "file_changes": changes,
+    }
+    intent = _plan_intent()
+    intent["nodes"][0]["inputs"]["file_changes"] = changes
+    intent["nodes"][0]["effect_contract"]["write_scopes"] = ["src", "tests"]
+
+    compiled = PlanCompiler().compile(intent, source, {"version": 1})
+    plan = json.loads(compiled.canonical_bytes)
+    work_node = next(node for node in plan["nodes"] if node["kind"] == "work")
+
+    assert plan["work_items"][0]["outcome_contract"] == {
+        "file_changes": changes,
+    }
+    assert work_node["inputs"]["file_changes"] == changes
+
+
+def test_plan_compiler_canonicalizes_multi_file_order_and_paths():
+    first_changes = [
+        {"path": "tests\\result.txt", "content": "verified\n"},
+        {"path": "src/result.txt", "content": "phase-2\n"},
+    ]
+    second_changes = [
+        {"path": "src/result.txt", "content": "phase-2\n"},
+        {"path": "tests/result.txt", "content": "verified\n"},
+    ]
+
+    def compile_changes(changes):
+        source = _ready_source()
+        source["work_items"][0]["outcome_contract"] = {
+            "file_changes": changes,
+        }
+        intent = _plan_intent()
+        intent["nodes"][0]["inputs"]["file_changes"] = changes
+        intent["nodes"][0]["effect_contract"]["write_scopes"] = [
+            "src",
+            "tests",
+        ]
+        return PlanCompiler().compile(intent, source, {"version": 1})
+
+    first = compile_changes(first_changes)
+    second = compile_changes(second_changes)
+    plan = json.loads(first.canonical_bytes)
+    work_node = next(node for node in plan["nodes"] if node["kind"] == "work")
+
+    assert first.canonical_bytes == second.canonical_bytes
+    assert first.digest == second.digest
+    assert work_node["inputs"]["file_changes"] == second_changes
+
+
+@pytest.mark.parametrize(
+    ("outcome_contract", "node_changes", "expected_code"),
+    [
+        (
+            {
+                "path": "result.txt",
+                "content": "phase-2\n",
+                "file_changes": [
+                    {"path": "result.txt", "content": "phase-2\n"}
+                ],
+            },
+            [{"path": "result.txt", "content": "phase-2\n"}],
+            "COMPILE_INPUT_INVALID",
+        ),
+        (
+            {"file_changes": []},
+            [{"path": "result.txt", "content": "phase-2\n"}],
+            "COMPILE_INPUT_INVALID",
+        ),
+        (
+            {
+                "file_changes": [
+                    {"path": "result.txt", "content": "phase-2\n"}
+                ]
+            },
+            [{"path": "result.txt", "content": "phase-2\n"}],
+            "COMPILE_INPUT_INVALID",
+        ),
+        (
+            {
+                "file_changes": [
+                    "not-an-object",
+                    {"path": "other.txt", "content": "other\n"},
+                ]
+            },
+            [
+                {"path": "result.txt", "content": "phase-2\n"},
+                {"path": "other.txt", "content": "other\n"},
+            ],
+            "COMPILE_INPUT_INVALID",
+        ),
+        (
+            {
+                "file_changes": [
+                    {
+                        "path": "result.txt",
+                        "content": "phase-2\n",
+                        "unsupported": True,
+                    },
+                    {"path": "other.txt", "content": "other\n"},
+                ]
+            },
+            [
+                {"path": "result.txt", "content": "phase-2\n"},
+                {"path": "other.txt", "content": "other\n"},
+            ],
+            "PLAN_FIELD_INVALID",
+        ),
+        (
+            {
+                "file_changes": [
+                    {"path": "result.txt"},
+                    {"path": "other.txt", "content": "other\n"},
+                ]
+            },
+            [
+                {"path": "result.txt", "content": "phase-2\n"},
+                {"path": "other.txt", "content": "other\n"},
+            ],
+            "PLAN_FIELD_INVALID",
+        ),
+        (
+            {
+                "file_changes": [
+                    {"path": "result.txt", "content": "phase-2\n"},
+                    {"path": "result.txt", "content": "duplicate\n"},
+                ]
+            },
+            [
+                {"path": "result.txt", "content": "phase-2\n"},
+                {"path": "result.txt", "content": "duplicate\n"},
+            ],
+            "COMPILE_INPUT_INVALID",
+        ),
+        (
+            {
+                "file_changes": [
+                    {"path": "src/result.txt", "content": "phase-2\n"},
+                    {"path": "src/./result.txt", "content": "duplicate\n"},
+                ]
+            },
+            [
+                {"path": "src/result.txt", "content": "phase-2\n"},
+                {"path": "src/./result.txt", "content": "duplicate\n"},
+            ],
+            "COMPILE_INPUT_INVALID",
+        ),
+        (
+            {
+                "file_changes": [
+                    {"path": "result.txt", "content": "phase-2\n"},
+                    {"path": "other.txt", "content": "other\n"},
+                ]
+            },
+            [{"path": "result.txt", "content": "phase-2\n"}],
+            "PLAN_RELATION_INVALID",
+        ),
+    ],
+)
+def test_plan_compiler_rejects_invalid_multi_file_outcomes(
+    outcome_contract,
+    node_changes,
+    expected_code,
+):
+    source = _ready_source()
+    source["work_items"][0]["outcome_contract"] = outcome_contract
+    intent = _plan_intent()
+    intent["nodes"][0]["inputs"]["file_changes"] = node_changes
+    intent["nodes"][0]["effect_contract"]["write_scopes"] = [
+        "result.txt",
+        "other.txt",
+    ]
+
+    with pytest.raises(CompileError) as captured:
+        PlanCompiler().compile(intent, source, {"version": 1})
+
+    assert captured.value.code == expected_code
+
+
+def test_plan_compiler_rejects_multi_file_change_outside_write_scope():
+    source = _ready_source()
+    changes = [
+        {"path": "result.txt", "content": "phase-2\n"},
+        {"path": "outside.txt", "content": "outside\n"},
+    ]
+    source["work_items"][0]["outcome_contract"] = {
+        "file_changes": changes,
+    }
+    intent = _plan_intent()
+    intent["nodes"][0]["inputs"]["file_changes"] = changes
+    intent["nodes"][0]["effect_contract"]["write_scopes"] = ["result.txt"]
+
+    with pytest.raises(CompileError) as captured:
+        PlanCompiler().compile(intent, source, {"version": 1})
+
+    assert captured.value.code == "EFFECT_CONTRACT_VIOLATION"
 
 
 def _git(repository: Path, *args: str) -> str:

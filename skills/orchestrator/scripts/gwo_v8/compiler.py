@@ -5,11 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 import json
+from pathlib import PurePosixPath
 import re
 from typing import Any
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
-from ._effects import EffectContractError, authorized_file_changes
+from ._effects import (
+    EffectContractError,
+    authorized_file_changes,
+    normalized_relative_path,
+)
 
 
 WORKFLOW_SKILLS = {"implement", "implement-gwo", "orchestrator"}
@@ -60,7 +65,7 @@ CHECK_DEFINITION_FIELDS = {
 EFFECT_CONTRACT_FIELDS = {"write_scopes", "external_effects"}
 RUNTIME_REQUIREMENT_FIELDS = {"capabilities"}
 RECOVERY_POLICY_FIELDS = {"semantic_attempts", "repair_rounds"}
-OUTCOME_CONTRACT_FIELDS = {"path", "content"}
+OUTCOME_CONTRACT_FIELDS = {"path", "content", "file_changes"}
 
 
 class CompileError(ValueError):
@@ -142,6 +147,128 @@ def _require_string_list(value: Any, *, label: str) -> list[str]:
     return value
 
 
+def _validated_file_changes(
+    value: Any,
+    *,
+    label: str,
+    normalize_paths: bool,
+) -> list[dict[str, str]]:
+    if not isinstance(value, list) or not value:
+        raise CompileError(
+            "COMPILE_INPUT_INVALID",
+            f"{label} must be a non-empty list",
+        )
+    changes: list[dict[str, str]] = []
+    paths: set[str] = set()
+    for item in value:
+        change = _require_object(
+            item,
+            fields=FILE_CHANGE_FIELDS,
+            label=f"{label} entry",
+        )
+        raw_path = _require_string(change.get("path"), label=f"{label} path")
+        if normalize_paths:
+            try:
+                path = PurePosixPath(
+                    normalized_relative_path(raw_path)
+                ).as_posix()
+            except EffectContractError as error:
+                raise CompileError(
+                    "COMPILE_INPUT_INVALID",
+                    f"{label} path is invalid: {raw_path}",
+                ) from error
+            if path == ".":
+                raise CompileError(
+                    "COMPILE_INPUT_INVALID",
+                    f"{label} path is invalid: {raw_path}",
+                )
+        else:
+            path = raw_path
+        content = _require_string(
+            change.get("content"),
+            label=f"{label} content",
+            allow_empty=True,
+        )
+        if path in paths:
+            raise CompileError(
+                "COMPILE_INPUT_INVALID",
+                f"{label} contains a duplicate path: {path}",
+            )
+        paths.add(path)
+        changes.append({"path": path, "content": content})
+    return (
+        sorted(changes, key=lambda change: change["path"])
+        if normalize_paths
+        else changes
+    )
+
+
+def _outcome_file_changes(
+    outcome_contract: dict[str, Any],
+) -> list[dict[str, str]]:
+    has_legacy = "path" in outcome_contract or "content" in outcome_contract
+    has_multi = "file_changes" in outcome_contract
+    if has_legacy == has_multi:
+        raise CompileError(
+            "COMPILE_INPUT_INVALID",
+            (
+                "Work Item outcome contract must use exactly one of "
+                "{path, content} or file_changes"
+            ),
+        )
+    if has_multi:
+        changes = _validated_file_changes(
+            outcome_contract.get("file_changes"),
+            label="outcome file_changes",
+            normalize_paths=True,
+        )
+        if len(changes) < 2:
+            raise CompileError(
+                "COMPILE_INPUT_INVALID",
+                (
+                    "multi-file outcome contract must contain at least two "
+                    "file changes"
+                ),
+            )
+        return changes
+    path = _require_string(outcome_contract.get("path"), label="outcome path")
+    content = _require_string(
+        outcome_contract.get("content"),
+        label="outcome content",
+        allow_empty=True,
+    )
+    return _validated_file_changes(
+        [{"path": path, "content": content}],
+        label="legacy outcome",
+        normalize_paths=False,
+    )
+
+
+def _normalized_work_item(work_item: dict[str, Any]) -> dict[str, Any]:
+    normalized = json.loads(canonical_bytes(work_item))
+    outcome = normalized["outcome_contract"]
+    changes = _outcome_file_changes(outcome)
+    if "file_changes" in outcome:
+        normalized["outcome_contract"] = {"file_changes": changes}
+    else:
+        normalized["outcome_contract"] = changes[0]
+    return normalized
+
+
+def _normalized_proposal(
+    proposal: dict[str, Any],
+    *,
+    normalize_paths: bool,
+) -> dict[str, Any]:
+    normalized = json.loads(canonical_bytes(proposal))
+    normalized["inputs"]["file_changes"] = _validated_file_changes(
+        normalized["inputs"]["file_changes"],
+        label="file_changes",
+        normalize_paths=normalize_paths,
+    )
+    return normalized
+
+
 def _require_string(
     value: Any,
     *,
@@ -193,12 +320,7 @@ def _validate_plan_fields(
         fields=OUTCOME_CONTRACT_FIELDS,
         label="Work Item outcome contract",
     )
-    _require_string(outcome_contract.get("path"), label="outcome path")
-    _require_string(
-        outcome_contract.get("content"),
-        label="outcome content",
-        allow_empty=True,
-    )
+    expected_changes = _outcome_file_changes(outcome_contract)
     _require_string(proposal.get("goal_key"), label="Plan Node Goal key")
     _require_string(proposal.get("work_item_key"), label="Plan Node Work Item key")
     kind = _require_string(proposal.get("kind"), label="Plan Node kind")
@@ -213,26 +335,12 @@ def _validate_plan_fields(
     inputs = _require_object(
         proposal.get("inputs"), fields=INPUT_FIELDS, label="Plan Node inputs"
     )
-    changes = inputs.get("file_changes")
-    if not isinstance(changes, list) or not changes:
-        raise CompileError(
-            "COMPILE_INPUT_INVALID", "file_changes must be a non-empty list"
-        )
-    for change in changes:
-        checked_change = _require_object(
-            change, fields=FILE_CHANGE_FIELDS, label="file change"
-        )
-        _require_string(checked_change.get("path"), label="file change path")
-        _require_string(
-            checked_change.get("content"),
-            label="file change content",
-            allow_empty=True,
-        )
-    expected_change = {
-        "path": outcome_contract.get("path"),
-        "content": outcome_contract.get("content"),
-    }
-    if changes != [expected_change]:
+    changes = _validated_file_changes(
+        inputs.get("file_changes"),
+        label="file_changes",
+        normalize_paths="file_changes" in outcome_contract,
+    )
+    if changes != expected_changes:
         raise CompileError(
             "PLAN_RELATION_INVALID",
             "Plan Node work must match the Ready Work Item outcome contract",
@@ -582,13 +690,23 @@ class PlanCompiler:
         goal: dict[str, Any],
         work_item: dict[str, Any],
         proposal: dict[str, Any],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]:
         _validate_plan_fields(
             plan_intent,
             source_snapshot,
             goal,
             work_item,
             proposal,
+        )
+        normalize_paths = "file_changes" in work_item["outcome_contract"]
+        work_item = _normalized_work_item(work_item)
+        proposal = _normalized_proposal(
+            proposal,
+            normalize_paths=normalize_paths,
         )
         _validate_effect_contract(proposal)
         skill_reference = _skill_name(proposal.get("skill_reference"))
@@ -770,7 +888,7 @@ class PlanCompiler:
                     "type": "decision_required",
                 },
             ]
-        return nodes, edges
+        return nodes, edges, work_item
 
     def compile(
         self,
@@ -871,8 +989,9 @@ class PlanCompiler:
 
         nodes: list[dict[str, Any]] = []
         edges: list[dict[str, Any]] = []
+        compiled_work_items: dict[str, dict[str, Any]] = {}
         for key in sorted(work_item_by_key):
-            unit_nodes, unit_edges = self._compile_work_unit(
+            unit_nodes, unit_edges, compiled_work_item = self._compile_work_unit(
                 repository=repository,
                 plan_intent=plan_intent,
                 source_snapshot=source_snapshot,
@@ -883,6 +1002,7 @@ class PlanCompiler:
             )
             nodes.extend(unit_nodes)
             edges.extend(unit_edges)
+            compiled_work_items[key] = compiled_work_item
         nodes.sort(key=lambda node: (node["kind"], node["node_key"]))
         plan_spec = {
             "schema_version": 2,
@@ -890,7 +1010,7 @@ class PlanCompiler:
             "parent_plan_digest": plan_intent.get("parent_plan_digest"),
             "goals": [_semantic_snapshot(goal)],
             "work_items": [
-                _semantic_snapshot(work_item_by_key[key])
+                _semantic_snapshot(compiled_work_items[key])
                 for key in sorted(work_item_by_key)
             ],
             "nodes": nodes,
