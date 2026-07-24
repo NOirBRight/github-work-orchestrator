@@ -36,7 +36,7 @@
       "provider": "kimi-cli",
       "settings": {
         "model": "kimi-code/k3",
-        "thinkingOptionId": "on",
+        "thinkingOptionId": "high",
         "modeId": "yolo",
         "features": {}
       }
@@ -56,7 +56,7 @@
       "provider": "kimi-cli",
       "settings": {
         "model": "kimi-code/k3",
-        "thinkingOptionId": "on",
+        "thinkingOptionId": "max",
         "modeId": "yolo",
         "features": {}
       }

@@ -1348,7 +1348,11 @@ def _validate_resolved_runtime(
                 "RUNTIME_THINKING_MISSING",
                 f"thinking option is required for model: {model}",
             )
-    kimi_thinking_on_compatibility = provider == "kimi-cli" and thinking == "on"
+    kimi_thinking_on_compatibility = (
+        provider == "kimi-cli"
+        and model == "kimi-code/kimi-for-coding"
+        and thinking == "on"
+    )
     if (
         thinking is not None
         and thinking not in supported_thinking
@@ -2811,7 +2815,7 @@ def default_config() -> dict[str, Any]:
                 "kimi-cli", "kimi-code/kimi-for-coding", "on", "yolo"
             ),
             "heavy": _initial_runtime_binding(
-                "kimi-cli", "kimi-code/k3", "on", "yolo"
+                "kimi-cli", "kimi-code/k3", "high", "yolo"
             ),
             "frontier": _initial_runtime_binding(
                 "codex", "gpt-5.6-sol", "xhigh", "full-access"
@@ -2819,7 +2823,7 @@ def default_config() -> dict[str, Any]:
         },
         "role_profiles": {
             "coordinator_auto": _initial_runtime_binding(
-                "kimi-cli", "kimi-code/k3", "on", "yolo"
+                "kimi-cli", "kimi-code/k3", "max", "yolo"
             ),
             "reviewer_standard": _initial_runtime_binding(
                 "codex", "gpt-5.6-sol", "high", "full-access"

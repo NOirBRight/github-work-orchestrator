@@ -35,24 +35,8 @@ from gwo_v8 import (  # noqa: E402
     RuntimeProfile,
     RuntimePrompt,
     resolve_review_profile,
-    runtime_thinking_matches,
 )
 import orch_core  # noqa: E402
-
-
-def test_kimi_k3_thinking_on_accepts_paseo_high_readback_only_for_k3():
-    assert runtime_thinking_matches(
-        "kimi-cli",
-        "kimi-code/k3",
-        "on",
-        "high",
-    )
-    assert not runtime_thinking_matches(
-        "kimi-cli",
-        "kimi-code/kimi-for-coding",
-        "on",
-        "high",
-    )
 
 
 def test_paseo_cli_client_resolves_windows_command_trampoline(monkeypatch):

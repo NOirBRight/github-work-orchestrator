@@ -214,7 +214,7 @@ def _coordinator_profile() -> RuntimeProfile:
         name="coordinator_auto",
         provider="kimi-cli",
         model="kimi-code/k3",
-        thinking="on",
+        thinking="max",
         mode="yolo",
         features={},
     )

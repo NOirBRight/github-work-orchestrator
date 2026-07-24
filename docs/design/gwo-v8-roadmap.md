@@ -120,9 +120,8 @@ Scope:
   Skill, and reuse the Prompt snapshot for delivery retries.
 - Add the host `/goal`-like Goal Driver, semantic-input digest, durable
   Coordinator Turn Observations, Wait Conditions, and Decision Gates.
-- Prefer a manually created Coordinator. Auto-create Kimi K3 with Paseo
-  thinking `on` only when no usable Coordinator exists or the prior
-  Coordinator session is irrecoverable.
+- Prefer a manually created Coordinator. Auto-create Kimi K3 Max only when no
+  usable Coordinator exists or the prior Coordinator session is irrecoverable.
 
 Exit criteria:
 

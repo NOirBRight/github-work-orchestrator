@@ -123,14 +123,6 @@ class _EventuallyReadableGitHubClient(GitHubCliContentClient):
         )
 
 
-class _K3NormalizedPaseoClient(InMemoryPaseoClient):
-    def create(self, request):
-        record = super().create(request)
-        normalized = replace(record, thinking="high")
-        self._agents[record.agent_id] = normalized
-        return normalized
-
-
 def test_github_content_read_retries_transient_transport_failure():
     client = _EventuallyReadableGitHubClient()
 
@@ -1312,7 +1304,7 @@ def _coordinator_profile() -> RuntimeProfile:
         name="coordinator_auto",
         provider="kimi-cli",
         model="kimi-code/k3",
-        thinking="on",
+        thinking="max",
         mode="yolo",
         features={},
     )
@@ -1668,7 +1660,7 @@ def test_goal_driver_waits_for_outstanding_turn_instead_of_sampling_again(
     assert coordinators.continue_count == 1
 
 
-def test_goal_driver_auto_creation_uses_exact_kimi_k3_on_role_profile(tmp_path):
+def test_goal_driver_auto_creation_uses_exact_kimi_k3_max_role_profile(tmp_path):
     profile = _coordinator_profile()
     coordinators = InMemoryCoordinatorRuntime()
     driver = GoalDriver(
@@ -1689,7 +1681,7 @@ def test_goal_driver_production_paseo_coordinator_reads_back_auto_profile(
     tmp_path,
 ):
     repository = _temporary_repository(tmp_path)
-    client = _K3NormalizedPaseoClient()
+    client = InMemoryPaseoClient()
     coordinators = PaseoCoordinatorRuntime(
         client,
         repository_path=repository,

@@ -112,7 +112,7 @@ def test_config_example_exposes_the_phase_zero_runtime_profiles():
     } == {
         "light": ("kimi-cli", "kimi-code/kimi-for-coding", "on", "yolo"),
         "standard": ("kimi-cli", "kimi-code/kimi-for-coding", "on", "yolo"),
-        "heavy": ("kimi-cli", "kimi-code/k3", "on", "yolo"),
+        "heavy": ("kimi-cli", "kimi-code/k3", "high", "yolo"),
         "frontier": ("codex", "gpt-5.6-sol", "xhigh", "full-access"),
     }
     assert {
@@ -124,7 +124,7 @@ def test_config_example_exposes_the_phase_zero_runtime_profiles():
         )
         for name, binding in config["role_profiles"].items()
     } == {
-        "coordinator_auto": ("kimi-cli", "kimi-code/k3", "on", "yolo"),
+        "coordinator_auto": ("kimi-cli", "kimi-code/k3", "max", "yolo"),
         "reviewer_standard": ("codex", "gpt-5.6-sol", "high", "full-access"),
         "reviewer_strict": ("codex", "gpt-5.6-sol", "max", "full-access"),
         "reviewer_recovery": ("codex", "gpt-5.6-sol", "max", "full-access"),
