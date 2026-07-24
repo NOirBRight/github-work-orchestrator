@@ -198,6 +198,7 @@ def test_current_runtime_uses_read_back_features_instead_of_inventing_empty(
         "Cwd": "C:/repo",
         "Worktree": {"Id": "wt-root"},
     }
+    monkeypatch.setattr(cli, "_tool", lambda *_args: "paseo")
     monkeypatch.setattr(cli, "_run", lambda _args: json.dumps(payload))
     runtime, _ = cli._paseo_current()
     assert runtime["settings"]["features"] == {"fast_mode": True}

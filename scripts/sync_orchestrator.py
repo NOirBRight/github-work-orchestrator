@@ -24,12 +24,15 @@ TEXT_SUFFIXES = {".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
 def package_digest(package: Path) -> str:
     digest = hashlib.sha256()
     files = sorted(
-        path
-        for path in package.rglob("*")
-        if path.is_file()
-        and path.name != MANIFEST
-        and "__pycache__" not in path.parts
-        and path.suffix != ".pyc"
+        (
+            path
+            for path in package.rglob("*")
+            if path.is_file()
+            and path.name != MANIFEST
+            and "__pycache__" not in path.parts
+            and path.suffix != ".pyc"
+        ),
+        key=lambda path: path.relative_to(package).as_posix(),
     )
     for path in files:
         relative = path.relative_to(package).as_posix().encode("utf-8")
