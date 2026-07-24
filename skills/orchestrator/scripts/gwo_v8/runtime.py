@@ -1893,6 +1893,10 @@ class PaseoRuntimeAdapter:
             identity_labels,
             action_key,
         )
+        prompt_was_inline = (
+            len(prompt.text.encode("utf-8"))
+            <= PASEO_INLINE_PROMPT_MAX_BYTES
+        )
         send_authorized = False
         while time.monotonic() < deadline:
             if self._prompt_is_accepted(
@@ -1903,6 +1907,12 @@ class PaseoRuntimeAdapter:
                 return
             agent = self._find_exact(agent_id, agent_labels)
             if state is None:
+                if prompt_was_inline:
+                    # Creation already acknowledged this exact Prompt as its
+                    # initial user message. A missing boundary can only remain
+                    # ambiguous; a separate send would duplicate that effect.
+                    time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
+                    continue
                 if agent.lifecycle != "idle":
                     time.sleep(PASEO_BOOTSTRAP_POLL_SECONDS)
                     continue
@@ -2136,11 +2146,23 @@ class PaseoRuntimeAdapter:
             labels["gwo.parent_agent"] = admission.parent_agent_id
         existing = self._find_one(labels)
         if existing is None:
+            creation_labels = dict(labels)
+            if (
+                len(prompt.text.encode("utf-8"))
+                <= PASEO_INLINE_PROMPT_MAX_BYTES
+            ):
+                creation_labels["gwo.prompt_delivery"] = (
+                    self._delivery_label_value(
+                        "acked",
+                        0,
+                        f"{admission.admission_id}:prompt",
+                    )
+                )
             existing = self.client.create(
                 PaseoCreateRequest(
                     action_key=f"{admission.admission_id}:materialize",
                     title=f"GWO {admission.node_key}",
-                    labels=labels,
+                    labels=creation_labels,
                     prompt=prompt,
                     repository_path=str(Path(admission.repository_path).resolve()),
                     base_sha=admission.base_sha,
@@ -2474,6 +2496,23 @@ class PaseoRuntimeAdapter:
             raise RuntimeAdapterError(
                 "RUNTIME_BINDING_UNKNOWN",
                 "Paseo Binding has no Agent identity",
+                failure_class="ambiguous",
+            )
+        prompt = self._prompts.get(binding.admission_id)
+        if prompt is None or prompt.digest != binding.prompt_digest:
+            raise RuntimeAdapterError(
+                "PROMPT_SNAPSHOT_MISSING",
+                "Paseo observation requires the frozen Prompt snapshot",
+                failure_class="ambiguous",
+            )
+        if not self._prompt_is_accepted(
+            binding.agent_id,
+            prompt,
+            {"gwo.admission": binding.admission_id},
+        ):
+            raise RuntimeAdapterError(
+                "PROMPT_ACCEPTANCE_AMBIGUOUS",
+                "Paseo observation lacks one exact Prompt boundary",
                 failure_class="ambiguous",
             )
         agent = self._find_exact(
@@ -2812,6 +2851,18 @@ class PaseoRuntimeAdapter:
             try:
                 agent = self._find_one({"gwo.action_key": request.action_key})
                 if agent is None:
+                    creation_labels = dict(labels)
+                    if (
+                        len(prompt.text.encode("utf-8"))
+                        <= PASEO_INLINE_PROMPT_MAX_BYTES
+                    ):
+                        creation_labels["gwo.prompt_delivery"] = (
+                            self._delivery_label_value(
+                                "acked",
+                                0,
+                                request.action_key,
+                            )
+                        )
                     self.client.create(
                         PaseoCreateRequest(
                             action_key=request.action_key,
@@ -2819,7 +2870,7 @@ class PaseoRuntimeAdapter:
                                 f"GWO Review {request.axis} "
                                 f"{request.candidate_sha[:12]}"
                             ),
-                            labels=labels,
+                            labels=creation_labels,
                             prompt=prompt,
                             repository_path=str(Path(request.workspace).resolve()),
                             base_sha=request.candidate_sha,

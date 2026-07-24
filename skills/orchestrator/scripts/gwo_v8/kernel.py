@@ -3647,27 +3647,25 @@ class Kernel:
 
         if not binding.prompt_accepted:
             actions = state.setdefault("materialization_actions", {})
-            if int(actions.get("prompt", 0)) >= 3:
-                blocked = RuntimeAdapterError(
-                    "PROMPT_DELIVERY_RETRIES_EXHAUSTED",
-                    "three unchanged Prompt executions were exhausted",
-                )
-                return None, self._materialization_failure(
-                    state,
-                    blocked,
-                    operation="prompt",
-                )
             circuit_outcome = self._prepare_runtime_operation(
                 state,
                 "prompt",
             )
             if circuit_outcome is not None:
                 return None, circuit_outcome
-            actions["prompt"] = int(actions.get("prompt", 0)) + 1
-            state["materialization_executions"] = sum(
-                int(value) for value in actions.values()
-            )
-            self._write_state(state["repository"], state["plan_digest"], state)
+            if int(actions.get("prompt", 0)) == 0:
+                # Record authorization of the one initial Prompt effect.
+                # Later calls only reconcile its authoritative readback and
+                # cannot exhaust Materialization while delivery is ambiguous.
+                actions["prompt"] = 1
+                state["materialization_executions"] = sum(
+                    int(value) for value in actions.values()
+                )
+                self._write_state(
+                    state["repository"],
+                    state["plan_digest"],
+                    state,
+                )
             try:
                 self.runtime.accept_prompt(binding, prompt)
                 self._clear_runtime_operation(state, "prompt")

@@ -106,6 +106,29 @@ def _wait_review(
     ) from last_error
 
 
+def _archive_agents(
+    client: PaseoCliClient,
+    repository_key: str,
+    *,
+    expected_agent_ids: set[str] | None,
+) -> list[str]:
+    records = client.find_by_labels({"gwo.repository": repository_key})
+    record_ids = {record.agent_id for record in records}
+    if expected_agent_ids is not None and record_ids != expected_agent_ids:
+        raise AssertionError(
+            "live Paseo E2E did not read back exactly its three Agents"
+        )
+    for record in records:
+        if not record.archived:
+            client.archive(record.agent_id)
+        archived = client.inspect(record.agent_id)
+        if not archived.archived:
+            raise AssertionError(
+                f"Paseo Agent archive did not read back: {record.agent_id}"
+            )
+    return sorted(record_ids)
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -161,6 +184,7 @@ def main() -> int:
     review_requests: list[ReviewAxisRequest] = []
     worker_binding = None
     review_bindings = {}
+    result_payload: dict[str, object] | None = None
 
     with tempfile.TemporaryDirectory(
         prefix="gwo-paseo-transport-",
@@ -300,40 +324,46 @@ def main() -> int:
                         f"{request.axis} Prompt was not accepted exactly once"
                     )
 
-            print(
-                json.dumps(
-                    {
-                        "repository": repository_key,
-                        "review_agents": {
-                            axis: binding.agent_id
-                            for axis, binding in readback_bindings.items()
-                        },
-                        "review_prompt_bytes": {
-                            request.axis: len(request.to_prompt().text.encode("utf-8"))
-                            for request in review_requests
-                        },
-                        "status": "passed",
-                        "worker_agent": adopted_worker.agent_id,
-                        "worker_prompt_bytes": len(worker_prompt.text.encode("utf-8")),
-                    },
-                    sort_keys=True,
-                )
-            )
+            result_payload = {
+                "repository": repository_key,
+                "review_agents": {
+                    axis: binding.agent_id
+                    for axis, binding in readback_bindings.items()
+                },
+                "review_prompt_bytes": {
+                    request.axis: len(request.to_prompt().text.encode("utf-8"))
+                    for request in review_requests
+                },
+                "status": "passed",
+                "worker_agent": adopted_worker.agent_id,
+                "worker_prompt_bytes": len(worker_prompt.text.encode("utf-8")),
+            }
         finally:
-            try:
-                records = client.find_by_labels({"gwo.repository": repository_key})
-            except RuntimeAdapterError:
-                records = ()
-            for record in records:
-                if record.archived:
-                    continue
-                try:
-                    client.archive(record.agent_id)
-                except RuntimeAdapterError as error:
-                    print(
-                        f"warning: could not archive {record.agent_id}: {error.code}",
-                        file=sys.stderr,
-                    )
+            expected_agent_ids = {
+                agent_id
+                for agent_id in (
+                    None if worker_binding is None else worker_binding.agent_id,
+                    *(
+                        binding.agent_id
+                        for binding in review_bindings.values()
+                    ),
+                )
+                if agent_id is not None
+            }
+            archived_agent_ids = _archive_agents(
+                client,
+                repository_key,
+                expected_agent_ids=(
+                    expected_agent_ids
+                    if result_payload is not None
+                    else None
+                ),
+            )
+            if result_payload is not None:
+                result_payload["archived_agents"] = archived_agent_ids
+    if result_payload is None:
+        raise AssertionError("live Paseo E2E completed without a result")
+    print(json.dumps(result_payload, sort_keys=True))
     return 0
 
 

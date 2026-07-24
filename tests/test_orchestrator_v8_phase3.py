@@ -37,6 +37,7 @@ from gwo_v8 import (  # noqa: E402
     resolve_review_profile,
 )
 from gwo_v8.kernel import DeliveryControlError  # noqa: E402
+from gwo_v8.runtime import PASEO_INLINE_PROMPT_MAX_BYTES  # noqa: E402
 import orch_core  # noqa: E402
 
 
@@ -786,6 +787,96 @@ def test_review_child_transport_retry_is_bounded_and_readback_first(tmp_path):
         )
     assert rejected.value.failure_class == "permanent"
     assert permanent_client.create_count == 1
+
+
+class _DelayedInlinePaseoClient(InMemoryPaseoClient):
+    def __init__(self):
+        super().__init__()
+        self.created_prompt = None
+
+    def create(self, request):
+        record = super().create(request)
+        self.created_prompt = request.prompt
+        self._accepted_prompt_digests[record.agent_id] = []
+        self._agents[record.agent_id] = replace(
+            record,
+            lifecycle="idle",
+        )
+        return self._agents[record.agent_id]
+
+    def expose_created_prompt(self):
+        record = next(iter(self._agents.values()))
+        self._accepted_prompt_digests[record.agent_id].append(
+            self.created_prompt.digest
+        )
+
+
+def test_prompt_ambiguity_does_not_exhaust_materialization(
+    tmp_path,
+    monkeypatch,
+):
+    repository = _temporary_repository(tmp_path)
+    compiled = PlanCompiler().compile(
+        _plan_intent(),
+        _ready_source(),
+        _policy_snapshot(),
+    )
+    work_node = next(
+        node
+        for node in json.loads(compiled.canonical_bytes)["nodes"]
+        if node["kind"] == "work"
+    )
+    prompt = RuntimePrompt.from_node(work_node)
+    assert len(prompt.text.encode("utf-8")) <= PASEO_INLINE_PROMPT_MAX_BYTES
+    store_path = tmp_path / "v8.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-3",
+    )
+    client = _DelayedInlinePaseoClient()
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=PaseoRuntimeAdapter(client),
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-3",
+        runtime_profile=RuntimeProfile(
+            name="worker-standard",
+            provider="kimi-cli",
+            model="kimi-code/kimi-for-coding",
+            thinking="max",
+            mode="yolo",
+            features={},
+        ),
+    )
+    monkeypatch.setattr("gwo_v8.runtime.PASEO_BOOTSTRAP_WAIT_SECONDS", 0.0)
+
+    ambiguous = [
+        kernel.reconcile_once("local/phase-three")
+        for _ in range(5)
+    ]
+
+    assert all(outcome.status == "waiting" for outcome in ambiguous)
+    assert all(
+        outcome.admission_state == "materialization_ambiguous"
+        for outcome in ambiguous
+    )
+    assert {outcome.materialization_executions for outcome in ambiguous} == {2}
+    assert client.create_count == 1
+    assert client.send_count == 0
+
+    client.expose_created_prompt()
+    adopted = kernel.reconcile_once("local/phase-three")
+
+    assert adopted.status != "blocked"
+    assert adopted.attempt_id is not None
+    assert adopted.materialization_executions == 2
+    assert client.create_count == 1
+    assert client.send_count == 0
 
 
 def test_dual_axis_review_evidence_preserves_axes_and_unlocks_publication(

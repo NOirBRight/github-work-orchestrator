@@ -27,6 +27,7 @@ from gwo_v8 import (  # noqa: E402
     RuntimePrompt,
 )
 from gwo_v8.runtime import PASEO_INLINE_PROMPT_MAX_BYTES  # noqa: E402
+from scripts.run_paseo_transport_e2e import _archive_agents  # noqa: E402
 
 
 def _prompt(byte_floor: int, *, name: str = "transport") -> RuntimePrompt:
@@ -346,6 +347,34 @@ class RestartBlindPaseoClient:
         )
 
 
+class ArchiveBlindPaseoClient(RestartBlindPaseoClient):
+    def archive(self, agent_id):
+        self.inspect(agent_id)
+
+
+def test_live_e2e_archive_requires_authoritative_readback(tmp_path):
+    prompt = _prompt(1_024, name="archive")
+    profile = _profile()
+    admission = RuntimeAdmission(
+        repository="local/archive",
+        plan_digest="a" * 64,
+        node_key="node:archive",
+        admission_id="admission:archive",
+        repository_path=tmp_path,
+        base_sha="b" * 40,
+        runtime_profile=profile,
+    )
+    client = ArchiveBlindPaseoClient()
+    binding = PaseoRuntimeAdapter(client).materialize(admission, prompt)
+
+    with pytest.raises(AssertionError, match="archive did not read back"):
+        _archive_agents(
+            client,
+            admission.repository,
+            expected_agent_ids={binding.agent_id},
+        )
+
+
 def test_worker_restart_never_replays_an_acknowledged_send(tmp_path, monkeypatch):
     prompt = _prompt(310_000, name="worker")
     profile = _profile()
@@ -411,6 +440,55 @@ def test_worker_restart_never_replays_an_acknowledged_send(tmp_path, monkeypatch
     assert readback.agent_id == pending.agent_id
     assert readback.prompt_accepted is True
     assert client.send_count == 1
+
+
+def test_delayed_inline_create_boundary_never_authorizes_send(
+    tmp_path,
+    monkeypatch,
+):
+    prompt = _prompt(1_024, name="inline")
+    profile = _profile()
+    admission = RuntimeAdmission(
+        repository="local/inline",
+        plan_digest="i" * 64,
+        node_key="node:inline",
+        admission_id="admission:inline",
+        repository_path=tmp_path,
+        base_sha="b" * 40,
+        runtime_profile=profile,
+    )
+    client = RestartBlindPaseoClient()
+    adapter = PaseoRuntimeAdapter(client)
+
+    pending = adapter.materialize(admission, prompt)
+    assert pending.prompt_accepted is False
+    assert client.send_count == 0
+    action_key = f"{admission.admission_id}:prompt"
+    expected_receipt = adapter._delivery_label_value(
+        "acked",
+        0,
+        action_key,
+    )
+    assert client.find_by_labels(
+        {
+            "gwo.admission": admission.admission_id,
+            "gwo.prompt_delivery": expected_receipt,
+        }
+    )
+
+    monkeypatch.setattr("gwo_v8.runtime.PASEO_BOOTSTRAP_WAIT_SECONDS", 0.0)
+    with pytest.raises(RuntimeAdapterError) as ambiguous:
+        adapter.accept_prompt(pending, prompt)
+
+    assert ambiguous.value.code == "PROMPT_DELIVERY_AMBIGUOUS"
+    assert client.send_count == 0
+
+    client.accept_prompt(pending.agent_id, prompt)
+    accepted = adapter.read_binding(admission, prompt)
+    assert accepted is not None
+    assert accepted.prompt_accepted is True
+    assert client.send_count == 0
+    assert client.prompt_acceptance_count(accepted.agent_id, prompt) == 1
 
 
 class DelayedAcceptancePaseoClient(RestartBlindPaseoClient):
@@ -545,6 +623,38 @@ def test_late_duplicate_boundary_overrides_published_digest(tmp_path):
 
     with pytest.raises(RuntimeAdapterError) as duplicate:
         adapter.read_binding(admission, prompt)
+
+    assert duplicate.value.code == "PROMPT_ACCEPTANCE_DUPLICATE"
+    assert duplicate.value.failure_class == "ambiguous"
+
+
+def test_worker_observation_recounts_late_duplicate_boundary(tmp_path):
+    prompt = _prompt(4_096, name="observe-duplicate")
+    profile = _profile()
+    admission = RuntimeAdmission(
+        repository="local/observe-duplicate",
+        plan_digest="o" * 64,
+        node_key="node:observe-duplicate",
+        admission_id="admission:observe-duplicate",
+        repository_path=tmp_path,
+        base_sha="b" * 40,
+        runtime_profile=profile,
+    )
+    client = InMemoryPaseoClient()
+    adapter = PaseoRuntimeAdapter(client)
+    accepted = adapter.materialize(admission, prompt)
+    attached = adapter.attach_attempt(
+        accepted,
+        "attempt:observe-duplicate",
+    )
+    client.send_prompt(
+        attached.agent_id,
+        prompt,
+        action_key="external:observe-duplicate",
+    )
+
+    with pytest.raises(RuntimeAdapterError) as duplicate:
+        adapter.observe(attached)
 
     assert duplicate.value.code == "PROMPT_ACCEPTANCE_DUPLICATE"
     assert duplicate.value.failure_class == "ambiguous"

@@ -217,10 +217,12 @@ A successful create response or `status: sent` is transport acknowledgement,
 not Prompt acceptance. The adapter reads the Agent activity and requires one
 exact `[User] <frozen-prompt>` message boundary. Only then does it publish
 `gwo.prompt_digest=<sha256>`, and it reads that label back through a Paseo
-label-filtered listing. Every later adoption, including one after the digest
-label exists, recounts the complete authoritative activity. More than one
-exact activity boundary is `PROMPT_ACCEPTANCE_DUPLICATE` and remains ambiguous
-rather than being treated as success.
+label-filtered listing. Inline create acknowledgement is also a durable
+delivery receipt: delayed activity visibility never authorizes a second send.
+Every later adoption and Worker observation, including one after the digest
+label exists, recounts the complete authoritative activity. More than one exact
+activity boundary is `PROMPT_ACCEPTANCE_DUPLICATE` and remains ambiguous rather
+than being treated as success.
 
 `paseo inspect` may omit labels. Fresh Coordinator processes therefore rebuild
 Worker and Review identity from authoritative `paseo ls --label ...` queries
@@ -236,7 +238,10 @@ Without an exact acceptance boundary, the same Agent and action therefore
 remain ambiguous indefinitely; reconciliation never replays from timing or
 idle heuristics. A retry is permitted only after an explicit pre-acceptance
 transport rejection proves that no enqueue occurred. The Admission or Review
-action never creates a replacement Agent while that identity exists.
+action never creates a replacement Agent while that identity exists. Empty
+readbacks do not consume a finite Prompt execution budget; the Admission keeps
+waiting until the original boundary becomes visible or a terminal Paseo result
+provides new authoritative evidence.
 
 Process-start failures distinguish `PASEO_COMMAND_LINE_OVERFLOW` from
 `PASEO_EXECUTABLE_UNAVAILABLE`. The former identifies a host command-line
@@ -258,8 +263,8 @@ Provider, model, thinking, mode, executable, and timeout are configurable
 flags. `GWO_RUN_PASEO_TRANSPORT_E2E=1` is the automation equivalent of
 `--live`. The runner uses a Worker Prompt above 300 KiB, two Review Prompts
 above 170 KiB, replaces the Coordinator client twice, proves one exact Prompt
-boundary per Agent, and archives every Agent it created. It does not run
-hosted checks.
+boundary per Agent, archives every Agent it created, and reads every archive
+back before it prints `passed`. It does not run hosted checks.
 
 Legacy migration is an explicit configuration operation:
 
