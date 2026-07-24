@@ -91,6 +91,8 @@ class DeliveryControl(Protocol):
         repository: str,
         candidate_sha: str,
         evidence_manifest_digest: str,
+        *,
+        target_branch: str | None = None,
     ) -> CandidatePublication: ...
 
     def read_hosted_checks(
@@ -152,7 +154,10 @@ class InMemoryDeliveryControl:
         repository: str,
         candidate_sha: str,
         evidence_manifest_digest: str,
+        *,
+        target_branch: str | None = None,
     ) -> CandidatePublication:
+        del target_branch
         existing = self.read_publication(repository, candidate_sha)
         if existing is not None:
             if existing.evidence_manifest_digest != evidence_manifest_digest:
@@ -272,7 +277,11 @@ class GitHubCliDeliveryControl:
     def _branch(candidate_sha: str) -> str:
         return f"gwo/candidates/{candidate_sha}"
 
-    def _evidence_digest(self, repository: str, candidate_sha: str) -> str | None:
+    def _evidence_status(
+        self,
+        repository: str,
+        candidate_sha: str,
+    ) -> tuple[str, str] | None:
         rendered = self._checked(
             [
                 self.executable,
@@ -299,15 +308,172 @@ class GitHubCliDeliveryControl:
                 and status.get("context") == self.evidence_context
             ):
                 description = status.get("description")
-                if isinstance(description, str) and description:
-                    return description
+                state = status.get("state")
+                if (
+                    isinstance(description, str)
+                    and description
+                    and isinstance(state, str)
+                    and state
+                ):
+                    return description, state
         return None
 
-    def read_publication(
+    @staticmethod
+    def _pull_request_identity(
+        pull_request: dict[str, Any],
+    ) -> tuple[str, str, str] | None:
+        head = pull_request.get("head")
+        base = pull_request.get("base")
+        if not isinstance(head, dict) or not isinstance(base, dict):
+            return None
+        head_ref = head.get("ref")
+        head_sha = head.get("sha")
+        base_ref = base.get("ref")
+        if not all(
+            isinstance(value, str) and value
+            for value in (head_ref, head_sha, base_ref)
+        ):
+            return None
+        return head_ref, head_sha, base_ref
+
+    def _read_candidate_pull_request(
         self,
         repository: str,
         candidate_sha: str,
-    ) -> CandidatePublication | None:
+        target_branch: str,
+    ) -> str | None:
+        branch = self._branch(candidate_sha)
+        owner = repository.split("/", 1)[0]
+        rendered = self._checked(
+            [
+                self.executable,
+                "api",
+                "--method",
+                "GET",
+                f"repos/{repository}/pulls",
+                "-f",
+                "state=all",
+                "-f",
+                f"head={owner}:{branch}",
+                "-f",
+                "per_page=100",
+            ]
+        )
+        try:
+            payload = json.loads(rendered)
+        except json.JSONDecodeError as error:
+            raise DeliveryControlError(
+                "PULL_REQUEST_READBACK_INVALID",
+                "GitHub pull request readback was not valid JSON",
+            ) from error
+        if not isinstance(payload, list):
+            raise DeliveryControlError(
+                "PULL_REQUEST_READBACK_INVALID",
+                "GitHub pull request readback was not a list",
+            )
+        identified = [
+            (item, self._pull_request_identity(item))
+            for item in payload
+            if isinstance(item, dict)
+        ]
+        conflicting = [
+            item
+            for item, identity in identified
+            if identity is not None
+            and identity[0] == branch
+            and identity != (branch, candidate_sha, target_branch)
+        ]
+        if conflicting:
+            raise DeliveryControlError(
+                "PULL_REQUEST_IDENTITY_CONFLICT",
+                "Candidate branch already has a pull request with another SHA or base",
+            )
+        exact = [
+            item
+            for item, identity in identified
+            if identity == (branch, candidate_sha, target_branch)
+        ]
+        if len(exact) > 1:
+            raise DeliveryControlError(
+                "PULL_REQUEST_IDENTITY_CONFLICT",
+                "Candidate branch has multiple pull requests for the same target",
+            )
+        if not exact:
+            return None
+        pull_request = exact[0]
+        state = pull_request.get("state")
+        merged_at = pull_request.get("merged_at")
+        if state != "open" and not (
+            state == "closed" and isinstance(merged_at, str) and merged_at
+        ):
+            raise DeliveryControlError(
+                "PULL_REQUEST_CLOSED_UNMERGED",
+                "Candidate pull request is closed without Integration",
+            )
+        source_ref = pull_request.get("html_url")
+        if not isinstance(source_ref, str) or not source_ref:
+            raise DeliveryControlError(
+                "PULL_REQUEST_READBACK_INVALID",
+                "Candidate pull request omitted its durable URL",
+            )
+        return source_ref
+
+    def _ensure_candidate_pull_request(
+        self,
+        repository: str,
+        candidate_sha: str,
+        target_branch: str,
+    ) -> str:
+        existing = self._read_candidate_pull_request(
+            repository,
+            candidate_sha,
+            target_branch,
+        )
+        if existing is not None:
+            return existing
+        branch = self._branch(candidate_sha)
+        result = self._command(
+            [
+                self.executable,
+                "api",
+                "--method",
+                "POST",
+                f"repos/{repository}/pulls",
+                "-f",
+                f"title=GWO Candidate {candidate_sha[:12]}",
+                "-f",
+                f"head={branch}",
+                "-f",
+                f"base={target_branch}",
+                "-f",
+                (
+                    "body=Automated exact-SHA Candidate publication by "
+                    "GitHub Work Orchestrator V8."
+                ),
+            ]
+        )
+        readback = self._read_candidate_pull_request(
+            repository,
+            candidate_sha,
+            target_branch,
+        )
+        if readback is None:
+            detail = (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "pull request creation did not read back"
+            )
+            raise DeliveryControlError(
+                "PULL_REQUEST_CREATE_AMBIGUOUS",
+                detail,
+            )
+        return readback
+
+    def _read_publication_status(
+        self,
+        repository: str,
+        candidate_sha: str,
+    ) -> tuple[CandidatePublication | None, str | None, bool]:
         branch = self._branch(candidate_sha)
         result = self._command(
             [
@@ -319,7 +485,7 @@ class GitHubCliDeliveryControl:
             ]
         )
         if result.returncode == 2:
-            return None
+            return None, None, False
         if result.returncode != 0:
             raise DeliveryControlError(
                 "PUBLICATION_READBACK_FAILED",
@@ -333,60 +499,102 @@ class GitHubCliDeliveryControl:
                 "PUBLICATION_IDENTITY_CONFLICT",
                 "remote Candidate branch does not point at the exact SHA",
             )
-        manifest_digest = self._evidence_digest(repository, candidate_sha)
-        if manifest_digest is None:
-            return None
-        return CandidatePublication(
-            repository=repository,
-            candidate_sha=candidate_sha,
-            evidence_manifest_digest=manifest_digest,
-            source_ref=(
-                f"https://github.com/{repository}/tree/{quote(branch, safe='/')}"
+        evidence = self._evidence_status(repository, candidate_sha)
+        if evidence is None:
+            return None, None, True
+        return (
+            CandidatePublication(
+                repository=repository,
+                candidate_sha=candidate_sha,
+                evidence_manifest_digest=evidence[0],
+                source_ref=(
+                    f"https://github.com/{repository}/tree/"
+                    f"{quote(branch, safe='/')}"
+                ),
             ),
+            evidence[1],
+            True,
         )
+
+    def read_publication(
+        self,
+        repository: str,
+        candidate_sha: str,
+    ) -> CandidatePublication | None:
+        publication, _evidence_state, _branch_exists = (
+            self._read_publication_status(
+                repository,
+                candidate_sha,
+            )
+        )
+        return publication
 
     def publish_once(
         self,
         repository: str,
         candidate_sha: str,
         evidence_manifest_digest: str,
+        *,
+        target_branch: str | None = None,
     ) -> CandidatePublication:
-        existing = self.read_publication(repository, candidate_sha)
+        existing, evidence_state, branch_exists = self._read_publication_status(
+            repository,
+            candidate_sha,
+        )
         if existing is not None:
             if existing.evidence_manifest_digest != evidence_manifest_digest:
                 raise DeliveryControlError(
                     "PUBLICATION_EVIDENCE_CONFLICT",
                     "published Candidate has another Evidence Manifest",
                 )
-            return existing
-        branch = self._branch(candidate_sha)
-        self._checked(
-            [
-                "git",
-                "push",
-                self.remote,
-                f"{candidate_sha}:refs/heads/{branch}",
-            ]
-        )
-        self._checked(
-            [
-                self.executable,
-                "api",
-                "--method",
-                "POST",
-                f"repos/{repository}/statuses/{candidate_sha}",
-                "-f",
-                "state=pending",
-                "-f",
-                f"context={self.evidence_context}",
-                "-f",
-                f"description={evidence_manifest_digest}",
-            ]
+        elif not branch_exists:
+            branch = self._branch(candidate_sha)
+            self._checked(
+                [
+                    "git",
+                    "push",
+                    self.remote,
+                    f"{candidate_sha}:refs/heads/{branch}",
+                ]
+            )
+        if existing is None or evidence_state != "success":
+            self._checked(
+                [
+                    self.executable,
+                    "api",
+                    "--method",
+                    "POST",
+                    f"repos/{repository}/statuses/{candidate_sha}",
+                    "-f",
+                    "state=success",
+                    "-f",
+                    f"context={self.evidence_context}",
+                    "-f",
+                    f"description={evidence_manifest_digest}",
+                ]
+            )
+        source_ref = (
+            None
+            if target_branch is None
+            else self._ensure_candidate_pull_request(
+                repository,
+                candidate_sha,
+                target_branch,
+            )
         )
         receipt = None
         for attempt in range(5):
-            receipt = self.read_publication(repository, candidate_sha)
-            if receipt is not None:
+            receipt, current_evidence_state, _branch_exists = (
+                self._read_publication_status(
+                    repository,
+                    candidate_sha,
+                )
+            )
+            if (
+                receipt is not None
+                and receipt.evidence_manifest_digest == evidence_manifest_digest
+                and current_evidence_state == "success"
+            ):
                 break
             if attempt < 4:
                 self._wait_for_publication_readback()
@@ -395,7 +603,18 @@ class GitHubCliDeliveryControl:
                 "PUBLICATION_READBACK_FAILED",
                 "Candidate publication was not visible after push",
             )
-        return receipt
+        if (
+            receipt.evidence_manifest_digest != evidence_manifest_digest
+            or current_evidence_state != "success"
+        ):
+            raise DeliveryControlError(
+                "PUBLICATION_READBACK_FAILED",
+                "Evidence Manifest status did not read back successful",
+            )
+        return replace(
+            receipt,
+            source_ref=source_ref or receipt.source_ref,
+        )
 
     def read_hosted_checks(
         self,
@@ -443,18 +662,89 @@ class GitHubCliDeliveryControl:
             for check in required_checks
         }
         if expected:
-            matched = [
+            observations = [
                 run
                 for run in runs
                 if run.get("name") in expected or run.get("workflowName") in expected
             ]
             matched_names = {
-                str(run.get("name")) for run in matched if run.get("name") in expected
+                str(run.get("name"))
+                for run in observations
+                if run.get("name") in expected
             } | {
                 str(run.get("workflowName"))
-                for run in matched
+                for run in observations
                 if run.get("workflowName") in expected
             }
+            combined_expected = {
+                name
+                for name in expected
+                if " / " in name and name not in matched_names
+            }
+            for run in runs:
+                workflow_name = str(
+                    run.get("workflowName") or run.get("name") or ""
+                )
+                if not any(
+                    name.startswith(f"{workflow_name} / ")
+                    for name in combined_expected
+                ):
+                    continue
+                run_id = run.get("databaseId")
+                if not isinstance(run_id, int) or isinstance(run_id, bool):
+                    raise DeliveryControlError(
+                        "HOSTED_CHECK_READBACK_INVALID",
+                        "GitHub Actions run omitted its database identity",
+                    )
+                jobs_rendered = self._checked(
+                    [
+                        self.executable,
+                        "api",
+                        "--method",
+                        "GET",
+                        f"repos/{repository}/actions/runs/{run_id}/jobs",
+                        "-f",
+                        "per_page=100",
+                    ]
+                )
+                try:
+                    jobs_payload = json.loads(jobs_rendered)
+                except json.JSONDecodeError as error:
+                    raise DeliveryControlError(
+                        "HOSTED_CHECK_READBACK_INVALID",
+                        "GitHub Actions job readback was not valid JSON",
+                    ) from error
+                jobs = (
+                    jobs_payload.get("jobs")
+                    if isinstance(jobs_payload, dict)
+                    else None
+                )
+                if not isinstance(jobs, list):
+                    raise DeliveryControlError(
+                        "HOSTED_CHECK_READBACK_INVALID",
+                        "GitHub Actions job readback omitted jobs",
+                    )
+                for job in jobs:
+                    if (
+                        not isinstance(job, dict)
+                        or job.get("head_sha") != candidate_sha
+                    ):
+                        continue
+                    combined_name = f"{workflow_name} / {job.get('name')}"
+                    if combined_name not in combined_expected:
+                        continue
+                    observations.append(
+                        {
+                            "databaseId": run_id,
+                            "status": job.get("status"),
+                            "conclusion": job.get("conclusion"),
+                            "url": job.get("html_url") or run.get("url"),
+                            "headSha": job.get("head_sha"),
+                            "name": combined_name,
+                            "workflowName": combined_name,
+                        }
+                    )
+                    matched_names.add(combined_name)
             if matched_names != set(expected):
                 return HostedCheckReadback(
                     candidate_sha,
@@ -462,7 +752,7 @@ class GitHubCliDeliveryControl:
                     source_ref,
                     tuple(sorted(expected.values())),
                 )
-            runs = matched
+            runs = observations
         definition_digests = tuple(sorted(expected.values()))
         if not runs or any(run.get("status") != "completed" for run in runs):
             return HostedCheckReadback(
@@ -4684,16 +4974,12 @@ class Kernel:
                 }
             )
             try:
-                receipt = self.delivery_control.read_publication(
+                receipt = self.delivery_control.publish_once(
                     repository,
                     batch_sha,
+                    manifest_digest,
+                    target_branch=self.integration_branch,
                 )
-                if receipt is None:
-                    receipt = self.delivery_control.publish_once(
-                        repository,
-                        batch_sha,
-                        manifest_digest,
-                    )
                 if (
                     receipt.candidate_sha != batch_sha
                     or receipt.evidence_manifest_digest != manifest_digest
