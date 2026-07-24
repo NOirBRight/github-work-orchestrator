@@ -202,11 +202,24 @@ K2.7 `kimi-cli` value `on` as a narrow discovery compatibility exception. K3
 continues to use its native `high/max` levels. This does not weaken capability
 validation for another provider, model, or thinking value.
 
-If V6.1 finds `~/.orch/providers.json` but no new config, it copies the source to
-`providers.v5.backup.json`, translates model and `thinking` to the new settings
-shape, and atomically installs `config.json`. It ignores ambiguous V5
-`roles` bindings, initializes an empty `role_profiles` map, and never reads the
-old file at runtime afterwards.
+Legacy migration is an explicit configuration operation:
+
+```text
+python <skill>/scripts/orch_config.py migrate
+```
+
+The command reads `~/.orch/providers.json`, validates the complete translated
+schema before publication, copies the source to `providers.v5.backup.json`,
+and atomically installs `config.json`. It refuses to replace an existing config
+or a conflicting backup, so unrelated global and repository overrides cannot
+be normalized away by a Runtime operation. It ignores ambiguous V5 `roles`
+bindings and initializes empty profile maps. Without this explicit command,
+an absent `config.json` is resolved in memory and neither it nor the legacy
+file is written.
+
+The `frontier` tier never inherits the current Coordinator runtime. A missing
+mapping fails as `RUNTIME_FRONTIER_PROFILE_MISSING`; an incomplete mapping
+fails as `RUNTIME_FRONTIER_PROFILE_INVALID`.
 
 Valid execution slots are 1–5. Integration WIP must be at least execution
 capacity and at most 20. Candidate and Ready Reserve limits are at most 100;

@@ -7,7 +7,6 @@ import hashlib
 import importlib.util
 import os
 import re
-import shutil
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -1434,6 +1433,32 @@ def resolve_runtime_request(
     mapping = (repo.get("tiers") or {}).get(tier)
     if mapping is None:
         mapping = (config.get("tiers") or {}).get(tier)
+
+    if tier == "frontier":
+        if mapping is None:
+            raise PolicyError(
+                "RUNTIME_FRONTIER_PROFILE_MISSING",
+                "frontier tier has no configured profile",
+            )
+        settings = mapping.get("settings") if isinstance(mapping, dict) else {}
+        if (
+            not isinstance(mapping, dict)
+            or not isinstance(mapping.get("provider"), str)
+            or not mapping.get("provider")
+            or not isinstance(settings, dict)
+            or not isinstance(settings.get("model"), str)
+            or not settings.get("model")
+            or not isinstance(settings.get("thinkingOptionId"), str)
+            or not settings.get("thinkingOptionId")
+            or not isinstance(settings.get("modeId"), str)
+            or not settings.get("modeId")
+            or not isinstance(settings.get("features"), dict)
+        ):
+            raise PolicyError(
+                "RUNTIME_FRONTIER_PROFILE_INVALID",
+                "frontier tier profile is incomplete",
+            )
+
     if mapping is None:
         mapping = coordinator_runtime
     if not isinstance(mapping, dict):
@@ -3172,7 +3197,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_or_migrate_config(
-    config_path: Path, old_path: Path | None = None, *, write_migration: bool = True
+    config_path: Path, old_path: Path | None = None, *, write_migration: bool = False
 ) -> dict[str, Any]:
     config_path = Path(config_path)
     if config_path.is_file():
@@ -3182,8 +3207,9 @@ def load_or_migrate_config(
             raise PolicyError("CONFIG_JSON_INVALID", str(error)) from error
         return validate_config(config)
     if old_path is not None and Path(old_path).is_file():
-        if write_migration:
-            return validate_config(migrate_config_file(Path(old_path), config_path))
+        # Retained only as a source-compatible V6.1 argument. Runtime commands
+        # never publish configuration; migration is an explicit command.
+        del write_migration
         try:
             old = json.loads(Path(old_path).read_text(encoding="utf-8"))
         except json.JSONDecodeError as error:
@@ -3194,20 +3220,65 @@ def load_or_migrate_config(
 
 def migrate_config_file(old_path: Path, new_path: Path) -> dict[str, Any]:
     old_path, new_path = Path(old_path), Path(new_path)
+    if new_path.exists():
+        raise PolicyError(
+            "CONFIG_ALREADY_EXISTS",
+            "explicit migration will not replace an existing runtime config",
+        )
     try:
         old = json.loads(old_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise PolicyError("CONFIG_MIGRATION_SOURCE_INVALID", str(error)) from error
-    migrated = migrate_v5_config(old)
+    migrated = validate_config(migrate_v5_config(old))
     new_path.parent.mkdir(parents=True, exist_ok=True)
     backup = old_path.with_name("providers.v5.backup.json")
-    shutil.copyfile(old_path, backup)
-    temporary = new_path.with_suffix(new_path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(migrated, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-    os.replace(temporary, new_path)
-    return migrated
+    source_bytes = old_path.read_bytes()
+    if backup.exists() and backup.read_bytes() != source_bytes:
+        raise PolicyError(
+            "CONFIG_MIGRATION_BACKUP_CONFLICT",
+            "legacy configuration backup already exists with different bytes",
+        )
+
+    config_temporary = new_path.with_suffix(new_path.suffix + ".tmp")
+    backup_temporary = backup.with_suffix(backup.suffix + ".tmp")
+    config_created = False
+    backup_created = False
+    try:
+        config_temporary.write_text(
+            json.dumps(migrated, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        validate_config(json.loads(config_temporary.read_text(encoding="utf-8")))
+        if not backup.exists():
+            backup_temporary.write_bytes(source_bytes)
+            try:
+                os.link(backup_temporary, backup)
+            except FileExistsError as error:
+                raise PolicyError(
+                    "CONFIG_MIGRATION_BACKUP_CONFLICT",
+                    "legacy backup appeared during migration",
+                ) from error
+            backup_created = True
+            backup_temporary.unlink()
+        try:
+            os.link(config_temporary, new_path)
+        except FileExistsError as error:
+            raise PolicyError(
+                "CONFIG_ALREADY_EXISTS",
+                "runtime config appeared during explicit migration",
+            ) from error
+        config_created = True
+        config_temporary.unlink()
+        return migrated
+    except Exception:
+        if config_created and new_path.exists():
+            new_path.unlink()
+        if backup_created and backup.exists():
+            backup.unlink()
+        raise
+    finally:
+        config_temporary.unlink(missing_ok=True)
+        backup_temporary.unlink(missing_ok=True)
 
 
 def project_result(*, permission: bool, drift: list[str]) -> dict[str, Any]:
