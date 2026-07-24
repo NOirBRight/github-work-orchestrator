@@ -215,7 +215,9 @@ or a conflicting backup, so unrelated global and repository overrides cannot
 be normalized away by a Runtime operation. It ignores ambiguous V5 `roles`
 bindings and initializes empty profile maps. Without this explicit command,
 an absent `config.json` is resolved in memory and neither it nor the legacy
-file is written.
+file is written. Once the no-clobber backup is published, migration retains it
+even if config publication loses a race. Migration never unlinks the backup,
+so a concurrent replacement cannot be removed by rollback.
 
 The `frontier` tier never inherits the current Coordinator runtime. A missing
 mapping fails as `RUNTIME_FRONTIER_PROFILE_MISSING`; an incomplete mapping

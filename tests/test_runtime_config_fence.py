@@ -331,7 +331,55 @@ def test_migration_does_not_clobber_config_created_concurrently(tmp_path, monkey
 
     assert error.value.code == "CONFIG_ALREADY_EXISTS"
     assert config.read_bytes() == concurrent_bytes
-    assert not (tmp_path / "providers.v5.backup.json").exists()
+    assert (tmp_path / "providers.v5.backup.json").read_bytes() == legacy.read_bytes()
+
+
+def test_migration_never_unlinks_backup_replaced_before_config_rollback(
+    tmp_path, monkeypatch
+):
+    legacy = tmp_path / "providers.json"
+    config = tmp_path / "config.json"
+    backup = tmp_path / "providers.v5.backup.json"
+    replacement = tmp_path / "replacement-backup.json"
+    _legacy(legacy)
+    replacement_bytes = b'{"replacement backup": true}'
+    concurrent_config_bytes = b'{"concurrent config": true}'
+    replacement.write_bytes(replacement_bytes)
+
+    real_link = os.link
+    real_unlink = Path.unlink
+    backup_published = False
+    backup_unlinks = []
+
+    def racing_link(src, dst):
+        nonlocal backup_published
+        destination = Path(dst)
+        if destination == backup:
+            result = real_link(src, dst)
+            backup_published = True
+            return result
+        if destination == config:
+            assert backup_published
+            os.replace(replacement, backup)
+            config.write_bytes(concurrent_config_bytes)
+            raise FileExistsError(errno.EEXIST, "simulated race", str(dst))
+        return real_link(src, dst)
+
+    def recording_unlink(path, *args, **kwargs):
+        if path == backup:
+            backup_unlinks.append(path)
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", racing_link)
+    monkeypatch.setattr(Path, "unlink", recording_unlink)
+
+    with pytest.raises(core.PolicyError) as error:
+        core.migrate_config_file(legacy, config)
+
+    assert error.value.code == "CONFIG_ALREADY_EXISTS"
+    assert config.read_bytes() == concurrent_config_bytes
+    assert backup.read_bytes() == replacement_bytes
+    assert backup_unlinks == []
 
 
 def test_migration_does_not_clobber_backup_created_concurrently(tmp_path, monkeypatch):

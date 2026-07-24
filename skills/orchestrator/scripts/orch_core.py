@@ -3274,7 +3274,6 @@ def migrate_config_file(old_path: Path, new_path: Path) -> dict[str, Any]:
     config_temporary = _write_unique_temporary(new_path, config_bytes)
     backup_temporary: Path | None = None
     config_created = False
-    backup_created = False
     try:
         validate_config(json.loads(config_temporary.read_text(encoding="utf-8")))
         if not backup.exists():
@@ -3286,7 +3285,6 @@ def migrate_config_file(old_path: Path, new_path: Path) -> dict[str, Any]:
                     "CONFIG_MIGRATION_BACKUP_CONFLICT",
                     "legacy backup appeared during migration",
                 ) from error
-            backup_created = True
             backup_temporary.unlink()
         try:
             os.link(config_temporary, new_path)
@@ -3301,8 +3299,6 @@ def migrate_config_file(old_path: Path, new_path: Path) -> dict[str, Any]:
     except Exception:
         if config_created and new_path.exists():
             new_path.unlink()
-        if backup_created and backup.exists():
-            backup.unlink()
         raise
     finally:
         config_temporary.unlink(missing_ok=True)
