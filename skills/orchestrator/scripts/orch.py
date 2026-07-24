@@ -8,6 +8,7 @@ returned as actions for the Skill to execute through Paseo MCP.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -19,10 +20,22 @@ from typing import Any, Literal, TypedDict
 
 import orch_core as core
 
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from gwo_v8 import (
+    ActivationError,
+    GitHubCliContentClient,
+    GitHubLegacyWriterControl,
+    LegacyWriterReadback,
+)
+
 frontier = core.frontier
 
 
 DEFAULT_CONFIG = Path.home() / ".orch" / "config.json"
+LEGACY_WRITER_CONTROL_BRANCH = "gwo-control"
 ORCH_PR_FIELDS = r"""
 number state title body headRefName headRefOid baseRefName isDraft updatedAt mergedAt
 mergeStateStatus reviewDecision url
@@ -180,6 +193,108 @@ def _git_common_dir() -> Path:
     if not path.is_absolute():
         path = Path.cwd() / path
     return path.resolve()
+
+
+def _legacy_writer_stopped(repository: str) -> bool:
+    """Read only the durable V6.1 stop bit used by mutation boundaries."""
+
+    control = GitHubLegacyWriterControl(
+        GitHubCliContentClient(executable=_tool("gh", "ORCH_GH_PATH")),
+        branch=LEGACY_WRITER_CONTROL_BRANCH,
+        execution_readback=lambda candidate: LegacyWriterReadback(
+            repository=candidate,
+            stopped=False,
+            active_dispatches=(),
+            integration_lease=False,
+            active_workers=(),
+        ),
+    )
+    return control.readback(repository).stopped
+
+
+def _require_v61_writer_authority(repository: str) -> None:
+    try:
+        stopped = _legacy_writer_stopped(repository)
+    except (ActivationError, ValueError) as error:
+        raise core.PolicyError(
+            "V61_WRITER_FENCE_UNAVAILABLE",
+            f"durable V6.1 writer fence could not be trusted: {error}",
+        ) from error
+    if stopped:
+        raise core.PolicyError(
+            "V61_WRITER_STOPPED",
+            "the durable V6.1 writer fence blocks repository mutation",
+        )
+
+
+@contextmanager
+def _v61_mutation_guard(repository: str):
+    with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
+        _require_v61_writer_authority(repository)
+        yield
+
+
+def _production_legacy_execution_readback(
+    repository: str,
+    repository_config: dict[str, Any],
+) -> LegacyWriterReadback:
+    integration_branch = repository_config.get("integration_branch")
+    if not isinstance(integration_branch, str) or not integration_branch:
+        raise core.PolicyError(
+            "LEGACY_READBACK_CONFIG_INVALID",
+            "legacy writer readback requires an integration branch",
+        )
+    with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
+        snapshot = GitHub().snapshot(repository, integration_branch)
+        active_dispatches = tuple(
+            sorted(
+                str(dispatch["id"])
+                for issue in snapshot.get("issues") or []
+                for dispatch in [issue.get("dispatch") or {}]
+                if dispatch.get("id")
+                and dispatch.get("status") not in {"merged", "retired"}
+            )
+        )
+        worker_ids: list[str] = []
+        for agent in Paseo().agents_for_labels(
+            {
+                "orch.repository": repository,
+                "orch.role": "worker",
+            }
+        ):
+            archived = bool(agent.get("Archived") or agent.get("archivedAt"))
+            status = str(agent.get("Status") or agent.get("status") or "").lower()
+            if archived or status == "closed":
+                continue
+            agent_id = agent.get("Id") or agent.get("id")
+            if not isinstance(agent_id, str) or not agent_id:
+                raise core.PolicyError(
+                    "LEGACY_RUNTIME_READBACK_INVALID",
+                    "Paseo Worker readback lacks an Agent identity",
+                )
+            worker_ids.append(agent_id)
+        return LegacyWriterReadback(
+            repository=repository,
+            stopped=False,
+            active_dispatches=active_dispatches,
+            integration_lease=False,
+            active_workers=tuple(sorted(worker_ids)),
+        )
+
+
+def production_legacy_writer_control(
+    repository_config: dict[str, Any],
+) -> GitHubLegacyWriterControl:
+    """Compose the production V6.1 fence and authoritative readback sources."""
+
+    return GitHubLegacyWriterControl(
+        GitHubCliContentClient(executable=_tool("gh", "ORCH_GH_PATH")),
+        branch=LEGACY_WRITER_CONTROL_BRANCH,
+        execution_readback=lambda repository: _production_legacy_execution_readback(
+            repository,
+            repository_config,
+        ),
+    )
 
 
 class GitHub:
@@ -2444,7 +2559,7 @@ def _frontier(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     plan = _read_json(args.plan)
-    with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
+    with _v61_mutation_guard(args.repo):
         candidates, snapshot, analysis = read_and_analyze()
         target_numbers = _admission_target_numbers(plan, repository=args.repo)
         details = github.issues_by_number(args.repo, target_numbers)
@@ -2592,7 +2707,7 @@ def _reconcile(args: argparse.Namespace) -> dict[str, Any]:
     if entry["status"] == "forwarded":
         return entry
     github = GitHub()
-    with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
+    with _v61_mutation_guard(args.repo):
         snapshot, runtime = _prepare_snapshot(
             github, args.repo, repo_config, observations, mutate=True
         )
@@ -2702,7 +2817,7 @@ def _integrate(args: argparse.Namespace) -> dict[str, Any]:
             "Orchestrator does not automatically release to main",
         )
     github = GitHub()
-    with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
+    with _v61_mutation_guard(args.repo):
         snapshot, runtime = _prepare_snapshot(
             github, args.repo, repo_config, [], mutate=True
         )
@@ -2824,7 +2939,7 @@ def _retire(args: argparse.Namespace) -> dict[str, Any]:
     if entry["status"] == "forwarded":
         return entry
     github = GitHub()
-    with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
+    with _v61_mutation_guard(args.repo):
         _prepare_snapshot(github, args.repo, repo_config, [], mutate=True)
         view = json.loads(
             github.run(
@@ -2895,7 +3010,7 @@ def _project(args: argparse.Namespace) -> dict[str, Any]:
     number = repo_config.get("project_number")
     owner = repo_config.get("project_owner") or args.repo.split("/", 1)[0]
     github = GitHub()
-    with core.coordination_mutex(_git_common_dir() / "orchestrator.lock"):
+    with _v61_mutation_guard(args.repo):
         _prepare_snapshot(github, args.repo, repo_config, [], mutate=True)
         repo_config = _reload_repo_config(args, repo_config)
         try:

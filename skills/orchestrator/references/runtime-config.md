@@ -215,3 +215,24 @@ Legacy `worker_slots` remains accepted as an execution-capacity alias when the
 new keys are absent; its integration limit defaults to at least six and twice
 execution capacity without rewriting the file. Invalid configuration blocks
 new mutations but does not alter already-running Workers.
+
+## V6.1 writer fence
+
+V8 cutover uses one durable V6.1 stop fence at
+`gwo-control:.gwo-v8/legacy-writer-fence.json`. Stop and restore append stable
+action-keyed events through GitHub compare-and-swap; they do not erase writer
+history. A missing branch or record means V6.1 has not been stopped. Invalid,
+contradictory, or unavailable fence readback blocks mutation instead of
+guessing.
+
+Every state-changing V6.1 command checks the fence while holding the same
+repository coordination mutex and before its first GitHub, Git, or Paseo
+write. `frontier scan` and `reconcile --read-only` remain available for
+diagnosis after stop.
+
+Production cutover readback holds that mutex, reads non-terminal Dispatches
+from GitHub, and reads unarchived repository Worker identities from Paseo.
+Only the combination of the exact durable stop fence, no non-terminal
+Dispatch, no in-flight Integration command, and no unarchived Worker can
+report zero V6.1 execution authority. Installing this Skill never creates the
+control branch, publishes the stop fence, or performs cutover.
