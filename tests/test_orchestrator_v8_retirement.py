@@ -697,7 +697,12 @@ def test_cli_repository_bound_list_reaches_real_paseo_daemon():
     repository = Path(__file__).resolve().parents[1]
     client = PaseoCliClient("paseo")
 
-    worktrees = client.list_worktrees(str(repository))
+    try:
+        worktrees = client.list_worktrees(str(repository))
+    except RuntimeAdapterError as error:
+        if error.code == "PASEO_NATIVE_TRANSPORT_UNAVAILABLE":
+            pytest.skip("installed Paseo exposes no daemon-native transport")
+        raise
 
     current = next(
         record
