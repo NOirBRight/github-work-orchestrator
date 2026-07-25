@@ -37,7 +37,24 @@ never fall back to `/implement` or run those HITL commands automatically.
 5. Drive one `Kernel.reconcile_once` per host wake. Follow its typed directive:
    continue the Coordinator, wait on the named condition without an LLM turn,
    request a decision, run another mechanical pass, or finish.
-6. Continue until the Task Group Goal is verified complete or explicitly
+6. Keep `batch_ready`, Review/CI wait, superseded, and failed Runtime Bindings
+   parked or interrupted. Only after exact target-branch Integration readback
+   may the Kernel issue a bound retirement authorization. Reconcile
+   `Agent archive -> repository-bound Paseo daemon retirement -> exact
+   temporary branch CAS/prune -> Agent/path/Git-worktree readback`; retry
+   typed pending/error retirement idempotently. Inside the Runtime Adapter,
+   preserve Paseo host/auth configuration and send an explicit `repoRoot`;
+   first uniquely read back the native name, canonical worktree path, and
+   branch in that repository, then call `archivePaseoWorktree` with the same
+   `repoRoot`, exact path and branch, and `scope: "worktree"`. Never treat a
+   `wks_*` Workspace ID as the native name or an arbitrary shell path as
+   deletion authority. Apply ADR-0041 to Reviewer retirement as well: remove
+   an independent disposable Reviewer worktree only after accepted Review
+   Evidence, while a child sharing the Candidate workspace archives identity
+   only.
+7. Continue until every in-scope Work Item is verified and every integrated
+   Batch member has complete Runtime retirement readback, or the Task Group
+   Goal is explicitly
    blocked. A Coordinator turn ending is not completion.
 
 The installed optional Skill named by a work Plan Node contributes Prompt
@@ -55,5 +72,7 @@ Effect Contract and output/Evidence contracts remain authoritative.
   readback before retry.
 - Do not poll Agents, treat token use as progress, or use elapsed time to fail,
   cancel, or replace work.
+- Never place absolute repository or worktree paths in durable retirement
+  Evidence.
 - Prefer a valid manually created Coordinator. Auto-create only from the
   configured `coordinator_auto` Role Profile when none is usable.

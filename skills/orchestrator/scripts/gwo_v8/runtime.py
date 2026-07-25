@@ -17,7 +17,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
 from ._effects import (
@@ -26,6 +26,14 @@ from ._effects import (
     normalized_relative_path,
 )
 from .evidence import ResultClaim, TypedEvidence
+
+if TYPE_CHECKING:
+    from .retirement import (
+        RetirementAuthorization,
+        RetirementReadback,
+        ReviewRetirementAuthorization,
+        ReviewRetirementReadback,
+    )
 
 
 PASEO_INLINE_PROMPT_MAX_BYTES = 8_192
@@ -42,6 +50,39 @@ PASEO_PROMPT_DELIVERY_PHASES = (
     "idle",
     "dropped",
 )
+
+_PASEO_DAEMON_TRANSPORT_SCRIPT = r"""
+import { pathToFileURL } from "node:url";
+
+const [clientModulePath, operation] = process.argv.slice(1);
+let input = "";
+for await (const chunk of process.stdin) {
+  input += chunk;
+}
+const request = JSON.parse(input);
+const { connectToDaemon } = await import(pathToFileURL(clientModulePath).href);
+const client = await connectToDaemon({});
+try {
+  let response;
+  if (operation === "list") {
+    response = await client.getPaseoWorktreeList({
+      repoRoot: request.repoRoot,
+    });
+  } else if (operation === "archive") {
+    response = await client.archivePaseoWorktree({
+      repoRoot: request.repoRoot,
+      worktreePath: request.worktreePath,
+      branchName: request.branchName,
+      scope: request.scope,
+    });
+  } else {
+    throw new Error(`Unsupported GWO Paseo daemon operation: ${operation}`);
+  }
+  process.stdout.write(JSON.stringify(response));
+} finally {
+  await client.close();
+}
+"""
 
 
 class RuntimeAdapterError(RuntimeError):
@@ -1220,7 +1261,17 @@ class RuntimeAdapter(Protocol):
 
     def interrupt(self, binding: RuntimeBinding) -> None: ...
 
-    def retire(self, binding: RuntimeBinding) -> None: ...
+    def retire_after_integration(
+        self,
+        binding: RuntimeBinding,
+        authorization: RetirementAuthorization,
+    ) -> RetirementReadback: ...
+
+    def retire_review_after_evidence(
+        self,
+        binding: ReviewAxisBinding,
+        authorization: ReviewRetirementAuthorization,
+    ) -> ReviewRetirementReadback: ...
 
 
 @dataclass
@@ -1434,6 +1485,17 @@ class PaseoClient(Protocol):
 
     def archive(self, agent_id: str) -> None: ...
 
+    def list_worktrees(
+        self,
+        repository_path: str,
+    ) -> tuple[dict[str, Any], ...]: ...
+
+    def archive_worktree(
+        self,
+        repository_path: str,
+        worktree_name: str,
+    ) -> None: ...
+
     def observed_worker_turn_capacity(
         self,
         profile: RuntimeProfile | None,
@@ -1472,6 +1534,7 @@ class InMemoryPaseoClient:
         self.create_count = 0
         self.send_count = 0
         self.create_prompt_digests: list[str] = []
+        self.archived_worktree_names: list[str] = []
 
     def capabilities(self, provider: str) -> ProviderCapabilities:
         """Return fresh capabilities for one canonical Paseo provider.
@@ -1550,13 +1613,41 @@ class InMemoryPaseoClient:
             )
         suffix = digest_bytes(request.action_key.encode("utf-8"))[:20]
         agent_id = f"agent:{suffix}"
+        worktree_name = f"gwo-{suffix[:16]}"
+        workspace = (
+            Path(request.repository_path) / worktree_name
+        ).resolve()
+        if "gwo.review_candidate" in request.labels:
+            source = Path(request.repository_path).resolve()
+            listing = _run(
+                ["git", "worktree", "list", "--porcelain"],
+                cwd=source,
+            )
+            first = next(
+                (
+                    line.partition(" ")[2]
+                    for line in listing.stdout.splitlines()
+                    if line.startswith("worktree ")
+                ),
+                "",
+            )
+            if listing.returncode == 0 and first:
+                workspace = (Path(first).resolve().parent / worktree_name)
+                if not workspace.exists():
+                    _git(
+                        source,
+                        "worktree",
+                        "add",
+                        "-b",
+                        f"gwo/review/{suffix[:16]}",
+                        str(workspace),
+                        request.base_sha,
+                    )
         record = PaseoAgentRecord(
             agent_id=agent_id,
             session_id=f"session:{suffix}",
-            workspace_id=f"workspace:{suffix}",
-            workspace=str(
-                (Path(request.repository_path) / f".paseo-{suffix}").resolve()
-            ),
+            workspace_id=worktree_name,
+            workspace=str(workspace),
             parent_agent_id=(
                 request.parent_agent_id
                 if self.native_finish_notification_supported
@@ -1669,6 +1760,87 @@ class InMemoryPaseoClient:
             archived=True,
         )
 
+    def archive_worktree(
+        self,
+        repository_path: str,
+        worktree_name: str,
+    ) -> None:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", worktree_name) is None:
+            raise RuntimeAdapterError(
+                "PASEO_WORKTREE_NAME_INVALID",
+                "Paseo worktree archive requires a name, not a path",
+            )
+        repository = Path(repository_path).resolve()
+        self.archived_worktree_names.append(worktree_name)
+        matches = {
+            Path(record.workspace).resolve()
+            for record in self._agents.values()
+            if Path(record.workspace).name == worktree_name
+        }
+        if len(matches) != 1:
+            raise RuntimeAdapterError(
+                "PASEO_WORKTREE_IDENTITY_AMBIGUOUS",
+                "Paseo worktree name does not identify one Agent workspace",
+                failure_class="ambiguous",
+            )
+        workspace = next(iter(matches))
+        record = next(
+            item
+            for item in self._agents.values()
+            if Path(item.workspace).resolve() == workspace
+        )
+        repository_value = record.labels.get("gwo.repository_path")
+        if not isinstance(repository_value, str) or not repository_value:
+            repository_value = next(
+                (
+                    item.labels.get("gwo.repository_path")
+                    for item in self._agents.values()
+                    if item.labels.get("gwo.repository")
+                    == record.labels.get("gwo.repository")
+                    and isinstance(
+                        item.labels.get("gwo.repository_path"),
+                        str,
+                    )
+                ),
+                None,
+            )
+        if (
+            not isinstance(repository_value, str)
+            or Path(repository_value).resolve() != repository
+        ):
+            raise RuntimeAdapterError(
+                "PASEO_WORKTREE_IDENTITY_MISMATCH",
+                "Paseo worktree does not belong to the requested repository",
+                failure_class="ambiguous",
+            )
+        if workspace.exists() and isinstance(repository_value, str) and repository_value:
+            _git(
+                Path(repository_value).resolve(),
+                "worktree",
+                "remove",
+                "--force",
+                str(workspace),
+            )
+
+    def list_worktrees(
+        self,
+        repository_path: str,
+    ) -> tuple[dict[str, Any], ...]:
+        from .retirement import _registered_worktrees
+
+        repository = Path(repository_path).resolve()
+        return tuple(
+            {
+                "path": str(workspace),
+                "head": registration.head,
+                "branch_name": registration.branch,
+                "native_name": workspace.name,
+            }
+            for workspace, registration in _registered_worktrees(
+                repository
+            ).items()
+        )
+
 class PaseoCliClient:
     """Concrete Paseo client for the public CLI lifecycle surface."""
 
@@ -1678,6 +1850,7 @@ class PaseoCliClient:
         self.executable = shutil.which(executable) or executable
         self._command_prefix = (self.executable,)
         self._command_environment: dict[str, str] | None = None
+        self._daemon_command_prefix: tuple[str, ...] | None = None
         self._create_receipts: set[tuple[str, str]] = set()
         self._create_receipt_lock = threading.Lock()
         if sys.platform == "win32" and Path(self.executable).suffix.lower() in {
@@ -1697,6 +1870,16 @@ class PaseoCliClient:
                 / "node-entrypoint-runner.js"
             )
             if app_executable.is_file() and runner.is_file():
+                daemon_client_module = (
+                    resources
+                    / "app.asar"
+                    / "node_modules"
+                    / "@getpaseo"
+                    / "cli"
+                    / "dist"
+                    / "utils"
+                    / "client.js"
+                )
                 self._command_prefix = (
                     str(app_executable),
                     "--disable-warning=DEP0040",
@@ -1712,12 +1895,97 @@ class PaseoCliClient:
                         / "index.js"
                     ),
                 )
+                self._daemon_command_prefix = (
+                    str(app_executable),
+                    "--disable-warning=DEP0040",
+                    "--input-type=module",
+                    "--eval",
+                    _PASEO_DAEMON_TRANSPORT_SCRIPT,
+                    str(daemon_client_module),
+                )
                 self._command_environment = {
                     **os.environ,
                     "ELECTRON_RUN_AS_NODE": "1",
                     "PASEO_NODE_ENV": "production",
                     "PASEO_DESKTOP_MANAGED": "1",
                 }
+
+    def _run_daemon_request(
+        self,
+        operation: str,
+        payload: dict[str, Any],
+        *,
+        failure_class: str = "ambiguous",
+    ) -> Any:
+        if self._daemon_command_prefix is None:
+            raise RuntimeAdapterError(
+                "PASEO_NATIVE_TRANSPORT_UNAVAILABLE",
+                "Installed Paseo does not expose its repository-bound daemon transport",
+                failure_class="permanent",
+            )
+        try:
+            result = subprocess.run(
+                [*self._daemon_command_prefix, operation],
+                input=json.dumps(payload, separators=(",", ":")),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=self._command_environment,
+                timeout=30,
+            )
+        except OSError as error:
+            self._raise_process_start_error(
+                error,
+                failure_class=failure_class,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeAdapterError(
+                "PASEO_DAEMON_REQUEST_TIMEOUT",
+                "Paseo daemon request timed out",
+                failure_class="transient",
+            ) from error
+        if result.returncode != 0:
+            detail = (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "Paseo daemon operation failed"
+            )
+            raise RuntimeAdapterError(
+                "PASEO_DAEMON_REQUEST_FAILED",
+                detail,
+                failure_class=self.classify_failure(
+                    detail,
+                    default=failure_class,
+                ),
+            )
+        try:
+            response = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise RuntimeAdapterError(
+                "PASEO_READBACK_INVALID",
+                "Paseo daemon returned non-JSON lifecycle data",
+                failure_class="ambiguous",
+            ) from error
+        daemon_error = (
+            response.get("error")
+            if isinstance(response, dict)
+            else None
+        )
+        if isinstance(daemon_error, dict):
+            detail = str(
+                daemon_error.get("message")
+                or "Paseo daemon operation failed"
+            )
+            raise RuntimeAdapterError(
+                str(daemon_error.get("code") or "PASEO_DAEMON_REQUEST_FAILED"),
+                detail,
+                failure_class=self.classify_failure(
+                    detail,
+                    default=failure_class,
+                ),
+            )
+        return response
+
     @staticmethod
     def classify_failure(message: str, *, default: str = "transient") -> str:
         lowered = message.casefold()
@@ -1787,6 +2055,7 @@ class PaseoCliClient:
         args: list[str],
         *,
         failure_class: str = "transient",
+        cwd: Path | None = None,
     ) -> Any:
         try:
             result = subprocess.run(
@@ -1795,6 +2064,7 @@ class PaseoCliClient:
                 text=True,
                 encoding="utf-8",
                 env=self._command_environment,
+                cwd=cwd,
             )
         except OSError as error:
             self._raise_process_start_error(
@@ -2264,6 +2534,101 @@ class PaseoCliClient:
 
     def archive(self, agent_id: str) -> None:
         self._run(["archive", agent_id, "--json"])
+
+    def list_worktrees(
+        self,
+        repository_path: str,
+    ) -> tuple[dict[str, Any], ...]:
+        repository = Path(repository_path).resolve()
+        payload = self._run_daemon_request(
+            "list",
+            {"repoRoot": str(repository)},
+            failure_class="ambiguous",
+        )
+        values = payload.get("worktrees") if isinstance(payload, dict) else None
+        if not isinstance(values, list):
+            raise RuntimeAdapterError(
+                "PASEO_WORKTREE_READBACK_INVALID",
+                "Paseo worktree listing is not an object with worktrees",
+                failure_class="ambiguous",
+            )
+        records: list[dict[str, Any]] = []
+        for value in values:
+            if not isinstance(value, dict):
+                raise RuntimeAdapterError(
+                    "PASEO_WORKTREE_READBACK_INVALID",
+                    "Paseo worktree listing contains an invalid record",
+                    failure_class="ambiguous",
+                )
+            path = (
+                value.get("worktreePath")
+                or value.get("path")
+                or value.get("Path")
+            )
+            head = value.get("head") or value.get("Head")
+            branch = (
+                value.get("branchName")
+                or value.get("BranchName")
+                or value.get("branch")
+                or value.get("Branch")
+            )
+            native_name = (
+                value.get("name")
+                or value.get("Name")
+                or value.get("worktreeSlug")
+                or value.get("WorktreeSlug")
+            )
+            if not isinstance(path, str) or not path:
+                raise RuntimeAdapterError(
+                    "PASEO_WORKTREE_READBACK_INVALID",
+                    "Paseo worktree record omitted its canonical path",
+                    failure_class="ambiguous",
+                )
+            if native_name is None:
+                native_name = Path(path).name
+            records.append(
+                {
+                    "path": path,
+                    "head": head,
+                    "branch_name": branch,
+                    "native_name": native_name,
+                }
+            )
+        return tuple(records)
+
+    def archive_worktree(
+        self,
+        repository_path: str,
+        worktree_name: str,
+    ) -> None:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", worktree_name) is None:
+            raise RuntimeAdapterError(
+                "PASEO_WORKTREE_NAME_INVALID",
+                "Paseo worktree archive requires a name, not a path",
+            )
+        repository = Path(repository_path).resolve()
+        matches = [
+            record
+            for record in self.list_worktrees(str(repository))
+            if record.get("native_name") == worktree_name
+        ]
+        if len(matches) != 1:
+            raise RuntimeAdapterError(
+                "PASEO_WORKTREE_IDENTITY_AMBIGUOUS",
+                "repository-bound Paseo readback did not identify one worktree",
+                failure_class="ambiguous",
+            )
+        record = matches[0]
+        self._run_daemon_request(
+            "archive",
+            {
+                "repoRoot": str(repository),
+                "worktreePath": str(Path(str(record["path"])).resolve()),
+                "branchName": record.get("branch_name"),
+                "scope": "worktree",
+            },
+            failure_class="ambiguous",
+        )
 
     def capabilities(self, provider: str) -> ProviderCapabilities:
         """Fresh capability readback for one canonical Paseo provider."""
@@ -4017,14 +4382,170 @@ class PaseoRuntimeAdapter:
             findings=tuple(normalized),
         )
 
-    def retire_review_axis(self, binding: ReviewAxisBinding) -> None:
-        self.client.archive(binding.agent_id)
-        if not self.client.inspect(binding.agent_id).archived:
-            raise RuntimeAdapterError(
-                "REVIEW_AXIS_RETIRE_READBACK_FAILED",
-                "Review child did not read back retired",
-                failure_class="ambiguous",
+    def retire_review_after_evidence(
+        self,
+        binding: ReviewAxisBinding,
+        authorization: ReviewRetirementAuthorization,
+    ) -> ReviewRetirementReadback:
+        from .retirement import (
+            RetirementError,
+            WorktreeRegistration,
+            _registered_worktrees,
+            assert_review_authorization_matches,
+            delete_temporary_branch_cas,
+            resolve_native_worktree_name,
+            review_retirement_readback,
+            validate_disposable_review_worktree,
+        )
+
+        try:
+            assert_review_authorization_matches(binding, authorization)
+            repository = Path(
+                self.client.inspect(authorization.parent_agent_id).labels.get(
+                    "gwo.repository_path",
+                    "",
+                )
+            ).resolve()
+            parent = self.client.inspect(authorization.parent_agent_id)
+            if (
+                parent.agent_id != authorization.parent_agent_id
+                or parent.workspace_id != authorization.parent_workspace_id
+                or parent.labels.get("gwo.repository")
+                != authorization.repository
+                or parent.labels.get("gwo.plan") != authorization.plan_digest
+                or parent.labels.get("gwo.node") != authorization.node_key
+                or parent.labels.get("gwo.admission")
+                != authorization.admission_id
+                or parent.labels.get("gwo.attempt")
+                != authorization.attempt_id
+                or not repository.is_dir()
+            ):
+                raise RetirementError(
+                    "REVIEW_RETIREMENT_PARENT_IDENTITY_MISMATCH",
+                    "Review parent readback does not own the authorization",
+                )
+            agent = self.client.inspect(binding.agent_id)
+            expected_labels = {
+                "gwo.action_key": authorization.action_key,
+                "gwo.repository": authorization.repository,
+                "gwo.review_attempt": authorization.attempt_id,
+                "gwo.review_candidate": authorization.candidate_sha,
+                "gwo.review_axis": authorization.axis,
+                "gwo.parent_agent": authorization.parent_agent_id,
+            }
+            if (
+                agent.agent_id != binding.agent_id
+                or agent.session_id != binding.session_id
+                or agent.workspace_id != binding.workspace_id
+                or Path(agent.workspace).resolve()
+                != Path(binding.workspace).resolve()
+                or any(
+                    agent.labels.get(key) != value
+                    for key, value in expected_labels.items()
+                )
+            ):
+                raise RetirementError(
+                    "REVIEW_RETIREMENT_OWNERSHIP_MISMATCH",
+                    "Review child readback does not own the authorization",
+                )
+            workspace = Path(binding.workspace).resolve()
+            if workspace == repository:
+                raise RetirementError(
+                    "REVIEW_RETIREMENT_STABLE_WORKSPACE",
+                    "Coordinator and Integration workspaces are never disposable",
+                )
+            active_agents = self.client.find_by_labels({})
+            shared = any(
+                item.agent_id != binding.agent_id
+                and (
+                    item.workspace_id == binding.workspace_id
+                    or Path(item.workspace).resolve() == workspace
+                )
+                for item in active_agents
             )
+            registrations = _registered_worktrees(repository)
+            registration = registrations.get(workspace)
+            if shared:
+                if registration is None or not workspace.exists():
+                    raise RetirementError(
+                        "REVIEW_RETIREMENT_SHARED_READBACK_MISMATCH",
+                        "shared Review workspace is not present at readback",
+                    )
+                if not agent.archived:
+                    self.client.archive(binding.agent_id)
+                return review_retirement_readback(
+                    authorization=authorization,
+                    workspace_disposition="shared_preserved",
+                    agent_archived=self.client.inspect(binding.agent_id).archived,
+                    directory_absent=not workspace.exists(),
+                    worktree_absent=(
+                        workspace not in _registered_worktrees(repository)
+                    ),
+                    branch_deleted=False,
+                )
+
+            if workspace.exists() or registration is not None:
+                registration = validate_disposable_review_worktree(
+                    repository=repository,
+                    workspace=workspace,
+                    authorization=authorization,
+                )
+            native_name = None
+            if registration is not None:
+                native_name = resolve_native_worktree_name(
+                    workspace=workspace,
+                    candidate_sha=authorization.candidate_sha,
+                    temporary_branch=authorization.temporary_branch,
+                    worktrees=self.client.list_worktrees(str(repository)),
+                )
+            if not agent.archived:
+                self.client.archive(binding.agent_id)
+            if registration is not None:
+                assert native_name is not None
+                self.client.archive_worktree(str(repository), native_name)
+                delete_temporary_branch_cas(
+                    repository,
+                    registration,
+                    candidate_sha=authorization.candidate_sha,
+                )
+            elif authorization.temporary_branch is not None:
+                delete_temporary_branch_cas(
+                    repository,
+                    WorktreeRegistration(
+                        head=authorization.candidate_sha,
+                        branch=authorization.temporary_branch,
+                    ),
+                    candidate_sha=authorization.candidate_sha,
+                )
+            _git(repository, "worktree", "prune")
+            branch_deleted = (
+                authorization.temporary_branch is None
+                or _run(
+                    [
+                        "git",
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        f"refs/heads/{authorization.temporary_branch}",
+                    ],
+                    cwd=repository,
+                ).returncode
+                != 0
+            )
+            return review_retirement_readback(
+                authorization=authorization,
+                workspace_disposition="disposable_removed",
+                agent_archived=self.client.inspect(binding.agent_id).archived,
+                directory_absent=not workspace.exists(),
+                worktree_absent=workspace not in _registered_worktrees(repository),
+                branch_deleted=branch_deleted,
+            )
+        except RetirementError as error:
+            raise RuntimeAdapterError(
+                error.code,
+                error.detail,
+                failure_class="ambiguous",
+            ) from error
 
     def interrupt(self, binding: RuntimeBinding) -> None:
         if binding.agent_id is None:
@@ -4041,20 +4562,164 @@ class PaseoRuntimeAdapter:
                 failure_class="ambiguous",
             )
 
-    def retire(self, binding: RuntimeBinding) -> None:
-        if binding.agent_id is None:
-            raise RuntimeAdapterError(
-                "RUNTIME_BINDING_UNKNOWN",
-                "Paseo Binding has no Agent identity",
-                failure_class="ambiguous",
+    def retire_after_integration(
+        self,
+        binding: RuntimeBinding,
+        authorization: RetirementAuthorization,
+    ) -> RetirementReadback:
+        from .retirement import (
+            RetirementError,
+            WorktreeRegistration,
+            _registered_worktrees,
+            assert_authorization_matches,
+            delete_temporary_branch_cas,
+            read_retirement_completion,
+            resolve_native_worktree_name,
+            validate_disposable_worktree,
+        )
+
+        try:
+            assert_authorization_matches(binding, authorization)
+            if binding.agent_id is None or binding.workspace_id is None:
+                raise RetirementError(
+                    "RETIREMENT_BINDING_INCOMPLETE",
+                    "Paseo retirement requires Agent and Workspace identity",
+                )
+            agent = self.client.inspect(binding.agent_id)
+            if (
+                agent.agent_id != binding.agent_id
+                or agent.session_id != binding.session_id
+                or agent.workspace_id != binding.workspace_id
+                or Path(agent.workspace).resolve() != Path(binding.workspace).resolve()
+                or any(
+                    agent.labels.get(key) != value
+                    for key, value in self._binding_labels(binding).items()
+                )
+            ):
+                raise RetirementError(
+                    "RETIREMENT_OWNERSHIP_MISMATCH",
+                    "Paseo readback does not own the authorized Runtime Binding",
+                )
+            active_agents = self.client.find_by_labels({})
+            if any(
+                item.agent_id != binding.agent_id
+                and (
+                    item.workspace_id == binding.workspace_id
+                    or Path(item.workspace).resolve()
+                    == Path(binding.workspace).resolve()
+                )
+                for item in active_agents
+            ):
+                raise RetirementError(
+                    "RETIREMENT_SHARED_WORKSPACE",
+                    "another active Agent shares the Candidate workspace",
+                )
+
+            repository = Path(binding.repository_path).resolve()
+            workspace = Path(binding.workspace).resolve()
+            registrations = _registered_worktrees(repository)
+            registration = registrations.get(workspace)
+            if workspace.exists() or registration is not None:
+                registration = validate_disposable_worktree(
+                    binding=binding,
+                    authorization=authorization,
+                )
+            native_name = None
+            if registration is not None:
+                native_name = resolve_native_worktree_name(
+                    workspace=workspace,
+                    candidate_sha=authorization.candidate_sha,
+                    temporary_branch=authorization.temporary_branch,
+                    worktrees=self.client.list_worktrees(
+                        binding.repository_path,
+                    ),
+                )
+            if not agent.archived:
+                self.client.archive(binding.agent_id)
+            agent_archived = self.client.inspect(binding.agent_id).archived
+            if registration is not None:
+                assert native_name is not None
+                self.client.archive_worktree(
+                    binding.repository_path,
+                    native_name,
+                )
+                delete_temporary_branch_cas(
+                    repository,
+                    registration,
+                    candidate_sha=authorization.candidate_sha,
+                )
+            elif authorization.temporary_branch is not None:
+                temporary_branch = authorization.temporary_branch
+                if (
+                    temporary_branch == authorization.target_branch
+                    or not temporary_branch.startswith(("gwo/", "gwo-"))
+                ):
+                    raise RetirementError(
+                        "RETIREMENT_STABLE_WORKSPACE",
+                        "authorization does not bind a GWO temporary branch",
+                    )
+                branch_ref = f"refs/heads/{temporary_branch}"
+                branch = _run(
+                    ["git", "rev-parse", "--verify", branch_ref],
+                    cwd=repository,
+                )
+                if branch.returncode == 0:
+                    if branch.stdout.strip() != authorization.candidate_sha:
+                        raise RetirementError(
+                            "RETIREMENT_BRANCH_CAS_MISMATCH",
+                            "temporary branch moved after partial retirement",
+                        )
+                    delete_temporary_branch_cas(
+                        repository,
+                        WorktreeRegistration(
+                            head=authorization.candidate_sha,
+                            branch=temporary_branch,
+                        ),
+                        candidate_sha=authorization.candidate_sha,
+                    )
+            _git(repository, "worktree", "prune")
+            if registration is None:
+                branch_deleted = (
+                    authorization.temporary_branch is None
+                    or _run(
+                        [
+                            "git",
+                            "show-ref",
+                            "--verify",
+                            "--quiet",
+                            f"refs/heads/{authorization.temporary_branch}",
+                        ],
+                        cwd=repository,
+                    ).returncode
+                    != 0
+                )
+            else:
+                branch_deleted = (
+                    registration.branch is None
+                    or _run(
+                        [
+                            "git",
+                            "show-ref",
+                            "--verify",
+                            "--quiet",
+                            f"refs/heads/{registration.branch}",
+                        ],
+                        cwd=repository,
+                    ).returncode
+                    != 0
+                )
+            return read_retirement_completion(
+                binding=binding,
+                authorization=authorization,
+                agent_archived=agent_archived,
+                branch_deleted=branch_deleted,
             )
-        self.client.archive(binding.agent_id)
-        if not self.client.inspect(binding.agent_id).archived:
+        except RetirementError as error:
             raise RuntimeAdapterError(
-                "RUNTIME_RETIRE_READBACK_FAILED",
-                "Paseo Agent did not read back retired",
+                error.code,
+                error.detail,
                 failure_class="ambiguous",
-            )
+            ) from error
 
 
 class InMemoryRuntimeAdapter:
@@ -4410,16 +5075,119 @@ class InMemoryRuntimeAdapter:
         )
         return claim, tuple(evidence)
 
-    def retire(self, binding: RuntimeBinding) -> None:
+    def retire_after_integration(
+        self,
+        binding: RuntimeBinding,
+        authorization: RetirementAuthorization,
+    ) -> RetirementReadback:
+        from .retirement import (
+            RetirementError,
+            WorktreeRegistration,
+            assert_authorization_matches,
+            delete_temporary_branch_cas,
+            read_retirement_completion,
+            validate_disposable_worktree,
+        )
+
         state = self._states.get(binding.admission_id)
         if state is None:
-            return
+            try:
+                assert_authorization_matches(binding, authorization)
+                repository = Path(binding.repository_path).resolve()
+                workspace = Path(binding.workspace).resolve()
+                if workspace.exists():
+                    raise RetirementError(
+                        "RUNTIME_IDENTITY_MISMATCH",
+                        "retirement state is absent while its workspace remains",
+                    )
+                branch_deleted = (
+                    authorization.temporary_branch is None
+                    or _run(
+                        [
+                            "git",
+                            "show-ref",
+                            "--verify",
+                            "--quiet",
+                            f"refs/heads/{authorization.temporary_branch}",
+                        ],
+                        cwd=repository,
+                    ).returncode
+                    != 0
+                )
+                return read_retirement_completion(
+                    binding=binding,
+                    authorization=authorization,
+                    agent_archived=True,
+                    branch_deleted=branch_deleted,
+                )
+            except RetirementError as error:
+                raise RuntimeAdapterError(
+                    error.code,
+                    error.detail,
+                    failure_class="ambiguous",
+                ) from error
         if state.binding != binding:
             raise RuntimeAdapterError(
-                "RUNTIME_IDENTITY_MISMATCH", "refusing to retire another binding"
+                "RUNTIME_IDENTITY_MISMATCH",
+                "refusing to retire another binding",
+                failure_class="ambiguous",
             )
-        repository = Path(binding.repository_path)
-        workspace = Path(binding.workspace)
-        if workspace.exists():
-            _git(repository, "worktree", "remove", "--force", str(workspace))
-        self._states.pop(binding.admission_id, None)
+        try:
+            repository = Path(binding.repository_path).resolve()
+            workspace = Path(binding.workspace).resolve()
+            if workspace.exists():
+                registration = validate_disposable_worktree(
+                    binding=binding,
+                    authorization=authorization,
+                )
+                _git(repository, "worktree", "remove", "--force", str(workspace))
+                delete_temporary_branch_cas(
+                    repository,
+                    registration,
+                    candidate_sha=authorization.candidate_sha,
+                )
+            elif authorization.temporary_branch is not None:
+                branch_ref = f"refs/heads/{authorization.temporary_branch}"
+                branch = _run(
+                    ["git", "rev-parse", "--verify", branch_ref],
+                    cwd=repository,
+                )
+                if branch.returncode == 0:
+                    delete_temporary_branch_cas(
+                        repository,
+                        WorktreeRegistration(
+                            head=authorization.candidate_sha,
+                            branch=authorization.temporary_branch,
+                        ),
+                        candidate_sha=authorization.candidate_sha,
+                    )
+            _git(repository, "worktree", "prune")
+            branch_deleted = (
+                authorization.temporary_branch is None
+                or _run(
+                    [
+                        "git",
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        f"refs/heads/{authorization.temporary_branch}",
+                    ],
+                    cwd=repository,
+                ).returncode
+                != 0
+            )
+            self._states.pop(binding.admission_id, None)
+            return read_retirement_completion(
+                binding=binding,
+                authorization=authorization,
+                agent_archived=True,
+                branch_deleted=branch_deleted,
+            )
+        except Exception as error:
+            if isinstance(error, RetirementError):
+                raise RuntimeAdapterError(
+                    error.code,
+                    error.detail,
+                    failure_class="ambiguous",
+                ) from error
+            raise

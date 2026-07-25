@@ -724,6 +724,150 @@ def test_reconstruction_preserves_integration_batch_identity(tmp_path):
     assert {state["integrated_sha"] for state in states} == {"f" * 40}
 
 
+def _completed_review_retirements(node):
+    from gwo_v8.retirement import (
+        authorize_review_after_evidence,
+        completed_review_retirement,
+        review_retirement_readback,
+    )
+
+    review_evidence = next(
+        item for item in node.evidence if item.kind == "review"
+    )
+    records = {}
+    for child in node.review_children:
+        authorization = authorize_review_after_evidence(
+            worker_binding=node.runtime_binding,
+            review_binding=child.binding,
+            review_evidence=review_evidence,
+        )
+        readback = review_retirement_readback(
+            authorization=authorization,
+            workspace_disposition="shared_preserved",
+            agent_archived=True,
+            directory_absent=False,
+            worktree_absent=False,
+            branch_deleted=False,
+        )
+        records[f"{child.binding.axis}:{child.recovery_ordinal}"] = (
+            completed_review_retirement(authorization, readback)
+        )
+    return records
+
+
+def test_reconstruction_does_not_trust_review_children_retired_without_records(
+    tmp_path,
+):
+    compiled, durable = _durable_readback(
+        tmp_path,
+        count=1,
+        reviewed=frozenset({1}),
+    )
+    node = replace(
+        _node(compiled, 1),
+        review_children_retired=True,
+        review_retirements={},
+    )
+
+    result = StoreReconstructor().reconstruct(
+        AuthoritativeRepositoryReadback.from_durable(
+            durable,
+            compiled.repository,
+            nodes=(node,),
+        ),
+        tmp_path / "forged-review-retired-bool.sqlite3",
+    )
+
+    assert "REVIEW_RETIREMENT_READBACK_CONTRADICTION" in result.blockers
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    (
+        "absolute_path",
+        "identity_mismatch",
+        "complete_without_readback",
+    ),
+)
+def test_reconstruction_rejects_forged_review_retirement_records(
+    tmp_path,
+    forgery,
+):
+    compiled, durable = _durable_readback(
+        tmp_path,
+        count=1,
+        reviewed=frozenset({1}),
+    )
+    original = _node(compiled, 1)
+    records = _completed_review_retirements(original)
+    axis_key = sorted(records)[0]
+    forged = json.loads(json.dumps(records))
+    authorization = forged[axis_key]["authorization"]
+    if forgery == "absolute_path":
+        authorization["workspace"] = str(ROOT.resolve())
+    elif forgery == "identity_mismatch":
+        authorization["agent_id"] = "review-agent:forged"
+        identity = {
+            key: value
+            for key, value in authorization.items()
+            if key != "authorization_digest"
+        }
+        authorization["authorization_digest"] = digest_value(identity)
+    else:
+        forged[axis_key]["evidence"] = None
+    node = replace(
+        original,
+        review_children_retired=True,
+        review_retirements=forged,
+    )
+
+    result = StoreReconstructor().reconstruct(
+        AuthoritativeRepositoryReadback.from_durable(
+            durable,
+            compiled.repository,
+            nodes=(node,),
+        ),
+        tmp_path / f"forged-review-retirement-{forgery}.sqlite3",
+    )
+
+    assert "REVIEW_RETIREMENT_READBACK_CONTRADICTION" in result.blockers
+
+
+def test_reconstruction_derives_review_children_retired_from_typed_records(
+    tmp_path,
+):
+    compiled, durable = _durable_readback(
+        tmp_path,
+        count=1,
+        reviewed=frozenset({1}),
+    )
+    original = _node(compiled, 1)
+    node = replace(
+        original,
+        review_children_retired=False,
+        review_retirements=_completed_review_retirements(original),
+    )
+    destination = tmp_path / "review-retirement-roundtrip.sqlite3"
+
+    result = StoreReconstructor().reconstruct(
+        AuthoritativeRepositoryReadback.from_durable(
+            durable,
+            compiled.repository,
+            nodes=(node,),
+        ),
+        destination,
+    )
+
+    assert result.status == "reconstructed", result.blockers
+    with sqlite3.connect(destination) as connection:
+        state = json.loads(
+            connection.execute(
+                "SELECT state_json FROM v8_node_execution_state"
+            ).fetchone()[0]
+        )
+    assert state["review_children_retired"] is True
+
+
 def test_reconstruction_preserves_publication_hosted_and_resume_progress(tmp_path):
     compiled = _compiled(1, hosted=True)
     durable = InMemoryDurablePlanControl()
@@ -942,6 +1086,86 @@ def test_review_recovery_child_keeps_its_action_and_provider_identity(tmp_path):
     assert (
         state["review_bindings"]["standards:1"]["action_key"]
         == recovered_binding.action_key
+    )
+
+
+def test_reconstruction_preserves_pending_retirement_authorization(tmp_path):
+    from gwo_v8._canonical import digest_value
+    from gwo_v8.retirement import RetirementAuthorization, pending_retirement
+
+    compiled, durable = _durable_readback(tmp_path, count=1)
+    node = _node(compiled, 1)
+    binding = node.runtime_binding
+    assert binding is not None
+    identity = {
+        "repository": compiled.repository,
+        "plan_digest": compiled.digest,
+        "node_key": node.node_key,
+        "admission_id": node.admission_id,
+        "attempt_id": node.attempt_id,
+        "agent_id": binding.agent_id,
+        "workspace_id": binding.workspace_id,
+        "candidate_sha": node.candidate_sha,
+        "integrated_sha": node.candidate_sha,
+        "target_branch": "main",
+        "temporary_branch": "gwo/reconstructed",
+    }
+    authorization = RetirementAuthorization(
+        **identity,
+        authorization_digest=digest_value(identity),
+    )
+    retirement = pending_retirement(authorization)
+    pending = replace(
+        node,
+        status="waiting",
+        directive="reconcile_again",
+        attempt_state="retirement_pending",
+        wait_condition="runtime_retirement",
+        wait_source_ref="paseo://retirement/pending",
+        integrated_sha=node.candidate_sha,
+        integration_source_ref=f"git://main/{node.candidate_sha}",
+        retirement=retirement,
+        retirement_state="pending",
+        last_retirement_error=None,
+    )
+    readback = AuthoritativeRepositoryReadback.from_durable(
+        durable,
+        compiled.repository,
+        nodes=(pending,),
+    )
+    destination = tmp_path / "retirement-reconstruction.sqlite3"
+
+    result = StoreReconstructor().reconstruct(readback, destination)
+
+    assert result.status == "reconstructed"
+    with sqlite3.connect(destination) as connection:
+        state = json.loads(
+            connection.execute(
+                "SELECT state_json FROM v8_node_execution_state"
+            ).fetchone()[0]
+        )
+    assert state["retirement"] == retirement
+    assert state["retirement_state"] == "pending"
+    assert state["attempt_state"] == "retirement_pending"
+
+    outcome = _kernel(destination, durable, tmp_path).reconcile_once(
+        compiled.repository
+    )
+
+    assert outcome.retirement_state == "error"
+    assert outcome.last_retirement_error == {
+        "code": "RUNTIME_IDENTITY_MISMATCH",
+        "failure_class": "ambiguous",
+    }
+    with sqlite3.connect(destination) as connection:
+        retried = json.loads(
+            connection.execute(
+                "SELECT state_json FROM v8_node_execution_state"
+            ).fetchone()[0]
+        )
+    assert (
+        retried["retirement"]["authorization"]
+        == retirement["authorization"]
     )
 
 

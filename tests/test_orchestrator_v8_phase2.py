@@ -852,8 +852,6 @@ def test_paseo_adapter_round_trips_identity_prompt_lifecycle_and_retirement(
     assert adapter.observe(binding).lifecycle == "idle"
     adapter.resume(binding)
     assert adapter.observe(binding).lifecycle == "running"
-    adapter.retire(binding)
-    assert adapter.read_binding(admission.admission_id) is None
 
 
 def test_paseo_adapter_reads_bounded_worker_result_and_git_head(tmp_path):

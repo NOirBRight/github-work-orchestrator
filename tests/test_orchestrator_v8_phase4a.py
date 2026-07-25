@@ -390,8 +390,17 @@ class _ReviewingInMemoryRuntime(InMemoryRuntimeAdapter):
             findings=(),
         )
 
-    def retire_review_axis(self, _binding):
-        return None
+    def retire_review_after_evidence(self, _binding, authorization):
+        from gwo_v8.retirement import review_retirement_readback
+
+        return review_retirement_readback(
+            authorization=authorization,
+            workspace_disposition="shared_preserved",
+            agent_archived=True,
+            directory_absent=False,
+            worktree_absent=False,
+            branch_deleted=False,
+        )
 
 
 class _ReviewMaterializationRecoveryRuntime(_ReviewingInMemoryRuntime):
@@ -767,6 +776,7 @@ def test_changed_candidate_review_axis_materialization_reset_clears_all_axis_sta
         "review_axis_errors": {},
         "review_materialization_waiting_actions": [],
         "review_children_retired": False,
+        "review_retirements": {},
         "review_evidence": None,
         "review_gate_status": None,
         "review_check_manifest_digest": None,

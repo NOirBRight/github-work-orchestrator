@@ -3794,7 +3794,9 @@ def test_dual_axis_review_blockers_produce_exact_restart_stable_repair_prompt(
     assert escalating.directive == "run_again"
     assert escalating.attempt_ordinal == 2
     assert escalating.attempt_id is None
-    assert client.inspect(worker.agent_id).archived is True
+    assert client.inspect(worker.agent_id).archived is False
+    assert client.inspect(worker.agent_id).lifecycle == "idle"
+    assert workspace.exists()
 
     frontier_waiting = restarted_kernel.reconcile_once("local/phase-three")
     frontier = client.find_by_labels({"gwo.admission": frontier_waiting.admission_id})[

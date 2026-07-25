@@ -401,9 +401,6 @@ def test_in_memory_runtime_observes_candidate_and_local_check(tmp_path):
         .status
         == "rejected"
     )
-    runtime.retire(binding)
-
-
 def test_reconcile_once_completes_the_single_node_walking_skeleton(tmp_path):
     repository = _temporary_repository(tmp_path)
     store_path = tmp_path / "v8.sqlite3"

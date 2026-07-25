@@ -106,8 +106,11 @@ Scope:
 
 - Implement the production Paseo Adapter for the capabilities V8.0 actually
   needs: idempotent create/adopt, identity round-trip, Prompt acceptance,
-  lifecycle and turn readback, resume, safe interrupt, and read-backed
-  retirement.
+  lifecycle and turn readback, resume, safe interrupt, and Kernel-authorized
+  read-backed retirement through the single `retire_after_integration` seam.
+  Resolve native archive names from Paseo worktree-list canonical-path
+  readback rather than treating `wks_*` Workspace IDs as names. Follow
+  ADR-0041 for retirement-gated Goal completion and typed Reviewer retirement.
 - Publish `/implement-gwo` as the V8 execution entry for one ready ticket, a
   parent Goal/spec, or an explicit ready set. Keep `/orchestrator` as a
   compatibility alias for this release only; leave Matt `/implement`
@@ -139,6 +142,8 @@ Exit criteria:
 - external waiting consumes no LLM turn.
 - an unready `/implement-gwo` input fails closed with the correct planning or
   triage next action and never falls back to plain `/implement`.
+- `batch_ready`, Review/CI wait, supersession, and failure only park or
+  interrupt; they never archive or delete a Candidate workspace.
 
 ## Phase 3 — Local-first delivery, review, and bounded recovery
 
@@ -162,6 +167,10 @@ Scope:
   them into one immutable Integration Batch, push that Batch SHA once, and run
   hosted CI once against it. Retry only classified infrastructure failure, at
   most two retries after the initial run.
+- After exact Integration readback, retire every member Runtime through
+  `Agent archive -> native Paseo worktree archive -> exact branch CAS/prune ->
+  three-part readback`. Persist typed pending/error state across partial
+  failure, and complete the Goal only after all member retirements complete.
 - Publish local Review and compact Check Evidence after the candidate becomes
   durable; do not repeat the analysis merely to publish it.
 - Compile `review_requirement` into Candidate-bearing Work Node output
