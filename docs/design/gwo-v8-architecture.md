@@ -301,7 +301,10 @@ V8.0 defines only the Paseo-shaped capabilities it actually consumes:
   identity round-trip;
 - Prompt acceptance and readback;
 - lifecycle and active-turn observation;
-- resumable session, safe interrupt, and read-backed retirement;
+- resumable session and safe interrupt;
+- one `retire_after_integration` destructive seam that consumes a
+  digest-bound Kernel authorization and performs read-backed Agent, worktree,
+  temporary-branch, and prune retirement;
 - explicit and classifiable errors.
 
 Capacity, permission, token, and event observations are optional when Paseo
@@ -635,6 +638,11 @@ internal edit and narrow diagnostic loop
   -> first and only push of that Batch SHA
   -> one exact-Batch-SHA hosted CI
   -> one serial target-branch fast-forward
+  -> exact Integration readback for every member Candidate
+  -> Agent archive
+  -> native Paseo worktree archive by parsed name
+  -> exact temporary-branch CAS deletion and worktree prune
+  -> Agent/directory/Git-worktree readback complete
 ```
 
 Publication eligibility is a predicate, not a lifecycle entity. It requires
@@ -655,6 +663,24 @@ content-derived ref so retry is readback-first and idempotent. It is not a
 PlanSpec node, Agent, Admission, Attempt, Result, or second state machine. The
 existing per-Work-Item Integration Nodes remain the acceptance graph; one
 Batch Evidence record may satisfy several of them.
+
+`batch_ready`, hosted-CI wait, Review wait, supersession, and Attempt failure
+only interrupt or park a Runtime Binding. They never archive an Agent or delete
+its Candidate workspace. After exact target-branch readback, the Kernel issues
+one authorization bound to repository, Plan Revision, Node Key, Admission,
+Attempt, Agent, Workspace, Candidate SHA, integrated SHA, target branch, and
+the read-back temporary branch. Each member Candidate may differ from the
+combined Batch SHA, but must be its ancestor.
+
+The Runtime Adapter validates authorization digest, ownership, exact
+worktree registration, clean status, Candidate HEAD, target head, ancestry,
+non-shared/non-stable workspace identity, and the native Paseo worktree name.
+It then archives the Agent, runs `paseo worktree archive <name> --json`, CAS
+deletes only the authorized temporary branch, prunes, and reads back Agent
+archived, directory absent, and Git worktree registration absent. Partial
+success persists as typed `pending` or `error` retirement state and the next
+Kernel reconciliation retries idempotently. Review children that share a
+Candidate workspace retire only their Agent identity.
 
 The Worker Prompt is a role projection: it exposes implementation authority and
 only affected diagnostics, while the frozen full output contract remains with
@@ -794,6 +820,11 @@ Evidence/Result acceptance, and destructive Runtime retirement. Workers may
 edit and commit locally, produce Artifacts and Result Claims, run checks, and
 request first candidate publication under their Effect Contract.
 
+Retirement Evidence is bounded and contains stable Agent, Workspace,
+Candidate, Integration, target-branch, authorization, and boolean readback
+identity only. Absolute workspace and repository paths remain host-local and
+never enter durable GitHub records.
+
 ## V6.1 transition
 
 V7 is not a migration source.
@@ -848,6 +879,9 @@ claims and Runtime resources before another writer generation starts.
 - A Plan Node accepts at most one Result.
 - Valid Evidence is reused rather than rerun by role.
 - Target-branch Integration is serialized.
+- No Runtime Agent or worktree is archived before exact Integration readback.
+- A Work Item and Goal are not complete until every integrated Batch member
+  has complete Runtime retirement readback.
 - Time passage alone never proves failure, completion, or safe cleanup.
 - A ready compatible frontier fills bounded configured and observed capacity
   in one pass.

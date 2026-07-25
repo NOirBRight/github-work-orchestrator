@@ -28,6 +28,14 @@ from .integration_batch import (
     IntegrationBatchMember,
 )
 from .review_convergence import ReviewConvergence, ReviewConvergenceError
+from .retirement import (
+    RetirementAuthorization,
+    RetirementError,
+    authorize_after_integration,
+    completed_retirement,
+    failed_retirement,
+    pending_retirement,
+)
 from .runtime import (
     RuntimeAdapter,
     RuntimeAdapterError,
@@ -1121,6 +1129,8 @@ class ReconcileOutcome:
     hosted_retry_count: int = 0
     integration_batch_id: str | None = None
     integration_batch_sha: str | None = None
+    retirement_state: str | None = None
+    last_retirement_error: dict[str, str] | None = None
     admitted_node_keys: tuple[str, ...] = field(default=(), compare=False)
     active_worker_turns: int = 0
     worker_turn_capacity: int = 1
@@ -1881,7 +1891,7 @@ class Kernel:
                 "SUPERSESSION_RUNTIME_UNREADABLE",
                 "Runtime must be read back before supersession releases claims",
             )
-        self.runtime.retire(binding)
+        self.runtime.interrupt(binding)
         state.update(
             {
                 "status": "superseded",
@@ -3082,6 +3092,9 @@ class Kernel:
             "hosted_retry_count": 0,
             "integration_batch_id": None,
             "integration_batch_sha": None,
+            "retirement": None,
+            "retirement_state": None,
+            "last_retirement_error": None,
             "materialization_executions": 0,
             "materialization_actions": {"create": 0, "prompt": 0},
             "wait_condition": None,
@@ -3499,6 +3512,7 @@ class Kernel:
         evidence_record = {
             **candidate_observation,
             "hosted_check_evidence": list(state.get("hosted_check_evidence") or ()),
+            "retirement": state.get("retirement"),
             "integration_batch": {
                 "batch_id": state.get("integration_batch_id"),
                 "batch_sha": state.get("integration_batch_sha"),
@@ -4636,7 +4650,7 @@ class Kernel:
                 work_node,
                 old_attempt_id=old_attempt_id,
             )
-            self.runtime.retire(binding)
+            self.runtime.interrupt(binding)
             return self._outcome(state)
         if directive.action == "block_runtime_unavailable":
             state.update(
@@ -4674,7 +4688,7 @@ class Kernel:
             }
         )
         self._mark_plan_node_failed(state)
-        self.runtime.retire(binding)
+        self.runtime.interrupt(binding)
         return self._outcome(state)
 
     @staticmethod
@@ -4823,6 +4837,127 @@ class Kernel:
     ) -> None:
         for state in states.values():
             self._write_state(repository, plan_digest, state)
+
+    @staticmethod
+    def _retirement_binding(state: dict[str, Any]) -> RuntimeBinding:
+        observation = state.get("candidate_observation")
+        value = (
+            observation.get("binding")
+            if isinstance(observation, dict)
+            else None
+        )
+        if not isinstance(value, dict):
+            raise KernelError(
+                "RETIREMENT_BINDING_MISSING",
+                "integrated Candidate has no persisted Runtime Binding",
+            )
+        try:
+            return RuntimeBinding(**value)
+        except TypeError as error:
+            raise KernelError(
+                "RETIREMENT_BINDING_INVALID",
+                "persisted Runtime Binding cannot be reconstructed",
+            ) from error
+
+    def _reconcile_retirements(
+        self,
+        repository: str,
+        *,
+        plan_digest: str,
+    ) -> None:
+        states = self._read_states(repository, plan_digest)
+        for state in states:
+            record = state.get("retirement")
+            if (
+                not isinstance(record, dict)
+                or record.get("state") not in {"pending", "error"}
+            ):
+                continue
+            authorization_value = record.get("authorization")
+            if not isinstance(authorization_value, dict):
+                raise KernelError(
+                    "RETIREMENT_AUTHORIZATION_MISSING",
+                    "pending retirement has no exact authorization",
+                )
+            try:
+                authorization = RetirementAuthorization(**authorization_value)
+                authorization.assert_valid_digest()
+                binding = self._retirement_binding(state)
+                readback = self.runtime.retire_after_integration(
+                    binding,
+                    authorization,
+                )
+                completed = completed_retirement(authorization, readback)
+            except RuntimeAdapterError as error:
+                failed = failed_retirement(
+                    authorization,
+                    code=error.code,
+                    failure_class=error.failure_class,
+                )
+                state.update(
+                    {
+                        "status": "waiting",
+                        "directive": "reconcile_again",
+                        "goal_state": "active",
+                        "attempt_state": "retirement_pending",
+                        "retirement": failed,
+                        "retirement_state": "error",
+                        "last_retirement_error": failed["error"],
+                        "wait_condition": "runtime_retirement",
+                        "wait_source_ref": (
+                            f"{self.runtime.adapter_name}://retirement/"
+                            f"{authorization.authorization_digest}"
+                        ),
+                        "wait_event_identity": (
+                            "runtime-retirement:"
+                            f"{authorization.authorization_digest[:24]}"
+                        ),
+                        "next_check_at": (
+                            datetime.now(timezone.utc) + timedelta(seconds=30)
+                        ).isoformat(),
+                    }
+                )
+                self._write_state(repository, plan_digest, state)
+                continue
+            except RetirementError as error:
+                raise KernelError(error.code, error.detail) from error
+            state.update(
+                {
+                    "status": "complete",
+                    "directive": "goal_complete",
+                    "work_item_state": "integrated",
+                    "attempt_state": "verified",
+                    "retirement": completed,
+                    "retirement_state": "complete",
+                    "last_retirement_error": None,
+                    "wait_condition": None,
+                    "wait_source_ref": None,
+                    "wait_event_identity": None,
+                    "next_check_at": None,
+                }
+            )
+            self._record_verified_result(
+                state,
+                candidate_sha=str(state["candidate_sha"]),
+                result_digest=str(state["result_digest"]),
+            )
+            self._write_state(repository, plan_digest, state)
+
+        reconciled = self._read_states(repository, plan_digest)
+        goal_keys = {
+            str(state["goal_key"])
+            for state in reconciled
+            if isinstance(state.get("goal_key"), str)
+        }
+        for goal_key in goal_keys:
+            members = [
+                state for state in reconciled if state.get("goal_key") == goal_key
+            ]
+            if members and all(state.get("status") == "complete" for state in members):
+                for state in members:
+                    if state.get("goal_state") != "completed":
+                        state["goal_state"] = "completed"
+                        self._write_state(repository, plan_digest, state)
 
     def _advance_integration_batch(
         self,
@@ -5431,6 +5566,16 @@ class Kernel:
                     "Integration branch did not reach the Batch SHA",
                 )
             for state in member_states.values():
+                binding = self._retirement_binding(state)
+                try:
+                    authorization = authorize_after_integration(
+                        binding=binding,
+                        candidate_sha=str(state["candidate_sha"]),
+                        integrated_sha=integrated_sha,
+                        target_branch=self.integration_branch,
+                    )
+                except RetirementError as error:
+                    raise KernelError(error.code, error.detail) from error
                 integration_evidence = TypedEvidence._capture(
                     kind="integration",
                     subject=integrated_sha,
@@ -5452,15 +5597,23 @@ class Kernel:
                 )
                 state.update(
                     {
-                        "status": "complete",
-                        "directive": "goal_complete",
-                        "goal_state": "completed",
+                        "status": "waiting",
+                        "directive": "reconcile_again",
+                        "goal_state": "active",
                         "work_item_state": "integrated",
-                        "attempt_state": "verified",
-                        "wait_condition": None,
-                        "wait_source_ref": None,
-                        "wait_event_identity": None,
-                        "next_check_at": None,
+                        "attempt_state": "retirement_pending",
+                        "wait_condition": "runtime_retirement",
+                        "wait_source_ref": (
+                            f"{self.runtime.adapter_name}://retirement/"
+                            f"{authorization.authorization_digest}"
+                        ),
+                        "wait_event_identity": (
+                            "runtime-retirement:"
+                            f"{authorization.authorization_digest[:24]}"
+                        ),
+                        "next_check_at": (
+                            datetime.now(timezone.utc) + timedelta(seconds=1)
+                        ).isoformat(),
                         "hosted_check_state": (
                             "passed" if hosted_definitions else None
                         ),
@@ -5472,6 +5625,9 @@ class Kernel:
                             integration_evidence.content_digest
                         ),
                         "integration_evidence": asdict(integration_evidence),
+                        "retirement": pending_retirement(authorization),
+                        "retirement_state": "pending",
+                        "last_retirement_error": None,
                     }
                 )
                 self._record_verified_result(
@@ -5524,6 +5680,7 @@ class Kernel:
         if state is not None and state.get("attempt_state") in {
             "batch_ready",
             "batch_wait",
+            "retirement_pending",
         }:
             return self._outcome(state)
         if state is not None and (
@@ -5897,7 +6054,7 @@ class Kernel:
             }
         )
         self._release_attempt_claims(state)
-        self.runtime.retire(binding)
+        self.runtime.interrupt(binding)
         self._write_state(repository, active.plan_digest, state)
         return self._outcome(state)
 
@@ -6031,6 +6188,10 @@ class Kernel:
             repository,
             active=active,
             units=units,
+        )
+        self._reconcile_retirements(
+            repository,
+            plan_digest=active.plan_digest,
         )
         outcomes = tuple(
             self._outcome(state)

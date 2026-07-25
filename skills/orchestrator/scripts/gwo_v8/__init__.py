@@ -101,6 +101,12 @@ from .integration_batch import (
     IntegrationBatchError,
     IntegrationBatchMember,
 )
+from .retirement import (
+    RetirementAuthorization,
+    RetirementError,
+    RetirementReadback,
+    authorize_after_integration,
+)
 from .reconstruction import (
     AuthoritativeNodeReadback,
     AuthoritativeRepositoryReadback,
@@ -222,6 +228,9 @@ __all__ = [
     "RecoveryDirective",
     "RecoveryLadder",
     "ReviewChildReadback",
+    "RetirementAuthorization",
+    "RetirementError",
+    "RetirementReadback",
     "PublishedPlan",
     "ProposedShadowAction",
     "ReconstructionResult",
@@ -247,6 +256,7 @@ __all__ = [
     "WriterTransitionRecord",
     "WriterAuthorityControl",
     "resolve_active_turn_pools",
+    "authorize_after_integration",
     "resolve_review_profile",
     "resolve_worker_profile",
     "ReconcileOutcome",

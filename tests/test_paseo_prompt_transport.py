@@ -11,7 +11,9 @@ import sys
 import pytest
 
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scripts"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "skills" / "orchestrator" / "scripts"
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SCRIPTS))
 
 from gwo_v8 import (  # noqa: E402

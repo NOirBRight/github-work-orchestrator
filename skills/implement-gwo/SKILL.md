@@ -37,7 +37,15 @@ never fall back to `/implement` or run those HITL commands automatically.
 5. Drive one `Kernel.reconcile_once` per host wake. Follow its typed directive:
    continue the Coordinator, wait on the named condition without an LLM turn,
    request a decision, run another mechanical pass, or finish.
-6. Continue until the Task Group Goal is verified complete or explicitly
+6. Keep `batch_ready`, Review/CI wait, superseded, and failed Runtime Bindings
+   parked or interrupted. Only after exact target-branch Integration readback
+   may the Kernel issue a bound retirement authorization. Reconcile
+   `Agent archive -> paseo worktree archive <name> --json -> exact temporary
+   branch CAS/prune -> Agent/path/Git-worktree readback`; retry typed
+   pending/error retirement idempotently.
+7. Continue until every in-scope Work Item is verified and every integrated
+   Batch member has complete Runtime retirement readback, or the Task Group
+   Goal is explicitly
    blocked. A Coordinator turn ending is not completion.
 
 The installed optional Skill named by a work Plan Node contributes Prompt
@@ -55,5 +63,7 @@ Effect Contract and output/Evidence contracts remain authoritative.
   readback before retry.
 - Do not poll Agents, treat token use as progress, or use elapsed time to fail,
   cancel, or replace work.
+- Never place absolute repository or worktree paths in durable retirement
+  Evidence.
 - Prefer a valid manually created Coordinator. Auto-create only from the
   configured `coordinator_auto` Role Profile when none is usable.
