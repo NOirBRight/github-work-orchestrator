@@ -5508,20 +5508,6 @@ class Kernel:
                 "wait_source_ref": None,
                 "wait_event_identity": None,
                 "next_check_at": None,
-                "review_check_manifest_digest": digest_value(
-                    {
-                        "candidate_sha": observation.result_claim.candidate_sha,
-                        "definitions": sorted(
-                            str(check.get("definition_digest"))
-                            for check in (work_node.get("output_contract") or {}).get(
-                                "checks"
-                            )
-                            or ()
-                            if isinstance(check, dict)
-                            and check.get("hosted_only") is not True
-                        ),
-                    }
-                ),
             }
         )
         self._persist_runtime_observation(state, observation)
@@ -5553,24 +5539,6 @@ class Kernel:
                     ),
                     cause_type="local_pre_review_failure",
                 )
-            affected_ids = {
-                str(check["check_id"])
-                for check in (work_node.get("output_contract") or {}).get("checks")
-                or ()
-                if isinstance(check, dict)
-                and check.get("suite") == "affected"
-                and check.get("hosted_only") is not True
-            }
-            state["review_check_manifest_digest"] = digest_value(
-                sorted(
-                    item.content_digest
-                    for item in observation.evidence
-                    if item.kind == "check"
-                    and item.payload.get("check_id") in affected_ids
-                    and item.has_valid_digest()
-                )
-            )
-            self._write_state(repository, active.plan_digest, state)
         try:
             review_decision = self._review_convergence.converge(
                 state,

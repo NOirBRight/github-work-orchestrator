@@ -421,10 +421,10 @@ class _HardFindingReviewRuntime(_ReviewingInMemoryRuntime):
         )
 
 
-def _review_materialization_kernel(tmp_path, runtime):
+def _review_materialization_kernel(tmp_path, runtime, *, risk="standard"):
     repository = _temporary_repository(tmp_path)
     intent, source, _policy = _multi_ready_inputs(count=1)
-    intent["nodes"][0]["risk"] = "standard"
+    intent["nodes"][0]["risk"] = risk
     policy = _local_first_policy(1)
     for definition in policy["check_definitions"]:
         if definition["hosted_only"] is not True:
@@ -676,6 +676,8 @@ def test_changed_candidate_review_axis_materialization_reset_clears_all_axis_sta
         ],
         "review_children_retired": True,
         "review_evidence": {"kind": "review"},
+        "review_gate_status": "accepted",
+        "review_check_manifest_digest": "f" * 64,
     }
 
     ReviewConvergence.invalidate_candidate(state)
@@ -689,6 +691,8 @@ def test_changed_candidate_review_axis_materialization_reset_clears_all_axis_sta
         "review_materialization_waiting_actions": [],
         "review_children_retired": False,
         "review_evidence": None,
+        "review_gate_status": None,
+        "review_check_manifest_digest": None,
     }
 
 
@@ -717,7 +721,40 @@ def test_hard_review_findings_return_typed_rejected_decision(tmp_path):
     assert first.wait_condition == "runtime_result"
 
 
+def test_strict_review_hard_findings_reject_before_human_decision(tmp_path):
+    runtime = _HardFindingReviewRuntime(tmp_path / "runtime")
+    kernel, compiled, work_node = _review_materialization_kernel(
+        tmp_path,
+        runtime,
+        risk="strict",
+    )
+    requirement = work_node["output_contract"]["review_requirement"]
+    assert requirement["mode"] == "strict"
+    assert requirement["human_decision_required"] is True
+    decisions = []
+    original_converge = kernel._review_convergence.converge
+
+    def recording_converge(*args, **kwargs):
+        decision = original_converge(*args, **kwargs)
+        decisions.append(decision)
+        return decision
+
+    kernel._review_convergence.converge = recording_converge
+
+    first = kernel.reconcile_once("local/phase-four-a")
+
+    assert [decision.status for decision in decisions] == ["rejected"]
+    assert decisions[0].findings
+    # A rejected gate never reaches the human approval wait; the normal
+    # Candidate Repair Round starts immediately.
+    assert first.status == "waiting"
+    assert first.directive == "wait_for_runtime"
+    assert first.attempt_state == "repairing"
+    assert first.wait_condition == "runtime_result"
+
+
 def test_review_convergence_is_one_deep_module_behind_kernel():
+    import inspect
     import typing
 
     from gwo_v8.review_convergence import (
@@ -737,6 +774,12 @@ def test_review_convergence_is_one_deep_module_behind_kernel():
     assert hasattr(ReviewConvergence, "invalidate_candidate")
     assert hasattr(ReviewConvergence, "initial_fields")
     assert hasattr(ReviewConvergence, "compact_review_contract")
+    initial_fields = ReviewConvergence.initial_fields()
+    assert initial_fields["review_gate_status"] is None
+    assert initial_fields["review_check_manifest_digest"] is None
+    kernel_source = inspect.getsource(Kernel)
+    assert "review_gate_status" not in kernel_source
+    assert "review_check_manifest_digest" not in kernel_source
     for moved in (
         "_ensure_review_evidence",
         "_review_request",

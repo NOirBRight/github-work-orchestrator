@@ -146,6 +146,8 @@ class ReviewConvergence:
             "review_materialization_waiting_actions": [],
             "review_children_retired": False,
             "review_evidence": None,
+            "review_gate_status": None,
+            "review_check_manifest_digest": None,
         }
 
     @staticmethod
@@ -430,6 +432,22 @@ class ReviewConvergence:
             "specialist_requirements": [],
             "human_decision_required": False,
         }
+        # The module owns the Review check manifest digest from seed to
+        # evidence-bound value; the Kernel never writes it.
+        state["review_check_manifest_digest"] = digest_value(
+            {
+                "candidate_sha": observation.result_claim.candidate_sha,
+                "definitions": sorted(
+                    str(check.get("definition_digest"))
+                    for check in (work_node.get("output_contract") or {}).get(
+                        "checks"
+                    )
+                    or ()
+                    if isinstance(check, dict)
+                    and check.get("hosted_only") is not True
+                ),
+            }
+        )
         if requirement.get("mode") == "none":
             return ReviewConvergenceDecision(
                 status="accepted",
@@ -457,6 +475,23 @@ class ReviewConvergence:
             self.invalidate_candidate(state)
             state.pop("last_runtime_error", None)
         state["review_candidate_sha"] = candidate_sha
+        affected_ids = {
+            str(check["check_id"])
+            for check in (work_node.get("output_contract") or {}).get("checks")
+            or ()
+            if isinstance(check, dict)
+            and check.get("suite") == "affected"
+            and check.get("hosted_only") is not True
+        }
+        state["review_check_manifest_digest"] = digest_value(
+            sorted(
+                item.content_digest
+                for item in observation.evidence
+                if item.kind == "check"
+                and item.payload.get("check_id") in affected_ids
+                and item.has_valid_digest()
+            )
+        )
         bindings = state.setdefault("review_bindings", {})
         observations = state.setdefault("review_observations", {})
         materialization_actions = state.setdefault(
@@ -997,6 +1032,19 @@ class ReviewConvergence:
                 )
             state["review_children_retired"] = True
             self._persist_state(state)
+        if gate.status == "rejected":
+            # A rejected gate is authoritative on its own; human approval is
+            # only relevant to an otherwise acceptable gate, so the typed
+            # rejection returns before any human wait or deny logic.
+            return ReviewConvergenceDecision(
+                status="rejected",
+                observation=replace(
+                    observation,
+                    evidence=observation.evidence + (gate.evidence,),
+                ),
+                capture_deferred_checks=True,
+                findings=gate.blockers,
+            )
         if requirement.get("human_decision_required") is True:
             decision = state.get("human_decision")
             if (
@@ -1051,25 +1099,17 @@ class ReviewConvergence:
             )
             state["human_decision_evidence"] = asdict(decision_evidence)
             self._persist_state(state)
-        enriched = replace(
-            observation,
-            evidence=observation.evidence
-            + (gate.evidence,)
-            + (
-                ()
-                if requirement.get("human_decision_required") is not True
-                else (decision_evidence,)
-            ),
-        )
-        if gate.status == "rejected":
-            return ReviewConvergenceDecision(
-                status="rejected",
-                observation=enriched,
-                capture_deferred_checks=True,
-                findings=gate.blockers,
-            )
         return ReviewConvergenceDecision(
             status="accepted",
-            observation=enriched,
+            observation=replace(
+                observation,
+                evidence=observation.evidence
+                + (gate.evidence,)
+                + (
+                    ()
+                    if requirement.get("human_decision_required") is not True
+                    else (decision_evidence,)
+                ),
+            ),
             capture_deferred_checks=True,
         )
