@@ -116,6 +116,89 @@ stores only Difficulty Tier; concrete runtimes never become repository truth.
 }
 ```
 
+## Runtime configuration ownership
+
+A repository request owns only its exact host-local
+`repositories["owner/repo"]` override. It must use
+`set-repository-runtime`; it must never translate repository preferences into
+top-level Worker tier or Role Profile changes. Top-level `tiers` and
+`role_profiles` are host-wide GLOBAL settings. They may change only when the
+user explicitly requests a host-wide update, through the separately named
+`set-global-runtime` command.
+
+Both mutation commands require `--patch`. The value is an inline JSON object;
+`@PATH` reads the object from a UTF-8 file and `-` reads it from standard input.
+A patch may contain only non-empty `tiers` and `role_profiles` maps:
+
+```json
+{
+  "tiers": {
+    "frontier": {
+      "provider": "codex",
+      "settings": {
+        "model": "gpt-5.6-sol",
+        "thinkingOptionId": "xhigh",
+        "modeId": "full-access",
+        "features": {}
+      }
+    }
+  },
+  "role_profiles": {
+    "reviewer_standard": {
+      "provider": "codex",
+      "settings": {
+        "model": "gpt-5.6-sol",
+        "thinkingOptionId": "high",
+        "modeId": "full-access",
+        "features": {}
+      }
+    }
+  }
+}
+```
+
+Each named entry is one complete replacement profile. Profiles do not
+deep-merge model fields: `provider`, `model`, `thinkingOptionId`, `modeId`,
+and `features` are all required. Unknown sections, unknown tier or role names,
+empty maps, incomplete profiles, non-JSON values, and patches larger than
+64 KiB are rejected before publication.
+
+Repository-scoped update:
+
+```text
+python <skill>/scripts/orch_config.py set-repository-runtime \
+  --repository owner/repo --patch @runtime-patch.json
+```
+
+This merges only the two allowed maps under
+`repositories["owner/repo"]`. GLOBAL settings, every other repository entry,
+and unrelated fields in the selected repository remain unchanged.
+
+Explicit host-wide update:
+
+```text
+python <skill>/scripts/orch_config.py set-global-runtime \
+  --patch @runtime-patch.json
+```
+
+This merges only the top-level `tiers` and `role_profiles` maps and preserves
+all repository entries. Neither command returns the configuration body. Its
+bounded JSON result names the scope and updated profiles and includes the
+published file digest.
+
+Explicit configuration commands serialize through one adjacent exclusive
+command lock. The command loads and validates the current file (or starts from
+the in-memory default when it is absent), applies the scoped merge, writes a
+unique adjacent temporary file, flushes and fsyncs it, validates an exact
+readback, and publishes with `os.replace`. Invalid input, lock contention,
+temporary-file corruption, or a failed replacement publishes no bytes and
+preserves the prior configuration exactly.
+
+Runtime launch, Runtime Binding readback, reconciliation, and Integration are
+read-only consumers of this file. They never invoke migration,
+`set-repository-runtime`, or `set-global-runtime`; configuration changes affect
+new Admissions only.
+
 ## Coordinator context
 
 Every state-changing `frontier admit`, `reconcile`, `integrate`, `retire`, or

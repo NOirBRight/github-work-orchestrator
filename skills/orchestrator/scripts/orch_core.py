@@ -33,6 +33,11 @@ ROLE_PROFILES = {
     "reviewer_strict",
     "reviewer_recovery",
 }
+RUNTIME_CONFIG_PATCH_SECTIONS = {
+    "tiers": TIERS,
+    "role_profiles": ROLE_PROFILES,
+}
+RUNTIME_CONFIG_PATCH_MAX_BYTES = 64 * 1024
 REVIEW_PROFILE_SELECTORS = {
     "standard_axis",
     "recovery_axis",
@@ -3352,6 +3357,8 @@ def _write_unique_temporary(target: Path, content: bytes) -> Path:
         ) as handle:
             temporary = Path(handle.name)
             handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
     except Exception:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -3359,8 +3366,240 @@ def _write_unique_temporary(target: Path, content: bytes) -> Path:
     return temporary
 
 
+def runtime_config_lock_path(config_path: Path) -> Path:
+    """Return the adjacent lock shared by explicit configuration commands."""
+
+    config_path = Path(config_path)
+    return config_path.with_name(f".{config_path.name}.lock")
+
+
+@contextmanager
+def _exclusive_runtime_config_command(config_path: Path):
+    config_path = Path(config_path)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = runtime_config_lock_path(config_path)
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+    except FileExistsError as error:
+        raise PolicyError(
+            "CONFIG_COMMAND_LOCKED",
+            "another explicit runtime configuration command is active",
+        ) from error
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+            handle.write(str(os.getpid()))
+            handle.flush()
+            os.fsync(handle.fileno())
+        yield
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+def _validate_complete_runtime_binding(
+    binding: Any,
+    *,
+    section: str,
+    name: str,
+) -> None:
+    if not isinstance(binding, dict) or set(binding) != {"provider", "settings"}:
+        raise PolicyError(
+            "RUNTIME_CONFIG_PATCH_INVALID",
+            f"{section}.{name} must be one complete runtime profile",
+        )
+    provider = binding.get("provider")
+    settings = binding.get("settings")
+    if (
+        not isinstance(provider, str)
+        or not provider.strip()
+        or not isinstance(settings, dict)
+        or set(settings)
+        != {"model", "thinkingOptionId", "modeId", "features"}
+    ):
+        raise PolicyError(
+            "RUNTIME_CONFIG_PATCH_INVALID",
+            f"{section}.{name} runtime profile is incomplete",
+        )
+    for field in ("model", "thinkingOptionId", "modeId"):
+        value = settings.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise PolicyError(
+                "RUNTIME_CONFIG_PATCH_INVALID",
+                f"{section}.{name} setting {field} is invalid",
+            )
+    if not isinstance(settings.get("features"), dict):
+        raise PolicyError(
+            "RUNTIME_CONFIG_PATCH_INVALID",
+            f"{section}.{name} setting features must be an object",
+        )
+
+
+def validate_runtime_config_patch(patch: Any) -> dict[str, Any]:
+    """Validate a bounded patch containing complete named runtime profiles."""
+
+    if not isinstance(patch, dict) or not patch:
+        raise PolicyError(
+            "RUNTIME_CONFIG_PATCH_INVALID",
+            "runtime configuration patch must be a non-empty object",
+        )
+    unknown_sections = set(patch) - set(RUNTIME_CONFIG_PATCH_SECTIONS)
+    if unknown_sections:
+        raise PolicyError(
+            "RUNTIME_CONFIG_PATCH_SCOPE_INVALID",
+            f"runtime patch contains forbidden sections: {sorted(unknown_sections)}",
+        )
+    try:
+        encoded = json.dumps(
+            patch,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise PolicyError("RUNTIME_CONFIG_PATCH_INVALID", str(error)) from error
+    if len(encoded) > RUNTIME_CONFIG_PATCH_MAX_BYTES:
+        raise PolicyError(
+            "RUNTIME_CONFIG_PATCH_TOO_LARGE",
+            "runtime configuration patch exceeds 64 KiB",
+        )
+    for section, mappings in patch.items():
+        if not isinstance(mappings, dict) or not mappings:
+            raise PolicyError(
+                "RUNTIME_CONFIG_PATCH_INVALID",
+                f"{section} patch must be a non-empty object",
+            )
+        allowed_names = RUNTIME_CONFIG_PATCH_SECTIONS[section]
+        for name, binding in mappings.items():
+            if name not in allowed_names:
+                raise PolicyError(
+                    "RUNTIME_CONFIG_PATCH_INVALID",
+                    f"runtime patch contains unknown {section} name: {name}",
+                )
+            _validate_complete_runtime_binding(
+                binding,
+                section=section,
+                name=name,
+            )
+    return copy.deepcopy(patch)
+
+
+def _load_config_for_explicit_update(config_path: Path) -> dict[str, Any]:
+    if not config_path.exists():
+        return validate_config(default_config())
+    try:
+        loaded = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise PolicyError("CONFIG_JSON_INVALID", str(error)) from error
+    return validate_config(loaded)
+
+
+def _publish_runtime_config(
+    config_path: Path,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    validated = validate_config(config)
+    content = (
+        json.dumps(validated, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    temporary = _write_unique_temporary(config_path, content)
+    try:
+        try:
+            readback_bytes = temporary.read_bytes()
+            readback = json.loads(readback_bytes.decode("utf-8"))
+            validate_config(readback)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, PolicyError) as error:
+            raise PolicyError(
+                "CONFIG_PUBLISH_VALIDATION_FAILED",
+                f"temporary runtime config readback failed: {error}",
+            ) from error
+        if readback_bytes != content or readback != validated:
+            raise PolicyError(
+                "CONFIG_PUBLISH_VALIDATION_FAILED",
+                "temporary runtime config changed before publication",
+            )
+        os.replace(temporary, config_path)
+        return validated
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def runtime_config_digest(config: dict[str, Any]) -> str:
+    """Return the digest of the exact bytes used by scoped publication."""
+
+    content = (
+        json.dumps(
+            validate_config(config),
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+def _set_runtime_config(
+    config_path: Path,
+    patch: Any,
+    *,
+    repository: str | None,
+) -> dict[str, Any]:
+    config_path = Path(config_path)
+    validated_patch = validate_runtime_config_patch(patch)
+    if repository is not None and (
+        not isinstance(repository, str)
+        or len(repository) > 255
+        or re.fullmatch(r"[^/\s]+/[^/\s]+", repository) is None
+    ):
+        raise PolicyError(
+            "REPOSITORY_CONFIG_INVALID",
+            "repository must be one exact owner/name identifier",
+        )
+    with _exclusive_runtime_config_command(config_path):
+        current = _load_config_for_explicit_update(config_path)
+        updated = copy.deepcopy(current)
+        if repository is None:
+            target = updated
+        else:
+            repositories = updated.setdefault("repositories", {})
+            target = copy.deepcopy(repositories.get(repository) or {})
+            repositories[repository] = target
+        for section, mappings in validated_patch.items():
+            merged = copy.deepcopy(target.get(section) or {})
+            merged.update(copy.deepcopy(mappings))
+            target[section] = merged
+        return _publish_runtime_config(config_path, updated)
+
+
+def set_repository_runtime_config(
+    config_path: Path,
+    repository: str,
+    patch: Any,
+) -> dict[str, Any]:
+    """Atomically replace complete profiles in one exact repository override."""
+
+    return _set_runtime_config(config_path, patch, repository=repository)
+
+
+def set_global_runtime_config(
+    config_path: Path,
+    patch: Any,
+) -> dict[str, Any]:
+    """Atomically replace complete profiles in the host-wide mappings."""
+
+    return _set_runtime_config(config_path, patch, repository=None)
+
+
 def migrate_config_file(old_path: Path, new_path: Path) -> dict[str, Any]:
     old_path, new_path = Path(old_path), Path(new_path)
+    with _exclusive_runtime_config_command(new_path):
+        return _migrate_config_file_locked(old_path, new_path)
+
+
+def _migrate_config_file_locked(old_path: Path, new_path: Path) -> dict[str, Any]:
     if new_path.exists():
         raise PolicyError(
             "CONFIG_ALREADY_EXISTS",
@@ -3371,7 +3610,6 @@ def migrate_config_file(old_path: Path, new_path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as error:
         raise PolicyError("CONFIG_MIGRATION_SOURCE_INVALID", str(error)) from error
     migrated = validate_config(migrate_v5_config(old))
-    new_path.parent.mkdir(parents=True, exist_ok=True)
     backup = old_path.with_name("providers.v5.backup.json")
     source_bytes = old_path.read_bytes()
     if backup.exists() and backup.read_bytes() != source_bytes:

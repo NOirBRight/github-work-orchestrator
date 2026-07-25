@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import importlib.util
 import json
 import os
@@ -44,6 +45,434 @@ def _legacy(path: Path, *, valid: bool = True) -> None:
         for tier in ("light", "standard", "heavy")
     }
     path.write_text(json.dumps({"tiers": tiers}), encoding="utf-8")
+
+
+def _binding(
+    name: str,
+    *,
+    provider: str = "codex",
+    thinking: str = "high",
+    mode: str = "full-access",
+) -> dict:
+    return {
+        "provider": provider,
+        "settings": {
+            "model": f"model-{name}",
+            "thinkingOptionId": thinking,
+            "modeId": mode,
+            "features": {"profile": name},
+        },
+    }
+
+
+def _runtime_patch() -> dict:
+    return {
+        "tiers": {"standard": _binding("repository-standard")},
+        "role_profiles": {
+            "reviewer_standard": _binding("repository-reviewer"),
+        },
+    }
+
+
+def test_scoped_runtime_config_repository_command_preserves_every_other_scope(
+    tmp_path,
+):
+    command = _load_config_command()
+    config_path = tmp_path / "config.json"
+    config = core.default_config()
+    config["global"]["custom_global"] = {"preserve": True}
+    config["tiers"]["light"] = _binding("global-light")
+    config["role_profiles"]["reviewer_recovery"] = _binding("global-recovery")
+    config["repositories"] = {
+        "owner/repository-a": {
+            "integration_branch": "dev",
+            "custom": {"preserve": ["exactly"]},
+            "tiers": {"light": _binding("repository-a-light")},
+            "role_profiles": {
+                "reviewer_recovery": _binding("repository-a-recovery"),
+            },
+        },
+        "owner/repository-b": {
+            "integration_branch": "release",
+            "custom": {"untouched": True},
+            "tiers": {"heavy": _binding("repository-b-heavy")},
+            "role_profiles": {
+                "reviewer_strict": _binding("repository-b-strict"),
+            },
+        },
+    }
+    config_path.write_text(
+        json.dumps(config, indent=1, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    before = json.loads(config_path.read_text(encoding="utf-8"))
+    patch = _runtime_patch()
+
+    result = command.run(
+        command.parse_args(
+            [
+                "set-repository-runtime",
+                "--config",
+                str(config_path),
+                "--repository",
+                "owner/repository-a",
+                "--patch",
+                json.dumps(patch),
+            ]
+        )
+    )
+
+    installed = json.loads(config_path.read_text(encoding="utf-8"))
+    assert installed["global"] == before["global"]
+    assert installed["tiers"] == before["tiers"]
+    assert installed["role_profiles"] == before["role_profiles"]
+    assert (
+        installed["repositories"]["owner/repository-b"]
+        == before["repositories"]["owner/repository-b"]
+    )
+    selected_before = before["repositories"]["owner/repository-a"]
+    selected = installed["repositories"]["owner/repository-a"]
+    assert selected["integration_branch"] == selected_before["integration_branch"]
+    assert selected["custom"] == selected_before["custom"]
+    assert selected["tiers"]["light"] == selected_before["tiers"]["light"]
+    assert selected["tiers"]["standard"] == patch["tiers"]["standard"]
+    assert (
+        selected["role_profiles"]["reviewer_recovery"]
+        == selected_before["role_profiles"]["reviewer_recovery"]
+    )
+    assert (
+        selected["role_profiles"]["reviewer_standard"]
+        == patch["role_profiles"]["reviewer_standard"]
+    )
+    assert result["scope"] == "repository"
+    assert result["repository"] == "owner/repository-a"
+    assert result["updated"] == {
+        "tiers": ["standard"],
+        "role_profiles": ["reviewer_standard"],
+    }
+    assert "config" not in result
+    assert len(json.dumps(result)) < 1024
+    assert result["config_sha256"] == hashlib.sha256(
+        config_path.read_bytes()
+    ).hexdigest()
+
+
+def test_runtime_config_ownership_global_command_is_separately_explicit(tmp_path):
+    command = _load_config_command()
+    config_path = tmp_path / "config.json"
+    config = core.default_config()
+    config["global"]["custom"] = "preserve"
+    config["repositories"] = {
+        "owner/repository-a": {
+            "custom": {"preserve": "a"},
+            "tiers": {"standard": _binding("repository-a-standard")},
+            "role_profiles": {
+                "reviewer_standard": _binding("repository-a-reviewer"),
+            },
+        },
+        "owner/repository-b": {
+            "custom": {"preserve": "b"},
+            "tiers": {"standard": _binding("repository-b-standard")},
+            "role_profiles": {
+                "reviewer_standard": _binding("repository-b-reviewer"),
+            },
+        },
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    before = json.loads(config_path.read_text(encoding="utf-8"))
+    patch = {
+        "tiers": {"light": _binding("global-light-updated")},
+        "role_profiles": {
+            "reviewer_strict": _binding("global-strict-updated"),
+        },
+    }
+
+    result = command.run(
+        command.parse_args(
+            [
+                "set-global-runtime",
+                "--config",
+                str(config_path),
+                "--patch",
+                json.dumps(patch),
+            ]
+        )
+    )
+
+    installed = json.loads(config_path.read_text(encoding="utf-8"))
+    assert installed["repositories"] == before["repositories"]
+    assert installed["global"] == before["global"]
+    assert installed["tiers"]["light"] == patch["tiers"]["light"]
+    assert installed["tiers"]["standard"] == before["tiers"]["standard"]
+    assert (
+        installed["role_profiles"]["reviewer_strict"]
+        == patch["role_profiles"]["reviewer_strict"]
+    )
+    assert (
+        installed["role_profiles"]["reviewer_standard"]
+        == before["role_profiles"]["reviewer_standard"]
+    )
+    assert result["scope"] == "global"
+    assert "repository" not in result
+    with pytest.raises(SystemExit):
+        command.parse_args(
+            [
+                "set-repository-runtime",
+                "--config",
+                str(config_path),
+                "--patch",
+                json.dumps(patch),
+            ]
+        )
+    with pytest.raises(SystemExit):
+        command.parse_args(
+            [
+                "set-global-runtime",
+                "--config",
+                str(config_path),
+                "--repository",
+                "owner/repository-a",
+                "--patch",
+                json.dumps(patch),
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {},
+        {"global": {"default_tier": "light"}},
+        {"tiers": {}},
+        {"tiers": {"unknown": _binding("unknown")}},
+        {
+            "tiers": {
+                "standard": {
+                    "provider": "codex",
+                    "settings": {"model": "partial"},
+                }
+            }
+        },
+        {
+            "role_profiles": {
+                "reviewer_standard": {
+                    "provider": "codex",
+                    "settings": {
+                        "model": "reviewer",
+                        "thinkingOptionId": "high",
+                        "modeId": "full-access",
+                        "features": [],
+                    },
+                }
+            }
+        },
+    ],
+)
+def test_scoped_runtime_config_invalid_or_partial_patch_preserves_exact_bytes(
+    tmp_path,
+    patch,
+):
+    config_path = tmp_path / "config.json"
+    original = (
+        b'{"schema_version":1, "global":{"custom":"keep"}, '
+        b'"repositories":{"owner/repository-a":{"custom":"keep"}}}'
+    )
+    config_path.write_bytes(original)
+
+    with pytest.raises(core.PolicyError):
+        core.set_repository_runtime_config(
+            config_path,
+            "owner/repository-a",
+            patch,
+        )
+
+    assert config_path.read_bytes() == original
+    assert not core.runtime_config_lock_path(config_path).exists()
+    assert list(tmp_path.glob(f".{config_path.name}.*.tmp")) == []
+
+
+@pytest.mark.parametrize("scope", ["repository", "global"])
+def test_scoped_runtime_config_absent_file_starts_from_validated_defaults(
+    tmp_path,
+    scope,
+):
+    config_path = tmp_path / scope / "config.json"
+    patch = _runtime_patch()
+
+    if scope == "repository":
+        updated = core.set_repository_runtime_config(
+            config_path,
+            "owner/repository-a",
+            patch,
+        )
+        target = updated["repositories"]["owner/repository-a"]
+        assert updated["tiers"] == core.default_config()["tiers"]
+        assert updated["role_profiles"] == core.default_config()["role_profiles"]
+    else:
+        updated = core.set_global_runtime_config(config_path, patch)
+        target = updated
+        assert updated["repositories"] == {}
+
+    assert target["tiers"]["standard"] == patch["tiers"]["standard"]
+    assert (
+        target["role_profiles"]["reviewer_standard"]
+        == patch["role_profiles"]["reviewer_standard"]
+    )
+    installed = json.loads(config_path.read_text(encoding="utf-8"))
+    assert core.validate_config(installed) == updated
+    assert not core.runtime_config_lock_path(config_path).exists()
+
+
+def test_scoped_runtime_config_replace_failure_preserves_exact_bytes(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "config.json"
+    original = (json.dumps(core.default_config(), indent=1) + "\n").encode("utf-8")
+    config_path.write_bytes(original)
+
+    def fail_replace(source, destination):
+        raise OSError("simulated atomic replacement failure")
+
+    monkeypatch.setattr(core.os, "replace", fail_replace)
+
+    with pytest.raises(OSError):
+        core.set_repository_runtime_config(
+            config_path,
+            "owner/repository-a",
+            _runtime_patch(),
+        )
+
+    assert config_path.read_bytes() == original
+    assert not core.runtime_config_lock_path(config_path).exists()
+    assert list(tmp_path.glob(f".{config_path.name}.*.tmp")) == []
+
+
+def test_runtime_config_ownership_exclusive_lock_blocks_racing_command(tmp_path):
+    config_path = tmp_path / "config.json"
+    original = (json.dumps(core.default_config(), indent=1) + "\n").encode("utf-8")
+    config_path.write_bytes(original)
+    lock_path = core.runtime_config_lock_path(config_path)
+    lock_path.write_text("other-command", encoding="ascii")
+
+    with pytest.raises(core.PolicyError) as locked:
+        core.set_global_runtime_config(config_path, _runtime_patch())
+
+    assert locked.value.code == "CONFIG_COMMAND_LOCKED"
+    assert config_path.read_bytes() == original
+    assert lock_path.read_text(encoding="ascii") == "other-command"
+
+
+def test_scoped_runtime_config_validation_readback_rejects_temporary_corruption(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "config.json"
+    original = (json.dumps(core.default_config(), indent=1) + "\n").encode("utf-8")
+    config_path.write_bytes(original)
+    real_write = core._write_unique_temporary
+
+    def corrupt_temporary(target, content):
+        temporary = real_write(target, content)
+        temporary.write_bytes(b'{"schema_version": 1, "corrupted": true}')
+        return temporary
+
+    monkeypatch.setattr(core, "_write_unique_temporary", corrupt_temporary)
+
+    with pytest.raises(core.PolicyError) as invalid:
+        core.set_repository_runtime_config(
+            config_path,
+            "owner/repository-a",
+            _runtime_patch(),
+        )
+
+    assert invalid.value.code == "CONFIG_PUBLISH_VALIDATION_FAILED"
+    assert config_path.read_bytes() == original
+    assert not core.runtime_config_lock_path(config_path).exists()
+    assert list(tmp_path.glob(f".{config_path.name}.*.tmp")) == []
+
+
+def test_runtime_config_ownership_runtime_paths_are_read_only_for_tiers_and_roles(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "config.json"
+    config = core.default_config()
+    config["repositories"]["owner/repository-a"] = _runtime_patch()
+    config_path.write_text(
+        json.dumps(config, indent=1, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    original = config_path.read_bytes()
+
+    def mutation_forbidden(*args, **kwargs):
+        raise AssertionError("runtime path invoked explicit config mutation")
+
+    monkeypatch.setattr(core, "set_repository_runtime_config", mutation_forbidden)
+    monkeypatch.setattr(core, "set_global_runtime_config", mutation_forbidden)
+
+    loaded = core.load_or_migrate_config(config_path)
+    worker = core.resolve_runtime_request(
+        loaded,
+        repository="owner/repository-a",
+        issue={"difficulty": "standard"},
+        coordinator_runtime=_binding("coordinator"),
+    )
+    reviewer = core.resolve_role_runtime_request(
+        loaded,
+        repository="owner/repository-a",
+        role="reviewer_standard",
+    )
+    assert worker["settings"]["model"] == "model-repository-standard"
+    assert reviewer["settings"]["model"] == "model-repository-reviewer"
+
+    client = InMemoryPaseoClient()
+    adapter = PaseoRuntimeAdapter(client)
+    profile = RuntimeProfile(
+        name="standard",
+        provider=worker["provider"],
+        model=worker["settings"]["model"],
+        thinking=worker["settings"]["thinkingOptionId"],
+        mode=worker["settings"]["modeId"],
+        features=worker["settings"]["features"],
+    )
+    admission = RuntimeAdmission(
+        repository="owner/repository-a",
+        plan_digest="plan:read-only",
+        node_key="node:read-only",
+        admission_id="admission:read-only",
+        repository_path=tmp_path,
+        base_sha="a" * 40,
+        runtime_profile=profile,
+    )
+    prompt = RuntimePrompt(text="read-only", digest="f" * 64)
+    launched = adapter.materialize(admission, prompt)
+    assert adapter.read_binding(admission, prompt) == launched
+
+    reconciled = core.plan_reconcile(
+        {
+            "issues": [],
+            "closed_issues": [],
+            "runtime_agents": [],
+            "execution_slots": 3,
+            "integration_wip_limit": 6,
+        }
+    )
+    integrated = core.plan_integration(
+        {
+            "pr": 65,
+            "base": "dev",
+            "integration_branch": "dev",
+            "workspace": {"dirty": False},
+            "checks": "green",
+            "review": "accepted",
+            "contract_valid": True,
+            "behind": False,
+        }
+    )
+    assert reconciled["status"] == "idle"
+    assert integrated["actions"] == [{"type": "merge", "pr": 65}]
+    assert config_path.read_bytes() == original
 
 
 def test_runtime_config_load_never_writes_even_through_the_legacy_flag(tmp_path):
