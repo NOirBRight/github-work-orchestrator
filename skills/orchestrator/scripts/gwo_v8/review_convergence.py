@@ -71,6 +71,32 @@ def _runtime_error_record(error: RuntimeAdapterError) -> dict[str, str]:
     }
 
 
+def _stable_review_evidence(
+    state: dict[str, Any],
+    fresh: TypedEvidence,
+) -> TypedEvidence:
+    """Reuse exact durable Evidence when fresh convergence is semantically equal."""
+
+    saved_value = state.get("review_evidence")
+    if not isinstance(saved_value, dict):
+        return fresh
+    try:
+        saved = TypedEvidence(**saved_value)
+    except TypeError:
+        return fresh
+    if (
+        saved.has_valid_digest()
+        and saved.kind == fresh.kind
+        and saved.subject == fresh.subject
+        and saved.observer_type == fresh.observer_type
+        and saved.observer_id == fresh.observer_id
+        and saved.source_ref == fresh.source_ref
+        and saved.payload == fresh.payload
+    ):
+        return saved
+    return fresh
+
+
 def _git(repository: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(repository), *args],
@@ -1027,7 +1053,11 @@ class ReviewConvergence:
                 status="blocked",
                 observation=observation,
             )
-        state["review_evidence"] = asdict(gate.evidence)
+        review_evidence = _stable_review_evidence(
+            state,
+            gate.evidence,
+        )
+        state["review_evidence"] = asdict(review_evidence)
         state["review_gate_status"] = gate.status
         state["wait_condition"] = None
         state["wait_source_ref"] = None
@@ -1055,7 +1085,7 @@ class ReviewConvergence:
                     for key, saved in bindings.items()
                     if isinstance(saved, dict)
                 },
-                review_evidence=gate.evidence,
+                review_evidence=review_evidence,
             )
         except RetirementError as error:
             state["review_children_retired"] = False
@@ -1110,7 +1140,7 @@ class ReviewConvergence:
                         authorization = authorize_review_after_evidence(
                             worker_binding=binding,
                             review_binding=child,
-                            review_evidence=gate.evidence,
+                            review_evidence=review_evidence,
                         )
                     except RetirementError as error:
                         retirements[key] = failed_review_retirement(
@@ -1183,7 +1213,7 @@ class ReviewConvergence:
                     for key, saved in bindings.items()
                     if isinstance(saved, dict)
                 },
-                review_evidence=gate.evidence,
+                review_evidence=review_evidence,
             )
             state["review_children_retired"] = (
                 completed_validation.children_retired
@@ -1202,7 +1232,7 @@ class ReviewConvergence:
                 status="rejected",
                 observation=replace(
                     observation,
-                    evidence=observation.evidence + (gate.evidence,),
+                    evidence=observation.evidence + (review_evidence,),
                 ),
                 capture_deferred_checks=True,
                 findings=gate.blockers,
@@ -1266,7 +1296,7 @@ class ReviewConvergence:
             observation=replace(
                 observation,
                 evidence=observation.evidence
-                + (gate.evidence,)
+                + (review_evidence,)
                 + (
                     ()
                     if requirement.get("human_decision_required") is not True
