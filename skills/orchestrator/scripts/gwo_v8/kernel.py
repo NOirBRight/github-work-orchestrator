@@ -1249,13 +1249,39 @@ class Kernel:
 
     @staticmethod
     def _profile_from_dict(data: dict[str, Any]) -> RuntimeProfile:
+        """Strictly parse a frozen RuntimeProfile snapshot from durable state.
+
+        Missing, null, or malformed fields fail closed so restart/config drift
+        cannot silently alter an Admission's profile.
+        """
+
+        def _field(key: str) -> str:
+            value = data.get(key)
+            if not isinstance(value, str) or not value:
+                raise KernelError(
+                    "RUNTIME_PROFILE_FROZEN_INVALID",
+                    f"frozen runtime profile has invalid {key}: {value!r}",
+                )
+            return value
+
+        name = _field("name")
+        provider = _field("provider")
+        model = _field("model")
+        thinking = _field("thinking")
+        mode = _field("mode")
+        features = data.get("features")
+        if not isinstance(features, dict):
+            raise KernelError(
+                "RUNTIME_PROFILE_FROZEN_INVALID",
+                f"frozen runtime profile has invalid features: {features!r}",
+            )
         return RuntimeProfile(
-            name=str(data["name"]),
-            provider=str(data["provider"]),
-            model=str(data["model"]),
-            thinking=str(data["thinking"]),
-            mode=str(data["mode"]),
-            features=dict(data.get("features") or {}),
+            name=name,
+            provider=provider,
+            model=model,
+            thinking=thinking,
+            mode=mode,
+            features=dict(features),
         )
 
     def _resolve_worker_profile(
@@ -1352,7 +1378,19 @@ class Kernel:
                 "RUNTIME_PROFILE_FROZEN_INVALID",
                 "frontier_runtime_profile is present but not a snapshot",
             )
-        return self._profile_from_dict(frozen)
+        profile = self._profile_from_dict(frozen)
+        expected_digest = state.get("frontier_profile_digest")
+        if not isinstance(expected_digest, str) or not expected_digest:
+            raise KernelError(
+                "RUNTIME_PROFILE_FROZEN_INVALID",
+                "frontier_profile_digest is missing or invalid",
+            )
+        if expected_digest != profile.digest:
+            raise KernelError(
+                "RUNTIME_PROFILE_FROZEN_INVALID",
+                "frontier_profile_digest does not match the frozen profile",
+            )
+        return profile
 
     @staticmethod
     def ensure_store_schema(connection: sqlite3.Connection) -> None:

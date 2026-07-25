@@ -212,7 +212,7 @@ def test_canary_kernel_does_not_inject_runtime_profile(tmp_path):
 
 
 def test_canary_kernel_maps_complex_difficulty_not_hardcoded_standard(tmp_path):
-    """complex PlanNode difficulty selects the heavy tier, not a hardcoded standard."""
+    """complex Plan Node Difficulty Tier selects the heavy tier, not a hardcoded standard."""
 
     store_path = tmp_path / "store.sqlite3"
     publication = LocalPlanPublication(store_path)

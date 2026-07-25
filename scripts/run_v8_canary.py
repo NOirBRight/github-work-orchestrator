@@ -245,7 +245,7 @@ def _build_canary_kernel(
     """Construct a canary Kernel without runtime_profile injection.
 
     Worker Runtime Profile selection must flow from the configured
-    ``runtime_config`` and the PlanNode difficulty at Admission time.
+    ``runtime_config`` and the Plan Node Difficulty Tier at Admission time.
     """
 
     return Kernel(

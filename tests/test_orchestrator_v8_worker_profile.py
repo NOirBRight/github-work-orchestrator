@@ -14,6 +14,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from gwo_v8 import (  # noqa: E402
     EvidenceVerifier,
+    InMemoryPaseoClient,
     InMemoryRuntimeAdapter,
     Kernel,
     KernelError,
@@ -346,6 +347,55 @@ def test_adapter_normalize_profile_requires_exact_k2_7_reasoning_on():
     assert normalized.thinking == "on"
 
 
+def test_paseo_adapter_exact_k2_7_exception_is_strict():
+    """Only exact config provider 'kimi-cli' + thinking 'on' is accepted for K2.7."""
+
+    adapter = PaseoRuntimeAdapter(InMemoryPaseoClient())
+
+    # Exact match accepted.
+    accepted = adapter.normalize_profile(
+        RuntimeProfile(
+            name="light",
+            provider="kimi-cli",
+            model="kimi-code/kimi-for-coding",
+            thinking="on",
+            mode="yolo",
+            features={},
+        )
+    )
+    assert accepted.thinking == "on"
+
+    # Non-exact thinking values fail closed.
+    for thinking in ("TRUE", "yes", "enabled", "off", "high", "max"):
+        with pytest.raises(RuntimeAdapterError) as error:
+            adapter.normalize_profile(
+                RuntimeProfile(
+                    name="light",
+                    provider="kimi-cli",
+                    model="kimi-code/kimi-for-coding",
+                    thinking=thinking,
+                    mode="yolo",
+                    features={},
+                )
+            )
+        assert error.value.code == "RUNTIME_THINKING_INVALID"
+
+    # Non-exact provider fails closed (canonical 'kimi' and case variants).
+    for provider in ("kimi", "KIMI-CLI", "Kimi-Cli"):
+        with pytest.raises(RuntimeAdapterError) as error:
+            adapter.normalize_profile(
+                RuntimeProfile(
+                    name="light",
+                    provider=provider,
+                    model="kimi-code/kimi-for-coding",
+                    thinking="on",
+                    mode="yolo",
+                    features={},
+                )
+            )
+        assert error.value.code == "RUNTIME_PROVIDER_UNSUPPORTED"
+
+
 def test_adapter_normalize_profile_rejects_unknown_codex_capabilities():
     capabilities = RuntimeCapabilities(
         providers={
@@ -393,28 +443,108 @@ def test_adapter_normalize_profile_rejects_unknown_codex_capabilities():
     assert error.value.code == "RUNTIME_THINKING_INVALID"
 
 
-def test_resolve_worker_profile_falsey_repository_override_is_invalid():
+@pytest.mark.parametrize(
+    "config_mutation, expected_code",
+    [
+        (lambda c: c.update({"repositories": None}), "RUNTIME_CONFIG_INVALID"),
+        (
+            lambda c: c["repositories"].update({"owner/repo": None}),
+            "RUNTIME_CONFIG_INVALID",
+        ),
+        (
+            lambda c: c["repositories"]["owner/repo"].update({"tiers": None}),
+            "RUNTIME_TIER_PROFILE_INVALID",
+        ),
+        (
+            lambda c: c["repositories"]["owner/repo"]["tiers"].update({"standard": None}),
+            "RUNTIME_TIER_PROFILE_INVALID",
+        ),
+        (lambda c: c.update({"tiers": None}), "RUNTIME_TIER_PROFILE_INVALID"),
+        (
+            lambda c: (
+                c["repositories"]["owner/repo"]["tiers"].clear(),
+                c["tiers"].update({"standard": None}),
+            )[1],
+            "RUNTIME_TIER_PROFILE_INVALID",
+        ),
+    ],
+    ids=[
+        "repositories_null",
+        "repository_config_null",
+        "repository_tiers_null",
+        "repository_tier_value_null",
+        "global_tiers_null",
+        "global_tier_value_null",
+    ],
+)
+def test_resolve_worker_profile_explicit_null_override_fails_closed(
+    config_mutation,
+    expected_code,
+):
+    config = _config(
+        repositories={
+            "owner/repo": {
+                "tiers": {
+                    "standard": _binding(
+                        "codex", "repo-sol", "high", "full-access"
+                    ),
+                },
+            },
+        },
+    )
+    config_mutation(config)
     with pytest.raises(RuntimeAdapterError) as error:
         resolve_worker_profile(
-            _config(repositories={"owner/repo": []}),
+            config,
             repository="owner/repo",
             difficulty="standard",
         )
-    assert error.value.code == "RUNTIME_CONFIG_INVALID"
+    assert error.value.code == expected_code
 
-    with pytest.raises(RuntimeAdapterError) as error:
-        resolve_worker_profile(
-            _config(
-                repositories={
-                    "owner/repo": {
-                        "tiers": [],
-                    }
-                }
-            ),
-            repository="owner/repo",
-            difficulty="standard",
-        )
-    assert error.value.code == "RUNTIME_TIER_PROFILE_INVALID"
+
+def test_resolve_worker_profile_absent_keys_fall_back_correctly():
+    # Repository block absent -> global tier used.
+    config = _config()
+    profile = resolve_worker_profile(
+        config,
+        repository="other/repo",
+        difficulty="standard",
+    )
+    assert profile.model == "kimi-code/kimi-for-coding"
+
+    # Repository block present but tier absent -> global tier used.
+    config = _config(
+        repositories={
+            "owner/repo": {
+                "tiers": {},
+            },
+        },
+    )
+    profile = resolve_worker_profile(
+        config,
+        repository="owner/repo",
+        difficulty="standard",
+    )
+    assert profile.model == "kimi-code/kimi-for-coding"
+
+    # Repository tier present overrides global.
+    config = _config(
+        repositories={
+            "owner/repo": {
+                "tiers": {
+                    "standard": _binding(
+                        "codex", "repo-sol", "high", "full-access"
+                    ),
+                },
+            },
+        },
+    )
+    profile = resolve_worker_profile(
+        config,
+        repository="owner/repo",
+        difficulty="standard",
+    )
+    assert profile.model == "repo-sol"
 
 
 def _frontier_kernel(tmp_path: Path) -> Kernel:
@@ -451,6 +581,52 @@ def _frontier_state() -> dict[str, Any]:
     }
 
 
+def _frozen_profile_dict(**overrides) -> dict[str, Any]:
+    return {
+        "name": "frontier",
+        "provider": "codex",
+        "model": "sol/xhigh",
+        "thinking": "xhigh",
+        "mode": "full-access",
+        "features": {},
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation, expected_detail_substring",
+    [
+        (lambda s: s.update({"frontier_runtime_profile": {"model": "sol/xhigh"}}), "name"),
+        (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(provider="")}), "provider"),
+        (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(thinking=None)}), "thinking"),
+        (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(features=False)}), "features"),
+        (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(), "frontier_profile_digest": None}), "frontier_profile_digest"),
+        (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(), "frontier_profile_digest": "mismatch"}), "does not match"),
+    ],
+    ids=[
+        "missing_field",
+        "empty_string_field",
+        "null_field",
+        "invalid_features",
+        "missing_digest",
+        "digest_mismatch",
+    ],
+)
+def test_kernel_freeze_legacy_frontier_profile_fails_closed_on_malformed_snapshot(
+    tmp_path,
+    mutation,
+    expected_detail_substring,
+):
+    kernel = _frontier_kernel(tmp_path)
+    state = _frontier_state()
+    mutation(state)
+
+    with pytest.raises(KernelError) as error:
+        kernel._freeze_legacy_frontier_profile(state)
+    assert error.value.code == "RUNTIME_PROFILE_FROZEN_INVALID"
+    assert expected_detail_substring in error.value.detail
+
+
 def test_kernel_freeze_legacy_frontier_profile_resolves_and_persists_missing_key(
     tmp_path,
 ):
@@ -464,16 +640,25 @@ def test_kernel_freeze_legacy_frontier_profile_resolves_and_persists_missing_key
     assert state["frontier_profile_digest"] == profile.digest
 
 
-def test_kernel_freeze_legacy_frontier_profile_fails_closed_on_invalid_value(
+def test_kernel_freeze_legacy_frontier_profile_returns_valid_frozen_snapshot(
     tmp_path,
 ):
     kernel = _frontier_kernel(tmp_path)
     state = _frontier_state()
-    state["frontier_runtime_profile"] = None
+    profile = RuntimeProfile(
+        name="frontier",
+        provider="codex",
+        model="gpt-5.6-sol",
+        thinking="high",
+        mode="full-access",
+        features={"custom": True},
+    )
+    state["frontier_runtime_profile"] = kernel._profile_to_dict(profile)
+    state["frontier_profile_digest"] = profile.digest
 
-    with pytest.raises(KernelError) as error:
-        kernel._freeze_legacy_frontier_profile(state)
-    assert error.value.code == "RUNTIME_PROFILE_FROZEN_INVALID"
+    parsed = kernel._freeze_legacy_frontier_profile(state)
+
+    assert parsed == profile
 
 
 def test_kernel_start_frontier_attempt_branch_uses_freeze_helper():

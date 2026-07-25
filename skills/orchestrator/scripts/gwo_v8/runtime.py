@@ -543,13 +543,17 @@ def resolve_worker_profile(
     repository: str,
     difficulty: str,
 ) -> RuntimeProfile:
-    """Resolve the initial Worker Runtime Profile shape from a PlanNode difficulty.
+    """Resolve the initial Worker Runtime Profile shape from a Plan Node Difficulty Tier.
 
     Repository tier mappings override global mappings. This resolver performs
     only shape validation: provider/model/thinking/mode must be non-empty
     strings and features must be a mapping. Concrete provider/model/reasoning
     normalization and support validation is performed by the selected
     RuntimeAdapter via ``normalize_profile``.
+
+    Explicit ``null`` overrides fail closed; only genuinely absent keys fall
+    back (repository block absent -> global block; repository tier absent ->
+    global tier).
     """
 
     if config is None:
@@ -565,46 +569,84 @@ def resolve_worker_profile(
     if difficulty not in WORKER_DIFFICULTIES:
         raise RuntimeAdapterError(
             "WORKER_DIFFICULTY_INVALID",
-            f"unknown PlanNode difficulty: {difficulty}",
+            f"unknown Plan Node Difficulty Tier: {difficulty}",
         )
     tier = DIFFICULTY_TO_TIER[difficulty]
 
-    repositories = config.get("repositories")
-    if repositories is None:
-        repositories = {}
-    if not isinstance(repositories, dict):
-        raise RuntimeAdapterError(
-            "RUNTIME_CONFIG_INVALID",
-            "repository Runtime configuration must be an object",
-        )
-    repository_config = repositories.get(repository)
-    if repository_config is None:
-        repository_config = {}
-    elif not isinstance(repository_config, dict):
-        raise RuntimeAdapterError(
-            "RUNTIME_CONFIG_INVALID",
-            f"repository Runtime configuration is invalid: {repository}",
-        )
-    repository_tiers = repository_config.get("tiers")
-    if repository_tiers is None:
-        repository_tiers = {}
-    elif not isinstance(repository_tiers, dict):
-        raise RuntimeAdapterError(
-            "RUNTIME_TIER_PROFILE_INVALID",
-            f"Worker tier mapping is invalid for repository: {repository}",
-        )
-    global_tiers = config.get("tiers")
-    if global_tiers is None:
-        global_tiers = {}
-    elif not isinstance(global_tiers, dict):
-        raise RuntimeAdapterError(
-            "RUNTIME_TIER_PROFILE_INVALID",
-            "Worker tier mappings must be objects",
-        )
+    if "repositories" not in config:
+        repositories: dict[str, Any] = {}
+    else:
+        repositories = config["repositories"]
+        if repositories is None:
+            raise RuntimeAdapterError(
+                "RUNTIME_CONFIG_INVALID",
+                "repositories override is explicitly null",
+            )
+        if not isinstance(repositories, dict):
+            raise RuntimeAdapterError(
+                "RUNTIME_CONFIG_INVALID",
+                "repository Runtime configuration must be an object",
+            )
+    if repository not in repositories:
+        repository_config: dict[str, Any] = {}
+    else:
+        repository_config = repositories[repository]
+        if repository_config is None:
+            raise RuntimeAdapterError(
+                "RUNTIME_CONFIG_INVALID",
+                f"repository Runtime configuration is null: {repository}",
+            )
+        if not isinstance(repository_config, dict):
+            raise RuntimeAdapterError(
+                "RUNTIME_CONFIG_INVALID",
+                f"repository Runtime configuration is invalid: {repository}",
+            )
+    if "tiers" not in repository_config:
+        repository_tiers: dict[str, Any] = {}
+    else:
+        repository_tiers = repository_config["tiers"]
+        if repository_tiers is None:
+            raise RuntimeAdapterError(
+                "RUNTIME_TIER_PROFILE_INVALID",
+                f"Worker tier mapping is null for repository: {repository}",
+            )
+        if not isinstance(repository_tiers, dict):
+            raise RuntimeAdapterError(
+                "RUNTIME_TIER_PROFILE_INVALID",
+                f"Worker tier mapping is invalid for repository: {repository}",
+            )
+    if "tiers" not in config:
+        global_tiers: dict[str, Any] = {}
+    else:
+        global_tiers = config["tiers"]
+        if global_tiers is None:
+            raise RuntimeAdapterError(
+                "RUNTIME_TIER_PROFILE_INVALID",
+                "Worker tier mappings are explicitly null",
+            )
+        if not isinstance(global_tiers, dict):
+            raise RuntimeAdapterError(
+                "RUNTIME_TIER_PROFILE_INVALID",
+                "Worker tier mappings must be objects",
+            )
 
-    mapping = repository_tiers.get(tier)
-    if mapping is None:
-        mapping = global_tiers.get(tier)
+    if tier not in repository_tiers:
+        if tier not in global_tiers:
+            mapping = None
+        else:
+            mapping = global_tiers[tier]
+            if mapping is None:
+                raise RuntimeAdapterError(
+                    "RUNTIME_TIER_PROFILE_INVALID",
+                    f"Worker tier mapping is null: {tier}",
+                )
+    else:
+        mapping = repository_tiers[tier]
+        if mapping is None:
+            raise RuntimeAdapterError(
+                "RUNTIME_TIER_PROFILE_INVALID",
+                f"Worker tier mapping is null: {tier}",
+            )
     if mapping is None:
         raise RuntimeAdapterError(
             "RUNTIME_TIER_PROFILE_MISSING",
@@ -2283,25 +2325,39 @@ class PaseoRuntimeAdapter:
             profile.provider.lower(),
         )
         provider_caps = self.client.capabilities(paseo_provider)
-        if (
-            paseo_provider == "kimi"
-            and profile.provider.lower() == "kimi-cli"
-            and profile.model == "kimi-code/kimi-for-coding"
-        ):
-            model_caps = provider_caps.models.get(profile.model)
-            if model_caps is not None:
-                provider_caps = ProviderCapabilities(
-                    models={
-                        **provider_caps.models,
-                        profile.model: ModelCapabilities(
-                            thinking_options=model_caps.thinking_options
-                            | frozenset({"on"}),
-                            features=model_caps.features,
-                        ),
-                    },
-                    modes=provider_caps.modes,
-                    features=provider_caps.features,
+        if profile.model == "kimi-code/kimi-for-coding":
+            # Exact K2.7 exception: only config provider "kimi-cli" + thinking "on"
+            # is accepted. No high/max/yes/true/enabled synonyms, no canonical "kimi"
+            # provider, and no case-insensitive matching.
+            if profile.provider != "kimi-cli":
+                raise RuntimeAdapterError(
+                    "RUNTIME_PROVIDER_UNSUPPORTED",
+                    f"Runtime provider is not supported: {profile.provider}",
                 )
+            if profile.thinking != "on":
+                raise RuntimeAdapterError(
+                    "RUNTIME_THINKING_INVALID",
+                    f"Runtime thinking is not supported for {profile.model}: {profile.thinking}",
+                )
+            model_caps = provider_caps.models.get(profile.model)
+            if model_caps is None:
+                # Let generic validation fail closed for an unknown model.
+                return _normalize_runtime_profile(
+                    profile,
+                    RuntimeCapabilities(providers={paseo_provider: provider_caps}),
+                    provider_aliases=_PASEO_PROVIDER_ALIASES,
+                )
+            provider_caps = ProviderCapabilities(
+                models={
+                    **provider_caps.models,
+                    profile.model: ModelCapabilities(
+                        thinking_options=frozenset({"on"}),
+                        features=model_caps.features,
+                    ),
+                },
+                modes=provider_caps.modes,
+                features=provider_caps.features,
+            )
         return _normalize_runtime_profile(
             profile,
             RuntimeCapabilities(providers={paseo_provider: provider_caps}),
