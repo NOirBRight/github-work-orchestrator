@@ -679,11 +679,17 @@ The native name comes from exact Agent identity plus canonical-path matching
 against Paseo worktree-list readback; a `wks_*` Workspace ID is not a worktree
 archive name. This completion rule is the ADR-0041 exception that supersedes
 ADR-0029's earlier non-blocking cleanup sentence.
-It then archives the Agent, runs `paseo worktree archive <name> --json`, CAS
-deletes only the authorized temporary branch, prunes, and reads back Agent
-archived, directory absent, and Git worktree registration absent. Partial
-success persists as typed `pending` or `error` retirement state and the next
-Kernel reconciliation retries idempotently. After accepted Review Evidence,
+It then archives the Agent and uses Paseo's internal daemon-native,
+repository-bound transport, preserving the configured host and authentication.
+The request carries an explicit `repoRoot`: the Adapter first uniquely reads
+back the native name, canonical worktree path, and branch within that
+repository, then calls `archivePaseoWorktree` with that `repoRoot`, exact
+worktree path and branch, and `scope: "worktree"`. This seam never treats an
+arbitrary shell path as deletion authority. The Adapter then CAS deletes only
+the authorized temporary branch, prunes, and reads back Agent archived,
+directory absent, and Git worktree registration absent. Partial success
+persists as typed `pending` or `error` retirement state and the next Kernel
+reconciliation retries idempotently. After accepted Review Evidence,
 independent disposable Reviewer worktrees use the same typed, identity-bound
 Runtime retirement policy. Review children that share a Candidate workspace
 retire only their Agent identity.
