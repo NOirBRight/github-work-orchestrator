@@ -3140,6 +3140,7 @@ class Kernel:
             "wait_source_ref": None,
             "wait_event_identity": None,
             "next_check_at": None,
+            "worker_parked_for_ci": False,
             "base_sha": _git(
                 self.repository_path,
                 "rev-parse",
@@ -4442,6 +4443,78 @@ class Kernel:
             )
         return causes
 
+    @staticmethod
+    def _invalidate_candidate_delivery(state: dict[str, Any]) -> None:
+        ReviewConvergence.invalidate_candidate(state)
+        state.update(EffectContractVerifier.initial_fields())
+        state.update(
+            {
+                "candidate_sha": None,
+                "candidate_observation": None,
+                "candidate_evidence_manifest": None,
+                "candidate_evidence_manifest_digest": None,
+                "result_digest": None,
+                "publication_eligible": None,
+                "publication_state": None,
+                "publication_ref": None,
+                "hosted_check_state": None,
+                "hosted_retry_count": 0,
+                "hosted_check_evidence": [],
+                "integration_batch_id": None,
+                "integration_batch_sha": None,
+                "integration_batch_hosted_check_evidence": [],
+                "integrated_sha": None,
+                "integration_evidence_digest": None,
+                "integration_evidence": None,
+                "retirement": None,
+                "retirement_state": None,
+                "last_retirement_error": None,
+                "resume_sent": False,
+                "worker_parked_for_ci": False,
+            }
+        )
+
+    def _reactivate_parked_attempt(self, state: dict[str, Any]) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                """
+                SELECT state FROM v8_attempts
+                WHERE attempt_id = ? AND repository = ? AND plan_digest = ?
+                """,
+                (
+                    state["attempt_id"],
+                    state["repository"],
+                    state["plan_digest"],
+                ),
+            ).fetchone()
+            if current is None or current["state"] not in {
+                "running",
+                "verified",
+            }:
+                raise KernelError(
+                    "PARKED_ATTEMPT_NOT_REPAIRABLE",
+                    "hosted code failure has no recoverable parked Attempt",
+                )
+            connection.execute(
+                """
+                UPDATE v8_attempts SET state = 'running'
+                WHERE attempt_id = ?
+                """,
+                (state["attempt_id"],),
+            )
+            connection.execute(
+                """
+                UPDATE v8_node_states SET state = 'running'
+                WHERE repository = ? AND plan_digest = ? AND node_key = ?
+                """,
+                (
+                    state["repository"],
+                    state["plan_digest"],
+                    state["node_key"],
+                ),
+            )
+
     def _handle_semantic_rejection(
         self,
         state: dict[str, Any],
@@ -4516,14 +4589,12 @@ class Kernel:
                 isinstance(existing_repair, dict)
                 and existing_repair.get("action_key") == repair_action_key
             ):
-                self._review_convergence.invalidate_candidate(state)
+                self._invalidate_candidate_delivery(state)
                 state.update(
                     {
                         "status": "waiting",
                         "directive": "wait_for_runtime",
                         "attempt_state": "repair_delivery_ambiguous",
-                        "candidate_sha": None,
-                        "candidate_observation": None,
                         "wait_condition": "runtime_result",
                         "wait_source_ref": (
                             f"{self.runtime.adapter_name}://attempt/"
@@ -4570,13 +4641,11 @@ class Kernel:
                 self.runtime.repair(binding, prompt)
             except RuntimeAdapterError as error:
                 repair_record["delivery_state"] = "ambiguous"
-                self._review_convergence.invalidate_candidate(state)
+                self._invalidate_candidate_delivery(state)
                 state.update(
                     {
                         "directive": "wait_for_runtime",
                         "attempt_state": "repair_delivery_ambiguous",
-                        "candidate_sha": None,
-                        "candidate_observation": None,
                         "repair_prompt": repair_record,
                         "last_runtime_error": _runtime_error_record(error),
                         "wait_condition": "runtime_result",
@@ -4589,7 +4658,7 @@ class Kernel:
                 )
                 return self._outcome(state)
             repair_record["delivery_state"] = "accepted"
-            self._review_convergence.invalidate_candidate(state)
+            self._invalidate_candidate_delivery(state)
             state.update(
                 {
                     "status": "waiting",
@@ -4598,16 +4667,8 @@ class Kernel:
                     "recovery_reserved_at": None,
                     "repair_rounds_used": repair_rounds_used + 1,
                     "attempt_terminal_reason": None,
-                    "candidate_sha": None,
-                    "publication_eligible": None,
-                    "publication_state": None,
-                    "publication_ref": None,
-                    "hosted_check_state": None,
-                    "hosted_retry_count": 0,
-                    "candidate_observation": None,
                     "prior_review_context": prior_review_context,
                     "repair_prompt": repair_record,
-                    "worker_parked_for_ci": False,
                     "wait_condition": "runtime_result",
                     "wait_source_ref": (
                         f"{self.runtime.adapter_name}://attempt/"
@@ -4637,7 +4698,7 @@ class Kernel:
                 same_attempt=False,
             )
             next_ordinal = attempt_ordinal + 1
-            self._review_convergence.invalidate_candidate(state)
+            self._invalidate_candidate_delivery(state)
             state.update(
                 {
                     "status": "running",
@@ -4653,21 +4714,12 @@ class Kernel:
                     "attempt_ordinal": next_ordinal,
                     "repair_rounds_used": 0,
                     "attempt_terminal_reason": None,
-                    "candidate_sha": None,
-                    "publication_eligible": None,
-                    "publication_state": None,
-                    "publication_ref": None,
-                    "hosted_check_state": None,
-                    "hosted_retry_count": 0,
-                    "candidate_observation": None,
                     "prior_review_context": prior_review_context,
-                    "worker_parked_for_ci": False,
                     "materialization_actions": {"create": 0, "prompt": 0},
                     "materialization_executions": 0,
                     "runtime_circuits": {},
                     "runtime_circuit": None,
                     "runtime_circuit_state": None,
-                    "resume_sent": False,
                     "wait_condition": None,
                     "wait_source_ref": None,
                     "wait_event_identity": None,
@@ -5002,6 +5054,7 @@ class Kernel:
                     "directive": "goal_complete",
                     "work_item_state": "integrated",
                     "attempt_state": "verified",
+                    "worker_parked_for_ci": False,
                     "retirement": completed,
                     "retirement_state": "complete",
                     "last_retirement_error": None,
@@ -5344,6 +5397,7 @@ class Kernel:
                     {
                         "publication_state": "published",
                         "publication_ref": publication_ref,
+                        "worker_parked_for_ci": bool(hosted_definitions),
                     }
                 )
 
@@ -5503,6 +5557,54 @@ class Kernel:
                         member_states,
                     )
                     return
+            if hosted.status == "code_failure" and len(member_states) == 1:
+                state = next(iter(member_states.values()))
+                work_node, _integration, goal, work_item = next(
+                    unit
+                    for unit in units
+                    if unit[0]["node_key"] == state["node_key"]
+                )
+                batch_state["state"] = "code_failure"
+                state.update(
+                    {
+                        "hosted_check_state": "code_failure",
+                        "wait_source_ref": hosted.source_ref,
+                    }
+                )
+                self._write_integration_batch(
+                    repository,
+                    active.plan_digest,
+                    batch_id,
+                    batch_state,
+                )
+                self._write_batch_members(
+                    repository,
+                    active.plan_digest,
+                    member_states,
+                )
+                binding, terminal = self._adopt_or_materialize(
+                    state,
+                    work_node,
+                )
+                if terminal is not None:
+                    return
+                assert binding is not None
+                binding = self._begin_or_adopt_attempt(state, binding)
+                self._reactivate_parked_attempt(state)
+                self._handle_semantic_rejection(
+                    state,
+                    work_node,
+                    goal,
+                    work_item,
+                    binding,
+                    terminal_reason="rejected",
+                    findings=(
+                        "hosted CI reported a code failure for "
+                        f"Integration Batch {batch_id}",
+                    ),
+                    cause_type="hosted_ci_code_failure",
+                )
+                return
             if hosted.status != "passed":
                 batch_state["state"] = "blocked"
                 for state in member_states.values():

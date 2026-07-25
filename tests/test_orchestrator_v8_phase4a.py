@@ -329,11 +329,26 @@ class _CoordinatorNeededReconciler:
 class _RepairCountingRuntime(InMemoryRuntimeAdapter):
     def __init__(self, workspace_root: Path):
         super().__init__(workspace_root)
+        self.materialization_count = 0
         self.repair_count = 0
+        self.resume_count = 0
+        self.retirement_count = 0
+
+    def materialize(self, admission, prompt=None):
+        self.materialization_count += 1
+        return super().materialize(admission, prompt)
 
     def repair(self, binding, prompt) -> None:
         self.repair_count += 1
         super().repair(binding, prompt)
+
+    def resume(self, binding) -> None:
+        self.resume_count += 1
+        super().resume(binding)
+
+    def retire_after_integration(self, binding, authorization):
+        self.retirement_count += 1
+        return super().retire_after_integration(binding, authorization)
 
 
 class _ReviewingInMemoryRuntime(InMemoryRuntimeAdapter):
@@ -401,6 +416,50 @@ class _ReviewingInMemoryRuntime(InMemoryRuntimeAdapter):
             worktree_absent=False,
             branch_deleted=False,
         )
+
+
+class _HostedCodeRepairRuntime(_ReviewingInMemoryRuntime):
+    def __init__(self, workspace_root: Path):
+        super().__init__(workspace_root)
+        self.materialization_count = 0
+        self.repair_count = 0
+        self.resume_count = 0
+        self.retirement_count = 0
+        self.review_candidates = []
+
+    def materialize(self, admission, prompt=None):
+        self.materialization_count += 1
+        return super().materialize(admission, prompt)
+
+    def repair(self, binding, prompt) -> None:
+        self.repair_count += 1
+        super().repair(binding, prompt)
+        state = self._states[binding.admission_id]
+        state.node["inputs"]["file_changes"][0]["content"] = (
+            "module 1\nhosted repair\n"
+        )
+
+    def resume(self, binding) -> None:
+        self.resume_count += 1
+        super().resume(binding)
+
+    def materialize_review_axis(
+        self,
+        request,
+        profile,
+        *,
+        parent_agent_id,
+    ):
+        self.review_candidates.append(request.candidate_sha)
+        return super().materialize_review_axis(
+            request,
+            profile,
+            parent_agent_id=parent_agent_id,
+        )
+
+    def retire_after_integration(self, binding, authorization):
+        self.retirement_count += 1
+        return super().retire_after_integration(binding, authorization)
 
 
 class _ReviewMaterializationRecoveryRuntime(_ReviewingInMemoryRuntime):
@@ -507,7 +566,14 @@ class _HardFindingReviewRuntime(_ReviewingInMemoryRuntime):
         )
 
 
-def _review_materialization_kernel(tmp_path, runtime, *, risk="standard"):
+def _review_materialization_kernel(
+    tmp_path,
+    runtime,
+    *,
+    risk="standard",
+    hosted_outcomes=("passed",),
+    repairable=False,
+):
     repository = _temporary_repository(tmp_path)
     intent, source, _policy = _multi_ready_inputs(count=1)
     intent["nodes"][0]["risk"] = risk
@@ -536,6 +602,22 @@ def _review_materialization_kernel(tmp_path, runtime, *, risk="standard"):
             "suite": "repository",
         }
     )
+    if repairable:
+        repairable_command = [
+            "python",
+            "-c",
+            (
+                "from pathlib import Path; "
+                "assert Path('module-1.txt').read_text()"
+                ".startswith('module 1\\n')"
+            ),
+        ]
+        for definition in policy["check_definitions"]:
+            if definition["hosted_only"] is not True:
+                definition["command"] = repairable_command
+        intent["nodes"][0]["output_contract"]["checks"][0][
+            "command"
+        ] = repairable_command
     compiled = PlanCompiler().compile(intent, source, policy)
     store_path = tmp_path / "review-materialization.sqlite3"
     publication = LocalPlanPublication(store_path)
@@ -552,7 +634,9 @@ def _review_materialization_kernel(tmp_path, runtime, *, risk="standard"):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
+        delivery_control=InMemoryDeliveryControl(
+            hosted_outcomes=hosted_outcomes,
+        ),
         runtime_config=_worker_runtime_config(
             workers=1,
             extra={
@@ -1272,6 +1356,208 @@ def test_batch_wait_releases_worker_turns_and_refills_before_one_hosted_ci(
     assert delivery.publication_count == 1
 
 
+def test_post_review_hosted_ci_wait_parks_same_worker_durably_across_restart(
+    tmp_path,
+):
+    runtime = _ReviewingInMemoryRuntime(tmp_path / "runtime")
+    kernel, compiled, _work_node = _review_materialization_kernel(
+        tmp_path,
+        runtime,
+        hosted_outcomes=("pending", "pending"),
+    )
+
+    parked = kernel.reconcile_once("local/phase-four-a")
+    state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        parked.node_key,
+    )
+
+    assert state is not None
+    assert parked.active_worker_turns == 0
+    assert state["wait_condition"] == "hosted_ci"
+    assert state["publication_state"] == "published"
+    assert state["worker_parked_for_ci"] is True
+    assert state["candidate_sha"] == parked.candidate_sha
+    assert state["attempt_id"] == parked.attempt_id
+    assert runtime.read_binding(state["admission_id"]) is not None
+
+    restarted = Kernel(
+        store_path=kernel.store_path,
+        publication=kernel.publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=kernel.repository_path,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        delivery_control=kernel.delivery_control,
+        runtime_config=kernel.runtime_config,
+    ).reconcile_once("local/phase-four-a")
+    restarted_state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        parked.node_key,
+    )
+
+    assert restarted.active_worker_turns == 0
+    assert restarted_state is not None
+    assert restarted_state["worker_parked_for_ci"] is True
+    assert restarted_state["candidate_sha"] == parked.candidate_sha
+    assert restarted_state["attempt_id"] == parked.attempt_id
+
+
+def test_hosted_infrastructure_failure_retries_same_parked_candidate_only(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    intent, source, _policy = _multi_ready_inputs(count=1)
+    compiled = PlanCompiler().compile(
+        intent,
+        source,
+        _local_first_policy(1),
+    )
+    store_path = tmp_path / "v8.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-4a",
+    )
+    delivery = InMemoryDeliveryControl(
+        hosted_outcomes=(
+            "pending",
+            "infrastructure_failure",
+            "infrastructure_failure",
+            "infrastructure_failure",
+        )
+    )
+    runtime = _RepairCountingRuntime(tmp_path / "runtime")
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        delivery_control=delivery,
+        runtime_config=_worker_runtime_config(workers=1),
+    )
+
+    parked = kernel.reconcile_once("local/phase-four-a")
+    candidate_sha = parked.candidate_sha
+    attempt_id = parked.attempt_id
+    admission_id = parked.admission_id
+    first_retry = kernel.reconcile_once("local/phase-four-a")
+    second_retry = kernel.reconcile_once("local/phase-four-a")
+    exhausted = kernel.reconcile_once("local/phase-four-a")
+    state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        parked.node_key,
+    )
+
+    assert first_retry.hosted_retry_count == 1
+    assert second_retry.hosted_retry_count == 2
+    assert exhausted.status == "blocked"
+    assert delivery.hosted_retry_count == 2
+    assert runtime.materialization_count == 1
+    assert runtime.resume_count == 1
+    assert runtime.repair_count == 0
+    assert runtime.retirement_count == 0
+    assert state is not None
+    assert state["candidate_sha"] == candidate_sha
+    assert state["attempt_id"] == attempt_id
+    assert state["admission_id"] == admission_id
+    assert state["publication_state"] == "published"
+    assert state["worker_parked_for_ci"] is True
+
+
+def test_single_member_hosted_code_failure_repairs_same_attempt_before_republish(
+    tmp_path,
+):
+    runtime = _HostedCodeRepairRuntime(tmp_path / "runtime")
+    kernel, compiled, _work_node = _review_materialization_kernel(
+        tmp_path,
+        runtime,
+        hosted_outcomes=("code_failure", "pending", "passed"),
+        repairable=True,
+    )
+
+    repair = kernel.reconcile_once("local/phase-four-a")
+    rejected_candidate_sha = kernel.delivery_control.published_candidate_sha
+    repairing_state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        repair.node_key,
+    )
+
+    assert repairing_state is not None
+    assert rejected_candidate_sha is not None
+    assert runtime.repair_count == 1
+    assert runtime.retirement_count == 0
+    assert repairing_state["attempt_state"] == "repairing"
+    assert repairing_state["attempt_id"] == repair.attempt_id
+    assert repairing_state["admission_id"] == repair.admission_id
+    assert repairing_state["attempt_ordinal"] == 1
+    assert repairing_state["repair_rounds_used"] == 1
+    assert repairing_state["resume_sent"] is False
+    assert repairing_state["worker_parked_for_ci"] is False
+    assert repairing_state["candidate_sha"] is None
+    assert repairing_state["candidate_observation"] is None
+    assert repairing_state["candidate_evidence_manifest"] is None
+    assert repairing_state["candidate_evidence_manifest_digest"] is None
+    assert repairing_state["review_evidence"] is None
+    assert repairing_state["effect_verification"] is None
+    assert repairing_state["result_digest"] is None
+    assert repairing_state["publication_eligible"] is None
+    assert repairing_state["publication_state"] is None
+    assert repairing_state["publication_ref"] is None
+    assert repairing_state["hosted_check_state"] is None
+    assert repairing_state["integration_batch_id"] is None
+    assert repairing_state["integration_batch_sha"] is None
+
+    republished = kernel.reconcile_once("local/phase-four-a")
+    republished_state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        repair.node_key,
+    )
+
+    assert republished_state is not None
+    assert republished.status == "waiting"
+    assert republished.wait_condition == "hosted_ci"
+    assert republished.active_worker_turns == 0
+    assert republished.attempt_id == repair.attempt_id
+    assert republished.admission_id == repair.admission_id
+    assert republished.candidate_sha != rejected_candidate_sha
+    assert runtime.materialization_count == 1
+    assert runtime.resume_count == 2
+    assert runtime.repair_count == 1
+    assert runtime.retirement_count == 0
+    assert kernel.delivery_control.publication_count == 2
+    assert runtime.review_candidates.count(republished.candidate_sha) == 2
+    evidence = republished_state["candidate_observation"]["evidence"]
+    assert any(
+        item["kind"] == "check"
+        and item["subject"] == republished.candidate_sha
+        and item["payload"]["outcome"] == "passed"
+        for item in evidence
+    )
+    assert any(
+        item["kind"] == "review"
+        and item["subject"] == republished.candidate_sha
+        for item in evidence
+    )
+
+    integrated = kernel.reconcile_once("local/phase-four-a")
+
+    assert integrated.status == "complete"
+    assert integrated.attempt_id == repair.attempt_id
+    assert integrated.attempt_ordinal == 1
+    assert runtime.retirement_count == 1
+
+
 def test_batch_hosted_failure_stops_without_blind_worker_repair(tmp_path):
     repository = _temporary_repository(tmp_path)
     intent, source, _policy = _multi_ready_inputs(count=2)
@@ -1319,16 +1605,37 @@ def test_batch_hosted_failure_stops_without_blind_worker_repair(tmp_path):
     assert {
         item.wait_condition for item in second.node_outcomes
     } == {"hosted_ci"}
+    parked_identities = {
+        item.node_key: (item.admission_id, item.attempt_id, item.candidate_sha)
+        for item in second.node_outcomes
+    }
 
     third = kernel.reconcile_once("local/phase-four-a")
 
     assert runtime.repair_count == 0
+    assert runtime.retirement_count == 0
+    assert runtime.materialization_count == 2
+    assert runtime.resume_count == 2
     assert third.admitted_node_keys == ()
     assert third.active_worker_turns == 0
     assert {item.status for item in third.node_outcomes} == {"blocked"}
+    assert {item.directive for item in third.node_outcomes} == {
+        "invoke_coordinator"
+    }
     assert {item.attempt_state for item in third.node_outcomes} == {
         "integration_batch_failed"
     }
+    states = kernel._read_states("local/phase-four-a", compiled.digest)
+    assert {
+        state["node_key"]: (
+            state["admission_id"],
+            state["attempt_id"],
+            state["candidate_sha"],
+        )
+        for state in states
+    } == parked_identities
+    assert {state["publication_state"] for state in states} == {"published"}
+    assert {state["worker_parked_for_ci"] for state in states} == {True}
 
 
 def test_same_node_recovery_reservation_is_compare_and_swap(tmp_path):
