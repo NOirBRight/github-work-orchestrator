@@ -1129,7 +1129,7 @@ def test_saturated_workers_cannot_consume_reserved_coordinator_capacity(
     tmp_path,
 ):
     repository = _temporary_repository(tmp_path)
-    intent, source, _policy = _multi_ready_inputs(count=1)
+    intent, source, policy = _multi_ready_inputs(count=1)
     compiled = PlanCompiler().compile(intent, source, policy)
     store_path = tmp_path / "driver.sqlite3"
     publication = LocalPlanPublication(store_path)

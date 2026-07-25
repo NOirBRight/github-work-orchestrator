@@ -945,6 +945,8 @@ class PaseoClient(Protocol):
 class InMemoryPaseoClient:
     """Deterministic contract fake for Paseo lifecycle capabilities."""
 
+    native_finish_notification_supported = True
+
     def __init__(
         self,
         *,
