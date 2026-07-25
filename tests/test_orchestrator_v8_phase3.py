@@ -38,6 +38,7 @@ from gwo_v8 import (  # noqa: E402
     resolve_review_profile,
 )
 from gwo_v8.kernel import DeliveryControlError  # noqa: E402
+from gwo_v8.review_convergence import ReviewConvergence  # noqa: E402
 from gwo_v8.runtime import (  # noqa: E402
     PASEO_INLINE_PROMPT_MAX_BYTES,
     _environment_snapshot,
@@ -3159,7 +3160,7 @@ def test_changed_candidate_review_request_carries_bounded_prior_context(
         risk="standard",
     )
     base_sha = _git(Path(binding.workspace), "rev-parse", "HEAD^")
-    request = Kernel._review_request(
+    request = ReviewConvergence._review_request(
         state={
             "repository": "local/phase-three",
             "base_sha": base_sha,
@@ -3197,7 +3198,7 @@ def test_review_request_references_large_outcome_contents_by_digest(tmp_path):
         risk="standard",
     )
     content = "large frozen source payload\n" * 20_000
-    request = Kernel._review_request(
+    request = ReviewConvergence._review_request(
         state={
             "repository": "local/phase-three",
             "base_sha": _git(Path(binding.workspace), "rev-parse", "HEAD^"),

@@ -37,6 +37,7 @@ from gwo_v8 import (  # noqa: E402
     RuntimeProfile,
     resolve_active_turn_pools,
 )
+from gwo_v8.review_convergence import ReviewConvergence  # noqa: E402
 import orch_core  # noqa: E402
 
 
@@ -658,7 +659,7 @@ def test_changed_candidate_review_axis_materialization_reset_clears_all_axis_sta
         "review_evidence": {"kind": "review"},
     }
 
-    Kernel._invalidate_review_candidate(state)
+    ReviewConvergence.invalidate_candidate(state)
 
     assert state == {
         "review_candidate_sha": None,
@@ -670,6 +671,34 @@ def test_changed_candidate_review_axis_materialization_reset_clears_all_axis_sta
         "review_children_retired": False,
         "review_evidence": None,
     }
+
+
+def test_review_convergence_is_one_deep_module_behind_kernel():
+    import typing
+
+    from gwo_v8.review_convergence import (
+        ReviewConvergence,
+        ReviewConvergenceDecision,
+    )
+
+    hints = typing.get_type_hints(ReviewConvergenceDecision)
+    assert set(typing.get_args(hints["status"])) == {
+        "waiting",
+        "accepted",
+        "rejected",
+        "blocked",
+    }
+    assert hasattr(ReviewConvergence, "converge")
+    assert hasattr(ReviewConvergence, "invalidate_candidate")
+    for moved in (
+        "_ensure_review_evidence",
+        "_review_request",
+        "_review_wait",
+        "_review_prompt_wait",
+        "_review_materialization_wait",
+        "_invalidate_review_candidate",
+    ):
+        assert not hasattr(Kernel, moved), moved
 
 
 class _ReadCountingDetachedPaseoClient(InMemoryPaseoClient):

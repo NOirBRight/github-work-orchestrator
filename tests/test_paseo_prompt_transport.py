@@ -16,7 +16,6 @@ sys.path.insert(0, str(SCRIPTS))
 
 from gwo_v8 import (  # noqa: E402
     InMemoryPaseoClient,
-    Kernel,
     PaseoAgentRecord,
     PaseoCliClient,
     PaseoRuntimeAdapter,
@@ -26,6 +25,7 @@ from gwo_v8 import (  # noqa: E402
     RuntimeProfile,
     RuntimePrompt,
 )
+from gwo_v8.review_convergence import ReviewConvergence  # noqa: E402
 from gwo_v8.runtime import (  # noqa: E402
     PASEO_INLINE_PROMPT_MAX_BYTES,
     _paseo_bootstrap_prompt,
@@ -1155,7 +1155,7 @@ def test_review_axis_ambiguous_bootstrap_child_delivers_exact_prompt_once(
 
 def test_review_prompts_keep_spec_authority_without_repeating_file_contents():
     content = "frozen-content-" * 25_000
-    compacted = Kernel._compact_review_contract(
+    compacted = ReviewConvergence._compact_review_contract(
         {
             "file_changes": [
                 {
