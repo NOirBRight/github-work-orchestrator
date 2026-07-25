@@ -62,6 +62,7 @@ def _record(
     workspace: str = "C:/workspace",
     lifecycle: str = "idle",
     parent_agent_id: str | None = None,
+    declared_parent_agent_id: str | None = None,
 ) -> PaseoAgentRecord:
     return PaseoAgentRecord(
         agent_id=agent_id,
@@ -77,6 +78,7 @@ def _record(
         features=dict(profile.features),
         labels={},
         lifecycle=lifecycle,
+        declared_parent_agent_id=declared_parent_agent_id,
     )
 
 
@@ -185,6 +187,59 @@ def test_cli_activity_readback_requires_an_exact_user_message_boundary(
     assert client.prompt_acceptance_count("agent-1", prompt) == 1
 
 
+def test_cli_parent_readback_preserves_declared_owner_without_native_finish(
+    monkeypatch,
+):
+    client = PaseoCliClient(executable="paseo")
+    profile = _profile()
+    declared_parent = "coordinator-agent"
+    labels = {
+        "gwo.repository": "local/parent-readback",
+        "gwo.plan": "p" * 64,
+        "gwo.node": "node:parent-readback",
+        "gwo.admission": "admission:parent-readback",
+        "gwo.repository_path": "C:/repository",
+        "gwo.runtime_profile": profile.name,
+        "gwo.profile_digest": profile.digest,
+        "gwo.parent_agent": declared_parent,
+        "gwo.base_sha": "b" * 40,
+    }
+    payload = {
+        "Id": "detached-child",
+        "SessionId": "session-detached-child",
+        "WorkspaceId": "workspace-detached-child",
+        "Cwd": "C:/workspace",
+        "ParentAgentId": None,
+        "Provider": profile.provider,
+        "Model": profile.model,
+        "Thinking": profile.thinking,
+        "Mode": profile.mode,
+        "RuntimeSettings": {"features": {}},
+        "Status": "idle",
+        "Labels": {},
+    }
+
+    def run(command, **_kwargs):
+        if command[0] == "ls":
+            return [{"id": "detached-child"}]
+        if command[0] == "inspect":
+            return payload
+        raise AssertionError(command)
+
+    monkeypatch.setattr(client, "_run", run)
+
+    records = client.find_by_labels(labels)
+    assert len(records) == 1
+    record = records[0]
+    binding = PaseoRuntimeAdapter(client)._binding(record)
+
+    assert record.parent_agent_id is None
+    assert record.declared_parent_agent_id == declared_parent
+    assert binding.parent_agent_id is None
+    assert binding.declared_parent_agent_id == declared_parent
+    assert binding.native_finish_notification_supported is False
+
+
 def test_windows_command_line_overflow_is_not_executable_absence(monkeypatch):
     client = PaseoCliClient(executable="paseo")
 
@@ -267,9 +322,9 @@ class RestartBlindPaseoClient:
                         "gwo.profile_digest",
                         record.profile_digest,
                     ),
-                    parent_agent_id=labels.get(
+                    declared_parent_agent_id=labels.get(
                         "gwo.parent_agent",
-                        record.parent_agent_id,
+                        record.declared_parent_agent_id,
                     ),
                 )
             )
@@ -290,6 +345,7 @@ class RestartBlindPaseoClient:
             ),
             lifecycle="idle",
             parent_agent_id=request.parent_agent_id,
+            declared_parent_agent_id=request.parent_agent_id,
         )
         self._records[agent_id] = record
         self._labels[agent_id] = {

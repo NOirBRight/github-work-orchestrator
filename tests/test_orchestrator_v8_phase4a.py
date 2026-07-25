@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import subprocess
@@ -15,6 +16,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scr
 sys.path.insert(0, str(SCRIPTS))
 
 from gwo_v8 import (  # noqa: E402
+    DurableWake,
     EvidenceVerifier,
     GoalDriver,
     GoalDriverError,
@@ -367,6 +369,52 @@ class _SweepThenCompleteReconciler:
             completed_work_item_keys=(
                 ("issue:goal:sweep",) if complete else ()
             ),
+        )
+
+
+class _WaitThenCompleteReconciler:
+    def __init__(
+        self,
+        *,
+        goal_key: str,
+        wait_condition: str,
+        next_check_at: str,
+    ):
+        self.goal_key = goal_key
+        self.wait_condition = wait_condition
+        self.next_check_at = next_check_at
+        self.calls = 0
+
+    def reconcile_once(self, repository: str) -> ReconcileOutcome:
+        self.calls += 1
+        complete = self.calls > 1
+        work_item_key = f"issue:{self.goal_key}"
+        return ReconcileOutcome(
+            status="complete" if complete else "waiting",
+            directive="goal_complete" if complete else "wait_for_runtime",
+            repository=repository,
+            plan_digest="a" * 64,
+            goal_key=self.goal_key,
+            goal_state="completed" if complete else "active",
+            work_item_key=work_item_key,
+            work_item_state="integrated" if complete else "active",
+            node_key=f"node:{self.goal_key}",
+            admission_id=f"admission:{self.goal_key}",
+            admission_state="consumed",
+            attempt_id=f"attempt:{self.goal_key}",
+            attempt_state="verified" if complete else "parked",
+            candidate_sha=None,
+            result_digest=None,
+            materialization_executions=1,
+            wait_condition=None if complete else self.wait_condition,
+            wait_source_ref=(
+                None if complete else f"paseo://wait/{self.goal_key}"
+            ),
+            wait_event_identity=(
+                None if complete else f"finish:{self.goal_key}"
+            ),
+            next_check_at=None if complete else self.next_check_at,
+            completed_work_item_keys=((work_item_key,) if complete else ()),
         )
 
 
@@ -1062,7 +1110,7 @@ def test_saturated_workers_cannot_consume_reserved_coordinator_capacity(
     tmp_path,
 ):
     repository = _temporary_repository(tmp_path)
-    intent, source, policy = _multi_ready_inputs(count=1)
+    intent, source, _policy = _multi_ready_inputs(count=1)
     compiled = PlanCompiler().compile(intent, source, policy)
     store_path = tmp_path / "driver.sqlite3"
     publication = LocalPlanPublication(store_path)
@@ -1254,6 +1302,252 @@ def test_kernel_sweep_rechecks_without_an_external_wake(tmp_path):
     assert finished.kind == "finish"
     assert reconciler.calls == 2
     assert runtime.auto_create_count == 0
+
+
+def test_due_wait_runs_one_kernel_readback_after_missed_finish(tmp_path):
+    reconciler = _WaitThenCompleteReconciler(
+        goal_key="goal:due-wait",
+        wait_condition="runtime_result",
+        next_check_at=(
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat(),
+    )
+    driver = GoalDriver(
+        store_path=tmp_path / "driver.sqlite3",
+        reconciler=reconciler,
+        coordinators=InMemoryCoordinatorRuntime(),
+        auto_profile=_coordinator_profile(),
+        durable=InMemoryDurableGoalControl(),
+    )
+    snapshot = _goal_snapshot("goal:due-wait")
+
+    waiting = driver.run_once(snapshot)
+    finished = driver.run_once(snapshot)
+
+    assert waiting.kind == "wait"
+    assert waiting.wait_event_identity == "finish:goal:due-wait"
+    assert finished.kind == "finish"
+    assert reconciler.calls == 2
+
+
+def test_due_wait_sleeps_until_due_and_event_wakes_first(tmp_path):
+    next_check_at = (
+        datetime.now(timezone.utc) + timedelta(hours=1)
+    ).isoformat()
+    reconciler = _WaitThenCompleteReconciler(
+        goal_key="goal:event-first",
+        wait_condition="runtime_result",
+        next_check_at=next_check_at,
+    )
+    durable = InMemoryDurableGoalControl()
+    driver = GoalDriver(
+        store_path=tmp_path / "driver.sqlite3",
+        reconciler=reconciler,
+        coordinators=InMemoryCoordinatorRuntime(),
+        auto_profile=_coordinator_profile(),
+        durable=durable,
+    )
+    snapshot = _goal_snapshot("goal:event-first")
+
+    waiting = driver.run_once(snapshot)
+    still_waiting = driver.run_once(snapshot)
+    wake_reference = "gwo-wake://event-first"
+    wake = DurableWake(
+        goal_key=snapshot.goal_key,
+        semantic_input_digest=waiting.semantic_input_digest,
+        wait_condition="runtime_result",
+        source_ref="paseo://wait/goal:event-first",
+        event_identity="finish:goal:event-first",
+        durable_reference=wake_reference,
+    )
+    durable.publish_wake(snapshot.repository, wake)
+    finished = driver.run_once(snapshot, wake_reference=wake_reference)
+
+    assert still_waiting.kind == "wait"
+    assert still_waiting.next_check_at == next_check_at
+    assert reconciler.calls == 2
+    assert finished.kind == "finish"
+    status = driver.read_status(snapshot.repository, snapshot.goal_key)
+    assert status is not None
+    assert status.last_wake_reference == wake_reference
+
+
+def test_due_wait_never_polls_human_decision(tmp_path):
+    reconciler = _WaitThenCompleteReconciler(
+        goal_key="goal:human-wait",
+        wait_condition="human_decision",
+        next_check_at=(
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).isoformat(),
+    )
+    driver = GoalDriver(
+        store_path=tmp_path / "driver.sqlite3",
+        reconciler=reconciler,
+        coordinators=InMemoryCoordinatorRuntime(),
+        auto_profile=_coordinator_profile(),
+        durable=InMemoryDurableGoalControl(),
+    )
+    snapshot = _goal_snapshot("goal:human-wait")
+
+    waiting = driver.run_once(snapshot)
+    still_waiting = driver.run_once(snapshot)
+
+    assert waiting.kind == "wait"
+    assert still_waiting.kind == "wait"
+    assert still_waiting.wait_condition == "human_decision"
+    assert reconciler.calls == 1
+
+
+def test_missed_finish_restart_adopts_result_once_and_retires(tmp_path):
+    repository = _temporary_repository(tmp_path)
+    intent, source, policy = _multi_ready_inputs(count=1)
+    compiled = PlanCompiler().compile(
+        intent,
+        source,
+        _local_first_policy(1),
+    )
+    plan = json.loads(compiled.canonical_bytes)
+    work_node = next(node for node in plan["nodes"] if node["kind"] == "work")
+    store_path = tmp_path / "driver.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-4a",
+    )
+    client = InMemoryPaseoClient(
+        native_finish_notification_supported=False,
+    )
+    delivery = InMemoryDeliveryControl(hosted_outcomes=("passed",))
+
+    def new_kernel() -> Kernel:
+        return Kernel(
+            store_path=store_path,
+            publication=publication,
+            runtime=PaseoRuntimeAdapter(client),
+            verifier=EvidenceVerifier(),
+            repository_path=repository,
+            integration_branch="main",
+            writer_generation="phase-4a",
+            runtime_profile=_runtime_profile(),
+            delivery_control=delivery,
+            parent_agent_id="coordinator-agent",
+        )
+
+    snapshot = GoalSnapshot(
+        repository=source["repository"],
+        goal_key="goal:phase-4a",
+        objective="Build the compatible ready frontier in parallel.",
+        acceptance=("Every independent module is integrated.",),
+        plan_digest=compiled.digest,
+        work_items=(("issue:101", "active"),),
+        decision_inputs=(),
+    )
+    first_kernel = new_kernel()
+    first_driver = GoalDriver(
+        store_path=store_path,
+        reconciler=first_kernel,
+        coordinators=InMemoryCoordinatorRuntime(),
+        auto_profile=_coordinator_profile(),
+        durable=InMemoryDurableGoalControl(),
+    )
+
+    waiting = first_driver.run_once(snapshot)
+    records = client.find_by_labels({"gwo.node": work_node["node_key"]})
+    assert len(records) == 1
+    record = records[0]
+    state = first_kernel._read_state(
+        snapshot.repository,
+        compiled.digest,
+        work_node["node_key"],
+    )
+    assert state is not None
+    prompt = first_kernel._prompt_from_state(state)
+    workspace = Path(record.workspace)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "--detach",
+            str(workspace),
+            state["base_sha"],
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    (workspace / "module-1.txt").write_text("module 1\n", encoding="utf-8")
+    _git(workspace, "add", "module-1.txt")
+    _git(workspace, "commit", "-m", "Complete missed-finish candidate")
+    candidate_sha = _git(workspace, "rev-parse", "HEAD")
+    client.set_output(
+        record.agent_id,
+        "GWO_RESULT "
+        + json.dumps(
+            {
+                "schema_version": 1,
+                "action_key": work_node["node_key"],
+                "candidate_sha": candidate_sha,
+            },
+            separators=(",", ":"),
+        ),
+    )
+    assert waiting.kind == "wait"
+    assert record.parent_agent_id is None
+    assert record.declared_parent_agent_id == "coordinator-agent"
+    assert client.prompt_acceptance_count(record.agent_id, prompt) == 1
+
+    status = first_driver.read_status(snapshot.repository, snapshot.goal_key)
+    assert status is not None
+    first_driver._write_status(
+        replace(
+            status,
+            next_check_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+        )
+    )
+
+    restarted_kernel = new_kernel()
+    restarted_driver = GoalDriver(
+        store_path=store_path,
+        reconciler=restarted_kernel,
+        coordinators=InMemoryCoordinatorRuntime(),
+        auto_profile=_coordinator_profile(),
+        durable=InMemoryDurableGoalControl(),
+    )
+    adopted = restarted_driver.run_once(snapshot)
+    adopted_state = restarted_kernel._read_state(
+        snapshot.repository,
+        compiled.digest,
+        work_node["node_key"],
+    )
+    assert adopted.kind == "finish"
+    assert adopted_state is not None
+    assert adopted_state["candidate_sha"] == candidate_sha
+    result_digest = adopted_state["result_digest"]
+    assert isinstance(result_digest, str) and result_digest
+    assert client.inspect(record.agent_id).archived is True
+    assert client.create_count == 1
+    assert client.send_count == 0
+    assert client.prompt_acceptance_count(record.agent_id, prompt) == 1
+
+    finished = restarted_driver.run_once(snapshot)
+    finished_state = restarted_kernel._read_state(
+        snapshot.repository,
+        compiled.digest,
+        work_node["node_key"],
+    )
+
+    assert finished.kind == "finish"
+    assert finished_state is not None
+    assert finished_state["result_digest"] == result_digest
+    assert client.create_count == 1
+    assert client.prompt_acceptance_count(record.agent_id, prompt) == 1
 
 
 def test_kernel_sweep_never_hides_decision_or_coordinator_directives():

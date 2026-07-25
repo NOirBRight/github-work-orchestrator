@@ -346,6 +346,8 @@ class RuntimeBinding:
     session_id: str | None = None
     workspace_id: str | None = None
     parent_agent_id: str | None = None
+    declared_parent_agent_id: str | None = None
+    native_finish_notification_supported: bool = False
     runtime_profile: str | None = None
     profile_digest: str | None = None
     provider: str | None = None
@@ -645,6 +647,8 @@ class ReviewAxisBinding:
     thinking: str
     mode: str
     prompt_digest: str
+    declared_parent_agent_id: str | None = None
+    native_finish_notification_supported: bool = False
 
 
 @dataclass(frozen=True)
@@ -890,10 +894,13 @@ class PaseoAgentRecord:
     result_claim: ResultClaim | None = None
     evidence: tuple[TypedEvidence, ...] = ()
     output_text: str | None = None
+    declared_parent_agent_id: str | None = None
 
 
 class PaseoClient(Protocol):
     """Host boundary used by the production Paseo Runtime Adapter."""
+
+    native_finish_notification_supported: bool
 
     def find_by_labels(
         self, labels: dict[str, str]
@@ -944,12 +951,16 @@ class InMemoryPaseoClient:
         create_failures: tuple[str, ...] = (),
         send_acceptances: tuple[bool, ...] = (),
         worker_turn_capacity: int | None = None,
+        native_finish_notification_supported: bool = True,
     ):
         self._agents: dict[str, PaseoAgentRecord] = {}
         self._create_failures = list(create_failures)
         self._send_acceptances = list(send_acceptances)
         self._accepted_prompt_digests: dict[str, list[str]] = {}
         self._worker_turn_capacity = worker_turn_capacity
+        self.native_finish_notification_supported = (
+            native_finish_notification_supported
+        )
         self._create_receipt: tuple[str, str] | None = None
         self.create_count = 0
         self.send_count = 0
@@ -1012,7 +1023,11 @@ class InMemoryPaseoClient:
             workspace=str(
                 (Path(request.repository_path) / f".paseo-{suffix}").resolve()
             ),
-            parent_agent_id=request.parent_agent_id,
+            parent_agent_id=(
+                request.parent_agent_id
+                if self.native_finish_notification_supported
+                else None
+            ),
             provider=request.profile.provider,
             model=request.profile.model,
             profile_digest=request.profile.digest,
@@ -1024,6 +1039,7 @@ class InMemoryPaseoClient:
                 "gwo.action_key": request.action_key,
             },
             lifecycle="running",
+            declared_parent_agent_id=request.parent_agent_id,
         )
         self._agents[agent_id] = record
         self._accepted_prompt_digests[agent_id] = [request.prompt.digest]
@@ -1092,6 +1108,10 @@ class InMemoryPaseoClient:
         self._agents[agent_id] = replace(
             record,
             labels={**record.labels, **labels},
+            declared_parent_agent_id=labels.get(
+                "gwo.parent_agent",
+                record.declared_parent_agent_id,
+            ),
         )
 
     def read_output(self, agent_id: str) -> str | None:
@@ -1116,6 +1136,8 @@ class InMemoryPaseoClient:
 
 class PaseoCliClient:
     """Concrete Paseo client for the public CLI lifecycle surface."""
+
+    native_finish_notification_supported = False
 
     def __init__(self, executable: str = "paseo"):
         self.executable = shutil.which(executable) or executable
@@ -1415,6 +1437,7 @@ class PaseoCliClient:
             labels=labels,
             lifecycle="archived" if archived else lifecycle,
             archived=archived,
+            declared_parent_agent_id=labels.get("gwo.parent_agent"),
         )
 
     def find_by_labels(self, labels: dict[str, str]) -> tuple[PaseoAgentRecord, ...]:
@@ -1445,20 +1468,20 @@ class PaseoCliClient:
                     failure_class="ambiguous",
                 )
             record = self.inspect(agent_id)
+            merged_labels = {
+                **record.labels,
+                **labels,
+            }
             records.append(
                 replace(
                     record,
-                    labels={
-                        **record.labels,
-                        **labels,
-                    },
+                    labels=merged_labels,
                     profile_digest=labels.get(
                         "gwo.profile_digest",
                         record.profile_digest,
                     ),
-                    parent_agent_id=labels.get(
+                    declared_parent_agent_id=merged_labels.get(
                         "gwo.parent_agent",
-                        record.parent_agent_id,
                     ),
                 ),
             )
@@ -1725,6 +1748,15 @@ class PaseoRuntimeAdapter:
             None,
         )
         return None if not callable(observe) else observe(profile)
+
+    def _native_finish_notification_supported(self) -> bool:
+        return bool(
+            getattr(
+                self.client,
+                "native_finish_notification_supported",
+                False,
+            )
+        )
 
     @staticmethod
     def _identity_labels(admission: RuntimeAdmission) -> dict[str, str]:
@@ -2092,7 +2124,7 @@ class PaseoRuntimeAdapter:
             "gwo.repository_path": binding.repository_path,
             "gwo.runtime_profile": binding.runtime_profile,
             "gwo.profile_digest": binding.profile_digest,
-            "gwo.parent_agent": binding.parent_agent_id,
+            "gwo.parent_agent": binding.declared_parent_agent_id,
             "gwo.base_sha": binding.base_sha,
             "gwo.prompt_digest": (
                 binding.prompt_digest if include_prompt else None
@@ -2108,8 +2140,7 @@ class PaseoRuntimeAdapter:
         )
         return labels
 
-    @staticmethod
-    def _binding(agent: PaseoAgentRecord) -> RuntimeBinding:
+    def _binding(self, agent: PaseoAgentRecord) -> RuntimeBinding:
         labels = agent.labels
         required = ("gwo.repository", "gwo.plan", "gwo.node", "gwo.admission")
         if any(
@@ -2138,6 +2169,10 @@ class PaseoRuntimeAdapter:
             session_id=agent.session_id,
             workspace_id=agent.workspace_id,
             parent_agent_id=agent.parent_agent_id,
+            declared_parent_agent_id=agent.declared_parent_agent_id,
+            native_finish_notification_supported=(
+                self._native_finish_notification_supported()
+            ),
             runtime_profile=labels.get("gwo.runtime_profile"),
             profile_digest=agent.profile_digest,
             provider=agent.provider,
@@ -2161,7 +2196,7 @@ class PaseoRuntimeAdapter:
             or binding.plan_digest != admission.plan_digest
             or binding.node_key != admission.node_key
             or binding.admission_id != admission.admission_id
-            or binding.parent_agent_id != admission.parent_agent_id
+            or binding.declared_parent_agent_id != admission.parent_agent_id
             or binding.runtime_profile != profile.name
             or binding.profile_digest != profile.digest
             or binding.provider != profile.provider
@@ -2615,6 +2650,15 @@ class PaseoRuntimeAdapter:
             observed.admission_id != binding.admission_id
             or observed.plan_digest != binding.plan_digest
             or observed.node_key != binding.node_key
+            or observed.parent_agent_id != binding.parent_agent_id
+            or (
+                observed.declared_parent_agent_id
+                != binding.declared_parent_agent_id
+            )
+            or (
+                observed.native_finish_notification_supported
+                != binding.native_finish_notification_supported
+            )
         ):
             raise RuntimeAdapterError(
                 "RUNTIME_IDENTITY_MISMATCH",
@@ -2847,8 +2891,8 @@ class PaseoRuntimeAdapter:
                 failure_class="ambiguous",
             )
 
-    @staticmethod
     def _review_binding(
+        self,
         agent: PaseoAgentRecord,
         request: ReviewAxisRequest,
         profile: RuntimeProfile,
@@ -2866,7 +2910,7 @@ class PaseoRuntimeAdapter:
             or labels.get("gwo.prompt_digest") != prompt.digest
             or labels.get("gwo.runtime_profile") != profile.name
             or labels.get("gwo.profile_digest") != profile.digest
-            or agent.parent_agent_id != parent_agent_id
+            or agent.declared_parent_agent_id != parent_agent_id
             or agent.profile_digest != profile.digest
             or agent.provider != profile.provider
             or agent.model != profile.model
@@ -2911,6 +2955,10 @@ class PaseoRuntimeAdapter:
             thinking=profile.thinking,
             mode=profile.mode,
             prompt_digest=prompt.digest,
+            declared_parent_agent_id=agent.declared_parent_agent_id,
+            native_finish_notification_supported=(
+                self._native_finish_notification_supported()
+            ),
         )
 
     def materialize_review_axis(
@@ -3067,8 +3115,8 @@ class PaseoRuntimeAdapter:
             "gwo.profile_digest": binding.profile_digest,
             "gwo.prompt_digest": binding.prompt_digest,
         }
-        if binding.parent_agent_id is not None:
-            labels["gwo.parent_agent"] = binding.parent_agent_id
+        if binding.declared_parent_agent_id is not None:
+            labels["gwo.parent_agent"] = binding.declared_parent_agent_id
         agent = self._find_exact(
             binding.agent_id,
             labels,
@@ -3091,6 +3139,15 @@ class PaseoRuntimeAdapter:
         if (
             agent.agent_id != binding.agent_id
             or agent.session_id != binding.session_id
+            or agent.parent_agent_id != binding.parent_agent_id
+            or (
+                agent.declared_parent_agent_id
+                != binding.declared_parent_agent_id
+            )
+            or (
+                self._native_finish_notification_supported()
+                != binding.native_finish_notification_supported
+            )
             or agent.profile_digest != binding.profile_digest
             or agent.provider != binding.provider
             or agent.model != binding.model
@@ -3302,6 +3359,8 @@ class InMemoryRuntimeAdapter:
             session_id=f"session:{runtime_id}",
             workspace_id=f"workspace:{runtime_id}",
             parent_agent_id=admission.parent_agent_id,
+            declared_parent_agent_id=admission.parent_agent_id,
+            native_finish_notification_supported=True,
             runtime_profile=(
                 None
                 if admission.runtime_profile is None

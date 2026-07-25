@@ -783,6 +783,21 @@ class PaseoCoordinatorRuntime:
 class GoalDriver:
     """Run one Kernel pass and return one bounded host continuation directive."""
 
+    _IMMEDIATE_RECONCILIATION_WAITS = {
+        "coordinator_capacity",
+        "integration_lease",
+        "integration_turn",
+        "kernel_sweep",
+        "recovery_dispatch",
+        "worker_capacity",
+    }
+    _NON_POLLING_WAITS = {
+        "decision",
+        "decision_gate",
+        "external_input",
+        "human_decision",
+        "semantic_input_refresh",
+    }
     _OUTCOMES = {
         "zero_outcome",
         "executable_work",
@@ -1017,6 +1032,24 @@ class GoalDriver:
     def _write_status(self, status: GoalDriverStatus) -> None:
         with self._connect() as connection:
             self._upsert_status(connection, status)
+
+    @staticmethod
+    def _next_check_is_due(next_check_at: str | None) -> bool:
+        if next_check_at is None:
+            return False
+        try:
+            due = datetime.fromisoformat(next_check_at.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise GoalDriverError(
+                "WAIT_NEXT_CHECK_INVALID",
+                "Wait Condition next_check_at is not an ISO-8601 timestamp",
+            ) from error
+        if due.tzinfo is None or due.utcoffset() is None:
+            raise GoalDriverError(
+                "WAIT_NEXT_CHECK_INVALID",
+                "Wait Condition next_check_at must include a UTC offset",
+            )
+        return due <= datetime.now(timezone.utc)
 
     def _apply_observation(
         self,
@@ -1320,22 +1353,6 @@ class GoalDriver:
                     wait_source_ref=status.wait_source_ref,
                     wait_event_identity=status.wait_event_identity,
                 )
-        elif status.wait_condition in {
-            "coordinator_capacity",
-            "integration_lease",
-            "integration_turn",
-            "kernel_sweep",
-            "recovery_dispatch",
-            "worker_capacity",
-        }:
-            status = replace(
-                status,
-                wait_condition=None,
-                wait_source_ref=None,
-                wait_event_identity=None,
-                next_check_at=None,
-            )
-            self._write_status(status)
         elif status.wait_condition is not None:
             wake = (
                 None
@@ -1345,17 +1362,26 @@ class GoalDriver:
                     wake_reference,
                 )
             )
-            if (
-                wake_reference is None
-                or wake_reference == status.last_wake_reference
-                or wake is None
-                or wake.durable_reference != wake_reference
-                or wake.goal_key != status.goal_key
-                or wake.semantic_input_digest != status.semantic_input_digest
-                or wake.wait_condition != status.wait_condition
-                or wake.source_ref != status.wait_source_ref
-                or wake.event_identity != status.wait_event_identity
-            ):
+            wake_matches = (
+                wake_reference is not None
+                and wake_reference != status.last_wake_reference
+                and wake is not None
+                and wake.durable_reference == wake_reference
+                and wake.goal_key == status.goal_key
+                and wake.semantic_input_digest == status.semantic_input_digest
+                and wake.wait_condition == status.wait_condition
+                and wake.source_ref == status.wait_source_ref
+                and wake.event_identity == status.wait_event_identity
+            )
+            immediate_readback = (
+                status.wait_condition in self._IMMEDIATE_RECONCILIATION_WAITS
+                and status.next_check_at is None
+            )
+            due_readback = (
+                status.wait_condition not in self._NON_POLLING_WAITS
+                and self._next_check_is_due(status.next_check_at)
+            )
+            if not wake_matches and not immediate_readback and not due_readback:
                 return self._directive(
                     "wait",
                     status,
@@ -1370,7 +1396,9 @@ class GoalDriver:
                 wait_source_ref=None,
                 wait_event_identity=None,
                 next_check_at=None,
-                last_wake_reference=wake_reference,
+                last_wake_reference=(
+                    wake_reference if wake_matches else status.last_wake_reference
+                ),
             )
             self._write_status(status)
         if observation is not None:

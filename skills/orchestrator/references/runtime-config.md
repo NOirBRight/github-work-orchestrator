@@ -287,8 +287,35 @@ than being treated as success.
 
 `paseo inspect` may omit labels. Fresh Coordinator processes therefore rebuild
 Worker and Review identity from authoritative `paseo ls --label ...` queries
-using Admission or Review action identity, runtime profile, Candidate, parent,
-and Prompt digest. Process-local label caches are not part of correctness.
+using Admission or Review action identity, runtime profile, Candidate, declared
+GWO owner, and Prompt digest. Process-local label caches are not part of
+correctness.
+
+Paseo `ParentAgentId` and the `gwo.parent_agent` label are different facts.
+`ParentAgentId` is raw transport readback and is never hydrated or replaced
+from a label-filtered listing. `gwo.parent_agent` is the declared GWO ownership
+identity used to adopt the exact Admission or Review action after restart.
+Runtime and Review Bindings retain both as `parent_agent_id` and
+`declared_parent_agent_id`; ownership checks use the declared identity without
+fabricating native Runtime parentage.
+
+Every Binding also records `native_finish_notification_supported`. The
+detached public CLI transport sets it to false because `paseo run --detach`
+has no parent or finish-notification option. A transport event can accelerate
+continuation only when the selected transport can actually deliver one; the
+declared ownership label is not evidence of that capability.
+
+When a non-human Wait Condition has no matching event, Goal Driver sleeps
+without an Agent turn until its durable `next_check_at`. A due invocation
+clears only that wait latch and runs one idempotent Kernel Reconciliation pass,
+which reads the same Agent, session, Admission, Review action, and Prompt
+identities. A matching event wakes the same readback first. A not-yet-due wait
+does not invoke the Kernel, and human or Decision Gate waits never become time
+polls. Process restart reloads the same wait identities from the Store, so a
+missed CLI finish notification adopts one exact terminal Result and retires
+the existing child without another create or Prompt. No Coordinator, Worker,
+or Reviewer Agent remains alive merely to detect progress.
+
 After an acknowledgement loss, reconciliation queries the exact digest first:
 an accepted Prompt is adopted without another send. Before the one large
 Prompt-file send, the adapter requires authoritative bootstrap-idle readback
@@ -341,6 +368,19 @@ flags. `GWO_RUN_PASEO_TRANSPORT_E2E=1` is the automation equivalent of
 above 170 KiB, replaces the Coordinator client twice, proves one exact Prompt
 boundary per Agent, archives every Agent it created, and reads every archive
 back before it prints `passed`. It does not run hosted checks.
+
+The missed-finish continuation E2E is separately opt-in and creates one
+detached live Worker:
+
+```text
+python scripts/run_paseo_goal_continuation_e2e.py --live
+```
+
+It proves raw `ParentAgentId` remains null, declared ownership remains
+readable, native finish notification is unavailable, and a due Goal Driver
+pass after restart adopts and retires the exact Result once. It also reads back
+one accepted Prompt before retirement and one Agent after a repeated pass. The
+environment equivalent is `GWO_RUN_PASEO_GOAL_CONTINUATION_E2E=1`.
 
 Legacy migration is an explicit configuration operation:
 
