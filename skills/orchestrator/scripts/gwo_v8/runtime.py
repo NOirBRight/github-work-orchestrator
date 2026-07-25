@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Protocol
 
@@ -470,6 +471,18 @@ class RuntimePrompt:
         )
 
 
+def _paseo_bootstrap_prompt(action_key: str) -> RuntimePrompt:
+    text = (
+        "GWO transport bootstrap "
+        f"{action_key}. Wait for the frozen Prompt; "
+        "do not inspect or modify files yet."
+    )
+    return RuntimePrompt(
+        text=text,
+        digest=digest_bytes(text.encode("utf-8")),
+    )
+
+
 def _contract_node_from_prompt(
     prompt: RuntimePrompt | None,
 ) -> dict[str, Any] | None:
@@ -762,6 +775,8 @@ def _environment_snapshot(
     for requirement in requirements:
         tool = re.split(r"[\s<>=!~]", requirement, maxsplit=1)[0].lower()
         executable = executable_aliases.get(tool, tool)
+        if sys.platform == "win32":
+            executable = shutil.which(executable) or executable
         try:
             result = _run([executable, "--version"], cwd=cwd)
         except OSError as error:
@@ -963,7 +978,8 @@ class InMemoryPaseoClient:
         self.native_finish_notification_supported = (
             native_finish_notification_supported
         )
-        self._create_receipt: tuple[str, str] | None = None
+        self._create_receipts: set[tuple[str, str]] = set()
+        self._create_receipt_lock = threading.Lock()
         self.create_count = 0
         self.send_count = 0
         self.create_prompt_digests: list[str] = []
@@ -991,7 +1007,12 @@ class InMemoryPaseoClient:
         )
 
     def create(self, request: PaseoCreateRequest) -> PaseoAgentRecord:
-        self._create_receipt = None
+        with self._create_receipt_lock:
+            self._create_receipts = {
+                receipt
+                for receipt in self._create_receipts
+                if receipt[0] != request.action_key
+            }
         self.create_count += 1
         self.create_prompt_digests.append(request.prompt.digest)
         existing = self.find_by_labels({"gwo.action_key": request.action_key})
@@ -1051,14 +1072,16 @@ class InMemoryPaseoClient:
                 "synthetic lost Paseo creation acknowledgement",
                 failure_class="ambiguous",
             )
-        self._create_receipt = (request.action_key, agent_id)
+        with self._create_receipt_lock:
+            self._create_receipts.add((request.action_key, agent_id))
         return record
 
     def consume_create_receipt(self, action_key: str, agent_id: str) -> bool:
         expected = (action_key, agent_id)
-        created = self._create_receipt == expected
-        self._create_receipt = None
-        return created
+        with self._create_receipt_lock:
+            created = expected in self._create_receipts
+            self._create_receipts.discard(expected)
+            return created
 
     def inspect(self, agent_id: str) -> PaseoAgentRecord:
         try:
@@ -1135,7 +1158,6 @@ class InMemoryPaseoClient:
             archived=True,
         )
 
-
 class PaseoCliClient:
     """Concrete Paseo client for the public CLI lifecycle surface."""
 
@@ -1145,7 +1167,8 @@ class PaseoCliClient:
         self.executable = shutil.which(executable) or executable
         self._command_prefix = (self.executable,)
         self._command_environment: dict[str, str] | None = None
-        self._create_receipt: tuple[str, str] | None = None
+        self._create_receipts: set[tuple[str, str]] = set()
+        self._create_receipt_lock = threading.Lock()
         if sys.platform == "win32" and Path(self.executable).suffix.lower() in {
             ".bat",
             ".cmd",
@@ -1188,6 +1211,8 @@ class PaseoCliClient:
     def classify_failure(message: str, *, default: str = "transient") -> str:
         lowered = message.casefold()
         permanent_markers = (
+            "certificate verify failed",
+            "certificate validation failed",
             "unauthorized",
             "forbidden",
             "authentication",
@@ -1195,8 +1220,6 @@ class PaseoCliClient:
             "invalid configuration",
             "unknown provider",
             "unknown model",
-            "certificate",
-            "tls",
         )
         if any(marker in lowered for marker in permanent_markers):
             return "permanent"
@@ -1206,6 +1229,8 @@ class PaseoCliClient:
             "timeout",
             "connection reset",
             "connection refused",
+            "tls",
+            "wrong version",
             "busy",
             "rate limit",
         )
@@ -1443,7 +1468,7 @@ class PaseoCliClient:
         )
 
     def find_by_labels(self, labels: dict[str, str]) -> tuple[PaseoAgentRecord, ...]:
-        command = ["ls", "--global", "--all"]
+        command = ["ls", "--global"]
         for key, value in sorted(labels.items()):
             command.extend(["--label", f"{key}={value}"])
         command.append("--json")
@@ -1470,6 +1495,8 @@ class PaseoCliClient:
                     failure_class="ambiguous",
                 )
             record = self.inspect(agent_id)
+            if record.archived:
+                continue
             merged_labels = {
                 **record.labels,
                 **labels,
@@ -1490,7 +1517,12 @@ class PaseoCliClient:
         return tuple(records)
 
     def create(self, request: PaseoCreateRequest) -> PaseoAgentRecord:
-        self._create_receipt = None
+        with self._create_receipt_lock:
+            self._create_receipts = {
+                receipt
+                for receipt in self._create_receipts
+                if receipt[0] != request.action_key
+            }
         worktree = f"gwo-{digest_bytes(request.action_key.encode('utf-8'))[:16]}"
         creation_labels = {
             **request.labels,
@@ -1501,11 +1533,7 @@ class PaseoCliClient:
         initial_prompt = (
             request.prompt.text
             if inline
-            else (
-                "GWO transport bootstrap "
-                f"{request.action_key}. Wait for the frozen Prompt; "
-                "do not inspect or modify files yet."
-            )
+            else _paseo_bootstrap_prompt(request.action_key).text
         )
         command = [
             "run",
@@ -1584,14 +1612,16 @@ class PaseoCliClient:
                 "Paseo creation identity became ambiguous",
                 failure_class="ambiguous",
             )
-        self._create_receipt = (request.action_key, agent_id)
+        with self._create_receipt_lock:
+            self._create_receipts.add((request.action_key, agent_id))
         return exact[0]
 
     def consume_create_receipt(self, action_key: str, agent_id: str) -> bool:
         expected = (action_key, agent_id)
-        created = self._create_receipt == expected
-        self._create_receipt = None
-        return created
+        with self._create_receipt_lock:
+            created = expected in self._create_receipts
+            self._create_receipts.discard(expected)
+            return created
 
     def inspect(self, agent_id: str) -> PaseoAgentRecord:
         payload = self._run(["inspect", agent_id, "--json"])
@@ -1723,7 +1753,6 @@ class PaseoCliClient:
 
     def archive(self, agent_id: str) -> None:
         self._run(["archive", agent_id, "--json"])
-
 
 class PaseoRuntimeAdapter:
     """Paseo resident-Agent lifecycle with Admission-rooted adoption."""
@@ -2108,6 +2137,39 @@ class PaseoRuntimeAdapter:
             ),
             failure_class="ambiguous",
         )
+
+    def _bootstrap_authorizes_review_prompt(
+        self,
+        agent_id: str,
+        request: ReviewAxisRequest,
+        prompt: RuntimePrompt,
+    ) -> bool:
+        if (
+            len(prompt.text.encode("utf-8"))
+            <= PASEO_INLINE_PROMPT_MAX_BYTES
+        ):
+            return False
+        target_count = self.client.prompt_acceptance_count(agent_id, prompt)
+        if target_count > 1:
+            raise RuntimeAdapterError(
+                "PROMPT_ACCEPTANCE_DUPLICATE",
+                "Paseo activity contains the exact Prompt more than once",
+                failure_class="ambiguous",
+            )
+        if target_count == 1:
+            return False
+        bootstrap = _paseo_bootstrap_prompt(request.action_key)
+        bootstrap_count = self.client.prompt_acceptance_count(
+            agent_id,
+            bootstrap,
+        )
+        if bootstrap_count > 1:
+            raise RuntimeAdapterError(
+                "PASEO_BOOTSTRAP_ACCEPTANCE_DUPLICATE",
+                "Paseo activity contains the transport bootstrap more than once",
+                failure_class="ambiguous",
+            )
+        return bootstrap_count == 1
 
     @staticmethod
     def _binding_labels(
@@ -2963,6 +3025,94 @@ class PaseoRuntimeAdapter:
             ),
         )
 
+    @staticmethod
+    def _review_runtime_conflicts(
+        agent: PaseoAgentRecord,
+        profile: RuntimeProfile,
+        parent_agent_id: str | None,
+    ) -> bool:
+        return (
+            agent.provider != profile.provider
+            or agent.model != profile.model
+            or agent.thinking != profile.thinking
+            or agent.mode != profile.mode
+            or digest_value(agent.features) != digest_value(profile.features)
+            or agent.profile_digest not in {"", profile.digest}
+            or agent.declared_parent_agent_id not in {None, parent_agent_id}
+            or agent.parent_agent_id not in {None, parent_agent_id}
+        )
+
+    def _reconcile_review_action_agent(
+        self,
+        agent: PaseoAgentRecord,
+        request: ReviewAxisRequest,
+        profile: RuntimeProfile,
+        prompt: RuntimePrompt,
+        labels: dict[str, str],
+        parent_agent_id: str | None,
+    ) -> PaseoAgentRecord:
+        exact = self._find_one(labels)
+        if exact is not None:
+            return exact
+        label_conflicts = {
+            key
+            for key, value in labels.items()
+            if key in agent.labels and agent.labels[key] != value
+        }
+        runtime_conflict = self._review_runtime_conflicts(
+            agent,
+            profile,
+            parent_agent_id,
+        )
+        target_prompt_count = self.client.prompt_acceptance_count(
+            agent.agent_id,
+            prompt,
+        )
+        if target_prompt_count > 1:
+            raise RuntimeAdapterError(
+                "PROMPT_ACCEPTANCE_DUPLICATE",
+                "Paseo activity contains the exact Prompt more than once",
+                failure_class="ambiguous",
+            )
+        if (
+            target_prompt_count == 1
+            and not label_conflicts
+            and not runtime_conflict
+        ):
+            self.client.update_labels(
+                agent.agent_id,
+                {
+                    **labels,
+                    "gwo.prompt_digest": prompt.digest,
+                },
+            )
+            return self._find_exact(
+                agent.agent_id,
+                {
+                    **labels,
+                    "gwo.prompt_digest": prompt.digest,
+                },
+                code="REVIEW_AXIS_LABEL_REPAIR_FAILED",
+            )
+        if (
+            target_prompt_count == 0
+            and (label_conflicts or runtime_conflict)
+        ):
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_IDENTITY_CONFLICT",
+                (
+                    "Review action identity is occupied by a conflicting "
+                    "runtime resource; Kernel authorization is required "
+                    "before any retirement"
+                ),
+                failure_class="permanent",
+            )
+        raise RuntimeAdapterError(
+            "REVIEW_AXIS_ORPHAN_AMBIGUOUS",
+            "Review action identity remains incomplete without a safe cleanup proof",
+            failure_class="ambiguous",
+        )
+
     def materialize_review_axis(
         self,
         request: ReviewAxisRequest,
@@ -2970,7 +3120,7 @@ class PaseoRuntimeAdapter:
         *,
         parent_agent_id: str | None,
     ) -> ReviewAxisBinding:
-        """Create or adopt one read-backed Review child with safe bounded retry."""
+        """Execute one readback-first Review child materialization action."""
 
         self._assert_review_workspace(request)
         prompt = request.to_prompt()
@@ -2987,104 +3137,113 @@ class PaseoRuntimeAdapter:
         }
         if parent_agent_id is not None:
             labels["gwo.parent_agent"] = parent_agent_id
-        last_error: RuntimeAdapterError | None = None
-        for execution in range(3):
-            try:
-                agent = self._find_one({"gwo.action_key": request.action_key})
-                created_here = False
-                created_agent_id: str | None = None
-                if agent is None:
-                    creation_labels = dict(labels)
-                    create_receipt = digest_bytes(
-                        f"{request.action_key}:".encode("utf-8") + os.urandom(32)
-                    )
-                    creation_labels["gwo.create_receipt"] = create_receipt
-                    if (
-                        len(prompt.text.encode("utf-8"))
-                        <= PASEO_INLINE_PROMPT_MAX_BYTES
-                    ):
-                        creation_labels["gwo.prompt_delivery"] = (
-                            self._delivery_label_value(
-                                "acked",
-                                0,
-                                request.action_key,
-                            )
-                        )
-                    created_agent = self.client.create(
-                        PaseoCreateRequest(
-                            action_key=request.action_key,
-                            title=(
-                                f"GWO Review {request.axis} "
-                                f"{request.candidate_sha[:12]}"
-                            ),
-                            labels=creation_labels,
-                            prompt=prompt,
-                            repository_path=str(Path(request.workspace).resolve()),
-                            base_sha=request.candidate_sha,
-                            profile=profile,
-                            parent_agent_id=parent_agent_id,
-                        )
-                    )
-                    created_here = self._created_in_current_call(
-                        created_agent.agent_id,
+        agent = self._find_one({"gwo.action_key": request.action_key})
+        if agent is not None:
+            agent = self._reconcile_review_action_agent(
+                agent,
+                request,
+                profile,
+                prompt,
+                labels,
+                parent_agent_id,
+            )
+        created_here = False
+        created_agent_id: str | None = None
+        if agent is None:
+            creation_labels = dict(labels)
+            create_receipt = digest_bytes(
+                f"{request.action_key}:".encode("utf-8") + os.urandom(32)
+            )
+            creation_labels["gwo.create_receipt"] = create_receipt
+            if (
+                len(prompt.text.encode("utf-8"))
+                <= PASEO_INLINE_PROMPT_MAX_BYTES
+            ):
+                creation_labels["gwo.prompt_delivery"] = (
+                    self._delivery_label_value(
+                        "acked",
+                        0,
                         request.action_key,
-                        {
-                            **labels,
-                            "gwo.create_receipt": create_receipt,
-                        },
                     )
-                    created_agent_id = created_agent.agent_id
-                agent = self._find_one(labels)
-                if agent is None:
-                    raise RuntimeAdapterError(
-                        "REVIEW_AXIS_READBACK_MISSING",
-                        "Review child creation has no exact identity readback",
-                        failure_class="ambiguous",
+                )
+            try:
+                created_agent = self.client.create(
+                    PaseoCreateRequest(
+                        action_key=request.action_key,
+                        title=(
+                            f"GWO Review {request.axis} "
+                            f"{request.candidate_sha[:12]}"
+                        ),
+                        labels=creation_labels,
+                        prompt=prompt,
+                        repository_path=str(Path(request.workspace).resolve()),
+                        base_sha=request.candidate_sha,
+                        profile=profile,
+                        parent_agent_id=parent_agent_id,
                     )
-                created_here = (
-                    created_here and created_agent_id == agent.agent_id
                 )
-                self._converge_prompt_delivery(
-                    agent.agent_id,
-                    prompt,
-                    identity_labels={"gwo.action_key": request.action_key},
-                    agent_labels=labels,
-                    action_key=request.action_key,
-                    allow_initial_send=created_here,
+            except RuntimeAdapterError as error:
+                if error.failure_class != "ambiguous":
+                    raise
+                action_agent = self._find_one(
+                    {"gwo.action_key": request.action_key}
                 )
-                readback = self._find_exact(
-                    agent.agent_id,
-                    {
-                        **labels,
-                        "gwo.prompt_digest": prompt.digest,
-                    },
-                    code="REVIEW_AXIS_READBACK_MISSING",
-                )
-                return self._review_binding(
-                    readback,
+                if action_agent is None:
+                    raise
+                agent = self._reconcile_review_action_agent(
+                    action_agent,
                     request,
                     profile,
                     prompt,
+                    labels,
                     parent_agent_id,
                 )
-            except RuntimeAdapterError as error:
-                last_error = error
-                if error.failure_class == "permanent":
-                    raise
-                if error.code == "PROMPT_DELIVERY_AMBIGUOUS":
-                    # Paseo acknowledged an asynchronous send, so another
-                    # convergence window can only read back the same Agent and
-                    # action. Empty windows are not failed executions and must
-                    # never turn this ambiguity into finite retry exhaustion.
-                    raise
-                if execution == 2:
-                    break
-        assert last_error is not None
-        raise RuntimeAdapterError(
-            "REVIEW_AXIS_MATERIALIZATION_RETRIES_EXHAUSTED",
-            "review child initial execution plus two transport retries failed",
-            failure_class=last_error.failure_class,
-        ) from last_error
+            else:
+                created_here = self._created_in_current_call(
+                    created_agent.agent_id,
+                    request.action_key,
+                    {
+                        **labels,
+                        "gwo.create_receipt": create_receipt,
+                    },
+                )
+                created_agent_id = created_agent.agent_id
+                agent = self._find_one(labels)
+        if agent is None:
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_READBACK_MISSING",
+                "Review child creation has no exact identity readback",
+                failure_class="ambiguous",
+            )
+        created_here = created_here and created_agent_id == agent.agent_id
+        bootstrap_authorized = self._bootstrap_authorizes_review_prompt(
+            agent.agent_id,
+            request,
+            prompt,
+        )
+        self._converge_prompt_delivery(
+            agent.agent_id,
+            prompt,
+            identity_labels={"gwo.action_key": request.action_key},
+            agent_labels=labels,
+            action_key=request.action_key,
+            allow_initial_send=created_here or bootstrap_authorized,
+        )
+        readback = self._find_exact(
+            agent.agent_id,
+            {
+                **labels,
+                "gwo.prompt_digest": prompt.digest,
+            },
+            code="REVIEW_AXIS_READBACK_MISSING",
+        )
+        return self._review_binding(
+            readback,
+            request,
+            profile,
+            prompt,
+            parent_agent_id,
+        )
 
     def observe_review_axis(
         self,

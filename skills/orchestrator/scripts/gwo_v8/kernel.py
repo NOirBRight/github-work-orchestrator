@@ -49,6 +49,8 @@ from .runtime import (
 REPAIR_PACKET_MAX_BYTES = 64 * 1024
 REPAIR_CHANGED_FILES_MAX_BYTES = 4 * 1024
 REPAIR_CHANGED_FILE_MAX_CHARACTERS = 256
+REVIEW_AXIS_MATERIALIZATION_EXECUTIONS = 3
+REVIEW_AXIS_OBSERVATION_READBACKS = 3
 
 
 class KernelError(RuntimeError):
@@ -2835,6 +2837,14 @@ class Kernel:
             "repair_rounds_used": 0,
             "attempt_terminal_reason": None,
             "candidate_sha": None,
+            "review_candidate_sha": None,
+            "review_bindings": {},
+            "review_observations": {},
+            "review_materialization_actions": {},
+            "review_axis_errors": {},
+            "review_materialization_waiting_actions": [],
+            "review_children_retired": False,
+            "review_evidence": None,
             "result_digest": None,
             "publication_eligible": None,
             "publication_state": None,
@@ -4212,6 +4222,7 @@ class Kernel:
                 isinstance(existing_repair, dict)
                 and existing_repair.get("action_key") == repair_action_key
             ):
+                self._invalidate_review_candidate(state)
                 state.update(
                     {
                         "status": "waiting",
@@ -4265,6 +4276,7 @@ class Kernel:
                 self.runtime.repair(binding, prompt)
             except RuntimeAdapterError as error:
                 repair_record["delivery_state"] = "ambiguous"
+                self._invalidate_review_candidate(state)
                 state.update(
                     {
                         "directive": "wait_for_runtime",
@@ -4283,6 +4295,7 @@ class Kernel:
                 )
                 return self._outcome(state)
             repair_record["delivery_state"] = "accepted"
+            self._invalidate_review_candidate(state)
             state.update(
                 {
                     "status": "waiting",
@@ -4349,6 +4362,7 @@ class Kernel:
                 same_attempt=False,
             )
             next_ordinal = attempt_ordinal + 1
+            self._invalidate_review_candidate(state)
             state.update(
                 {
                     "status": "running",
@@ -4453,6 +4467,21 @@ class Kernel:
     @staticmethod
     def _review_binding_from_state(value: dict[str, Any]) -> ReviewAxisBinding:
         return ReviewAxisBinding(**value)
+
+    @staticmethod
+    def _invalidate_review_candidate(state: dict[str, Any]) -> None:
+        state.update(
+            {
+                "review_candidate_sha": None,
+                "review_bindings": {},
+                "review_observations": {},
+                "review_materialization_actions": {},
+                "review_axis_errors": {},
+                "review_materialization_waiting_actions": [],
+                "review_children_retired": False,
+                "review_evidence": None,
+            }
+        )
 
     @staticmethod
     def _persisted_runtime_observation(
@@ -4648,6 +4677,7 @@ class Kernel:
                     f"{self.runtime.adapter_name}://review/{candidate_sha}"
                 ),
                 "wait_event_identity": f"review:{candidate_sha}",
+                "review_materialization_waiting_actions": [],
                 "next_check_at": (
                     datetime.now(timezone.utc) + timedelta(seconds=30)
                 ).isoformat(),
@@ -4674,10 +4704,65 @@ class Kernel:
                     f"{request.candidate_sha}/action/{request.action_key}"
                 ),
                 "wait_event_identity": f"{request.action_key}:prompt_readback",
+                "review_materialization_waiting_actions": [],
                 "next_check_at": (
                     datetime.now(timezone.utc) + timedelta(seconds=30)
                 ).isoformat(),
                 "last_runtime_error": _runtime_error_record(error),
+            }
+        )
+        self._write_state(state["repository"], state["plan_digest"], state)
+        return self._outcome(state)
+
+    def _review_materialization_wait(
+        self,
+        state: dict[str, Any],
+        *,
+        requests: tuple[ReviewAxisRequest, ...],
+    ) -> ReconcileOutcome:
+        if not requests:
+            raise KernelError(
+                "REVIEW_AXIS_WAIT_INVALID",
+                "Review materialization wait requires at least one action",
+            )
+        candidate_sha = requests[0].candidate_sha
+        waiting_actions = [
+            {
+                "axis": request.axis,
+                "recovery_ordinal": request.recovery_ordinal,
+                "action_key": request.action_key,
+            }
+            for request in requests
+        ]
+        first_request = requests[0]
+        first_action = (
+            state.get("review_materialization_actions") or {}
+        ).get(f"{first_request.axis}:{first_request.recovery_ordinal}")
+        last_error = (
+            first_action.get("last_error")
+            if isinstance(first_action, dict)
+            else None
+        )
+        state.update(
+            {
+                "status": "waiting",
+                "directive": "wait_for_runtime_readback",
+                "attempt_state": "reviewing",
+                "wait_condition": "runtime_available",
+                "wait_source_ref": (
+                    f"{self.runtime.adapter_name}://review/"
+                    f"{candidate_sha}/materialization"
+                ),
+                "wait_event_identity": "review_axis_materialization",
+                "review_materialization_waiting_actions": waiting_actions,
+                **(
+                    {"last_runtime_error": last_error}
+                    if isinstance(last_error, dict)
+                    else {}
+                ),
+                "next_check_at": (
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat(),
             }
         )
         self._write_state(state["repository"], state["plan_digest"], state)
@@ -4755,74 +4840,358 @@ class Kernel:
                 "Runtime Adapter does not support Review Internal Subagents",
             )
         candidate_sha = observation.result_claim.candidate_sha
-        if state.get("review_candidate_sha") not in {None, candidate_sha}:
-            state["review_bindings"] = {}
-            state["review_observations"] = {}
-            state["review_children_retired"] = False
-            state.pop("review_evidence", None)
+        if state.get("review_candidate_sha") != candidate_sha:
+            self._invalidate_review_candidate(state)
+            state.pop("last_runtime_error", None)
         state["review_candidate_sha"] = candidate_sha
         bindings = state.setdefault("review_bindings", {})
         observations = state.setdefault("review_observations", {})
+        materialization_actions = state.setdefault(
+            "review_materialization_actions",
+            {},
+        )
 
-        def collect(axis: str, recovery_ordinal: int):
-            key = f"{axis}:{recovery_ordinal}"
-            request = self._review_request(
-                state=state,
-                goal=goal,
-                work_item=work_item,
-                binding=binding,
-                observation=observation,
-                axis=axis,
-                recovery_ordinal=recovery_ordinal,
-            )
-            saved_observation = observations.get(key)
-            if isinstance(saved_observation, dict):
-                captured = self._review_observation_from_state(saved_observation)
-                if captured.lifecycle == "completed":
-                    return request, captured
-            selector = (
-                "recovery_axis"
-                if recovery_ordinal > 0
-                else (
-                    "strict_specialist"
-                    if axis.startswith("specialist:")
-                    else "standard_axis"
+        def collect_axes(
+            axis_ordinals: tuple[tuple[str, int], ...],
+        ) -> dict[
+            str,
+            tuple[
+                ReviewAxisRequest,
+                ReviewAxisObservation | None,
+                RuntimeAdapterError | None,
+            ],
+        ]:
+            results: dict[
+                str,
+                tuple[
+                    ReviewAxisRequest,
+                    ReviewAxisObservation | None,
+                    RuntimeAdapterError | None,
+                ],
+            ] = {}
+            jobs: list[
+                tuple[
+                    str,
+                    str,
+                    ReviewAxisRequest,
+                    RuntimeProfile,
+                    ReviewAxisBinding | None,
+                    int | None,
+                ]
+            ] = []
+            materialization_reserved = False
+            for axis, recovery_ordinal in axis_ordinals:
+                key = f"{axis}:{recovery_ordinal}"
+                request = self._review_request(
+                    state=state,
+                    goal=goal,
+                    work_item=work_item,
+                    binding=binding,
+                    observation=observation,
+                    axis=axis,
+                    recovery_ordinal=recovery_ordinal,
                 )
-            )
-            profile = resolve_review_profile(
-                self.runtime_config,
-                repository=state["repository"],
-                selector=selector,
-            )
-            saved_binding = bindings.get(key)
-            if isinstance(saved_binding, dict):
-                child_binding = self._review_binding_from_state(saved_binding)
-            else:
+                saved_observation = observations.get(key)
+                if isinstance(saved_observation, dict):
+                    captured = self._review_observation_from_state(
+                        saved_observation
+                    )
+                    if captured.lifecycle == "completed":
+                        results[axis] = (request, captured, None)
+                        continue
+                selector = (
+                    "recovery_axis"
+                    if recovery_ordinal > 0
+                    else (
+                        "strict_specialist"
+                        if axis.startswith("specialist:")
+                        else "standard_axis"
+                    )
+                )
+                try:
+                    profile = resolve_review_profile(
+                        self.runtime_config,
+                        repository=state["repository"],
+                        selector=selector,
+                    )
+                except RuntimeAdapterError as error:
+                    results[axis] = (request, None, error)
+                    continue
+                saved_binding = bindings.get(key)
+                if isinstance(saved_binding, dict):
+                    child_binding = self._review_binding_from_state(
+                        saved_binding
+                    )
+                    jobs.append(
+                        (
+                            axis,
+                            key,
+                            request,
+                            profile,
+                            child_binding,
+                            None,
+                        )
+                    )
+                    continue
+                action = materialization_actions.setdefault(
+                    key,
+                    {
+                        "action_key": request.action_key,
+                        "executions": 0,
+                        "state": "pending",
+                    },
+                )
+                if action.get("action_key") != request.action_key:
+                    raise KernelError(
+                        "REVIEW_AXIS_ACTION_IDENTITY_MISMATCH",
+                        "persisted Review materialization action changed identity",
+                    )
+                executions = action.get("executions")
+                if (
+                    not isinstance(executions, int)
+                    or isinstance(executions, bool)
+                    or executions < 0
+                ):
+                    raise KernelError(
+                        "REVIEW_AXIS_ACTION_STATE_INVALID",
+                        "persisted Review materialization budget is invalid",
+                    )
+                if executions >= REVIEW_AXIS_MATERIALIZATION_EXECUTIONS:
+                    results[axis] = (
+                        request,
+                        None,
+                        RuntimeAdapterError(
+                            "REVIEW_AXIS_MATERIALIZATION_RETRIES_EXHAUSTED",
+                            (
+                                "review child materialization exhausted three "
+                                "reconcile-cycle executions"
+                            ),
+                            failure_class="permanent",
+                        ),
+                    )
+                    continue
+                action.update(
+                    {
+                        "executions": executions + 1,
+                        "state": "executing",
+                    }
+                )
+                materialization_reserved = True
+                jobs.append(
+                    (
+                        axis,
+                        key,
+                        request,
+                        profile,
+                        None,
+                        executions,
+                    )
+                )
+            if materialization_reserved:
                 self.publication.assert_writer(
                     repository=state["repository"],
                     writer_generation=self.writer_generation,
                     plan_digest=state["plan_digest"],
                     activation_id=state["activation_id"],
                 )
-                child_binding = materialize(
-                    request,
-                    profile,
-                    parent_agent_id=binding.agent_id,
-                )
-                bindings[key] = asdict(child_binding)
                 self._write_state(
                     state["repository"],
                     state["plan_digest"],
                     state,
                 )
-            captured = observe_axis(request, child_binding)
-            observations[key] = asdict(captured)
-            self._write_state(
-                state["repository"],
-                state["plan_digest"],
-                state,
-            )
-            return request, captured
+
+            def execute_axis(job):
+                (
+                    axis,
+                    key,
+                    request,
+                    profile,
+                    child_binding,
+                    executions,
+                ) = job
+                materialization_error = None
+                if child_binding is None:
+                    try:
+                        child_binding = materialize(
+                            request,
+                            profile,
+                            parent_agent_id=binding.agent_id,
+                        )
+                    except RuntimeAdapterError as error:
+                        materialization_error = error
+                if materialization_error is not None:
+                    return (
+                        axis,
+                        key,
+                        request,
+                        None,
+                        None,
+                        materialization_error,
+                        executions,
+                    )
+                try:
+                    captured = observe_axis(request, child_binding)
+                except RuntimeAdapterError as error:
+                    return (
+                        axis,
+                        key,
+                        request,
+                        child_binding,
+                        None,
+                        error,
+                        executions,
+                    )
+                return (
+                    axis,
+                    key,
+                    request,
+                    child_binding,
+                    captured,
+                    None,
+                    executions,
+                )
+
+            executed = []
+            if jobs:
+                with ThreadPoolExecutor(
+                    max_workers=len(jobs),
+                    thread_name_prefix="gwo-review-axis",
+                ) as executor:
+                    futures = tuple(executor.submit(execute_axis, job) for job in jobs)
+                    executed = [future.result() for future in futures]
+
+            for (
+                axis,
+                key,
+                request,
+                child_binding,
+                captured,
+                error,
+                executions,
+            ) in executed:
+                materialized_here = executions is not None
+                if child_binding is not None and materialized_here:
+                    action = materialization_actions[key]
+                    action.update(
+                        {
+                            "state": "materialized",
+                            "last_error": None,
+                        }
+                    )
+                    state.setdefault("review_axis_errors", {}).pop(key, None)
+                    bindings[key] = asdict(child_binding)
+                if child_binding is not None:
+                    action = materialization_actions[key]
+                    if (
+                        error is not None
+                        and error.code
+                        not in {
+                            "REVIEW_AXIS_OUTPUT_MISSING",
+                            "REVIEW_AXIS_OUTPUT_INVALID",
+                        }
+                        and error.failure_class in {"ambiguous", "transient"}
+                    ):
+                        observation_readbacks = (
+                            int(action.get("observation_readbacks", 0)) + 1
+                        )
+                        action.update(
+                            {
+                                "observation_readbacks": observation_readbacks,
+                                "last_error": _runtime_error_record(error),
+                            }
+                        )
+                        state.setdefault("review_axis_errors", {})[key] = error.code
+                        if (
+                            observation_readbacks
+                            < REVIEW_AXIS_OBSERVATION_READBACKS
+                        ):
+                            action["state"] = "observation_pending"
+                            error = RuntimeAdapterError(
+                                "REVIEW_AXIS_OBSERVATION_PENDING",
+                                (
+                                    f"{error.code}: Review child observation "
+                                    "will retry against the existing binding"
+                                ),
+                                failure_class=error.failure_class,
+                            )
+                        else:
+                            action["state"] = "blocked"
+                            error = RuntimeAdapterError(
+                                "REVIEW_AXIS_OBSERVATION_RETRIES_EXHAUSTED",
+                                (
+                                    "Review child observation exhausted three "
+                                    "readback-first reconcile cycles"
+                                ),
+                                failure_class="permanent",
+                            )
+                    elif error is None:
+                        action.pop("observation_readbacks", None)
+                        action["last_error"] = None
+                        state.setdefault("review_axis_errors", {}).pop(key, None)
+                if child_binding is None and materialized_here:
+                    assert error is not None
+                    action = materialization_actions[key]
+                    if error.code == "PROMPT_DELIVERY_AMBIGUOUS":
+                        action["executions"] = executions
+                    action.update(
+                        {
+                            "state": (
+                                "blocked"
+                                if error.failure_class == "permanent"
+                                else "retry_pending"
+                            ),
+                            "last_error": _runtime_error_record(error),
+                        }
+                    )
+                    state.setdefault("review_axis_errors", {})[key] = error.code
+                    if (
+                        error.code != "PROMPT_DELIVERY_AMBIGUOUS"
+                        and error.failure_class != "permanent"
+                        and action["executions"]
+                        < REVIEW_AXIS_MATERIALIZATION_EXECUTIONS
+                    ):
+                        error = RuntimeAdapterError(
+                            "REVIEW_AXIS_MATERIALIZATION_PENDING",
+                            (
+                                f"{error.code}: Review child materialization "
+                                "will retry by stable action readback"
+                            ),
+                            failure_class=error.failure_class,
+                        )
+                    elif (
+                        error.code != "PROMPT_DELIVERY_AMBIGUOUS"
+                        and error.failure_class != "permanent"
+                    ):
+                        action["state"] = "blocked"
+                        error = RuntimeAdapterError(
+                            "REVIEW_AXIS_MATERIALIZATION_RETRIES_EXHAUSTED",
+                            (
+                                "review child materialization exhausted three "
+                                "reconcile-cycle executions"
+                            ),
+                            failure_class="permanent",
+                        )
+                if captured is not None:
+                    observations[key] = asdict(captured)
+                results[axis] = (request, captured, error)
+            if executed:
+                ordered_errors = [
+                    results[axis][2]
+                    for axis, _ordinal in axis_ordinals
+                    if axis in results and results[axis][2] is not None
+                ]
+                if ordered_errors:
+                    state["last_runtime_error"] = _runtime_error_record(
+                        ordered_errors[0]
+                    )
+                else:
+                    state.pop("last_runtime_error", None)
+                self._write_state(
+                    state["repository"],
+                    state["plan_digest"],
+                    state,
+                )
+            return results
 
         required_axes = (
             *tuple(requirement.get("axes") or ()),
@@ -4834,44 +5203,33 @@ class Kernel:
         primary: dict[str, ReviewAxisObservation] = {}
         requests: dict[str, ReviewAxisRequest] = {}
         running = False
+        materialization_pending: list[ReviewAxisRequest] = []
+        prompt_pending: list[tuple[ReviewAxisRequest, RuntimeAdapterError]] = []
         try:
+            primary_outcomes = collect_axes(
+                tuple((str(axis), 0) for axis in required_axes)
+            )
             for axis in required_axes:
-                try:
-                    request, captured = collect(str(axis), 0)
-                except RuntimeAdapterError as error:
+                request, captured, error = primary_outcomes[str(axis)]
+                requests[str(axis)] = request
+                if error is not None:
                     if error.code == "PROMPT_DELIVERY_AMBIGUOUS":
-                        request = self._review_request(
-                            state=state,
-                            goal=goal,
-                            work_item=work_item,
-                            binding=binding,
-                            observation=observation,
-                            axis=str(axis),
-                            recovery_ordinal=0,
-                        )
-                        return observation, self._review_prompt_wait(
-                            state,
-                            request=request,
-                            error=error,
-                        )
+                        prompt_pending.append((request, error))
+                        continue
+                    if error.code == "REVIEW_AXIS_MATERIALIZATION_PENDING":
+                        materialization_pending.append(request)
+                        continue
+                    if error.code == "REVIEW_AXIS_OBSERVATION_PENDING":
+                        running = True
+                        continue
                     if error.code not in {
                         "REVIEW_AXIS_OUTPUT_MISSING",
                         "REVIEW_AXIS_OUTPUT_INVALID",
                     }:
-                        raise
-                    request = self._review_request(
-                        state=state,
-                        goal=goal,
-                        work_item=work_item,
-                        binding=binding,
-                        observation=observation,
-                        axis=str(axis),
-                        recovery_ordinal=0,
-                    )
-                    requests[str(axis)] = request
+                        raise error
                     state.setdefault("review_axis_errors", {})[str(axis)] = error.code
                     continue
-                requests[str(axis)] = request
+                assert captured is not None
                 if captured.lifecycle == "completed":
                     primary[str(axis)] = captured
                 else:
@@ -4895,6 +5253,19 @@ class Kernel:
                 state,
             )
             return observation, self._outcome(state)
+        if materialization_pending:
+            return observation, self._review_materialization_wait(
+                state,
+                requests=tuple(materialization_pending),
+            )
+        if prompt_pending:
+            request, error = prompt_pending[0]
+            return observation, self._review_prompt_wait(
+                state,
+                request=request,
+                error=error,
+            )
+        state["review_materialization_waiting_actions"] = []
         if running:
             return observation, self._review_wait(
                 state,
@@ -4913,28 +5284,29 @@ class Kernel:
         if gate.missing_axes:
             recovered = dict(primary)
             recovery_running = False
+            recovery_materialization_pending: list[ReviewAxisRequest] = []
+            recovery_prompt_pending: list[
+                tuple[ReviewAxisRequest, RuntimeAdapterError]
+            ] = []
             try:
+                recovery_outcomes = collect_axes(
+                    tuple((axis, 1) for axis in gate.missing_axes)
+                )
                 for axis in gate.missing_axes:
-                    try:
-                        request, captured = collect(axis, 1)
-                    except RuntimeAdapterError as error:
-                        if error.code != "PROMPT_DELIVERY_AMBIGUOUS":
-                            raise
-                        request = self._review_request(
-                            state=state,
-                            goal=goal,
-                            work_item=work_item,
-                            binding=binding,
-                            observation=observation,
-                            axis=axis,
-                            recovery_ordinal=1,
-                        )
-                        return observation, self._review_prompt_wait(
-                            state,
-                            request=request,
-                            error=error,
-                        )
+                    request, captured, error = recovery_outcomes[axis]
                     requests[axis] = request
+                    if error is not None:
+                        if error.code == "PROMPT_DELIVERY_AMBIGUOUS":
+                            recovery_prompt_pending.append((request, error))
+                            continue
+                        if error.code == "REVIEW_AXIS_MATERIALIZATION_PENDING":
+                            recovery_materialization_pending.append(request)
+                            continue
+                        if error.code == "REVIEW_AXIS_OBSERVATION_PENDING":
+                            recovery_running = True
+                            continue
+                        raise error
+                    assert captured is not None
                     if captured.lifecycle == "completed":
                         recovered[axis] = captured
                     else:
@@ -4955,6 +5327,19 @@ class Kernel:
                     state,
                 )
                 return observation, self._outcome(state)
+            if recovery_materialization_pending:
+                return observation, self._review_materialization_wait(
+                    state,
+                    requests=tuple(recovery_materialization_pending),
+                )
+            if recovery_prompt_pending:
+                request, error = recovery_prompt_pending[0]
+                return observation, self._review_prompt_wait(
+                    state,
+                    request=request,
+                    error=error,
+                )
+            state["review_materialization_waiting_actions"] = []
             if recovery_running:
                 return observation, self._review_wait(
                     state,
@@ -4988,6 +5373,7 @@ class Kernel:
         state["wait_condition"] = None
         state["wait_source_ref"] = None
         state["wait_event_identity"] = None
+        state["review_materialization_waiting_actions"] = []
         state["next_check_at"] = None
         self._write_state(state["repository"], state["plan_digest"], state)
         retire_review = getattr(self.runtime, "retire_review_axis", None)

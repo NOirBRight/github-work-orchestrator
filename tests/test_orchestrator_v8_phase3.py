@@ -38,7 +38,10 @@ from gwo_v8 import (  # noqa: E402
     resolve_review_profile,
 )
 from gwo_v8.kernel import DeliveryControlError  # noqa: E402
-from gwo_v8.runtime import PASEO_INLINE_PROMPT_MAX_BYTES  # noqa: E402
+from gwo_v8.runtime import (  # noqa: E402
+    PASEO_INLINE_PROMPT_MAX_BYTES,
+    _environment_snapshot,
+)
 import orch_core  # noqa: E402
 
 
@@ -1036,7 +1039,7 @@ def test_repair_packet_accepts_two_valid_axis_envelopes(tmp_path):
     assert raised.value.code == "RECOVERY_PACKET_TOO_LARGE"
 
 
-def test_review_child_transport_retry_is_bounded_and_readback_first(tmp_path):
+def test_review_axis_materialization_is_one_execution_and_readback_first(tmp_path):
     _node, _worker_runtime, worker_binding, observation = _execute_candidate(
         tmp_path,
         risk="standard",
@@ -1052,7 +1055,18 @@ def test_review_child_transport_retry_is_bounded_and_readback_first(tmp_path):
         selector="standard_axis",
     )
     transient_client = InMemoryPaseoClient(create_failures=("transient", "transient"))
-    binding = PaseoRuntimeAdapter(transient_client).materialize_review_axis(
+    adapter = PaseoRuntimeAdapter(transient_client)
+    for expected_count in (1, 2):
+        with pytest.raises(RuntimeAdapterError) as transient:
+            adapter.materialize_review_axis(
+                request,
+                profile,
+                parent_agent_id=worker_binding.agent_id,
+            )
+        assert transient.value.code == "PASEO_CREATE_TRANSIENT"
+        assert transient.value.failure_class == "transient"
+        assert transient_client.create_count == expected_count
+    binding = adapter.materialize_review_axis(
         request,
         profile,
         parent_agent_id=worker_binding.agent_id,
@@ -1080,12 +1094,235 @@ def test_review_child_transport_retry_is_bounded_and_readback_first(tmp_path):
     assert permanent_client.create_count == 1
 
 
+class _ReviewOrphanTrackingPaseoClient(InMemoryPaseoClient):
+    def __init__(self):
+        super().__init__()
+        self.archived_agent_ids = []
+        self.cleaned_action_keys = []
+
+    def archive(self, agent_id):
+        self.archived_agent_ids.append(agent_id)
+        super().archive(agent_id)
+
+    def cleanup_orphan_worktree(self, action_key, _repository_path):
+        self.cleaned_action_keys.append(action_key)
+
+
+def test_review_axis_materialization_blocks_conflicting_orphan_without_cleanup(
+    tmp_path,
+):
+    _node, _worker_runtime, worker_binding, observation = _execute_candidate(
+        tmp_path,
+        risk="standard",
+    )
+    request = _review_axis_request(
+        worker_binding,
+        observation,
+        axis="standards",
+    )
+    profile = resolve_review_profile(
+        _runtime_config(),
+        repository="local/phase-three",
+        selector="standard_axis",
+    )
+    client = _ReviewOrphanTrackingPaseoClient()
+    orphan_prompt = RuntimePrompt(text="orphan", digest="f" * 64)
+    orphan = client.create(
+        PaseoCreateRequest(
+            action_key=request.action_key,
+            title="orphan",
+            labels={
+                "gwo.action_key": request.action_key,
+                "gwo.review_candidate": "0" * 40,
+            },
+            prompt=orphan_prompt,
+            repository_path=str(request.workspace),
+            base_sha=request.candidate_sha,
+            profile=profile,
+            parent_agent_id=worker_binding.agent_id,
+        )
+    )
+
+    with pytest.raises(RuntimeAdapterError) as blocked:
+        PaseoRuntimeAdapter(client).materialize_review_axis(
+            request,
+            profile,
+            parent_agent_id=worker_binding.agent_id,
+        )
+
+    assert blocked.value.code == "REVIEW_AXIS_IDENTITY_CONFLICT"
+    assert blocked.value.failure_class == "permanent"
+    assert client.archived_agent_ids == []
+    assert client.cleaned_action_keys == []
+    assert client.inspect(orphan.agent_id).archived is False
+
+
+def test_review_axis_materialization_repairs_accepted_agent_labels_without_reprompt(
+    tmp_path,
+):
+    _node, _worker_runtime, worker_binding, observation = _execute_candidate(
+        tmp_path,
+        risk="standard",
+    )
+    request = _review_axis_request(
+        worker_binding,
+        observation,
+        axis="standards",
+    )
+    profile = resolve_review_profile(
+        _runtime_config(),
+        repository="local/phase-three",
+        selector="standard_axis",
+    )
+    client = InMemoryPaseoClient()
+    prompt = request.to_prompt()
+    incomplete = client.create(
+        PaseoCreateRequest(
+            action_key=request.action_key,
+            title="incomplete accepted Review child",
+            labels={"gwo.action_key": request.action_key},
+            prompt=prompt,
+            repository_path=str(request.workspace),
+            base_sha=request.candidate_sha,
+            profile=profile,
+            parent_agent_id=worker_binding.agent_id,
+        )
+    )
+
+    binding = PaseoRuntimeAdapter(client).materialize_review_axis(
+        request,
+        profile,
+        parent_agent_id=worker_binding.agent_id,
+    )
+
+    repaired = client.inspect(incomplete.agent_id)
+    assert binding.agent_id == incomplete.agent_id
+    assert repaired.labels["gwo.review_candidate"] == request.candidate_sha
+    assert repaired.labels["gwo.review_axis"] == request.axis
+    assert repaired.labels["gwo.prompt_digest"] == prompt.digest
+    assert client.create_count == 1
+    assert client.send_count == 0
+    assert client.prompt_acceptance_count(binding.agent_id, prompt) == 1
+
+
+class _AmbiguousCreateWithoutIdentityPaseoClient(
+    _ReviewOrphanTrackingPaseoClient
+):
+    def __init__(self):
+        super().__init__()
+        self.fail_ambiguously = True
+
+    def create(self, request):
+        if self.fail_ambiguously:
+            self.fail_ambiguously = False
+            self.create_count += 1
+            raise RuntimeAdapterError(
+                "PASEO_CREATE_AMBIGUOUS",
+                "synthetic create lost before Agent identity readback",
+                failure_class="ambiguous",
+            )
+        return super().create(request)
+
+
+def test_review_axis_materialization_ambiguous_create_never_cleans_without_orphan_proof(
+    tmp_path,
+):
+    _node, _worker_runtime, worker_binding, observation = _execute_candidate(
+        tmp_path,
+        risk="standard",
+    )
+    request = _review_axis_request(
+        worker_binding,
+        observation,
+        axis="standards",
+    )
+    profile = resolve_review_profile(
+        _runtime_config(),
+        repository="local/phase-three",
+        selector="standard_axis",
+    )
+    client = _AmbiguousCreateWithoutIdentityPaseoClient()
+    adapter = PaseoRuntimeAdapter(client)
+
+    with pytest.raises(RuntimeAdapterError) as ambiguous:
+        adapter.materialize_review_axis(
+            request,
+            profile,
+            parent_agent_id=worker_binding.agent_id,
+        )
+
+    assert ambiguous.value.code == "PASEO_CREATE_AMBIGUOUS"
+    assert client.cleaned_action_keys == []
+    binding = adapter.materialize_review_axis(
+        request,
+        profile,
+        parent_agent_id=worker_binding.agent_id,
+    )
+    assert binding.action_key == request.action_key
+    assert client.create_count == 2
+    assert client.cleaned_action_keys == []
+
+
+def test_review_axis_materialization_tls_transport_is_transient_but_config_is_permanent():
+    permanent_failures = (
+        "TLS certificate verify failed",
+        "certificate validation failed for local issuer",
+        "unauthorized provider authentication",
+        "invalid configuration: unknown model",
+        "unknown provider kimi-x",
+    )
+    transient_failures = (
+        "TLS connect timeout",
+        "TLS certificate handshake timed out",
+        "TLS wrong version number",
+        "connection reset by peer",
+    )
+
+    assert {
+        PaseoCliClient.classify_failure(message, default="transient")
+        for message in permanent_failures
+    } == {"permanent"}
+    assert {
+        PaseoCliClient.classify_failure(message, default="permanent")
+        for message in transient_failures
+    } == {"transient"}
+
+
+def test_windows_environment_requirement_resolves_logical_paseo_executable(
+    tmp_path,
+    monkeypatch,
+):
+    resolved = r"C:\Users\test\.local\bin\paseo.cmd"
+    commands = []
+
+    monkeypatch.setattr("gwo_v8.runtime.sys.platform", "win32")
+    monkeypatch.setattr(
+        "gwo_v8.runtime.shutil.which",
+        lambda executable: resolved if executable == "paseo" else None,
+    )
+
+    def run(command, *, cwd):
+        commands.append((command, cwd))
+        return SimpleNamespace(returncode=0, stdout="paseo 1.2.3\n", stderr="")
+
+    monkeypatch.setattr("gwo_v8.runtime._run", run)
+
+    snapshot = _environment_snapshot(("paseo",), cwd=tmp_path)
+
+    assert snapshot["platform"] == "win32"
+    assert snapshot["paseo"] == {
+        "executable": resolved,
+        "version": "paseo 1.2.3",
+    }
+    assert commands == [([resolved, "--version"], tmp_path)]
+
+
 class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
     def __init__(self, previous=None):
         if previous is None:
             super().__init__()
             self.sent_action_keys = []
-            self.pending_prompt = None
+            self.pending_prompts = {}
         else:
             self._agents = previous._agents
             self._create_failures = previous._create_failures
@@ -1096,7 +1333,7 @@ class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
             self.send_count = previous.send_count
             self.create_prompt_digests = previous.create_prompt_digests
             self.sent_action_keys = previous.sent_action_keys
-            self.pending_prompt = previous.pending_prompt
+            self.pending_prompts = previous.pending_prompts
         self.ack_receipt_visible = False
 
     def find_by_labels(self, labels):
@@ -1111,14 +1348,15 @@ class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
 
     def create(self, request):
         record = super().create(request)
-        if request.labels.get("gwo.review_axis") != "standards":
+        if "gwo.review_axis" not in request.labels:
             return record
         self._accepted_prompt_digests[record.agent_id] = []
         self._agents[record.agent_id] = replace(record, lifecycle="idle")
         return self._agents[record.agent_id]
 
     def send_prompt(self, agent_id, prompt, *, action_key):
-        if self.inspect(agent_id).labels.get("gwo.review_axis") != "standards":
+        axis = self.inspect(agent_id).labels.get("gwo.review_axis")
+        if axis is None:
             return super().send_prompt(
                 agent_id,
                 prompt,
@@ -1126,19 +1364,19 @@ class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
             )
         self.sent_action_keys.append(action_key)
         self.send_count += 1
-        self.pending_prompt = (agent_id, prompt)
+        self.pending_prompts[axis] = (agent_id, prompt, action_key)
         self._agents[agent_id] = replace(
             self.inspect(agent_id),
             lifecycle="idle",
         )
 
     def expose_prompt_boundary(self):
-        agent_id, prompt = self.pending_prompt
-        self._accepted_prompt_digests[agent_id].append(prompt.digest)
-        self._agents[agent_id] = replace(
-            self.inspect(agent_id),
-            lifecycle="running",
-        )
+        for agent_id, prompt, _action_key in self.pending_prompts.values():
+            self._accepted_prompt_digests[agent_id].append(prompt.digest)
+            self._agents[agent_id] = replace(
+                self.inspect(agent_id),
+                lifecycle="running",
+            )
 
 
 def test_review_prompt_ambiguity_survives_delayed_visibility_windows(
@@ -1252,23 +1490,35 @@ def test_review_prompt_ambiguity_survives_delayed_visibility_windows(
         for outcome in ambiguous
     )
     assert all(outcome.attempt_state == "reviewing" for outcome in ambiguous)
-    assert client.create_count == 2
-    assert client.send_count == 1
-    assert len(client.sent_action_keys) == 1
-    action_key = client.sent_action_keys[0]
+    review_agents = client.find_by_labels(
+        {"gwo.review_candidate": candidate_sha}
+    )
+    assert {
+        agent.labels["gwo.review_axis"] for agent in review_agents
+    } == {"standards", "spec"}
+    assert len(
+        {agent.labels["gwo.action_key"] for agent in review_agents}
+    ) == 2
+    assert client.create_count == 1 + len(review_agents)
+    assert client.send_count == len(review_agents)
+    assert len(client.sent_action_keys) == len(review_agents)
+    assert len(set(client.sent_action_keys)) == len(review_agents)
+    assert set(client.pending_prompts) == {"standards", "spec"}
+    standards_action_key = client.pending_prompts["standards"][2]
     assert {
         outcome.wait_source_ref for outcome in ambiguous
     } == {
-        f"paseo://review/{candidate_sha}/action/{action_key}"
+        f"paseo://review/{candidate_sha}/action/{standards_action_key}"
     }
     assert {
         outcome.wait_event_identity for outcome in ambiguous
     } == {
-        f"{action_key}:prompt_readback"
+        f"{standards_action_key}:prompt_readback"
     }
-    prompt = client.pending_prompt[1]
-    assert len(prompt.text.encode("utf-8")) > PASEO_INLINE_PROMPT_MAX_BYTES
-    agent_id = client.pending_prompt[0]
+    assert all(
+        len(prompt.text.encode("utf-8")) > PASEO_INLINE_PROMPT_MAX_BYTES
+        for _agent_id, prompt, _action_key in client.pending_prompts.values()
+    )
     client.expose_prompt_boundary()
     adopted = kernel.reconcile_once("local/phase-three")
 
@@ -1277,16 +1527,18 @@ def test_review_prompt_ambiguity_survives_delayed_visibility_windows(
     review_agents = client.find_by_labels(
         {"gwo.review_candidate": candidate_sha}
     )
-    standards = next(
-        agent
-        for agent in review_agents
-        if agent.labels["gwo.review_axis"] == "standards"
-    )
-    assert standards.agent_id == agent_id
-    assert standards.labels["gwo.action_key"] == action_key
+    for axis in ("standards", "spec"):
+        agent = next(
+            agent
+            for agent in review_agents
+            if agent.labels["gwo.review_axis"] == axis
+        )
+        agent_id, prompt, action_key = client.pending_prompts[axis]
+        assert agent.agent_id == agent_id
+        assert agent.labels["gwo.action_key"] == action_key
+        assert client.prompt_acceptance_count(agent_id, prompt) == 1
     assert client.create_count == 3
-    assert client.send_count == 1
-    assert client.prompt_acceptance_count(agent_id, prompt) == 1
+    assert client.send_count == 2
 
 
 class _DelayedInlinePaseoClient(InMemoryPaseoClient):

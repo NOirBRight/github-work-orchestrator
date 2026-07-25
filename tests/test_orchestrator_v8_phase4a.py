@@ -316,6 +316,362 @@ class _ReviewingInMemoryRuntime(InMemoryRuntimeAdapter):
         return None
 
 
+class _ReviewMaterializationRecoveryRuntime(_ReviewingInMemoryRuntime):
+    def __init__(
+        self,
+        workspace_root: Path,
+        *,
+        spec_failures: int = 0,
+        standards_failures: int = 0,
+    ):
+        super().__init__(workspace_root)
+        self.axis_failures = {
+            "standards": standards_failures,
+            "spec": spec_failures,
+        }
+        self.review_materialization_calls = []
+
+    def materialize_review_axis(
+        self,
+        request,
+        profile,
+        *,
+        parent_agent_id,
+    ):
+        self.review_materialization_calls.append(
+            (request.axis, request.action_key)
+        )
+        if self.axis_failures.get(request.axis, 0) > 0:
+            self.axis_failures[request.axis] -= 1
+            raise RuntimeAdapterError(
+                "PASEO_CREATE_TRANSIENT",
+                "synthetic transient TLS certificate transport failure",
+                failure_class="transient",
+            )
+        return super().materialize_review_axis(
+            request,
+            profile,
+            parent_agent_id=parent_agent_id,
+        )
+
+
+class _ParallelReviewAxisRuntime(_ReviewingInMemoryRuntime):
+    def __init__(self, workspace_root: Path):
+        super().__init__(workspace_root)
+        self.primary_barrier = threading.Barrier(2)
+        self.primary_threads: dict[str, int] = {}
+        self._primary_threads_lock = threading.Lock()
+
+    def materialize_review_axis(
+        self,
+        request,
+        profile,
+        *,
+        parent_agent_id,
+    ):
+        if request.recovery_ordinal == 0:
+            with self._primary_threads_lock:
+                self.primary_threads[request.axis] = threading.get_ident()
+            self.primary_barrier.wait(timeout=5)
+        return super().materialize_review_axis(
+            request,
+            profile,
+            parent_agent_id=parent_agent_id,
+        )
+
+
+class _ReviewObservationRecoveryRuntime(_ReviewMaterializationRecoveryRuntime):
+    def __init__(self, workspace_root: Path, *, standards_failures: int):
+        super().__init__(workspace_root)
+        self.standards_observation_failures = standards_failures
+        self.review_observation_calls = []
+
+    def observe_review_axis(self, request, binding):
+        self.review_observation_calls.append(request.axis)
+        if (
+            request.axis == "standards"
+            and self.standards_observation_failures > 0
+        ):
+            self.standards_observation_failures -= 1
+            raise RuntimeAdapterError(
+                "PASEO_READ_TRANSIENT",
+                "synthetic transient TLS observation failure",
+                failure_class="transient",
+            )
+        return super().observe_review_axis(request, binding)
+
+
+def _review_materialization_kernel(tmp_path, runtime):
+    repository = _temporary_repository(tmp_path)
+    intent, source, _policy = _multi_ready_inputs(count=1)
+    intent["nodes"][0]["risk"] = "standard"
+    policy = _local_first_policy(1)
+    for definition in policy["check_definitions"]:
+        if definition["hosted_only"] is not True:
+            definition["suite"] = "affected"
+    policy["check_definitions"].append(
+        {
+            "check_id": "module-1-repository",
+            "version": 1,
+            "command": [
+                "python",
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "assert Path('module-1.txt').read_text() == 'module 1\\n'"
+                ),
+            ],
+            "hosted_name": None,
+            "environment_requirements": ["python"],
+            "input_selector": ["module-1.txt"],
+            "base_sensitive": False,
+            "risk": "low",
+            "hosted_only": False,
+            "suite": "repository",
+        }
+    )
+    compiled = PlanCompiler().compile(intent, source, policy)
+    store_path = tmp_path / "review-materialization.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-4a",
+    )
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        runtime_profile=_runtime_profile(),
+        delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
+        runtime_config={
+            "active_turn_pools": {"workers": 1, "coordinators": 1},
+            "repositories": {},
+            "runtime_profiles": {
+                "reviewer_standard": {
+                    "provider": "codex",
+                    "settings": {
+                        "model": "gpt-5.6-sol",
+                        "thinkingOptionId": "high",
+                        "modeId": "full-access",
+                        "features": {},
+                    },
+                }
+            },
+            "review_profiles": {"standard_axis": "reviewer_standard"},
+        },
+    )
+    work_node = next(
+        node
+        for node in json.loads(compiled.canonical_bytes)["nodes"]
+        if node["kind"] == "work"
+    )
+    return kernel, compiled, work_node
+
+
+def test_required_review_axis_materialization_launches_in_parallel(tmp_path):
+    runtime = _ParallelReviewAxisRuntime(tmp_path / "runtime")
+    kernel, _compiled, _work_node = _review_materialization_kernel(
+        tmp_path,
+        runtime,
+    )
+
+    outcome = kernel.reconcile_once("local/phase-four-a")
+
+    assert outcome.status == "complete"
+    assert set(runtime.primary_threads) == {"standards", "spec"}
+    assert len(set(runtime.primary_threads.values())) == 2
+
+
+def test_review_axis_transient_observation_retries_existing_binding(
+    tmp_path,
+):
+    runtime = _ReviewObservationRecoveryRuntime(
+        tmp_path / "runtime",
+        standards_failures=1,
+    )
+    kernel, compiled, work_node = _review_materialization_kernel(tmp_path, runtime)
+
+    first = kernel.reconcile_once("local/phase-four-a")
+    first_state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        work_node["node_key"],
+    )
+    second = kernel.reconcile_once("local/phase-four-a")
+
+    assert first.status == "waiting"
+    assert first.wait_condition == "review_axis"
+    assert second.status == "complete"
+    assert first.attempt_id == second.attempt_id
+    assert first.attempt_ordinal == second.attempt_ordinal == 1
+    assert first_state is not None
+    assert set(first_state["review_bindings"]) == {"standards:0", "spec:0"}
+    assert (
+        first_state["review_materialization_actions"]["standards:0"]["executions"]
+        == 1
+    )
+    assert [axis for axis, _key in runtime.review_materialization_calls].count(
+        "standards"
+    ) == 1
+    assert [axis for axis, _key in runtime.review_materialization_calls].count(
+        "spec"
+    ) == 1
+    assert runtime.review_observation_calls.count("standards") == 2
+    assert runtime.review_observation_calls.count("spec") == 1
+
+
+def test_review_axis_materialization_recovers_across_reconcile_cycles_without_worker_attempt(
+    tmp_path,
+):
+    runtime = _ReviewMaterializationRecoveryRuntime(
+        tmp_path / "runtime",
+        standards_failures=2,
+    )
+    kernel, compiled, work_node = _review_materialization_kernel(tmp_path, runtime)
+
+    first = kernel.reconcile_once("local/phase-four-a")
+    first_state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        work_node["node_key"],
+    )
+    second = kernel.reconcile_once("local/phase-four-a")
+    second_state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        work_node["node_key"],
+    )
+    third = kernel.reconcile_once("local/phase-four-a")
+
+    assert first.wait_condition == "runtime_available"
+    assert first.wait_event_identity == "review_axis_materialization"
+    assert second.wait_condition == "runtime_available"
+    assert second.wait_event_identity == "review_axis_materialization"
+    assert third.status == "complete"
+    assert first.attempt_id == second.attempt_id == third.attempt_id
+    assert first.attempt_ordinal == second.attempt_ordinal == third.attempt_ordinal == 1
+    assert first.materialization_executions == 1
+    assert second.materialization_executions == 1
+    assert third.materialization_executions == 1
+    assert first_state is not None
+    assert second_state is not None
+    assert set(first_state["review_observations"]) == {"spec:0"}
+    assert set(second_state["review_observations"]) == {"spec:0"}
+    assert (
+        first_state["review_materialization_actions"]["standards:0"]["executions"]
+        == 1
+    )
+    assert (
+        second_state["review_materialization_actions"]["standards:0"]["executions"]
+        == 2
+    )
+    standards_calls = [
+        action_key
+        for axis, action_key in runtime.review_materialization_calls
+        if axis == "standards"
+    ]
+    spec_calls = [
+        action_key
+        for axis, action_key in runtime.review_materialization_calls
+        if axis == "spec"
+    ]
+    assert len(standards_calls) == 3
+    assert len(set(standards_calls)) == 1
+    assert len(spec_calls) == 1
+    assert first_state["review_materialization_waiting_actions"] == [
+        {
+            "axis": "standards",
+            "recovery_ordinal": 0,
+            "action_key": standards_calls[0],
+        }
+    ]
+
+
+def test_review_axis_materialization_budget_blocks_after_three_reconcile_cycles(
+    tmp_path,
+):
+    runtime = _ReviewMaterializationRecoveryRuntime(
+        tmp_path / "runtime",
+        spec_failures=3,
+    )
+    kernel, compiled, work_node = _review_materialization_kernel(tmp_path, runtime)
+
+    first = kernel.reconcile_once("local/phase-four-a")
+    second = kernel.reconcile_once("local/phase-four-a")
+    third = kernel.reconcile_once("local/phase-four-a")
+    state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        work_node["node_key"],
+    )
+
+    assert first.wait_condition == "runtime_available"
+    assert second.wait_condition == "runtime_available"
+    assert third.status == "blocked"
+    assert third.attempt_state == "review_runtime_blocked"
+    assert first.attempt_id == second.attempt_id == third.attempt_id
+    assert first.attempt_ordinal == second.attempt_ordinal == third.attempt_ordinal == 1
+    assert state is not None
+    assert set(state["review_observations"]) == {"standards:0"}
+    assert (
+        state["review_materialization_actions"]["spec:0"]["executions"]
+        == 3
+    )
+    assert state["last_runtime_error"]["code"] == (
+        "REVIEW_AXIS_MATERIALIZATION_RETRIES_EXHAUSTED"
+    )
+    spec_calls = [
+        action_key
+        for axis, action_key in runtime.review_materialization_calls
+        if axis == "spec"
+    ]
+    assert len(spec_calls) == 3
+    assert len(set(spec_calls)) == 1
+
+
+def test_changed_candidate_review_axis_materialization_reset_clears_all_axis_state():
+    state = {
+        "review_candidate_sha": "a" * 40,
+        "review_bindings": {"standards:0": {"agent_id": "review-agent"}},
+        "review_observations": {"standards:0": {"lifecycle": "completed"}},
+        "review_materialization_actions": {
+            "spec:0": {
+                "action_key": "review-action",
+                "executions": 2,
+                "state": "retry_pending",
+            }
+        },
+        "review_axis_errors": {"spec:0": "PASEO_CREATE_TRANSIENT"},
+        "review_materialization_waiting_actions": [
+            {
+                "axis": "spec",
+                "recovery_ordinal": 0,
+                "action_key": "review-action",
+            }
+        ],
+        "review_children_retired": True,
+        "review_evidence": {"kind": "review"},
+    }
+
+    Kernel._invalidate_review_candidate(state)
+
+    assert state == {
+        "review_candidate_sha": None,
+        "review_bindings": {},
+        "review_observations": {},
+        "review_materialization_actions": {},
+        "review_axis_errors": {},
+        "review_materialization_waiting_actions": [],
+        "review_children_retired": False,
+        "review_evidence": None,
+    }
+
+
 class _ReadCountingDetachedPaseoClient(InMemoryPaseoClient):
     def __init__(self):
         super().__init__(native_finish_notification_supported=False)
