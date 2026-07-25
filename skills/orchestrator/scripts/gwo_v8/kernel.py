@@ -1011,7 +1011,7 @@ class RecoveryLadder:
 
         bounded_causes: list[dict[str, Any]] = []
         cause_bytes = 0
-        for cause in causes[:64]:
+        for cause in causes:
             cause_type = str(cause.get("type") or "candidate_rejection")[:64]
             if cause_type == "review_blocker":
                 finding = cause.get("finding")
@@ -1045,12 +1045,10 @@ class RecoveryLadder:
                             total=2_048,
                         )
             encoded = canonical_bytes(normalized)
-            if cause_bytes + len(encoded) > 10_240:
-                if cause_type == "review_blocker":
-                    raise KernelError(
-                        "REPAIR_REVIEW_FINDINGS_TOO_LARGE",
-                        "exact Review blockers exceed the bounded Repair Prompt",
-                    )
+            if (
+                cause_type != "review_blocker"
+                and cause_bytes + len(encoded) > 10_240
+            ):
                 break
             bounded_causes.append(normalized)
             cause_bytes += len(encoded)

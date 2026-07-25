@@ -1463,6 +1463,29 @@ def test_recovery_ladder_is_bounded_and_runtime_loss_never_fails_node():
     assert "full_transcript" not in packet
     assert json.loads(packet)["acceptance_digest"] == "b" * 64
 
+    review_causes = [
+        {
+            "type": "review_blocker",
+            "axis": "standards" if index % 2 == 0 else "spec",
+            "finding": {
+                "severity": "hard",
+                "code": f"F{index:02d}",
+                "source": "CONTEXT.md",
+                "location": f"result.txt:{index + 1}",
+                "message": f"blocking finding {index}",
+            },
+        }
+        for index in range(65)
+    ]
+    review_packet = ladder.recovery_packet(
+        candidate_sha="a" * 40,
+        acceptance_digest="b" * 64,
+        changed_files=["result.txt"],
+        causes=review_causes,
+    )
+    assert json.loads(review_packet)["causes"] == review_causes
+    assert len(review_packet.encode("utf-8")) <= 16_384
+
 
 def test_terminal_worker_without_result_enters_one_bounded_repair_round(
     tmp_path,
