@@ -21,6 +21,14 @@ from typing import Any, Callable, Literal
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
 from .evidence import EvidenceVerifier, TypedEvidence
+from .retirement import (
+    RetirementError,
+    ReviewRetirementAuthorization,
+    authorize_review_after_evidence,
+    completed_review_retirement,
+    failed_review_retirement,
+    pending_review_retirement,
+)
 from .runtime import (
     ReviewAxisBinding,
     ReviewAxisObservation,
@@ -145,6 +153,7 @@ class ReviewConvergence:
             "review_axis_errors": {},
             "review_materialization_waiting_actions": [],
             "review_children_retired": False,
+            "review_retirements": {},
             "review_evidence": None,
             "review_gate_status": None,
             "review_check_manifest_digest": None,
@@ -356,6 +365,31 @@ class ReviewConvergence:
             status="waiting",
             observation=observation,
         )
+
+    def _review_retirement_wait(
+        self,
+        candidate_sha: str,
+        *,
+        error_code: str,
+    ) -> dict[str, Any]:
+        return {
+            "status": "waiting",
+            "directive": "wait_for_review_retirement",
+            "attempt_state": "reviewing",
+            "wait_condition": "review_retirement",
+            "wait_source_ref": (
+                f"{self.runtime.adapter_name}://review/"
+                f"{candidate_sha}/retirement"
+            ),
+            "wait_event_identity": f"review-retirement:{candidate_sha}",
+            "next_check_at": (
+                datetime.now(timezone.utc) + timedelta(seconds=30)
+            ).isoformat(),
+            "last_runtime_error": {
+                "code": error_code,
+                "failure_class": "ambiguous",
+            },
+        }
 
     def _review_materialization_wait(
         self,
@@ -1000,36 +1034,116 @@ class ReviewConvergence:
         state["review_materialization_waiting_actions"] = []
         state["next_check_at"] = None
         self._persist_state(state)
-        retire_review = getattr(self.runtime, "retire_review_axis", None)
-        if callable(retire_review) and not state.get("review_children_retired"):
+        retire_review = getattr(
+            self.runtime,
+            "retire_review_after_evidence",
+            None,
+        )
+        if not callable(retire_review):
+            raise ReviewConvergenceError(
+                "REVIEW_RETIREMENT_UNSUPPORTED",
+                "Runtime Adapter has no typed Review retirement seam",
+            )
+        if not state.get("review_children_retired"):
             self._assert_writer(state)
-            try:
-                for saved in bindings.values():
-                    if isinstance(saved, dict):
-                        retire_review(self._review_binding_from_state(saved))
-            except RuntimeAdapterError as error:
-                state.update(
-                    {
-                        "status": "waiting",
-                        "directive": "wait_for_review_retirement",
-                        "attempt_state": "reviewing",
-                        "wait_condition": "review_retirement",
-                        "wait_source_ref": (
-                            f"{self.runtime.adapter_name}://review/"
-                            f"{candidate_sha}/retirement"
-                        ),
-                        "wait_event_identity": (f"review-retirement:{candidate_sha}"),
-                        "next_check_at": (
-                            datetime.now(timezone.utc) + timedelta(seconds=30)
-                        ).isoformat(),
-                        "last_runtime_error": _runtime_error_record(error),
-                    }
-                )
+            retirements = state.setdefault("review_retirements", {})
+            for key, saved in bindings.items():
+                if not isinstance(saved, dict):
+                    continue
+                child = self._review_binding_from_state(saved)
+                record = retirements.get(key)
+                authorization = None
+                if isinstance(record, dict) and isinstance(
+                    record.get("authorization"),
+                    dict,
+                ):
+                    try:
+                        authorization = ReviewRetirementAuthorization(
+                            **record["authorization"]
+                        )
+                        authorization.assert_valid_digest()
+                    except (RetirementError, TypeError) as error:
+                        code = (
+                            error.code
+                            if isinstance(error, RetirementError)
+                            else "REVIEW_RETIREMENT_AUTHORIZATION_INVALID"
+                        )
+                        retirements[key] = failed_review_retirement(
+                            None,
+                            code=code,
+                            failure_class="ambiguous",
+                        )
+                        authorization = None
+                if authorization is None:
+                    try:
+                        authorization = authorize_review_after_evidence(
+                            worker_binding=binding,
+                            review_binding=child,
+                            review_evidence=gate.evidence,
+                        )
+                    except RetirementError as error:
+                        retirements[key] = failed_review_retirement(
+                            None,
+                            code=error.code,
+                            failure_class="ambiguous",
+                        )
+                        state.update(
+                            self._review_retirement_wait(
+                                candidate_sha,
+                                error_code=error.code,
+                            )
+                        )
+                        self._persist_state(state)
+                        return ReviewConvergenceDecision(
+                            status="waiting",
+                            observation=observation,
+                        )
+                    retirements[key] = pending_review_retirement(
+                        authorization
+                    )
+                    self._persist_state(state)
+                try:
+                    receipt = retire_review(child, authorization)
+                    retirements[key] = completed_review_retirement(
+                        authorization,
+                        receipt,
+                    )
+                except RuntimeAdapterError as error:
+                    retirements[key] = failed_review_retirement(
+                        authorization,
+                        code=error.code,
+                        failure_class=error.failure_class,
+                    )
+                    state.update(
+                        self._review_retirement_wait(
+                            candidate_sha,
+                            error_code=error.code,
+                        )
+                    )
+                    state["last_runtime_error"] = _runtime_error_record(error)
+                    self._persist_state(state)
+                    return ReviewConvergenceDecision(
+                        status="waiting",
+                        observation=observation,
+                    )
+                except RetirementError as error:
+                    retirements[key] = failed_review_retirement(
+                        authorization,
+                        code=error.code,
+                        failure_class="ambiguous",
+                    )
+                    state.update(
+                        self._review_retirement_wait(
+                            candidate_sha,
+                            error_code=error.code,
+                        )
+                    )
+                    self._persist_state(state)
+                    return ReviewConvergenceDecision(
+                        status="waiting",
+                        observation=observation,
+                    )
                 self._persist_state(state)
-                return ReviewConvergenceDecision(
-                    status="waiting",
-                    observation=observation,
-                )
             state["review_children_retired"] = True
             self._persist_state(state)
         if gate.status == "rejected":

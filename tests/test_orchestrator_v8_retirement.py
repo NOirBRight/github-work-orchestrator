@@ -613,6 +613,66 @@ def test_paseo_client_archives_only_a_parsed_worktree_name(monkeypatch):
     ]
 
 
+def test_cli_maps_real_wks_agent_payload_to_native_worktree_list_name(
+    tmp_path,
+    monkeypatch,
+):
+    from gwo_v8.retirement import resolve_native_worktree_name
+
+    repository = tmp_path / "repository"
+    workspace = tmp_path / "gwo-issue-88"
+    repository.mkdir()
+    workspace.mkdir()
+    client = PaseoCliClient("paseo")
+    commands: list[tuple[list[str], Path | None]] = []
+
+    def _run(command, **kwargs):
+        commands.append((command, kwargs.get("cwd")))
+        return {
+            "worktrees": [
+                {
+                    "path": str(workspace),
+                    "head": "a" * 40,
+                    "branchName": "gwo/issue-88-review",
+                    "createdAt": "2026-07-26T00:00:00.000Z",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "_run", _run)
+    agent = client._agent(
+        {
+            "Id": "agent_01k1x88",
+            "SessionId": "session_01k1x88",
+            "Worktree": {
+                "Id": "wks_01k1x88",
+                "Path": str(workspace),
+            },
+            "Cwd": str(workspace),
+            "Provider": "kimi",
+            "Model": "kimi-code/k3",
+            "Thinking": "high",
+            "Mode": "yolo",
+            "Status": "idle",
+        }
+    )
+
+    worktrees = client.list_worktrees(str(repository))
+    native_name = resolve_native_worktree_name(
+        workspace=Path(agent.workspace),
+        candidate_sha="a" * 40,
+        temporary_branch="gwo/issue-88-review",
+        worktrees=worktrees,
+    )
+
+    assert agent.workspace_id == "wks_01k1x88"
+    assert native_name == "gwo-issue-88"
+    assert native_name != agent.workspace_id
+    assert commands == [
+        (["worktree", "ls", "--json"], repository.resolve())
+    ]
+
+
 class _NativeArchivingPaseoClient:
     native_finish_notification_supported = True
 
@@ -626,6 +686,21 @@ class _NativeArchivingPaseoClient:
         self.record = record
         self.extra_records = extra_records
         self.archived_worktree_names: list[str] = []
+
+    def list_worktrees(self, repository_path):
+        assert Path(repository_path).resolve() == self.repository.resolve()
+        return (
+            {
+                "path": self.record.workspace,
+                "head": _git(Path(self.record.workspace), "rev-parse", "HEAD"),
+                "branch_name": _git(
+                    Path(self.record.workspace),
+                    "branch",
+                    "--show-current",
+                ),
+                "native_name": Path(self.record.workspace).name,
+            },
+        )
 
     def find_by_labels(self, labels):
         return tuple(
@@ -651,7 +726,7 @@ class _NativeArchivingPaseoClient:
         )
 
     def archive_worktree(self, worktree_name):
-        assert worktree_name == self.record.workspace_id
+        assert worktree_name == Path(self.record.workspace).name
         self.archived_worktree_names.append(worktree_name)
         _git(
             self.repository,
@@ -726,6 +801,472 @@ def test_paseo_adapter_consumes_authorization_at_only_destructive_seam(tmp_path)
     )
 
 
+def test_paseo_retirement_resolves_wks_id_to_native_worktree_name(tmp_path):
+    from gwo_v8.retirement import authorize_after_integration
+
+    repository, base_sha = _repository(tmp_path)
+    workspace, candidate_sha = _candidate(repository, tmp_path, base_sha)
+    binding = replace(
+        _binding(repository, workspace),
+        workspace_id="wks_01k1x88nativeidentity",
+    )
+    _git(repository, "merge", "--ff-only", candidate_sha)
+    record = _paseo_record(binding)
+    client = _NativeArchivingPaseoClient(repository, record)
+    runtime = PaseoRuntimeAdapter(client)
+    authorization = authorize_after_integration(
+        binding=binding,
+        candidate_sha=candidate_sha,
+        integrated_sha=candidate_sha,
+        target_branch="main",
+    )
+
+    readback = runtime.retire_after_integration(binding, authorization)
+
+    assert readback.complete is True
+    assert client.archived_worktree_names == [workspace.name]
+    assert workspace.name != binding.workspace_id
+    assert not workspace.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("repository", "owner/wrong"),
+        ("plan_digest", "0" * 64),
+        ("node_key", "node:wrong"),
+        ("admission_id", "admission:wrong"),
+        ("attempt_id", "attempt:wrong"),
+        ("agent_id", "agent:wrong"),
+        ("workspace_id", "wks_wrong"),
+        ("candidate_sha", "0" * 40),
+        ("integrated_sha", "f" * 40),
+        ("target_branch", "release"),
+        ("temporary_branch", "gwo/wrong"),
+    ],
+)
+def test_completed_retirement_rejects_wrong_receipt_identity(
+    tmp_path,
+    field,
+    wrong_value,
+):
+    from gwo_v8.retirement import (
+        RetirementError,
+        RetirementReadback,
+        authorize_after_integration,
+        completed_retirement,
+    )
+
+    repository, base_sha = _repository(tmp_path)
+    workspace, candidate_sha = _candidate(repository, tmp_path, base_sha)
+    binding = _binding(repository, workspace)
+    _git(repository, "merge", "--ff-only", candidate_sha)
+    authorization = authorize_after_integration(
+        binding=binding,
+        candidate_sha=candidate_sha,
+        integrated_sha=candidate_sha,
+        target_branch="main",
+    )
+    receipt = RetirementReadback(
+        repository=authorization.repository,
+        plan_digest=authorization.plan_digest,
+        node_key=authorization.node_key,
+        admission_id=authorization.admission_id,
+        attempt_id=authorization.attempt_id,
+        agent_id=authorization.agent_id,
+        workspace_id=authorization.workspace_id,
+        candidate_sha=authorization.candidate_sha,
+        integrated_sha=authorization.integrated_sha,
+        target_branch=authorization.target_branch,
+        temporary_branch=authorization.temporary_branch,
+        authorization_digest=authorization.authorization_digest,
+        agent_archived=True,
+        directory_absent=True,
+        worktree_absent=True,
+        branch_deleted=True,
+    )
+
+    with pytest.raises(RetirementError) as error:
+        completed_retirement(
+            authorization,
+            replace(receipt, **{field: wrong_value}),
+        )
+
+    assert error.value.code == "RETIREMENT_READBACK_IDENTITY_MISMATCH"
+
+
+def test_in_memory_missing_state_returns_typed_runtime_error(tmp_path):
+    from gwo_v8.retirement import authorize_after_integration
+
+    repository, base_sha = _repository(tmp_path)
+    workspace, candidate_sha = _candidate(repository, tmp_path, base_sha)
+    binding = _binding(repository, workspace)
+    _git(repository, "merge", "--ff-only", candidate_sha)
+    authorization = authorize_after_integration(
+        binding=binding,
+        candidate_sha=candidate_sha,
+        integrated_sha=candidate_sha,
+        target_branch="main",
+    )
+    restarted_runtime = InMemoryRuntimeAdapter(tmp_path / "restarted-runtime")
+
+    with pytest.raises(RuntimeAdapterError) as error:
+        restarted_runtime.retire_after_integration(binding, authorization)
+
+    assert error.value.code == "RUNTIME_IDENTITY_MISMATCH"
+    assert error.value.failure_class == "ambiguous"
+    assert workspace.exists()
+
+
+def test_runtime_interface_has_no_legacy_retire_entrypoint(tmp_path):
+    from gwo_v8.runtime import InMemoryPaseoClient, RuntimeAdapter
+
+    assert "retire" not in RuntimeAdapter.__dict__
+    assert not hasattr(PaseoRuntimeAdapter(InMemoryPaseoClient()), "retire")
+    assert not hasattr(
+        InMemoryRuntimeAdapter(tmp_path / "runtime"),
+        "retire",
+    )
+
+
+def _review_evidence(binding: RuntimeBinding, candidate_sha: str):
+    from gwo_v8 import TypedEvidence
+
+    return TypedEvidence._capture(
+        kind="review",
+        subject=candidate_sha,
+        observer_type="kernel",
+        observer_id=str(binding.runtime_id),
+        observed_at="2026-07-26T00:00:00+00:00",
+        source_ref=f"github://review/{candidate_sha}",
+        payload={
+            "attempt_id": binding.attempt_id,
+            "candidate_sha": candidate_sha,
+            "axes": [],
+        },
+    )
+
+
+def _review_binding(
+    record: PaseoAgentRecord,
+    worker: RuntimeBinding,
+    candidate_sha: str,
+) -> ReviewAxisBinding:
+    return ReviewAxisBinding(
+        action_key="review:retirement",
+        axis="spec",
+        candidate_sha=candidate_sha,
+        fixed_input_digest="3" * 64,
+        runtime_id=record.agent_id,
+        agent_id=record.agent_id,
+        session_id=record.session_id,
+        workspace_id=record.workspace_id,
+        workspace=record.workspace,
+        parent_agent_id=worker.agent_id,
+        runtime_profile="reviewer-standard",
+        profile_digest=record.profile_digest,
+        provider=record.provider,
+        model=record.model,
+        thinking=record.thinking,
+        mode=record.mode,
+        prompt_digest="4" * 64,
+    )
+
+
+def _review_record(
+    worker: RuntimeBinding,
+    *,
+    workspace: Path,
+    workspace_id: str,
+    candidate_sha: str,
+) -> PaseoAgentRecord:
+    return replace(
+        _paseo_record(worker),
+        agent_id="agent:review-child",
+        session_id="session:review-child",
+        workspace_id=workspace_id,
+        workspace=str(workspace),
+        labels={
+            "gwo.action_key": "review:retirement",
+            "gwo.repository": worker.repository,
+            "gwo.review_attempt": str(worker.attempt_id),
+            "gwo.review_candidate": candidate_sha,
+            "gwo.review_axis": "spec",
+            "gwo.parent_agent": str(worker.agent_id),
+        },
+    )
+
+
+def test_review_retirement_removes_independent_disposable_worktree(tmp_path):
+    from gwo_v8.retirement import authorize_review_after_evidence
+
+    repository, base_sha = _repository(tmp_path)
+    candidate_workspace, candidate_sha = _candidate(repository, tmp_path, base_sha)
+    worker = _binding(repository, candidate_workspace)
+    review_workspace = tmp_path / "gwo-review-spec"
+    _git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        "gwo/review/spec",
+        str(review_workspace),
+        candidate_sha,
+    )
+    review_record = _review_record(
+        worker,
+        workspace=review_workspace,
+        workspace_id="wks_01reviewindependent",
+        candidate_sha=candidate_sha,
+    )
+    client = _NativeArchivingPaseoClient(
+        repository,
+        review_record,
+        (_paseo_record(worker),),
+    )
+    runtime = PaseoRuntimeAdapter(client)
+    review_binding = _review_binding(review_record, worker, candidate_sha)
+    authorization = authorize_review_after_evidence(
+        worker_binding=worker,
+        review_binding=review_binding,
+        review_evidence=_review_evidence(worker, candidate_sha),
+    )
+
+    receipt = runtime.retire_review_after_evidence(
+        review_binding,
+        authorization,
+    )
+
+    assert receipt.complete is True
+    assert receipt.workspace_disposition == "disposable_removed"
+    assert client.archived_worktree_names == [review_workspace.name]
+    assert not review_workspace.exists()
+    assert candidate_workspace.exists()
+
+
+def test_review_retirement_preserves_shared_candidate_workspace(tmp_path):
+    from gwo_v8.retirement import authorize_review_after_evidence
+
+    repository, base_sha = _repository(tmp_path)
+    candidate_workspace, candidate_sha = _candidate(repository, tmp_path, base_sha)
+    worker = _binding(repository, candidate_workspace)
+    review_record = _review_record(
+        worker,
+        workspace=candidate_workspace,
+        workspace_id=str(worker.workspace_id),
+        candidate_sha=candidate_sha,
+    )
+    client = _NativeArchivingPaseoClient(
+        repository,
+        review_record,
+        (_paseo_record(worker),),
+    )
+    runtime = PaseoRuntimeAdapter(client)
+    review_binding = _review_binding(review_record, worker, candidate_sha)
+    authorization = authorize_review_after_evidence(
+        worker_binding=worker,
+        review_binding=review_binding,
+        review_evidence=_review_evidence(worker, candidate_sha),
+    )
+
+    receipt = runtime.retire_review_after_evidence(
+        review_binding,
+        authorization,
+    )
+
+    assert receipt.complete is True
+    assert receipt.workspace_disposition == "shared_preserved"
+    assert client.inspect(review_record.agent_id).archived is True
+    assert client.archived_worktree_names == []
+    assert candidate_workspace.exists()
+
+
+@pytest.mark.parametrize(
+    ("unsafe_kind", "expected_code"),
+    [
+        ("stable", "REVIEW_RETIREMENT_STABLE_WORKSPACE"),
+        ("dirty", "REVIEW_RETIREMENT_WORKTREE_DIRTY"),
+    ],
+)
+def test_review_retirement_fails_closed_for_unsafe_workspace(
+    tmp_path,
+    unsafe_kind,
+    expected_code,
+):
+    from gwo_v8.retirement import authorize_review_after_evidence
+
+    repository, base_sha = _repository(tmp_path)
+    candidate_workspace, candidate_sha = _candidate(repository, tmp_path, base_sha)
+    worker = _binding(repository, candidate_workspace)
+    if unsafe_kind == "stable":
+        review_workspace = repository
+        workspace_id = "wks_01reviewstable"
+    else:
+        review_workspace = tmp_path / "gwo-review-dirty"
+        workspace_id = "wks_01reviewdirty"
+        _git(
+            repository,
+            "worktree",
+            "add",
+            "-b",
+            "gwo/review/dirty",
+            str(review_workspace),
+            candidate_sha,
+        )
+        (review_workspace / "untracked-wip.txt").write_text(
+            "wip\n",
+            encoding="utf-8",
+        )
+    review_record = _review_record(
+        worker,
+        workspace=review_workspace,
+        workspace_id=workspace_id,
+        candidate_sha=candidate_sha,
+    )
+    client = _NativeArchivingPaseoClient(
+        repository,
+        review_record,
+        (_paseo_record(worker),),
+    )
+    runtime = PaseoRuntimeAdapter(client)
+    review_binding = _review_binding(review_record, worker, candidate_sha)
+    authorization = authorize_review_after_evidence(
+        worker_binding=worker,
+        review_binding=review_binding,
+        review_evidence=_review_evidence(worker, candidate_sha),
+    )
+
+    with pytest.raises(RuntimeAdapterError) as error:
+        runtime.retire_review_after_evidence(
+            review_binding,
+            authorization,
+        )
+
+    assert error.value.code == expected_code
+    assert client.inspect(review_record.agent_id).archived is False
+    assert client.archived_worktree_names == []
+    assert review_workspace.exists()
+
+
+def test_review_retirement_rejects_wrong_child_authorization(tmp_path):
+    from gwo_v8._canonical import digest_value
+    from gwo_v8.retirement import (
+        ReviewRetirementAuthorization,
+        authorize_review_after_evidence,
+    )
+
+    repository, base_sha = _repository(tmp_path)
+    candidate_workspace, candidate_sha = _candidate(repository, tmp_path, base_sha)
+    worker = _binding(repository, candidate_workspace)
+    review_workspace = tmp_path / "gwo-review-wrong-child"
+    _git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        "gwo/review/wrong-child",
+        str(review_workspace),
+        candidate_sha,
+    )
+    review_record = _review_record(
+        worker,
+        workspace=review_workspace,
+        workspace_id="wks_01reviewwrongchild",
+        candidate_sha=candidate_sha,
+    )
+    client = _NativeArchivingPaseoClient(
+        repository,
+        review_record,
+        (_paseo_record(worker),),
+    )
+    runtime = PaseoRuntimeAdapter(client)
+    review_binding = _review_binding(review_record, worker, candidate_sha)
+    authorization = authorize_review_after_evidence(
+        worker_binding=worker,
+        review_binding=review_binding,
+        review_evidence=_review_evidence(worker, candidate_sha),
+    )
+    identity = {
+        **authorization.identity,
+        "agent_id": "agent:wrong-review-child",
+    }
+    wrong = ReviewRetirementAuthorization(
+        **identity,
+        authorization_digest=digest_value(identity),
+    )
+
+    with pytest.raises(RuntimeAdapterError) as error:
+        runtime.retire_review_after_evidence(review_binding, wrong)
+
+    assert (
+        error.value.code
+        == "REVIEW_RETIREMENT_AUTHORIZATION_IDENTITY_MISMATCH"
+    )
+    assert review_workspace.exists()
+    assert client.inspect(review_record.agent_id).archived is False
+
+
+def test_kernel_persists_authorization_failure_then_retries(tmp_path, monkeypatch):
+    import gwo_v8.kernel as kernel_module
+    from gwo_v8.retirement import RetirementError
+
+    runtime = InMemoryRuntimeAdapter(tmp_path / "runtime-workspaces")
+    kernel, repository = _kernel_with_runtime(tmp_path, runtime)
+    batch_ready = kernel.reconcile_once("local/retirement")
+    assert batch_ready.candidate_sha is not None
+    _git(repository, "merge", "--ff-only", batch_ready.candidate_sha)
+    original = kernel_module.authorize_after_integration
+
+    def _fail_authorization(**_kwargs):
+        raise RetirementError(
+            "RETIREMENT_WORKTREE_AMBIGUOUS",
+            "synthetic authorization readback gap",
+        )
+
+    monkeypatch.setattr(
+        kernel_module,
+        "authorize_after_integration",
+        _fail_authorization,
+    )
+
+    waiting = kernel.reconcile_once("local/retirement")
+
+    assert waiting.status == "waiting"
+    assert waiting.retirement_state == "error"
+    assert waiting.last_retirement_error == {
+        "code": "RETIREMENT_WORKTREE_AMBIGUOUS",
+        "failure_class": "ambiguous",
+    }
+    monkeypatch.setattr(
+        kernel_module,
+        "authorize_after_integration",
+        original,
+    )
+
+    completed = kernel.reconcile_once("local/retirement")
+
+    assert completed.status == "complete"
+    assert completed.retirement_state == "complete"
+    assert runtime.read_binding(waiting.admission_id) is None
+
+
+def test_issue_88_retirement_adr_explicitly_supersedes_adr_0029_cleanup():
+    root = Path(__file__).resolve().parents[1]
+    adr = (
+        root
+        / "docs"
+        / "adr"
+        / "0041-require-read-backed-post-integration-retirement.md"
+    )
+
+    text = adr.read_text(encoding="utf-8")
+
+    assert "status: accepted" in text
+    assert "supersedes: 0029" in text
+    assert "Resource cleanup is Kernel-owned follow-up and does not hold the Goal open." in text
+    assert "retirement complete" in text
+
+
 @pytest.mark.parametrize(
     ("unsafe_kind", "expected_code"),
     [
@@ -787,52 +1328,6 @@ def test_paseo_retirement_fails_closed_for_unsafe_workspaces(
     assert client.archived_worktree_names == []
 
 
-def test_review_child_retirement_archives_identity_without_shared_workspace_delete(
-    tmp_path,
-):
-    repository, base_sha = _repository(tmp_path)
-    workspace, candidate_sha = _candidate(repository, tmp_path, base_sha)
-    worker_binding = _binding(repository, workspace)
-    record = replace(
-        _paseo_record(worker_binding),
-        agent_id="agent:review-child",
-        session_id="session:review-child",
-    )
-    client = _NativeArchivingPaseoClient(repository, record)
-    runtime = PaseoRuntimeAdapter(client)
-    review_binding = ReviewAxisBinding(
-        action_key="review:retirement",
-        axis="spec",
-        candidate_sha=candidate_sha,
-        fixed_input_digest="3" * 64,
-        runtime_id=record.agent_id,
-        agent_id=record.agent_id,
-        session_id=record.session_id,
-        workspace_id=record.workspace_id,
-        workspace=record.workspace,
-        parent_agent_id=worker_binding.agent_id,
-        runtime_profile="reviewer-standard",
-        profile_digest=record.profile_digest,
-        provider=record.provider,
-        model=record.model,
-        thinking=record.thinking,
-        mode=record.mode,
-        prompt_digest="4" * 64,
-    )
-
-    runtime.retire_review_axis(review_binding)
-
-    assert client.inspect(record.agent_id).archived is True
-    assert client.archived_worktree_names == []
-    assert workspace.exists()
-    assert workspace.resolve().as_posix() in _git(
-        repository,
-        "worktree",
-        "list",
-        "--porcelain",
-    )
-
-
 def test_paseo_partial_archive_failure_retries_exact_branch_cas(
     tmp_path,
     monkeypatch,
@@ -885,6 +1380,50 @@ def test_paseo_partial_archive_failure_retries_exact_branch_cas(
     readback = runtime.retire_after_integration(binding, authorization)
 
     assert readback.complete is True
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/gwo/attempt/retirement-worker",
+            ],
+            cwd=repository,
+        ).returncode
+        != 0
+    )
+
+
+def test_branch_cas_accepts_native_archive_already_deleted_exact_branch(
+    tmp_path,
+):
+    from gwo_v8.retirement import (
+        WorktreeRegistration,
+        delete_temporary_branch_cas,
+    )
+
+    repository, base_sha = _repository(tmp_path)
+    workspace, candidate_sha = _candidate(repository, tmp_path, base_sha)
+    registration = WorktreeRegistration(
+        head=candidate_sha,
+        branch="gwo/attempt/retirement-worker",
+    )
+    _git(repository, "worktree", "remove", "--force", str(workspace))
+    _git(
+        repository,
+        "update-ref",
+        "-d",
+        "refs/heads/gwo/attempt/retirement-worker",
+        candidate_sha,
+    )
+
+    delete_temporary_branch_cas(
+        repository,
+        registration,
+        candidate_sha=candidate_sha,
+    )
+
     assert (
         subprocess.run(
             [

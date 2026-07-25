@@ -4874,25 +4874,59 @@ class Kernel:
             ):
                 continue
             authorization_value = record.get("authorization")
-            if not isinstance(authorization_value, dict):
-                raise KernelError(
-                    "RETIREMENT_AUTHORIZATION_MISSING",
-                    "pending retirement has no exact authorization",
-                )
+            binding = self._retirement_binding(state)
+            authorization = None
             try:
-                authorization = RetirementAuthorization(**authorization_value)
-                authorization.assert_valid_digest()
-                binding = self._retirement_binding(state)
+                if isinstance(authorization_value, dict):
+                    authorization = RetirementAuthorization(
+                        **authorization_value
+                    )
+                    authorization.assert_valid_digest()
+                else:
+                    authorization = authorize_after_integration(
+                        binding=binding,
+                        candidate_sha=str(state["candidate_sha"]),
+                        integrated_sha=str(state["integrated_sha"]),
+                        target_branch=self.integration_branch,
+                    )
+                    state["retirement"] = pending_retirement(authorization)
+                    state["retirement_state"] = "pending"
+                    state["last_retirement_error"] = None
+                    self._write_state(repository, plan_digest, state)
                 readback = self.runtime.retire_after_integration(
                     binding,
                     authorization,
                 )
                 completed = completed_retirement(authorization, readback)
-            except RuntimeAdapterError as error:
+            except (RuntimeAdapterError, RetirementError, TypeError) as error:
+                code = (
+                    error.code
+                    if isinstance(error, (RuntimeAdapterError, RetirementError))
+                    else "RETIREMENT_AUTHORIZATION_INVALID"
+                )
+                failure_class = (
+                    error.failure_class
+                    if isinstance(error, RuntimeAdapterError)
+                    else "ambiguous"
+                )
                 failed = failed_retirement(
                     authorization,
-                    code=error.code,
-                    failure_class=error.failure_class,
+                    code=code,
+                    failure_class=failure_class,
+                )
+                retirement_identity = (
+                    authorization.authorization_digest
+                    if authorization is not None
+                    else digest_value(
+                        {
+                            "repository": repository,
+                            "plan_digest": plan_digest,
+                            "node_key": state["node_key"],
+                            "candidate_sha": state["candidate_sha"],
+                            "integrated_sha": state["integrated_sha"],
+                            "target_branch": self.integration_branch,
+                        }
+                    )
                 )
                 state.update(
                     {
@@ -4906,11 +4940,11 @@ class Kernel:
                         "wait_condition": "runtime_retirement",
                         "wait_source_ref": (
                             f"{self.runtime.adapter_name}://retirement/"
-                            f"{authorization.authorization_digest}"
+                            f"{retirement_identity}"
                         ),
                         "wait_event_identity": (
                             "runtime-retirement:"
-                            f"{authorization.authorization_digest[:24]}"
+                            f"{retirement_identity[:24]}"
                         ),
                         "next_check_at": (
                             datetime.now(timezone.utc) + timedelta(seconds=30)
@@ -4919,8 +4953,6 @@ class Kernel:
                 )
                 self._write_state(repository, plan_digest, state)
                 continue
-            except RetirementError as error:
-                raise KernelError(error.code, error.detail) from error
             state.update(
                 {
                     "status": "complete",
@@ -5567,6 +5599,8 @@ class Kernel:
                 )
             for state in member_states.values():
                 binding = self._retirement_binding(state)
+                authorization = None
+                authorization_error = None
                 try:
                     authorization = authorize_after_integration(
                         binding=binding,
@@ -5575,7 +5609,21 @@ class Kernel:
                         target_branch=self.integration_branch,
                     )
                 except RetirementError as error:
-                    raise KernelError(error.code, error.detail) from error
+                    authorization_error = error
+                retirement_identity = (
+                    authorization.authorization_digest
+                    if authorization is not None
+                    else digest_value(
+                        {
+                            "repository": repository,
+                            "plan_digest": active.plan_digest,
+                            "node_key": state["node_key"],
+                            "candidate_sha": state["candidate_sha"],
+                            "integrated_sha": integrated_sha,
+                            "target_branch": self.integration_branch,
+                        }
+                    )
+                )
                 integration_evidence = TypedEvidence._capture(
                     kind="integration",
                     subject=integrated_sha,
@@ -5602,14 +5650,15 @@ class Kernel:
                         "goal_state": "active",
                         "work_item_state": "integrated",
                         "attempt_state": "retirement_pending",
+                        "integrated_sha": integrated_sha,
                         "wait_condition": "runtime_retirement",
                         "wait_source_ref": (
                             f"{self.runtime.adapter_name}://retirement/"
-                            f"{authorization.authorization_digest}"
+                            f"{retirement_identity}"
                         ),
                         "wait_event_identity": (
                             "runtime-retirement:"
-                            f"{authorization.authorization_digest[:24]}"
+                            f"{retirement_identity[:24]}"
                         ),
                         "next_check_at": (
                             datetime.now(timezone.utc) + timedelta(seconds=1)
@@ -5625,9 +5674,28 @@ class Kernel:
                             integration_evidence.content_digest
                         ),
                         "integration_evidence": asdict(integration_evidence),
-                        "retirement": pending_retirement(authorization),
-                        "retirement_state": "pending",
-                        "last_retirement_error": None,
+                        "retirement": (
+                            pending_retirement(authorization)
+                            if authorization is not None
+                            else failed_retirement(
+                                None,
+                                code=str(authorization_error.code),
+                                failure_class="ambiguous",
+                            )
+                        ),
+                        "retirement_state": (
+                            "pending"
+                            if authorization is not None
+                            else "error"
+                        ),
+                        "last_retirement_error": (
+                            None
+                            if authorization is not None
+                            else {
+                                "code": str(authorization_error.code),
+                                "failure_class": "ambiguous",
+                            }
+                        ),
                     }
                 )
                 self._record_verified_result(

@@ -105,7 +105,10 @@ from .retirement import (
     RetirementAuthorization,
     RetirementError,
     RetirementReadback,
+    ReviewRetirementAuthorization,
+    ReviewRetirementReadback,
     authorize_after_integration,
+    authorize_review_after_evidence,
 )
 from .reconstruction import (
     AuthoritativeNodeReadback,
@@ -231,6 +234,9 @@ __all__ = [
     "RetirementAuthorization",
     "RetirementError",
     "RetirementReadback",
+    "ReviewRetirementAuthorization",
+    "ReviewRetirementReadback",
+    "authorize_review_after_evidence",
     "PublishedPlan",
     "ProposedShadowAction",
     "ReconstructionResult",

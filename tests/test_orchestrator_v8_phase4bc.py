@@ -945,6 +945,86 @@ def test_review_recovery_child_keeps_its_action_and_provider_identity(tmp_path):
     )
 
 
+def test_reconstruction_preserves_pending_retirement_authorization(tmp_path):
+    from gwo_v8._canonical import digest_value
+    from gwo_v8.retirement import RetirementAuthorization, pending_retirement
+
+    compiled, durable = _durable_readback(tmp_path, count=1)
+    node = _node(compiled, 1)
+    binding = node.runtime_binding
+    assert binding is not None
+    identity = {
+        "repository": compiled.repository,
+        "plan_digest": compiled.digest,
+        "node_key": node.node_key,
+        "admission_id": node.admission_id,
+        "attempt_id": node.attempt_id,
+        "agent_id": binding.agent_id,
+        "workspace_id": binding.workspace_id,
+        "candidate_sha": node.candidate_sha,
+        "integrated_sha": node.candidate_sha,
+        "target_branch": "main",
+        "temporary_branch": "gwo/reconstructed",
+    }
+    authorization = RetirementAuthorization(
+        **identity,
+        authorization_digest=digest_value(identity),
+    )
+    retirement = pending_retirement(authorization)
+    pending = replace(
+        node,
+        status="waiting",
+        directive="reconcile_again",
+        attempt_state="retirement_pending",
+        wait_condition="runtime_retirement",
+        wait_source_ref="paseo://retirement/pending",
+        integrated_sha=node.candidate_sha,
+        integration_source_ref=f"git://main/{node.candidate_sha}",
+        retirement=retirement,
+        retirement_state="pending",
+        last_retirement_error=None,
+    )
+    readback = AuthoritativeRepositoryReadback.from_durable(
+        durable,
+        compiled.repository,
+        nodes=(pending,),
+    )
+    destination = tmp_path / "retirement-reconstruction.sqlite3"
+
+    result = StoreReconstructor().reconstruct(readback, destination)
+
+    assert result.status == "reconstructed"
+    with sqlite3.connect(destination) as connection:
+        state = json.loads(
+            connection.execute(
+                "SELECT state_json FROM v8_node_execution_state"
+            ).fetchone()[0]
+        )
+    assert state["retirement"] == retirement
+    assert state["retirement_state"] == "pending"
+    assert state["attempt_state"] == "retirement_pending"
+
+    outcome = _kernel(destination, durable, tmp_path).reconcile_once(
+        compiled.repository
+    )
+
+    assert outcome.retirement_state == "error"
+    assert outcome.last_retirement_error == {
+        "code": "RUNTIME_IDENTITY_MISMATCH",
+        "failure_class": "ambiguous",
+    }
+    with sqlite3.connect(destination) as connection:
+        retried = json.loads(
+            connection.execute(
+                "SELECT state_json FROM v8_node_execution_state"
+            ).fetchone()[0]
+        )
+    assert (
+        retried["retirement"]["authorization"]
+        == retirement["authorization"]
+    )
+
+
 def test_partial_review_and_consumed_budgets_resume_without_reset(tmp_path):
     compiled, durable = _durable_readback(
         tmp_path,

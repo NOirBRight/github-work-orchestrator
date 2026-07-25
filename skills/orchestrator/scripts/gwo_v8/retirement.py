@@ -11,10 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import subprocess
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from ._canonical import digest_value
-from .runtime import RuntimeBinding
+from .evidence import TypedEvidence
+from .runtime import ReviewAxisBinding, RuntimeBinding
 
 
 class RetirementError(RuntimeError):
@@ -66,6 +67,8 @@ class RetirementAuthorization:
 @dataclass(frozen=True)
 class RetirementReadback:
     repository: str
+    plan_digest: str
+    node_key: str
     admission_id: str
     attempt_id: str
     agent_id: str
@@ -73,6 +76,7 @@ class RetirementReadback:
     candidate_sha: str
     integrated_sha: str
     target_branch: str
+    temporary_branch: str | None
     authorization_digest: str
     agent_archived: bool
     directory_absent: bool
@@ -88,11 +92,398 @@ class RetirementReadback:
             and self.branch_deleted
         )
 
+    @property
+    def identity(self) -> dict[str, Any]:
+        return {
+            "repository": self.repository,
+            "plan_digest": self.plan_digest,
+            "node_key": self.node_key,
+            "admission_id": self.admission_id,
+            "attempt_id": self.attempt_id,
+            "agent_id": self.agent_id,
+            "workspace_id": self.workspace_id,
+            "candidate_sha": self.candidate_sha,
+            "integrated_sha": self.integrated_sha,
+            "target_branch": self.target_branch,
+            "temporary_branch": self.temporary_branch,
+        }
+
 
 @dataclass(frozen=True)
 class WorktreeRegistration:
     head: str
     branch: str | None
+
+
+@dataclass(frozen=True)
+class ReviewRetirementAuthorization:
+    repository: str
+    plan_digest: str
+    node_key: str
+    admission_id: str
+    attempt_id: str
+    parent_agent_id: str
+    parent_workspace_id: str
+    action_key: str
+    axis: str
+    agent_id: str
+    session_id: str
+    workspace_id: str
+    candidate_sha: str
+    temporary_branch: str | None
+    review_evidence_digest: str
+    authorization_digest: str
+
+    @property
+    def identity(self) -> dict[str, Any]:
+        return {
+            "repository": self.repository,
+            "plan_digest": self.plan_digest,
+            "node_key": self.node_key,
+            "admission_id": self.admission_id,
+            "attempt_id": self.attempt_id,
+            "parent_agent_id": self.parent_agent_id,
+            "parent_workspace_id": self.parent_workspace_id,
+            "action_key": self.action_key,
+            "axis": self.axis,
+            "agent_id": self.agent_id,
+            "session_id": self.session_id,
+            "workspace_id": self.workspace_id,
+            "candidate_sha": self.candidate_sha,
+            "temporary_branch": self.temporary_branch,
+            "review_evidence_digest": self.review_evidence_digest,
+        }
+
+    def assert_valid_digest(self) -> None:
+        if digest_value(self.identity) != self.authorization_digest:
+            raise RetirementError(
+                "REVIEW_RETIREMENT_AUTHORIZATION_DIGEST_MISMATCH",
+                "Review retirement identity does not match its digest",
+            )
+
+
+@dataclass(frozen=True)
+class ReviewRetirementReadback:
+    repository: str
+    plan_digest: str
+    node_key: str
+    admission_id: str
+    attempt_id: str
+    parent_agent_id: str
+    parent_workspace_id: str
+    action_key: str
+    axis: str
+    agent_id: str
+    session_id: str
+    workspace_id: str
+    candidate_sha: str
+    temporary_branch: str | None
+    review_evidence_digest: str
+    authorization_digest: str
+    workspace_disposition: str
+    agent_archived: bool
+    directory_absent: bool
+    worktree_absent: bool
+    branch_deleted: bool
+
+    @property
+    def identity(self) -> dict[str, Any]:
+        return {
+            "repository": self.repository,
+            "plan_digest": self.plan_digest,
+            "node_key": self.node_key,
+            "admission_id": self.admission_id,
+            "attempt_id": self.attempt_id,
+            "parent_agent_id": self.parent_agent_id,
+            "parent_workspace_id": self.parent_workspace_id,
+            "action_key": self.action_key,
+            "axis": self.axis,
+            "agent_id": self.agent_id,
+            "session_id": self.session_id,
+            "workspace_id": self.workspace_id,
+            "candidate_sha": self.candidate_sha,
+            "temporary_branch": self.temporary_branch,
+            "review_evidence_digest": self.review_evidence_digest,
+        }
+
+    @property
+    def complete(self) -> bool:
+        if self.workspace_disposition == "shared_preserved":
+            return (
+                self.agent_archived
+                and not self.directory_absent
+                and not self.worktree_absent
+                and not self.branch_deleted
+            )
+        return (
+            self.workspace_disposition == "disposable_removed"
+            and self.agent_archived
+            and self.directory_absent
+            and self.worktree_absent
+            and self.branch_deleted
+        )
+
+
+def pending_review_retirement(
+    authorization: ReviewRetirementAuthorization,
+) -> dict[str, Any]:
+    authorization.assert_valid_digest()
+    return {
+        "state": "pending",
+        "authorization": {
+            **authorization.identity,
+            "authorization_digest": authorization.authorization_digest,
+        },
+        "error": None,
+        "evidence": None,
+    }
+
+
+def failed_review_retirement(
+    authorization: ReviewRetirementAuthorization | None,
+    *,
+    code: str,
+    failure_class: str,
+) -> dict[str, Any]:
+    return {
+        "state": "error",
+        "authorization": (
+            None
+            if authorization is None
+            else {
+                **authorization.identity,
+                "authorization_digest": authorization.authorization_digest,
+            }
+        ),
+        "error": {
+            "code": code,
+            "failure_class": failure_class,
+        },
+        "evidence": None,
+    }
+
+
+def completed_review_retirement(
+    authorization: ReviewRetirementAuthorization,
+    readback: ReviewRetirementReadback,
+) -> dict[str, Any]:
+    if (
+        not readback.complete
+        or readback.identity != authorization.identity
+        or readback.authorization_digest != authorization.authorization_digest
+    ):
+        raise RetirementError(
+            "REVIEW_RETIREMENT_READBACK_IDENTITY_MISMATCH",
+            "Review retirement receipt does not match its authorization",
+        )
+    record = pending_review_retirement(authorization)
+    record.update(
+        {
+            "state": "complete",
+            "evidence": {
+                **readback.identity,
+                "authorization_digest": readback.authorization_digest,
+                "workspace_disposition": readback.workspace_disposition,
+                "agent_archived": readback.agent_archived,
+                "directory_absent": readback.directory_absent,
+                "worktree_absent": readback.worktree_absent,
+                "branch_deleted": readback.branch_deleted,
+            },
+        }
+    )
+    return record
+
+
+def resolve_native_worktree_name(
+    *,
+    workspace: Path,
+    candidate_sha: str,
+    temporary_branch: str | None,
+    worktrees: Iterable[Mapping[str, Any]],
+) -> str:
+    """Resolve one Paseo-native archive name from canonical list readback."""
+
+    expected_path = workspace.resolve()
+    exact = [
+        item
+        for item in worktrees
+        if isinstance(item.get("path"), str)
+        and Path(str(item["path"])).resolve() == expected_path
+    ]
+    if len(exact) != 1:
+        raise RetirementError(
+            "PASEO_WORKTREE_IDENTITY_AMBIGUOUS",
+            "Paseo worktree list did not identify one exact canonical path",
+        )
+    item = exact[0]
+    native_name = item.get("native_name")
+    if (
+        not isinstance(native_name, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", native_name) is None
+        or item.get("head") != candidate_sha
+        or item.get("branch_name") != temporary_branch
+    ):
+        raise RetirementError(
+            "PASEO_WORKTREE_IDENTITY_MISMATCH",
+            "Paseo worktree readback does not match Candidate identity",
+        )
+    return native_name
+
+
+def authorize_review_after_evidence(
+    *,
+    worker_binding: RuntimeBinding,
+    review_binding: ReviewAxisBinding,
+    review_evidence: TypedEvidence,
+) -> ReviewRetirementAuthorization:
+    """Bind Review retirement only after exact Review Evidence convergence."""
+
+    worker = _required_binding_identity(worker_binding)
+    parent_agent_id = str(worker_binding.agent_id)
+    parent_workspace_id = str(worker_binding.workspace_id)
+    review_parent = (
+        review_binding.parent_agent_id
+        or review_binding.declared_parent_agent_id
+    )
+    if (
+        review_parent != parent_agent_id
+        or review_binding.candidate_sha != review_evidence.subject
+        or review_evidence.kind != "review"
+        or not review_evidence.has_valid_digest()
+        or review_evidence.payload.get("attempt_id") != worker_binding.attempt_id
+        or review_evidence.payload.get("candidate_sha")
+        != review_binding.candidate_sha
+    ):
+        raise RetirementError(
+            "REVIEW_RETIREMENT_EVIDENCE_MISMATCH",
+            "Review retirement requires exact converged Evidence and parent identity",
+        )
+    registration = _registered_worktrees(
+        Path(worker_binding.repository_path).resolve()
+    ).get(Path(review_binding.workspace).resolve())
+    if registration is None:
+        raise RetirementError(
+            "REVIEW_RETIREMENT_WORKTREE_AMBIGUOUS",
+            "Review retirement cannot identify its exact Git worktree",
+        )
+    payload = {
+        **worker,
+        "parent_agent_id": parent_agent_id,
+        "parent_workspace_id": parent_workspace_id,
+        "action_key": review_binding.action_key,
+        "axis": review_binding.axis,
+        "agent_id": review_binding.agent_id,
+        "session_id": review_binding.session_id,
+        "workspace_id": review_binding.workspace_id,
+        "candidate_sha": review_binding.candidate_sha,
+        "temporary_branch": registration.branch,
+        "review_evidence_digest": review_evidence.content_digest,
+    }
+    authorization = ReviewRetirementAuthorization(
+        **payload,
+        authorization_digest=digest_value(payload),
+    )
+    authorization.assert_valid_digest()
+    return authorization
+
+
+def assert_review_authorization_matches(
+    binding: ReviewAxisBinding,
+    authorization: ReviewRetirementAuthorization,
+) -> None:
+    authorization.assert_valid_digest()
+    expected = {
+        "action_key": binding.action_key,
+        "axis": binding.axis,
+        "agent_id": binding.agent_id,
+        "session_id": binding.session_id,
+        "workspace_id": binding.workspace_id,
+        "candidate_sha": binding.candidate_sha,
+    }
+    if any(
+        authorization.identity.get(key) != value
+        for key, value in expected.items()
+    ):
+        raise RetirementError(
+            "REVIEW_RETIREMENT_AUTHORIZATION_IDENTITY_MISMATCH",
+            "Review authorization does not bind this child identity",
+        )
+
+
+def validate_disposable_review_worktree(
+    *,
+    repository: Path,
+    workspace: Path,
+    authorization: ReviewRetirementAuthorization,
+) -> WorktreeRegistration:
+    repository = repository.resolve()
+    workspace = workspace.resolve()
+    if workspace == repository:
+        raise RetirementError(
+            "REVIEW_RETIREMENT_STABLE_WORKSPACE",
+            "Coordinator and Integration workspaces are never disposable",
+        )
+    registration = _registered_worktrees(repository).get(workspace)
+    if registration is None:
+        raise RetirementError(
+            "REVIEW_RETIREMENT_WORKTREE_AMBIGUOUS",
+            "Review workspace is not one exact registered Git worktree",
+        )
+    if (
+        registration.branch != authorization.temporary_branch
+        or (
+            registration.branch is not None
+            and not registration.branch.startswith(("gwo/", "gwo-"))
+        )
+    ):
+        raise RetirementError(
+            "REVIEW_RETIREMENT_STABLE_WORKSPACE",
+            "only a GWO disposable Review worktree may be removed",
+        )
+    status = _git(
+        workspace,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+    if status:
+        raise RetirementError(
+            "REVIEW_RETIREMENT_WORKTREE_DIRTY",
+            "Review workspace contains tracked or untracked WIP",
+        )
+    head = _git(workspace, "rev-parse", "HEAD")
+    if head != authorization.candidate_sha or registration.head != head:
+        raise RetirementError(
+            "REVIEW_RETIREMENT_CANDIDATE_MISMATCH",
+            "Review workspace does not read back the authorized Candidate",
+        )
+    return registration
+
+
+def review_retirement_readback(
+    *,
+    authorization: ReviewRetirementAuthorization,
+    workspace_disposition: str,
+    agent_archived: bool,
+    directory_absent: bool,
+    worktree_absent: bool,
+    branch_deleted: bool,
+) -> ReviewRetirementReadback:
+    readback = ReviewRetirementReadback(
+        **authorization.identity,
+        authorization_digest=authorization.authorization_digest,
+        workspace_disposition=workspace_disposition,
+        agent_archived=agent_archived,
+        directory_absent=directory_absent,
+        worktree_absent=worktree_absent,
+        branch_deleted=branch_deleted,
+    )
+    if not readback.complete:
+        raise RetirementError(
+            "REVIEW_RETIREMENT_READBACK_INCOMPLETE",
+            "Review Agent/worktree retirement did not read back complete",
+        )
+    return readback
 
 
 def pending_retirement(
@@ -111,12 +502,21 @@ def pending_retirement(
 
 
 def failed_retirement(
-    authorization: RetirementAuthorization,
+    authorization: RetirementAuthorization | None,
     *,
     code: str,
     failure_class: str,
 ) -> dict[str, Any]:
-    record = pending_retirement(authorization)
+    record = (
+        {
+            "state": "error",
+            "authorization": None,
+            "error": None,
+            "evidence": None,
+        }
+        if authorization is None
+        else pending_retirement(authorization)
+    )
     record.update(
         {
             "state": "error",
@@ -135,6 +535,7 @@ def completed_retirement(
 ) -> dict[str, Any]:
     if (
         not readback.complete
+        or readback.identity != authorization.identity
         or readback.authorization_digest != authorization.authorization_digest
     ):
         raise RetirementError(
@@ -146,15 +547,7 @@ def completed_retirement(
         {
             "state": "complete",
             "evidence": {
-                "repository": readback.repository,
-                "admission_id": readback.admission_id,
-                "attempt_id": readback.attempt_id,
-                "agent_id": readback.agent_id,
-                "workspace_id": readback.workspace_id,
-                "candidate_sha": readback.candidate_sha,
-                "integrated_sha": readback.integrated_sha,
-                "target_branch": readback.target_branch,
-                "temporary_branch": authorization.temporary_branch,
+                **readback.identity,
                 "authorization_digest": readback.authorization_digest,
                 "agent_archived": readback.agent_archived,
                 "directory_absent": readback.directory_absent,
@@ -354,6 +747,20 @@ def delete_temporary_branch_cas(
             "only an exact GWO temporary branch may be CAS deleted",
         )
     branch_ref = f"refs/heads/{registration.branch}"
+    present = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", branch_ref],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if present.returncode == 1:
+        return
+    if present.returncode != 0:
+        raise RetirementError(
+            "RETIREMENT_GIT_READBACK_FAILED",
+            present.stderr.strip() or "temporary branch readback failed",
+        )
     current = _git(repository, "rev-parse", "--verify", branch_ref)
     if current != candidate_sha:
         raise RetirementError(
@@ -375,6 +782,8 @@ def read_retirement_completion(
     worktree_absent = workspace not in _registered_worktrees(repository)
     readback = RetirementReadback(
         repository=authorization.repository,
+        plan_digest=authorization.plan_digest,
+        node_key=authorization.node_key,
         admission_id=authorization.admission_id,
         attempt_id=authorization.attempt_id,
         agent_id=authorization.agent_id,
@@ -382,6 +791,7 @@ def read_retirement_completion(
         candidate_sha=authorization.candidate_sha,
         integrated_sha=authorization.integrated_sha,
         target_branch=authorization.target_branch,
+        temporary_branch=authorization.temporary_branch,
         authorization_digest=authorization.authorization_digest,
         agent_archived=agent_archived,
         directory_absent=not workspace.exists(),

@@ -28,7 +28,9 @@ individual Coordinator turns and Plan Revisions. A turn ending is not a Goal
 outcome. The Coordinator may propose completion, but the Kernel accepts it only
 after every in-scope Work Item is completed or integrated and all required
 review, integration, and Decision Gates are satisfied. Resource cleanup is
-Kernel-owned follow-up and does not hold the Goal open.
+Kernel-owned follow-up and does not hold the Goal open. ADR-0041 supersedes
+this sentence for V8 Candidate and Review retirement: the Goal remains active
+until every required retirement reads back complete.
 
 While the Goal remains active, a reconciliation pass returns a wait directive
 without invoking an Agent when an Attempt, GitHub check, materialization retry,

@@ -675,12 +675,18 @@ combined Batch SHA, but must be its ancestor.
 The Runtime Adapter validates authorization digest, ownership, exact
 worktree registration, clean status, Candidate HEAD, target head, ancestry,
 non-shared/non-stable workspace identity, and the native Paseo worktree name.
+The native name comes from exact Agent identity plus canonical-path matching
+against Paseo worktree-list readback; a `wks_*` Workspace ID is not a worktree
+archive name. This completion rule is the ADR-0041 exception that supersedes
+ADR-0029's earlier non-blocking cleanup sentence.
 It then archives the Agent, runs `paseo worktree archive <name> --json`, CAS
 deletes only the authorized temporary branch, prunes, and reads back Agent
 archived, directory absent, and Git worktree registration absent. Partial
 success persists as typed `pending` or `error` retirement state and the next
-Kernel reconciliation retries idempotently. Review children that share a
-Candidate workspace retire only their Agent identity.
+Kernel reconciliation retries idempotently. After accepted Review Evidence,
+independent disposable Reviewer worktrees use the same typed, identity-bound
+Runtime retirement policy. Review children that share a Candidate workspace
+retire only their Agent identity.
 
 The Worker Prompt is a role projection: it exposes implementation authority and
 only affected diagnostics, while the frozen full output contract remains with

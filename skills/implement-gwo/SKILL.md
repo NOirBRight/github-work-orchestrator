@@ -43,6 +43,12 @@ never fall back to `/implement` or run those HITL commands automatically.
    `Agent archive -> paseo worktree archive <name> --json -> exact temporary
    branch CAS/prune -> Agent/path/Git-worktree readback`; retry typed
    pending/error retirement idempotently.
+   Resolve the native archive name inside the Runtime Adapter from exact Agent
+   and Paseo worktree-list canonical-path readback; never treat a `wks_*`
+   Workspace ID as that name. Apply ADR-0041 to Reviewer retirement as well:
+   remove an independent disposable Reviewer worktree only after accepted
+   Review Evidence, while a child sharing the Candidate workspace archives
+   identity only.
 7. Continue until every in-scope Work Item is verified and every integrated
    Batch member has complete Runtime retirement readback, or the Task Group
    Goal is explicitly

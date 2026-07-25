@@ -108,6 +108,9 @@ Scope:
   needs: idempotent create/adopt, identity round-trip, Prompt acceptance,
   lifecycle and turn readback, resume, safe interrupt, and Kernel-authorized
   read-backed retirement through the single `retire_after_integration` seam.
+  Resolve native archive names from Paseo worktree-list canonical-path
+  readback rather than treating `wks_*` Workspace IDs as names. Follow
+  ADR-0041 for retirement-gated Goal completion and typed Reviewer retirement.
 - Publish `/implement-gwo` as the V8 execution entry for one ready ticket, a
   parent Goal/spec, or an explicit ready set. Keep `/orchestrator` as a
   compatibility alias for this release only; leave Matt `/implement`

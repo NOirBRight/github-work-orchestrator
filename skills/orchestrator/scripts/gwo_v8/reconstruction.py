@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 import re
@@ -18,6 +18,12 @@ from .activation import (
 )
 from .evidence import EvidenceVerifier, ResultClaim, TypedEvidence
 from .kernel import Kernel
+from .retirement import (
+    RetirementAuthorization,
+    RetirementError,
+    RetirementReadback,
+    completed_retirement,
+)
 from .runtime import (
     ReviewAxisBinding,
     ReviewAxisObservation,
@@ -87,6 +93,13 @@ class AuthoritativeNodeReadback:
     integration_batch_id: str | None = None
     integration_batch_sha: str | None = None
     integration_evidence: TypedEvidence | None = None
+    retirement: dict[str, Any] | None = None
+    retirement_state: str | None = None
+    last_retirement_error: dict[str, str] | None = None
+    review_retirements: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
+    review_children_retired: bool = False
 
     def result_claim(self) -> ResultClaim | None:
         if self.attempt_id is None or self.candidate_sha is None:
@@ -139,7 +152,9 @@ class AuthoritativeNodeReadback:
             ),
             "work_item_key": self.work_item_key,
             "work_item_state": (
-                "integrated" if self.status == "complete" else "active"
+                "integrated"
+                if self.integrated_sha is not None
+                else "active"
             ),
             "node_key": self.node_key,
             "contract_digest": contract_digest,
@@ -196,7 +211,8 @@ class AuthoritativeNodeReadback:
             "review_evidence": (
                 None if review_evidence is None else asdict(review_evidence)
             ),
-            "review_children_retired": False,
+            "review_children_retired": self.review_children_retired,
+            "review_retirements": self.review_retirements,
             "integrated_sha": self.integrated_sha,
             "integration_source_ref": self.integration_source_ref,
             "integration_batch_id": self.integration_batch_id,
@@ -214,6 +230,9 @@ class AuthoritativeNodeReadback:
                 if self.integration_evidence is None
                 else self.integration_evidence.content_digest
             ),
+            "retirement": self.retirement,
+            "retirement_state": self.retirement_state,
+            "last_retirement_error": self.last_retirement_error,
         }
 
 
@@ -776,6 +795,71 @@ class StoreReconstructor:
                         or gate.evidence.payload != review_evidence.payload
                     ):
                         blockers.add("REVIEW_EVIDENCE_INVALID")
+            retirement = node.retirement
+            if retirement is not None:
+                retirement_record_valid = (
+                    isinstance(retirement, dict)
+                    and retirement.get("state")
+                    in {"pending", "error", "complete"}
+                    and node.retirement_state == retirement.get("state")
+                )
+                authorization = None
+                authorization_value = (
+                    retirement.get("authorization")
+                    if isinstance(retirement, dict)
+                    else None
+                )
+                if isinstance(authorization_value, dict):
+                    try:
+                        authorization = RetirementAuthorization(
+                            **authorization_value
+                        )
+                        authorization.assert_valid_digest()
+                    except (RetirementError, TypeError):
+                        retirement_record_valid = False
+                    else:
+                        retirement_record_valid = retirement_record_valid and (
+                            authorization.repository == readback.repository
+                            and authorization.plan_digest
+                            == readback.receipt.plan_digest
+                            and authorization.node_key == node.node_key
+                            and authorization.admission_id == node.admission_id
+                            and authorization.attempt_id == node.attempt_id
+                            and authorization.candidate_sha
+                            == node.candidate_sha
+                            and authorization.integrated_sha
+                            == node.integrated_sha
+                        )
+                elif (
+                    not isinstance(retirement, dict)
+                    or retirement.get("state") != "error"
+                ):
+                    retirement_record_valid = False
+                if (
+                    retirement_record_valid
+                    and retirement.get("state") == "complete"
+                    and authorization is not None
+                ):
+                    evidence_value = retirement.get("evidence")
+                    if not isinstance(evidence_value, dict):
+                        retirement_record_valid = False
+                    else:
+                        try:
+                            completed_retirement(
+                                authorization,
+                                RetirementReadback(**evidence_value),
+                            )
+                        except (RetirementError, TypeError):
+                            retirement_record_valid = False
+                if not retirement_record_valid:
+                    blockers.add("RETIREMENT_READBACK_CONTRADICTION")
+            if node.attempt_state == "retirement_pending" and (
+                retirement is None
+                or node.status != "waiting"
+                or node.integrated_sha is None
+                or node.retirement_state not in {"pending", "error"}
+            ):
+                blockers.add("RETIREMENT_READBACK_CONTRADICTION")
             if node.status == "complete" and (
                 node.directive != "goal_complete"
                 or node.candidate_sha is None
@@ -786,11 +870,17 @@ class StoreReconstructor:
                 blockers.add("COMPLETION_FACTS_MISSING")
             if node.status != "complete" and (
                 node.directive == "goal_complete"
-                or node.integrated_sha is not None
+                or (
+                    node.integrated_sha is not None
+                    and node.attempt_state != "retirement_pending"
+                )
             ):
                 blockers.add("LIFECYCLE_RELATION_CONTRADICTION")
             if node.integrated_sha is not None and (
-                node.status != "complete"
+                (
+                    node.status != "complete"
+                    and node.attempt_state != "retirement_pending"
+                )
                 or node.integrated_sha != integration_subject
                 or not node.integration_source_ref
             ):
