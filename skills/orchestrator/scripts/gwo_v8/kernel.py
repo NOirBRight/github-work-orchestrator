@@ -15,12 +15,12 @@ from typing import Any, Protocol
 from urllib.parse import quote
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
-from ._effects import EffectContractError, normalized_relative_path
 from .activation import LocalPlanPublication
 from .effect_verification import (
     EffectContractVerifier,
     EffectVerificationError,
-    effect_contract_evidence_binds,
+    adoption_evidence_is_valid,
+    verified_result_producer_binding,
 )
 from .evidence import (
     EvidenceVerifier,
@@ -1514,7 +1514,7 @@ class Kernel:
                 candidate_sha TEXT NOT NULL,
                 result_digest TEXT NOT NULL,
                 base_sha TEXT NOT NULL,
-                authoritative_base_sha TEXT,
+                integrated_sha TEXT,
                 producer_binding_digest TEXT,
                 evidence_manifest_digest TEXT,
                 evidence_json TEXT,
@@ -1555,13 +1555,21 @@ class Kernel:
                 ADD COLUMN evidence_json TEXT
                 """
             )
-        if "authoritative_base_sha" not in result_columns:
+        if "integrated_sha" not in result_columns:
             connection.execute(
                 """
                 ALTER TABLE v8_verified_results
-                ADD COLUMN authoritative_base_sha TEXT
+                ADD COLUMN integrated_sha TEXT
                 """
             )
+            if "authoritative_base_sha" in result_columns:
+                connection.execute(
+                    """
+                    UPDATE v8_verified_results
+                    SET integrated_sha = authoritative_base_sha
+                    WHERE integrated_sha IS NULL
+                    """
+                )
         if "producer_binding_digest" not in result_columns:
             connection.execute(
                 """
@@ -3178,7 +3186,7 @@ class Kernel:
                     candidate_sha,
                     result_digest,
                     base_sha,
-                    authoritative_base_sha,
+                    integrated_sha,
                     producer_binding_digest,
                     evidence_manifest_digest,
                     evidence_json
@@ -3200,89 +3208,25 @@ class Kernel:
                 continue
             try:
                 evidence_record = json.loads(row["evidence_json"])
-                if (
-                    not isinstance(evidence_record, dict)
-                    or digest_value(evidence_record) != row["evidence_manifest_digest"]
-                ):
+                if not isinstance(evidence_record, dict):
                     continue
-                producer = evidence_record["producer_binding"]
-                if (
-                    not isinstance(producer, dict)
-                    or digest_value(producer) != row["producer_binding_digest"]
-                    or set(producer)
-                    != {
-                        "repository",
-                        "plan_digest",
-                        "node_key",
-                        "contract_digest",
-                        "attempt_id",
-                        "base_sha",
-                        "candidate_sha",
-                        "result_digest",
-                        "authoritative_base_sha",
-                        "writer_generation",
-                        "candidate_evidence_manifest_digest",
-                        "effect_contract_evidence_digest",
-                    }
-                    or any(
-                        producer.get(name) != row[name]
-                        for name in (
-                            "repository",
-                            "plan_digest",
-                            "node_key",
-                            "contract_digest",
-                            "base_sha",
-                            "candidate_sha",
-                            "result_digest",
-                            "authoritative_base_sha",
-                        )
-                    )
-                    or current_base != row["authoritative_base_sha"]
-                    or not isinstance(producer.get("attempt_id"), str)
-                    or not isinstance(producer.get("writer_generation"), str)
-                ):
-                    continue
+            except json.JSONDecodeError:
+                continue
+            try:
+                valid_effect_evidence = adoption_evidence_is_valid(
+                    self.repository_path,
+                    current_target_sha=current_base,
+                    source_row=dict(row),
+                    evidence_record=evidence_record,
+                    work_node=work_node,
+                )
+            except EffectVerificationError as error:
+                raise KernelError(error.code, error.detail) from error
+            if not valid_effect_evidence:
+                continue
+            try:
                 historical_binding = RuntimeBinding(**evidence_record["binding"])
                 historical_claim = ResultClaim(**evidence_record["result_claim"])
-                effect_evidence = TypedEvidence(
-                    **evidence_record["effect_contract_verification"]
-                )
-                scopes = tuple(
-                    normalized_relative_path(scope)
-                    for scope in (
-                        (work_node.get("effect_contract") or {}).get(
-                            "write_scopes"
-                        )
-                        or ()
-                    )
-                )
-                if (
-                    historical_binding.repository != row["repository"]
-                    or historical_binding.plan_digest != row["plan_digest"]
-                    or historical_binding.node_key != row["node_key"]
-                    or historical_binding.attempt_id != producer["attempt_id"]
-                    or historical_binding.base_sha != row["base_sha"]
-                    or historical_claim.attempt_id != producer["attempt_id"]
-                    or historical_claim.node_key != row["node_key"]
-                    or historical_claim.candidate_sha != row["candidate_sha"]
-                    or not effect_contract_evidence_binds(
-                        effect_evidence,
-                        identity={
-                            "plan_digest": str(row["plan_digest"]),
-                            "node_key": str(row["node_key"]),
-                            "attempt_id": producer["attempt_id"],
-                            "base_sha": str(row["base_sha"]),
-                            "candidate_sha": str(row["candidate_sha"]),
-                        },
-                        contract_digest=str(row["contract_digest"]),
-                        scopes=scopes,
-                        observer_id=producer["writer_generation"],
-                    )
-                    or effect_evidence.payload.get("status") != "accepted"
-                    or effect_evidence.content_digest
-                    != producer["effect_contract_evidence_digest"]
-                ):
-                    continue
                 historical_observation = RuntimeObservation(
                     binding=historical_binding,
                     lifecycle=str(evidence_record.get("lifecycle") or "completed"),
@@ -3291,92 +3235,9 @@ class Kernel:
                         TypedEvidence(**item) for item in evidence_record["evidence"]
                     ),
                 )
-                manifest = evidence_record["candidate_evidence_manifest"]
-                manifest_digest = evidence_record[
-                    "candidate_evidence_manifest_digest"
-                ]
-                manifest_entries = [
-                    {
-                        "kind": item.kind,
-                        **(
-                            {
-                                "decision_type": item.payload.get(
-                                    "decision_type"
-                                )
-                            }
-                            if item.kind == "decision"
-                            else {}
-                        ),
-                        "content_digest": item.content_digest,
-                        "source_ref": item.source_ref,
-                    }
-                    for item in (
-                        *historical_observation.evidence,
-                        effect_evidence,
-                    )
-                    if item.has_valid_digest()
-                ]
-                expected_manifest = {
-                    "candidate_sha": str(row["candidate_sha"]),
-                    "evidence": sorted(
-                        manifest_entries,
-                        key=lambda item: (
-                            str(item["kind"]),
-                            str(item["content_digest"]),
-                            str(item["source_ref"]),
-                        ),
-                    ),
-                }
-                if (
-                    manifest != expected_manifest
-                    or digest_value(manifest) != manifest_digest
-                    or manifest_digest
-                    != producer["candidate_evidence_manifest_digest"]
-                ):
-                    continue
-                integration_evidence = TypedEvidence(
-                    **evidence_record["integration_batch"][
-                        "integration_evidence"
-                    ]
-                )
-                if (
-                    not integration_evidence.has_valid_digest()
-                    or integration_evidence.kind != "integration"
-                    or integration_evidence.subject
-                    != row["authoritative_base_sha"]
-                    or integration_evidence.payload.get("candidate_sha")
-                    != row["candidate_sha"]
-                    or row["node_key"]
-                    not in (
-                        integration_evidence.payload.get("member_node_keys")
-                        or ()
-                    )
-                ):
-                    continue
-            except (
-                EffectContractError,
-                KeyError,
-                TypeError,
-                json.JSONDecodeError,
-            ):
+            except (KeyError, TypeError):
                 continue
             candidate_sha = str(row["candidate_sha"])
-            ancestry = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(self.repository_path),
-                    "merge-base",
-                    "--is-ancestor",
-                    candidate_sha,
-                    current_base,
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-            )
-            if ancestry.returncode != 0:
-                continue
             refresh_evidence_digests: tuple[str, ...] = ()
             if base_sensitive and row["base_sha"] != current_base:
                 refreshed = self._refresh_base_sensitive_evidence(
@@ -3428,24 +3289,6 @@ class Kernel:
                     batch_sha = ""
                     batch_hosted = ()
                     batch_integration = None
-                batch_ancestry = (
-                    subprocess.run(
-                        [
-                            "git",
-                            "-C",
-                            str(self.repository_path),
-                            "merge-base",
-                            "--is-ancestor",
-                            batch_sha,
-                            current_base,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                    )
-                    if batch_sha
-                    else None
-                )
                 expected_hosted_names = {
                     str(definition["hosted_name"])
                     for definition in hosted_definitions
@@ -3460,8 +3303,7 @@ class Kernel:
                     and item.has_valid_digest()
                 }
                 batch_is_valid = (
-                    batch_ancestry is not None
-                    and batch_ancestry.returncode == 0
+                    batch_sha == row["integrated_sha"]
                     and batch_integration is not None
                     and batch_integration.kind == "integration"
                     and batch_integration.subject == batch_sha
@@ -3685,85 +3527,27 @@ class Kernel:
                 "VERIFIED_RESULT_EVIDENCE_MISSING",
                 "verified Result has no persisted Evidence record",
             )
-        candidate_evidence_manifest = state.get("candidate_evidence_manifest")
-        effect_verification = state.get("effect_verification")
-        if not isinstance(candidate_evidence_manifest, dict) or not isinstance(
-            effect_verification, dict
-        ):
-            raise KernelError(
-                "VERIFIED_RESULT_EVIDENCE_MISSING",
-                "verified Result has no Effect Contract Evidence manifest",
+        integrated_sha = str(state.get("integrated_sha") or "")
+        producer_binding = verified_result_producer_binding(
+            state,
+            candidate_sha=candidate_sha,
+            result_digest=result_digest,
+            integrated_sha=integrated_sha,
+            observer_id=self.writer_generation,
         )
-        authoritative_base_sha = str(state.get("integrated_sha") or "")
-        if len(authoritative_base_sha) != 40 or any(
-            character not in "0123456789abcdef"
-            for character in authoritative_base_sha
-        ):
-            raise KernelError(
-                "VERIFIED_RESULT_EVIDENCE_MISSING",
-                "verified Result has no authoritative integration base",
-            )
-        try:
-            effect_evidence = TypedEvidence(**effect_verification)
-            effect_scopes = tuple(effect_evidence.payload["write_scopes"])
-            manifest_digest = state["candidate_evidence_manifest_digest"]
-            effect_manifest_entry = {
-                "kind": "decision",
-                "decision_type": "effect_contract_verification",
-                "content_digest": effect_evidence.content_digest,
-                "source_ref": effect_evidence.source_ref,
-            }
-        except (KeyError, TypeError) as error:
-            raise KernelError(
-                "VERIFIED_RESULT_EVIDENCE_INVALID",
-                "verified Result Effect Contract Evidence is malformed",
-            ) from error
-        if (
-            not effect_contract_evidence_binds(
-                effect_evidence,
-                identity={
-                    "plan_digest": str(state["plan_digest"]),
-                    "node_key": str(state["node_key"]),
-                    "attempt_id": str(state["attempt_id"]),
-                    "base_sha": str(state["base_sha"]),
-                    "candidate_sha": candidate_sha,
-                },
-                contract_digest=str(state["contract_digest"]),
-                scopes=effect_scopes,
-                observer_id=self.writer_generation,
-            )
-            or effect_evidence.payload.get("status") != "accepted"
-            or candidate_evidence_manifest.get("candidate_sha") != candidate_sha
-            or effect_manifest_entry
-            not in (candidate_evidence_manifest.get("evidence") or ())
-            or digest_value(candidate_evidence_manifest) != manifest_digest
-        ):
+        if producer_binding is None:
             raise KernelError(
                 "VERIFIED_RESULT_EVIDENCE_INVALID",
                 "verified Result Effect Contract Evidence failed readback",
             )
-        producer_binding = {
-            "repository": state["repository"],
-            "plan_digest": state["plan_digest"],
-            "node_key": state["node_key"],
-            "contract_digest": state["contract_digest"],
-            "attempt_id": state["attempt_id"],
-            "base_sha": state["base_sha"],
-            "candidate_sha": candidate_sha,
-            "result_digest": result_digest,
-            "authoritative_base_sha": authoritative_base_sha,
-            "writer_generation": self.writer_generation,
-            "candidate_evidence_manifest_digest": manifest_digest,
-            "effect_contract_evidence_digest": effect_evidence.content_digest,
-        }
         evidence_record = {
             **candidate_observation,
             "producer_binding": producer_binding,
-            "candidate_evidence_manifest": candidate_evidence_manifest,
+            "candidate_evidence_manifest": state["candidate_evidence_manifest"],
             "candidate_evidence_manifest_digest": state[
                 "candidate_evidence_manifest_digest"
             ],
-            "effect_contract_verification": effect_verification,
+            "effect_contract_verification": state["effect_verification"],
             "hosted_check_evidence": list(state.get("hosted_check_evidence") or ()),
             "retirement": state.get("retirement"),
             "integration_batch": {
@@ -3788,7 +3572,7 @@ class Kernel:
                     candidate_sha,
                     result_digest,
                     base_sha,
-                    authoritative_base_sha,
+                    integrated_sha,
                     producer_binding_digest,
                     evidence_manifest_digest,
                     evidence_json,
@@ -3802,7 +3586,7 @@ class Kernel:
                 ) DO UPDATE SET
                     result_digest = excluded.result_digest,
                     base_sha = excluded.base_sha,
-                    authoritative_base_sha = excluded.authoritative_base_sha,
+                    integrated_sha = excluded.integrated_sha,
                     producer_binding_digest = excluded.producer_binding_digest,
                     evidence_manifest_digest = excluded.evidence_manifest_digest,
                     evidence_json = excluded.evidence_json,
@@ -3816,7 +3600,7 @@ class Kernel:
                     candidate_sha,
                     result_digest,
                     state["base_sha"],
-                    authoritative_base_sha,
+                    integrated_sha,
                     digest_value(producer_binding),
                     evidence_manifest_digest,
                     evidence_json,

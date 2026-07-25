@@ -26,6 +26,7 @@ from gwo_v8 import (  # noqa: E402
     InMemoryDeliveryControl,
     InMemoryRuntimeAdapter,
     Kernel,
+    KernelError,
     LocalPlanPublication,
     PlanCompiler,
     ReviewAxisBinding,
@@ -571,6 +572,62 @@ def test_result_adoption_accepts_bound_evidence_across_plan_digests(tmp_path):
     assert state["adopted_from_plan_digest"] == compiled.digest
 
 
+def test_result_adoption_accepts_later_descendant_target_commit(tmp_path):
+    runtime = _ReviewingRuntime(tmp_path / "runtime")
+    kernel, compiled, _work_node = _kernel(
+        tmp_path,
+        runtime,
+        scopes=["module-1.txt"],
+    )
+    original = kernel.reconcile_once("local/issue-67")
+    repository = Path(kernel.repository_path)
+    (repository / "README.md").write_text(
+        "base\nlater integrated work\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "later target commit")
+    later_target = _git(repository, "rev-parse", "main")
+    assert later_target != original.candidate_sha
+    _successor, successor_kernel = _successor_kernel(kernel, compiled)
+
+    adopted = successor_kernel.reconcile_once("local/issue-67")
+
+    assert adopted.status == "complete"
+    assert adopted.attempt_state == "adopted"
+    assert adopted.candidate_sha == original.candidate_sha
+    assert adopted.result_digest == original.result_digest
+
+
+def test_result_adoption_rejects_divergent_current_target(tmp_path):
+    runtime = _ReviewingRuntime(tmp_path / "runtime")
+    kernel, compiled, work_node = _kernel(
+        tmp_path,
+        runtime,
+        scopes=["module-1.txt"],
+    )
+    assert kernel.reconcile_once("local/issue-67").status == "complete"
+    state = kernel._read_state(
+        "local/issue-67",
+        compiled.digest,
+        work_node["node_key"],
+    )
+    repository = Path(kernel.repository_path)
+    _git(repository, "switch", "--detach", state["base_sha"])
+    (repository / "README.md").write_text(
+        "base\ndivergent target\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "divergent target")
+    divergent_target = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "update-ref", "refs/heads/main", divergent_target)
+    _successor, successor_kernel = _successor_kernel(kernel, compiled)
+
+    with pytest.raises(AssertionError, match="Runtime.read_binding"):
+        successor_kernel.reconcile_once("local/issue-67")
+
+
 def test_result_adoption_rejects_forged_effect_evidence_binding(tmp_path):
     runtime = _ReviewingRuntime(tmp_path / "runtime")
     kernel, compiled, _work_node = _kernel(
@@ -1001,6 +1058,48 @@ def test_candidate_parent_of_exact_base_fails_closed_before_diff(tmp_path):
     assert len(persisted) == 1
 
 
+def test_merge_base_operational_error_does_not_consume_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = _ReviewingRuntime(tmp_path / "runtime")
+    kernel, compiled, work_node = _kernel(
+        tmp_path,
+        runtime,
+        scopes=["module-1.txt"],
+    )
+    real_run = subprocess.run
+
+    def fail_merge_base(command, *args, **kwargs):
+        if "merge-base" in command:
+            return subprocess.CompletedProcess(
+                command,
+                128,
+                stdout=b"",
+                stderr=b"fatal: repository read failed",
+            )
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "gwo_v8.effect_verification.subprocess.run",
+        fail_merge_base,
+    )
+
+    with pytest.raises(KernelError) as operational:
+        kernel.reconcile_once("local/issue-67")
+
+    assert operational.value.code == "GIT_OPERATION_FAILED"
+    assert runtime.review_materializations == []
+    state = kernel._read_state(
+        "local/issue-67",
+        compiled.digest,
+        work_node["node_key"],
+    )
+    assert state["attempt_state"] == "result_submitted"
+    assert state["repair_rounds_used"] == 0
+    assert state["effect_verification"] is None
+
+
 def test_git_posix_path_with_literal_backslash_is_not_windows_normalized():
     with pytest.raises(EffectVerificationError) as rejected:
         _parse_changed_paths(b"A\0directory\\literal.txt\0")
@@ -1110,3 +1209,6 @@ def test_effect_contract_verification_is_one_deep_module_behind_kernel():
     assert "--name-status" not in kernel_source
     assert "find-copies-harder" not in kernel_source
     assert "diff_projection_digest" not in kernel_source
+    assert "merge-base" not in kernel_source
+    assert "effect_contract_evidence_binds" not in kernel_source
+    assert "expected_manifest" not in kernel_source

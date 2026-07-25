@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 import subprocess
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 
 from ._canonical import digest_value
 from ._effects import EffectContractError, normalized_relative_path
@@ -85,6 +85,36 @@ def _git_identity(repository: Path, sha: str) -> str | None:
         return None
     resolved = result.stdout.strip()
     return resolved if resolved == sha and _SHA40.fullmatch(resolved) else None
+
+
+def commit_is_ancestor(
+    repository: Path,
+    ancestor_sha: str,
+    descendant_sha: str,
+) -> bool:
+    """Read exact Git reachability without collapsing operational failure."""
+
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "merge-base",
+            "--is-ancestor",
+            ancestor_sha,
+            descendant_sha,
+        ],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    detail = result.stderr.decode("utf-8", errors="replace").strip()
+    raise EffectVerificationError(
+        "GIT_OPERATION_FAILED",
+        detail or "git merge-base reachability check failed",
+    )
 
 
 @dataclass(frozen=True)
@@ -240,6 +270,240 @@ def effect_contract_evidence_binds(
     )
 
 
+def verified_result_producer_binding(
+    state: Mapping[str, Any],
+    *,
+    candidate_sha: str,
+    result_digest: str,
+    integrated_sha: str,
+    observer_id: str,
+) -> dict[str, Any] | None:
+    """Validate persisted Effect Evidence and bind its verified Result producer."""
+
+    manifest = state.get("candidate_evidence_manifest")
+    saved_effect = state.get("effect_verification")
+    if (
+        not isinstance(manifest, dict)
+        or not isinstance(saved_effect, dict)
+        or _SHA40.fullmatch(integrated_sha) is None
+    ):
+        return None
+    try:
+        effect = TypedEvidence(**saved_effect)
+        scopes = tuple(effect.payload["write_scopes"])
+        manifest_digest = state["candidate_evidence_manifest_digest"]
+        effect_reference = {
+            "kind": "decision",
+            "decision_type": "effect_contract_verification",
+            "content_digest": effect.content_digest,
+            "source_ref": effect.source_ref,
+        }
+        identity = {
+            "plan_digest": str(state["plan_digest"]),
+            "node_key": str(state["node_key"]),
+            "attempt_id": str(state["attempt_id"]),
+            "base_sha": str(state["base_sha"]),
+            "candidate_sha": candidate_sha,
+        }
+    except (KeyError, TypeError):
+        return None
+    if (
+        not effect_contract_evidence_binds(
+            effect,
+            identity=identity,
+            contract_digest=str(state["contract_digest"]),
+            scopes=scopes,
+            observer_id=observer_id,
+        )
+        or effect.payload.get("status") != "accepted"
+        or manifest.get("candidate_sha") != candidate_sha
+        or effect_reference not in (manifest.get("evidence") or ())
+        or digest_value(manifest) != manifest_digest
+    ):
+        return None
+    return {
+        "repository": state["repository"],
+        "plan_digest": state["plan_digest"],
+        "node_key": state["node_key"],
+        "contract_digest": state["contract_digest"],
+        "attempt_id": state["attempt_id"],
+        "base_sha": state["base_sha"],
+        "candidate_sha": candidate_sha,
+        "result_digest": result_digest,
+        "integrated_sha": integrated_sha,
+        "writer_generation": observer_id,
+        "candidate_evidence_manifest_digest": manifest_digest,
+        "effect_contract_evidence_digest": effect.content_digest,
+    }
+
+
+def adoption_evidence_is_valid(
+    repository: Path,
+    *,
+    current_target_sha: str,
+    source_row: Mapping[str, Any],
+    evidence_record: dict[str, Any],
+    work_node: dict[str, Any],
+) -> bool:
+    """Validate historical Effect Evidence and reachable integration readback."""
+
+    if any(
+        _SHA40.fullmatch(str(value or "")) is None
+        for value in (
+            source_row.get("candidate_sha"),
+            source_row.get("integrated_sha"),
+            current_target_sha,
+        )
+    ):
+        return False
+    try:
+        producer = evidence_record["producer_binding"]
+        if (
+            not isinstance(producer, dict)
+            or digest_value(evidence_record)
+            != source_row["evidence_manifest_digest"]
+            or digest_value(producer) != source_row["producer_binding_digest"]
+            or set(producer)
+            != {
+                "repository",
+                "plan_digest",
+                "node_key",
+                "contract_digest",
+                "attempt_id",
+                "base_sha",
+                "candidate_sha",
+                "result_digest",
+                "integrated_sha",
+                "writer_generation",
+                "candidate_evidence_manifest_digest",
+                "effect_contract_evidence_digest",
+            }
+            or any(
+                producer.get(name) != source_row[name]
+                for name in (
+                    "repository",
+                    "plan_digest",
+                    "node_key",
+                    "contract_digest",
+                    "base_sha",
+                    "candidate_sha",
+                    "result_digest",
+                    "integrated_sha",
+                )
+            )
+            or not isinstance(producer.get("attempt_id"), str)
+            or not isinstance(producer.get("writer_generation"), str)
+        ):
+            return False
+        binding = evidence_record["binding"]
+        claim = evidence_record["result_claim"]
+        if (
+            not isinstance(binding, dict)
+            or not isinstance(claim, dict)
+            or binding.get("repository") != source_row["repository"]
+            or binding.get("plan_digest") != source_row["plan_digest"]
+            or binding.get("node_key") != source_row["node_key"]
+            or binding.get("attempt_id") != producer["attempt_id"]
+            or binding.get("base_sha") != source_row["base_sha"]
+            or claim.get("attempt_id") != producer["attempt_id"]
+            or claim.get("node_key") != source_row["node_key"]
+            or claim.get("candidate_sha") != source_row["candidate_sha"]
+        ):
+            return False
+        effect = TypedEvidence(
+            **evidence_record["effect_contract_verification"]
+        )
+        scopes = tuple(
+            normalized_relative_path(scope)
+            for scope in (
+                (work_node.get("effect_contract") or {}).get("write_scopes")
+                or ()
+            )
+        )
+        if (
+            not effect_contract_evidence_binds(
+                effect,
+                identity={
+                    "plan_digest": str(source_row["plan_digest"]),
+                    "node_key": str(source_row["node_key"]),
+                    "attempt_id": producer["attempt_id"],
+                    "base_sha": str(source_row["base_sha"]),
+                    "candidate_sha": str(source_row["candidate_sha"]),
+                },
+                contract_digest=str(source_row["contract_digest"]),
+                scopes=scopes,
+                observer_id=producer["writer_generation"],
+            )
+            or effect.payload.get("status") != "accepted"
+            or effect.content_digest
+            != producer["effect_contract_evidence_digest"]
+        ):
+            return False
+        observed = tuple(
+            TypedEvidence(**item) for item in evidence_record["evidence"]
+        )
+        manifest = evidence_record["candidate_evidence_manifest"]
+        manifest_digest = evidence_record[
+            "candidate_evidence_manifest_digest"
+        ]
+        references = [
+            {
+                "kind": item.kind,
+                **(
+                    {"decision_type": item.payload.get("decision_type")}
+                    if item.kind == "decision"
+                    else {}
+                ),
+                "content_digest": item.content_digest,
+                "source_ref": item.source_ref,
+            }
+            for item in (*observed, effect)
+            if item.has_valid_digest()
+        ]
+        expected_manifest = {
+            "candidate_sha": str(source_row["candidate_sha"]),
+            "evidence": sorted(
+                references,
+                key=lambda item: (
+                    str(item["kind"]),
+                    str(item["content_digest"]),
+                    str(item["source_ref"]),
+                ),
+            ),
+        }
+        integration_record = evidence_record["integration_batch"]
+        integration = TypedEvidence(
+            **integration_record["integration_evidence"]
+        )
+        if (
+            manifest != expected_manifest
+            or digest_value(manifest) != manifest_digest
+            or manifest_digest
+            != producer["candidate_evidence_manifest_digest"]
+            or integration_record.get("batch_sha")
+            != source_row["integrated_sha"]
+            or not integration.has_valid_digest()
+            or integration.kind != "integration"
+            or integration.subject != source_row["integrated_sha"]
+            or integration.payload.get("candidate_sha")
+            != source_row["candidate_sha"]
+            or source_row["node_key"]
+            not in (integration.payload.get("member_node_keys") or ())
+        ):
+            return False
+    except (EffectContractError, KeyError, TypeError):
+        return False
+    return commit_is_ancestor(
+        repository,
+        str(source_row["candidate_sha"]),
+        str(source_row["integrated_sha"]),
+    ) and commit_is_ancestor(
+        repository,
+        str(source_row["integrated_sha"]),
+        current_target_sha,
+    )
+
+
 class EffectContractVerifier:
     """Verify one Candidate against the Plan Node Effect Contract."""
 
@@ -359,19 +623,11 @@ class EffectContractVerifier:
                 )
 
         if not findings:
-            ancestry = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(workspace),
-                    "merge-base",
-                    "--is-ancestor",
-                    identity["base_sha"],
-                    identity["candidate_sha"],
-                ],
-                capture_output=True,
-            )
-            if ancestry.returncode != 0:
+            if not commit_is_ancestor(
+                workspace,
+                identity["base_sha"],
+                identity["candidate_sha"],
+            ):
                 findings.append(
                     "Candidate is not descended from the exact integration base"
                 )
