@@ -233,6 +233,35 @@ def build_full_plan(
     )
 
 
+def _build_canary_kernel(
+    store_path: Path,
+    publication: LocalPlanPublication,
+    runtime,
+    repository_path: Path,
+    writer_generation: str,
+    runtime_config: dict[str, Any],
+    delivery_control,
+):
+    """Construct a canary Kernel without runtime_profile injection.
+
+    Worker Runtime Profile selection must flow from the configured
+    ``runtime_config`` and the PlanNode difficulty at Admission time.
+    """
+
+    return Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=repository_path,
+        integration_branch="main",
+        writer_generation=writer_generation,
+        runtime_config=runtime_config,
+        delivery_control=delivery_control,
+        parent_agent_id=None,
+    )
+
+
 def run_smoke(
     *,
     repository: str,
@@ -272,18 +301,16 @@ def run_smoke(
         writer_generation="v8-canary-smoke",
     )
     runtime = InMemoryRuntimeAdapter(state_root / "worktrees")
-    kernel = Kernel(
+    runtime_config = orch_core.default_config()
+    runtime_config["active_turn_pools"] = {"workers": 1, "coordinators": 1}
+    runtime_config["repositories"] = {}
+    kernel = _build_canary_kernel(
         store_path=store_path,
         publication=publication,
         runtime=runtime,
-        verifier=EvidenceVerifier(),
         repository_path=repository_path,
-        integration_branch="main",
         writer_generation="v8-canary-smoke",
-        runtime_config={
-            "active_turn_pools": {"workers": 1, "coordinators": 1},
-            "repositories": {},
-        },
+        runtime_config=runtime_config,
         delivery_control=GitHubCliDeliveryControl(
             repository_path=repository_path,
         ),
@@ -410,27 +437,16 @@ def run_full(
         )
     progress(f"full canary: configured Kimi thinking -> {worker_thinking}")
     runtime = PaseoRuntimeAdapter(PaseoCliClient())
-    kernel = Kernel(
+    kernel = _build_canary_kernel(
         store_path=store_path,
         publication=publication,
         runtime=runtime,
-        verifier=EvidenceVerifier(),
         repository_path=repository_path,
-        integration_branch="main",
         writer_generation=writer_generation,
-        runtime_profile=RuntimeProfile(
-            name="standard",
-            provider=worker_mapping["provider"],
-            model=worker_settings["model"],
-            thinking=worker_thinking,
-            mode=worker_settings["modeId"],
-            features=dict(worker_settings.get("features") or {}),
-        ),
         runtime_config=runtime_config,
         delivery_control=GitHubCliDeliveryControl(
             repository_path=repository_path,
         ),
-        parent_agent_id=None,
     )
     started = time.monotonic()
     history = []
