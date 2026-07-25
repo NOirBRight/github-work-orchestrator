@@ -24,6 +24,7 @@ from typing import Any, Callable, Literal
 
 from ._canonical import digest_value
 from ._effects import EffectContractError, normalized_relative_path
+from .evidence import TypedEvidence
 
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
 
@@ -83,110 +84,7 @@ def _git_identity(repository: Path, sha: str) -> str | None:
     if result.returncode != 0:
         return None
     resolved = result.stdout.strip()
-    return resolved if _SHA40.fullmatch(resolved) else None
-
-
-@dataclass(frozen=True)
-class EffectContractVerification:
-    """Durable verdict bound to Plan, Node, Attempt, base, Candidate, and diff."""
-
-    plan_digest: str
-    node_key: str
-    attempt_id: str
-    base_sha: str
-    candidate_sha: str
-    base_tree_sha: str
-    candidate_tree_sha: str
-    write_scopes: tuple[str, ...]
-    changed_paths: tuple[dict[str, Any], ...]
-    diff_projection_digest: str
-    status: str
-    findings: tuple[str, ...]
-    observed_at: str
-    content_digest: str
-
-    @classmethod
-    def _capture(
-        cls,
-        *,
-        plan_digest: str,
-        node_key: str,
-        attempt_id: str,
-        base_sha: str,
-        candidate_sha: str,
-        base_tree_sha: str,
-        candidate_tree_sha: str,
-        write_scopes: tuple[str, ...],
-        changed_paths: tuple[dict[str, Any], ...],
-        status: str,
-        findings: tuple[str, ...],
-    ) -> EffectContractVerification:
-        projection = {
-            "base_sha": base_sha,
-            "base_tree_sha": base_tree_sha,
-            "candidate_sha": candidate_sha,
-            "candidate_tree_sha": candidate_tree_sha,
-            "changed_paths": [dict(entry) for entry in changed_paths],
-        }
-        body = {
-            "plan_digest": plan_digest,
-            "node_key": node_key,
-            "attempt_id": attempt_id,
-            "base_sha": base_sha,
-            "candidate_sha": candidate_sha,
-            "base_tree_sha": base_tree_sha,
-            "candidate_tree_sha": candidate_tree_sha,
-            "write_scopes": list(write_scopes),
-            "changed_paths": [dict(entry) for entry in changed_paths],
-            "diff_projection_digest": digest_value(projection),
-            "status": status,
-            "findings": list(findings),
-            "observed_at": _now(),
-        }
-        return cls(
-            **{
-                **body,
-                "write_scopes": tuple(write_scopes),
-                "changed_paths": tuple(dict(entry) for entry in changed_paths),
-                "findings": tuple(findings),
-            },
-            content_digest=digest_value(body),
-        )
-
-    def has_valid_digest(self) -> bool:
-        body = {
-            "plan_digest": self.plan_digest,
-            "node_key": self.node_key,
-            "attempt_id": self.attempt_id,
-            "base_sha": self.base_sha,
-            "candidate_sha": self.candidate_sha,
-            "base_tree_sha": self.base_tree_sha,
-            "candidate_tree_sha": self.candidate_tree_sha,
-            "write_scopes": list(self.write_scopes),
-            "changed_paths": [dict(entry) for entry in self.changed_paths],
-            "diff_projection_digest": self.diff_projection_digest,
-            "status": self.status,
-            "findings": list(self.findings),
-            "observed_at": self.observed_at,
-        }
-        return self.content_digest == digest_value(body)
-
-    def binds(
-        self,
-        *,
-        plan_digest: str,
-        node_key: str,
-        attempt_id: str,
-        base_sha: str,
-        candidate_sha: str,
-    ) -> bool:
-        return (
-            self.plan_digest == plan_digest
-            and self.node_key == node_key
-            and self.attempt_id == attempt_id
-            and self.base_sha == base_sha
-            and self.candidate_sha == candidate_sha
-        )
+    return resolved if resolved == sha and _SHA40.fullmatch(resolved) else None
 
 
 @dataclass(frozen=True)
@@ -194,7 +92,7 @@ class EffectContractDecision:
     """The one narrow typed Effect Contract verdict a Kernel caller receives."""
 
     status: Literal["accepted", "rejected"]
-    verification: EffectContractVerification
+    verification: TypedEvidence
     findings: tuple[str, ...] = ()
 
 
@@ -236,6 +134,23 @@ def _parse_changed_paths(output: bytes) -> tuple[dict[str, Any], ...]:
                 "GIT_CHANGED_PATHS_INVALID",
                 "git changed-path output was not valid UTF-8",
             ) from error
+        if "\0" in decoded:
+            raise EffectVerificationError(
+                "GIT_CHANGED_PATHS_INVALID",
+                "git changed-path output contained a NUL path escape",
+            )
+        if "\\" in decoded:
+            raise EffectVerificationError(
+                "GIT_CHANGED_PATHS_INVALID",
+                "git changed path contains a literal backslash",
+            )
+        if decoded.startswith("/") or any(
+            part in {".", ".."} for part in decoded.split("/")
+        ):
+            raise EffectVerificationError(
+                "GIT_CHANGED_PATHS_INVALID",
+                f"git changed path is not repository-relative: {decoded!r}",
+            )
         return decoded
 
     while cursor < len(tokens):
@@ -278,15 +193,64 @@ def _covered(path: str, scopes: tuple[str, ...]) -> bool:
     return any(path == scope or path.startswith(f"{scope}/") for scope in scopes)
 
 
+def _effect_source_ref(identity: dict[str, str]) -> str:
+    return (
+        "store://effect-contract-verification/"
+        f"{identity['plan_digest']}/{identity['node_key']}/"
+        f"{identity['attempt_id']}/{identity['candidate_sha']}"
+    )
+
+
+def effect_contract_evidence_binds(
+    evidence: TypedEvidence,
+    *,
+    identity: dict[str, str],
+    contract_digest: str,
+    scopes: tuple[str, ...],
+    observer_id: str,
+) -> bool:
+    """Validate the common envelope and its exact producer/source binding."""
+
+    payload = evidence.payload
+    if not isinstance(payload, dict):
+        return False
+    projection = {
+        "base_sha": payload.get("base_sha"),
+        "base_tree_sha": payload.get("base_tree_sha"),
+        "candidate_sha": payload.get("candidate_sha"),
+        "candidate_tree_sha": payload.get("candidate_tree_sha"),
+        "changed_paths": payload.get("changed_paths"),
+    }
+    return not (
+        not evidence.has_valid_digest()
+        or evidence.kind != "decision"
+        or evidence.subject != identity["candidate_sha"]
+        or evidence.observer_type != "kernel"
+        or evidence.observer_id != observer_id
+        or evidence.source_ref != _effect_source_ref(identity)
+        or payload.get("decision_type") != "effect_contract_verification"
+        or any(payload.get(name) != value for name, value in identity.items())
+        or payload.get("contract_digest") != contract_digest
+        or payload.get("write_scopes") != list(scopes)
+        or payload.get("status") not in {"accepted", "rejected"}
+        or not isinstance(payload.get("findings"), list)
+        or any(not isinstance(item, str) for item in payload["findings"])
+        or not isinstance(payload.get("changed_paths"), list)
+        or payload.get("diff_projection_digest") != digest_value(projection)
+    )
+
+
 class EffectContractVerifier:
     """Verify one Candidate against the Plan Node Effect Contract."""
 
     def __init__(
         self,
         *,
+        observer_id: str,
         assert_writer: Callable[[dict[str, Any]], None],
         persist_state: Callable[[dict[str, Any]], None],
     ):
+        self._observer_id = observer_id
         self._assert_writer = assert_writer
         self._persist_state = persist_state
 
@@ -296,26 +260,30 @@ class EffectContractVerifier:
 
         return {"effect_verification": None}
 
-    @staticmethod
-    def _saved_verification(state: dict[str, Any]) -> EffectContractVerification | None:
+    def _saved_verification(
+        self,
+        state: dict[str, Any],
+        *,
+        identity: dict[str, str],
+        contract_digest: str,
+        scopes: tuple[str, ...],
+    ) -> TypedEvidence | None:
         saved = state.get("effect_verification")
         if not isinstance(saved, dict):
             return None
         try:
-            record = EffectContractVerification(
-                **{
-                    **saved,
-                    "write_scopes": tuple(saved.get("write_scopes") or ()),
-                    "changed_paths": tuple(
-                        dict(entry)
-                        for entry in saved.get("changed_paths") or ()
-                    ),
-                    "findings": tuple(saved.get("findings") or ()),
-                }
-            )
+            evidence = TypedEvidence(**saved)
         except TypeError:
             return None
-        return record if record.has_valid_digest() else None
+        if not effect_contract_evidence_binds(
+            evidence,
+            identity=identity,
+            contract_digest=contract_digest,
+            scopes=scopes,
+            observer_id=self._observer_id,
+        ):
+            return None
+        return evidence
 
     def verify_candidate(
         self,
@@ -339,14 +307,9 @@ class EffectContractVerifier:
             "base_sha": str(base_sha or ""),
             "candidate_sha": str(candidate_sha or ""),
         }
-        saved = self._saved_verification(state)
-        if saved is not None and saved.binds(**identity):
-            return EffectContractDecision(
-                status="accepted" if saved.status == "accepted" else "rejected",
-                verification=saved,
-                findings=tuple(saved.findings),
-            )
-
+        contract_digest = str(
+            work_node.get("contract_digest") or state.get("contract_digest") or ""
+        )
         findings: list[str] = []
         changed_paths: tuple[dict[str, Any], ...] = ()
         base_tree_sha = ""
@@ -367,6 +330,19 @@ class EffectContractVerifier:
                     f"Effect Contract Write Scope is invalid: {error}"
                 )
 
+        saved = self._saved_verification(
+            state,
+            identity=identity,
+            contract_digest=contract_digest,
+            scopes=scopes,
+        )
+        if saved is not None:
+            return EffectContractDecision(
+                status=saved.payload["status"],
+                verification=saved,
+                findings=tuple(saved.payload["findings"]),
+            )
+
         if _SHA40.fullmatch(identity["base_sha"]) is None:
             findings.append("integration base SHA is not a valid Git identity")
         if _SHA40.fullmatch(identity["candidate_sha"]) is None:
@@ -380,6 +356,24 @@ class EffectContractVerifier:
             if _git_identity(workspace, identity["candidate_sha"]) is None:
                 findings.append(
                     "Candidate is not resolvable as a Git commit"
+                )
+
+        if not findings:
+            ancestry = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "merge-base",
+                    "--is-ancestor",
+                    identity["base_sha"],
+                    identity["candidate_sha"],
+                ],
+                capture_output=True,
+            )
+            if ancestry.returncode != 0:
+                findings.append(
+                    "Candidate is not descended from the exact integration base"
                 )
 
         if not findings:
@@ -412,57 +406,62 @@ class EffectContractVerifier:
                     result.stderr.decode("utf-8", errors="replace").strip()
                     or "git changed-path diff failed",
                 )
-            changed_paths = _parse_changed_paths(result.stdout)
-            for entry in changed_paths:
-                label = _STATUS_LABELS[entry["status"]]
-                try:
-                    destination = normalized_relative_path(entry["path"])
-                except EffectContractError:
-                    findings.append(
-                        f"changed path ({label}) escapes the repository: "
-                        f"{entry['path']!r}"
-                    )
-                    continue
-                if not _covered(destination, scopes):
-                    findings.append(
-                        f"changed path '{destination}' ({label}) is outside "
-                        "the authorized Write Scope"
-                    )
-                source = entry.get("source_path")
-                if source is None:
-                    continue
-                try:
-                    source_path = normalized_relative_path(source)
-                except EffectContractError:
-                    findings.append(
-                        f"{label} source path escapes the repository: {source!r}"
-                    )
-                    continue
-                if not _covered(source_path, scopes):
-                    findings.append(
-                        f"{label} source path '{source_path}' is outside "
-                        "the authorized Write Scope"
-                    )
+            try:
+                changed_paths = _parse_changed_paths(result.stdout)
+            except EffectVerificationError as error:
+                findings.append(error.detail)
+            else:
+                for entry in changed_paths:
+                    label = _STATUS_LABELS[entry["status"]]
+                    destination = entry["path"]
+                    if not _covered(destination, scopes):
+                        findings.append(
+                            f"changed path '{destination}' ({label}) is outside "
+                            "the authorized Write Scope"
+                        )
+                    source = entry.get("source_path")
+                    if source is None:
+                        continue
+                    source_path = source
+                    if not _covered(source_path, scopes):
+                        findings.append(
+                            f"{label} source path '{source_path}' is outside "
+                            "the authorized Write Scope"
+                        )
 
         status = "accepted" if not findings else "rejected"
-        record = EffectContractVerification._capture(
-            plan_digest=identity["plan_digest"],
-            node_key=identity["node_key"],
-            attempt_id=identity["attempt_id"],
-            base_sha=identity["base_sha"],
-            candidate_sha=identity["candidate_sha"],
-            base_tree_sha=base_tree_sha,
-            candidate_tree_sha=candidate_tree_sha,
-            write_scopes=scopes,
-            changed_paths=changed_paths,
-            status=status,
-            findings=tuple(findings),
+        projection = {
+            "base_sha": identity["base_sha"],
+            "base_tree_sha": base_tree_sha,
+            "candidate_sha": identity["candidate_sha"],
+            "candidate_tree_sha": candidate_tree_sha,
+            "changed_paths": [dict(entry) for entry in changed_paths],
+        }
+        evidence = TypedEvidence._capture(
+            kind="decision",
+            subject=identity["candidate_sha"],
+            observer_type="kernel",
+            observer_id=self._observer_id,
+            observed_at=_now(),
+            source_ref=_effect_source_ref(identity),
+            payload={
+                "decision_type": "effect_contract_verification",
+                **identity,
+                "contract_digest": contract_digest,
+                "base_tree_sha": base_tree_sha,
+                "candidate_tree_sha": candidate_tree_sha,
+                "write_scopes": list(scopes),
+                "changed_paths": [dict(entry) for entry in changed_paths],
+                "diff_projection_digest": digest_value(projection),
+                "status": status,
+                "findings": list(findings),
+            },
         )
-        state["effect_verification"] = asdict(record)
+        state["effect_verification"] = asdict(evidence)
         self._assert_writer(state)
         self._persist_state(state)
         return EffectContractDecision(
             status=status,
-            verification=record,
+            verification=evidence,
             findings=tuple(findings),
         )

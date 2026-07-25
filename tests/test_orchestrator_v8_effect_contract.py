@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -29,12 +30,15 @@ from gwo_v8 import (  # noqa: E402
     PlanCompiler,
     ReviewAxisBinding,
     ReviewAxisObservation,
+    TypedEvidence,
 )
 from gwo_v8.effect_verification import (  # noqa: E402
     EffectContractDecision,
-    EffectContractVerification,
     EffectContractVerifier,
+    EffectVerificationError,
+    _parse_changed_paths,
 )
+from gwo_v8._canonical import digest_value  # noqa: E402
 
 
 def _git(repository: Path, *args: str) -> str:
@@ -314,6 +318,16 @@ class _ReviewingRuntime(InMemoryRuntimeAdapter):
         )
 
 
+class _AdoptionMustNotRun:
+    adapter_name = "adoption-must-not-run"
+
+    def normalize_profile(self, profile):
+        return profile
+
+    def __getattr__(self, name):
+        raise AssertionError(f"invalid Result Adoption called Runtime.{name}")
+
+
 def _write_tamper(path: str, content: str, *, only_execution: int | None = None):
     def tamper(workspace: Path, ordinal: int) -> None:
         if only_execution is not None and ordinal != only_execution:
@@ -396,7 +410,30 @@ def _effect_record(kernel, compiled, work_node) -> dict:
     assert state is not None
     record = state.get("effect_verification")
     assert isinstance(record, dict)
-    return record
+    return {**record["payload"], "_evidence": record}
+
+
+def _successor_kernel(kernel, compiled):
+    intent, source = _intent(["module-1.txt"])
+    source["work_items"][0]["title"] = "Same Node contract in a successor Plan"
+    successor = PlanCompiler().compile(intent, source, _policy())
+    assert successor.digest != compiled.digest
+    kernel.publication.publish_and_activate(
+        successor,
+        expected_active_digest=compiled.digest,
+        writer_generation="issue-67",
+    )
+    return successor, Kernel(
+        store_path=kernel.store_path,
+        publication=kernel.publication,
+        runtime=_AdoptionMustNotRun(),
+        verifier=EvidenceVerifier(),
+        repository_path=kernel.repository_path,
+        integration_branch="main",
+        writer_generation="issue-67",
+        delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
+        runtime_config=_runtime_config(),
+    )
 
 
 def test_in_scope_candidate_is_accepted_and_review_materializes(tmp_path):
@@ -425,11 +462,186 @@ def test_in_scope_candidate_is_accepted_and_review_materializes(tmp_path):
         {"status": "A", "path": "module-1.txt"}
     ]
     assert len(record["diff_projection_digest"]) == 64
-    assert EffectContractVerification(
-        **{k: v for k, v in record.items() if k != "changed_paths"}
-        | {"changed_paths": tuple(record["changed_paths"])}
-    ).has_valid_digest()
+    assert TypedEvidence(**record["_evidence"]).has_valid_digest()
     del base_sha
+
+
+def test_candidate_manifest_and_verified_result_retain_effect_evidence_source(
+    tmp_path,
+):
+    runtime = _ReviewingRuntime(tmp_path / "runtime")
+    kernel, compiled, work_node = _kernel(
+        tmp_path,
+        runtime,
+        scopes=["module-1.txt"],
+    )
+
+    outcome = kernel.reconcile_once("local/issue-67")
+
+    assert outcome.status == "complete"
+    state = kernel._read_state(
+        "local/issue-67",
+        compiled.digest,
+        work_node["node_key"],
+    )
+    assert state is not None
+    effect = TypedEvidence(**state["effect_verification"])
+    manifest = state["candidate_evidence_manifest"]
+    assert {
+        "kind": "decision",
+        "decision_type": "effect_contract_verification",
+        "content_digest": effect.content_digest,
+        "source_ref": effect.source_ref,
+    } in manifest["evidence"]
+    assert state["candidate_evidence_manifest_digest"] == digest_value(manifest)
+    with sqlite3.connect(kernel.store_path) as connection:
+        saved = json.loads(
+            connection.execute(
+                """
+                SELECT evidence_json
+                FROM v8_verified_results
+                WHERE plan_digest = ? AND node_key = ?
+                """,
+                (compiled.digest, work_node["node_key"]),
+            ).fetchone()[0]
+        )
+    assert saved["effect_contract_verification"] == state["effect_verification"]
+    assert saved["candidate_evidence_manifest"] == manifest
+
+
+def test_result_adoption_rejects_missing_effect_contract_evidence(tmp_path):
+    runtime = _ReviewingRuntime(tmp_path / "runtime")
+    kernel, compiled, _work_node = _kernel(
+        tmp_path,
+        runtime,
+        scopes=["module-1.txt"],
+    )
+    assert kernel.reconcile_once("local/issue-67").status == "complete"
+    with sqlite3.connect(kernel.store_path) as connection:
+        row = connection.execute(
+            """
+            SELECT rowid, evidence_json
+            FROM v8_verified_results
+            WHERE plan_digest = ?
+            """,
+            (compiled.digest,),
+        ).fetchone()
+        evidence_record = json.loads(row[1])
+        del evidence_record["effect_contract_verification"]
+        connection.execute(
+            """
+            UPDATE v8_verified_results
+            SET evidence_json = ?, evidence_manifest_digest = ?
+            WHERE rowid = ?
+            """,
+            (
+                json.dumps(evidence_record, separators=(",", ":"), sort_keys=True),
+                digest_value(evidence_record),
+                row[0],
+            ),
+        )
+    _successor, successor_kernel = _successor_kernel(kernel, compiled)
+
+    with pytest.raises(AssertionError, match="Runtime.read_binding"):
+        successor_kernel.reconcile_once("local/issue-67")
+
+
+def test_result_adoption_accepts_bound_evidence_across_plan_digests(tmp_path):
+    runtime = _ReviewingRuntime(tmp_path / "runtime")
+    kernel, compiled, work_node = _kernel(
+        tmp_path,
+        runtime,
+        scopes=["module-1.txt"],
+    )
+    original = kernel.reconcile_once("local/issue-67")
+    successor, successor_kernel = _successor_kernel(kernel, compiled)
+
+    adopted = successor_kernel.reconcile_once("local/issue-67")
+
+    assert successor.digest != compiled.digest
+    assert adopted.status == "complete"
+    assert adopted.attempt_state == "adopted"
+    assert adopted.candidate_sha == original.candidate_sha
+    assert adopted.result_digest == original.result_digest
+    state = successor_kernel._read_state(
+        "local/issue-67",
+        successor.digest,
+        work_node["node_key"],
+    )
+    assert state["adopted_from_plan_digest"] == compiled.digest
+
+
+def test_result_adoption_rejects_forged_effect_evidence_binding(tmp_path):
+    runtime = _ReviewingRuntime(tmp_path / "runtime")
+    kernel, compiled, _work_node = _kernel(
+        tmp_path,
+        runtime,
+        scopes=["module-1.txt"],
+    )
+    assert kernel.reconcile_once("local/issue-67").status == "complete"
+    with sqlite3.connect(kernel.store_path) as connection:
+        row = connection.execute(
+            """
+            SELECT rowid, evidence_json
+            FROM v8_verified_results
+            WHERE plan_digest = ?
+            """,
+            (compiled.digest,),
+        ).fetchone()
+        evidence_record = json.loads(row[1])
+        original = TypedEvidence(
+            **evidence_record["effect_contract_verification"]
+        )
+        forged_payload = {
+            **original.payload,
+            "changed_paths": [
+                *original.payload["changed_paths"],
+                {"status": "A", "path": "forged.txt"},
+            ],
+        }
+        forged_payload["diff_projection_digest"] = digest_value(
+            {
+                "base_sha": forged_payload["base_sha"],
+                "base_tree_sha": forged_payload["base_tree_sha"],
+                "candidate_sha": forged_payload["candidate_sha"],
+                "candidate_tree_sha": forged_payload["candidate_tree_sha"],
+                "changed_paths": forged_payload["changed_paths"],
+            }
+        )
+        forged = TypedEvidence._capture(
+            kind=original.kind,
+            subject=original.subject,
+            observer_type=original.observer_type,
+            observer_id=original.observer_id,
+            observed_at=original.observed_at,
+            source_ref=original.source_ref,
+            payload=forged_payload,
+        )
+        evidence_record["effect_contract_verification"] = (
+            forged.__dict__
+        )
+        for item in evidence_record["candidate_evidence_manifest"]["evidence"]:
+            if item.get("decision_type") == "effect_contract_verification":
+                item["content_digest"] = forged.content_digest
+        evidence_record["candidate_evidence_manifest_digest"] = digest_value(
+            evidence_record["candidate_evidence_manifest"]
+        )
+        connection.execute(
+            """
+            UPDATE v8_verified_results
+            SET evidence_json = ?, evidence_manifest_digest = ?
+            WHERE rowid = ?
+            """,
+            (
+                json.dumps(evidence_record, separators=(",", ":"), sort_keys=True),
+                digest_value(evidence_record),
+                row[0],
+            ),
+        )
+    _successor, successor_kernel = _successor_kernel(kernel, compiled)
+
+    with pytest.raises(AssertionError, match="Runtime.read_binding"):
+        successor_kernel.reconcile_once("local/issue-67")
 
 
 def test_out_of_scope_write_fails_closed_before_review_materialization(tmp_path):
@@ -622,6 +834,7 @@ def _unit_repository(tmp_path: Path) -> tuple[Path, str, str]:
 
 def _unit_verifier(persisted: list) -> EffectContractVerifier:
     return EffectContractVerifier(
+        observer_id="kernel:unit",
         assert_writer=lambda _state: None,
         persist_state=lambda state: persisted.append(dict(state)),
     )
@@ -633,6 +846,7 @@ def _unit_state(base_sha: str) -> dict:
         "plan_digest": "a" * 64,
         "activation_id": "activation:unit",
         "node_key": "node:unit",
+        "contract_digest": "b" * 64,
         "attempt_id": "attempt:unit:1",
         "base_sha": base_sha,
         "effect_verification": None,
@@ -669,21 +883,63 @@ def test_verification_covers_add_modify_delete_rename_copy_statuses(tmp_path):
 
     assert decision.status == "accepted"
     assert decision.verification.has_valid_digest()
+    payload = decision.verification.payload
     statuses = {
         (entry["status"], entry.get("source_path"), entry["path"])
-        for entry in decision.verification.changed_paths
+        for entry in payload["changed_paths"]
     }
     assert (("A", None, "added.txt")) in statuses
     assert (("M", None, "modify.txt")) in statuses
     assert (("D", None, "delete.txt")) in statuses
     assert (("R", "rename-old.txt", "rename-new.txt")) in statuses
     assert (("C", "copy-source.txt", "copy-target.txt")) in statuses
-    assert decision.verification.plan_digest == "a" * 64
-    assert decision.verification.node_key == "node:unit"
-    assert decision.verification.attempt_id == "attempt:unit:1"
-    assert decision.verification.base_sha == base_sha
-    assert decision.verification.candidate_sha == candidate_sha
+    assert payload["plan_digest"] == "a" * 64
+    assert payload["node_key"] == "node:unit"
+    assert payload["attempt_id"] == "attempt:unit:1"
+    assert payload["base_sha"] == base_sha
+    assert payload["candidate_sha"] == candidate_sha
     assert len(persisted) == 1
+
+
+def test_effect_contract_verification_uses_common_typed_evidence_envelope(tmp_path):
+    repository, base_sha, candidate_sha = _unit_repository(tmp_path)
+    persisted: list = []
+    state = _unit_state(base_sha)
+    work_node = {
+        "node_key": state["node_key"],
+        "contract_digest": state["contract_digest"],
+        "effect_contract": {"write_scopes": ["modify.txt"]},
+    }
+
+    decision = _unit_verifier(persisted).verify_candidate(
+        state,
+        work_node,
+        SimpleNamespace(workspace=str(repository)),
+        _unit_observation(candidate_sha),
+    )
+
+    evidence = decision.verification
+    assert isinstance(evidence, TypedEvidence)
+    assert evidence.kind == "decision"
+    assert evidence.subject == candidate_sha
+    assert evidence.observer_type == "kernel"
+    assert evidence.observer_id == "kernel:unit"
+    assert evidence.source_ref == (
+        "store://effect-contract-verification/"
+        f"{state['plan_digest']}/{state['node_key']}/"
+        f"{state['attempt_id']}/{candidate_sha}"
+    )
+    assert evidence.payload["decision_type"] == "effect_contract_verification"
+    assert evidence.payload["plan_digest"] == state["plan_digest"]
+    assert evidence.payload["node_key"] == state["node_key"]
+    assert evidence.payload["attempt_id"] == state["attempt_id"]
+    assert evidence.payload["base_sha"] == base_sha
+    assert evidence.payload["candidate_sha"] == candidate_sha
+    assert evidence.payload["contract_digest"] == state["contract_digest"]
+    assert evidence.payload["write_scopes"] == ["modify.txt"]
+    assert len(evidence.payload["diff_projection_digest"]) == 64
+    assert evidence.has_valid_digest()
+    assert state["effect_verification"] == persisted[0]["effect_verification"]
 
 
 def test_saved_record_is_reused_for_the_same_candidate(tmp_path):
@@ -721,8 +977,122 @@ def test_unresolvable_candidate_identity_fails_closed(tmp_path):
 
     assert decision.status == "rejected"
     assert decision.findings
-    assert decision.verification.changed_paths == ()
+    assert decision.verification.payload["changed_paths"] == []
     assert len(persisted) == 1
+
+
+def test_candidate_parent_of_exact_base_fails_closed_before_diff(tmp_path):
+    repository, parent_sha, exact_base_sha = _unit_repository(tmp_path)
+    persisted: list = []
+    verifier = _unit_verifier(persisted)
+
+    decision = verifier.verify_candidate(
+        _unit_state(exact_base_sha),
+        {"effect_contract": {"write_scopes": ["modify.txt"]}},
+        SimpleNamespace(workspace=str(repository)),
+        _unit_observation(parent_sha),
+    )
+
+    assert decision.status == "rejected"
+    assert decision.verification.payload["changed_paths"] == []
+    assert decision.findings == (
+        "Candidate is not descended from the exact integration base",
+    )
+    assert len(persisted) == 1
+
+
+def test_git_posix_path_with_literal_backslash_is_not_windows_normalized():
+    with pytest.raises(EffectVerificationError) as rejected:
+        _parse_changed_paths(b"A\0directory\\literal.txt\0")
+
+    assert rejected.value.code == "GIT_CHANGED_PATHS_INVALID"
+    assert "backslash" in rejected.value.detail
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    (b"/absolute.txt", b"directory/../escape.txt", b"directory/./alias.txt"),
+)
+def test_git_diff_paths_reject_absolute_and_dot_escapes(raw_path):
+    with pytest.raises(EffectVerificationError) as rejected:
+        _parse_changed_paths(b"A\0" + raw_path + b"\0")
+
+    assert rejected.value.code == "GIT_CHANGED_PATHS_INVALID"
+
+
+def test_git_diff_paths_reject_nul_record_injection():
+    with pytest.raises(EffectVerificationError):
+        _parse_changed_paths(b"A\0safe.txt\0forged-status\0")
+
+
+def test_effect_violation_remains_in_mixed_check_and_review_repair_packet():
+    review = TypedEvidence._capture(
+        kind="review",
+        subject="c" * 40,
+        observer_type="runtime_adapter",
+        observer_id="review:unit",
+        observed_at="2026-07-26T00:00:00+00:00",
+        source_ref="runtime://review/unit",
+        payload={
+            "axes": [
+                {
+                    "axis": "spec",
+                    "findings": [
+                        {
+                            "severity": "hard",
+                            "code": "SPEC_BLOCK",
+                            "source": "synthetic://issue/67",
+                            "location": "forbidden.txt:1",
+                            "message": "The Candidate changes a forbidden path.",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    state = {
+        "review_evidence": review.__dict__,
+        "candidate_observation": {
+            "evidence": [
+                {
+                    "kind": "check",
+                    "source_ref": "runtime://check/unit",
+                    "payload": {
+                        "check_id": "module-1",
+                        "outcome": "failed",
+                        "exit_code": 2,
+                    },
+                }
+            ]
+        },
+    }
+    work_node = {
+        "output_contract": {
+            "checks": [
+                {
+                    "check_id": "module-1",
+                    "suite": "affected",
+                    "hosted_only": False,
+                }
+            ]
+        }
+    }
+
+    causes = Kernel._repair_causes(
+        state,
+        work_node,
+        cause_type="effect_contract_violation",
+        findings=("changed path 'forbidden.txt' is outside Write Scope",),
+    )
+
+    assert [cause["type"] for cause in causes] == [
+        "review_blocker",
+        "local_check_failure",
+        "effect_contract_violation",
+    ]
+    assert causes[-1]["messages"] == [
+        "changed path 'forbidden.txt' is outside Write Scope"
+    ]
 
 
 def test_effect_contract_verification_is_one_deep_module_behind_kernel():
