@@ -442,6 +442,106 @@ def test_worker_restart_never_replays_an_acknowledged_send(tmp_path, monkeypatch
     assert client.send_count == 1
 
 
+class AckLabelGapPaseoClient(RestartBlindPaseoClient):
+    """Fresh-client fake with a durable ACK hidden from filtered readback."""
+
+    def __init__(self, previous=None):
+        if previous is None:
+            super().__init__(send_acceptances=(False,))
+        else:
+            self._records = previous._records
+            self._labels = previous._labels
+            self._accepted = previous._accepted
+            self._send_acceptances = previous._send_acceptances
+            self.create_count = previous.create_count
+            self.send_count = previous.send_count
+            self.sent_action_keys = previous.sent_action_keys
+        self.ack_receipt_visible = False
+
+    def find_by_labels(self, labels):
+        delivery = labels.get("gwo.prompt_delivery")
+        if (
+            isinstance(delivery, str)
+            and delivery.startswith("acked:")
+            and not self.ack_receipt_visible
+        ):
+            return ()
+        return super().find_by_labels(labels)
+
+
+def test_ack_label_readback_gap_never_replays_across_fresh_client(
+    tmp_path,
+    monkeypatch,
+):
+    prompt = _prompt(310_000, name="ack-gap")
+    admission = RuntimeAdmission(
+        repository="local/ack-gap",
+        plan_digest="g" * 64,
+        node_key="node:ack-gap",
+        admission_id="admission:ack-gap",
+        repository_path=tmp_path,
+        base_sha="b" * 40,
+        runtime_profile=_profile(),
+    )
+    first_client = AckLabelGapPaseoClient()
+    first_adapter = PaseoRuntimeAdapter(first_client)
+    pending = first_adapter.materialize(admission, prompt)
+    action_key = f"{admission.admission_id}:prompt"
+
+    with pytest.raises(RuntimeAdapterError) as ack_gap:
+        first_adapter.accept_prompt(pending, prompt)
+
+    assert ack_gap.value.code == "PROMPT_DELIVERY_AMBIGUOUS"
+    assert first_client.send_count == 1
+    assert first_client.sent_action_keys == [action_key]
+    assert first_client._labels[pending.agent_id]["gwo.prompt_delivery"] == (
+        first_adapter._delivery_label_value("acked", 0, action_key)
+    )
+
+    restarted_client = AckLabelGapPaseoClient(first_client)
+    restarted = PaseoRuntimeAdapter(restarted_client)
+    adopted = restarted.read_binding(admission, prompt)
+    assert adopted is not None
+    assert adopted.agent_id == pending.agent_id
+    assert adopted.prompt_accepted is False
+
+    monkeypatch.setattr("gwo_v8.runtime.PASEO_BOOTSTRAP_WAIT_SECONDS", 0.0)
+    with pytest.raises(RuntimeAdapterError) as hidden_receipt:
+        restarted.accept_prompt(adopted, prompt)
+
+    assert hidden_receipt.value.code == "PROMPT_DELIVERY_AMBIGUOUS"
+    assert restarted_client.send_count == 1
+    assert restarted_client.sent_action_keys == [action_key]
+
+    restarted_client.ack_receipt_visible = True
+    assert restarted._read_delivery_state(
+        adopted.agent_id,
+        {"gwo.admission": admission.admission_id},
+        action_key,
+    ) == ("acked", 0)
+    with pytest.raises(RuntimeAdapterError) as visible_receipt:
+        restarted.accept_prompt(adopted, prompt)
+
+    assert visible_receipt.value.code == "PROMPT_DELIVERY_AMBIGUOUS"
+    assert restarted_client.send_count == 1
+    assert restarted_client.sent_action_keys == [action_key]
+
+    restarted_client.accept_prompt(adopted.agent_id, prompt)
+    accepted = PaseoRuntimeAdapter(
+        AckLabelGapPaseoClient(restarted_client)
+    ).read_binding(admission, prompt)
+
+    assert accepted is not None
+    assert accepted.agent_id == pending.agent_id
+    assert accepted.prompt_accepted is True
+    assert accepted.prompt_digest == prompt.digest
+    assert restarted_client.send_count == 1
+    assert restarted_client.prompt_acceptance_count(
+        accepted.agent_id,
+        prompt,
+    ) == 1
+
+
 def test_delayed_inline_create_boundary_never_authorizes_send(
     tmp_path,
     monkeypatch,

@@ -234,14 +234,16 @@ Prompt-file send, the adapter requires authoritative bootstrap-idle readback
 and publishes an action-keyed `gwo.prompt_delivery` receipt on the same Agent.
 Once the send may have been invoked, acknowledgement, elapsed time, and later
 idle observations cannot prove it was absent from Paseo's asynchronous queue.
-Without an exact acceptance boundary, the same Agent and action therefore
-remain ambiguous indefinitely; reconciliation never replays from timing or
-idle heuristics. A retry is permitted only after an explicit pre-acceptance
-transport rejection proves that no enqueue occurred. The Admission or Review
-action never creates a replacement Agent while that identity exists. Empty
-readbacks do not consume a finite Prompt execution budget; the Admission keeps
-waiting until the original boundary becomes visible or a terminal Paseo result
-provides new authoritative evidence.
+An absent or lagging delivery label after acknowledgement remains ambiguous
+across fresh Paseo clients. Without an exact acceptance boundary or a terminal
+Paseo result, the same Agent and action remain ambiguous indefinitely;
+reconciliation never replays from acknowledgement timing or idle heuristics. A
+retry is permitted only after an explicit pre-acceptance transport rejection
+proves that no enqueue occurred. The Admission or Review action never creates a
+replacement Agent while that identity exists. Empty readbacks do not consume a
+finite Prompt execution budget; the Admission keeps waiting until the original
+boundary becomes visible or a terminal Paseo result provides new authoritative
+evidence.
 Review-axis convergence applies the same rule: an acknowledged send without
 the exact activity boundary remains `PROMPT_DELIVERY_AMBIGUOUS` on the same
 Review Agent and action across any number of empty convergence windows. It is

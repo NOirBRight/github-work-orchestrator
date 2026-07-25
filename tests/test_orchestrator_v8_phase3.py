@@ -790,10 +790,33 @@ def test_review_child_transport_retry_is_bounded_and_readback_first(tmp_path):
 
 
 class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
-    def __init__(self):
-        super().__init__()
-        self.sent_action_keys = []
-        self.pending_prompt = None
+    def __init__(self, previous=None):
+        if previous is None:
+            super().__init__()
+            self.sent_action_keys = []
+            self.pending_prompt = None
+        else:
+            self._agents = previous._agents
+            self._create_failures = previous._create_failures
+            self._send_acceptances = previous._send_acceptances
+            self._accepted_prompt_digests = previous._accepted_prompt_digests
+            self._worker_turn_capacity = previous._worker_turn_capacity
+            self.create_count = previous.create_count
+            self.send_count = previous.send_count
+            self.create_prompt_digests = previous.create_prompt_digests
+            self.sent_action_keys = previous.sent_action_keys
+            self.pending_prompt = previous.pending_prompt
+        self.ack_receipt_visible = False
+
+    def find_by_labels(self, labels):
+        delivery = labels.get("gwo.prompt_delivery")
+        if (
+            isinstance(delivery, str)
+            and delivery.startswith("acked:")
+            and not self.ack_receipt_visible
+        ):
+            return ()
+        return super().find_by_labels(labels)
 
     def create(self, request):
         record = super().create(request)
@@ -921,11 +944,17 @@ def test_review_prompt_ambiguity_survives_delayed_visibility_windows(
     monkeypatch.setattr("gwo_v8.runtime.time.sleep", lambda _seconds: None)
     monkeypatch.setattr("gwo_v8.runtime.PASEO_BOOTSTRAP_WAIT_SECONDS", 3.0)
 
-    ambiguous = [
+    ambiguous = [kernel.reconcile_once("local/phase-three")]
+    client = _DelayedReviewPromptPaseoClient(client)
+    kernel.runtime = PaseoRuntimeAdapter(client)
+    ambiguous.extend(
         kernel.reconcile_once("local/phase-three")
-        for _ in range(5)
-    ]
+        for _ in range(3)
+    )
+    client.ack_receipt_visible = True
+    ambiguous.append(kernel.reconcile_once("local/phase-three"))
 
+    assert len(ambiguous) == 5
     assert all(outcome.status == "waiting" for outcome in ambiguous)
     assert all(
         outcome.wait_condition == "review_prompt_readback"

@@ -1682,6 +1682,7 @@ class PaseoRuntimeAdapter:
     def __init__(self, client: PaseoClient):
         self.client = client
         self._prompts: dict[str, RuntimePrompt] = {}
+        self._fresh_bootstrap_actions: set[tuple[str, str]] = set()
         self._worker_observations: dict[
             str,
             tuple[str, RuntimeObservation],
@@ -1879,6 +1880,7 @@ class PaseoRuntimeAdapter:
         identity_labels: dict[str, str],
         agent_labels: dict[str, str],
         action_key: str,
+        allow_initial_send: bool = False,
     ) -> None:
         deadline = time.monotonic() + PASEO_BOOTSTRAP_WAIT_SECONDS
         self._find_exact(agent_id, agent_labels)
@@ -1913,6 +1915,13 @@ class PaseoRuntimeAdapter:
                     # ambiguous; a separate send would duplicate that effect.
                     time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
                     continue
+                if not allow_initial_send:
+                    # An existing bootstrap with no authoritative delivery
+                    # receipt may already have received this asynchronous
+                    # action. Only the process that just created this Agent can
+                    # prove that its first send has not yet been invoked.
+                    time.sleep(PASEO_PROMPT_SETTLE_SECONDS)
+                    continue
                 if agent.lifecycle != "idle":
                     time.sleep(PASEO_BOOTSTRAP_POLL_SECONDS)
                     continue
@@ -1923,6 +1932,7 @@ class PaseoRuntimeAdapter:
                     phase="prepared",
                     ordinal=0,
                 )
+                allow_initial_send = False
                 send_authorized = True
             phase, ordinal = state
             if phase == "prepared" and not send_authorized:
@@ -1988,13 +1998,23 @@ class PaseoRuntimeAdapter:
                 )
                 continue
 
-            state = self._publish_delivery_state(
-                agent_id,
-                identity_labels,
-                action_key,
-                phase="acked",
-                ordinal=ordinal,
-            )
+            try:
+                state = self._publish_delivery_state(
+                    agent_id,
+                    identity_labels,
+                    action_key,
+                    phase="acked",
+                    ordinal=ordinal,
+                )
+            except RuntimeAdapterError as error:
+                raise RuntimeAdapterError(
+                    "PROMPT_DELIVERY_AMBIGUOUS",
+                    (
+                        "Paseo acknowledged the asynchronous Prompt send, "
+                        "but its durable delivery receipt is not yet readable"
+                    ),
+                    failure_class="ambiguous",
+                ) from error
             if self._prompt_is_accepted(
                 agent_id,
                 prompt,
@@ -2145,7 +2165,8 @@ class PaseoRuntimeAdapter:
         if admission.parent_agent_id is not None:
             labels["gwo.parent_agent"] = admission.parent_agent_id
         existing = self._find_one(labels)
-        if existing is None:
+        created_here = existing is None
+        if created_here:
             creation_labels = dict(labels)
             if (
                 len(prompt.text.encode("utf-8"))
@@ -2189,6 +2210,14 @@ class PaseoRuntimeAdapter:
         binding = self._binding(existing)
         self._assert_admission_identity(admission, binding, prompt)
         self._prompts[admission.admission_id] = prompt
+        if (
+            created_here
+            and not accepted
+            and len(prompt.text.encode("utf-8")) > PASEO_INLINE_PROMPT_MAX_BYTES
+        ):
+            self._fresh_bootstrap_actions.add(
+                (existing.agent_id, f"{admission.admission_id}:prompt")
+            )
         return binding
 
     def read_binding(
@@ -2267,6 +2296,10 @@ class PaseoRuntimeAdapter:
                 failure_class="ambiguous",
             )
         identity_labels = {"gwo.admission": binding.admission_id}
+        action_key = f"{binding.admission_id}:prompt"
+        fresh_action = (binding.agent_id, action_key)
+        allow_initial_send = fresh_action in self._fresh_bootstrap_actions
+        self._fresh_bootstrap_actions.discard(fresh_action)
         self._converge_prompt_delivery(
             binding.agent_id,
             prompt,
@@ -2276,7 +2309,8 @@ class PaseoRuntimeAdapter:
                 include_prompt=binding.prompt_accepted,
                 include_attempt=False,
             ),
-            action_key=f"{binding.admission_id}:prompt",
+            action_key=action_key,
+            allow_initial_send=allow_initial_send,
         )
 
     def attach_attempt(
@@ -2850,6 +2884,7 @@ class PaseoRuntimeAdapter:
         for execution in range(3):
             try:
                 agent = self._find_one({"gwo.action_key": request.action_key})
+                created_here = agent is None
                 if agent is None:
                     creation_labels = dict(labels)
                     if (
@@ -2891,6 +2926,7 @@ class PaseoRuntimeAdapter:
                     identity_labels={"gwo.action_key": request.action_key},
                     agent_labels=labels,
                     action_key=request.action_key,
+                    allow_initial_send=created_here,
                 )
                 readback = self._find_exact(
                     agent.agent_id,
