@@ -355,6 +355,31 @@ class _ReviewMaterializationRecoveryRuntime(_ReviewingInMemoryRuntime):
         )
 
 
+class _ParallelReviewAxisRuntime(_ReviewingInMemoryRuntime):
+    def __init__(self, workspace_root: Path):
+        super().__init__(workspace_root)
+        self.primary_barrier = threading.Barrier(2)
+        self.primary_threads: dict[str, int] = {}
+        self._primary_threads_lock = threading.Lock()
+
+    def materialize_review_axis(
+        self,
+        request,
+        profile,
+        *,
+        parent_agent_id,
+    ):
+        if request.recovery_ordinal == 0:
+            with self._primary_threads_lock:
+                self.primary_threads[request.axis] = threading.get_ident()
+            self.primary_barrier.wait(timeout=5)
+        return super().materialize_review_axis(
+            request,
+            profile,
+            parent_agent_id=parent_agent_id,
+        )
+
+
 def _review_materialization_kernel(tmp_path, runtime):
     repository = _temporary_repository(tmp_path)
     intent, source, _policy = _multi_ready_inputs(count=1)
@@ -425,6 +450,20 @@ def _review_materialization_kernel(tmp_path, runtime):
         if node["kind"] == "work"
     )
     return kernel, compiled, work_node
+
+
+def test_required_review_axis_materialization_launches_in_parallel(tmp_path):
+    runtime = _ParallelReviewAxisRuntime(tmp_path / "runtime")
+    kernel, _compiled, _work_node = _review_materialization_kernel(
+        tmp_path,
+        runtime,
+    )
+
+    outcome = kernel.reconcile_once("local/phase-four-a")
+
+    assert outcome.status == "complete"
+    assert set(runtime.primary_threads) == {"standards", "spec"}
+    assert len(set(runtime.primary_threads.values())) == 2
 
 
 def test_review_axis_materialization_recovers_across_reconcile_cycles_without_worker_attempt(

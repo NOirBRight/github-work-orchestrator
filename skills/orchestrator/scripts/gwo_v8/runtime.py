@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Protocol
 
@@ -468,6 +469,18 @@ class RuntimePrompt:
             warnings=warnings,
             contract_node=contract_node,
         )
+
+
+def _paseo_bootstrap_prompt(action_key: str) -> RuntimePrompt:
+    text = (
+        "GWO transport bootstrap "
+        f"{action_key}. Wait for the frozen Prompt; "
+        "do not inspect or modify files yet."
+    )
+    return RuntimePrompt(
+        text=text,
+        digest=digest_bytes(text.encode("utf-8")),
+    )
 
 
 def _contract_node_from_prompt(
@@ -971,7 +984,8 @@ class InMemoryPaseoClient:
         self.native_finish_notification_supported = (
             native_finish_notification_supported
         )
-        self._create_receipt: tuple[str, str] | None = None
+        self._create_receipts: set[tuple[str, str]] = set()
+        self._create_receipt_lock = threading.Lock()
         self.create_count = 0
         self.send_count = 0
         self.create_prompt_digests: list[str] = []
@@ -999,7 +1013,12 @@ class InMemoryPaseoClient:
         )
 
     def create(self, request: PaseoCreateRequest) -> PaseoAgentRecord:
-        self._create_receipt = None
+        with self._create_receipt_lock:
+            self._create_receipts = {
+                receipt
+                for receipt in self._create_receipts
+                if receipt[0] != request.action_key
+            }
         self.create_count += 1
         self.create_prompt_digests.append(request.prompt.digest)
         existing = self.find_by_labels({"gwo.action_key": request.action_key})
@@ -1059,14 +1078,16 @@ class InMemoryPaseoClient:
                 "synthetic lost Paseo creation acknowledgement",
                 failure_class="ambiguous",
             )
-        self._create_receipt = (request.action_key, agent_id)
+        with self._create_receipt_lock:
+            self._create_receipts.add((request.action_key, agent_id))
         return record
 
     def consume_create_receipt(self, action_key: str, agent_id: str) -> bool:
         expected = (action_key, agent_id)
-        created = self._create_receipt == expected
-        self._create_receipt = None
-        return created
+        with self._create_receipt_lock:
+            created = expected in self._create_receipts
+            self._create_receipts.discard(expected)
+            return created
 
     def inspect(self, agent_id: str) -> PaseoAgentRecord:
         try:
@@ -1160,7 +1181,8 @@ class PaseoCliClient:
         self.executable = shutil.which(executable) or executable
         self._command_prefix = (self.executable,)
         self._command_environment: dict[str, str] | None = None
-        self._create_receipt: tuple[str, str] | None = None
+        self._create_receipts: set[tuple[str, str]] = set()
+        self._create_receipt_lock = threading.Lock()
         if sys.platform == "win32" and Path(self.executable).suffix.lower() in {
             ".bat",
             ".cmd",
@@ -1507,7 +1529,12 @@ class PaseoCliClient:
         return tuple(records)
 
     def create(self, request: PaseoCreateRequest) -> PaseoAgentRecord:
-        self._create_receipt = None
+        with self._create_receipt_lock:
+            self._create_receipts = {
+                receipt
+                for receipt in self._create_receipts
+                if receipt[0] != request.action_key
+            }
         worktree = f"gwo-{digest_bytes(request.action_key.encode('utf-8'))[:16]}"
         creation_labels = {
             **request.labels,
@@ -1518,11 +1545,7 @@ class PaseoCliClient:
         initial_prompt = (
             request.prompt.text
             if inline
-            else (
-                "GWO transport bootstrap "
-                f"{request.action_key}. Wait for the frozen Prompt; "
-                "do not inspect or modify files yet."
-            )
+            else _paseo_bootstrap_prompt(request.action_key).text
         )
         command = [
             "run",
@@ -1601,14 +1624,16 @@ class PaseoCliClient:
                 "Paseo creation identity became ambiguous",
                 failure_class="ambiguous",
             )
-        self._create_receipt = (request.action_key, agent_id)
+        with self._create_receipt_lock:
+            self._create_receipts.add((request.action_key, agent_id))
         return exact[0]
 
     def consume_create_receipt(self, action_key: str, agent_id: str) -> bool:
         expected = (action_key, agent_id)
-        created = self._create_receipt == expected
-        self._create_receipt = None
-        return created
+        with self._create_receipt_lock:
+            created = expected in self._create_receipts
+            self._create_receipts.discard(expected)
+            return created
 
     def inspect(self, agent_id: str) -> PaseoAgentRecord:
         payload = self._run(["inspect", agent_id, "--json"])
@@ -2155,6 +2180,39 @@ class PaseoRuntimeAdapter:
             ),
             failure_class="ambiguous",
         )
+
+    def _bootstrap_authorizes_review_prompt(
+        self,
+        agent_id: str,
+        request: ReviewAxisRequest,
+        prompt: RuntimePrompt,
+    ) -> bool:
+        if (
+            len(prompt.text.encode("utf-8"))
+            <= PASEO_INLINE_PROMPT_MAX_BYTES
+        ):
+            return False
+        target_count = self.client.prompt_acceptance_count(agent_id, prompt)
+        if target_count > 1:
+            raise RuntimeAdapterError(
+                "PROMPT_ACCEPTANCE_DUPLICATE",
+                "Paseo activity contains the exact Prompt more than once",
+                failure_class="ambiguous",
+            )
+        if target_count == 1:
+            return False
+        bootstrap = _paseo_bootstrap_prompt(request.action_key)
+        bootstrap_count = self.client.prompt_acceptance_count(
+            agent_id,
+            bootstrap,
+        )
+        if bootstrap_count > 1:
+            raise RuntimeAdapterError(
+                "PASEO_BOOTSTRAP_ACCEPTANCE_DUPLICATE",
+                "Paseo activity contains the transport bootstrap more than once",
+                failure_class="ambiguous",
+            )
+        return bootstrap_count == 1
 
     @staticmethod
     def _binding_labels(
@@ -3226,13 +3284,18 @@ class PaseoRuntimeAdapter:
                 failure_class="ambiguous",
             )
         created_here = created_here and created_agent_id == agent.agent_id
+        bootstrap_authorized = self._bootstrap_authorizes_review_prompt(
+            agent.agent_id,
+            request,
+            prompt,
+        )
         self._converge_prompt_delivery(
             agent.agent_id,
             prompt,
             identity_labels={"gwo.action_key": request.action_key},
             agent_labels=labels,
             action_key=request.action_key,
-            allow_initial_send=created_here,
+            allow_initial_send=created_here or bootstrap_authorized,
         )
         readback = self._find_exact(
             agent.agent_id,

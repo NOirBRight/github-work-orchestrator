@@ -26,7 +26,10 @@ from gwo_v8 import (  # noqa: E402
     RuntimeProfile,
     RuntimePrompt,
 )
-from gwo_v8.runtime import PASEO_INLINE_PROMPT_MAX_BYTES  # noqa: E402
+from gwo_v8.runtime import (  # noqa: E402
+    PASEO_INLINE_PROMPT_MAX_BYTES,
+    _paseo_bootstrap_prompt,
+)
 from scripts.run_paseo_transport_e2e import _archive_agents  # noqa: E402
 
 
@@ -601,6 +604,28 @@ class CreateRacePaseoClient(RestartBlindPaseoClient):
         return record
 
 
+class AmbiguousBootstrapOnlyReviewClient(RestartBlindPaseoClient):
+    """Lost create response after the exact bootstrap was accepted."""
+
+    def __init__(self):
+        super().__init__()
+        self._lose_first_create_response = True
+
+    def create(self, request):
+        record = super().create(request)
+        if self._lose_first_create_response:
+            self._lose_first_create_response = False
+            bootstrap = _paseo_bootstrap_prompt(request.action_key)
+            self._accepted[record.agent_id].append(bootstrap.digest)
+            self._create_receipt = None
+            raise RuntimeAdapterError(
+                "PASEO_CREATE_AMBIGUOUS",
+                "synthetic lost create response after bootstrap acceptance",
+                failure_class="ambiguous",
+            )
+        return record
+
+
 def test_worker_lookup_create_race_does_not_authorize_first_send(
     tmp_path,
     monkeypatch,
@@ -1075,6 +1100,57 @@ def test_review_axis_prompt_acceptance_adopts_after_restart_without_duplicate_de
             duplicate_binding,
         )
     assert duplicate.value.code == "PROMPT_ACCEPTANCE_DUPLICATE"
+
+
+def test_review_axis_ambiguous_bootstrap_child_delivers_exact_prompt_once(
+    tmp_path,
+):
+    repository, candidate_sha = _repository(tmp_path)
+    profile = _profile()
+    request = ReviewAxisRequest(
+        repository="local/review-bootstrap-recovery",
+        attempt_id="attempt:review-bootstrap-recovery",
+        candidate_sha=candidate_sha,
+        base_sha=candidate_sha,
+        axis="standards",
+        recovery_ordinal=0,
+        workspace=repository,
+        diff_command=("git", "diff", f"{candidate_sha}...{candidate_sha}"),
+        commit_list=("transport candidate",),
+        spec_source_ref="synthetic://issue/77",
+        spec_text=json.dumps(
+            {"payload": "b" * 20_000},
+            separators=(",", ":"),
+        ),
+        standards_sources=("AGENTS.md", "CONTEXT.md"),
+        check_manifest_digest="c" * 64,
+    )
+    prompt = request.to_prompt()
+    bootstrap = _paseo_bootstrap_prompt(request.action_key)
+    assert len(prompt.text.encode("utf-8")) > PASEO_INLINE_PROMPT_MAX_BYTES
+    client = AmbiguousBootstrapOnlyReviewClient()
+
+    binding = PaseoRuntimeAdapter(client).materialize_review_axis(
+        request,
+        profile,
+        parent_agent_id="worker-parent",
+    )
+
+    assert client.create_count == 1
+    assert client.send_count == 1
+    assert client.prompt_acceptance_count(binding.agent_id, bootstrap) == 1
+    assert client.prompt_acceptance_count(binding.agent_id, prompt) == 1
+
+    adopted = PaseoRuntimeAdapter(client).materialize_review_axis(
+        request,
+        profile,
+        parent_agent_id="worker-parent",
+    )
+    assert adopted.agent_id == binding.agent_id
+    assert client.create_count == 1
+    assert client.send_count == 1
+    assert client.prompt_acceptance_count(binding.agent_id, bootstrap) == 1
+    assert client.prompt_acceptance_count(binding.agent_id, prompt) == 1
 
 
 def test_review_prompts_keep_spec_authority_without_repeating_file_contents():
