@@ -205,9 +205,86 @@ def _runtime_profile() -> RuntimeProfile:
     return RuntimeProfile(
         name="worker-standard",
         provider="kimi-cli",
-        model="kimi-code/k2.7",
-        thinking="max",
+        model="kimi-code/kimi-for-coding",
+        thinking="on",
         mode="yolo",
+        features={},
+    )
+
+
+def _worker_runtime_config(
+    workers: int,
+    coordinators: int = 1,
+    *,
+    repository: str = "local/phase-four-a",
+    extra: dict | None = None,
+) -> dict:
+    """Return a runtime_config with valid Worker tier mappings for tests."""
+    config = {
+        "active_turn_pools": {"workers": workers, "coordinators": coordinators},
+        "tiers": {
+            "light": {
+                "provider": "kimi-cli",
+                "settings": {
+                    "model": "kimi-code/kimi-for-coding",
+                    "thinkingOptionId": "on",
+                    "modeId": "yolo",
+                    "features": {},
+                },
+            },
+            "standard": {
+                "provider": "kimi-cli",
+                "settings": {
+                    "model": "kimi-code/kimi-for-coding",
+                    "thinkingOptionId": "on",
+                    "modeId": "yolo",
+                    "features": {},
+                },
+            },
+            "heavy": {
+                "provider": "kimi-cli",
+                "settings": {
+                    "model": "kimi-code/k3",
+                    "thinkingOptionId": "high",
+                    "modeId": "yolo",
+                    "features": {},
+                },
+            },
+            "frontier": {
+                "provider": "codex",
+                "settings": {
+                    "model": "sol/xhigh",
+                    "thinkingOptionId": "xhigh",
+                    "modeId": "full-access",
+                    "features": {},
+                },
+            },
+        },
+        "repositories": {
+            repository: {
+                "active_turn_pools": {
+                    "workers": workers,
+                    "coordinators": coordinators,
+                }
+            }
+        },
+    }
+    if extra:
+        for key, value in extra.items():
+            if key == "repositories" and isinstance(value, dict):
+                config["repositories"].update(value)
+            else:
+                config[key] = value
+    return config
+
+
+def _frontier_runtime_profile() -> RuntimeProfile:
+    return RuntimeProfile(
+        name="worker-frontier",
+        provider="codex",
+        model="sol/xhigh",
+        thinking="xhigh",
+        mode="full-access",
         features={},
     )
 
@@ -466,24 +543,24 @@ def _review_materialization_kernel(tmp_path, runtime, *, risk="standard"):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        runtime_profile=_runtime_profile(),
         delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
-        runtime_config={
-            "active_turn_pools": {"workers": 1, "coordinators": 1},
-            "repositories": {},
-            "runtime_profiles": {
-                "reviewer_standard": {
-                    "provider": "codex",
-                    "settings": {
-                        "model": "gpt-5.6-sol",
-                        "thinkingOptionId": "high",
-                        "modeId": "full-access",
-                        "features": {},
-                    },
-                }
+        runtime_config=_worker_runtime_config(
+            workers=1,
+            extra={
+                "runtime_profiles": {
+                    "reviewer_standard": {
+                        "provider": "codex",
+                        "settings": {
+                            "model": "gpt-5.6-sol",
+                            "thinkingOptionId": "high",
+                            "modeId": "full-access",
+                            "features": {},
+                        },
+                    }
+                },
+                "review_profiles": {"standard_axis": "reviewer_standard"},
             },
-            "review_profiles": {"standard_axis": "reviewer_standard"},
-        },
+        ),
     )
     work_node = next(
         node
@@ -1002,11 +1079,7 @@ def test_one_pass_admits_the_ready_frontier_up_to_worker_capacity(tmp_path):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        runtime_profile=_runtime_profile(),
-        runtime_config={
-            "active_turn_pools": {"workers": 2, "coordinators": 1},
-            "repositories": {},
-        },
+        runtime_config=_worker_runtime_config(workers=2),
     )
 
     outcome = kernel.reconcile_once("local/phase-four-a")
@@ -1041,6 +1114,7 @@ def test_default_pool_demonstrates_high_parallel_utilization(tmp_path):
         integration_branch="main",
         writer_generation="phase-4a",
         runtime_profile=_runtime_profile(),
+        frontier_runtime_profile=_frontier_runtime_profile(),
     ).reconcile_once("local/phase-four-a")
 
     assert outcome.worker_turn_capacity == 8
@@ -1069,11 +1143,7 @@ def test_committed_frontier_materializes_without_head_of_line_blocking(tmp_path)
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        runtime_profile=_runtime_profile(),
-        runtime_config={
-            "active_turn_pools": {"workers": 2, "coordinators": 1},
-            "repositories": {},
-        },
+        runtime_config=_worker_runtime_config(workers=2),
     ).reconcile_once("local/phase-four-a")
 
     assert len(outcome.admitted_node_keys) == 2
@@ -1100,18 +1170,19 @@ def test_repository_and_observed_capacity_bound_the_ready_frontier(tmp_path):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        runtime_profile=_runtime_profile(),
-        runtime_config={
-            "active_turn_pools": {"workers": 8, "coordinators": 1},
-            "repositories": {
-                "local/phase-four-a": {
-                    "active_turn_pools": {
-                        "workers": 3,
-                        "coordinators": 2,
+        runtime_config=_worker_runtime_config(
+            workers=8,
+            extra={
+                "repositories": {
+                    "local/phase-four-a": {
+                        "active_turn_pools": {
+                            "workers": 3,
+                            "coordinators": 2,
+                        }
                     }
                 }
             },
-        },
+        ),
     )
 
     outcome = kernel.reconcile_once("local/phase-four-a")
@@ -1171,12 +1242,8 @@ def test_batch_wait_releases_worker_turns_and_refills_before_one_hosted_ci(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        runtime_profile=_runtime_profile(),
         delivery_control=delivery,
-        runtime_config={
-            "active_turn_pools": {"workers": 2, "coordinators": 1},
-            "repositories": {},
-        },
+        runtime_config=_worker_runtime_config(workers=2),
     )
 
     first = kernel.reconcile_once("local/phase-four-a")
@@ -1228,12 +1295,8 @@ def test_batch_hosted_failure_stops_without_blind_worker_repair(tmp_path):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        runtime_profile=_runtime_profile(),
         delivery_control=delivery,
-        runtime_config={
-            "active_turn_pools": {"workers": 1, "coordinators": 1},
-            "repositories": {},
-        },
+        runtime_config=_worker_runtime_config(workers=1),
     )
 
     first = kernel.reconcile_once("local/phase-four-a")
@@ -1285,12 +1348,8 @@ def test_same_node_recovery_reservation_is_compare_and_swap(tmp_path):
             repository_path=repository,
             integration_branch="main",
             writer_generation="phase-4a",
-            runtime_profile=_runtime_profile(),
             delivery_control=delivery,
-            runtime_config={
-                "active_turn_pools": {"workers": 1, "coordinators": 1},
-                "repositories": {},
-            },
+            runtime_config=_worker_runtime_config(workers=1),
         )
 
     first_kernel = new_kernel()
@@ -1359,11 +1418,7 @@ def test_overlapping_write_scopes_are_advisory_for_admission(tmp_path):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        runtime_profile=_runtime_profile(),
-        runtime_config={
-            "active_turn_pools": {"workers": 2, "coordinators": 1},
-            "repositories": {},
-        },
+        runtime_config=_worker_runtime_config(workers=2),
     )
 
     outcome = kernel.reconcile_once("local/phase-four-a")
@@ -1393,11 +1448,7 @@ def test_explicit_non_shareable_resource_hard_excludes_second_admission(tmp_path
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        runtime_profile=_runtime_profile(),
-        runtime_config={
-            "active_turn_pools": {"workers": 2, "coordinators": 1},
-            "repositories": {},
-        },
+        runtime_config=_worker_runtime_config(workers=2),
     )
 
     outcome = kernel.reconcile_once("local/phase-four-a")
@@ -1432,12 +1483,8 @@ def test_one_batch_performs_only_one_target_branch_mutation(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        runtime_profile=_runtime_profile(),
         delivery_control=delivery,
-        runtime_config={
-            "active_turn_pools": {"workers": 2, "coordinators": 1},
-            "repositories": {},
-        },
+        runtime_config=_worker_runtime_config(workers=2),
     )
 
     outcome = kernel.reconcile_once("local/phase-four-a")
@@ -1483,12 +1530,8 @@ def test_three_node_e2e_reaches_the_serial_integration_boundary(tmp_path):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        runtime_profile=_runtime_profile(),
         delivery_control=delivery,
-        runtime_config={
-            "active_turn_pools": {"workers": 2, "coordinators": 1},
-            "repositories": {},
-        },
+        runtime_config=_worker_runtime_config(workers=2),
     )
 
     first = kernel.reconcile_once("local/phase-four-a")
@@ -1561,24 +1604,24 @@ def test_three_standard_candidates_keep_dual_axis_review_in_one_batch(tmp_path):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        runtime_profile=_runtime_profile(),
         delivery_control=delivery,
-        runtime_config={
-            "active_turn_pools": {"workers": 3, "coordinators": 1},
-            "repositories": {},
-            "runtime_profiles": {
-                "reviewer_standard": {
-                    "provider": "codex",
-                    "settings": {
-                        "model": "gpt-5.6-sol",
-                        "thinkingOptionId": "high",
-                        "modeId": "full-access",
-                        "features": {},
-                    },
-                }
+        runtime_config=_worker_runtime_config(
+            workers=3,
+            extra={
+                "runtime_profiles": {
+                    "reviewer_standard": {
+                        "provider": "codex",
+                        "settings": {
+                            "model": "gpt-5.6-sol",
+                            "thinkingOptionId": "high",
+                            "modeId": "full-access",
+                            "features": {},
+                        },
+                    }
+                },
+                "review_profiles": {"standard_axis": "reviewer_standard"},
             },
-            "review_profiles": {"standard_axis": "reviewer_standard"},
-        },
+        ),
     )
 
     completed = kernel.reconcile_once("local/phase-four-a")
@@ -1613,10 +1656,7 @@ def test_saturated_workers_cannot_consume_reserved_coordinator_capacity(
         expected_active_digest=None,
         writer_generation="phase-4a",
     )
-    config = {
-        "active_turn_pools": {"workers": 1, "coordinators": 1},
-        "repositories": {},
-    }
+    config = _worker_runtime_config(workers=1)
     worker_outcome = Kernel(
         store_path=store_path,
         publication=publication,
@@ -1625,7 +1665,6 @@ def test_saturated_workers_cannot_consume_reserved_coordinator_capacity(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-4a",
-        runtime_profile=_runtime_profile(),
         runtime_config=config,
     ).reconcile_once("local/phase-four-a")
     assert worker_outcome.active_worker_turns == 1
@@ -1924,6 +1963,7 @@ def test_missed_finish_restart_verifies_result_claim_once_and_retires(tmp_path):
             integration_branch="main",
             writer_generation="phase-4a",
             runtime_profile=_runtime_profile(),
+            frontier_runtime_profile=_frontier_runtime_profile(),
             delivery_control=delivery,
             parent_agent_id="coordinator-agent",
         )
@@ -2085,22 +2125,23 @@ def test_missed_finish_restart_reads_completed_review_children_once(tmp_path):
     )
     client = _ReadCountingDetachedPaseoClient()
     delivery = InMemoryDeliveryControl(hosted_outcomes=("passed",))
-    runtime_config = {
-        "active_turn_pools": {"workers": 1, "coordinators": 1},
-        "repositories": {},
-        "runtime_profiles": {
-            "reviewer_standard": {
-                "provider": "codex",
-                "settings": {
-                    "model": "gpt-5.6-sol",
-                    "thinkingOptionId": "high",
-                    "modeId": "full-access",
-                    "features": {},
-                },
-            }
+    runtime_config = _worker_runtime_config(
+        workers=1,
+        extra={
+            "runtime_profiles": {
+                "reviewer_standard": {
+                    "provider": "codex",
+                    "settings": {
+                        "model": "gpt-5.6-sol",
+                        "thinkingOptionId": "high",
+                        "modeId": "full-access",
+                        "features": {},
+                    },
+                }
+            },
+            "review_profiles": {"standard_axis": "reviewer_standard"},
         },
-        "review_profiles": {"standard_axis": "reviewer_standard"},
-    }
+    )
 
     def new_kernel() -> Kernel:
         return Kernel(
@@ -2111,7 +2152,6 @@ def test_missed_finish_restart_reads_completed_review_children_once(tmp_path):
             repository_path=repository,
             integration_branch="main",
             writer_generation="phase-4a",
-            runtime_profile=_runtime_profile(),
             delivery_control=delivery,
             parent_agent_id="coordinator-agent",
             runtime_config=runtime_config,

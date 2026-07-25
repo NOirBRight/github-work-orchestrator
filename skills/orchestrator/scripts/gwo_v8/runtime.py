@@ -87,6 +87,253 @@ class ActiveTurnPools:
     coordinators: int
 
 
+@dataclass(frozen=True)
+class ModelCapabilities:
+    """Capability snapshot for one provider/model combination."""
+
+    thinking_options: frozenset[str]
+    features: frozenset[str]
+
+
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    """Fresh capability readback for one Runtime provider."""
+
+    models: dict[str, ModelCapabilities]
+    modes: frozenset[str]
+    features: frozenset[str]
+
+
+@dataclass(frozen=True)
+class RuntimeCapabilities:
+    """Snapshot returned by a PaseoClient capability-read seam."""
+
+    providers: dict[str, ProviderCapabilities]
+
+
+def _default_paseo_capabilities() -> RuntimeCapabilities:
+    """Deterministic Paseo snapshot for in-memory PaseoClient fakes.
+
+    Uses Paseo-canonical provider ids (``kimi``, ``codex``). The
+    ``kimi-code/kimi-for-coding`` model does not enumerate ``on``; the Adapter
+    adds the narrow exact-``on`` exception during normalization.
+    """
+
+    return RuntimeCapabilities(
+        providers={
+            "kimi": ProviderCapabilities(
+                models={
+                    "kimi-code/kimi-for-coding": ModelCapabilities(
+                        thinking_options=frozenset(),
+                        features=frozenset(),
+                    ),
+                    "kimi-code/k3": ModelCapabilities(
+                        thinking_options=frozenset({"high", "max"}),
+                        features=frozenset(),
+                    ),
+                },
+                modes=frozenset({"yolo"}),
+                features=frozenset(),
+            ),
+            "codex": ProviderCapabilities(
+                models={
+                    "gpt-5.6-sol": ModelCapabilities(
+                        thinking_options=frozenset({"high", "xhigh"}),
+                        features=frozenset(),
+                    ),
+                    "sol/xhigh": ModelCapabilities(
+                        thinking_options=frozenset({"xhigh"}),
+                        features=frozenset(),
+                    ),
+                },
+                modes=frozenset({"full-access", "yolo"}),
+                features=frozenset(),
+            ),
+        }
+    )
+
+
+def _default_runtime_capabilities() -> RuntimeCapabilities:
+    """Deterministic default snapshot for in-memory RuntimeAdapter fakes."""
+
+    return RuntimeCapabilities(
+        providers={
+            "kimi-cli": ProviderCapabilities(
+                models={
+                    "kimi-code/kimi-for-coding": ModelCapabilities(
+                        thinking_options=frozenset({"on"}),
+                        features=frozenset(),
+                    ),
+                    "kimi-code/k3": ModelCapabilities(
+                        thinking_options=frozenset({"high", "max"}),
+                        features=frozenset(),
+                    ),
+                },
+                modes=frozenset({"yolo", "full-access"}),
+                features=frozenset(),
+            ),
+            "codex": ProviderCapabilities(
+                models={
+                    "gpt-5.6-sol": ModelCapabilities(
+                        thinking_options=frozenset({"high", "xhigh"}),
+                        features=frozenset(),
+                    ),
+                    "sol/xhigh": ModelCapabilities(
+                        thinking_options=frozenset({"xhigh"}),
+                        features=frozenset(),
+                    ),
+                },
+                modes=frozenset({"full-access", "yolo"}),
+                features=frozenset(),
+            ),
+        }
+    )
+
+
+_PASEO_PROVIDER_ALIASES = {
+    "kimi-cli": "kimi",
+}
+
+
+def _mode_slug_from_label(label: str) -> str:
+    """Derive a conservative Runtime mode slug from a Paseo mode label.
+
+    Empty labels and labels that collapse to the same slug as another distinct
+    label fail closed. All other labels are normalized to lowercase kebab-slugs.
+    """
+
+    raw = label.strip()
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    if not slug:
+        raise RuntimeAdapterError(
+            "RUNTIME_MODE_AMBIGUOUS",
+            f"Provider mode label is empty or non-alphanumeric: {label!r}",
+        )
+    return slug
+
+
+def _split_id_field(value: Any) -> set[str]:
+    """Parse a comma-separated id string or list of ids from CLI JSON."""
+
+    result: set[str] = set()
+    if isinstance(value, str):
+        for part in value.split(","):
+            part = part.strip()
+            if part:
+                result.add(part)
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                result.add(item.strip())
+    return result
+
+
+def _is_enabled(value: Any) -> bool:
+    """Accept bool True or common enabled strings from Paseo CLI JSON."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"enabled", "true", "yes"}
+    return False
+
+
+def _parse_paseo_providers(payload: Any) -> dict[str, ProviderCapabilities]:
+    """Parse ``paseo provider ls --json`` into provider-mode skeletons.
+
+    Each item has keys: ``provider``, ``status``, ``enabled``, ``defaultMode``,
+    ``modes`` (comma-separated labels). Disabled or non-ready providers are
+    omitted. ``defaultMode`` is treated as an exact mode id; ``modes`` labels
+    are conservatively slugified.
+    """
+
+    providers: dict[str, ProviderCapabilities] = {}
+    if not isinstance(payload, list):
+        return providers
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        provider_id = item.get("provider")
+        if not isinstance(provider_id, str) or not provider_id:
+            continue
+        if not _is_enabled(item.get("enabled")):
+            continue
+        status = item.get("status")
+        if isinstance(status, str) and status.strip().lower() not in {
+            "ready",
+            "available",
+        }:
+            continue
+        modes: set[str] = set()
+        default_mode = item.get("defaultMode")
+        if isinstance(default_mode, str):
+            candidate = default_mode.strip()
+            if candidate:
+                modes.add(candidate)
+        raw_modes = item.get("modes")
+        if isinstance(raw_modes, str):
+            seen: dict[str, str] = {}
+            for label in raw_modes.split(","):
+                label = label.strip()
+                if not label:
+                    continue
+                slug = _mode_slug_from_label(label)
+                if slug in seen and seen[slug] != label:
+                    raise RuntimeAdapterError(
+                        "RUNTIME_MODE_AMBIGUOUS",
+                        f"Provider mode labels collide at {slug!r}",
+                    )
+                seen[slug] = label
+                modes.add(slug)
+        providers[provider_id] = ProviderCapabilities(
+            models={},
+            modes=frozenset(modes),
+            features=frozenset(),
+        )
+    return providers
+
+
+def _parse_paseo_models(
+    provider: str,
+    payload: Any,
+) -> ProviderCapabilities:
+    """Parse ``paseo provider models <provider> --thinking --json``.
+
+    Each item has keys: ``id``, ``thinkingOptionIds``,
+    ``defaultThinkingOptionId``.
+    """
+
+    models: dict[str, ModelCapabilities] = {}
+    provider_features: set[str] = set()
+    if not isinstance(payload, list):
+        return ProviderCapabilities(
+            models=models,
+            modes=frozenset(),
+            features=frozenset(provider_features),
+        )
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        thinking = _split_id_field(item.get("thinkingOptionIds"))
+        default_thinking = item.get("defaultThinkingOptionId")
+        if isinstance(default_thinking, str) and default_thinking.strip():
+            thinking.add(default_thinking.strip())
+        features = _split_id_field(item.get("features"))
+        models[model_id] = ModelCapabilities(
+            thinking_options=frozenset(thinking),
+            features=frozenset(features),
+        )
+        provider_features.update(features)
+    return ProviderCapabilities(
+        models=models,
+        modes=frozenset(),
+        features=frozenset(provider_features),
+    )
+
+
 def resolve_active_turn_pools(
     config: dict[str, Any] | None,
     *,
@@ -154,6 +401,15 @@ REVIEW_PROFILE_SELECTORS = {
     "strict_specialist",
 }
 REVIEW_AXES = {"standards", "spec", "specialist"}
+
+WORKER_DIFFICULTIES = {"routine", "standard", "complex", "frontier"}
+WORKER_TIERS = {"light", "standard", "heavy", "frontier"}
+DIFFICULTY_TO_TIER = {
+    "routine": "light",
+    "standard": "standard",
+    "complex": "heavy",
+    "frontier": "frontier",
+}
 
 
 def _valid_review_axis(value: str) -> bool:
@@ -278,6 +534,229 @@ def resolve_review_profile(
         thinking=thinking,
         mode=mode,
         features=dict(features),
+    )
+
+
+def resolve_worker_profile(
+    config: dict[str, Any] | None,
+    *,
+    repository: str,
+    difficulty: str,
+) -> RuntimeProfile:
+    """Resolve the initial Worker Runtime Profile shape from a Plan Node Difficulty Tier.
+
+    Repository tier mappings override global mappings. This resolver performs
+    only shape validation: provider/model/thinking/mode must be non-empty
+    strings and features must be a mapping. Concrete provider/model/reasoning
+    normalization and support validation is performed by the selected
+    RuntimeAdapter via ``normalize_profile``.
+
+    Explicit ``null`` overrides fail closed; only genuinely absent keys fall
+    back (repository block absent -> global block; repository tier absent ->
+    global tier).
+    """
+
+    if config is None:
+        raise RuntimeAdapterError(
+            "RUNTIME_CONFIG_MISSING",
+            "Runtime configuration is required to resolve a Worker profile",
+        )
+    if not isinstance(config, dict):
+        raise RuntimeAdapterError(
+            "RUNTIME_CONFIG_INVALID",
+            "Runtime configuration must be an object",
+        )
+    if difficulty not in WORKER_DIFFICULTIES:
+        raise RuntimeAdapterError(
+            "WORKER_DIFFICULTY_INVALID",
+            f"unknown Plan Node Difficulty Tier: {difficulty}",
+        )
+    tier = DIFFICULTY_TO_TIER[difficulty]
+
+    if "repositories" not in config:
+        repositories: dict[str, Any] = {}
+    else:
+        repositories = config["repositories"]
+        if repositories is None:
+            raise RuntimeAdapterError(
+                "RUNTIME_CONFIG_INVALID",
+                "repositories override is explicitly null",
+            )
+        if not isinstance(repositories, dict):
+            raise RuntimeAdapterError(
+                "RUNTIME_CONFIG_INVALID",
+                "repository Runtime configuration must be an object",
+            )
+    if repository not in repositories:
+        repository_config: dict[str, Any] = {}
+    else:
+        repository_config = repositories[repository]
+        if repository_config is None:
+            raise RuntimeAdapterError(
+                "RUNTIME_CONFIG_INVALID",
+                f"repository Runtime configuration is null: {repository}",
+            )
+        if not isinstance(repository_config, dict):
+            raise RuntimeAdapterError(
+                "RUNTIME_CONFIG_INVALID",
+                f"repository Runtime configuration is invalid: {repository}",
+            )
+    if "tiers" not in repository_config:
+        repository_tiers: dict[str, Any] = {}
+    else:
+        repository_tiers = repository_config["tiers"]
+        if repository_tiers is None:
+            raise RuntimeAdapterError(
+                "RUNTIME_TIER_PROFILE_INVALID",
+                f"Worker tier mapping is null for repository: {repository}",
+            )
+        if not isinstance(repository_tiers, dict):
+            raise RuntimeAdapterError(
+                "RUNTIME_TIER_PROFILE_INVALID",
+                f"Worker tier mapping is invalid for repository: {repository}",
+            )
+    if "tiers" not in config:
+        global_tiers: dict[str, Any] = {}
+    else:
+        global_tiers = config["tiers"]
+        if global_tiers is None:
+            raise RuntimeAdapterError(
+                "RUNTIME_TIER_PROFILE_INVALID",
+                "Worker tier mappings are explicitly null",
+            )
+        if not isinstance(global_tiers, dict):
+            raise RuntimeAdapterError(
+                "RUNTIME_TIER_PROFILE_INVALID",
+                "Worker tier mappings must be objects",
+            )
+
+    if tier not in repository_tiers:
+        if tier not in global_tiers:
+            mapping = None
+        else:
+            mapping = global_tiers[tier]
+            if mapping is None:
+                raise RuntimeAdapterError(
+                    "RUNTIME_TIER_PROFILE_INVALID",
+                    f"Worker tier mapping is null: {tier}",
+                )
+    else:
+        mapping = repository_tiers[tier]
+        if mapping is None:
+            raise RuntimeAdapterError(
+                "RUNTIME_TIER_PROFILE_INVALID",
+                f"Worker tier mapping is null: {tier}",
+            )
+    if mapping is None:
+        raise RuntimeAdapterError(
+            "RUNTIME_TIER_PROFILE_MISSING",
+            f"Worker tier has no configured profile: {tier}",
+        )
+    if not isinstance(mapping, dict):
+        raise RuntimeAdapterError(
+            "RUNTIME_TIER_PROFILE_INVALID",
+            f"Worker tier mapping is invalid: {tier}",
+        )
+
+    provider = mapping.get("provider")
+    settings = mapping.get("settings")
+    if not isinstance(provider, str) or not provider.strip():
+        raise RuntimeAdapterError(
+            "RUNTIME_PROVIDER_INVALID",
+            f"Worker tier {tier} has no provider",
+        )
+    if not isinstance(settings, dict):
+        raise RuntimeAdapterError(
+            "RUNTIME_SETTINGS_INVALID",
+            f"Worker tier {tier} settings must be an object",
+        )
+
+    model = settings.get("model")
+    thinking = settings.get("thinkingOptionId")
+    mode = settings.get("modeId")
+    features = settings.get("features", {})
+    if (
+        not isinstance(model, str)
+        or not model.strip()
+        or not isinstance(thinking, str)
+        or not thinking.strip()
+        or not isinstance(mode, str)
+        or not mode.strip()
+        or not isinstance(features, dict)
+    ):
+        raise RuntimeAdapterError(
+            "RUNTIME_TIER_PROFILE_INVALID",
+            f"Worker tier {tier} profile is incomplete",
+        )
+
+    return RuntimeProfile(
+        name=tier,
+        provider=provider.strip(),
+        model=model.strip(),
+        thinking=thinking.strip(),
+        mode=mode.strip(),
+        features=dict(features),
+    )
+
+
+def _normalize_runtime_profile(
+    profile: RuntimeProfile,
+    capabilities: RuntimeCapabilities,
+    *,
+    provider_aliases: dict[str, str] | None = None,
+) -> RuntimeProfile:
+    """Validate and normalize a RuntimeProfile against a capability snapshot.
+
+    Unknown provider/model/reasoning/mode/feature combinations fail closed.
+    Optional ``provider_aliases`` resolve config-facing names (e.g.
+    ``kimi-cli``) to canonical Paseo ids for capability lookup while keeping
+    the original provider name on the returned profile.
+    """
+
+    provider_key = profile.provider.lower()
+    if provider_aliases:
+        provider_key = provider_aliases.get(provider_key, provider_key)
+    provider_caps = capabilities.providers.get(provider_key)
+    if provider_caps is None:
+        raise RuntimeAdapterError(
+            "RUNTIME_PROVIDER_UNSUPPORTED",
+            f"Runtime provider is not supported: {profile.provider}",
+        )
+
+    model_caps = provider_caps.models.get(profile.model)
+    if model_caps is None:
+        raise RuntimeAdapterError(
+            "RUNTIME_MODEL_UNSUPPORTED",
+            f"Runtime model is not supported: {profile.model}",
+        )
+
+    thinking = profile.thinking.strip()
+    if thinking not in model_caps.thinking_options:
+        raise RuntimeAdapterError(
+            "RUNTIME_THINKING_INVALID",
+            f"Runtime thinking is not supported for {profile.model}: {profile.thinking}",
+        )
+
+    mode = profile.mode.strip()
+    if mode not in provider_caps.modes:
+        raise RuntimeAdapterError(
+            "RUNTIME_MODE_UNSUPPORTED",
+            f"Runtime mode is not supported: {profile.mode}",
+        )
+
+    requested_features = set(profile.features.keys())
+    allowed_features = provider_caps.features | model_caps.features
+    if not requested_features.issubset(allowed_features):
+        raise RuntimeAdapterError(
+            "RUNTIME_FEATURES_UNSUPPORTED",
+            f"Runtime features are not supported: {requested_features - allowed_features}",
+        )
+
+    return replace(
+        profile,
+        provider=profile.provider,
+        thinking=thinking,
+        mode=mode,
     )
 
 
@@ -703,6 +1182,8 @@ class RuntimeAdapter(Protocol):
 
     adapter_name: str
 
+    def normalize_profile(self, profile: RuntimeProfile) -> RuntimeProfile: ...
+
     def materialize(
         self,
         admission: RuntimeAdmission,
@@ -917,6 +1398,8 @@ class PaseoClient(Protocol):
 
     native_finish_notification_supported: bool
 
+    def capabilities(self, provider: str) -> ProviderCapabilities: ...
+
     def find_by_labels(
         self, labels: dict[str, str]
     ) -> tuple[PaseoAgentRecord, ...]: ...
@@ -969,6 +1452,7 @@ class InMemoryPaseoClient:
         send_acceptances: tuple[bool, ...] = (),
         worker_turn_capacity: int | None = None,
         native_finish_notification_supported: bool = True,
+        capabilities: RuntimeCapabilities | None = None,
     ):
         self._agents: dict[str, PaseoAgentRecord] = {}
         self._create_failures = list(create_failures)
@@ -978,11 +1462,38 @@ class InMemoryPaseoClient:
         self.native_finish_notification_supported = (
             native_finish_notification_supported
         )
+        self._capabilities = (
+            capabilities
+            if capabilities is not None
+            else _default_paseo_capabilities()
+        )
         self._create_receipts: set[tuple[str, str]] = set()
         self._create_receipt_lock = threading.Lock()
         self.create_count = 0
         self.send_count = 0
         self.create_prompt_digests: list[str] = []
+
+    def capabilities(self, provider: str) -> ProviderCapabilities:
+        """Return fresh capabilities for one canonical Paseo provider.
+
+        Supports the ``kimi-cli`` -> ``kimi`` alias for config portability.
+        """
+
+        if not isinstance(provider, str) or not provider:
+            raise RuntimeAdapterError(
+                "RUNTIME_PROVIDER_INVALID",
+                "Capability read requires a provider identifier",
+            )
+        canonical = provider.lower()
+        if canonical not in self._capabilities.providers:
+            canonical = _PASEO_PROVIDER_ALIASES.get(canonical, canonical)
+        try:
+            return self._capabilities.providers[canonical]
+        except KeyError as error:
+            raise RuntimeAdapterError(
+                "RUNTIME_PROVIDER_UNSUPPORTED",
+                f"Runtime provider is not supported: {provider}",
+            ) from error
 
     def observed_worker_turn_capacity(
         self,
@@ -1754,6 +2265,37 @@ class PaseoCliClient:
     def archive(self, agent_id: str) -> None:
         self._run(["archive", agent_id, "--json"])
 
+    def capabilities(self, provider: str) -> ProviderCapabilities:
+        """Fresh capability readback for one canonical Paseo provider."""
+
+        if not isinstance(provider, str) or not provider:
+            raise RuntimeAdapterError(
+                "RUNTIME_PROVIDER_INVALID",
+                "Capability read requires a provider identifier",
+            )
+        canonical = provider.lower()
+        providers_payload = self._run(
+            ["provider", "ls", "--json"],
+            failure_class="transient",
+        )
+        providers = _parse_paseo_providers(providers_payload)
+        provider_caps = providers.get(canonical)
+        if provider_caps is None:
+            raise RuntimeAdapterError(
+                "RUNTIME_PROVIDER_UNSUPPORTED",
+                f"Runtime provider is not supported by this host: {provider}",
+            )
+        models_payload = self._run(
+            ["provider", "models", canonical, "--thinking", "--json"],
+            failure_class="transient",
+        )
+        model_caps = _parse_paseo_models(canonical, models_payload)
+        return ProviderCapabilities(
+            models=model_caps.models,
+            modes=provider_caps.modes,
+            features=model_caps.features,
+        )
+
 class PaseoRuntimeAdapter:
     """Paseo resident-Agent lifecycle with Admission-rooted adoption."""
 
@@ -1768,6 +2310,59 @@ class PaseoRuntimeAdapter:
             tuple[str, RuntimeObservation],
         ] = {}
         self._deferred_repository_checks: set[str] = set()
+
+    def normalize_profile(self, profile: RuntimeProfile) -> RuntimeProfile:
+        """Validate and normalize provider/model/reasoning/mode for Paseo.
+
+        Fresh capability readback for the canonical Paseo provider is
+        authoritative. A narrow Paseo-specific exception ensures the exact K2.7
+        ``on`` reasoning value is accepted even if the host snapshot does not
+        enumerate it; generic normalization does not accept synonyms.
+        """
+
+        paseo_provider = _PASEO_PROVIDER_ALIASES.get(
+            profile.provider.lower(),
+            profile.provider.lower(),
+        )
+        provider_caps = self.client.capabilities(paseo_provider)
+        if profile.model == "kimi-code/kimi-for-coding":
+            # Exact K2.7 exception: only config provider "kimi-cli" + thinking "on"
+            # is accepted. No high/max/yes/true/enabled synonyms, no canonical "kimi"
+            # provider, and no case-insensitive matching.
+            if profile.provider != "kimi-cli":
+                raise RuntimeAdapterError(
+                    "RUNTIME_PROVIDER_UNSUPPORTED",
+                    f"Runtime provider is not supported: {profile.provider}",
+                )
+            if profile.thinking != "on":
+                raise RuntimeAdapterError(
+                    "RUNTIME_THINKING_INVALID",
+                    f"Runtime thinking is not supported for {profile.model}: {profile.thinking}",
+                )
+            model_caps = provider_caps.models.get(profile.model)
+            if model_caps is None:
+                # Let generic validation fail closed for an unknown model.
+                return _normalize_runtime_profile(
+                    profile,
+                    RuntimeCapabilities(providers={paseo_provider: provider_caps}),
+                    provider_aliases=_PASEO_PROVIDER_ALIASES,
+                )
+            provider_caps = ProviderCapabilities(
+                models={
+                    **provider_caps.models,
+                    profile.model: ModelCapabilities(
+                        thinking_options=frozenset({"on"}),
+                        features=model_caps.features,
+                    ),
+                },
+                modes=provider_caps.modes,
+                features=provider_caps.features,
+            )
+        return _normalize_runtime_profile(
+            profile,
+            RuntimeCapabilities(providers={paseo_provider: provider_caps}),
+            provider_aliases=_PASEO_PROVIDER_ALIASES,
+        )
 
     def observed_worker_turn_capacity(
         self,
@@ -3467,10 +4062,23 @@ class InMemoryRuntimeAdapter:
 
     adapter_name = "in-memory"
 
-    def __init__(self, workspace_root: Path):
+    def __init__(
+        self,
+        workspace_root: Path,
+        capabilities: RuntimeCapabilities | None = None,
+    ):
         self.workspace_root = Path(workspace_root)
         self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self._capabilities = (
+            capabilities
+            if capabilities is not None
+            else _default_runtime_capabilities()
+        )
         self._states: dict[str, _RuntimeState] = {}
+
+    def normalize_profile(self, profile: RuntimeProfile) -> RuntimeProfile:
+        """Validate and normalize provider/model/reasoning/mode for the fake."""
+        return _normalize_runtime_profile(profile, self._capabilities)
 
     def materialize(
         self,

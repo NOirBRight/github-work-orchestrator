@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,7 +14,19 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
-from gwo_v8 import RuntimePrompt  # noqa: E402
+SCRIPTS = ROOT / "skills" / "orchestrator" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+from gwo_v8 import (  # noqa: E402
+    EvidenceVerifier,
+    InMemoryDeliveryControl,
+    InMemoryRuntimeAdapter,
+    Kernel,
+    LocalPlanPublication,
+    PlanCompiler,
+    RuntimePrompt,
+)
+import orch_core  # noqa: E402
 
 
 def test_smoke_plan_compiles_exact_hosted_boundary_contract():
@@ -167,3 +181,61 @@ def test_full_plan_compiles_three_dual_axis_candidates_for_one_batch_boundary():
         check["suite"]
         for check in prompt.contract_node["output_contract"]["checks"]
     } == {"affected", "repository", "hosted"}
+
+
+def _canary_runtime_config() -> dict:
+    config = orch_core.default_config()
+    config["active_turn_pools"] = {"workers": 1, "coordinators": 1}
+    config["repositories"] = {}
+    return config
+
+
+def test_canary_kernel_does_not_inject_runtime_profile(tmp_path):
+    """The real canary Kernel constructor path must not mix injection."""
+
+    store_path = tmp_path / "store.sqlite3"
+    publication = LocalPlanPublication(store_path)
+
+    kernel = MODULE._build_canary_kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=InMemoryRuntimeAdapter(tmp_path / "runtime"),
+        repository_path=tmp_path,
+        writer_generation="canary-test",
+        runtime_config=_canary_runtime_config(),
+        delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
+    )
+
+    assert kernel.runtime_profile is None
+    assert kernel.frontier_runtime_profile is None
+    assert kernel.runtime_config is not None
+
+
+def test_canary_kernel_maps_complex_difficulty_not_hardcoded_standard(tmp_path):
+    """complex Plan Node Difficulty Tier selects the heavy tier, not a hardcoded standard."""
+
+    store_path = tmp_path / "store.sqlite3"
+    publication = LocalPlanPublication(store_path)
+
+    kernel = MODULE._build_canary_kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=InMemoryRuntimeAdapter(tmp_path / "runtime"),
+        repository_path=tmp_path,
+        writer_generation="canary-test",
+        runtime_config=_canary_runtime_config(),
+        delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
+    )
+
+    standard = kernel._resolve_worker_profile(
+        repository="owner/repo",
+        difficulty="standard",
+    )
+    complex_profile = kernel._resolve_worker_profile(
+        repository="owner/repo",
+        difficulty="complex",
+    )
+
+    assert standard.model == "kimi-code/kimi-for-coding"
+    assert complex_profile.model == "kimi-code/k3"
+    assert complex_profile.model != standard.model

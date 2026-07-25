@@ -542,6 +542,44 @@ def _kernel(store: Path, durable, tmp_path: Path) -> Kernel:
         writer_generation="v8-canary",
         runtime_config={
             "active_turn_pools": {"workers": 8, "coordinators": 1},
+            "tiers": {
+                "light": {
+                    "provider": "kimi-cli",
+                    "settings": {
+                        "model": "kimi-code/kimi-for-coding",
+                        "thinkingOptionId": "on",
+                        "modeId": "yolo",
+                        "features": {},
+                    },
+                },
+                "standard": {
+                    "provider": "kimi-cli",
+                    "settings": {
+                        "model": "kimi-code/kimi-for-coding",
+                        "thinkingOptionId": "on",
+                        "modeId": "yolo",
+                        "features": {},
+                    },
+                },
+                "heavy": {
+                    "provider": "kimi-cli",
+                    "settings": {
+                        "model": "kimi-code/k3",
+                        "thinkingOptionId": "high",
+                        "modeId": "yolo",
+                        "features": {},
+                    },
+                },
+                "frontier": {
+                    "provider": "codex",
+                    "settings": {
+                        "model": "sol/xhigh",
+                        "thinkingOptionId": "xhigh",
+                        "modeId": "full-access",
+                        "features": {},
+                    },
+                },
+            },
             "repositories": {},
         },
     )

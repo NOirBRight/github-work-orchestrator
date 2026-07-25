@@ -24,6 +24,7 @@ from gwo_v8 import (  # noqa: E402
     PlanCompiler,
     ResultClaim,
     RuntimeAdmission,
+    RuntimeProfile,
     RuntimePrompt,
 )
 
@@ -93,6 +94,22 @@ def _plan_intent(*, skill_reference: str | None = None) -> dict:
             }
         ],
         "edges": [],
+    }
+
+
+def _runtime_config() -> dict:
+    return {
+        "tiers": {
+            "light": {
+                "provider": "kimi-cli",
+                "settings": {
+                    "model": "kimi-code/kimi-for-coding",
+                    "thinkingOptionId": "on",
+                    "modeId": "yolo",
+                    "features": {},
+                },
+            },
+        },
     }
 
 
@@ -407,6 +424,7 @@ def test_reconcile_once_completes_the_single_node_walking_skeleton(tmp_path):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-1",
+        runtime_config=_runtime_config(),
     )
 
     outcome = kernel.reconcile_once("local/walking-skeleton")
