@@ -27,10 +27,8 @@ from .integration_batch import (
     IntegrationBatchError,
     IntegrationBatchMember,
 )
+from .review_convergence import ReviewConvergence, ReviewConvergenceError
 from .runtime import (
-    ReviewAxisBinding,
-    ReviewAxisObservation,
-    ReviewAxisRequest,
     RuntimeAdapter,
     RuntimeAdapterError,
     RuntimeAdmission,
@@ -43,14 +41,11 @@ from .runtime import (
     _input_projection_digest,
     _run,
     resolve_active_turn_pools,
-    resolve_review_profile,
 )
 
 REPAIR_PACKET_MAX_BYTES = 64 * 1024
 REPAIR_CHANGED_FILES_MAX_BYTES = 4 * 1024
 REPAIR_CHANGED_FILE_MAX_CHARACTERS = 256
-REVIEW_AXIS_MATERIALIZATION_EXECUTIONS = 3
-REVIEW_AXIS_OBSERVATION_READBACKS = 3
 
 
 class KernelError(RuntimeError):
@@ -1207,8 +1202,26 @@ class Kernel:
         self.delivery_control = delivery_control
         self.parent_agent_id = parent_agent_id
         self.skill_catalog = skill_catalog
+        self._review_convergence = ReviewConvergence(
+            runtime=runtime,
+            verifier=verifier,
+            runtime_config=runtime_config,
+            assert_writer=self._assert_state_writer,
+            persist_state=self._persist_state_snapshot,
+        )
         with self._connect() as connection:
             self.ensure_store_schema(connection)
+
+    def _assert_state_writer(self, state: dict[str, Any]) -> None:
+        self.publication.assert_writer(
+            repository=state["repository"],
+            writer_generation=self.writer_generation,
+            plan_digest=state["plan_digest"],
+            activation_id=state["activation_id"],
+        )
+
+    def _persist_state_snapshot(self, state: dict[str, Any]) -> None:
+        self._write_state(state["repository"], state["plan_digest"], state)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.store_path)
@@ -2816,7 +2829,7 @@ class Kernel:
             work_node,
             skill_catalog=self.skill_catalog,
         )
-        return {
+        state = {
             "status": "running",
             "directive": "run_again",
             "repository": repository,
@@ -2837,14 +2850,6 @@ class Kernel:
             "repair_rounds_used": 0,
             "attempt_terminal_reason": None,
             "candidate_sha": None,
-            "review_candidate_sha": None,
-            "review_bindings": {},
-            "review_observations": {},
-            "review_materialization_actions": {},
-            "review_axis_errors": {},
-            "review_materialization_waiting_actions": [],
-            "review_children_retired": False,
-            "review_evidence": None,
             "result_digest": None,
             "publication_eligible": None,
             "publication_state": None,
@@ -2879,6 +2884,8 @@ class Kernel:
             },
             "resume_sent": False,
         }
+        state.update(ReviewConvergence.initial_fields())
+        return state
 
     def _adopt_verified_result(
         self,
@@ -3993,7 +4000,7 @@ class Kernel:
         spec_text = canonical_bytes(
             {
                 "goal_acceptance": goal.get("acceptance") or [],
-                "outcome_contract": Kernel._compact_review_contract(
+                "outcome_contract": ReviewConvergence.compact_review_contract(
                     work_item.get("outcome_contract") or {}
                 ),
             }
@@ -4162,23 +4169,7 @@ class Kernel:
             attempt_ordinal=attempt_ordinal,
             repair_rounds_used=repair_rounds_used,
         )
-        prior_findings: list[dict[str, str]] = []
-        for captured in (state.get("review_observations") or {}).values():
-            if not isinstance(captured, dict):
-                continue
-            for finding in captured.get("findings") or ():
-                if isinstance(finding, dict):
-                    prior_findings.append(
-                        {
-                            str(key): str(value)[:1000]
-                            for key, value in finding.items()
-                            if isinstance(key, str)
-                        }
-                    )
-        prior_review_context = {
-            "candidate_sha": state.get("candidate_sha"),
-            "findings": prior_findings[:32],
-        }
+        prior_review_context = self._review_convergence.prior_context(state)
 
         def recovery_packet() -> str:
             candidate_sha = state.get("candidate_sha")
@@ -4222,7 +4213,7 @@ class Kernel:
                 isinstance(existing_repair, dict)
                 and existing_repair.get("action_key") == repair_action_key
             ):
-                self._invalidate_review_candidate(state)
+                self._review_convergence.invalidate_candidate(state)
                 state.update(
                     {
                         "status": "waiting",
@@ -4276,7 +4267,7 @@ class Kernel:
                 self.runtime.repair(binding, prompt)
             except RuntimeAdapterError as error:
                 repair_record["delivery_state"] = "ambiguous"
-                self._invalidate_review_candidate(state)
+                self._review_convergence.invalidate_candidate(state)
                 state.update(
                     {
                         "directive": "wait_for_runtime",
@@ -4295,7 +4286,7 @@ class Kernel:
                 )
                 return self._outcome(state)
             repair_record["delivery_state"] = "accepted"
-            self._invalidate_review_candidate(state)
+            self._review_convergence.invalidate_candidate(state)
             state.update(
                 {
                     "status": "waiting",
@@ -4310,11 +4301,6 @@ class Kernel:
                     "publication_ref": None,
                     "hosted_check_state": None,
                     "hosted_retry_count": 0,
-                    "review_candidate_sha": None,
-                    "review_bindings": {},
-                    "review_observations": {},
-                    "review_children_retired": False,
-                    "review_evidence": None,
                     "candidate_observation": None,
                     "prior_review_context": prior_review_context,
                     "repair_prompt": repair_record,
@@ -4362,7 +4348,7 @@ class Kernel:
                 same_attempt=False,
             )
             next_ordinal = attempt_ordinal + 1
-            self._invalidate_review_candidate(state)
+            self._review_convergence.invalidate_candidate(state)
             state.update(
                 {
                     "status": "running",
@@ -4384,11 +4370,6 @@ class Kernel:
                     "publication_ref": None,
                     "hosted_check_state": None,
                     "hosted_retry_count": 0,
-                    "review_candidate_sha": None,
-                    "review_bindings": {},
-                    "review_observations": {},
-                    "review_children_retired": False,
-                    "review_evidence": None,
                     "candidate_observation": None,
                     "prior_review_context": prior_review_context,
                     "worker_parked_for_ci": False,
@@ -4465,25 +4446,6 @@ class Kernel:
         return self._outcome(state)
 
     @staticmethod
-    def _review_binding_from_state(value: dict[str, Any]) -> ReviewAxisBinding:
-        return ReviewAxisBinding(**value)
-
-    @staticmethod
-    def _invalidate_review_candidate(state: dict[str, Any]) -> None:
-        state.update(
-            {
-                "review_candidate_sha": None,
-                "review_bindings": {},
-                "review_observations": {},
-                "review_materialization_actions": {},
-                "review_axis_errors": {},
-                "review_materialization_waiting_actions": [],
-                "review_children_retired": False,
-                "review_evidence": None,
-            }
-        )
-
-    @staticmethod
     def _persisted_runtime_observation(
         state: dict[str, Any],
         binding,
@@ -4546,228 +4508,6 @@ class Kernel:
             "evidence": [asdict(item) for item in observation.evidence],
         }
 
-    @staticmethod
-    def _review_observation_from_state(
-        value: dict[str, Any],
-    ) -> ReviewAxisObservation:
-        body = dict(value)
-        body["findings"] = tuple(
-            dict(finding) for finding in body.get("findings") or ()
-        )
-        return ReviewAxisObservation(**body)
-
-    @staticmethod
-    def _compact_review_contract(value: Any) -> Any:
-        """Replace authoritative file payloads with exact workspace references."""
-
-        if isinstance(value, list):
-            return [
-                Kernel._compact_review_contract(item)
-                for item in value
-            ]
-        if not isinstance(value, dict):
-            return value
-        path = value.get("path")
-        content = value.get("content")
-        compacted = {
-            str(key): Kernel._compact_review_contract(item)
-            for key, item in value.items()
-            if key != "content"
-        }
-        if isinstance(path, str) and path and isinstance(content, str):
-            encoded = content.encode("utf-8")
-            compacted["content_digest"] = digest_bytes(encoded)
-            compacted["content_bytes"] = len(encoded)
-        elif "content" in value:
-            compacted["content"] = Kernel._compact_review_contract(content)
-        return compacted
-
-    @staticmethod
-    def _review_request(
-        *,
-        state: dict[str, Any],
-        goal: dict[str, Any],
-        work_item: dict[str, Any],
-        binding,
-        observation,
-        axis: str,
-        recovery_ordinal: int,
-    ) -> ReviewAxisRequest:
-        assert observation.result_claim is not None
-        check_manifest_digest = state.get("review_check_manifest_digest")
-        if not isinstance(check_manifest_digest, str):
-            check_manifest_digest = digest_value(
-                sorted(
-                    evidence.content_digest
-                    for evidence in observation.evidence
-                    if isinstance(evidence, TypedEvidence)
-                    and evidence.kind == "check"
-                    and evidence.has_valid_digest()
-                )
-            )
-        workspace = Path(binding.workspace).resolve()
-        commit_output = _git(
-            workspace,
-            "log",
-            "--format=%H %s",
-            f"{state['base_sha']}..{observation.result_claim.candidate_sha}",
-        )
-        spec_text = canonical_bytes(
-            {
-                "goal_acceptance": goal.get("acceptance") or [],
-                "outcome_contract": Kernel._compact_review_contract(
-                    work_item.get("outcome_contract") or {}
-                ),
-            }
-        ).decode("utf-8")
-        prior_context = state.get("prior_review_context") or {}
-        prior_candidate = prior_context.get("candidate_sha")
-        candidate_delta = None
-        if (
-            isinstance(prior_candidate, str)
-            and prior_candidate
-            and prior_candidate != observation.result_claim.candidate_sha
-        ):
-            candidate_delta = _git(
-                workspace,
-                "diff",
-                "--stat",
-                prior_candidate,
-                observation.result_claim.candidate_sha,
-            )[:4000]
-        return ReviewAxisRequest(
-            repository=state["repository"],
-            attempt_id=observation.result_claim.attempt_id,
-            candidate_sha=observation.result_claim.candidate_sha,
-            base_sha=state["base_sha"],
-            axis=axis,
-            recovery_ordinal=recovery_ordinal,
-            workspace=workspace,
-            diff_command=(
-                "git",
-                "diff",
-                f"{state['base_sha']}...{observation.result_claim.candidate_sha}",
-            ),
-            commit_list=tuple(commit_output.splitlines()),
-            spec_source_ref=str(work_item.get("source_ref") or ""),
-            spec_text=spec_text,
-            standards_sources=("AGENTS.md", "CONTEXT.md"),
-            check_manifest_digest=check_manifest_digest,
-            prior_findings=tuple(
-                dict(finding)
-                for finding in prior_context.get("findings") or ()
-                if isinstance(finding, dict)
-            ),
-            candidate_delta=candidate_delta,
-        )
-
-    def _review_wait(
-        self,
-        state: dict[str, Any],
-        *,
-        candidate_sha: str,
-    ) -> ReconcileOutcome:
-        state.update(
-            {
-                "status": "waiting",
-                "directive": "wait_for_review",
-                "attempt_state": "reviewing",
-                "wait_condition": "review_axis",
-                "wait_source_ref": (
-                    f"{self.runtime.adapter_name}://review/{candidate_sha}"
-                ),
-                "wait_event_identity": f"review:{candidate_sha}",
-                "review_materialization_waiting_actions": [],
-                "next_check_at": (
-                    datetime.now(timezone.utc) + timedelta(seconds=30)
-                ).isoformat(),
-            }
-        )
-        self._write_state(state["repository"], state["plan_digest"], state)
-        return self._outcome(state)
-
-    def _review_prompt_wait(
-        self,
-        state: dict[str, Any],
-        *,
-        request: ReviewAxisRequest,
-        error: RuntimeAdapterError,
-    ) -> ReconcileOutcome:
-        state.update(
-            {
-                "status": "waiting",
-                "directive": "wait_for_runtime_readback",
-                "attempt_state": "reviewing",
-                "wait_condition": "review_prompt_readback",
-                "wait_source_ref": (
-                    f"{self.runtime.adapter_name}://review/"
-                    f"{request.candidate_sha}/action/{request.action_key}"
-                ),
-                "wait_event_identity": f"{request.action_key}:prompt_readback",
-                "review_materialization_waiting_actions": [],
-                "next_check_at": (
-                    datetime.now(timezone.utc) + timedelta(seconds=30)
-                ).isoformat(),
-                "last_runtime_error": _runtime_error_record(error),
-            }
-        )
-        self._write_state(state["repository"], state["plan_digest"], state)
-        return self._outcome(state)
-
-    def _review_materialization_wait(
-        self,
-        state: dict[str, Any],
-        *,
-        requests: tuple[ReviewAxisRequest, ...],
-    ) -> ReconcileOutcome:
-        if not requests:
-            raise KernelError(
-                "REVIEW_AXIS_WAIT_INVALID",
-                "Review materialization wait requires at least one action",
-            )
-        candidate_sha = requests[0].candidate_sha
-        waiting_actions = [
-            {
-                "axis": request.axis,
-                "recovery_ordinal": request.recovery_ordinal,
-                "action_key": request.action_key,
-            }
-            for request in requests
-        ]
-        first_request = requests[0]
-        first_action = (
-            state.get("review_materialization_actions") or {}
-        ).get(f"{first_request.axis}:{first_request.recovery_ordinal}")
-        last_error = (
-            first_action.get("last_error")
-            if isinstance(first_action, dict)
-            else None
-        )
-        state.update(
-            {
-                "status": "waiting",
-                "directive": "wait_for_runtime_readback",
-                "attempt_state": "reviewing",
-                "wait_condition": "runtime_available",
-                "wait_source_ref": (
-                    f"{self.runtime.adapter_name}://review/"
-                    f"{candidate_sha}/materialization"
-                ),
-                "wait_event_identity": "review_axis_materialization",
-                "review_materialization_waiting_actions": waiting_actions,
-                **(
-                    {"last_runtime_error": last_error}
-                    if isinstance(last_error, dict)
-                    else {}
-                ),
-                "next_check_at": (
-                    datetime.now(timezone.utc) + timedelta(seconds=30)
-                ).isoformat(),
-            }
-        )
-        self._write_state(state["repository"], state["plan_digest"], state)
-        return self._outcome(state)
-
     def _verify_pre_review_checks(
         self,
         work_node: dict[str, Any],
@@ -4802,692 +4542,6 @@ class Kernel:
             contract,
             observation,
         )
-
-    def _ensure_review_evidence(
-        self,
-        state: dict[str, Any],
-        work_node: dict[str, Any],
-        goal: dict[str, Any],
-        work_item: dict[str, Any],
-        binding,
-        observation,
-    ):
-        requirement = (work_node.get("output_contract") or {}).get(
-            "review_requirement"
-        ) or {
-            "mode": "none",
-            "axes": [],
-            "specialist_requirements": [],
-            "human_decision_required": False,
-        }
-        if requirement.get("mode") == "none":
-            return observation, None
-        if observation.result_claim is None:
-            raise KernelError(
-                "REVIEW_CANDIDATE_MISSING",
-                "Review cannot begin before one Result Claim",
-            )
-        if self.runtime_config is None:
-            raise KernelError(
-                "REVIEW_RUNTIME_CONFIG_MISSING",
-                "reviewed work requires host-local Review Profiles",
-            )
-        materialize = getattr(self.runtime, "materialize_review_axis", None)
-        observe_axis = getattr(self.runtime, "observe_review_axis", None)
-        if not callable(materialize) or not callable(observe_axis):
-            raise KernelError(
-                "REVIEW_RUNTIME_UNSUPPORTED",
-                "Runtime Adapter does not support Review Internal Subagents",
-            )
-        candidate_sha = observation.result_claim.candidate_sha
-        if state.get("review_candidate_sha") != candidate_sha:
-            self._invalidate_review_candidate(state)
-            state.pop("last_runtime_error", None)
-        state["review_candidate_sha"] = candidate_sha
-        bindings = state.setdefault("review_bindings", {})
-        observations = state.setdefault("review_observations", {})
-        materialization_actions = state.setdefault(
-            "review_materialization_actions",
-            {},
-        )
-
-        def collect_axes(
-            axis_ordinals: tuple[tuple[str, int], ...],
-        ) -> dict[
-            str,
-            tuple[
-                ReviewAxisRequest,
-                ReviewAxisObservation | None,
-                RuntimeAdapterError | None,
-            ],
-        ]:
-            results: dict[
-                str,
-                tuple[
-                    ReviewAxisRequest,
-                    ReviewAxisObservation | None,
-                    RuntimeAdapterError | None,
-                ],
-            ] = {}
-            jobs: list[
-                tuple[
-                    str,
-                    str,
-                    ReviewAxisRequest,
-                    RuntimeProfile,
-                    ReviewAxisBinding | None,
-                    int | None,
-                ]
-            ] = []
-            materialization_reserved = False
-            for axis, recovery_ordinal in axis_ordinals:
-                key = f"{axis}:{recovery_ordinal}"
-                request = self._review_request(
-                    state=state,
-                    goal=goal,
-                    work_item=work_item,
-                    binding=binding,
-                    observation=observation,
-                    axis=axis,
-                    recovery_ordinal=recovery_ordinal,
-                )
-                saved_observation = observations.get(key)
-                if isinstance(saved_observation, dict):
-                    captured = self._review_observation_from_state(
-                        saved_observation
-                    )
-                    if captured.lifecycle == "completed":
-                        results[axis] = (request, captured, None)
-                        continue
-                selector = (
-                    "recovery_axis"
-                    if recovery_ordinal > 0
-                    else (
-                        "strict_specialist"
-                        if axis.startswith("specialist:")
-                        else "standard_axis"
-                    )
-                )
-                try:
-                    profile = resolve_review_profile(
-                        self.runtime_config,
-                        repository=state["repository"],
-                        selector=selector,
-                    )
-                except RuntimeAdapterError as error:
-                    results[axis] = (request, None, error)
-                    continue
-                saved_binding = bindings.get(key)
-                if isinstance(saved_binding, dict):
-                    child_binding = self._review_binding_from_state(
-                        saved_binding
-                    )
-                    jobs.append(
-                        (
-                            axis,
-                            key,
-                            request,
-                            profile,
-                            child_binding,
-                            None,
-                        )
-                    )
-                    continue
-                action = materialization_actions.setdefault(
-                    key,
-                    {
-                        "action_key": request.action_key,
-                        "executions": 0,
-                        "state": "pending",
-                    },
-                )
-                if action.get("action_key") != request.action_key:
-                    raise KernelError(
-                        "REVIEW_AXIS_ACTION_IDENTITY_MISMATCH",
-                        "persisted Review materialization action changed identity",
-                    )
-                executions = action.get("executions")
-                if (
-                    not isinstance(executions, int)
-                    or isinstance(executions, bool)
-                    or executions < 0
-                ):
-                    raise KernelError(
-                        "REVIEW_AXIS_ACTION_STATE_INVALID",
-                        "persisted Review materialization budget is invalid",
-                    )
-                if executions >= REVIEW_AXIS_MATERIALIZATION_EXECUTIONS:
-                    results[axis] = (
-                        request,
-                        None,
-                        RuntimeAdapterError(
-                            "REVIEW_AXIS_MATERIALIZATION_RETRIES_EXHAUSTED",
-                            (
-                                "review child materialization exhausted three "
-                                "reconcile-cycle executions"
-                            ),
-                            failure_class="permanent",
-                        ),
-                    )
-                    continue
-                action.update(
-                    {
-                        "executions": executions + 1,
-                        "state": "executing",
-                    }
-                )
-                materialization_reserved = True
-                jobs.append(
-                    (
-                        axis,
-                        key,
-                        request,
-                        profile,
-                        None,
-                        executions,
-                    )
-                )
-            if materialization_reserved:
-                self.publication.assert_writer(
-                    repository=state["repository"],
-                    writer_generation=self.writer_generation,
-                    plan_digest=state["plan_digest"],
-                    activation_id=state["activation_id"],
-                )
-                self._write_state(
-                    state["repository"],
-                    state["plan_digest"],
-                    state,
-                )
-
-            def execute_axis(job):
-                (
-                    axis,
-                    key,
-                    request,
-                    profile,
-                    child_binding,
-                    executions,
-                ) = job
-                materialization_error = None
-                if child_binding is None:
-                    try:
-                        child_binding = materialize(
-                            request,
-                            profile,
-                            parent_agent_id=binding.agent_id,
-                        )
-                    except RuntimeAdapterError as error:
-                        materialization_error = error
-                if materialization_error is not None:
-                    return (
-                        axis,
-                        key,
-                        request,
-                        None,
-                        None,
-                        materialization_error,
-                        executions,
-                    )
-                try:
-                    captured = observe_axis(request, child_binding)
-                except RuntimeAdapterError as error:
-                    return (
-                        axis,
-                        key,
-                        request,
-                        child_binding,
-                        None,
-                        error,
-                        executions,
-                    )
-                return (
-                    axis,
-                    key,
-                    request,
-                    child_binding,
-                    captured,
-                    None,
-                    executions,
-                )
-
-            executed = []
-            if jobs:
-                with ThreadPoolExecutor(
-                    max_workers=len(jobs),
-                    thread_name_prefix="gwo-review-axis",
-                ) as executor:
-                    futures = tuple(executor.submit(execute_axis, job) for job in jobs)
-                    executed = [future.result() for future in futures]
-
-            for (
-                axis,
-                key,
-                request,
-                child_binding,
-                captured,
-                error,
-                executions,
-            ) in executed:
-                materialized_here = executions is not None
-                if child_binding is not None and materialized_here:
-                    action = materialization_actions[key]
-                    action.update(
-                        {
-                            "state": "materialized",
-                            "last_error": None,
-                        }
-                    )
-                    state.setdefault("review_axis_errors", {}).pop(key, None)
-                    bindings[key] = asdict(child_binding)
-                if child_binding is not None:
-                    action = materialization_actions[key]
-                    if (
-                        error is not None
-                        and error.code
-                        not in {
-                            "REVIEW_AXIS_OUTPUT_MISSING",
-                            "REVIEW_AXIS_OUTPUT_INVALID",
-                        }
-                        and error.failure_class in {"ambiguous", "transient"}
-                    ):
-                        observation_readbacks = (
-                            int(action.get("observation_readbacks", 0)) + 1
-                        )
-                        action.update(
-                            {
-                                "observation_readbacks": observation_readbacks,
-                                "last_error": _runtime_error_record(error),
-                            }
-                        )
-                        state.setdefault("review_axis_errors", {})[key] = error.code
-                        if (
-                            observation_readbacks
-                            < REVIEW_AXIS_OBSERVATION_READBACKS
-                        ):
-                            action["state"] = "observation_pending"
-                            error = RuntimeAdapterError(
-                                "REVIEW_AXIS_OBSERVATION_PENDING",
-                                (
-                                    f"{error.code}: Review child observation "
-                                    "will retry against the existing binding"
-                                ),
-                                failure_class=error.failure_class,
-                            )
-                        else:
-                            action["state"] = "blocked"
-                            error = RuntimeAdapterError(
-                                "REVIEW_AXIS_OBSERVATION_RETRIES_EXHAUSTED",
-                                (
-                                    "Review child observation exhausted three "
-                                    "readback-first reconcile cycles"
-                                ),
-                                failure_class="permanent",
-                            )
-                    elif error is None:
-                        action.pop("observation_readbacks", None)
-                        action["last_error"] = None
-                        state.setdefault("review_axis_errors", {}).pop(key, None)
-                if child_binding is None and materialized_here:
-                    assert error is not None
-                    action = materialization_actions[key]
-                    if error.code == "PROMPT_DELIVERY_AMBIGUOUS":
-                        action["executions"] = executions
-                    action.update(
-                        {
-                            "state": (
-                                "blocked"
-                                if error.failure_class == "permanent"
-                                else "retry_pending"
-                            ),
-                            "last_error": _runtime_error_record(error),
-                        }
-                    )
-                    state.setdefault("review_axis_errors", {})[key] = error.code
-                    if (
-                        error.code != "PROMPT_DELIVERY_AMBIGUOUS"
-                        and error.failure_class != "permanent"
-                        and action["executions"]
-                        < REVIEW_AXIS_MATERIALIZATION_EXECUTIONS
-                    ):
-                        error = RuntimeAdapterError(
-                            "REVIEW_AXIS_MATERIALIZATION_PENDING",
-                            (
-                                f"{error.code}: Review child materialization "
-                                "will retry by stable action readback"
-                            ),
-                            failure_class=error.failure_class,
-                        )
-                    elif (
-                        error.code != "PROMPT_DELIVERY_AMBIGUOUS"
-                        and error.failure_class != "permanent"
-                    ):
-                        action["state"] = "blocked"
-                        error = RuntimeAdapterError(
-                            "REVIEW_AXIS_MATERIALIZATION_RETRIES_EXHAUSTED",
-                            (
-                                "review child materialization exhausted three "
-                                "reconcile-cycle executions"
-                            ),
-                            failure_class="permanent",
-                        )
-                if captured is not None:
-                    observations[key] = asdict(captured)
-                results[axis] = (request, captured, error)
-            if executed:
-                ordered_errors = [
-                    results[axis][2]
-                    for axis, _ordinal in axis_ordinals
-                    if axis in results and results[axis][2] is not None
-                ]
-                if ordered_errors:
-                    state["last_runtime_error"] = _runtime_error_record(
-                        ordered_errors[0]
-                    )
-                else:
-                    state.pop("last_runtime_error", None)
-                self._write_state(
-                    state["repository"],
-                    state["plan_digest"],
-                    state,
-                )
-            return results
-
-        required_axes = (
-            *tuple(requirement.get("axes") or ()),
-            *tuple(
-                f"specialist:{item}"
-                for item in requirement.get("specialist_requirements") or ()
-            ),
-        )
-        primary: dict[str, ReviewAxisObservation] = {}
-        requests: dict[str, ReviewAxisRequest] = {}
-        running = False
-        materialization_pending: list[ReviewAxisRequest] = []
-        prompt_pending: list[tuple[ReviewAxisRequest, RuntimeAdapterError]] = []
-        try:
-            primary_outcomes = collect_axes(
-                tuple((str(axis), 0) for axis in required_axes)
-            )
-            for axis in required_axes:
-                request, captured, error = primary_outcomes[str(axis)]
-                requests[str(axis)] = request
-                if error is not None:
-                    if error.code == "PROMPT_DELIVERY_AMBIGUOUS":
-                        prompt_pending.append((request, error))
-                        continue
-                    if error.code == "REVIEW_AXIS_MATERIALIZATION_PENDING":
-                        materialization_pending.append(request)
-                        continue
-                    if error.code == "REVIEW_AXIS_OBSERVATION_PENDING":
-                        running = True
-                        continue
-                    if error.code not in {
-                        "REVIEW_AXIS_OUTPUT_MISSING",
-                        "REVIEW_AXIS_OUTPUT_INVALID",
-                    }:
-                        raise error
-                    state.setdefault("review_axis_errors", {})[str(axis)] = error.code
-                    continue
-                assert captured is not None
-                if captured.lifecycle == "completed":
-                    primary[str(axis)] = captured
-                else:
-                    running = True
-        except RuntimeAdapterError as error:
-            state.update(
-                {
-                    "status": "blocked",
-                    "directive": "request_decision",
-                    "attempt_state": "review_runtime_blocked",
-                    "wait_condition": None,
-                    "wait_source_ref": None,
-                    "wait_event_identity": None,
-                    "next_check_at": None,
-                    "last_runtime_error": _runtime_error_record(error),
-                }
-            )
-            self._write_state(
-                state["repository"],
-                state["plan_digest"],
-                state,
-            )
-            return observation, self._outcome(state)
-        if materialization_pending:
-            return observation, self._review_materialization_wait(
-                state,
-                requests=tuple(materialization_pending),
-            )
-        if prompt_pending:
-            request, error = prompt_pending[0]
-            return observation, self._review_prompt_wait(
-                state,
-                request=request,
-                error=error,
-            )
-        state["review_materialization_waiting_actions"] = []
-        if running:
-            return observation, self._review_wait(
-                state,
-                candidate_sha=candidate_sha,
-            )
-
-        first_request = requests[required_axes[0]]
-        gate = self.verifier.assemble_review_evidence(
-            observation.result_claim,
-            requirement,
-            tuple(primary[axis] for axis in required_axes if axis in primary),
-            acceptance_digest=first_request.spec_digest,
-            check_manifest_digest=first_request.check_manifest_digest,
-            observer_id=binding.runtime_id,
-        )
-        if gate.missing_axes:
-            recovered = dict(primary)
-            recovery_running = False
-            recovery_materialization_pending: list[ReviewAxisRequest] = []
-            recovery_prompt_pending: list[
-                tuple[ReviewAxisRequest, RuntimeAdapterError]
-            ] = []
-            try:
-                recovery_outcomes = collect_axes(
-                    tuple((axis, 1) for axis in gate.missing_axes)
-                )
-                for axis in gate.missing_axes:
-                    request, captured, error = recovery_outcomes[axis]
-                    requests[axis] = request
-                    if error is not None:
-                        if error.code == "PROMPT_DELIVERY_AMBIGUOUS":
-                            recovery_prompt_pending.append((request, error))
-                            continue
-                        if error.code == "REVIEW_AXIS_MATERIALIZATION_PENDING":
-                            recovery_materialization_pending.append(request)
-                            continue
-                        if error.code == "REVIEW_AXIS_OBSERVATION_PENDING":
-                            recovery_running = True
-                            continue
-                        raise error
-                    assert captured is not None
-                    if captured.lifecycle == "completed":
-                        recovered[axis] = captured
-                    else:
-                        recovery_running = True
-            except RuntimeAdapterError as error:
-                state.update(
-                    {
-                        "status": "blocked",
-                        "directive": "request_decision",
-                        "attempt_state": "review_recovery_blocked",
-                        "wait_condition": None,
-                        "last_runtime_error": _runtime_error_record(error),
-                    }
-                )
-                self._write_state(
-                    state["repository"],
-                    state["plan_digest"],
-                    state,
-                )
-                return observation, self._outcome(state)
-            if recovery_materialization_pending:
-                return observation, self._review_materialization_wait(
-                    state,
-                    requests=tuple(recovery_materialization_pending),
-                )
-            if recovery_prompt_pending:
-                request, error = recovery_prompt_pending[0]
-                return observation, self._review_prompt_wait(
-                    state,
-                    request=request,
-                    error=error,
-                )
-            state["review_materialization_waiting_actions"] = []
-            if recovery_running:
-                return observation, self._review_wait(
-                    state,
-                    candidate_sha=candidate_sha,
-                )
-            gate = self.verifier.assemble_review_evidence(
-                observation.result_claim,
-                requirement,
-                tuple(recovered[axis] for axis in required_axes if axis in recovered),
-                acceptance_digest=first_request.spec_digest,
-                check_manifest_digest=first_request.check_manifest_digest,
-                observer_id=binding.runtime_id,
-            )
-        if gate.evidence is None:
-            state.update(
-                {
-                    "status": "blocked",
-                    "directive": "request_decision",
-                    "attempt_state": "review_evidence_invalid",
-                    "wait_condition": None,
-                }
-            )
-            self._write_state(
-                state["repository"],
-                state["plan_digest"],
-                state,
-            )
-            return observation, self._outcome(state)
-        state["review_evidence"] = asdict(gate.evidence)
-        state["review_gate_status"] = gate.status
-        state["wait_condition"] = None
-        state["wait_source_ref"] = None
-        state["wait_event_identity"] = None
-        state["review_materialization_waiting_actions"] = []
-        state["next_check_at"] = None
-        self._write_state(state["repository"], state["plan_digest"], state)
-        retire_review = getattr(self.runtime, "retire_review_axis", None)
-        if callable(retire_review) and not state.get("review_children_retired"):
-            self.publication.assert_writer(
-                repository=state["repository"],
-                writer_generation=self.writer_generation,
-                plan_digest=state["plan_digest"],
-                activation_id=state["activation_id"],
-            )
-            try:
-                for saved in bindings.values():
-                    if isinstance(saved, dict):
-                        retire_review(self._review_binding_from_state(saved))
-            except RuntimeAdapterError as error:
-                state.update(
-                    {
-                        "status": "waiting",
-                        "directive": "wait_for_review_retirement",
-                        "attempt_state": "reviewing",
-                        "wait_condition": "review_retirement",
-                        "wait_source_ref": (
-                            f"{self.runtime.adapter_name}://review/"
-                            f"{candidate_sha}/retirement"
-                        ),
-                        "wait_event_identity": (f"review-retirement:{candidate_sha}"),
-                        "next_check_at": (
-                            datetime.now(timezone.utc) + timedelta(seconds=30)
-                        ).isoformat(),
-                        "last_runtime_error": _runtime_error_record(error),
-                    }
-                )
-                self._write_state(
-                    state["repository"],
-                    state["plan_digest"],
-                    state,
-                )
-                return observation, self._outcome(state)
-            state["review_children_retired"] = True
-            self._write_state(
-                state["repository"],
-                state["plan_digest"],
-                state,
-            )
-        if requirement.get("human_decision_required") is True:
-            decision = state.get("human_decision")
-            if (
-                not isinstance(decision, dict)
-                or decision.get("candidate_sha") != candidate_sha
-            ):
-                if not state.get("worker_parked_for_decision"):
-                    self.runtime.interrupt(binding)
-                    state["worker_parked_for_decision"] = True
-                state.update(
-                    {
-                        "status": "waiting",
-                        "directive": "wait_for_decision",
-                        "attempt_state": "reviewing",
-                        "wait_condition": "human_decision",
-                        "wait_source_ref": str(work_item.get("source_ref") or ""),
-                        "wait_event_identity": (f"human-decision:{candidate_sha}"),
-                        "next_check_at": None,
-                    }
-                )
-                self._write_state(
-                    state["repository"],
-                    state["plan_digest"],
-                    state,
-                )
-                return observation, self._outcome(state)
-            if decision.get("approved") is not True:
-                state.update(
-                    {
-                        "status": "blocked",
-                        "directive": "request_decision",
-                        "attempt_state": "candidate_rejected",
-                        "wait_condition": None,
-                    }
-                )
-                self._write_state(
-                    state["repository"],
-                    state["plan_digest"],
-                    state,
-                )
-                return observation, self._outcome(state)
-            decision_evidence = TypedEvidence._capture(
-                kind="decision",
-                subject=candidate_sha,
-                observer_type="human",
-                observer_id=str(decision["source_ref"]),
-                observed_at=_now(),
-                source_ref=str(decision["source_ref"]),
-                payload={
-                    "candidate_sha": candidate_sha,
-                    "approved": True,
-                    "decision_kind": "strict_review_human",
-                },
-            )
-            state["human_decision_evidence"] = asdict(decision_evidence)
-            self._write_state(
-                state["repository"],
-                state["plan_digest"],
-                state,
-            )
-        return replace(
-            observation,
-            evidence=observation.evidence
-            + (gate.evidence,)
-            + (
-                ()
-                if requirement.get("human_decision_required") is not True
-                else (decision_evidence,)
-            ),
-        ), None
 
     @staticmethod
     def _batch_hosted_definitions(
@@ -6454,20 +5508,6 @@ class Kernel:
                 "wait_source_ref": None,
                 "wait_event_identity": None,
                 "next_check_at": None,
-                "review_check_manifest_digest": digest_value(
-                    {
-                        "candidate_sha": observation.result_claim.candidate_sha,
-                        "definitions": sorted(
-                            str(check.get("definition_digest"))
-                            for check in (work_node.get("output_contract") or {}).get(
-                                "checks"
-                            )
-                            or ()
-                            if isinstance(check, dict)
-                            and check.get("hosted_only") is not True
-                        ),
-                    }
-                ),
             }
         )
         self._persist_runtime_observation(state, observation)
@@ -6499,53 +5539,41 @@ class Kernel:
                     ),
                     cause_type="local_pre_review_failure",
                 )
-            affected_ids = {
-                str(check["check_id"])
-                for check in (work_node.get("output_contract") or {}).get("checks")
-                or ()
-                if isinstance(check, dict)
-                and check.get("suite") == "affected"
-                and check.get("hosted_only") is not True
-            }
-            state["review_check_manifest_digest"] = digest_value(
-                sorted(
-                    item.content_digest
-                    for item in observation.evidence
-                    if item.kind == "check"
-                    and item.payload.get("check_id") in affected_ids
-                    and item.has_valid_digest()
-                )
+        try:
+            review_decision = self._review_convergence.converge(
+                state,
+                work_node,
+                goal,
+                work_item,
+                binding,
+                observation,
             )
-            self._write_state(repository, active.plan_digest, state)
-        observation, review_terminal = self._ensure_review_evidence(
-            state,
-            work_node,
-            goal,
-            work_item,
-            binding,
-            observation,
-        )
-        if review_terminal is not None:
-            if review_terminal.wait_condition == "review_axis":
-                capture_checks = getattr(
-                    self.runtime,
-                    "capture_deferred_checks",
-                    None,
-                )
-                if callable(capture_checks):
-                    observation = capture_checks(binding, observation)
-                    self._persist_runtime_observation(state, observation)
-                    self._write_state(repository, active.plan_digest, state)
-            return review_terminal
-        capture_checks = getattr(
-            self.runtime,
-            "capture_deferred_checks",
-            None,
-        )
-        if callable(capture_checks):
-            observation = capture_checks(binding, observation)
-            self._persist_runtime_observation(state, observation)
-            self._write_state(repository, active.plan_digest, state)
+        except ReviewConvergenceError as error:
+            raise KernelError(error.code, error.detail) from error
+        observation = review_decision.observation
+        if review_decision.capture_deferred_checks:
+            capture_checks = getattr(
+                self.runtime,
+                "capture_deferred_checks",
+                None,
+            )
+            if callable(capture_checks):
+                observation = capture_checks(binding, observation)
+                self._persist_runtime_observation(state, observation)
+                self._write_state(repository, active.plan_digest, state)
+        if review_decision.status == "rejected":
+            return self._handle_semantic_rejection(
+                state,
+                work_node,
+                goal,
+                work_item,
+                binding,
+                terminal_reason="rejected",
+                findings=review_decision.findings,
+                cause_type="candidate_verification_failure",
+            )
+        if review_decision.status != "accepted":
+            return self._outcome(state)
         decision = self.verifier.verify(
             observation.result_claim,
             work_node["output_contract"],

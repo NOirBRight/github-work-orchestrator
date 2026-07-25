@@ -37,6 +37,7 @@ from gwo_v8 import (  # noqa: E402
     RuntimeProfile,
     resolve_active_turn_pools,
 )
+from gwo_v8.review_convergence import ReviewConvergence  # noqa: E402
 import orch_core  # noqa: E402
 
 
@@ -401,10 +402,29 @@ class _ReviewObservationRecoveryRuntime(_ReviewMaterializationRecoveryRuntime):
         return super().observe_review_axis(request, binding)
 
 
-def _review_materialization_kernel(tmp_path, runtime):
+class _HardFindingReviewRuntime(_ReviewingInMemoryRuntime):
+    def observe_review_axis(self, request, binding):
+        observation = super().observe_review_axis(request, binding)
+        if request.axis != "standards":
+            return observation
+        return replace(
+            observation,
+            findings=(
+                {
+                    "severity": "hard",
+                    "code": "STD-HARD",
+                    "source": "AGENTS.md",
+                    "location": "module-1.txt:1",
+                    "message": "synthetic hard standards violation",
+                },
+            ),
+        )
+
+
+def _review_materialization_kernel(tmp_path, runtime, *, risk="standard"):
     repository = _temporary_repository(tmp_path)
     intent, source, _policy = _multi_ready_inputs(count=1)
-    intent["nodes"][0]["risk"] = "standard"
+    intent["nodes"][0]["risk"] = risk
     policy = _local_first_policy(1)
     for definition in policy["check_definitions"]:
         if definition["hosted_only"] is not True:
@@ -656,9 +676,11 @@ def test_changed_candidate_review_axis_materialization_reset_clears_all_axis_sta
         ],
         "review_children_retired": True,
         "review_evidence": {"kind": "review"},
+        "review_gate_status": "accepted",
+        "review_check_manifest_digest": "f" * 64,
     }
 
-    Kernel._invalidate_review_candidate(state)
+    ReviewConvergence.invalidate_candidate(state)
 
     assert state == {
         "review_candidate_sha": None,
@@ -669,7 +691,104 @@ def test_changed_candidate_review_axis_materialization_reset_clears_all_axis_sta
         "review_materialization_waiting_actions": [],
         "review_children_retired": False,
         "review_evidence": None,
+        "review_gate_status": None,
+        "review_check_manifest_digest": None,
     }
+
+
+def test_hard_review_findings_return_typed_rejected_decision(tmp_path):
+    runtime = _HardFindingReviewRuntime(tmp_path / "runtime")
+    kernel, compiled, work_node = _review_materialization_kernel(tmp_path, runtime)
+    decisions = []
+    original_converge = kernel._review_convergence.converge
+
+    def recording_converge(*args, **kwargs):
+        decision = original_converge(*args, **kwargs)
+        decisions.append(decision)
+        return decision
+
+    kernel._review_convergence.converge = recording_converge
+
+    first = kernel.reconcile_once("local/phase-four-a")
+
+    assert [decision.status for decision in decisions] == ["rejected"]
+    assert decisions[0].findings
+    assert all("standards" in finding for finding in decisions[0].findings)
+    # #77 behavior is preserved: rejection enters the authorized Repair Round.
+    assert first.status == "waiting"
+    assert first.directive == "wait_for_runtime"
+    assert first.attempt_state == "repairing"
+    assert first.wait_condition == "runtime_result"
+
+
+def test_strict_review_hard_findings_reject_before_human_decision(tmp_path):
+    runtime = _HardFindingReviewRuntime(tmp_path / "runtime")
+    kernel, compiled, work_node = _review_materialization_kernel(
+        tmp_path,
+        runtime,
+        risk="strict",
+    )
+    requirement = work_node["output_contract"]["review_requirement"]
+    assert requirement["mode"] == "strict"
+    assert requirement["human_decision_required"] is True
+    decisions = []
+    original_converge = kernel._review_convergence.converge
+
+    def recording_converge(*args, **kwargs):
+        decision = original_converge(*args, **kwargs)
+        decisions.append(decision)
+        return decision
+
+    kernel._review_convergence.converge = recording_converge
+
+    first = kernel.reconcile_once("local/phase-four-a")
+
+    assert [decision.status for decision in decisions] == ["rejected"]
+    assert decisions[0].findings
+    # A rejected gate never reaches the human approval wait; the normal
+    # Candidate Repair Round starts immediately.
+    assert first.status == "waiting"
+    assert first.directive == "wait_for_runtime"
+    assert first.attempt_state == "repairing"
+    assert first.wait_condition == "runtime_result"
+
+
+def test_review_convergence_is_one_deep_module_behind_kernel():
+    import inspect
+    import typing
+
+    from gwo_v8.review_convergence import (
+        ReviewConvergence,
+        ReviewConvergenceDecision,
+    )
+
+    hints = typing.get_type_hints(ReviewConvergenceDecision)
+    assert set(typing.get_args(hints["status"])) == {
+        "waiting",
+        "accepted",
+        "rejected",
+        "blocked",
+    }
+    assert "capture_deferred_checks" in ReviewConvergenceDecision.__dataclass_fields__
+    assert hasattr(ReviewConvergence, "converge")
+    assert hasattr(ReviewConvergence, "invalidate_candidate")
+    assert hasattr(ReviewConvergence, "initial_fields")
+    assert hasattr(ReviewConvergence, "compact_review_contract")
+    initial_fields = ReviewConvergence.initial_fields()
+    assert initial_fields["review_gate_status"] is None
+    assert initial_fields["review_check_manifest_digest"] is None
+    kernel_source = inspect.getsource(Kernel)
+    assert "review_gate_status" not in kernel_source
+    assert "review_check_manifest_digest" not in kernel_source
+    for moved in (
+        "_ensure_review_evidence",
+        "_review_request",
+        "_review_wait",
+        "_review_prompt_wait",
+        "_review_materialization_wait",
+        "_invalidate_review_candidate",
+    ):
+        assert not hasattr(Kernel, moved), moved
 
 
 class _ReadCountingDetachedPaseoClient(InMemoryPaseoClient):
