@@ -1153,6 +1153,134 @@ def test_review_axis_materialization_cleans_conflicting_exact_orphan(tmp_path):
     assert client.prompt_acceptance_count(binding.agent_id, request.to_prompt()) == 1
 
 
+def test_review_axis_materialization_repairs_accepted_agent_labels_without_reprompt(
+    tmp_path,
+):
+    _node, _worker_runtime, worker_binding, observation = _execute_candidate(
+        tmp_path,
+        risk="standard",
+    )
+    request = _review_axis_request(
+        worker_binding,
+        observation,
+        axis="standards",
+    )
+    profile = resolve_review_profile(
+        _runtime_config(),
+        repository="local/phase-three",
+        selector="standard_axis",
+    )
+    client = InMemoryPaseoClient()
+    prompt = request.to_prompt()
+    incomplete = client.create(
+        PaseoCreateRequest(
+            action_key=request.action_key,
+            title="incomplete accepted Review child",
+            labels={"gwo.action_key": request.action_key},
+            prompt=prompt,
+            repository_path=str(request.workspace),
+            base_sha=request.candidate_sha,
+            profile=profile,
+            parent_agent_id=worker_binding.agent_id,
+        )
+    )
+
+    binding = PaseoRuntimeAdapter(client).materialize_review_axis(
+        request,
+        profile,
+        parent_agent_id=worker_binding.agent_id,
+    )
+
+    repaired = client.inspect(incomplete.agent_id)
+    assert binding.agent_id == incomplete.agent_id
+    assert repaired.labels["gwo.review_candidate"] == request.candidate_sha
+    assert repaired.labels["gwo.review_axis"] == request.axis
+    assert repaired.labels["gwo.prompt_digest"] == prompt.digest
+    assert client.create_count == 1
+    assert client.send_count == 0
+    assert client.prompt_acceptance_count(binding.agent_id, prompt) == 1
+
+
+class _AmbiguousCreateWithoutIdentityPaseoClient(
+    _ReviewOrphanTrackingPaseoClient
+):
+    def __init__(self):
+        super().__init__()
+        self.fail_ambiguously = True
+
+    def create(self, request):
+        if self.fail_ambiguously:
+            self.fail_ambiguously = False
+            self.create_count += 1
+            raise RuntimeAdapterError(
+                "PASEO_CREATE_AMBIGUOUS",
+                "synthetic create lost before Agent identity readback",
+                failure_class="ambiguous",
+            )
+        return super().create(request)
+
+
+def test_review_axis_materialization_ambiguous_create_never_cleans_without_orphan_proof(
+    tmp_path,
+):
+    _node, _worker_runtime, worker_binding, observation = _execute_candidate(
+        tmp_path,
+        risk="standard",
+    )
+    request = _review_axis_request(
+        worker_binding,
+        observation,
+        axis="standards",
+    )
+    profile = resolve_review_profile(
+        _runtime_config(),
+        repository="local/phase-three",
+        selector="standard_axis",
+    )
+    client = _AmbiguousCreateWithoutIdentityPaseoClient()
+    adapter = PaseoRuntimeAdapter(client)
+
+    with pytest.raises(RuntimeAdapterError) as ambiguous:
+        adapter.materialize_review_axis(
+            request,
+            profile,
+            parent_agent_id=worker_binding.agent_id,
+        )
+
+    assert ambiguous.value.code == "PASEO_CREATE_AMBIGUOUS"
+    assert client.cleaned_action_keys == []
+    binding = adapter.materialize_review_axis(
+        request,
+        profile,
+        parent_agent_id=worker_binding.agent_id,
+    )
+    assert binding.action_key == request.action_key
+    assert client.create_count == 2
+    assert client.cleaned_action_keys == []
+
+
+def test_review_axis_materialization_tls_transport_is_transient_but_config_is_permanent():
+    assert (
+        PaseoCliClient.classify_failure(
+            "TLS certificate handshake timed out",
+            default="permanent",
+        )
+        == "transient"
+    )
+    assert (
+        PaseoCliClient.classify_failure(
+            "unauthorized provider authentication",
+        )
+        == "permanent"
+    )
+    assert (
+        PaseoCliClient.classify_failure(
+            "invalid configuration: unknown model",
+        )
+        == "permanent"
+    )
+
+
 def test_windows_environment_requirement_resolves_logical_paseo_executable(
     tmp_path,
     monkeypatch,

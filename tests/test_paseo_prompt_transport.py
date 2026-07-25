@@ -240,6 +240,55 @@ def test_cli_parent_readback_preserves_declared_owner_without_native_finish(
     assert binding.native_finish_notification_supported is False
 
 
+def test_review_axis_materialization_cli_label_readback_excludes_archived_agents(
+    monkeypatch,
+):
+    client = PaseoCliClient(executable="paseo")
+    profile = _profile()
+    labels = {
+        "gwo.action_key": "review-action",
+        "gwo.profile_digest": profile.digest,
+    }
+
+    def payload(agent_id, *, archived):
+        return {
+            "Id": agent_id,
+            "SessionId": f"session-{agent_id}",
+            "WorkspaceId": f"workspace-{agent_id}",
+            "Cwd": f"C:/workspace/{agent_id}",
+            "Provider": profile.provider,
+            "Model": profile.model,
+            "Thinking": profile.thinking,
+            "Mode": profile.mode,
+            "RuntimeSettings": {"features": {}},
+            "Status": "idle",
+            "Archived": archived,
+            "Labels": labels,
+        }
+
+    payloads = {
+        "active-review": payload("active-review", archived=False),
+        "archived-review": payload("archived-review", archived=True),
+    }
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        if command[0] == "ls":
+            return [{"id": agent_id} for agent_id in payloads]
+        if command[0] == "inspect":
+            return payloads[command[1]]
+        raise AssertionError(command)
+
+    monkeypatch.setattr(client, "_run", run)
+
+    records = client.find_by_labels({"gwo.action_key": "review-action"})
+
+    assert [record.agent_id for record in records] == ["active-review"]
+    assert records[0].archived is False
+    assert "--all" not in commands[0]
+
+
 def test_windows_command_line_overflow_is_not_executable_absence(monkeypatch):
     client = PaseoCliClient(executable="paseo")
 

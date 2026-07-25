@@ -317,9 +317,18 @@ class _ReviewingInMemoryRuntime(InMemoryRuntimeAdapter):
 
 
 class _ReviewMaterializationRecoveryRuntime(_ReviewingInMemoryRuntime):
-    def __init__(self, workspace_root: Path, *, spec_failures: int):
+    def __init__(
+        self,
+        workspace_root: Path,
+        *,
+        spec_failures: int = 0,
+        standards_failures: int = 0,
+    ):
         super().__init__(workspace_root)
-        self.spec_failures = spec_failures
+        self.axis_failures = {
+            "standards": standards_failures,
+            "spec": spec_failures,
+        }
         self.review_materialization_calls = []
 
     def materialize_review_axis(
@@ -332,11 +341,11 @@ class _ReviewMaterializationRecoveryRuntime(_ReviewingInMemoryRuntime):
         self.review_materialization_calls.append(
             (request.axis, request.action_key)
         )
-        if request.axis == "spec" and self.spec_failures > 0:
-            self.spec_failures -= 1
+        if self.axis_failures.get(request.axis, 0) > 0:
+            self.axis_failures[request.axis] -= 1
             raise RuntimeAdapterError(
                 "PASEO_CREATE_TRANSIENT",
-                "synthetic transient Review materialization failure",
+                "synthetic transient TLS certificate transport failure",
                 failure_class="transient",
             )
         return super().materialize_review_axis(
@@ -423,7 +432,7 @@ def test_review_axis_materialization_recovers_across_reconcile_cycles_without_wo
 ):
     runtime = _ReviewMaterializationRecoveryRuntime(
         tmp_path / "runtime",
-        spec_failures=2,
+        standards_failures=2,
     )
     kernel, compiled, work_node = _review_materialization_kernel(tmp_path, runtime)
 
@@ -453,14 +462,14 @@ def test_review_axis_materialization_recovers_across_reconcile_cycles_without_wo
     assert third.materialization_executions == 1
     assert first_state is not None
     assert second_state is not None
-    assert set(first_state["review_observations"]) == {"standards:0"}
-    assert set(second_state["review_observations"]) == {"standards:0"}
+    assert set(first_state["review_observations"]) == {"spec:0"}
+    assert set(second_state["review_observations"]) == {"spec:0"}
     assert (
-        first_state["review_materialization_actions"]["spec:0"]["executions"]
+        first_state["review_materialization_actions"]["standards:0"]["executions"]
         == 1
     )
     assert (
-        second_state["review_materialization_actions"]["spec:0"]["executions"]
+        second_state["review_materialization_actions"]["standards:0"]["executions"]
         == 2
     )
     standards_calls = [
@@ -473,9 +482,16 @@ def test_review_axis_materialization_recovers_across_reconcile_cycles_without_wo
         for axis, action_key in runtime.review_materialization_calls
         if axis == "spec"
     ]
-    assert len(standards_calls) == 1
-    assert len(spec_calls) == 3
-    assert len(set(spec_calls)) == 1
+    assert len(standards_calls) == 3
+    assert len(set(standards_calls)) == 1
+    assert len(spec_calls) == 1
+    assert first_state["review_materialization_waiting_actions"] == [
+        {
+            "axis": "standards",
+            "recovery_ordinal": 0,
+            "action_key": standards_calls[0],
+        }
+    ]
 
 
 def test_review_axis_materialization_budget_blocks_after_three_reconcile_cycles(
@@ -518,6 +534,44 @@ def test_review_axis_materialization_budget_blocks_after_three_reconcile_cycles(
     ]
     assert len(spec_calls) == 3
     assert len(set(spec_calls)) == 1
+
+
+def test_changed_candidate_review_axis_materialization_reset_clears_all_axis_state():
+    state = {
+        "review_candidate_sha": "a" * 40,
+        "review_bindings": {"standards:0": {"agent_id": "review-agent"}},
+        "review_observations": {"standards:0": {"lifecycle": "completed"}},
+        "review_materialization_actions": {
+            "spec:0": {
+                "action_key": "review-action",
+                "executions": 2,
+                "state": "retry_pending",
+            }
+        },
+        "review_axis_errors": {"spec:0": "PASEO_CREATE_TRANSIENT"},
+        "review_materialization_waiting_actions": [
+            {
+                "axis": "spec",
+                "recovery_ordinal": 0,
+                "action_key": "review-action",
+            }
+        ],
+        "review_children_retired": True,
+        "review_evidence": {"kind": "review"},
+    }
+
+    Kernel._invalidate_review_candidate(state)
+
+    assert state == {
+        "review_candidate_sha": None,
+        "review_bindings": {},
+        "review_observations": {},
+        "review_materialization_actions": {},
+        "review_axis_errors": {},
+        "review_materialization_waiting_actions": [],
+        "review_children_retired": False,
+        "review_evidence": None,
+    }
 
 
 class _ReadCountingDetachedPaseoClient(InMemoryPaseoClient):

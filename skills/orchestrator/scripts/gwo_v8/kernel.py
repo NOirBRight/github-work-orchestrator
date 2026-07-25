@@ -2836,6 +2836,14 @@ class Kernel:
             "repair_rounds_used": 0,
             "attempt_terminal_reason": None,
             "candidate_sha": None,
+            "review_candidate_sha": None,
+            "review_bindings": {},
+            "review_observations": {},
+            "review_materialization_actions": {},
+            "review_axis_errors": {},
+            "review_materialization_waiting_actions": [],
+            "review_children_retired": False,
+            "review_evidence": None,
             "result_digest": None,
             "publication_eligible": None,
             "publication_state": None,
@@ -4213,6 +4221,7 @@ class Kernel:
                 isinstance(existing_repair, dict)
                 and existing_repair.get("action_key") == repair_action_key
             ):
+                self._invalidate_review_candidate(state)
                 state.update(
                     {
                         "status": "waiting",
@@ -4266,6 +4275,7 @@ class Kernel:
                 self.runtime.repair(binding, prompt)
             except RuntimeAdapterError as error:
                 repair_record["delivery_state"] = "ambiguous"
+                self._invalidate_review_candidate(state)
                 state.update(
                     {
                         "directive": "wait_for_runtime",
@@ -4284,6 +4294,7 @@ class Kernel:
                 )
                 return self._outcome(state)
             repair_record["delivery_state"] = "accepted"
+            self._invalidate_review_candidate(state)
             state.update(
                 {
                     "status": "waiting",
@@ -4350,6 +4361,7 @@ class Kernel:
                 same_attempt=False,
             )
             next_ordinal = attempt_ordinal + 1
+            self._invalidate_review_candidate(state)
             state.update(
                 {
                     "status": "running",
@@ -4454,6 +4466,21 @@ class Kernel:
     @staticmethod
     def _review_binding_from_state(value: dict[str, Any]) -> ReviewAxisBinding:
         return ReviewAxisBinding(**value)
+
+    @staticmethod
+    def _invalidate_review_candidate(state: dict[str, Any]) -> None:
+        state.update(
+            {
+                "review_candidate_sha": None,
+                "review_bindings": {},
+                "review_observations": {},
+                "review_materialization_actions": {},
+                "review_axis_errors": {},
+                "review_materialization_waiting_actions": [],
+                "review_children_retired": False,
+                "review_evidence": None,
+            }
+        )
 
     @staticmethod
     def _persisted_runtime_observation(
@@ -4649,6 +4676,7 @@ class Kernel:
                     f"{self.runtime.adapter_name}://review/{candidate_sha}"
                 ),
                 "wait_event_identity": f"review:{candidate_sha}",
+                "review_materialization_waiting_actions": [],
                 "next_check_at": (
                     datetime.now(timezone.utc) + timedelta(seconds=30)
                 ).isoformat(),
@@ -4675,6 +4703,7 @@ class Kernel:
                     f"{request.candidate_sha}/action/{request.action_key}"
                 ),
                 "wait_event_identity": f"{request.action_key}:prompt_readback",
+                "review_materialization_waiting_actions": [],
                 "next_check_at": (
                     datetime.now(timezone.utc) + timedelta(seconds=30)
                 ).isoformat(),
@@ -4688,8 +4717,31 @@ class Kernel:
         self,
         state: dict[str, Any],
         *,
-        request: ReviewAxisRequest,
+        requests: tuple[ReviewAxisRequest, ...],
     ) -> ReconcileOutcome:
+        if not requests:
+            raise KernelError(
+                "REVIEW_AXIS_WAIT_INVALID",
+                "Review materialization wait requires at least one action",
+            )
+        candidate_sha = requests[0].candidate_sha
+        waiting_actions = [
+            {
+                "axis": request.axis,
+                "recovery_ordinal": request.recovery_ordinal,
+                "action_key": request.action_key,
+            }
+            for request in requests
+        ]
+        first_request = requests[0]
+        first_action = (
+            state.get("review_materialization_actions") or {}
+        ).get(f"{first_request.axis}:{first_request.recovery_ordinal}")
+        last_error = (
+            first_action.get("last_error")
+            if isinstance(first_action, dict)
+            else None
+        )
         state.update(
             {
                 "status": "waiting",
@@ -4698,9 +4750,15 @@ class Kernel:
                 "wait_condition": "runtime_available",
                 "wait_source_ref": (
                     f"{self.runtime.adapter_name}://review/"
-                    f"{request.candidate_sha}/action/{request.action_key}"
+                    f"{candidate_sha}/materialization"
                 ),
                 "wait_event_identity": "review_axis_materialization",
+                "review_materialization_waiting_actions": waiting_actions,
+                **(
+                    {"last_runtime_error": last_error}
+                    if isinstance(last_error, dict)
+                    else {}
+                ),
                 "next_check_at": (
                     datetime.now(timezone.utc) + timedelta(seconds=30)
                 ).isoformat(),
@@ -4781,13 +4839,8 @@ class Kernel:
                 "Runtime Adapter does not support Review Internal Subagents",
             )
         candidate_sha = observation.result_claim.candidate_sha
-        if state.get("review_candidate_sha") not in {None, candidate_sha}:
-            state["review_bindings"] = {}
-            state["review_observations"] = {}
-            state["review_materialization_actions"] = {}
-            state["review_axis_errors"] = {}
-            state["review_children_retired"] = False
-            state.pop("review_evidence", None)
+        if state.get("review_candidate_sha") != candidate_sha:
+            self._invalidate_review_candidate(state)
             state.pop("last_runtime_error", None)
         state["review_candidate_sha"] = candidate_sha
         bindings = state.setdefault("review_bindings", {})
@@ -4899,6 +4952,7 @@ class Kernel:
                             "last_error": _runtime_error_record(error),
                         }
                     )
+                    state.setdefault("review_axis_errors", {})[key] = error.code
                     state["last_runtime_error"] = _runtime_error_record(error)
                     self._write_state(
                         state["repository"],
@@ -4946,6 +5000,7 @@ class Kernel:
                         "last_error": None,
                     }
                 )
+                state.setdefault("review_axis_errors", {}).pop(key, None)
                 state.pop("last_runtime_error", None)
                 bindings[key] = asdict(child_binding)
                 self._write_state(
@@ -4972,45 +5027,13 @@ class Kernel:
         primary: dict[str, ReviewAxisObservation] = {}
         requests: dict[str, ReviewAxisRequest] = {}
         running = False
+        materialization_pending: list[ReviewAxisRequest] = []
+        prompt_pending: list[tuple[ReviewAxisRequest, RuntimeAdapterError]] = []
         try:
             for axis in required_axes:
                 try:
                     request, captured = collect(str(axis), 0)
                 except RuntimeAdapterError as error:
-                    if error.code == "PROMPT_DELIVERY_AMBIGUOUS":
-                        request = self._review_request(
-                            state=state,
-                            goal=goal,
-                            work_item=work_item,
-                            binding=binding,
-                            observation=observation,
-                            axis=str(axis),
-                            recovery_ordinal=0,
-                        )
-                        return observation, self._review_prompt_wait(
-                            state,
-                            request=request,
-                            error=error,
-                        )
-                    if error.code == "REVIEW_AXIS_MATERIALIZATION_PENDING":
-                        request = self._review_request(
-                            state=state,
-                            goal=goal,
-                            work_item=work_item,
-                            binding=binding,
-                            observation=observation,
-                            axis=str(axis),
-                            recovery_ordinal=0,
-                        )
-                        return observation, self._review_materialization_wait(
-                            state,
-                            request=request,
-                        )
-                    if error.code not in {
-                        "REVIEW_AXIS_OUTPUT_MISSING",
-                        "REVIEW_AXIS_OUTPUT_INVALID",
-                    }:
-                        raise
                     request = self._review_request(
                         state=state,
                         goal=goal,
@@ -5021,6 +5044,17 @@ class Kernel:
                         recovery_ordinal=0,
                     )
                     requests[str(axis)] = request
+                    if error.code == "PROMPT_DELIVERY_AMBIGUOUS":
+                        prompt_pending.append((request, error))
+                        continue
+                    if error.code == "REVIEW_AXIS_MATERIALIZATION_PENDING":
+                        materialization_pending.append(request)
+                        continue
+                    if error.code not in {
+                        "REVIEW_AXIS_OUTPUT_MISSING",
+                        "REVIEW_AXIS_OUTPUT_INVALID",
+                    }:
+                        raise
                     state.setdefault("review_axis_errors", {})[str(axis)] = error.code
                     continue
                 requests[str(axis)] = request
@@ -5047,6 +5081,19 @@ class Kernel:
                 state,
             )
             return observation, self._outcome(state)
+        if materialization_pending:
+            return observation, self._review_materialization_wait(
+                state,
+                requests=tuple(materialization_pending),
+            )
+        if prompt_pending:
+            request, error = prompt_pending[0]
+            return observation, self._review_prompt_wait(
+                state,
+                request=request,
+                error=error,
+            )
+        state["review_materialization_waiting_actions"] = []
         if running:
             return observation, self._review_wait(
                 state,
@@ -5065,6 +5112,10 @@ class Kernel:
         if gate.missing_axes:
             recovered = dict(primary)
             recovery_running = False
+            recovery_materialization_pending: list[ReviewAxisRequest] = []
+            recovery_prompt_pending: list[
+                tuple[ReviewAxisRequest, RuntimeAdapterError]
+            ] = []
             try:
                 for axis in gate.missing_axes:
                     try:
@@ -5080,16 +5131,11 @@ class Kernel:
                             recovery_ordinal=1,
                         )
                         if error.code == "PROMPT_DELIVERY_AMBIGUOUS":
-                            return observation, self._review_prompt_wait(
-                                state,
-                                request=request,
-                                error=error,
-                            )
+                            recovery_prompt_pending.append((request, error))
+                            continue
                         if error.code == "REVIEW_AXIS_MATERIALIZATION_PENDING":
-                            return observation, self._review_materialization_wait(
-                                state,
-                                request=request,
-                            )
+                            recovery_materialization_pending.append(request)
+                            continue
                         raise
                     requests[axis] = request
                     if captured.lifecycle == "completed":
@@ -5112,6 +5158,19 @@ class Kernel:
                     state,
                 )
                 return observation, self._outcome(state)
+            if recovery_materialization_pending:
+                return observation, self._review_materialization_wait(
+                    state,
+                    requests=tuple(recovery_materialization_pending),
+                )
+            if recovery_prompt_pending:
+                request, error = recovery_prompt_pending[0]
+                return observation, self._review_prompt_wait(
+                    state,
+                    request=request,
+                    error=error,
+                )
+            state["review_materialization_waiting_actions"] = []
             if recovery_running:
                 return observation, self._review_wait(
                     state,
@@ -5145,6 +5204,7 @@ class Kernel:
         state["wait_condition"] = None
         state["wait_source_ref"] = None
         state["wait_event_identity"] = None
+        state["review_materialization_waiting_actions"] = []
         state["next_check_at"] = None
         self._write_state(state["repository"], state["plan_digest"], state)
         retire_review = getattr(self.runtime, "retire_review_axis", None)

@@ -1210,8 +1210,6 @@ class PaseoCliClient:
             "invalid configuration",
             "unknown provider",
             "unknown model",
-            "certificate",
-            "tls",
         )
         if any(marker in lowered for marker in permanent_markers):
             return "permanent"
@@ -1221,6 +1219,8 @@ class PaseoCliClient:
             "timeout",
             "connection reset",
             "connection refused",
+            "certificate",
+            "tls",
             "busy",
             "rate limit",
         )
@@ -1458,7 +1458,7 @@ class PaseoCliClient:
         )
 
     def find_by_labels(self, labels: dict[str, str]) -> tuple[PaseoAgentRecord, ...]:
-        command = ["ls", "--global", "--all"]
+        command = ["ls", "--global"]
         for key, value in sorted(labels.items()):
             command.extend(["--label", f"{key}={value}"])
         command.append("--json")
@@ -1485,6 +1485,8 @@ class PaseoCliClient:
                     failure_class="ambiguous",
                 )
             record = self.inspect(agent_id)
+            if record.archived:
+                continue
             merged_labels = {
                 **record.labels,
                 **labels,
@@ -3008,6 +3010,110 @@ class PaseoRuntimeAdapter:
             ),
         )
 
+    @staticmethod
+    def _review_runtime_conflicts(
+        agent: PaseoAgentRecord,
+        profile: RuntimeProfile,
+        parent_agent_id: str | None,
+    ) -> bool:
+        return (
+            agent.provider != profile.provider
+            or agent.model != profile.model
+            or agent.thinking != profile.thinking
+            or agent.mode != profile.mode
+            or digest_value(agent.features) != digest_value(profile.features)
+            or agent.profile_digest not in {"", profile.digest}
+            or agent.declared_parent_agent_id not in {None, parent_agent_id}
+            or agent.parent_agent_id not in {None, parent_agent_id}
+        )
+
+    def _cleanup_review_orphan(
+        self,
+        agent: PaseoAgentRecord,
+        request: ReviewAxisRequest,
+    ) -> None:
+        self.client.archive(agent.agent_id)
+        if not self.client.inspect(agent.agent_id).archived:
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_ORPHAN_CLEANUP_AMBIGUOUS",
+                "mismatched Review child did not read back archived",
+                failure_class="ambiguous",
+            )
+        cleanup_worktree = getattr(
+            self.client,
+            "cleanup_orphan_worktree",
+            None,
+        )
+        if callable(cleanup_worktree):
+            cleanup_worktree(
+                request.action_key,
+                str(Path(request.workspace).resolve()),
+            )
+
+    def _reconcile_review_action_agent(
+        self,
+        agent: PaseoAgentRecord,
+        request: ReviewAxisRequest,
+        profile: RuntimeProfile,
+        prompt: RuntimePrompt,
+        labels: dict[str, str],
+        parent_agent_id: str | None,
+    ) -> PaseoAgentRecord | None:
+        exact = self._find_one(labels)
+        if exact is not None:
+            return exact
+        label_conflicts = {
+            key
+            for key, value in labels.items()
+            if key in agent.labels and agent.labels[key] != value
+        }
+        runtime_conflict = self._review_runtime_conflicts(
+            agent,
+            profile,
+            parent_agent_id,
+        )
+        target_prompt_count = self.client.prompt_acceptance_count(
+            agent.agent_id,
+            prompt,
+        )
+        if target_prompt_count > 1:
+            raise RuntimeAdapterError(
+                "PROMPT_ACCEPTANCE_DUPLICATE",
+                "Paseo activity contains the exact Prompt more than once",
+                failure_class="ambiguous",
+            )
+        if (
+            target_prompt_count == 1
+            and not label_conflicts
+            and not runtime_conflict
+        ):
+            self.client.update_labels(
+                agent.agent_id,
+                {
+                    **labels,
+                    "gwo.prompt_digest": prompt.digest,
+                },
+            )
+            return self._find_exact(
+                agent.agent_id,
+                {
+                    **labels,
+                    "gwo.prompt_digest": prompt.digest,
+                },
+                code="REVIEW_AXIS_LABEL_REPAIR_FAILED",
+            )
+        if (
+            target_prompt_count == 0
+            and (label_conflicts or runtime_conflict)
+        ):
+            self._cleanup_review_orphan(agent, request)
+            return None
+        raise RuntimeAdapterError(
+            "REVIEW_AXIS_ORPHAN_AMBIGUOUS",
+            "Review action identity remains incomplete without a safe cleanup proof",
+            failure_class="ambiguous",
+        )
+
     def materialize_review_axis(
         self,
         request: ReviewAxisRequest,
@@ -3033,41 +3139,15 @@ class PaseoRuntimeAdapter:
         if parent_agent_id is not None:
             labels["gwo.parent_agent"] = parent_agent_id
         agent = self._find_one({"gwo.action_key": request.action_key})
-        if agent is not None and self._find_one(labels) is None:
-            conflicts = {
-                key
-                for key, value in labels.items()
-                if key in agent.labels and agent.labels[key] != value
-            }
-            target_prompt_count = self.client.prompt_acceptance_count(
-                agent.agent_id,
+        if agent is not None:
+            agent = self._reconcile_review_action_agent(
+                agent,
+                request,
+                profile,
                 prompt,
+                labels,
+                parent_agent_id,
             )
-            if conflicts and target_prompt_count == 0:
-                self.client.archive(agent.agent_id)
-                if not self.client.inspect(agent.agent_id).archived:
-                    raise RuntimeAdapterError(
-                        "REVIEW_AXIS_ORPHAN_CLEANUP_AMBIGUOUS",
-                        "mismatched Review child did not read back archived",
-                        failure_class="ambiguous",
-                    )
-                cleanup_worktree = getattr(
-                    self.client,
-                    "cleanup_orphan_worktree",
-                    None,
-                )
-                if callable(cleanup_worktree):
-                    cleanup_worktree(
-                        request.action_key,
-                        str(Path(request.workspace).resolve()),
-                    )
-                agent = None
-            else:
-                raise RuntimeAdapterError(
-                    "REVIEW_AXIS_ORPHAN_AMBIGUOUS",
-                    "Review action identifies an Agent without exact fixed identity",
-                    failure_class="ambiguous",
-                )
         created_here = False
         created_agent_id: str | None = None
         if agent is None:
@@ -3106,19 +3186,28 @@ class PaseoRuntimeAdapter:
             except RuntimeAdapterError as error:
                 if error.failure_class != "ambiguous":
                     raise
-                agent = self._find_one(labels)
-                if agent is None:
-                    cleanup_worktree = getattr(
-                        self.client,
-                        "cleanup_orphan_worktree",
-                        None,
-                    )
-                    if callable(cleanup_worktree):
-                        cleanup_worktree(
-                            request.action_key,
-                            str(Path(request.workspace).resolve()),
-                        )
+                action_agent = self._find_one(
+                    {"gwo.action_key": request.action_key}
+                )
+                if action_agent is None:
                     raise
+                agent = self._reconcile_review_action_agent(
+                    action_agent,
+                    request,
+                    profile,
+                    prompt,
+                    labels,
+                    parent_agent_id,
+                )
+                if agent is None:
+                    raise RuntimeAdapterError(
+                        "REVIEW_AXIS_ORPHAN_RECONCILED",
+                        (
+                            "non-adoptable Review orphan was cleaned; "
+                            "stable action readback must retry next reconcile"
+                        ),
+                        failure_class="transient",
+                    ) from error
             else:
                 created_here = self._created_in_current_call(
                     created_agent.agent_id,
