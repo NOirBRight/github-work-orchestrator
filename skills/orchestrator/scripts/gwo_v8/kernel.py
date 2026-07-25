@@ -41,6 +41,7 @@ from .runtime import (
     _input_projection_digest,
     _run,
     resolve_active_turn_pools,
+    resolve_worker_profile,
 )
 
 REPAIR_PACKET_MAX_BYTES = 64 * 1024
@@ -3588,11 +3589,22 @@ class Kernel:
         work_node: dict[str, Any],
     ):
         prompt = self._prompt_from_state(state)
-        selected_profile = (
-            self.frontier_runtime_profile
-            if int(state.get("attempt_ordinal", 1)) > 1
-            else self.runtime_profile
-        )
+        attempt_ordinal = int(state.get("attempt_ordinal", 1))
+        if attempt_ordinal == 1 and self.runtime_profile is not None:
+            selected_profile = self.runtime_profile
+        elif attempt_ordinal > 1 and self.frontier_runtime_profile is not None:
+            selected_profile = self.frontier_runtime_profile
+        elif self.runtime_config is not None:
+            difficulty = (
+                "frontier" if attempt_ordinal > 1 else str(work_node.get("difficulty"))
+            )
+            selected_profile = resolve_worker_profile(
+                self.runtime_config,
+                repository=state["repository"],
+                difficulty=difficulty,
+            )
+        else:
+            selected_profile = None
         admission = RuntimeAdmission(
             repository=state["repository"],
             plan_digest=state["plan_digest"],

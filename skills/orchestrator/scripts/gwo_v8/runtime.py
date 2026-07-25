@@ -155,6 +155,15 @@ REVIEW_PROFILE_SELECTORS = {
 }
 REVIEW_AXES = {"standards", "spec", "specialist"}
 
+WORKER_DIFFICULTIES = {"routine", "standard", "complex", "frontier"}
+WORKER_TIERS = {"light", "standard", "heavy", "frontier"}
+DIFFICULTY_TO_TIER = {
+    "routine": "light",
+    "standard": "standard",
+    "complex": "heavy",
+    "frontier": "frontier",
+}
+
 
 def _valid_review_axis(value: str) -> bool:
     return value in {"standards", "spec"} or (
@@ -273,6 +282,140 @@ def resolve_review_profile(
         )
     return RuntimeProfile(
         name=profile_id,
+        provider=provider,
+        model=model,
+        thinking=thinking,
+        mode=mode,
+        features=dict(features),
+    )
+
+
+def _normalize_worker_reasoning(provider: str, model: str, thinking: str) -> str:
+    """Return the Runtime-facing Kimi reasoning value for the adapter contract."""
+
+    normalized = thinking.strip().lower()
+    if provider not in {"kimi", "kimi-cli"}:
+        return normalized
+    if normalized in {"on", "true", "enabled", "yes"}:
+        normalized = "on"
+    elif normalized in {"off", "false", "disabled", "no"}:
+        normalized = "off"
+    if model == "kimi-code/kimi-for-coding" and normalized not in {"on", "off"}:
+        raise RuntimeAdapterError(
+            "RUNTIME_THINKING_INVALID",
+            f"Kimi K2.7 reasoning must be a toggle, got: {thinking}",
+        )
+    if model == "kimi-code/k3" and normalized not in {"high", "max"}:
+        raise RuntimeAdapterError(
+            "RUNTIME_THINKING_INVALID",
+            f"Kimi K3 reasoning must be high or max, got: {thinking}",
+        )
+    return normalized
+
+
+def resolve_worker_profile(
+    config: dict[str, Any] | None,
+    *,
+    repository: str,
+    difficulty: str,
+) -> RuntimeProfile:
+    """Resolve the initial Worker Runtime Profile from a PlanNode difficulty.
+
+    Repository tier mappings override global mappings. Invalid or incomplete
+    mappings fail closed; there is no silent fallback to a host default.
+    """
+
+    if config is None:
+        raise RuntimeAdapterError(
+            "RUNTIME_CONFIG_MISSING",
+            "Runtime configuration is required to resolve a Worker profile",
+        )
+    if not isinstance(config, dict):
+        raise RuntimeAdapterError(
+            "RUNTIME_CONFIG_INVALID",
+            "Runtime configuration must be an object",
+        )
+    if difficulty not in WORKER_DIFFICULTIES:
+        raise RuntimeAdapterError(
+            "WORKER_DIFFICULTY_INVALID",
+            f"unknown PlanNode difficulty: {difficulty}",
+        )
+    tier = DIFFICULTY_TO_TIER[difficulty]
+
+    repositories = config.get("repositories") or {}
+    if not isinstance(repositories, dict):
+        raise RuntimeAdapterError(
+            "RUNTIME_CONFIG_INVALID",
+            "repository Runtime configuration must be an object",
+        )
+    repository_config = repositories.get(repository) or {}
+    if not isinstance(repository_config, dict):
+        raise RuntimeAdapterError(
+            "RUNTIME_CONFIG_INVALID",
+            f"repository Runtime configuration is invalid: {repository}",
+        )
+    repository_tiers = repository_config.get("tiers") or {}
+    global_tiers = config.get("tiers") or {}
+    if not isinstance(repository_tiers, dict) or not isinstance(global_tiers, dict):
+        raise RuntimeAdapterError(
+            "RUNTIME_TIER_PROFILE_INVALID",
+            "Worker tier mappings must be objects",
+        )
+
+    mapping = repository_tiers.get(tier)
+    if mapping is None:
+        mapping = global_tiers.get(tier)
+    if mapping is None:
+        raise RuntimeAdapterError(
+            "RUNTIME_TIER_PROFILE_MISSING",
+            f"Worker tier has no configured profile: {tier}",
+        )
+    if not isinstance(mapping, dict):
+        raise RuntimeAdapterError(
+            "RUNTIME_TIER_PROFILE_INVALID",
+            f"Worker tier mapping is invalid: {tier}",
+        )
+
+    provider = mapping.get("provider")
+    settings = mapping.get("settings")
+    if not isinstance(provider, str) or not provider.strip():
+        raise RuntimeAdapterError(
+            "RUNTIME_PROVIDER_INVALID",
+            f"Worker tier {tier} has no provider",
+        )
+    if not isinstance(settings, dict):
+        raise RuntimeAdapterError(
+            "RUNTIME_SETTINGS_INVALID",
+            f"Worker tier {tier} settings must be an object",
+        )
+
+    model = settings.get("model")
+    thinking = settings.get("thinkingOptionId")
+    mode = settings.get("modeId")
+    features = settings.get("features", {})
+    if (
+        not isinstance(model, str)
+        or not model.strip()
+        or not isinstance(thinking, str)
+        or not thinking.strip()
+        or not isinstance(mode, str)
+        or not mode.strip()
+        or not isinstance(features, dict)
+    ):
+        raise RuntimeAdapterError(
+            "RUNTIME_TIER_PROFILE_INVALID",
+            f"Worker tier {tier} profile is incomplete",
+        )
+
+    provider = provider.strip()
+    if provider == "kimi":
+        provider = "kimi-cli"
+    model = model.strip()
+    mode = mode.strip()
+    thinking = _normalize_worker_reasoning(provider, model, thinking)
+
+    return RuntimeProfile(
+        name=tier,
         provider=provider,
         model=model,
         thinking=thinking,

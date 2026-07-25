@@ -74,6 +74,7 @@ from .runtime import (
     SkillCatalog,
     resolve_active_turn_pools,
     resolve_review_profile,
+    resolve_worker_profile,
 )
 from .kernel import (
     CandidatePublication,
@@ -244,6 +245,7 @@ __all__ = [
     "WriterAuthorityControl",
     "resolve_active_turn_pools",
     "resolve_review_profile",
+    "resolve_worker_profile",
     "ReconcileOutcome",
     "Reconciler",
     "VerificationDecision",
