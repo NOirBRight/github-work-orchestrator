@@ -126,6 +126,37 @@ class ReviewGateDecision:
     blockers: tuple[str, ...] = ()
 
 
+def blocking_review_findings(
+    evidence: TypedEvidence | None,
+) -> tuple[dict[str, Any], ...]:
+    """Return exact typed hard findings from one Review Evidence envelope."""
+
+    if evidence is None or evidence.kind != "review" or not evidence.has_valid_digest():
+        return ()
+    blockers: list[dict[str, Any]] = []
+    for record in evidence.payload.get("axes") or ():
+        if not isinstance(record, dict) or not isinstance(record.get("axis"), str):
+            continue
+        for finding in record.get("findings") or ():
+            if not isinstance(finding, dict) or finding.get("severity") != "hard":
+                continue
+            if set(finding) != {
+                "severity",
+                "code",
+                "source",
+                "location",
+                "message",
+            }:
+                continue
+            blockers.append(
+                {
+                    "axis": record["axis"],
+                    "finding": dict(finding),
+                }
+            )
+    return tuple(blockers)
+
+
 class EvidenceVerifier:
     """Accept Result Claims only when independently observed Evidence satisfies them."""
 
@@ -207,6 +238,7 @@ class EvidenceVerifier:
             and isinstance(definition.get("check_id"), str)
         }
         semantically_valid: list[TypedEvidence] = []
+        failed_checks: list[str] = []
         for evidence in valid:
             if evidence.kind == "review":
                 requirement = output_contract.get("review_requirement") or {
@@ -233,7 +265,7 @@ class EvidenceVerifier:
                     findings.append("Review Evidence envelope is invalid")
                     continue
                 hard = [
-                    finding
+                    (record, finding)
                     for record in axes
                     if isinstance(record, dict)
                     for finding in record.get("findings") or ()
@@ -244,8 +276,14 @@ class EvidenceVerifier:
                         status="rejected",
                         result=None,
                         findings=tuple(
-                            (f"{finding.get('code')}: {finding.get('message')}")
-                            for finding in hard
+                            (
+                                f"review:{record.get('axis')}:"
+                                f"{finding.get('code')}:"
+                                f"{finding.get('source')}:"
+                                f"{finding.get('location')}:"
+                                f"{finding.get('message')}"
+                            )
+                            for record, finding in hard
                         ),
                     )
                 semantically_valid.append(evidence)
@@ -253,16 +291,18 @@ class EvidenceVerifier:
             if evidence.kind != "check":
                 semantically_valid.append(evidence)
                 continue
-            if evidence.payload.get("outcome") != "passed":
-                return VerificationDecision(
-                    status="rejected",
-                    result=None,
-                    findings=("required check did not pass",),
-                )
             check_id = evidence.payload.get("check_id")
             definition = definitions.get(check_id)
             if definition is None:
                 findings.append("check Evidence has no compiled definition")
+                continue
+            if evidence.payload.get("outcome") != "passed":
+                check_source = (
+                    "hosted check"
+                    if definition.get("hosted_only") is True
+                    else "local check"
+                )
+                failed_checks.append(f"{check_source}:{check_id} did not pass")
                 continue
             expected_definition_digest = definition.get("definition_digest")
             if (
@@ -325,6 +365,12 @@ class EvidenceVerifier:
                 continue
             semantically_valid.append(evidence)
         valid = semantically_valid
+        if failed_checks:
+            return VerificationDecision(
+                status="rejected",
+                result=None,
+                findings=tuple(failed_checks),
+            )
 
         missing: list[str] = []
         requirements = output_contract.get("required_evidence")

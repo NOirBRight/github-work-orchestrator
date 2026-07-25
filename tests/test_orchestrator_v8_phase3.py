@@ -1449,16 +1449,19 @@ def test_recovery_ladder_is_bounded_and_runtime_loss_never_fails_node():
     assert runtime_lost.plan_node_failed is False
 
     packet = ladder.recovery_packet(
-        goal="complete the Phase 3 delivery",
-        acceptance=["exact Candidate", "blocker-free review"],
         candidate_sha="a" * 40,
+        acceptance_digest="b" * 64,
         changed_files=["result.txt"],
-        findings=["x" * 20_000],
-        attempted_approaches=["primary Worker produced one rejected Candidate"],
-        durable_references=["github://issue/48"],
+        causes=[
+            {
+                "type": "runtime_no_result",
+                "messages": ["x" * 20_000],
+            }
+        ],
     )
     assert len(packet.encode("utf-8")) <= 16_384
     assert "full_transcript" not in packet
+    assert json.loads(packet)["acceptance_digest"] == "b" * 64
 
 
 def test_terminal_worker_without_result_enters_one_bounded_repair_round(
@@ -3022,7 +3025,22 @@ def test_replan_hold_blocks_new_admission_until_active_writer_clears_it(
     assert kernel.reconcile_once("local/phase-three").status == "complete"
 
 
-def test_review_blocker_automatically_starts_one_same_attempt_repair(
+class _RepairCapturePaseoClient(InMemoryPaseoClient):
+    def __init__(self):
+        super().__init__()
+        self.repair_prompts = []
+
+    def send_prompt(self, agent_id, prompt, *, action_key):
+        if ":repair:" in action_key:
+            self.repair_prompts.append((agent_id, prompt, action_key))
+        return super().send_prompt(
+            agent_id,
+            prompt,
+            action_key=action_key,
+        )
+
+
+def test_dual_axis_review_blockers_produce_exact_restart_stable_repair_prompt(
     tmp_path,
 ):
     repository = _temporary_repository(tmp_path)
@@ -3038,7 +3056,23 @@ def test_review_blocker_automatically_starts_one_same_attempt_repair(
         expected_active_digest=None,
         writer_generation="phase-3",
     )
-    client = InMemoryPaseoClient()
+    client = _RepairCapturePaseoClient()
+    worker_profile = RuntimeProfile(
+        name="worker-standard",
+        provider="kimi-cli",
+        model="kimi-code/kimi-for-coding",
+        thinking="max",
+        mode="yolo",
+        features={},
+    )
+    frontier_profile = RuntimeProfile(
+        name="worker-frontier",
+        provider="codex",
+        model="gpt-5.6-sol",
+        thinking="xhigh",
+        mode="full-access",
+        features={},
+    )
     kernel = Kernel(
         store_path=store_path,
         publication=publication,
@@ -3047,22 +3081,8 @@ def test_review_blocker_automatically_starts_one_same_attempt_repair(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
-        runtime_profile=RuntimeProfile(
-            name="worker-standard",
-            provider="kimi-cli",
-            model="kimi-code/kimi-for-coding",
-            thinking="max",
-            mode="yolo",
-            features={},
-        ),
-        frontier_runtime_profile=RuntimeProfile(
-            name="worker-frontier",
-            provider="codex",
-            model="gpt-5.6-sol",
-            thinking="xhigh",
-            mode="full-access",
-            features={},
-        ),
+        runtime_profile=worker_profile,
+        frontier_runtime_profile=frontier_profile,
         runtime_config=_runtime_config(),
     )
     waiting_for_worker = kernel.reconcile_once("local/phase-three")
@@ -3102,20 +3122,24 @@ def test_review_blocker_automatically_starts_one_same_attempt_repair(
     )
     kernel.reconcile_once("local/phase-three")
     review_agents = client.find_by_labels({"gwo.review_candidate": candidate_sha})
+    findings_by_axis = {
+        "standards": {
+            "severity": "hard",
+            "code": "STANDARD_BROKEN",
+            "source": "CONTEXT.md",
+            "location": "result.txt:1",
+            "message": "Candidate violates the documented standard.",
+        },
+        "spec": {
+            "severity": "hard",
+            "code": "SPEC_MISSING",
+            "source": "synthetic://issue/45",
+            "location": "result.txt:1",
+            "message": "Candidate does not satisfy the Spec.",
+        },
+    }
     for agent in review_agents:
-        findings = (
-            [
-                {
-                    "severity": "hard",
-                    "code": "SPEC_MISSING",
-                    "source": "synthetic://issue/45",
-                    "location": "result.txt:1",
-                    "message": "Candidate does not satisfy the Spec.",
-                }
-            ]
-            if agent.labels["gwo.review_axis"] == "spec"
-            else []
-        )
+        axis = agent.labels["gwo.review_axis"]
         client.set_output(
             agent.agent_id,
             "GWO_REVIEW_AXIS "
@@ -3124,9 +3148,9 @@ def test_review_blocker_automatically_starts_one_same_attempt_repair(
                     "schema_version": 1,
                     "action_key": agent.labels["gwo.action_key"],
                     "candidate_sha": candidate_sha,
-                    "axis": agent.labels["gwo.review_axis"],
+                    "axis": axis,
                     "fixed_input_digest": agent.labels["gwo.review_input"],
-                    "findings": findings,
+                    "findings": [findings_by_axis[axis]],
                 },
                 separators=(",", ":"),
             ),
@@ -3144,6 +3168,56 @@ def test_review_blocker_automatically_starts_one_same_attempt_repair(
     assert client.inspect(worker.agent_id).lifecycle == "running"
     assert client.read_output(worker.agent_id) is None
     assert all(client.inspect(agent.agent_id).archived for agent in review_agents)
+    assert len(client.repair_prompts) == 1
+    repair_prompt = client.repair_prompts[0][1]
+    repair_round = json.loads(repair_prompt.text)["repair_round"]
+    assert repair_round["causes"] == [
+        {
+            "type": "review_blocker",
+            "axis": axis,
+            "finding": findings_by_axis[axis],
+        }
+        for axis in ("standards", "spec")
+    ]
+    assert repair_round["changed_files"] == ["result.txt"]
+    assert len(repair_round["acceptance_digest"]) == 64
+    assert len(repair_prompt.text.encode("utf-8")) <= 16_384
+    assert "required check did not pass" not in repair_prompt.text
+    assert "result-hosted" not in repair_prompt.text
+    assert "hosted_only" not in repair_prompt.text
+
+    repair_state = kernel._read_state(
+        "local/phase-three",
+        compiled.digest,
+        repairing.node_key,
+    )
+    prompt_digest = repair_state["repair_prompt"]["prompt_digest"]
+    payload_digest = repair_state["repair_prompt"]["payload_digest"]
+    send_count = client.send_count
+    restarted_kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=PaseoRuntimeAdapter(client),
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-3",
+        runtime_profile=worker_profile,
+        frontier_runtime_profile=frontier_profile,
+        runtime_config=_runtime_config(),
+    )
+
+    restarted = restarted_kernel.reconcile_once("local/phase-three")
+
+    assert restarted.wait_condition == "runtime_result"
+    assert client.send_count == send_count
+    restarted_state = restarted_kernel._read_state(
+        "local/phase-three",
+        compiled.digest,
+        repairing.node_key,
+    )
+    assert restarted_state["repair_prompt"]["prompt_digest"] == prompt_digest
+    assert restarted_state["repair_prompt"]["payload_digest"] == payload_digest
 
     _git(workspace, "commit", "--allow-empty", "-m", "repaired Candidate")
     repaired_sha = _git(workspace, "rev-parse", "HEAD")
@@ -3159,7 +3233,7 @@ def test_review_blocker_automatically_starts_one_same_attempt_repair(
             separators=(",", ":"),
         ),
     )
-    second_review_wait = kernel.reconcile_once("local/phase-three")
+    second_review_wait = restarted_kernel.reconcile_once("local/phase-three")
     assert second_review_wait.wait_condition == "review_axis"
     second_review_agents = client.find_by_labels({"gwo.review_candidate": repaired_sha})
     assert len(second_review_agents) == 2
@@ -3190,7 +3264,7 @@ def test_review_blocker_automatically_starts_one_same_attempt_repair(
             ),
         )
 
-    escalating = kernel.reconcile_once("local/phase-three")
+    escalating = restarted_kernel.reconcile_once("local/phase-three")
 
     assert escalating.status == "running"
     assert escalating.directive == "run_again"
@@ -3198,7 +3272,7 @@ def test_review_blocker_automatically_starts_one_same_attempt_repair(
     assert escalating.attempt_id is None
     assert client.inspect(worker.agent_id).archived is True
 
-    frontier_waiting = kernel.reconcile_once("local/phase-three")
+    frontier_waiting = restarted_kernel.reconcile_once("local/phase-three")
     frontier = client.find_by_labels({"gwo.admission": frontier_waiting.admission_id})[
         0
     ]

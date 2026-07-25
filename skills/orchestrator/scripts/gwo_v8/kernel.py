@@ -16,7 +16,12 @@ from urllib.parse import quote
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
 from .activation import LocalPlanPublication
-from .evidence import EvidenceVerifier, ResultClaim, TypedEvidence
+from .evidence import (
+    EvidenceVerifier,
+    ResultClaim,
+    TypedEvidence,
+    blocking_review_findings,
+)
 from .integration_batch import (
     GitIntegrationBatchAssembler,
     IntegrationBatchError,
@@ -980,13 +985,10 @@ class RecoveryLadder:
     @staticmethod
     def recovery_packet(
         *,
-        goal: str,
-        acceptance: list[str],
         candidate_sha: str,
+        acceptance_digest: str,
         changed_files: list[str],
-        findings: list[str],
-        attempted_approaches: list[str],
-        durable_references: list[str],
+        causes: list[dict[str, Any]],
     ) -> str:
         def bounded(values: list[str], *, each: int, total: int) -> list[str]:
             result: list[str] = []
@@ -1007,27 +1009,62 @@ class RecoveryLadder:
                 used += size
             return result
 
+        bounded_causes: list[dict[str, Any]] = []
+        cause_bytes = 0
+        for cause in causes[:64]:
+            cause_type = str(cause.get("type") or "candidate_rejection")[:64]
+            if cause_type == "review_blocker":
+                finding = cause.get("finding")
+                if (
+                    not isinstance(finding, dict)
+                    or set(finding)
+                    != {"severity", "code", "source", "location", "message"}
+                ):
+                    raise KernelError(
+                        "REPAIR_CAUSE_INVALID",
+                        "Review repair cause does not contain one exact typed finding",
+                    )
+                normalized = {
+                    "type": cause_type,
+                    "axis": str(cause.get("axis") or "")[:128],
+                    "finding": dict(finding),
+                }
+            else:
+                normalized = {"type": cause_type}
+                for key, value in sorted(cause.items()):
+                    if key == "type":
+                        continue
+                    if isinstance(value, str):
+                        normalized[str(key)] = value[:2_048]
+                    elif isinstance(value, int) and not isinstance(value, bool):
+                        normalized[str(key)] = value
+                    elif isinstance(value, list):
+                        normalized[str(key)] = bounded(
+                            [str(item) for item in value],
+                            each=1_024,
+                            total=2_048,
+                        )
+            encoded = canonical_bytes(normalized)
+            if cause_bytes + len(encoded) > 10_240:
+                if cause_type == "review_blocker":
+                    raise KernelError(
+                        "REPAIR_REVIEW_FINDINGS_TOO_LARGE",
+                        "exact Review blockers exceed the bounded Repair Prompt",
+                    )
+                break
+            bounded_causes.append(normalized)
+            cause_bytes += len(encoded)
+
         packet = {
-            "schema_version": 1,
-            "goal": str(goal)[:2_048],
-            "acceptance": bounded(acceptance, each=1_024, total=3_072),
+            "schema_version": 2,
             "candidate_sha": candidate_sha,
+            "acceptance_digest": acceptance_digest,
             "changed_files": bounded(
-                changed_files,
+                sorted(set(changed_files)),
                 each=256,
-                total=2_048,
+                total=4_096,
             ),
-            "findings": bounded(findings, each=2_048, total=4_096),
-            "attempted_approaches": bounded(
-                attempted_approaches,
-                each=1_024,
-                total=2_048,
-            ),
-            "durable_references": bounded(
-                durable_references,
-                each=512,
-                total=1_024,
-            ),
+            "causes": bounded_causes,
         }
         rendered = canonical_bytes(packet).decode("utf-8")
         if len(rendered.encode("utf-8")) > 16_384:
@@ -3923,6 +3960,132 @@ class Kernel:
             contract_node=work_node,
         )
 
+    @staticmethod
+    def _acceptance_digest(
+        goal: dict[str, Any],
+        work_item: dict[str, Any],
+    ) -> str:
+        spec_text = canonical_bytes(
+            {
+                "goal_acceptance": goal.get("acceptance") or [],
+                "outcome_contract": Kernel._compact_review_contract(
+                    work_item.get("outcome_contract") or {}
+                ),
+            }
+        ).decode("utf-8")
+        return digest_value(
+            {
+                "source_ref": str(work_item.get("source_ref") or ""),
+                "text": spec_text,
+            }
+        )
+
+    def _repair_changed_files(
+        self,
+        state: dict[str, Any],
+        work_node: dict[str, Any],
+        binding,
+    ) -> list[str]:
+        candidate_sha = state.get("candidate_sha")
+        base_sha = state.get("base_sha")
+        if (
+            isinstance(candidate_sha, str)
+            and len(candidate_sha) == 40
+            and isinstance(base_sha, str)
+            and len(base_sha) == 40
+        ):
+            try:
+                changed = _git(
+                    Path(binding.workspace).resolve(),
+                    "diff",
+                    "--name-only",
+                    f"{base_sha}...{candidate_sha}",
+                )
+                return sorted(
+                    {
+                        line.strip()
+                        for line in changed.splitlines()
+                        if line.strip()
+                    }
+                )
+            except RuntimeAdapterError:
+                pass
+        return sorted(
+            {
+                str(change.get("path"))
+                for change in (work_node.get("inputs") or {}).get("file_changes")
+                or ()
+                if isinstance(change, dict) and change.get("path")
+            }
+        )
+
+    @staticmethod
+    def _repair_causes(
+        state: dict[str, Any],
+        work_node: dict[str, Any],
+        *,
+        cause_type: str,
+        findings: tuple[str, ...],
+    ) -> list[dict[str, Any]]:
+        causes: list[dict[str, Any]] = []
+        saved_review = state.get("review_evidence")
+        if isinstance(saved_review, dict):
+            try:
+                review_evidence = TypedEvidence(**saved_review)
+            except TypeError:
+                review_evidence = None
+            for blocker in blocking_review_findings(review_evidence):
+                causes.append(
+                    {
+                        "type": "review_blocker",
+                        "axis": blocker["axis"],
+                        "finding": blocker["finding"],
+                    }
+                )
+
+        definitions = {
+            str(definition.get("check_id")): definition
+            for definition in (work_node.get("output_contract") or {}).get("checks")
+            or ()
+            if isinstance(definition, dict)
+            and definition.get("hosted_only") is not True
+            and definition.get("check_id")
+        }
+        candidate_observation = state.get("candidate_observation")
+        for evidence in (
+            candidate_observation.get("evidence") or ()
+            if isinstance(candidate_observation, dict)
+            else ()
+        ):
+            if (
+                not isinstance(evidence, dict)
+                or evidence.get("kind") != "check"
+                or (evidence.get("payload") or {}).get("outcome") != "failed"
+            ):
+                continue
+            payload = evidence.get("payload") or {}
+            check_id = str(payload.get("check_id") or "")
+            definition = definitions.get(check_id)
+            if definition is None:
+                continue
+            causes.append(
+                {
+                    "type": "local_check_failure",
+                    "check_id": check_id,
+                    "suite": str(definition.get("suite") or "local"),
+                    "source_ref": str(evidence.get("source_ref") or ""),
+                    "exit_code": int(payload.get("exit_code") or 0),
+                }
+            )
+        if not causes:
+            causes.append(
+                {
+                    "type": cause_type,
+                    "messages": [str(finding) for finding in findings],
+                }
+            )
+        return causes
+
     def _handle_semantic_rejection(
         self,
         state: dict[str, Any],
@@ -3933,6 +4096,7 @@ class Kernel:
         *,
         terminal_reason: str,
         findings: tuple[str, ...],
+        cause_type: str = "candidate_rejection",
     ) -> ReconcileOutcome:
         self.publication.assert_writer(
             repository=state["repository"],
@@ -3970,22 +4134,15 @@ class Kernel:
             "findings": prior_findings[:32],
         }
         packet = ladder.recovery_packet(
-            goal=str(goal.get("objective") or ""),
-            acceptance=[str(item) for item in goal.get("acceptance") or ()],
             candidate_sha=str(state.get("candidate_sha") or ""),
-            changed_files=[
-                str(change.get("path"))
-                for change in (work_node.get("inputs") or {}).get("file_changes") or ()
-                if isinstance(change, dict)
-            ],
-            findings=[str(finding) for finding in findings],
-            attempted_approaches=[
-                (f"Attempt {attempt_ordinal} used {repair_rounds_used} Repair Rounds")
-            ],
-            durable_references=[
-                str(work_item.get("source_ref") or ""),
-                str(state.get("publication_ref") or ""),
-            ],
+            acceptance_digest=self._acceptance_digest(goal, work_item),
+            changed_files=self._repair_changed_files(state, work_node, binding),
+            causes=self._repair_causes(
+                state,
+                work_node,
+                cause_type=cause_type,
+                findings=findings,
+            ),
         )
         if directive.action == "repair_same_attempt":
             prompt = self._recovery_prompt(
@@ -3993,7 +4150,93 @@ class Kernel:
                 packet,
                 same_attempt=True,
             )
-            self.runtime.repair(binding, prompt)
+            repair_round = repair_rounds_used + 1
+            repair_action_key = (
+                f"repair:{state['attempt_id']}:{repair_round}:{prompt.digest}"
+            )
+            repair_record = {
+                "round": repair_round,
+                "action_key": repair_action_key,
+                "prompt_digest": prompt.digest,
+                "payload_digest": digest_value(json.loads(packet)),
+                "delivery_state": "reserved",
+            }
+            existing_repair = state.get("repair_prompt")
+            if (
+                isinstance(existing_repair, dict)
+                and existing_repair.get("action_key") == repair_action_key
+            ):
+                state.update(
+                    {
+                        "status": "waiting",
+                        "directive": "wait_for_runtime",
+                        "attempt_state": "repair_delivery_ambiguous",
+                        "candidate_sha": None,
+                        "candidate_observation": None,
+                        "wait_condition": "runtime_result",
+                        "wait_source_ref": (
+                            f"{self.runtime.adapter_name}://attempt/"
+                            f"{state['attempt_id']}/repair/{prompt.digest}"
+                        ),
+                        "wait_event_identity": repair_action_key,
+                        "next_check_at": (
+                            datetime.now(timezone.utc) + timedelta(seconds=30)
+                        ).isoformat(),
+                    }
+                )
+                self._write_state(
+                    state["repository"],
+                    state["plan_digest"],
+                    state,
+                )
+                return self._outcome(state)
+            state.update(
+                {
+                    "status": "waiting",
+                    "directive": "reconcile_again",
+                    "attempt_state": "repair_dispatching",
+                    "recovery_reserved_at": _now(),
+                    "repair_prompt": repair_record,
+                    "repair_prompt_digest": prompt.digest,
+                    "repair_prompt_action_key": repair_action_key,
+                    "wait_condition": "repair_prompt_delivery",
+                    "wait_source_ref": (
+                        f"{self.runtime.adapter_name}://attempt/"
+                        f"{state['attempt_id']}/repair/{prompt.digest}"
+                    ),
+                    "wait_event_identity": repair_action_key,
+                    "next_check_at": (
+                        datetime.now(timezone.utc) + timedelta(seconds=30)
+                    ).isoformat(),
+                }
+            )
+            self._write_state(
+                state["repository"],
+                state["plan_digest"],
+                state,
+            )
+            try:
+                self.runtime.repair(binding, prompt)
+            except RuntimeAdapterError as error:
+                repair_record["delivery_state"] = "ambiguous"
+                state.update(
+                    {
+                        "directive": "wait_for_runtime",
+                        "attempt_state": "repair_delivery_ambiguous",
+                        "candidate_sha": None,
+                        "candidate_observation": None,
+                        "repair_prompt": repair_record,
+                        "last_runtime_error": _runtime_error_record(error),
+                        "wait_condition": "runtime_result",
+                    }
+                )
+                self._write_state(
+                    state["repository"],
+                    state["plan_digest"],
+                    state,
+                )
+                return self._outcome(state)
+            repair_record["delivery_state"] = "accepted"
             state.update(
                 {
                     "status": "waiting",
@@ -4015,6 +4258,7 @@ class Kernel:
                     "review_evidence": None,
                     "candidate_observation": None,
                     "prior_review_context": prior_review_context,
+                    "repair_prompt": repair_record,
                     "worker_parked_for_ci": False,
                     "wait_condition": "runtime_result",
                     "wait_source_ref": (
@@ -4022,7 +4266,7 @@ class Kernel:
                         f"{state['attempt_id']}/repair"
                     ),
                     "wait_event_identity": (
-                        f"repair:{state['attempt_id']}:{repair_rounds_used + 1}"
+                        repair_action_key
                     ),
                     "next_check_at": (
                         datetime.now(timezone.utc) + timedelta(seconds=30)
@@ -5657,6 +5901,7 @@ class Kernel:
                     binding,
                     terminal_reason="no_result",
                     findings=(f"{error.code}: {error.detail}",),
+                    cause_type="runtime_result_failure",
                 )
             if error.failure_class == "permanent":
                 state.update(
@@ -5681,6 +5926,7 @@ class Kernel:
                     binding,
                     terminal_reason="runtime_lost",
                     findings=(f"{error.code}: {error.detail}",),
+                    cause_type="runtime_infrastructure_failure",
                 )
             state.update(
                 {
@@ -5714,6 +5960,7 @@ class Kernel:
                         observation.terminal_detail
                         or "Runtime returned a typed no_result",
                     ),
+                    cause_type="runtime_no_result",
                 )
             if state.get("resume_sent") and observation.lifecycle in {
                 "idle",
@@ -5730,6 +5977,7 @@ class Kernel:
                     findings=(
                         "runtime reached a terminal lifecycle without a Result Claim",
                     ),
+                    cause_type="runtime_no_result",
                 )
             state.update(
                 {
@@ -5763,6 +6011,7 @@ class Kernel:
                 binding,
                 terminal_reason="no_result",
                 findings=("Repair Round returned the unchanged rejected Candidate",),
+                cause_type="repair_no_change",
             )
         state.update(
             {
@@ -5815,6 +6064,7 @@ class Kernel:
                             for item in pre_review.missing_evidence
                         ),
                     ),
+                    cause_type="local_pre_review_failure",
                 )
             affected_ids = {
                 str(check["check_id"])
@@ -5878,6 +6128,7 @@ class Kernel:
                     binding,
                     terminal_reason="rejected",
                     findings=decision.findings,
+                    cause_type="candidate_verification_failure",
                 )
             state.update(
                 {

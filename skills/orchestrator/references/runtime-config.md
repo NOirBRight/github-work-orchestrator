@@ -196,6 +196,24 @@ concrete model, thinking option, mode, and feature is checked against fresh
 Paseo capabilities before creation. Ambiguous or unsupported combinations
 fail closed for that action.
 
+## V8 typed Repair Prompts
+
+Candidate repair uses one bounded typed `causes` list. A `review_blocker`
+cause preserves the Review axis and the exact `severity`, `code`, `source`,
+`location`, and `message` finding dict observed by the Runtime Adapter.
+`local_check_failure`, Review blockers, hosted-check state, and
+runtime/infrastructure failure remain distinct causes; hosted-only checks are
+publication or Integration Batch work and are never projected into Worker
+repair instructions.
+
+The same-Attempt Repair Prompt contains the rejected Candidate SHA, the
+acceptance digest, the Candidate's changed-file list, and the bounded causes.
+It does not repeat the full Plan, declared file contents, Worker transcript,
+or check commands. The Kernel derives the Prompt and payload digests
+canonically, persists the round/action/digests before delivery, and adopts
+that identity after restart. An already reserved or accepted Repair Prompt is
+never sent again merely because Coordinator process state was lost.
+
 Paseo 0.1.110 advertises `low/high/max` for Kimi K2.7 while its daemon accepts
 `on` and rejects the tested `high/max` values. GWO therefore permits the exact
 K2.7 `kimi-cli` value `on` as a narrow discovery compatibility exception. K3
