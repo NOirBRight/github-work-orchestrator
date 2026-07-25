@@ -230,6 +230,9 @@ strictly decodes each path as UTF-8 without line splitting or trimming, so
 Unicode, embedded newlines, and leading or trailing whitespace remain intact.
 A Git error, malformed NUL framing, or undecodable path fails closed; declared
 `file_changes` are never substituted for Candidate diff evidence.
+No-Candidate Repair Rounds carry an empty changed-file list without invoking
+the Candidate collector, and runtime-loss blocking does not build a Repair
+Packet.
 
 Paseo 0.1.110 advertises `low/high/max` for Kimi K2.7 while its daemon accepts
 `on` and rejects the tested `high/max` values. GWO therefore permits the exact

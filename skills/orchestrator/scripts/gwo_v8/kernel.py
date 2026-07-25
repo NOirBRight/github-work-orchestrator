@@ -4169,18 +4169,28 @@ class Kernel:
             "candidate_sha": state.get("candidate_sha"),
             "findings": prior_findings[:32],
         }
-        packet = ladder.recovery_packet(
-            candidate_sha=str(state.get("candidate_sha") or ""),
-            acceptance_digest=self._acceptance_digest(goal, work_item),
-            changed_files=self._repair_changed_files(state, work_node, binding),
-            causes=self._repair_causes(
-                state,
-                work_node,
-                cause_type=cause_type,
-                findings=findings,
-            ),
-        )
+
+        def recovery_packet() -> str:
+            candidate_sha = state.get("candidate_sha")
+            changed_files = (
+                []
+                if candidate_sha is None
+                else self._repair_changed_files(state, work_node, binding)
+            )
+            return ladder.recovery_packet(
+                candidate_sha=str(candidate_sha or ""),
+                acceptance_digest=self._acceptance_digest(goal, work_item),
+                changed_files=changed_files,
+                causes=self._repair_causes(
+                    state,
+                    work_node,
+                    cause_type=cause_type,
+                    findings=findings,
+                ),
+            )
+
         if directive.action == "repair_same_attempt":
+            packet = recovery_packet()
             prompt = self._recovery_prompt(
                 work_node,
                 packet,
@@ -4332,6 +4342,7 @@ class Kernel:
                 )
                 return self._outcome(state)
             old_attempt_id = str(state["attempt_id"])
+            packet = recovery_packet()
             prompt = self._recovery_prompt(
                 work_node,
                 packet,

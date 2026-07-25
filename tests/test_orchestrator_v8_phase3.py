@@ -1769,7 +1769,7 @@ def test_terminal_worker_without_result_enters_one_bounded_repair_round(
         expected_active_digest=None,
         writer_generation="phase-3",
     )
-    client = InMemoryPaseoClient()
+    client = _RepairCapturePaseoClient()
     kernel = Kernel(
         store_path=store_path,
         publication=publication,
@@ -1801,6 +1801,9 @@ def test_terminal_worker_without_result_enters_one_bounded_repair_round(
     assert repaired.attempt_state == "repairing"
     assert repaired.repair_rounds_used == 1
     assert repaired.wait_condition == "runtime_result"
+    repair_round = json.loads(client.repair_prompts[0][1].text)["repair_round"]
+    assert repair_round["candidate_sha"] == ""
+    assert repair_round["changed_files"] == []
 
 
 def test_paseo_runtime_captures_bounded_typed_no_result(tmp_path):
