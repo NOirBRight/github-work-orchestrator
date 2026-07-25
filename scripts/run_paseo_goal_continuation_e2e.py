@@ -55,7 +55,7 @@ def _inputs(repository_key: str) -> tuple[dict, dict, dict]:
         (
             "from pathlib import Path; "
             "assert Path('continuation.txt').read_text() "
-            "== 'missed finish adopted\\n'"
+            "== 'missed finish verified\\n'"
         ),
     ]
     work_item = {
@@ -65,7 +65,7 @@ def _inputs(repository_key: str) -> tuple[dict, dict, dict]:
         "title": "Prove missed finish continuation",
         "outcome_contract": {
             "path": "continuation.txt",
-            "content": "missed finish adopted\n",
+            "content": "missed finish verified\n",
         },
     }
     node = {
@@ -76,7 +76,7 @@ def _inputs(repository_key: str) -> tuple[dict, dict, dict]:
             "file_changes": [
                 {
                     "path": "continuation.txt",
-                    "content": "missed finish adopted\n",
+                    "content": "missed finish verified\n",
                 }
             ],
         },
@@ -113,7 +113,10 @@ def _inputs(repository_key: str) -> tuple[dict, dict, dict]:
         "goals": [
             {
                 "goal_key": node["goal_key"],
-                "objective": "Adopt a detached Worker result after a missed finish.",
+                "objective": (
+                    "Read and verify a detached Worker Result Claim after a "
+                    "missed finish."
+                ),
                 "acceptance": ["The exact Candidate is integrated and retired."],
             }
         ],
@@ -314,7 +317,10 @@ def main() -> int:
         snapshot = GoalSnapshot(
             repository=repository_key,
             goal_key="goal:live-continuation",
-            objective="Adopt a detached Worker result after a missed finish.",
+            objective=(
+                "Read and verify a detached Worker Result Claim after a missed "
+                "finish."
+            ),
             acceptance=("The exact Candidate is integrated and retired.",),
             plan_digest=compiled.digest,
             work_items=(("issue:live-continuation", "active"),),
@@ -466,24 +472,28 @@ def main() -> int:
                 auto_profile=coordinator_profile,
                 durable=durable,
             )
-            adopted = restarted_driver.run_once(snapshot)
-            adopted_state = restarted_kernel._read_state(
+            verified = restarted_driver.run_once(snapshot)
+            verified_state = restarted_kernel._read_state(
                 repository_key,
                 compiled.digest,
                 work_node["node_key"],
             )
-            if adopted_state is None:
-                raise AssertionError("due readback omitted the adopted Result")
-            candidate_sha = adopted_state.get("candidate_sha")
-            result_digest = adopted_state.get("result_digest")
+            if verified_state is None:
+                raise AssertionError(
+                    "due readback omitted the submitted Result Claim"
+                )
+            candidate_sha = verified_state.get("candidate_sha")
+            result_digest = verified_state.get("result_digest")
             if (
                 not isinstance(candidate_sha, str)
                 or not isinstance(result_digest, str)
                 or not result_digest
             ):
-                raise AssertionError("due readback did not adopt the exact Result")
+                raise AssertionError(
+                    "due readback did not verify the exact Result Claim"
+                )
             if not client.inspect(record.agent_id).archived:
-                raise AssertionError("adopted Worker was not retired")
+                raise AssertionError("verified Worker was not retired")
 
             repeated = restarted_driver.run_once(snapshot)
             repeated_state = restarted_kernel._read_state(
@@ -499,12 +509,14 @@ def main() -> int:
                 or repeated_state.get("candidate_sha") != candidate_sha
                 or repeated_state.get("result_digest") != result_digest
             ):
-                raise AssertionError("repeated readback changed exact-once adoption")
+                raise AssertionError(
+                    "repeated readback changed exact-once verification"
+                )
             summary = {
                 "agent_id": record.agent_id,
                 "candidate_sha": candidate_sha,
                 "declared_parent_agent_id": declared_parent,
-                "first_due_directive": adopted.kind,
+                "first_due_directive": verified.kind,
                 "native_finish_notification_supported": False,
                 "parent_agent_id": None,
                 "prompt_acceptance_count": prompt_acceptance_count,

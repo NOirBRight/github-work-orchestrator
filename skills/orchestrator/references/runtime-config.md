@@ -311,10 +311,11 @@ clears only that wait latch and runs one idempotent Kernel Reconciliation pass,
 which reads the same Agent, session, Admission, Review action, and Prompt
 identities. A matching event wakes the same readback first. A not-yet-due wait
 does not invoke the Kernel, and human or Decision Gate waits never become time
-polls. Process restart reloads the same wait identities from the Store, so a
-missed CLI finish notification adopts one exact terminal Result and retires
-the existing child without another create or Prompt. No Coordinator, Worker,
-or Reviewer Agent remains alive merely to detect progress.
+polls. Process restart reloads the same wait identities from the Store, reads
+the same runtime resource and Result Claim, lets the Kernel verify it once,
+and retires the existing child without another create or Prompt. No
+Coordinator, Worker, or Reviewer Agent remains alive merely to detect
+progress.
 
 After an acknowledgement loss, reconciliation queries the exact digest first:
 an accepted Prompt is adopted without another send. Before the one large
@@ -378,9 +379,10 @@ python scripts/run_paseo_goal_continuation_e2e.py --live
 
 It proves raw `ParentAgentId` remains null, declared ownership remains
 readable, native finish notification is unavailable, and a due Goal Driver
-pass after restart adopts and retires the exact Result once. It also reads back
-one accepted Prompt before retirement and one Agent after a repeated pass. The
-environment equivalent is `GWO_RUN_PASEO_GOAL_CONTINUATION_E2E=1`.
+pass after restart reads the same runtime resource and Result Claim before
+Kernel verification and retirement. It also reads back one accepted Prompt
+before retirement and one Agent after a repeated pass. The environment
+equivalent is `GWO_RUN_PASEO_GOAL_CONTINUATION_E2E=1`.
 
 Legacy migration is an explicit configuration operation:
 

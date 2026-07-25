@@ -316,6 +316,25 @@ class _ReviewingInMemoryRuntime(InMemoryRuntimeAdapter):
         return None
 
 
+class _ReadCountingDetachedPaseoClient(InMemoryPaseoClient):
+    def __init__(self):
+        super().__init__(native_finish_notification_supported=False)
+        self.output_read_counts: dict[str, int] = {}
+
+    def read_output(self, agent_id: str) -> str | None:
+        self.output_read_counts[agent_id] = (
+            self.output_read_counts.get(agent_id, 0) + 1
+        )
+        return super().read_output(agent_id)
+
+    def reset_output_read_counts(self, agent_ids: tuple[str, ...]) -> None:
+        for agent_id in agent_ids:
+            self.output_read_counts[agent_id] = 0
+
+    def accepted_digest_count(self, agent_id: str, digest: str) -> int:
+        return self._accepted_prompt_digests.get(agent_id, []).count(digest)
+
+
 class _BarrierRuntime(InMemoryRuntimeAdapter):
     def __init__(self, workspace_root: Path):
         super().__init__(workspace_root)
@@ -1398,7 +1417,7 @@ def test_due_wait_never_polls_human_decision(tmp_path):
     assert reconciler.calls == 1
 
 
-def test_missed_finish_restart_adopts_result_once_and_retires(tmp_path):
+def test_missed_finish_restart_verifies_result_claim_once_and_retires(tmp_path):
     repository = _temporary_repository(tmp_path)
     intent, source, policy = _multi_ready_inputs(count=1)
     compiled = PlanCompiler().compile(
@@ -1520,16 +1539,16 @@ def test_missed_finish_restart_adopts_result_once_and_retires(tmp_path):
         auto_profile=_coordinator_profile(),
         durable=InMemoryDurableGoalControl(),
     )
-    adopted = restarted_driver.run_once(snapshot)
-    adopted_state = restarted_kernel._read_state(
+    verified = restarted_driver.run_once(snapshot)
+    verified_state = restarted_kernel._read_state(
         snapshot.repository,
         compiled.digest,
         work_node["node_key"],
     )
-    assert adopted.kind == "finish"
-    assert adopted_state is not None
-    assert adopted_state["candidate_sha"] == candidate_sha
-    result_digest = adopted_state["result_digest"]
+    assert verified.kind == "finish"
+    assert verified_state is not None
+    assert verified_state["candidate_sha"] == candidate_sha
+    result_digest = verified_state["result_digest"]
     assert isinstance(result_digest, str) and result_digest
     assert client.inspect(record.agent_id).archived is True
     assert client.create_count == 1
@@ -1548,6 +1567,264 @@ def test_missed_finish_restart_adopts_result_once_and_retires(tmp_path):
     assert finished_state["result_digest"] == result_digest
     assert client.create_count == 1
     assert client.prompt_acceptance_count(record.agent_id, prompt) == 1
+
+
+def test_missed_finish_restart_reads_completed_review_children_once(tmp_path):
+    repository = _temporary_repository(tmp_path)
+    intent, source, _policy = _multi_ready_inputs(count=1)
+    intent["nodes"][0]["risk"] = "standard"
+    policy = _local_first_policy(1)
+    for definition in policy["check_definitions"]:
+        if definition["hosted_only"] is not True:
+            definition["suite"] = "affected"
+    policy["check_definitions"].append(
+        {
+            "check_id": "module-1-repository",
+            "version": 1,
+            "command": [
+                "python",
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "assert Path('module-1.txt').read_text() == 'module 1\\n'"
+                ),
+            ],
+            "hosted_name": None,
+            "environment_requirements": ["python"],
+            "input_selector": ["module-1.txt"],
+            "base_sensitive": False,
+            "risk": "low",
+            "hosted_only": False,
+            "suite": "repository",
+        }
+    )
+    compiled = PlanCompiler().compile(intent, source, policy)
+    plan = json.loads(compiled.canonical_bytes)
+    work_node = next(node for node in plan["nodes"] if node["kind"] == "work")
+    store_path = tmp_path / "driver.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-4a",
+    )
+    client = _ReadCountingDetachedPaseoClient()
+    delivery = InMemoryDeliveryControl(hosted_outcomes=("passed",))
+    runtime_config = {
+        "active_turn_pools": {"workers": 1, "coordinators": 1},
+        "repositories": {},
+        "runtime_profiles": {
+            "reviewer_standard": {
+                "provider": "codex",
+                "settings": {
+                    "model": "gpt-5.6-sol",
+                    "thinkingOptionId": "high",
+                    "modeId": "full-access",
+                    "features": {},
+                },
+            }
+        },
+        "review_profiles": {"standard_axis": "reviewer_standard"},
+    }
+
+    def new_kernel() -> Kernel:
+        return Kernel(
+            store_path=store_path,
+            publication=publication,
+            runtime=PaseoRuntimeAdapter(client),
+            verifier=EvidenceVerifier(),
+            repository_path=repository,
+            integration_branch="main",
+            writer_generation="phase-4a",
+            runtime_profile=_runtime_profile(),
+            delivery_control=delivery,
+            parent_agent_id="coordinator-agent",
+            runtime_config=runtime_config,
+        )
+
+    snapshot = GoalSnapshot(
+        repository=source["repository"],
+        goal_key="goal:phase-4a",
+        objective="Build the compatible ready frontier in parallel.",
+        acceptance=("Every independent module is integrated.",),
+        plan_digest=compiled.digest,
+        work_items=(("issue:101", "active"),),
+        decision_inputs=(),
+    )
+    durable = InMemoryDurableGoalControl()
+    first_kernel = new_kernel()
+    first_driver = GoalDriver(
+        store_path=store_path,
+        reconciler=first_kernel,
+        coordinators=InMemoryCoordinatorRuntime(),
+        auto_profile=_coordinator_profile(),
+        durable=durable,
+    )
+
+    worker_wait = first_driver.run_once(snapshot)
+    worker_record = client.find_by_labels(
+        {"gwo.node": work_node["node_key"]}
+    )[0]
+    worker_state = first_kernel._read_state(
+        snapshot.repository,
+        compiled.digest,
+        work_node["node_key"],
+    )
+    assert worker_state is not None
+    workspace = Path(worker_record.workspace)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "--detach",
+            str(workspace),
+            worker_state["base_sha"],
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    (workspace / "module-1.txt").write_text("module 1\n", encoding="utf-8")
+    _git(workspace, "add", "module-1.txt")
+    _git(workspace, "commit", "-m", "Complete review restart candidate")
+    candidate_sha = _git(workspace, "rev-parse", "HEAD")
+    client.set_output(
+        worker_record.agent_id,
+        "GWO_RESULT "
+        + json.dumps(
+            {
+                "schema_version": 1,
+                "action_key": work_node["node_key"],
+                "candidate_sha": candidate_sha,
+            },
+            separators=(",", ":"),
+        ),
+    )
+    assert worker_wait.kind == "wait"
+
+    worker_status = first_driver.read_status(
+        snapshot.repository,
+        snapshot.goal_key,
+    )
+    assert worker_status is not None
+    first_driver._write_status(
+        replace(
+            worker_status,
+            next_check_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+        )
+    )
+    review_wait = first_driver.run_once(snapshot)
+    reviewing_state = first_kernel._read_state(
+        snapshot.repository,
+        compiled.digest,
+        work_node["node_key"],
+    )
+    assert review_wait.kind == "wait"
+    assert reviewing_state is not None
+    assert reviewing_state["wait_condition"] == "review_axis"
+    review_records = client.find_by_labels(
+        {"gwo.review_attempt": reviewing_state["attempt_id"]}
+    )
+    assert len(review_records) == 2
+    assert {
+        record.labels["gwo.review_axis"] for record in review_records
+    } == {"standards", "spec"}
+
+    prompt_digests: dict[str, str] = {}
+    for record in review_records:
+        labels = record.labels
+        prompt_digest = labels["gwo.prompt_digest"]
+        prompt_digests[record.agent_id] = prompt_digest
+        assert client.accepted_digest_count(record.agent_id, prompt_digest) == 1
+        client.set_output(
+            record.agent_id,
+            "GWO_REVIEW_AXIS "
+            + json.dumps(
+                {
+                    "schema_version": 1,
+                    "action_key": labels["gwo.action_key"],
+                    "candidate_sha": candidate_sha,
+                    "axis": labels["gwo.review_axis"],
+                    "fixed_input_digest": labels["gwo.review_input"],
+                    "findings": [],
+                },
+                separators=(",", ":"),
+            ),
+        )
+    review_agent_ids = tuple(record.agent_id for record in review_records)
+    client.reset_output_read_counts(review_agent_ids)
+
+    review_status = first_driver.read_status(
+        snapshot.repository,
+        snapshot.goal_key,
+    )
+    assert review_status is not None
+    first_driver._write_status(
+        replace(
+            review_status,
+            next_check_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+        )
+    )
+
+    restarted_kernel = new_kernel()
+    restarted_driver = GoalDriver(
+        store_path=store_path,
+        reconciler=restarted_kernel,
+        coordinators=InMemoryCoordinatorRuntime(),
+        auto_profile=_coordinator_profile(),
+        durable=durable,
+    )
+    verified = restarted_driver.run_once(snapshot)
+    verified_state = restarted_kernel._read_state(
+        snapshot.repository,
+        compiled.digest,
+        work_node["node_key"],
+    )
+
+    assert verified.kind == "finish"
+    assert verified_state is not None
+    assert verified_state["status"] == "complete"
+    assert set(verified_state["review_observations"]) == {
+        "standards:0",
+        "spec:0",
+    }
+    assert all(
+        item["lifecycle"] == "completed"
+        for item in verified_state["review_observations"].values()
+    )
+    assert verified_state["review_children_retired"] is True
+    assert {
+        agent_id: client.output_read_counts[agent_id]
+        for agent_id in review_agent_ids
+    } == {agent_id: 1 for agent_id in review_agent_ids}
+    assert all(client.inspect(agent_id).archived for agent_id in review_agent_ids)
+    assert client.create_count == 3
+    assert client.send_count == 0
+    assert all(
+        client.accepted_digest_count(agent_id, prompt_digests[agent_id]) == 1
+        for agent_id in review_agent_ids
+    )
+
+    repeated = restarted_driver.run_once(snapshot)
+
+    assert repeated.kind == "finish"
+    assert client.create_count == 3
+    assert {
+        agent_id: client.output_read_counts[agent_id]
+        for agent_id in review_agent_ids
+    } == {agent_id: 1 for agent_id in review_agent_ids}
+    assert all(
+        client.accepted_digest_count(agent_id, prompt_digests[agent_id]) == 1
+        for agent_id in review_agent_ids
+    )
 
 
 def test_kernel_sweep_never_hides_decision_or_coordinator_directives():
