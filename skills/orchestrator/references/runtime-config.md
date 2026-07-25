@@ -224,6 +224,12 @@ Changed-file metadata retains the exact ordered path list. Its canonical JSON
 encoding is limited to 4 KiB and each path to 256 characters; exceeding either
 allocation rejects the packet instead of truncating a path, partially
 including an entry, or dropping later files.
+The Kernel collects that list directly from NUL-delimited, unquoted
+`git diff --name-only -z` output for the exact base-to-Candidate range. It
+strictly decodes each path as UTF-8 without line splitting or trimming, so
+Unicode, embedded newlines, and leading or trailing whitespace remain intact.
+A Git error, malformed NUL framing, or undecodable path fails closed; declared
+`file_changes` are never substituted for Candidate diff evidence.
 
 Paseo 0.1.110 advertises `low/high/max` for Kimi K2.7 while its daemon accepts
 `on` and rejects the tested `high/max` values. GWO therefore permits the exact

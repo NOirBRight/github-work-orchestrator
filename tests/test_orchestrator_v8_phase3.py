@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -287,6 +288,71 @@ def _temporary_repository(tmp_path: Path) -> Path:
     _git(repository, "add", "README.md")
     _git(repository, "commit", "-m", "base")
     return repository
+
+
+def test_repair_changed_files_preserves_exact_git_paths(tmp_path):
+    repository = _temporary_repository(tmp_path)
+    base_sha = _git(repository, "rev-parse", "HEAD")
+    paths = [
+        "unicodé-雪.txt",
+        "line\nbreak.txt",
+        " leading.txt",
+        "trailing.txt ",
+    ]
+    tree_entries = [("README.md", _git(repository, "rev-parse", "HEAD:README.md"))]
+    for ordinal, path in enumerate(paths):
+        blob = subprocess.run(
+            ["git", "-C", str(repository), "hash-object", "-w", "--stdin"],
+            input=f"exact path {ordinal}\n".encode(),
+            check=True,
+            capture_output=True,
+        ).stdout.decode("ascii").strip()
+        tree_entries.append((path, blob))
+    tree_input = b"".join(
+        b"100644 blob "
+        + blob.encode("ascii")
+        + b"\t"
+        + path.encode("utf-8")
+        + b"\0"
+        for path, blob in sorted(
+            tree_entries,
+            key=lambda entry: entry[0].encode("utf-8"),
+        )
+    )
+    tree_sha = subprocess.run(
+        ["git", "-C", str(repository), "mktree", "-z"],
+        input=tree_input,
+        check=True,
+        capture_output=True,
+    ).stdout.decode("ascii").strip()
+    candidate_sha = subprocess.run(
+        ["git", "-C", str(repository), "commit-tree", tree_sha, "-p", base_sha],
+        input=b"exact paths\n",
+        check=True,
+        capture_output=True,
+    ).stdout.decode("ascii").strip()
+    binding = SimpleNamespace(workspace=str(repository))
+    declared_inputs = {
+        "inputs": {"file_changes": [{"path": "declared-only.txt"}]}
+    }
+
+    changed_files = Kernel._repair_changed_files(
+        object(),
+        {"candidate_sha": candidate_sha, "base_sha": base_sha},
+        declared_inputs,
+        binding,
+    )
+
+    assert changed_files == sorted(paths, key=lambda path: path.encode("utf-8"))
+
+    with pytest.raises(KernelError) as git_error:
+        Kernel._repair_changed_files(
+            object(),
+            {"candidate_sha": "0" * 40, "base_sha": base_sha},
+            declared_inputs,
+            binding,
+        )
+    assert git_error.value.code == "GIT_OPERATION_FAILED"
 
 
 def _execute_candidate(tmp_path: Path, *, risk: str = "low"):

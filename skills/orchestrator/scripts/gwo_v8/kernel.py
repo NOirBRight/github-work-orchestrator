@@ -4001,38 +4001,59 @@ class Kernel:
         work_node: dict[str, Any],
         binding,
     ) -> list[str]:
+        del work_node
         candidate_sha = state.get("candidate_sha")
         base_sha = state.get("base_sha")
-        if (
+        if not (
             isinstance(candidate_sha, str)
             and len(candidate_sha) == 40
             and isinstance(base_sha, str)
             and len(base_sha) == 40
         ):
-            try:
-                changed = _git(
-                    Path(binding.workspace).resolve(),
-                    "diff",
-                    "--name-only",
-                    f"{base_sha}...{candidate_sha}",
-                )
-                return sorted(
-                    {
-                        line.strip()
-                        for line in changed.splitlines()
-                        if line.strip()
-                    }
-                )
-            except RuntimeAdapterError:
-                pass
-        return sorted(
-            {
-                str(change.get("path"))
-                for change in (work_node.get("inputs") or {}).get("file_changes")
-                or ()
-                if isinstance(change, dict) and change.get("path")
-            }
+            raise KernelError(
+                "REPAIR_CHANGED_FILES_UNAVAILABLE",
+                "exact changed-file collection requires Candidate and base SHAs",
+            )
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(Path(binding.workspace).resolve()),
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--name-only",
+                "-z",
+                f"{base_sha}...{candidate_sha}",
+            ],
+            capture_output=True,
         )
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise KernelError(
+                "GIT_OPERATION_FAILED",
+                detail or "git changed-file collection failed",
+            )
+        output = result.stdout
+        if output and not output.endswith(b"\0"):
+            raise KernelError(
+                "GIT_CHANGED_FILES_INVALID",
+                "git changed-file output was not NUL-terminated",
+            )
+        encoded_paths = output.split(b"\0")
+        encoded_paths.pop()
+        if any(not path for path in encoded_paths):
+            raise KernelError(
+                "GIT_CHANGED_FILES_INVALID",
+                "git changed-file output contained an empty path",
+            )
+        try:
+            return [path.decode("utf-8") for path in encoded_paths]
+        except UnicodeDecodeError as error:
+            raise KernelError(
+                "GIT_CHANGED_FILES_INVALID",
+                "git changed-file output was not valid UTF-8",
+            ) from error
 
     @staticmethod
     def _repair_causes(
