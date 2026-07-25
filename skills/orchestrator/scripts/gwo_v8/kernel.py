@@ -16,6 +16,12 @@ from urllib.parse import quote
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
 from .activation import LocalPlanPublication
+from .effect_verification import (
+    EffectContractVerifier,
+    EffectVerificationError,
+    adoption_evidence_is_valid,
+    verified_result_producer_binding,
+)
 from .evidence import (
     EvidenceVerifier,
     ResultClaim,
@@ -1227,6 +1233,11 @@ class Kernel:
             assert_writer=self._assert_state_writer,
             persist_state=self._persist_state_snapshot,
         )
+        self._effect_verification = EffectContractVerifier(
+            observer_id=self.writer_generation,
+            assert_writer=self._assert_state_writer,
+            persist_state=self._persist_state_snapshot,
+        )
         with self._connect() as connection:
             self.ensure_store_schema(connection)
 
@@ -1503,6 +1514,8 @@ class Kernel:
                 candidate_sha TEXT NOT NULL,
                 result_digest TEXT NOT NULL,
                 base_sha TEXT NOT NULL,
+                integrated_sha TEXT,
+                producer_binding_digest TEXT,
                 evidence_manifest_digest TEXT,
                 evidence_json TEXT,
                 superseded INTEGER NOT NULL DEFAULT 0,
@@ -1540,6 +1553,28 @@ class Kernel:
                 """
                 ALTER TABLE v8_verified_results
                 ADD COLUMN evidence_json TEXT
+                """
+            )
+        if "integrated_sha" not in result_columns:
+            connection.execute(
+                """
+                ALTER TABLE v8_verified_results
+                ADD COLUMN integrated_sha TEXT
+                """
+            )
+            if "authoritative_base_sha" in result_columns:
+                connection.execute(
+                    """
+                    UPDATE v8_verified_results
+                    SET integrated_sha = authoritative_base_sha
+                    WHERE integrated_sha IS NULL
+                    """
+                )
+        if "producer_binding_digest" not in result_columns:
+            connection.execute(
+                """
+                ALTER TABLE v8_verified_results
+                ADD COLUMN producer_binding_digest TEXT
                 """
             )
 
@@ -3122,6 +3157,7 @@ class Kernel:
             "resume_sent": False,
         }
         state.update(ReviewConvergence.initial_fields())
+        state.update(EffectContractVerifier.initial_fields())
         return state
 
     def _adopt_verified_result(
@@ -3143,10 +3179,15 @@ class Kernel:
             rows = connection.execute(
                 """
                 SELECT
+                    repository,
                     plan_digest,
+                    node_key,
+                    contract_digest,
                     candidate_sha,
                     result_digest,
                     base_sha,
+                    integrated_sha,
+                    producer_binding_digest,
                     evidence_manifest_digest,
                     evidence_json
                 FROM v8_verified_results
@@ -3167,11 +3208,23 @@ class Kernel:
                 continue
             try:
                 evidence_record = json.loads(row["evidence_json"])
-                if (
-                    not isinstance(evidence_record, dict)
-                    or digest_value(evidence_record) != row["evidence_manifest_digest"]
-                ):
+                if not isinstance(evidence_record, dict):
                     continue
+            except json.JSONDecodeError:
+                continue
+            try:
+                valid_effect_evidence = adoption_evidence_is_valid(
+                    self.repository_path,
+                    current_target_sha=current_base,
+                    source_row=dict(row),
+                    evidence_record=evidence_record,
+                    work_node=work_node,
+                )
+            except EffectVerificationError as error:
+                raise KernelError(error.code, error.detail) from error
+            if not valid_effect_evidence:
+                continue
+            try:
                 historical_binding = RuntimeBinding(**evidence_record["binding"])
                 historical_claim = ResultClaim(**evidence_record["result_claim"])
                 historical_observation = RuntimeObservation(
@@ -3182,25 +3235,9 @@ class Kernel:
                         TypedEvidence(**item) for item in evidence_record["evidence"]
                     ),
                 )
-            except (KeyError, TypeError, json.JSONDecodeError):
+            except (KeyError, TypeError):
                 continue
             candidate_sha = str(row["candidate_sha"])
-            ancestry = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(self.repository_path),
-                    "merge-base",
-                    "--is-ancestor",
-                    candidate_sha,
-                    current_base,
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-            )
-            if ancestry.returncode != 0:
-                continue
             refresh_evidence_digests: tuple[str, ...] = ()
             if base_sensitive and row["base_sha"] != current_base:
                 refreshed = self._refresh_base_sensitive_evidence(
@@ -3252,24 +3289,6 @@ class Kernel:
                     batch_sha = ""
                     batch_hosted = ()
                     batch_integration = None
-                batch_ancestry = (
-                    subprocess.run(
-                        [
-                            "git",
-                            "-C",
-                            str(self.repository_path),
-                            "merge-base",
-                            "--is-ancestor",
-                            batch_sha,
-                            current_base,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                    )
-                    if batch_sha
-                    else None
-                )
                 expected_hosted_names = {
                     str(definition["hosted_name"])
                     for definition in hosted_definitions
@@ -3284,8 +3303,7 @@ class Kernel:
                     and item.has_valid_digest()
                 }
                 batch_is_valid = (
-                    batch_ancestry is not None
-                    and batch_ancestry.returncode == 0
+                    batch_sha == row["integrated_sha"]
                     and batch_integration is not None
                     and batch_integration.kind == "integration"
                     and batch_integration.subject == batch_sha
@@ -3509,8 +3527,27 @@ class Kernel:
                 "VERIFIED_RESULT_EVIDENCE_MISSING",
                 "verified Result has no persisted Evidence record",
             )
+        integrated_sha = str(state.get("integrated_sha") or "")
+        producer_binding = verified_result_producer_binding(
+            state,
+            candidate_sha=candidate_sha,
+            result_digest=result_digest,
+            integrated_sha=integrated_sha,
+            observer_id=self.writer_generation,
+        )
+        if producer_binding is None:
+            raise KernelError(
+                "VERIFIED_RESULT_EVIDENCE_INVALID",
+                "verified Result Effect Contract Evidence failed readback",
+            )
         evidence_record = {
             **candidate_observation,
+            "producer_binding": producer_binding,
+            "candidate_evidence_manifest": state["candidate_evidence_manifest"],
+            "candidate_evidence_manifest_digest": state[
+                "candidate_evidence_manifest_digest"
+            ],
+            "effect_contract_verification": state["effect_verification"],
             "hosted_check_evidence": list(state.get("hosted_check_evidence") or ()),
             "retirement": state.get("retirement"),
             "integration_batch": {
@@ -3535,10 +3572,12 @@ class Kernel:
                     candidate_sha,
                     result_digest,
                     base_sha,
+                    integrated_sha,
+                    producer_binding_digest,
                     evidence_manifest_digest,
                     evidence_json,
                     superseded
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 ON CONFLICT(
                     repository,
                     plan_digest,
@@ -3547,6 +3586,8 @@ class Kernel:
                 ) DO UPDATE SET
                     result_digest = excluded.result_digest,
                     base_sha = excluded.base_sha,
+                    integrated_sha = excluded.integrated_sha,
+                    producer_binding_digest = excluded.producer_binding_digest,
                     evidence_manifest_digest = excluded.evidence_manifest_digest,
                     evidence_json = excluded.evidence_json,
                     superseded = 0
@@ -3559,6 +3600,8 @@ class Kernel:
                     candidate_sha,
                     result_digest,
                     state["base_sha"],
+                    integrated_sha,
+                    digest_value(producer_binding),
                     evidence_manifest_digest,
                     evidence_json,
                 ),
@@ -4390,7 +4433,7 @@ class Kernel:
                     "exit_code": int(payload.get("exit_code") or 0),
                 }
             )
-        if not causes:
+        if cause_type == "effect_contract_violation" or not causes:
             causes.append(
                 {
                     "type": cause_type,
@@ -5969,6 +6012,28 @@ class Kernel:
         )
         self._persist_runtime_observation(state, observation)
         self._write_state(repository, active.plan_digest, state)
+        try:
+            effect_decision = self._effect_verification.verify_candidate(
+                state,
+                work_node,
+                binding,
+                observation,
+            )
+        except EffectVerificationError as error:
+            raise KernelError(error.code, error.detail) from error
+        if effect_decision.status != "accepted":
+            # Fail closed before Review materialization or deferred Check
+            # capture: the Candidate diff escapes the authorized Write Scope.
+            return self._handle_semantic_rejection(
+                state,
+                work_node,
+                goal,
+                work_item,
+                binding,
+                terminal_reason="rejected",
+                findings=effect_decision.findings,
+                cause_type="effect_contract_violation",
+            )
         review_mode = (
             (work_node.get("output_contract") or {})
             .get("review_requirement", {})
@@ -6097,14 +6162,39 @@ class Kernel:
             )
         state["result_digest"] = decision.result.result_digest
         state["publication_eligible"] = True
-        state["candidate_evidence_manifest_digest"] = digest_value(
+        effect_evidence = effect_decision.verification
+        manifest_evidence = [
             {
-                "candidate_sha": observation.result_claim.candidate_sha,
-                "check_evidence_digests": list(
-                    eligibility.check_evidence_digests
+                "kind": evidence.kind,
+                **(
+                    {
+                        "decision_type": evidence.payload.get(
+                            "decision_type"
+                        )
+                    }
+                    if evidence.kind == "decision"
+                    else {}
                 ),
-                "review_evidence_digest": eligibility.review_evidence_digest,
+                "content_digest": evidence.content_digest,
+                "source_ref": evidence.source_ref,
             }
+            for evidence in (*observation.evidence, effect_evidence)
+            if evidence.has_valid_digest()
+        ]
+        candidate_evidence_manifest = {
+            "candidate_sha": observation.result_claim.candidate_sha,
+            "evidence": sorted(
+                manifest_evidence,
+                key=lambda item: (
+                    str(item["kind"]),
+                    str(item["content_digest"]),
+                    str(item["source_ref"]),
+                ),
+            ),
+        }
+        state["candidate_evidence_manifest"] = candidate_evidence_manifest
+        state["candidate_evidence_manifest_digest"] = digest_value(
+            candidate_evidence_manifest
         )
         state.update(
             {
