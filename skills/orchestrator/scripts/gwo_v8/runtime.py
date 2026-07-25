@@ -895,6 +895,8 @@ class PaseoClient(Protocol):
 
     def create(self, request: PaseoCreateRequest) -> PaseoAgentRecord: ...
 
+    def consume_create_receipt(self, action_key: str, agent_id: str) -> bool: ...
+
     def inspect(self, agent_id: str) -> PaseoAgentRecord: ...
 
     def send_prompt(
@@ -942,6 +944,7 @@ class InMemoryPaseoClient:
         self._send_acceptances = list(send_acceptances)
         self._accepted_prompt_digests: dict[str, list[str]] = {}
         self._worker_turn_capacity = worker_turn_capacity
+        self._create_receipt: tuple[str, str] | None = None
         self.create_count = 0
         self.send_count = 0
         self.create_prompt_digests: list[str] = []
@@ -969,6 +972,7 @@ class InMemoryPaseoClient:
         )
 
     def create(self, request: PaseoCreateRequest) -> PaseoAgentRecord:
+        self._create_receipt = None
         self.create_count += 1
         self.create_prompt_digests.append(request.prompt.digest)
         existing = self.find_by_labels({"gwo.action_key": request.action_key})
@@ -1023,7 +1027,14 @@ class InMemoryPaseoClient:
                 "synthetic lost Paseo creation acknowledgement",
                 failure_class="ambiguous",
             )
+        self._create_receipt = (request.action_key, agent_id)
         return record
+
+    def consume_create_receipt(self, action_key: str, agent_id: str) -> bool:
+        expected = (action_key, agent_id)
+        created = self._create_receipt == expected
+        self._create_receipt = None
+        return created
 
     def inspect(self, agent_id: str) -> PaseoAgentRecord:
         try:
@@ -1104,6 +1115,7 @@ class PaseoCliClient:
         self.executable = shutil.which(executable) or executable
         self._command_prefix = (self.executable,)
         self._command_environment: dict[str, str] | None = None
+        self._create_receipt: tuple[str, str] | None = None
         if sys.platform == "win32" and Path(self.executable).suffix.lower() in {
             ".bat",
             ".cmd",
@@ -1447,6 +1459,7 @@ class PaseoCliClient:
         return tuple(records)
 
     def create(self, request: PaseoCreateRequest) -> PaseoAgentRecord:
+        self._create_receipt = None
         worktree = f"gwo-{digest_bytes(request.action_key.encode('utf-8'))[:16]}"
         creation_labels = {
             **request.labels,
@@ -1540,7 +1553,14 @@ class PaseoCliClient:
                 "Paseo creation identity became ambiguous",
                 failure_class="ambiguous",
             )
+        self._create_receipt = (request.action_key, agent_id)
         return exact[0]
+
+    def consume_create_receipt(self, action_key: str, agent_id: str) -> bool:
+        expected = (action_key, agent_id)
+        created = self._create_receipt == expected
+        self._create_receipt = None
+        return created
 
     def inspect(self, agent_id: str) -> PaseoAgentRecord:
         payload = self._run(["inspect", agent_id, "--json"])
@@ -1739,6 +1759,24 @@ class PaseoRuntimeAdapter:
                 failure_class="ambiguous",
             )
         return exact[0]
+
+    def _created_in_current_call(
+        self,
+        agent_id: str,
+        action_key: str,
+        labels: dict[str, str],
+    ) -> bool:
+        if not self.client.consume_create_receipt(action_key, agent_id):
+            return False
+        matches = self.client.find_by_labels(labels)
+        exact = [record for record in matches if record.agent_id == agent_id]
+        if len(matches) > 1 or (matches and len(exact) != 1):
+            raise RuntimeAdapterError(
+                "MATERIALIZATION_CREATE_RECEIPT_AMBIGUOUS",
+                "Paseo create receipt identifies a different or duplicate Agent",
+                failure_class="ambiguous",
+            )
+        return len(exact) == 1
 
     def _prompt_is_accepted(
         self,
@@ -2165,9 +2203,13 @@ class PaseoRuntimeAdapter:
         if admission.parent_agent_id is not None:
             labels["gwo.parent_agent"] = admission.parent_agent_id
         existing = self._find_one(labels)
-        created_here = existing is None
-        if created_here:
+        created_here = False
+        if existing is None:
             creation_labels = dict(labels)
+            create_receipt = digest_bytes(
+                f"{admission.admission_id}:".encode("utf-8") + os.urandom(32)
+            )
+            creation_labels["gwo.create_receipt"] = create_receipt
             if (
                 len(prompt.text.encode("utf-8"))
                 <= PASEO_INLINE_PROMPT_MAX_BYTES
@@ -2179,9 +2221,10 @@ class PaseoRuntimeAdapter:
                         f"{admission.admission_id}:prompt",
                     )
                 )
+            create_action_key = f"{admission.admission_id}:materialize"
             existing = self.client.create(
                 PaseoCreateRequest(
-                    action_key=f"{admission.admission_id}:materialize",
+                    action_key=create_action_key,
                     title=f"GWO {admission.node_key}",
                     labels=creation_labels,
                     prompt=prompt,
@@ -2190,6 +2233,14 @@ class PaseoRuntimeAdapter:
                     profile=admission.runtime_profile,
                     parent_agent_id=admission.parent_agent_id,
                 )
+            )
+            created_here = self._created_in_current_call(
+                existing.agent_id,
+                create_action_key,
+                {
+                    **labels,
+                    "gwo.create_receipt": create_receipt,
+                },
             )
         accepted = self._prompt_is_accepted(
             existing.agent_id,
@@ -2884,9 +2935,14 @@ class PaseoRuntimeAdapter:
         for execution in range(3):
             try:
                 agent = self._find_one({"gwo.action_key": request.action_key})
-                created_here = agent is None
+                created_here = False
+                created_agent_id: str | None = None
                 if agent is None:
                     creation_labels = dict(labels)
+                    create_receipt = digest_bytes(
+                        f"{request.action_key}:".encode("utf-8") + os.urandom(32)
+                    )
+                    creation_labels["gwo.create_receipt"] = create_receipt
                     if (
                         len(prompt.text.encode("utf-8"))
                         <= PASEO_INLINE_PROMPT_MAX_BYTES
@@ -2898,7 +2954,7 @@ class PaseoRuntimeAdapter:
                                 request.action_key,
                             )
                         )
-                    self.client.create(
+                    created_agent = self.client.create(
                         PaseoCreateRequest(
                             action_key=request.action_key,
                             title=(
@@ -2913,6 +2969,15 @@ class PaseoRuntimeAdapter:
                             parent_agent_id=parent_agent_id,
                         )
                     )
+                    created_here = self._created_in_current_call(
+                        created_agent.agent_id,
+                        request.action_key,
+                        {
+                            **labels,
+                            "gwo.create_receipt": create_receipt,
+                        },
+                    )
+                    created_agent_id = created_agent.agent_id
                 agent = self._find_one(labels)
                 if agent is None:
                     raise RuntimeAdapterError(
@@ -2920,6 +2985,9 @@ class PaseoRuntimeAdapter:
                         "Review child creation has no exact identity readback",
                         failure_class="ambiguous",
                     )
+                created_here = (
+                    created_here and created_agent_id == agent.agent_id
+                )
                 self._converge_prompt_delivery(
                     agent.agent_id,
                     prompt,

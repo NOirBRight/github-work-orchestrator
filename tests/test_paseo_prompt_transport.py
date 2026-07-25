@@ -243,6 +243,7 @@ class RestartBlindPaseoClient:
         self._labels: dict[str, dict[str, str]] = {}
         self._accepted: dict[str, list[str]] = {}
         self._send_acceptances = list(send_acceptances)
+        self._create_receipt: tuple[str, str] | None = None
         self.create_count = 0
         self.send_count = 0
         self.sent_action_keys: list[str] = []
@@ -275,6 +276,7 @@ class RestartBlindPaseoClient:
         return tuple(matches)
 
     def create(self, request):
+        self._create_receipt = None
         existing = self.find_by_labels({"gwo.action_key": request.action_key})
         if existing:
             return existing[0]
@@ -295,7 +297,14 @@ class RestartBlindPaseoClient:
             "gwo.action_key": request.action_key,
         }
         self._accepted[agent_id] = []
+        self._create_receipt = (request.action_key, agent_id)
         return replace(record, labels=dict(request.labels))
+
+    def consume_create_receipt(self, action_key, agent_id):
+        expected = (action_key, agent_id)
+        created = self._create_receipt == expected
+        self._create_receipt = None
+        return created
 
     def inspect(self, agent_id):
         return replace(self._records[agent_id], labels={}, profile_digest="")
@@ -453,6 +462,7 @@ class AckLabelGapPaseoClient(RestartBlindPaseoClient):
             self._labels = previous._labels
             self._accepted = previous._accepted
             self._send_acceptances = previous._send_acceptances
+            self._create_receipt = None
             self.create_count = previous.create_count
             self.send_count = previous.send_count
             self.sent_action_keys = previous.sent_action_keys
@@ -467,6 +477,53 @@ class AckLabelGapPaseoClient(RestartBlindPaseoClient):
         ):
             return ()
         return super().find_by_labels(labels)
+
+
+class CreateRacePaseoClient(RestartBlindPaseoClient):
+    """Client that idempotently adopts an Agent created after lookup."""
+
+    def create(self, request):
+        raced_request = replace(
+            request,
+            labels={
+                key: value
+                for key, value in request.labels.items()
+                if key != "gwo.create_receipt"
+            },
+        )
+        record = super().create(raced_request)
+        self.consume_create_receipt(request.action_key, record.agent_id)
+        return record
+
+
+def test_worker_lookup_create_race_does_not_authorize_first_send(
+    tmp_path,
+    monkeypatch,
+):
+    prompt = _prompt(310_000, name="worker-create-race")
+    admission = RuntimeAdmission(
+        repository="local/worker-create-race",
+        plan_digest="w" * 64,
+        node_key="node:worker-create-race",
+        admission_id="admission:worker-create-race",
+        repository_path=tmp_path,
+        base_sha="b" * 40,
+        runtime_profile=_profile(),
+    )
+    client = CreateRacePaseoClient()
+    adapter = PaseoRuntimeAdapter(client)
+    pending = adapter.materialize(admission, prompt)
+
+    monkeypatch.setattr("gwo_v8.runtime.PASEO_BOOTSTRAP_WAIT_SECONDS", 0.0)
+    with pytest.raises(RuntimeAdapterError) as ambiguous:
+        adapter.accept_prompt(pending, prompt)
+
+    assert ambiguous.value.code == "PROMPT_DELIVERY_AMBIGUOUS"
+    assert pending.prompt_accepted is False
+    assert client.create_count == 1
+    assert client.send_count == 0
+    assert client.sent_action_keys == []
+    assert "gwo.create_receipt" not in client._labels[pending.agent_id]
 
 
 def test_ack_label_readback_gap_never_replays_across_fresh_client(
@@ -783,6 +840,51 @@ def _repository(tmp_path: Path) -> tuple[Path, str]:
     _git(repository, "add", "README.md")
     _git(repository, "commit", "-m", "transport base")
     return repository, _git(repository, "rev-parse", "HEAD")
+
+
+def test_review_lookup_create_race_does_not_authorize_first_send(
+    tmp_path,
+    monkeypatch,
+):
+    repository, candidate_sha = _repository(tmp_path)
+    request = ReviewAxisRequest(
+        repository="local/review-create-race",
+        attempt_id="attempt:review-create-race",
+        candidate_sha=candidate_sha,
+        base_sha=candidate_sha,
+        axis="standards",
+        recovery_ordinal=0,
+        workspace=repository,
+        diff_command=("git", "diff", f"{candidate_sha}...{candidate_sha}"),
+        commit_list=("transport candidate",),
+        spec_source_ref="synthetic://issue/63",
+        spec_text=json.dumps(
+            {"payload": "r" * 20_000},
+            separators=(",", ":"),
+        ),
+        standards_sources=("AGENTS.md", "CONTEXT.md"),
+        check_manifest_digest="c" * 64,
+    )
+    prompt = request.to_prompt()
+    assert len(prompt.text.encode("utf-8")) > PASEO_INLINE_PROMPT_MAX_BYTES
+    client = CreateRacePaseoClient()
+    adapter = PaseoRuntimeAdapter(client)
+
+    monkeypatch.setattr("gwo_v8.runtime.PASEO_BOOTSTRAP_WAIT_SECONDS", 0.0)
+    with pytest.raises(RuntimeAdapterError) as ambiguous:
+        adapter.materialize_review_axis(
+            request,
+            _profile(),
+            parent_agent_id="worker-parent",
+        )
+
+    assert ambiguous.value.code == "PROMPT_DELIVERY_AMBIGUOUS"
+    agents = client.find_by_labels({"gwo.action_key": request.action_key})
+    assert len(agents) == 1
+    assert client.create_count == 1
+    assert client.send_count == 0
+    assert client.sent_action_keys == []
+    assert "gwo.create_receipt" not in client._labels[agents[0].agent_id]
 
 
 def test_dual_review_axes_above_mcp_limit_adopt_after_restart(tmp_path):

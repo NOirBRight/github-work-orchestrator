@@ -232,6 +232,11 @@ After an acknowledgement loss, reconciliation queries the exact digest first:
 an accepted Prompt is adopted without another send. Before the one large
 Prompt-file send, the adapter requires authoritative bootstrap-idle readback
 and publishes an action-keyed `gwo.prompt_delivery` receipt on the same Agent.
+First-send authority also requires both a client create receipt naming that
+exact Agent and action and authoritative readback of its unique current-call
+`gwo.create_receipt` label. A lookup miss before create is not proof: if
+idempotent create adopts an Agent that appeared in that gap, the existing Agent
+has no first-send authority and remains ambiguous without a delivery receipt.
 Once the send may have been invoked, acknowledgement, elapsed time, and later
 idle observations cannot prove it was absent from Paseo's asynchronous queue.
 An absent or lagging delivery label after acknowledgement remains ambiguous
