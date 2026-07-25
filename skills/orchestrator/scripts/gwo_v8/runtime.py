@@ -2829,7 +2829,7 @@ class PaseoRuntimeAdapter:
         *,
         parent_agent_id: str | None,
     ) -> ReviewAxisBinding:
-        """Create or adopt one read-backed Review child with bounded transport retry."""
+        """Create or adopt one read-backed Review child with safe bounded retry."""
 
         self._assert_review_workspace(request)
         prompt = request.to_prompt()
@@ -2910,6 +2910,12 @@ class PaseoRuntimeAdapter:
             except RuntimeAdapterError as error:
                 last_error = error
                 if error.failure_class == "permanent":
+                    raise
+                if error.code == "PROMPT_DELIVERY_AMBIGUOUS":
+                    # Paseo acknowledged an asynchronous send, so another
+                    # convergence window can only read back the same Agent and
+                    # action. Empty windows are not failed executions and must
+                    # never turn this ambiguity into finite retry exhaustion.
                     raise
                 if execution == 2:
                     break

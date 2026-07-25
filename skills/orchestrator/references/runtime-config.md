@@ -242,6 +242,11 @@ action never creates a replacement Agent while that identity exists. Empty
 readbacks do not consume a finite Prompt execution budget; the Admission keeps
 waiting until the original boundary becomes visible or a terminal Paseo result
 provides new authoritative evidence.
+Review-axis convergence applies the same rule: an acknowledged send without
+the exact activity boundary remains `PROMPT_DELIVERY_AMBIGUOUS` on the same
+Review Agent and action across any number of empty convergence windows. It is
+never rewritten as `REVIEW_AXIS_MATERIALIZATION_RETRIES_EXHAUSTED`; only an
+explicit pre-enqueue rejection permits the bounded Prompt retry.
 
 Process-start failures distinguish `PASEO_COMMAND_LINE_OVERFLOW` from
 `PASEO_EXECUTABLE_UNAVAILABLE`. The former identifies a host command-line

@@ -789,6 +789,96 @@ def test_review_child_transport_retry_is_bounded_and_readback_first(tmp_path):
     assert permanent_client.create_count == 1
 
 
+class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
+    def __init__(self):
+        super().__init__()
+        self.sent_action_keys = []
+        self.pending_prompt = None
+
+    def create(self, request):
+        record = super().create(request)
+        self._accepted_prompt_digests[record.agent_id] = []
+        self._agents[record.agent_id] = replace(record, lifecycle="idle")
+        return self._agents[record.agent_id]
+
+    def send_prompt(self, agent_id, prompt, *, action_key):
+        self.sent_action_keys.append(action_key)
+        self.send_count += 1
+        self.pending_prompt = (agent_id, prompt)
+        self._agents[agent_id] = replace(
+            self.inspect(agent_id),
+            lifecycle="idle",
+        )
+
+    def expose_prompt_boundary(self):
+        agent_id, prompt = self.pending_prompt
+        self._accepted_prompt_digests[agent_id].append(prompt.digest)
+
+
+def test_review_prompt_ambiguity_survives_delayed_visibility_windows(
+    tmp_path,
+    monkeypatch,
+):
+    _node, _worker_runtime, worker_binding, observation = _execute_candidate(
+        tmp_path,
+        risk="standard",
+    )
+    request = replace(
+        _review_axis_request(
+            worker_binding,
+            observation,
+            axis="standards",
+        ),
+        spec_text="delayed Review transport authority " * 512,
+    )
+    prompt = request.to_prompt()
+    assert len(prompt.text.encode("utf-8")) > PASEO_INLINE_PROMPT_MAX_BYTES
+    profile = resolve_review_profile(
+        _runtime_config(),
+        repository="local/phase-three",
+        selector="standard_axis",
+    )
+    client = _DelayedReviewPromptPaseoClient()
+    adapter = PaseoRuntimeAdapter(client)
+    clock = {"tick": 0}
+
+    def monotonic():
+        clock["tick"] += 1
+        return float(clock["tick"])
+
+    monkeypatch.setattr("gwo_v8.runtime.time.monotonic", monotonic)
+    monkeypatch.setattr("gwo_v8.runtime.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("gwo_v8.runtime.PASEO_BOOTSTRAP_WAIT_SECONDS", 3.0)
+
+    for _ in range(5):
+        with pytest.raises(RuntimeAdapterError) as ambiguous:
+            adapter.materialize_review_axis(
+                request,
+                profile,
+                parent_agent_id=worker_binding.agent_id,
+            )
+        assert ambiguous.value.code == "PROMPT_DELIVERY_AMBIGUOUS"
+        assert ambiguous.value.code != "REVIEW_AXIS_MATERIALIZATION_RETRIES_EXHAUSTED"
+        assert ambiguous.value.failure_class == "ambiguous"
+        assert client.create_count == 1
+        assert client.send_count == 1
+        assert client.sent_action_keys == [request.action_key]
+
+    agent_id = client.pending_prompt[0]
+    client.expose_prompt_boundary()
+    adopted = adapter.materialize_review_axis(
+        request,
+        profile,
+        parent_agent_id=worker_binding.agent_id,
+    )
+
+    assert adopted.agent_id == agent_id
+    assert adopted.action_key == request.action_key
+    assert client.create_count == 1
+    assert client.send_count == 1
+    assert client.prompt_acceptance_count(agent_id, prompt) == 1
+
+
 class _DelayedInlinePaseoClient(InMemoryPaseoClient):
     def __init__(self):
         super().__init__()
