@@ -3404,8 +3404,15 @@ def _validate_complete_runtime_binding(
     *,
     section: str,
     name: str,
+    allow_fallback: bool = True,
 ) -> None:
-    if not isinstance(binding, dict) or set(binding) != {"provider", "settings"}:
+    required = {"provider", "settings"}
+    allowed = required | ({"fallback"} if allow_fallback else set())
+    if (
+        not isinstance(binding, dict)
+        or not required.issubset(binding)
+        or set(binding) - allowed
+    ):
         raise PolicyError(
             "RUNTIME_CONFIG_PATCH_INVALID",
             f"{section}.{name} must be one complete runtime profile",
@@ -3434,6 +3441,13 @@ def _validate_complete_runtime_binding(
         raise PolicyError(
             "RUNTIME_CONFIG_PATCH_INVALID",
             f"{section}.{name} setting features must be an object",
+        )
+    if "fallback" in binding:
+        _validate_complete_runtime_binding(
+            binding["fallback"],
+            section=section,
+            name=f"{name}.fallback",
+            allow_fallback=False,
         )
 
 

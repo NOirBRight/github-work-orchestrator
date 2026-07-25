@@ -159,9 +159,12 @@ A patch may contain only non-empty `tiers` and `role_profiles` maps:
 
 Each named entry is one complete replacement profile. Profiles do not
 deep-merge model fields: `provider`, `model`, `thinkingOptionId`, `modeId`,
-and `features` are all required. Unknown sections, unknown tier or role names,
-empty maps, incomplete profiles, non-JSON values, and patches larger than
-64 KiB are rejected before publication.
+and `features` are all required. A primary profile may also contain one
+optional `fallback` with the same complete `provider` and `settings` shape.
+The fallback cannot name another fallback; same-or-higher eligibility remains
+a Runtime Policy check before a new Admission. Unknown sections, unknown tier
+or role names, empty maps, incomplete or chained profiles, non-JSON values,
+and patches larger than 64 KiB are rejected before publication.
 
 Repository-scoped update:
 

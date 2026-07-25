@@ -238,6 +238,34 @@ def test_runtime_config_ownership_global_command_is_separately_explicit(tmp_path
         )
 
 
+def test_scoped_runtime_config_accepts_one_complete_optional_fallback(tmp_path):
+    config_path = tmp_path / "config.json"
+    worker = _binding("worker-primary")
+    worker["fallback"] = _binding("worker-fallback", thinking="max")
+    reviewer = _binding("reviewer-primary")
+    reviewer["fallback"] = _binding("reviewer-fallback", thinking="max")
+    patch = {
+        "tiers": {"heavy": worker},
+        "role_profiles": {"reviewer_standard": reviewer},
+    }
+
+    updated = core.set_repository_runtime_config(
+        config_path,
+        "owner/repository-a",
+        patch,
+    )
+
+    repository = updated["repositories"]["owner/repository-a"]
+    assert repository["tiers"]["heavy"] == worker
+    assert repository["role_profiles"]["reviewer_standard"] == reviewer
+    assert (
+        json.loads(config_path.read_text(encoding="utf-8"))["repositories"][
+            "owner/repository-a"
+        ]
+        == repository
+    )
+
+
 @pytest.mark.parametrize(
     "patch",
     [
@@ -262,6 +290,28 @@ def test_runtime_config_ownership_global_command_is_separately_explicit(tmp_path
                         "thinkingOptionId": "high",
                         "modeId": "full-access",
                         "features": [],
+                    },
+                }
+            }
+        },
+        {
+            "tiers": {
+                "heavy": {
+                    **_binding("primary"),
+                    "fallback": {
+                        "provider": "codex",
+                        "settings": {"model": "partial-fallback"},
+                    },
+                }
+            }
+        },
+        {
+            "role_profiles": {
+                "reviewer_standard": {
+                    **_binding("primary-reviewer"),
+                    "fallback": {
+                        **_binding("fallback-reviewer"),
+                        "fallback": _binding("chained-reviewer"),
                     },
                 }
             }
