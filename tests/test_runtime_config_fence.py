@@ -430,3 +430,236 @@ def test_migration_does_not_publish_mutated_predictable_temporary(
 
     assert core.validate_config(installed) == migrated
     assert config.read_bytes() != injected
+
+
+def _explicit_runtime_profile(
+    model: str,
+    *,
+    provider: str = "codex",
+    thinking: str = "high",
+    mode: str = "full-access",
+    features: dict | None = None,
+) -> dict:
+    return {
+        "provider": provider,
+        "settings": {
+            "model": model,
+            "thinkingOptionId": thinking,
+            "modeId": mode,
+            "features": {} if features is None else features,
+        },
+    }
+
+
+def _fallback_capabilities() -> dict:
+    return {
+        "provider": "codex",
+        "models": {
+            "primary": {"thinking": ["high"]},
+            "fallback": {"thinking": ["high"]},
+        },
+        "modes": ["full-access"],
+        "features": ["supported"],
+    }
+
+
+def _fallback_coordinator_runtime() -> dict:
+    return {
+        "provider": "coordinator-provider",
+        "settings": {
+            "model": "coordinator-model",
+            "thinkingOptionId": "high",
+            "modeId": "coordinator-mode",
+            "features": {},
+        },
+    }
+
+
+def test_runtime_profile_fallback_primary_success_remains_primary():
+    config = core.default_config()
+    primary = _explicit_runtime_profile("primary")
+    config["tiers"]["standard"] = {
+        **primary,
+        "fallback": _explicit_runtime_profile("not-advertised"),
+    }
+
+    selected = core.resolve_runtime(
+        config,
+        repository="owner/repo",
+        issue={"difficulty": "standard"},
+        coordinator_runtime=_fallback_coordinator_runtime(),
+        capabilities=_fallback_capabilities(),
+    )
+
+    assert selected == {"tier": "standard", **primary}
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [
+        _explicit_runtime_profile("primary", provider="unavailable-provider"),
+        _explicit_runtime_profile("not-advertised"),
+        _explicit_runtime_profile("primary", thinking="max"),
+        _explicit_runtime_profile("primary", mode="sandbox"),
+        _explicit_runtime_profile("primary", features={"missing": True}),
+    ],
+)
+def test_runtime_profile_fallback_selects_only_for_typed_unavailability(primary):
+    config = core.default_config()
+    fallback = _explicit_runtime_profile("fallback")
+    config["tiers"]["heavy"] = {**primary, "fallback": fallback}
+
+    selected = core.resolve_runtime(
+        config,
+        repository="owner/repo",
+        issue={"difficulty": "heavy"},
+        coordinator_runtime=_fallback_coordinator_runtime(),
+        capabilities=_fallback_capabilities(),
+    )
+
+    assert selected == {"tier": "heavy", **fallback}
+    assert "fallback" not in selected
+
+
+def test_runtime_profile_fallback_both_unavailable_is_typed():
+    config = core.default_config()
+    config["tiers"]["standard"] = {
+        **_explicit_runtime_profile("primary-unavailable"),
+        "fallback": _explicit_runtime_profile("fallback-unavailable"),
+    }
+
+    with pytest.raises(core.PolicyError) as unavailable:
+        core.resolve_runtime(
+            config,
+            repository="owner/repo",
+            issue={"difficulty": "standard"},
+            coordinator_runtime=_fallback_coordinator_runtime(),
+            capabilities=_fallback_capabilities(),
+        )
+
+    assert unavailable.value.code == "RUNTIME_PROFILE_FALLBACK_UNAVAILABLE"
+    assert "RUNTIME_MODEL_UNAVAILABLE, RUNTIME_MODEL_UNAVAILABLE" in str(
+        unavailable.value
+    )
+
+
+def test_runtime_profile_fallback_configuration_error_never_selects_fallback():
+    config = core.default_config()
+    config["tiers"]["standard"] = {
+        "provider": "codex",
+        "settings": {
+            "model": "primary",
+            "modeId": "full-access",
+            "features": {},
+        },
+        "fallback": _explicit_runtime_profile("fallback"),
+    }
+
+    with pytest.raises(core.PolicyError) as invalid:
+        core.resolve_runtime(
+            config,
+            repository="owner/repo",
+            issue={"difficulty": "standard"},
+            coordinator_runtime=_fallback_coordinator_runtime(),
+            capabilities=_fallback_capabilities(),
+        )
+
+    assert invalid.value.code == "RUNTIME_THINKING_MISSING"
+
+
+def test_runtime_profile_fallback_repository_override_is_preserved():
+    config = core.default_config()
+    global_fallback = _explicit_runtime_profile("global-fallback")
+    repository_fallback = _explicit_runtime_profile("repository-fallback")
+    config["tiers"]["standard"]["fallback"] = global_fallback
+    config["repositories"]["owner/repo"] = {
+        "tiers": {
+            "standard": {
+                **_explicit_runtime_profile("repository-primary"),
+                "fallback": repository_fallback,
+            }
+        }
+    }
+
+    request = core.resolve_runtime_request(
+        config,
+        repository="owner/repo",
+        issue={"difficulty": "standard"},
+        coordinator_runtime=_fallback_coordinator_runtime(),
+    )
+
+    assert request["settings"]["model"] == "repository-primary"
+    assert request["fallback"] == repository_fallback
+    assert request["fallback"] is not repository_fallback
+
+
+def test_runtime_profile_fallback_worker_tier_request_preserves_identity():
+    config = core.default_config()
+    fallback = _explicit_runtime_profile("worker-fallback")
+    config["tiers"]["frontier"]["fallback"] = fallback
+
+    request = core.resolve_runtime_request(
+        config,
+        repository="owner/repo",
+        issue={"difficulty": "frontier"},
+        coordinator_runtime=_fallback_coordinator_runtime(),
+    )
+
+    assert request["tier"] == "frontier"
+    assert request["fallback"] == fallback
+    assert set(request["fallback"]) == {"provider", "settings"}
+
+
+def test_runtime_profile_fallback_managed_role_request_and_selection():
+    config = core.default_config()
+    fallback = _explicit_runtime_profile("fallback")
+    config["role_profiles"]["coordinator_auto"] = {
+        **_explicit_runtime_profile("not-advertised"),
+        "fallback": fallback,
+    }
+
+    request = core.resolve_role_runtime_request(
+        config,
+        repository="owner/repo",
+        role="coordinator_auto",
+    )
+    selected = core.resolve_role_runtime(
+        config,
+        repository="owner/repo",
+        role="coordinator_auto",
+        coordinator_runtime=_fallback_coordinator_runtime(),
+        capabilities=_fallback_capabilities(),
+    )
+
+    assert request == {
+        "role": "coordinator_auto",
+        **_explicit_runtime_profile("not-advertised"),
+        "fallback": fallback,
+    }
+    assert selected == {"role": "coordinator_auto", **fallback}
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        {
+            **_explicit_runtime_profile("lower"),
+            "tier": "light",
+        },
+        {
+            **_explicit_runtime_profile("recursive"),
+            "fallback": _explicit_runtime_profile("second-fallback"),
+        },
+    ],
+)
+def test_runtime_profile_fallback_rejects_lower_or_recursive_shape(fallback):
+    config = core.default_config()
+    config["tiers"]["heavy"] = {
+        **_explicit_runtime_profile("primary"),
+        "fallback": fallback,
+    }
+
+    with pytest.raises(core.PolicyError) as invalid:
+        core.validate_config(config)
+
+    assert invalid.value.code == "RUNTIME_PROFILE_FALLBACK_INVALID"

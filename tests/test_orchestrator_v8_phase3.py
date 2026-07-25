@@ -706,6 +706,29 @@ def test_default_config_exposes_review_profile_selectors_and_repo_override():
     assert profile.model == "repo-sol"
 
 
+def test_runtime_profile_fallback_v8_review_is_explicitly_rejected():
+    config = _runtime_config()
+    config["role_profiles"]["reviewer_standard"]["fallback"] = {
+        "provider": "codex",
+        "settings": {
+            "model": "gpt-5.6-sol",
+            "thinkingOptionId": "max",
+            "modeId": "full-access",
+            "features": {},
+        },
+    }
+
+    with pytest.raises(RuntimeAdapterError) as unsupported:
+        resolve_review_profile(
+            config,
+            repository="local/phase-three",
+            selector="standard_axis",
+        )
+
+    assert unsupported.value.code == "REVIEW_PROFILE_FALLBACK_UNSUPPORTED"
+    assert "availability-aware selection before Admission" in str(unsupported.value)
+
+
 def _review_axis_request(
     worker_binding,
     observation,

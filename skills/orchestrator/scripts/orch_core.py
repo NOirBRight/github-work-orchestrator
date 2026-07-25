@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import importlib.util
@@ -37,6 +38,15 @@ REVIEW_PROFILE_SELECTORS = {
     "recovery_axis",
     "strict_specialist",
 }
+RUNTIME_PROFILE_AVAILABILITY_ERRORS = frozenset(
+    {
+        "RUNTIME_PROVIDER_UNAVAILABLE",
+        "RUNTIME_MODEL_UNAVAILABLE",
+        "RUNTIME_THINKING_UNAVAILABLE",
+        "RUNTIME_MODE_UNAVAILABLE",
+        "RUNTIME_FEATURE_UNAVAILABLE",
+    }
+)
 ISSUE_MARKER_V1 = "<!-- orchestrator:issue:v1 -->"
 ISSUE_MARKER_V2 = "<!-- orchestrator:issue:v2 -->"
 DELIVERY_MARKER = "<!-- orchestrator:delivery:v1 -->"
@@ -1308,7 +1318,53 @@ def coordination_mutex(path: Path, *, timeout_seconds: float = 5.0):
         handle.close()
 
 
-def _validate_resolved_runtime(
+def _complete_inline_runtime_profile(mapping: Any) -> bool:
+    if not isinstance(mapping, dict) or set(mapping) != {"provider", "settings"}:
+        return False
+    provider = mapping.get("provider")
+    settings = mapping.get("settings")
+    if (
+        not isinstance(provider, str)
+        or not provider.strip()
+        or not isinstance(settings, dict)
+        or set(settings)
+        != {"model", "thinkingOptionId", "modeId", "features"}
+    ):
+        return False
+    return (
+        all(
+            isinstance(settings.get(field), str) and settings[field].strip()
+            for field in ("model", "thinkingOptionId", "modeId")
+        )
+        and isinstance(settings.get("features"), dict)
+    )
+
+
+def _runtime_profile_fallback(
+    mapping: dict[str, Any],
+    *,
+    identity: str,
+) -> dict[str, Any] | None:
+    if "fallback" not in mapping:
+        return None
+    fallback = mapping["fallback"]
+    if not _complete_inline_runtime_profile(fallback):
+        raise PolicyError(
+            "RUNTIME_PROFILE_FALLBACK_INVALID",
+            f"{identity} fallback must be one complete non-recursive runtime profile",
+        )
+    return copy.deepcopy(fallback)
+
+
+def _resolved_runtime_identity(resolved: dict[str, Any]) -> dict[str, Any]:
+    return (
+        {"role": resolved["role"]}
+        if "role" in resolved
+        else {"tier": resolved["tier"]}
+    )
+
+
+def _validate_one_resolved_runtime(
     resolved: dict[str, Any],
     *,
     coordinator_runtime: dict[str, Any],
@@ -1382,10 +1438,50 @@ def _validate_resolved_runtime(
             f"features unavailable: {sorted(unknown_features)}",
         )
 
-    identity = (
-        {"role": resolved["role"]} if "role" in resolved else {"tier": resolved["tier"]}
-    )
-    return {**identity, "provider": provider, "settings": settings}
+    return {
+        **_resolved_runtime_identity(resolved),
+        "provider": provider,
+        "settings": settings,
+    }
+
+
+def _validate_resolved_runtime(
+    resolved: dict[str, Any],
+    *,
+    coordinator_runtime: dict[str, Any],
+    capabilities: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return _validate_one_resolved_runtime(
+            resolved,
+            coordinator_runtime=coordinator_runtime,
+            capabilities=capabilities,
+        )
+    except PolicyError as primary_error:
+        fallback = resolved.get("fallback")
+        if (
+            fallback is None
+            or primary_error.code not in RUNTIME_PROFILE_AVAILABILITY_ERRORS
+        ):
+            raise
+        fallback_resolved = {
+            **_resolved_runtime_identity(resolved),
+            **copy.deepcopy(fallback),
+        }
+        try:
+            return _validate_one_resolved_runtime(
+                fallback_resolved,
+                coordinator_runtime=coordinator_runtime,
+                capabilities=capabilities,
+            )
+        except PolicyError as fallback_error:
+            if fallback_error.code not in RUNTIME_PROFILE_AVAILABILITY_ERRORS:
+                raise
+            raise PolicyError(
+                "RUNTIME_PROFILE_FALLBACK_UNAVAILABLE",
+                "primary and configured fallback are unavailable: "
+                f"{primary_error.code}, {fallback_error.code}",
+            ) from fallback_error
 
 
 def resolve_runtime(
@@ -1479,7 +1575,11 @@ def resolve_runtime_request(
         if not settings.get("model"):
             raise PolicyError("RUNTIME_MODEL_MISSING", f"tier {tier} has no model")
 
-    return {"tier": tier, "provider": provider, "settings": settings}
+    request = {"tier": tier, "provider": provider, "settings": settings}
+    fallback = _runtime_profile_fallback(mapping, identity=f"tier {tier}")
+    if fallback is not None:
+        request["fallback"] = fallback
+    return request
 
 
 def resolve_role_runtime_request(
@@ -1509,7 +1609,11 @@ def resolve_role_runtime_request(
         )
     if not settings.get("model"):
         raise PolicyError("RUNTIME_MODEL_MISSING", f"runtime role has no model: {role}")
-    return {"role": role, "provider": provider, "settings": settings}
+    request = {"role": role, "provider": provider, "settings": settings}
+    fallback = _runtime_profile_fallback(mapping, identity=f"runtime role {role}")
+    if fallback is not None:
+        request["fallback"] = fallback
+    return request
 
 
 def resolve_role_runtime(
@@ -3054,6 +3158,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
                     "RUNTIME_BINDING_INVALID",
                     f"invalid {scope} binding",
                 )
+            _runtime_profile_fallback(
+                binding,
+                identity=f"{scope} tier {tier}",
+            )
     for selector, profile_id in review_profiles.items():
         if (
             selector not in REVIEW_PROFILE_SELECTORS
@@ -3099,6 +3207,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
                     "RUNTIME_ROLE_PROFILE_INVALID",
                     f"invalid {scope} role binding",
                 )
+            _runtime_profile_fallback(
+                binding,
+                identity=f"{scope} runtime role {role}",
+            )
     if any(
         not isinstance(tier, str) or tier not in TIERS
         for tier in reviewer_tiers.values()

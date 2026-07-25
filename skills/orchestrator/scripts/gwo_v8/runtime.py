@@ -233,6 +233,12 @@ def resolve_review_profile(
             "REVIEW_PROFILE_MISSING",
             f"Runtime Profile is missing: {profile_id}",
         )
+    if "fallback" in mapping:
+        raise RuntimeAdapterError(
+            "REVIEW_PROFILE_FALLBACK_UNSUPPORTED",
+            "Review Profile fallback requires availability-aware selection "
+            f"before Admission: {profile_id}",
+        )
     provider = mapping.get("provider")
     settings = mapping.get("settings")
     if (
