@@ -1318,7 +1318,7 @@ class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
         if previous is None:
             super().__init__()
             self.sent_action_keys = []
-            self.pending_prompt = None
+            self.pending_prompts = {}
         else:
             self._agents = previous._agents
             self._create_failures = previous._create_failures
@@ -1329,7 +1329,7 @@ class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
             self.send_count = previous.send_count
             self.create_prompt_digests = previous.create_prompt_digests
             self.sent_action_keys = previous.sent_action_keys
-            self.pending_prompt = previous.pending_prompt
+            self.pending_prompts = previous.pending_prompts
         self.ack_receipt_visible = False
 
     def find_by_labels(self, labels):
@@ -1344,14 +1344,15 @@ class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
 
     def create(self, request):
         record = super().create(request)
-        if request.labels.get("gwo.review_axis") != "standards":
+        if "gwo.review_axis" not in request.labels:
             return record
         self._accepted_prompt_digests[record.agent_id] = []
         self._agents[record.agent_id] = replace(record, lifecycle="idle")
         return self._agents[record.agent_id]
 
     def send_prompt(self, agent_id, prompt, *, action_key):
-        if self.inspect(agent_id).labels.get("gwo.review_axis") != "standards":
+        axis = self.inspect(agent_id).labels.get("gwo.review_axis")
+        if axis is None:
             return super().send_prompt(
                 agent_id,
                 prompt,
@@ -1359,19 +1360,19 @@ class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
             )
         self.sent_action_keys.append(action_key)
         self.send_count += 1
-        self.pending_prompt = (agent_id, prompt)
+        self.pending_prompts[axis] = (agent_id, prompt, action_key)
         self._agents[agent_id] = replace(
             self.inspect(agent_id),
             lifecycle="idle",
         )
 
     def expose_prompt_boundary(self):
-        agent_id, prompt = self.pending_prompt
-        self._accepted_prompt_digests[agent_id].append(prompt.digest)
-        self._agents[agent_id] = replace(
-            self.inspect(agent_id),
-            lifecycle="running",
-        )
+        for agent_id, prompt, _action_key in self.pending_prompts.values():
+            self._accepted_prompt_digests[agent_id].append(prompt.digest)
+            self._agents[agent_id] = replace(
+                self.inspect(agent_id),
+                lifecycle="running",
+            )
 
 
 def test_review_prompt_ambiguity_survives_delayed_visibility_windows(
@@ -1495,23 +1496,25 @@ def test_review_prompt_ambiguity_survives_delayed_visibility_windows(
         {agent.labels["gwo.action_key"] for agent in review_agents}
     ) == 2
     assert client.create_count == 1 + len(review_agents)
-    assert client.send_count == 1
-    assert len(client.sent_action_keys) == 1
-    assert len(set(client.sent_action_keys)) == 1
-    action_key = client.sent_action_keys[0]
+    assert client.send_count == len(review_agents)
+    assert len(client.sent_action_keys) == len(review_agents)
+    assert len(set(client.sent_action_keys)) == len(review_agents)
+    assert set(client.pending_prompts) == {"standards", "spec"}
+    standards_action_key = client.pending_prompts["standards"][2]
     assert {
         outcome.wait_source_ref for outcome in ambiguous
     } == {
-        f"paseo://review/{candidate_sha}/action/{action_key}"
+        f"paseo://review/{candidate_sha}/action/{standards_action_key}"
     }
     assert {
         outcome.wait_event_identity for outcome in ambiguous
     } == {
-        f"{action_key}:prompt_readback"
+        f"{standards_action_key}:prompt_readback"
     }
-    prompt = client.pending_prompt[1]
-    assert len(prompt.text.encode("utf-8")) > PASEO_INLINE_PROMPT_MAX_BYTES
-    agent_id = client.pending_prompt[0]
+    assert all(
+        len(prompt.text.encode("utf-8")) > PASEO_INLINE_PROMPT_MAX_BYTES
+        for _agent_id, prompt, _action_key in client.pending_prompts.values()
+    )
     client.expose_prompt_boundary()
     adopted = kernel.reconcile_once("local/phase-three")
 
@@ -1520,16 +1523,18 @@ def test_review_prompt_ambiguity_survives_delayed_visibility_windows(
     review_agents = client.find_by_labels(
         {"gwo.review_candidate": candidate_sha}
     )
-    standards = next(
-        agent
-        for agent in review_agents
-        if agent.labels["gwo.review_axis"] == "standards"
-    )
-    assert standards.agent_id == agent_id
-    assert standards.labels["gwo.action_key"] == action_key
+    for axis in ("standards", "spec"):
+        agent = next(
+            agent
+            for agent in review_agents
+            if agent.labels["gwo.review_axis"] == axis
+        )
+        agent_id, prompt, action_key = client.pending_prompts[axis]
+        assert agent.agent_id == agent_id
+        assert agent.labels["gwo.action_key"] == action_key
+        assert client.prompt_acceptance_count(agent_id, prompt) == 1
     assert client.create_count == 3
-    assert client.send_count == 1
-    assert client.prompt_acceptance_count(agent_id, prompt) == 1
+    assert client.send_count == 2
 
 
 class _DelayedInlinePaseoClient(InMemoryPaseoClient):
