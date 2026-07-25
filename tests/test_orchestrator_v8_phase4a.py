@@ -402,6 +402,25 @@ class _ReviewObservationRecoveryRuntime(_ReviewMaterializationRecoveryRuntime):
         return super().observe_review_axis(request, binding)
 
 
+class _HardFindingReviewRuntime(_ReviewingInMemoryRuntime):
+    def observe_review_axis(self, request, binding):
+        observation = super().observe_review_axis(request, binding)
+        if request.axis != "standards":
+            return observation
+        return replace(
+            observation,
+            findings=(
+                {
+                    "severity": "hard",
+                    "code": "STD-HARD",
+                    "source": "AGENTS.md",
+                    "location": "module-1.txt:1",
+                    "message": "synthetic hard standards violation",
+                },
+            ),
+        )
+
+
 def _review_materialization_kernel(tmp_path, runtime):
     repository = _temporary_repository(tmp_path)
     intent, source, _policy = _multi_ready_inputs(count=1)
@@ -673,6 +692,31 @@ def test_changed_candidate_review_axis_materialization_reset_clears_all_axis_sta
     }
 
 
+def test_hard_review_findings_return_typed_rejected_decision(tmp_path):
+    runtime = _HardFindingReviewRuntime(tmp_path / "runtime")
+    kernel, compiled, work_node = _review_materialization_kernel(tmp_path, runtime)
+    decisions = []
+    original_converge = kernel._review_convergence.converge
+
+    def recording_converge(*args, **kwargs):
+        decision = original_converge(*args, **kwargs)
+        decisions.append(decision)
+        return decision
+
+    kernel._review_convergence.converge = recording_converge
+
+    first = kernel.reconcile_once("local/phase-four-a")
+
+    assert [decision.status for decision in decisions] == ["rejected"]
+    assert decisions[0].findings
+    assert all("standards" in finding for finding in decisions[0].findings)
+    # #77 behavior is preserved: rejection enters the authorized Repair Round.
+    assert first.status == "waiting"
+    assert first.directive == "wait_for_runtime"
+    assert first.attempt_state == "repairing"
+    assert first.wait_condition == "runtime_result"
+
+
 def test_review_convergence_is_one_deep_module_behind_kernel():
     import typing
 
@@ -688,8 +732,11 @@ def test_review_convergence_is_one_deep_module_behind_kernel():
         "rejected",
         "blocked",
     }
+    assert "capture_deferred_checks" in ReviewConvergenceDecision.__dataclass_fields__
     assert hasattr(ReviewConvergence, "converge")
     assert hasattr(ReviewConvergence, "invalidate_candidate")
+    assert hasattr(ReviewConvergence, "initial_fields")
+    assert hasattr(ReviewConvergence, "compact_review_contract")
     for moved in (
         "_ensure_review_evidence",
         "_review_request",

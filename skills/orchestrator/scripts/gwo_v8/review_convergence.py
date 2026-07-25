@@ -83,6 +83,8 @@ class ReviewConvergenceDecision:
 
     status: Literal["waiting", "accepted", "rejected", "blocked"]
     observation: RuntimeObservation
+    capture_deferred_checks: bool = False
+    findings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -132,19 +134,23 @@ class ReviewConvergence:
         self._persist_state = persist_state
 
     @staticmethod
+    def initial_fields() -> dict[str, Any]:
+        """The Review-internal persisted fields owned and reset by this module."""
+
+        return {
+            "review_candidate_sha": None,
+            "review_bindings": {},
+            "review_observations": {},
+            "review_materialization_actions": {},
+            "review_axis_errors": {},
+            "review_materialization_waiting_actions": [],
+            "review_children_retired": False,
+            "review_evidence": None,
+        }
+
+    @staticmethod
     def invalidate_candidate(state: dict[str, Any]) -> None:
-        state.update(
-            {
-                "review_candidate_sha": None,
-                "review_bindings": {},
-                "review_observations": {},
-                "review_materialization_actions": {},
-                "review_axis_errors": {},
-                "review_materialization_waiting_actions": [],
-                "review_children_retired": False,
-                "review_evidence": None,
-            }
-        )
+        state.update(ReviewConvergence.initial_fields())
 
     @staticmethod
     def prior_context(state: dict[str, Any]) -> dict[str, Any]:
@@ -181,12 +187,12 @@ class ReviewConvergence:
         return ReviewAxisObservation(**body)
 
     @staticmethod
-    def _compact_review_contract(value: Any) -> Any:
+    def compact_review_contract(value: Any) -> Any:
         """Replace authoritative file payloads with exact workspace references."""
 
         if isinstance(value, list):
             return [
-                ReviewConvergence._compact_review_contract(item)
+                ReviewConvergence.compact_review_contract(item)
                 for item in value
             ]
         if not isinstance(value, dict):
@@ -194,7 +200,7 @@ class ReviewConvergence:
         path = value.get("path")
         content = value.get("content")
         compacted = {
-            str(key): ReviewConvergence._compact_review_contract(item)
+            str(key): ReviewConvergence.compact_review_contract(item)
             for key, item in value.items()
             if key != "content"
         }
@@ -203,7 +209,7 @@ class ReviewConvergence:
             compacted["content_digest"] = digest_bytes(encoded)
             compacted["content_bytes"] = len(encoded)
         elif "content" in value:
-            compacted["content"] = ReviewConvergence._compact_review_contract(
+            compacted["content"] = ReviewConvergence.compact_review_contract(
                 content
             )
         return compacted
@@ -241,7 +247,7 @@ class ReviewConvergence:
         spec_text = canonical_bytes(
             {
                 "goal_acceptance": goal.get("acceptance") or [],
-                "outcome_contract": ReviewConvergence._compact_review_contract(
+                "outcome_contract": ReviewConvergence.compact_review_contract(
                     work_item.get("outcome_contract") or {}
                 ),
             }
@@ -314,6 +320,7 @@ class ReviewConvergence:
         return ReviewConvergenceDecision(
             status="waiting",
             observation=observation,
+            capture_deferred_checks=True,
         )
 
     def _review_prompt_wait(
@@ -1044,16 +1051,25 @@ class ReviewConvergence:
             )
             state["human_decision_evidence"] = asdict(decision_evidence)
             self._persist_state(state)
+        enriched = replace(
+            observation,
+            evidence=observation.evidence
+            + (gate.evidence,)
+            + (
+                ()
+                if requirement.get("human_decision_required") is not True
+                else (decision_evidence,)
+            ),
+        )
+        if gate.status == "rejected":
+            return ReviewConvergenceDecision(
+                status="rejected",
+                observation=enriched,
+                capture_deferred_checks=True,
+                findings=gate.blockers,
+            )
         return ReviewConvergenceDecision(
             status="accepted",
-            observation=replace(
-                observation,
-                evidence=observation.evidence
-                + (gate.evidence,)
-                + (
-                    ()
-                    if requirement.get("human_decision_required") is not True
-                    else (decision_evidence,)
-                ),
-            ),
+            observation=enriched,
+            capture_deferred_checks=True,
         )

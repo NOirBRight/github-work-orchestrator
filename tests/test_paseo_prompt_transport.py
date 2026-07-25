@@ -1155,7 +1155,7 @@ def test_review_axis_ambiguous_bootstrap_child_delivers_exact_prompt_once(
 
 def test_review_prompts_keep_spec_authority_without_repeating_file_contents():
     content = "frozen-content-" * 25_000
-    compacted = ReviewConvergence._compact_review_contract(
+    compacted = ReviewConvergence.compact_review_contract(
         {
             "file_changes": [
                 {

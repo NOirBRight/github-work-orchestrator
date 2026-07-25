@@ -2829,7 +2829,7 @@ class Kernel:
             work_node,
             skill_catalog=self.skill_catalog,
         )
-        return {
+        state = {
             "status": "running",
             "directive": "run_again",
             "repository": repository,
@@ -2850,14 +2850,6 @@ class Kernel:
             "repair_rounds_used": 0,
             "attempt_terminal_reason": None,
             "candidate_sha": None,
-            "review_candidate_sha": None,
-            "review_bindings": {},
-            "review_observations": {},
-            "review_materialization_actions": {},
-            "review_axis_errors": {},
-            "review_materialization_waiting_actions": [],
-            "review_children_retired": False,
-            "review_evidence": None,
             "result_digest": None,
             "publication_eligible": None,
             "publication_state": None,
@@ -2892,6 +2884,8 @@ class Kernel:
             },
             "resume_sent": False,
         }
+        state.update(ReviewConvergence.initial_fields())
+        return state
 
     def _adopt_verified_result(
         self,
@@ -4006,7 +4000,7 @@ class Kernel:
         spec_text = canonical_bytes(
             {
                 "goal_acceptance": goal.get("acceptance") or [],
-                "outcome_contract": ReviewConvergence._compact_review_contract(
+                "outcome_contract": ReviewConvergence.compact_review_contract(
                     work_item.get("outcome_contract") or {}
                 ),
             }
@@ -4307,11 +4301,6 @@ class Kernel:
                     "publication_ref": None,
                     "hosted_check_state": None,
                     "hosted_retry_count": 0,
-                    "review_candidate_sha": None,
-                    "review_bindings": {},
-                    "review_observations": {},
-                    "review_children_retired": False,
-                    "review_evidence": None,
                     "candidate_observation": None,
                     "prior_review_context": prior_review_context,
                     "repair_prompt": repair_record,
@@ -4381,11 +4370,6 @@ class Kernel:
                     "publication_ref": None,
                     "hosted_check_state": None,
                     "hosted_retry_count": 0,
-                    "review_candidate_sha": None,
-                    "review_bindings": {},
-                    "review_observations": {},
-                    "review_children_retired": False,
-                    "review_evidence": None,
                     "candidate_observation": None,
                     "prior_review_context": prior_review_context,
                     "worker_parked_for_ci": False,
@@ -5599,27 +5583,29 @@ class Kernel:
         except ReviewConvergenceError as error:
             raise KernelError(error.code, error.detail) from error
         observation = review_decision.observation
+        if review_decision.capture_deferred_checks:
+            capture_checks = getattr(
+                self.runtime,
+                "capture_deferred_checks",
+                None,
+            )
+            if callable(capture_checks):
+                observation = capture_checks(binding, observation)
+                self._persist_runtime_observation(state, observation)
+                self._write_state(repository, active.plan_digest, state)
+        if review_decision.status == "rejected":
+            return self._handle_semantic_rejection(
+                state,
+                work_node,
+                goal,
+                work_item,
+                binding,
+                terminal_reason="rejected",
+                findings=review_decision.findings,
+                cause_type="candidate_verification_failure",
+            )
         if review_decision.status != "accepted":
-            if state.get("wait_condition") == "review_axis":
-                capture_checks = getattr(
-                    self.runtime,
-                    "capture_deferred_checks",
-                    None,
-                )
-                if callable(capture_checks):
-                    observation = capture_checks(binding, observation)
-                    self._persist_runtime_observation(state, observation)
-                    self._write_state(repository, active.plan_digest, state)
             return self._outcome(state)
-        capture_checks = getattr(
-            self.runtime,
-            "capture_deferred_checks",
-            None,
-        )
-        if callable(capture_checks):
-            observation = capture_checks(binding, observation)
-            self._persist_runtime_observation(state, observation)
-            self._write_state(repository, active.plan_digest, state)
         decision = self.verifier.verify(
             observation.result_claim,
             work_node["output_contract"],
