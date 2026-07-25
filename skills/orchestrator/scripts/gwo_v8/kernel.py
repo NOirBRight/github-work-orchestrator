@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
 from .activation import LocalPlanPublication
+from .effect_verification import EffectContractVerifier, EffectVerificationError
 from .evidence import (
     EvidenceVerifier,
     ResultClaim,
@@ -1224,6 +1225,10 @@ class Kernel:
             runtime=runtime,
             verifier=verifier,
             runtime_config=runtime_config,
+            assert_writer=self._assert_state_writer,
+            persist_state=self._persist_state_snapshot,
+        )
+        self._effect_verification = EffectContractVerifier(
             assert_writer=self._assert_state_writer,
             persist_state=self._persist_state_snapshot,
         )
@@ -3122,6 +3127,7 @@ class Kernel:
             "resume_sent": False,
         }
         state.update(ReviewConvergence.initial_fields())
+        state.update(EffectContractVerifier.initial_fields())
         return state
 
     def _adopt_verified_result(
@@ -5969,6 +5975,28 @@ class Kernel:
         )
         self._persist_runtime_observation(state, observation)
         self._write_state(repository, active.plan_digest, state)
+        try:
+            effect_decision = self._effect_verification.verify_candidate(
+                state,
+                work_node,
+                binding,
+                observation,
+            )
+        except EffectVerificationError as error:
+            raise KernelError(error.code, error.detail) from error
+        if effect_decision.status != "accepted":
+            # Fail closed before Review materialization or deferred Check
+            # capture: the Candidate diff escapes the authorized Write Scope.
+            return self._handle_semantic_rejection(
+                state,
+                work_node,
+                goal,
+                work_item,
+                binding,
+                terminal_reason="rejected",
+                findings=effect_decision.findings,
+                cause_type="effect_contract_violation",
+            )
         review_mode = (
             (work_node.get("output_contract") or {})
             .get("review_requirement", {})
