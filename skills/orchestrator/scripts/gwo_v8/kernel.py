@@ -4365,6 +4365,33 @@ class Kernel:
         self._write_state(state["repository"], state["plan_digest"], state)
         return self._outcome(state)
 
+    def _review_prompt_wait(
+        self,
+        state: dict[str, Any],
+        *,
+        request: ReviewAxisRequest,
+        error: RuntimeAdapterError,
+    ) -> ReconcileOutcome:
+        state.update(
+            {
+                "status": "waiting",
+                "directive": "wait_for_runtime_readback",
+                "attempt_state": "reviewing",
+                "wait_condition": "review_prompt_readback",
+                "wait_source_ref": (
+                    f"{self.runtime.adapter_name}://review/"
+                    f"{request.candidate_sha}/action/{request.action_key}"
+                ),
+                "wait_event_identity": f"{request.action_key}:prompt_readback",
+                "next_check_at": (
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat(),
+                "last_runtime_error": _runtime_error_record(error),
+            }
+        )
+        self._write_state(state["repository"], state["plan_digest"], state)
+        return self._outcome(state)
+
     def _verify_pre_review_checks(
         self,
         work_node: dict[str, Any],
@@ -4521,6 +4548,21 @@ class Kernel:
                 try:
                     request, captured = collect(str(axis), 0)
                 except RuntimeAdapterError as error:
+                    if error.code == "PROMPT_DELIVERY_AMBIGUOUS":
+                        request = self._review_request(
+                            state=state,
+                            goal=goal,
+                            work_item=work_item,
+                            binding=binding,
+                            observation=observation,
+                            axis=str(axis),
+                            recovery_ordinal=0,
+                        )
+                        return observation, self._review_prompt_wait(
+                            state,
+                            request=request,
+                            error=error,
+                        )
                     if error.code not in {
                         "REVIEW_AXIS_OUTPUT_MISSING",
                         "REVIEW_AXIS_OUTPUT_INVALID",
@@ -4582,7 +4624,25 @@ class Kernel:
             recovery_running = False
             try:
                 for axis in gate.missing_axes:
-                    request, captured = collect(axis, 1)
+                    try:
+                        request, captured = collect(axis, 1)
+                    except RuntimeAdapterError as error:
+                        if error.code != "PROMPT_DELIVERY_AMBIGUOUS":
+                            raise
+                        request = self._review_request(
+                            state=state,
+                            goal=goal,
+                            work_item=work_item,
+                            binding=binding,
+                            observation=observation,
+                            axis=axis,
+                            recovery_ordinal=1,
+                        )
+                        return observation, self._review_prompt_wait(
+                            state,
+                            request=request,
+                            error=error,
+                        )
                     requests[axis] = request
                     if captured.lifecycle == "completed":
                         recovered[axis] = captured

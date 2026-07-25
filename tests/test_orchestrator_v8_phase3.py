@@ -797,11 +797,19 @@ class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
 
     def create(self, request):
         record = super().create(request)
+        if request.labels.get("gwo.review_axis") != "standards":
+            return record
         self._accepted_prompt_digests[record.agent_id] = []
         self._agents[record.agent_id] = replace(record, lifecycle="idle")
         return self._agents[record.agent_id]
 
     def send_prompt(self, agent_id, prompt, *, action_key):
+        if self.inspect(agent_id).labels.get("gwo.review_axis") != "standards":
+            return super().send_prompt(
+                agent_id,
+                prompt,
+                action_key=action_key,
+            )
         self.sent_action_keys.append(action_key)
         self.send_count += 1
         self.pending_prompt = (agent_id, prompt)
@@ -813,33 +821,96 @@ class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
     def expose_prompt_boundary(self):
         agent_id, prompt = self.pending_prompt
         self._accepted_prompt_digests[agent_id].append(prompt.digest)
+        self._agents[agent_id] = replace(
+            self.inspect(agent_id),
+            lifecycle="running",
+        )
 
 
 def test_review_prompt_ambiguity_survives_delayed_visibility_windows(
     tmp_path,
     monkeypatch,
 ):
-    _node, _worker_runtime, worker_binding, observation = _execute_candidate(
-        tmp_path,
-        risk="standard",
+    repository = _temporary_repository(tmp_path)
+    intent = _plan_intent(risk="standard")
+    intent["goals"][0]["acceptance"] = [
+        "delayed Review transport authority " * 512
+    ]
+    compiled = PlanCompiler().compile(
+        intent,
+        _ready_source(),
+        _policy_snapshot(),
     )
-    request = replace(
-        _review_axis_request(
-            worker_binding,
-            observation,
-            axis="standards",
-        ),
-        spec_text="delayed Review transport authority " * 512,
-    )
-    prompt = request.to_prompt()
-    assert len(prompt.text.encode("utf-8")) > PASEO_INLINE_PROMPT_MAX_BYTES
-    profile = resolve_review_profile(
-        _runtime_config(),
-        repository="local/phase-three",
-        selector="standard_axis",
+    store_path = tmp_path / "v8.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-3",
     )
     client = _DelayedReviewPromptPaseoClient()
-    adapter = PaseoRuntimeAdapter(client)
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=PaseoRuntimeAdapter(client),
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-3",
+        runtime_profile=RuntimeProfile(
+            name="worker-standard",
+            provider="kimi-cli",
+            model="kimi-code/kimi-for-coding",
+            thinking="max",
+            mode="yolo",
+            features={},
+        ),
+        frontier_runtime_profile=RuntimeProfile(
+            name="worker-frontier",
+            provider="codex",
+            model="gpt-5.6-sol",
+            thinking="xhigh",
+            mode="full-access",
+            features={},
+        ),
+        runtime_config=_runtime_config(),
+        delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
+    )
+    waiting_for_worker = kernel.reconcile_once("local/phase-three")
+    worker = client.find_by_labels(
+        {"gwo.admission": waiting_for_worker.admission_id}
+    )[0]
+    workspace = Path(worker.workspace)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "--detach",
+            str(workspace),
+            "HEAD",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    (workspace / "result.txt").write_text("phase-3\n", encoding="utf-8")
+    _git(workspace, "add", "result.txt")
+    _git(workspace, "commit", "-m", "delayed Review Candidate")
+    candidate_sha = _git(workspace, "rev-parse", "HEAD")
+    client.set_output(
+        worker.agent_id,
+        "GWO_RESULT "
+        + json.dumps(
+            {
+                "schema_version": 1,
+                "action_key": waiting_for_worker.node_key,
+                "candidate_sha": candidate_sha,
+            },
+            separators=(",", ":"),
+        ),
+    )
     clock = {"tick": 0}
 
     def monotonic():
@@ -850,31 +921,50 @@ def test_review_prompt_ambiguity_survives_delayed_visibility_windows(
     monkeypatch.setattr("gwo_v8.runtime.time.sleep", lambda _seconds: None)
     monkeypatch.setattr("gwo_v8.runtime.PASEO_BOOTSTRAP_WAIT_SECONDS", 3.0)
 
-    for _ in range(5):
-        with pytest.raises(RuntimeAdapterError) as ambiguous:
-            adapter.materialize_review_axis(
-                request,
-                profile,
-                parent_agent_id=worker_binding.agent_id,
-            )
-        assert ambiguous.value.code == "PROMPT_DELIVERY_AMBIGUOUS"
-        assert ambiguous.value.code != "REVIEW_AXIS_MATERIALIZATION_RETRIES_EXHAUSTED"
-        assert ambiguous.value.failure_class == "ambiguous"
-        assert client.create_count == 1
-        assert client.send_count == 1
-        assert client.sent_action_keys == [request.action_key]
+    ambiguous = [
+        kernel.reconcile_once("local/phase-three")
+        for _ in range(5)
+    ]
 
+    assert all(outcome.status == "waiting" for outcome in ambiguous)
+    assert all(
+        outcome.wait_condition == "review_prompt_readback"
+        for outcome in ambiguous
+    )
+    assert all(outcome.attempt_state == "reviewing" for outcome in ambiguous)
+    assert client.create_count == 2
+    assert client.send_count == 1
+    assert len(client.sent_action_keys) == 1
+    action_key = client.sent_action_keys[0]
+    assert {
+        outcome.wait_source_ref for outcome in ambiguous
+    } == {
+        f"paseo://review/{candidate_sha}/action/{action_key}"
+    }
+    assert {
+        outcome.wait_event_identity for outcome in ambiguous
+    } == {
+        f"{action_key}:prompt_readback"
+    }
+    prompt = client.pending_prompt[1]
+    assert len(prompt.text.encode("utf-8")) > PASEO_INLINE_PROMPT_MAX_BYTES
     agent_id = client.pending_prompt[0]
     client.expose_prompt_boundary()
-    adopted = adapter.materialize_review_axis(
-        request,
-        profile,
-        parent_agent_id=worker_binding.agent_id,
-    )
+    adopted = kernel.reconcile_once("local/phase-three")
 
-    assert adopted.agent_id == agent_id
-    assert adopted.action_key == request.action_key
-    assert client.create_count == 1
+    assert adopted.status == "waiting"
+    assert adopted.wait_condition == "review_axis"
+    review_agents = client.find_by_labels(
+        {"gwo.review_candidate": candidate_sha}
+    )
+    standards = next(
+        agent
+        for agent in review_agents
+        if agent.labels["gwo.review_axis"] == "standards"
+    )
+    assert standards.agent_id == agent_id
+    assert standards.labels["gwo.action_key"] == action_key
+    assert client.create_count == 3
     assert client.send_count == 1
     assert client.prompt_acceptance_count(agent_id, prompt) == 1
 

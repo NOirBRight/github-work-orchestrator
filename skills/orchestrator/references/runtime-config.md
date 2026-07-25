@@ -246,7 +246,10 @@ Review-axis convergence applies the same rule: an acknowledged send without
 the exact activity boundary remains `PROMPT_DELIVERY_AMBIGUOUS` on the same
 Review Agent and action across any number of empty convergence windows. It is
 never rewritten as `REVIEW_AXIS_MATERIALIZATION_RETRIES_EXHAUSTED`; only an
-explicit pre-enqueue rejection permits the bounded Prompt retry.
+explicit pre-enqueue rejection permits the bounded Prompt retry. The Kernel
+persists this state as the observable `review_prompt_readback` Wait Condition,
+so later reconciliation reads and adopts the same Review action instead of
+turning transport ambiguity into a Blocked Goal.
 
 Process-start failures distinguish `PASEO_COMMAND_LINE_OVERFLOW` from
 `PASEO_EXECUTABLE_UNAVAILABLE`. The former identifies a host command-line
