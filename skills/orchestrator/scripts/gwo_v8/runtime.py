@@ -237,7 +237,7 @@ def resolve_review_profile(
         raise RuntimeAdapterError(
             "REVIEW_PROFILE_FALLBACK_UNSUPPORTED",
             "Review Profile fallback requires availability-aware selection "
-            f"before Admission: {profile_id}",
+            f"before Review child dispatch: {profile_id}",
         )
     provider = mapping.get("provider")
     settings = mapping.get("settings")

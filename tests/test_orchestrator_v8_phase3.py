@@ -726,7 +726,9 @@ def test_runtime_profile_fallback_v8_review_is_explicitly_rejected():
         )
 
     assert unsupported.value.code == "REVIEW_PROFILE_FALLBACK_UNSUPPORTED"
-    assert "availability-aware selection before Admission" in str(unsupported.value)
+    assert "availability-aware selection before Review child dispatch" in str(
+        unsupported.value
+    )
 
 
 def _review_axis_request(

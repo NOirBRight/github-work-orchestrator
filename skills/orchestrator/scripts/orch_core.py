@@ -1477,11 +1477,11 @@ def _validate_resolved_runtime(
         except PolicyError as fallback_error:
             if fallback_error.code not in RUNTIME_PROFILE_AVAILABILITY_ERRORS:
                 raise
-            raise PolicyError(
-                "RUNTIME_PROFILE_FALLBACK_UNAVAILABLE",
-                "primary and configured fallback are unavailable: "
-                f"{primary_error.code}, {fallback_error.code}",
-            ) from fallback_error
+            primary_error.add_note(
+                "configured fallback unavailable "
+                f"({fallback_error.code}: {fallback_error})",
+            )
+            raise primary_error from fallback_error
 
 
 def resolve_runtime(

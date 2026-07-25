@@ -191,11 +191,12 @@ Coordinator. `reviewer_standard` and `reviewer_strict` select Reviewer
 runtimes without turning Reviewer strength into a Worker tier.
 `reviewer_recovery` is reserved for targeted review recovery in V8.
 
-One Worker tier or managed Role Profile may contain one inline `fallback`.
-It must repeat the complete `{provider, settings}` shape, including concrete
-model, thinking, mode, and feature settings, and cannot contain `fallback`,
-`tier`, `role`, or another field. The fallback inherits the containing Worker
-tier or managed role; it does not declare or lower its own logical level.
+One Runtime Profile selected by a Worker Tier or managed Role Binding may
+contain one inline `fallback`. It must repeat the complete
+`{provider, settings}` shape, including concrete model, thinking, mode, and
+feature settings, and cannot contain `fallback`, `tier`, `role`, or another
+field. The fallback inherits the containing Worker Tier or managed Role
+Binding; it does not declare or lower its own logical level.
 
 Runtime Policy validates the primary first. It considers the fallback only
 when primary validation returns one of the typed
@@ -213,8 +214,8 @@ Paseo capabilities before creation. Ambiguous or unsupported combinations
 fail closed for that action.
 
 V8 Review Profile materialization does not yet expose an availability-aware
-selection seam before Admission. A selected Review Runtime Profile containing
-`fallback` is therefore rejected as
+selection seam before Review child dispatch. A selected Review Runtime Profile
+containing `fallback` is therefore rejected as
 `REVIEW_PROFILE_FALLBACK_UNSUPPORTED`; Review resolution never silently drops
 it.
 

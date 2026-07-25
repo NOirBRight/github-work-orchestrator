@@ -537,10 +537,14 @@ def test_runtime_profile_fallback_both_unavailable_is_typed():
             capabilities=_fallback_capabilities(),
         )
 
-    assert unavailable.value.code == "RUNTIME_PROFILE_FALLBACK_UNAVAILABLE"
-    assert "RUNTIME_MODEL_UNAVAILABLE, RUNTIME_MODEL_UNAVAILABLE" in str(
-        unavailable.value
-    )
+    assert unavailable.value.code == "RUNTIME_MODEL_UNAVAILABLE"
+    assert str(unavailable.value) == "model unavailable: primary-unavailable"
+    assert unavailable.value.__notes__ == [
+        "configured fallback unavailable "
+        "(RUNTIME_MODEL_UNAVAILABLE: model unavailable: fallback-unavailable)"
+    ]
+    assert isinstance(unavailable.value.__cause__, core.PolicyError)
+    assert unavailable.value.__cause__.code == "RUNTIME_MODEL_UNAVAILABLE"
 
 
 def test_runtime_profile_fallback_configuration_error_never_selects_fallback():
