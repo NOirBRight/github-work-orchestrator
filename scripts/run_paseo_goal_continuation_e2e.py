@@ -189,7 +189,7 @@ def _arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _wait_for_terminal_result(
+def _wait_for_terminal_result_claim(
     client: PaseoCliClient,
     agent_id: str,
     *,
@@ -201,7 +201,9 @@ def _wait_for_terminal_result(
         if agent.lifecycle in {"idle", "completed", "ready"} and "GWO_RESULT" in output:
             return
         time.sleep(1.0)
-    raise TimeoutError("detached Paseo Worker did not return GWO_RESULT in time")
+    raise TimeoutError(
+        "detached Paseo Worker did not return a GWO_RESULT Result Claim in time"
+    )
 
 
 def _wait_until_due(next_check_at: str | None, *, deadline: float) -> None:
@@ -250,7 +252,7 @@ def main() -> int:
     )
     client = PaseoCliClient(executable=args.executable)
     created_agent_id: str | None = None
-    result: dict[str, object] | None = None
+    summary: dict[str, object] | None = None
 
     with tempfile.TemporaryDirectory(
         prefix="gwo-paseo-goal-continuation-",
@@ -302,7 +304,8 @@ def main() -> int:
                         "live-continuation-delay": (
                             "For this timing E2E only, wait 45 seconds before "
                             "editing files. Then implement the frozen Plan Node, "
-                            "run its focused check, commit, and return GWO_RESULT."
+                            "run its focused check, commit, and return the "
+                            "GWO_RESULT Result Claim."
                         )
                     }
                 ),
@@ -428,7 +431,7 @@ def main() -> int:
             if binding.native_finish_notification_supported:
                 raise AssertionError("detached CLI claimed native finish notification")
 
-            _wait_for_terminal_result(
+            _wait_for_terminal_result_claim(
                 client,
                 record.agent_id,
                 deadline=deadline,
@@ -497,7 +500,7 @@ def main() -> int:
                 or repeated_state.get("result_digest") != result_digest
             ):
                 raise AssertionError("repeated readback changed exact-once adoption")
-            result = {
+            summary = {
                 "agent_id": record.agent_id,
                 "candidate_sha": candidate_sha,
                 "declared_parent_agent_id": declared_parent,
@@ -523,9 +526,11 @@ def main() -> int:
                         f"Paseo Agent retirement did not read back: {record.agent_id}"
                     )
 
-    if result is None or created_agent_id is None:
-        raise AssertionError("live Paseo continuation E2E produced no Result")
-    print(json.dumps(result, sort_keys=True))
+    if summary is None or created_agent_id is None:
+        raise AssertionError(
+            "live Paseo continuation E2E produced no passing summary"
+        )
+    print(json.dumps(summary, sort_keys=True))
     return 0
 
 
