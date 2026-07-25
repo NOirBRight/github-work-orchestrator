@@ -493,7 +493,9 @@ def main() -> int:
                     "due readback did not verify the exact Result Claim"
                 )
             if not client.inspect(record.agent_id).archived:
-                raise AssertionError("verified Worker was not retired")
+                raise AssertionError(
+                    "Worker was not retired after its Result Claim was verified"
+                )
 
             repeated = restarted_driver.run_once(snapshot)
             repeated_state = restarted_kernel._read_state(
