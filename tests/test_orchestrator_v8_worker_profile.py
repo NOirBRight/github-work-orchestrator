@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from textwrap import dedent
+from typing import Any
 
 import pytest
 
@@ -16,11 +18,17 @@ from gwo_v8 import (  # noqa: E402
     Kernel,
     KernelError,
     LocalPlanPublication,
+    ModelCapabilities,
+    PaseoCliClient,
+    PaseoRuntimeAdapter,
     PlanCompiler,
+    ProviderCapabilities,
     RuntimeAdapterError,
+    RuntimeCapabilities,
     RuntimeProfile,
     resolve_worker_profile,
 )
+
 
 
 def _binding(
@@ -308,22 +316,177 @@ def test_adapter_normalize_profile_rejects_unknown_provider_model_reasoning_mode
     assert error.value.code == "RUNTIME_MODE_UNSUPPORTED"
 
 
-def test_adapter_normalize_profile_normalizes_kimi_provider_and_reasoning():
+def test_adapter_normalize_profile_requires_exact_k2_7_reasoning_on():
     adapter = InMemoryRuntimeAdapter(Path("/tmp/normalize-test"))
+
+    for thinking in ("TRUE", "yes", "enabled", "off"):
+        with pytest.raises(RuntimeAdapterError) as error:
+            adapter.normalize_profile(
+                RuntimeProfile(
+                    name="standard",
+                    provider="kimi-cli",
+                    model="kimi-code/kimi-for-coding",
+                    thinking=thinking,
+                    mode="yolo",
+                    features={},
+                )
+            )
+        assert error.value.code == "RUNTIME_THINKING_INVALID"
 
     normalized = adapter.normalize_profile(
         RuntimeProfile(
             name="standard",
-            provider="kimi",
+            provider="kimi-cli",
             model="kimi-code/kimi-for-coding",
-            thinking="  TRUE  ",
+            thinking="on",
             mode="yolo",
             features={},
         )
     )
-
-    assert normalized.provider == "kimi-cli"
     assert normalized.thinking == "on"
+
+
+def test_adapter_normalize_profile_rejects_unknown_codex_capabilities():
+    capabilities = RuntimeCapabilities(
+        providers={
+            "codex": ProviderCapabilities(
+                models={
+                    "gpt-5.6-sol": ModelCapabilities(
+                        thinking_options=frozenset({"high"}),
+                        features=frozenset(),
+                    ),
+                },
+                modes=frozenset({"full-access"}),
+                features=frozenset(),
+            )
+        }
+    )
+    adapter = InMemoryRuntimeAdapter(
+        Path("/tmp/normalize-codex-test"),
+        capabilities=capabilities,
+    )
+
+    with pytest.raises(RuntimeAdapterError) as error:
+        adapter.normalize_profile(
+            RuntimeProfile(
+                name="frontier",
+                provider="codex",
+                model="sol/xhigh",
+                thinking="xhigh",
+                mode="full-access",
+                features={},
+            )
+        )
+    assert error.value.code == "RUNTIME_MODEL_UNSUPPORTED"
+
+    with pytest.raises(RuntimeAdapterError) as error:
+        adapter.normalize_profile(
+            RuntimeProfile(
+                name="frontier",
+                provider="codex",
+                model="gpt-5.6-sol",
+                thinking="xhigh",
+                mode="full-access",
+                features={},
+            )
+        )
+    assert error.value.code == "RUNTIME_THINKING_INVALID"
+
+
+def test_resolve_worker_profile_falsey_repository_override_is_invalid():
+    with pytest.raises(RuntimeAdapterError) as error:
+        resolve_worker_profile(
+            _config(repositories={"owner/repo": []}),
+            repository="owner/repo",
+            difficulty="standard",
+        )
+    assert error.value.code == "RUNTIME_CONFIG_INVALID"
+
+    with pytest.raises(RuntimeAdapterError) as error:
+        resolve_worker_profile(
+            _config(
+                repositories={
+                    "owner/repo": {
+                        "tiers": [],
+                    }
+                }
+            ),
+            repository="owner/repo",
+            difficulty="standard",
+        )
+    assert error.value.code == "RUNTIME_TIER_PROFILE_INVALID"
+
+
+def _frontier_kernel(tmp_path: Path) -> Kernel:
+    """Minimal Kernel for frontier-profile helper tests."""
+
+    store_path = tmp_path / "v8.sqlite3"
+    return Kernel(
+        store_path=store_path,
+        publication=LocalPlanPublication(store_path),
+        runtime=InMemoryRuntimeAdapter(tmp_path / "runtime"),
+        verifier=EvidenceVerifier(),
+        repository_path=tmp_path / "repo",
+        integration_branch="main",
+        writer_generation="frontier-test",
+        runtime_config={
+            "tiers": {
+                "light": _binding("kimi-cli", "kimi-code/kimi-for-coding", "on", "yolo"),
+                "standard": _binding(
+                    "kimi-cli", "kimi-code/kimi-for-coding", "on", "yolo"
+                ),
+                "heavy": _binding("kimi-cli", "kimi-code/k3", "high", "yolo"),
+                "frontier": _binding("codex", "sol/xhigh", "xhigh", "full-access"),
+            }
+        },
+    )
+
+
+def _frontier_state() -> dict[str, Any]:
+    return {
+        "repository": "local/frontier",
+        "plan_digest": "a" * 64,
+        "node_key": "node:1",
+        "activation_id": "activation:1",
+    }
+
+
+def test_kernel_freeze_legacy_frontier_profile_resolves_and_persists_missing_key(
+    tmp_path,
+):
+    kernel = _frontier_kernel(tmp_path)
+    state = _frontier_state()
+
+    profile = kernel._freeze_legacy_frontier_profile(state)
+
+    assert profile.model == "sol/xhigh"
+    assert state["frontier_runtime_profile"]["model"] == "sol/xhigh"
+    assert state["frontier_profile_digest"] == profile.digest
+
+
+def test_kernel_freeze_legacy_frontier_profile_fails_closed_on_invalid_value(
+    tmp_path,
+):
+    kernel = _frontier_kernel(tmp_path)
+    state = _frontier_state()
+    state["frontier_runtime_profile"] = None
+
+    with pytest.raises(KernelError) as error:
+        kernel._freeze_legacy_frontier_profile(state)
+    assert error.value.code == "RUNTIME_PROFILE_FROZEN_INVALID"
+
+
+def test_kernel_start_frontier_attempt_branch_uses_freeze_helper():
+    """Structural proof that the start_frontier_attempt gate uses the freeze helper."""
+
+    import inspect
+
+    source = inspect.getsource(Kernel._handle_semantic_rejection)
+    start_index = source.find("start_frontier_attempt")
+    freeze_index = source.find("_freeze_legacy_frontier_profile")
+    assert start_index != -1
+    assert freeze_index != -1
+    assert freeze_index > start_index
 
 
 def test_resolve_worker_profile_preserves_features():
@@ -466,9 +629,7 @@ def test_kernel_resolves_worker_profile_from_runtime_config_at_admission(tmp_pat
 
     runtime_config = {
         "tiers": {
-            "heavy": _binding(
-                "codex", "admission-resolved-sol", "high", "full-access"
-            ),
+            "heavy": _binding("codex", "gpt-5.6-sol", "high", "full-access"),
         },
     }
     runtime = InMemoryRuntimeAdapter(tmp_path / "runtime")
@@ -502,7 +663,7 @@ def test_kernel_resolves_worker_profile_from_runtime_config_at_admission(tmp_pat
     assert isinstance(profile, RuntimeProfile)
     assert profile.name == "heavy"
     assert profile.provider == "codex"
-    assert profile.model == "admission-resolved-sol"
+    assert profile.model == "gpt-5.6-sol"
     assert profile.thinking == "high"
     assert profile.mode == "full-access"
 
@@ -524,7 +685,7 @@ def test_kernel_resolves_worker_profile_from_runtime_config_at_admission(tmp_pat
     durable = json.loads(row[0])
     assert durable["runtime_profile"]["name"] == "heavy"
     assert durable["runtime_profile"]["provider"] == "codex"
-    assert durable["runtime_profile"]["model"] == "admission-resolved-sol"
+    assert durable["runtime_profile"]["model"] == "gpt-5.6-sol"
     assert durable["runtime_profile"]["thinking"] == "high"
     assert durable["runtime_profile"]["mode"] == "full-access"
     assert durable["profile_digest"] == profile.digest
@@ -688,3 +849,122 @@ def test_kernel_canary_selects_configured_tier_without_injection(
     assert isinstance(profile, RuntimeProfile)
     assert profile.name == expected_tier
     assert profile.model == expected_model
+
+
+
+def test_paseo_cli_capabilities_read_real_payload_and_reject_unknown():
+    """Fresh capability readback validates against one requested provider."""
+
+    client = PaseoCliClient()
+
+    def _mock_run(args: list[str], *, failure_class: str = "transient"):  # noqa: ARG001
+        if args == ["provider", "ls", "--json"]:
+            return [
+                {
+                    "provider": "codex",
+                    "status": "ready",
+                    "enabled": "Enabled",
+                    "defaultMode": "auto",
+                    "modes": "Full Access,YOLO",
+                },
+                {
+                    "provider": "kimi",
+                    "status": "ready",
+                    "enabled": True,
+                    "defaultMode": "default",
+                    "modes": "Plan,Auto,YOLO",
+                },
+            ]
+        if args[:3] == ["provider", "models", "codex"]:
+            return [
+                {
+                    "id": "gpt-5.6-sol",
+                    "thinkingOptionIds": "high,xhigh",
+                    "defaultThinkingOptionId": "xhigh",
+                },
+                {
+                    "id": "sol/xhigh",
+                    "thinkingOptionIds": "xhigh",
+                    "defaultThinkingOptionId": "xhigh",
+                },
+            ]
+        if args[:3] == ["provider", "models", "kimi"]:
+            return [
+                {
+                    "id": "kimi-code/kimi-for-coding",
+                    "thinkingOptionIds": "",
+                    "defaultThinkingOptionId": "",
+                },
+                {
+                    "id": "kimi-code/k3",
+                    "thinkingOptionIds": "high,max",
+                    "defaultThinkingOptionId": "high",
+                },
+            ]
+        raise RuntimeError(f"unexpected args: {args}")
+
+    client._run = _mock_run  # type: ignore[method-assign]
+    adapter = PaseoRuntimeAdapter(client)
+
+    # Codex: gpt-5.6-sol/high/yolo and sol/xhigh/xhigh/full-access accepted.
+    assert adapter.normalize_profile(
+        RuntimeProfile(
+            name="standard",
+            provider="codex",
+            model="gpt-5.6-sol",
+            thinking="high",
+            mode="yolo",
+            features={},
+        )
+    ).model == "gpt-5.6-sol"
+    assert adapter.normalize_profile(
+        RuntimeProfile(
+            name="frontier",
+            provider="codex",
+            model="sol/xhigh",
+            thinking="xhigh",
+            mode="full-access",
+            features={},
+        )
+    ).model == "sol/xhigh"
+
+    # Kimi: K3/high/yolo accepted; exact K2.7 "on" accepted via narrow exception.
+    assert adapter.normalize_profile(
+        RuntimeProfile(
+            name="heavy",
+            provider="kimi-cli",
+            model="kimi-code/k3",
+            thinking="high",
+            mode="yolo",
+            features={},
+        )
+    ).model == "kimi-code/k3"
+    assert adapter.normalize_profile(
+        RuntimeProfile(
+            name="light",
+            provider="kimi-cli",
+            model="kimi-code/kimi-for-coding",
+            thinking="on",
+            mode="yolo",
+            features={},
+        )
+    ).thinking == "on"
+
+    # Unknown provider and disabled/non-ready providers fail closed.
+    with pytest.raises(RuntimeAdapterError) as error:
+        client.capabilities("unknown-provider")
+    assert error.value.code == "RUNTIME_PROVIDER_UNSUPPORTED"
+
+    # Unknown model/thinking/mode rejected for known provider.
+    with pytest.raises(RuntimeAdapterError) as error:
+        adapter.normalize_profile(
+            RuntimeProfile(
+                name="frontier",
+                provider="codex",
+                model="unknown-sol",
+                thinking="xhigh",
+                mode="full-access",
+                features={},
+            )
+        )
+    assert error.value.code == "RUNTIME_MODEL_UNSUPPORTED"

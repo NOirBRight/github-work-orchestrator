@@ -1323,6 +1323,37 @@ class Kernel:
                 error.detail,
             ) from error
 
+    def _freeze_legacy_frontier_profile(
+        self,
+        state: dict[str, Any],
+    ) -> RuntimeProfile:
+        """Return the frozen frontier profile, resolving once for legacy state.
+
+        - Key absent: resolve+normalize current configured/injected frontier,
+          persist snapshot+digest in ``state``, and return it.
+        - Key dict: return the frozen RuntimeProfile without re-resolving.
+        - Key present but null/malformed: fail closed.
+        """
+
+        repository = state["repository"]
+        if "frontier_runtime_profile" not in state:
+            profile = self._resolve_frontier_profile(repository=repository)
+            state["frontier_runtime_profile"] = self._profile_to_dict(profile)
+            state["frontier_profile_digest"] = profile.digest
+            self._write_state(
+                repository,
+                state["plan_digest"],
+                state,
+            )
+            return profile
+        frozen = state["frontier_runtime_profile"]
+        if not isinstance(frozen, dict):
+            raise KernelError(
+                "RUNTIME_PROFILE_FROZEN_INVALID",
+                "frontier_runtime_profile is present but not a snapshot",
+            )
+        return self._profile_from_dict(frozen)
+
     @staticmethod
     def ensure_store_schema(connection: sqlite3.Connection) -> None:
         """Create the one native Store schema used by live and reconstructed Kernel."""
@@ -3713,31 +3744,24 @@ class Kernel:
         # Admissions committed after this repair persist an immutable profile
         # snapshot. Materialization must consume that frozen selection; it must
         # not re-resolve from mutable runtime_config or constructor injection.
-        frozen_key = (
-            "frontier_runtime_profile"
-            if attempt_ordinal > 1
-            else "runtime_profile"
-        )
-        frozen_profile_data = state.get(frozen_key)
-        if isinstance(frozen_profile_data, dict):
-            selected_profile = self._profile_from_dict(frozen_profile_data)
-        elif attempt_ordinal == 1 and self.runtime_profile is not None:
-            # Legacy constructor-injection seam: only reachable for pre-repair
-            # state or when runtime_config is None.
-            selected_profile = self.runtime_profile
-        elif attempt_ordinal > 1 and self.frontier_runtime_profile is not None:
-            selected_profile = self.frontier_runtime_profile
-        elif self.runtime_config is not None:
-            difficulty = (
-                "frontier" if attempt_ordinal > 1 else str(work_node.get("difficulty"))
-            )
-            selected_profile = resolve_worker_profile(
-                self.runtime_config,
-                repository=state["repository"],
-                difficulty=difficulty,
-            )
+        if attempt_ordinal == 1:
+            frozen_profile_data = state.get("runtime_profile")
+            if isinstance(frozen_profile_data, dict):
+                selected_profile = self._profile_from_dict(frozen_profile_data)
+            elif self.runtime_profile is not None:
+                # Legacy constructor-injection seam: only reachable for pre-repair
+                # state or when runtime_config is None.
+                selected_profile = self.runtime_profile
+            elif self.runtime_config is not None:
+                selected_profile = resolve_worker_profile(
+                    self.runtime_config,
+                    repository=state["repository"],
+                    difficulty=str(work_node.get("difficulty")),
+                )
+            else:
+                selected_profile = None
         else:
-            selected_profile = None
+            selected_profile = self._freeze_legacy_frontier_profile(state)
         admission = RuntimeAdmission(
             repository=state["repository"],
             plan_digest=state["plan_digest"],
@@ -4470,24 +4494,7 @@ class Kernel:
             )
             return self._outcome(state)
         if directive.action == "start_frontier_attempt":
-            frontier_profile_data = state.get("frontier_runtime_profile")
-            if frontier_profile_data is None and (
-                self.frontier_runtime_profile is None
-            ):
-                state.update(
-                    {
-                        "status": "blocked",
-                        "directive": "request_decision",
-                        "attempt_state": "recovery_profile_blocked",
-                        "wait_condition": None,
-                    }
-                )
-                self._write_state(
-                    state["repository"],
-                    state["plan_digest"],
-                    state,
-                )
-                return self._outcome(state)
+            self._freeze_legacy_frontier_profile(state)
             old_attempt_id = str(state["attempt_id"])
             packet = recovery_packet()
             prompt = self._recovery_prompt(
