@@ -943,7 +943,9 @@ def test_review_lookup_create_race_does_not_authorize_first_send(
     assert "gwo.create_receipt" not in client._labels[agents[0].agent_id]
 
 
-def test_dual_review_axes_above_mcp_limit_adopt_after_restart(tmp_path):
+def test_review_axis_prompt_acceptance_adopts_after_restart_without_duplicate_delivery(
+    tmp_path,
+):
     repository, candidate_sha = _repository(tmp_path)
     profile = _profile()
     client = RestartBlindPaseoClient()

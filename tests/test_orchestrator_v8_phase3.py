@@ -38,7 +38,10 @@ from gwo_v8 import (  # noqa: E402
     resolve_review_profile,
 )
 from gwo_v8.kernel import DeliveryControlError  # noqa: E402
-from gwo_v8.runtime import PASEO_INLINE_PROMPT_MAX_BYTES  # noqa: E402
+from gwo_v8.runtime import (  # noqa: E402
+    PASEO_INLINE_PROMPT_MAX_BYTES,
+    _environment_snapshot,
+)
 import orch_core  # noqa: E402
 
 
@@ -1036,7 +1039,7 @@ def test_repair_packet_accepts_two_valid_axis_envelopes(tmp_path):
     assert raised.value.code == "RECOVERY_PACKET_TOO_LARGE"
 
 
-def test_review_child_transport_retry_is_bounded_and_readback_first(tmp_path):
+def test_review_axis_materialization_is_one_execution_and_readback_first(tmp_path):
     _node, _worker_runtime, worker_binding, observation = _execute_candidate(
         tmp_path,
         risk="standard",
@@ -1052,7 +1055,18 @@ def test_review_child_transport_retry_is_bounded_and_readback_first(tmp_path):
         selector="standard_axis",
     )
     transient_client = InMemoryPaseoClient(create_failures=("transient", "transient"))
-    binding = PaseoRuntimeAdapter(transient_client).materialize_review_axis(
+    adapter = PaseoRuntimeAdapter(transient_client)
+    for expected_count in (1, 2):
+        with pytest.raises(RuntimeAdapterError) as transient:
+            adapter.materialize_review_axis(
+                request,
+                profile,
+                parent_agent_id=worker_binding.agent_id,
+            )
+        assert transient.value.code == "PASEO_CREATE_TRANSIENT"
+        assert transient.value.failure_class == "transient"
+        assert transient_client.create_count == expected_count
+    binding = adapter.materialize_review_axis(
         request,
         profile,
         parent_agent_id=worker_binding.agent_id,
@@ -1078,6 +1092,94 @@ def test_review_child_transport_retry_is_bounded_and_readback_first(tmp_path):
         )
     assert rejected.value.failure_class == "permanent"
     assert permanent_client.create_count == 1
+
+
+class _ReviewOrphanTrackingPaseoClient(InMemoryPaseoClient):
+    def __init__(self):
+        super().__init__()
+        self.archived_agent_ids = []
+        self.cleaned_action_keys = []
+
+    def archive(self, agent_id):
+        self.archived_agent_ids.append(agent_id)
+        super().archive(agent_id)
+
+    def cleanup_orphan_worktree(self, action_key, _repository_path):
+        self.cleaned_action_keys.append(action_key)
+
+
+def test_review_axis_materialization_cleans_conflicting_exact_orphan(tmp_path):
+    _node, _worker_runtime, worker_binding, observation = _execute_candidate(
+        tmp_path,
+        risk="standard",
+    )
+    request = _review_axis_request(
+        worker_binding,
+        observation,
+        axis="standards",
+    )
+    profile = resolve_review_profile(
+        _runtime_config(),
+        repository="local/phase-three",
+        selector="standard_axis",
+    )
+    client = _ReviewOrphanTrackingPaseoClient()
+    orphan_prompt = RuntimePrompt(text="orphan", digest="f" * 64)
+    orphan = client.create(
+        PaseoCreateRequest(
+            action_key=request.action_key,
+            title="orphan",
+            labels={
+                "gwo.action_key": request.action_key,
+                "gwo.review_candidate": "0" * 40,
+            },
+            prompt=orphan_prompt,
+            repository_path=str(request.workspace),
+            base_sha=request.candidate_sha,
+            profile=profile,
+            parent_agent_id=worker_binding.agent_id,
+        )
+    )
+
+    binding = PaseoRuntimeAdapter(client).materialize_review_axis(
+        request,
+        profile,
+        parent_agent_id=worker_binding.agent_id,
+    )
+
+    assert client.archived_agent_ids == [orphan.agent_id]
+    assert client.cleaned_action_keys == [request.action_key]
+    assert binding.action_key == request.action_key
+    assert client.prompt_acceptance_count(binding.agent_id, request.to_prompt()) == 1
+
+
+def test_windows_environment_requirement_resolves_logical_paseo_executable(
+    tmp_path,
+    monkeypatch,
+):
+    resolved = r"C:\Users\test\.local\bin\paseo.cmd"
+    commands = []
+
+    monkeypatch.setattr("gwo_v8.runtime.sys.platform", "win32")
+    monkeypatch.setattr(
+        "gwo_v8.runtime.shutil.which",
+        lambda executable: resolved if executable == "paseo" else None,
+    )
+
+    def run(command, *, cwd):
+        commands.append((command, cwd))
+        return SimpleNamespace(returncode=0, stdout="paseo 1.2.3\n", stderr="")
+
+    monkeypatch.setattr("gwo_v8.runtime._run", run)
+
+    snapshot = _environment_snapshot(("paseo",), cwd=tmp_path)
+
+    assert snapshot["platform"] == "win32"
+    assert snapshot["paseo"] == {
+        "executable": resolved,
+        "version": "paseo 1.2.3",
+    }
+    assert commands == [([resolved, "--version"], tmp_path)]
 
 
 class _DelayedReviewPromptPaseoClient(InMemoryPaseoClient):
