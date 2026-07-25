@@ -636,7 +636,38 @@ def test_low_risk_publication_eligibility_consumes_typed_check_evidence(
 
 
 def _runtime_config() -> dict:
+    worker_binding = {
+        "provider": "kimi-cli",
+        "settings": {
+            "model": "kimi-code/kimi-for-coding",
+            "thinkingOptionId": "on",
+            "modeId": "yolo",
+            "features": {},
+        },
+    }
     return {
+        "tiers": {
+            "light": worker_binding,
+            "standard": worker_binding,
+            "heavy": {
+                "provider": "kimi-cli",
+                "settings": {
+                    "model": "kimi-code/k3",
+                    "thinkingOptionId": "high",
+                    "modeId": "yolo",
+                    "features": {},
+                },
+            },
+            "frontier": {
+                "provider": "codex",
+                "settings": {
+                    "model": "gpt-5.6-sol",
+                    "thinkingOptionId": "xhigh",
+                    "modeId": "full-access",
+                    "features": {},
+                },
+            },
+        },
         "role_profiles": {
             "reviewer_standard": {
                 "provider": "codex",
@@ -967,6 +998,7 @@ def test_repair_packet_accepts_two_valid_axis_envelopes(tmp_path):
         repository_path=Path(worker_binding.repository_path),
         integration_branch="main",
         writer_generation="phase-3",
+        runtime_config=_runtime_config(),
     )
     repair_prompt = kernel._recovery_prompt(
         work_node,
@@ -1410,22 +1442,6 @@ def test_review_prompt_ambiguity_survives_delayed_visibility_windows(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
-        runtime_profile=RuntimeProfile(
-            name="worker-standard",
-            provider="kimi-cli",
-            model="kimi-code/kimi-for-coding",
-            thinking="max",
-            mode="yolo",
-            features={},
-        ),
-        frontier_runtime_profile=RuntimeProfile(
-            name="worker-frontier",
-            provider="codex",
-            model="gpt-5.6-sol",
-            thinking="xhigh",
-            mode="full-access",
-            features={},
-        ),
         runtime_config=_runtime_config(),
         delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
     )
@@ -1597,14 +1613,7 @@ def test_prompt_ambiguity_does_not_exhaust_materialization(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
-        runtime_profile=RuntimeProfile(
-            name="worker-standard",
-            provider="kimi-cli",
-            model="kimi-code/kimi-for-coding",
-            thinking="max",
-            mode="yolo",
-            features={},
-        ),
+        runtime_config=_runtime_config(),
     )
     monkeypatch.setattr("gwo_v8.runtime.PASEO_BOOTSTRAP_WAIT_SECONDS", 0.0)
 
@@ -1731,22 +1740,6 @@ def test_kernel_runs_standard_review_inside_candidate_work_attempt(tmp_path):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
-        runtime_profile=RuntimeProfile(
-            name="worker-standard",
-            provider="kimi-cli",
-            model="kimi-code/kimi-for-coding",
-            thinking="max",
-            mode="yolo",
-            features={},
-        ),
-        frontier_runtime_profile=RuntimeProfile(
-            name="worker-frontier",
-            provider="codex",
-            model="gpt-5.6-sol",
-            thinking="xhigh",
-            mode="full-access",
-            features={},
-        ),
         runtime_config=_runtime_config(),
         delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
     )
@@ -1889,6 +1882,7 @@ def test_kernel_publishes_once_waits_for_exact_sha_ci_then_integrates(
         integration_branch="main",
         writer_generation="phase-3",
         delivery_control=delivery,
+        runtime_config=_runtime_config(),
     )
     base_sha = _git(repository, "rev-parse", "HEAD")
 
@@ -1939,6 +1933,7 @@ def test_v3_delivery_requirement_fails_closed_without_delivery_control(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
+        runtime_config=_runtime_config(),
     )
 
     blocked = kernel.reconcile_once("local/phase-three")
@@ -2056,14 +2051,7 @@ def test_terminal_worker_without_result_enters_one_bounded_repair_round(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
-        runtime_profile=RuntimeProfile(
-            name="worker",
-            provider="kimi-cli",
-            model="kimi-code/kimi-for-coding",
-            thinking="max",
-            mode="yolo",
-            features={},
-        ),
+        runtime_config=_runtime_config(),
     )
 
     first = kernel.reconcile_once("local/phase-three")
@@ -2098,7 +2086,7 @@ def test_paseo_runtime_captures_bounded_typed_no_result(tmp_path):
             name="worker",
             provider="kimi-cli",
             model="kimi-code/kimi-for-coding",
-            thinking="max",
+            thinking="on",
             mode="yolo",
             features={},
         ),
@@ -2154,14 +2142,7 @@ def test_invalid_worker_result_consumes_no_result_recovery_immediately(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
-        runtime_profile=RuntimeProfile(
-            name="worker",
-            provider="kimi-cli",
-            model="kimi-code/kimi-for-coding",
-            thinking="max",
-            mode="yolo",
-            features={},
-        ),
+        runtime_config=_runtime_config(),
         delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
     )
     waiting = kernel.reconcile_once("local/phase-three")
@@ -2228,6 +2209,7 @@ def test_repeated_runtime_loss_blocks_without_consuming_semantic_attempt(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
+        runtime_config=_runtime_config(),
     )
 
     assert kernel.reconcile_once("local/phase-three").status == "waiting"
@@ -2271,6 +2253,7 @@ def test_hosted_infrastructure_failure_retries_twice_then_blocks(tmp_path):
         integration_branch="main",
         writer_generation="phase-3",
         delivery_control=delivery,
+        runtime_config=_runtime_config(),
     )
 
     first = kernel.reconcile_once("local/phase-three")
@@ -2307,6 +2290,7 @@ def test_hosted_cancellation_waits_without_rejecting_candidate(tmp_path):
         integration_branch="main",
         writer_generation="phase-3",
         delivery_control=InMemoryDeliveryControl(hosted_outcomes=("cancelled",)),
+        runtime_config=_runtime_config(),
     )
 
     waiting = kernel.reconcile_once("local/phase-three")
@@ -2369,6 +2353,7 @@ def test_kernel_reconciles_again_after_ambiguous_publication_readback(tmp_path):
         integration_branch="main",
         writer_generation="phase-3",
         delivery_control=delivery,
+        runtime_config=_runtime_config(),
     )
 
     waiting = kernel.reconcile_once("local/phase-three")
@@ -3063,14 +3048,7 @@ def test_kernel_reuses_store_persisted_checks_after_adapter_restart(tmp_path):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
-        runtime_profile=RuntimeProfile(
-            name="worker",
-            provider="kimi-cli",
-            model="kimi-code/kimi-for-coding",
-            thinking="max",
-            mode="yolo",
-            features={},
-        ),
+        runtime_config=_runtime_config(),
         delivery_control=delivery,
     )
     worker_wait = kernel.reconcile_once("local/phase-three")
@@ -3124,14 +3102,7 @@ def test_kernel_reuses_store_persisted_checks_after_adapter_restart(tmp_path):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
-        runtime_profile=RuntimeProfile(
-            name="worker",
-            provider="kimi-cli",
-            model="kimi-code/kimi-for-coding",
-            thinking="max",
-            mode="yolo",
-            features={},
-        ),
+        runtime_config=_runtime_config(),
         delivery_control=delivery,
     )
 
@@ -3255,14 +3226,6 @@ def test_strict_review_adds_specialist_then_waits_for_bound_human_decision(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
-        runtime_profile=RuntimeProfile(
-            name="worker",
-            provider="kimi-cli",
-            model="kimi-code/kimi-for-coding",
-            thinking="max",
-            mode="yolo",
-            features={},
-        ),
         runtime_config=_runtime_config(),
         delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
     )
@@ -3350,6 +3313,10 @@ def test_strict_review_adds_specialist_then_waits_for_bound_human_decision(
 class _RuntimeMustNotRun:
     adapter_name = "must-not-run"
 
+    def normalize_profile(self, profile):
+        # Admission may ask; binding operations are the ones that must not run.
+        return profile
+
     def __getattr__(self, name):
         raise AssertionError(f"Result Adoption must not call Runtime.{name}")
 
@@ -3379,6 +3346,7 @@ def test_unchanged_node_and_contract_adopt_verified_result_without_runtime(
         integration_branch="main",
         writer_generation="phase-3",
         delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
+        runtime_config=_runtime_config(),
     )
     first = first_kernel.reconcile_once("local/phase-three")
     assert first.status == "complete"
@@ -3413,6 +3381,7 @@ def test_unchanged_node_and_contract_adopt_verified_result_without_runtime(
         integration_branch="main",
         writer_generation="phase-3",
         delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
+        runtime_config=_runtime_config(),
     )
 
     adopted = second_kernel.reconcile_once("local/phase-three")
@@ -3449,6 +3418,7 @@ def test_result_adoption_refreshes_only_base_sensitive_checks(tmp_path):
         integration_branch="main",
         writer_generation="phase-3",
         delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
+        runtime_config=_runtime_config(),
     )
     first = first_kernel.reconcile_once("local/phase-three")
     assert first.status == "complete"
@@ -3476,6 +3446,7 @@ def test_result_adoption_refreshes_only_base_sensitive_checks(tmp_path):
         integration_branch="main",
         writer_generation="phase-3",
         delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
+        runtime_config=_runtime_config(),
     )
 
     adopted = second_kernel.reconcile_once("local/phase-three")
@@ -3516,6 +3487,7 @@ def test_explicit_result_supersession_excludes_historical_adoption(tmp_path):
         integration_branch="main",
         writer_generation="phase-3",
         delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
+        runtime_config=_runtime_config(),
     )
     completed = first_kernel.reconcile_once("local/phase-three")
     first_node = _compiled_work_node()
@@ -3546,6 +3518,7 @@ def test_explicit_result_supersession_excludes_historical_adoption(tmp_path):
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
+        runtime_config=_runtime_config(),
     )
 
     with pytest.raises(AssertionError, match="must not call Runtime.read_binding"):
@@ -3577,6 +3550,7 @@ def test_replan_hold_blocks_new_admission_until_active_writer_clears_it(
         integration_branch="main",
         writer_generation="phase-3",
         delivery_control=InMemoryDeliveryControl(hosted_outcomes=("passed",)),
+        runtime_config=_runtime_config(),
     )
     kernel.place_replan_hold(
         repository="local/phase-three",
@@ -3627,22 +3601,6 @@ def test_dual_axis_review_blockers_produce_exact_restart_stable_repair_prompt(
         writer_generation="phase-3",
     )
     client = _RepairCapturePaseoClient()
-    worker_profile = RuntimeProfile(
-        name="worker-standard",
-        provider="kimi-cli",
-        model="kimi-code/kimi-for-coding",
-        thinking="max",
-        mode="yolo",
-        features={},
-    )
-    frontier_profile = RuntimeProfile(
-        name="worker-frontier",
-        provider="codex",
-        model="gpt-5.6-sol",
-        thinking="xhigh",
-        mode="full-access",
-        features={},
-    )
     kernel = Kernel(
         store_path=store_path,
         publication=publication,
@@ -3651,8 +3609,6 @@ def test_dual_axis_review_blockers_produce_exact_restart_stable_repair_prompt(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
-        runtime_profile=worker_profile,
-        frontier_runtime_profile=frontier_profile,
         runtime_config=_runtime_config(),
     )
     waiting_for_worker = kernel.reconcile_once("local/phase-three")
@@ -3772,8 +3728,6 @@ def test_dual_axis_review_blockers_produce_exact_restart_stable_repair_prompt(
         repository_path=repository,
         integration_branch="main",
         writer_generation="phase-3",
-        runtime_profile=worker_profile,
-        frontier_runtime_profile=frontier_profile,
         runtime_config=_runtime_config(),
     )
 

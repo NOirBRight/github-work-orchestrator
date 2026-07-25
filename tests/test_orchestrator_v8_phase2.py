@@ -801,7 +801,7 @@ def test_paseo_adapter_round_trips_identity_prompt_lifecycle_and_retirement(
         name="worker-standard",
         provider="kimi-cli",
         model="kimi-code/kimi-for-coding",
-        thinking="max",
+        thinking="on",
         mode="yolo",
         features={},
     )
@@ -867,7 +867,7 @@ def test_paseo_adapter_reads_bounded_worker_result_and_git_head(tmp_path):
         name="worker-standard",
         provider="kimi-cli",
         model="kimi-code/kimi-for-coding",
-        thinking="max",
+        thinking="on",
         mode="yolo",
         features={},
     )
@@ -1083,7 +1083,7 @@ def _paseo_kernel(
         name="worker-standard",
         provider="kimi-cli",
         model="kimi-code/kimi-for-coding",
-        thinking="max",
+        thinking="on",
         mode="yolo",
         features={},
     )
@@ -1344,6 +1344,7 @@ def test_implement_gwo_launcher_runs_one_ready_item_through_goal_completion(
         repository_path=repository,
         integration_branch="main",
         writer_generation="v8-generation-1",
+        runtime_config=_runtime_config(),
     )
     driver = GoalDriver(
         store_path=tmp_path / "v8.sqlite3",
@@ -1434,6 +1435,7 @@ def test_implement_gwo_launcher_executes_explicit_ready_set_serially_in_phase_tw
         repository_path=repository,
         integration_branch="main",
         writer_generation="v8-generation-1",
+        runtime_config=_runtime_config(),
     )
     launcher = ImplementGwoLauncher(
         compiler=PlanCompiler(),
@@ -1551,6 +1553,22 @@ def _coordinator_profile() -> RuntimeProfile:
         mode="yolo",
         features={},
     )
+
+
+def _runtime_config() -> dict:
+    return {
+        "tiers": {
+            "light": {
+                "provider": "kimi-cli",
+                "settings": {
+                    "model": "kimi-code/kimi-for-coding",
+                    "thinkingOptionId": "on",
+                    "modeId": "yolo",
+                    "features": {},
+                },
+            },
+        },
+    }
 
 
 def test_goal_driver_resumes_manual_coordinator_when_campaign_stops_silently(

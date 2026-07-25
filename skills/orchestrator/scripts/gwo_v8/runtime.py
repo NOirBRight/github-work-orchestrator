@@ -290,39 +290,19 @@ def resolve_review_profile(
     )
 
 
-def _normalize_worker_reasoning(provider: str, model: str, thinking: str) -> str:
-    """Return the Runtime-facing Kimi reasoning value for the adapter contract."""
-
-    normalized = thinking.strip().lower()
-    if provider not in {"kimi", "kimi-cli"}:
-        return normalized
-    if normalized in {"on", "true", "enabled", "yes"}:
-        normalized = "on"
-    elif normalized in {"off", "false", "disabled", "no"}:
-        normalized = "off"
-    if model == "kimi-code/kimi-for-coding" and normalized not in {"on", "off"}:
-        raise RuntimeAdapterError(
-            "RUNTIME_THINKING_INVALID",
-            f"Kimi K2.7 reasoning must be a toggle, got: {thinking}",
-        )
-    if model == "kimi-code/k3" and normalized not in {"high", "max"}:
-        raise RuntimeAdapterError(
-            "RUNTIME_THINKING_INVALID",
-            f"Kimi K3 reasoning must be high or max, got: {thinking}",
-        )
-    return normalized
-
-
 def resolve_worker_profile(
     config: dict[str, Any] | None,
     *,
     repository: str,
     difficulty: str,
 ) -> RuntimeProfile:
-    """Resolve the initial Worker Runtime Profile from a PlanNode difficulty.
+    """Resolve the initial Worker Runtime Profile shape from a PlanNode difficulty.
 
-    Repository tier mappings override global mappings. Invalid or incomplete
-    mappings fail closed; there is no silent fallback to a host default.
+    Repository tier mappings override global mappings. This resolver performs
+    only shape validation: provider/model/thinking/mode must be non-empty
+    strings and features must be a mapping. Concrete provider/model/reasoning
+    normalization and support validation is performed by the selected
+    RuntimeAdapter via ``normalize_profile``.
     """
 
     if config is None:
@@ -342,7 +322,9 @@ def resolve_worker_profile(
         )
     tier = DIFFICULTY_TO_TIER[difficulty]
 
-    repositories = config.get("repositories") or {}
+    repositories = config.get("repositories")
+    if repositories is None:
+        repositories = {}
     if not isinstance(repositories, dict):
         raise RuntimeAdapterError(
             "RUNTIME_CONFIG_INVALID",
@@ -407,20 +389,98 @@ def resolve_worker_profile(
             f"Worker tier {tier} profile is incomplete",
         )
 
-    provider = provider.strip()
-    if provider == "kimi":
-        provider = "kimi-cli"
-    model = model.strip()
-    mode = mode.strip()
-    thinking = _normalize_worker_reasoning(provider, model, thinking)
-
     return RuntimeProfile(
         name=tier,
-        provider=provider,
-        model=model,
-        thinking=thinking,
-        mode=mode,
+        provider=provider.strip(),
+        model=model.strip(),
+        thinking=thinking.strip(),
+        mode=mode.strip(),
         features=dict(features),
+    )
+
+
+_KIMI_K27_MODELS = {
+    "kimi-code/kimi-for-coding",
+}
+_KIMI_K3_MODELS = {
+    "kimi-code/k3",
+}
+_KNOWN_MODES = {
+    "yolo",
+    "full-access",
+}
+
+
+def _normalize_kimi_reasoning(model: str, thinking: str) -> str:
+    """Return the Runtime-facing Kimi reasoning value for the adapter contract."""
+
+    normalized = thinking.strip().lower()
+    if normalized in {"on", "true", "enabled", "yes"}:
+        normalized = "on"
+    elif normalized in {"off", "false", "disabled", "no"}:
+        normalized = "off"
+    elif normalized in {"high", "max"}:
+        pass
+    else:
+        raise RuntimeAdapterError(
+            "RUNTIME_THINKING_INVALID",
+            f"Kimi reasoning value is not recognized: {thinking}",
+        )
+    if model in _KIMI_K27_MODELS and normalized not in {"on", "off"}:
+        raise RuntimeAdapterError(
+            "RUNTIME_THINKING_INVALID",
+            f"Kimi K2.7 reasoning must be a toggle, got: {thinking}",
+        )
+    if model in _KIMI_K3_MODELS and normalized not in {"high", "max"}:
+        raise RuntimeAdapterError(
+            "RUNTIME_THINKING_INVALID",
+            f"Kimi K3 reasoning must be high or max, got: {thinking}",
+        )
+    return normalized
+
+
+def _normalize_runtime_profile(
+    profile: RuntimeProfile,
+    *,
+    allowed_providers: set[str] | None = None,
+) -> RuntimeProfile:
+    """Shared Adapter normalization: provider aliases, Kimi reasoning, modes.
+
+    Unknown provider/model/reasoning/mode combinations fail closed. Adapters may
+    supply an allowed-provider set; when omitted, ``kimi``, ``kimi-cli``, and
+    ``codex`` are accepted.
+    """
+
+    providers = {"kimi", "kimi-cli", "codex"} if allowed_providers is None else allowed_providers
+    provider = profile.provider.lower()
+    if provider == "kimi":
+        provider = "kimi-cli"
+    if provider not in providers:
+        raise RuntimeAdapterError(
+            "RUNTIME_PROVIDER_UNSUPPORTED",
+            f"Runtime provider is not supported: {profile.provider}",
+        )
+
+    if provider in {"kimi", "kimi-cli"}:
+        if profile.model not in _KIMI_K27_MODELS | _KIMI_K3_MODELS:
+            raise RuntimeAdapterError(
+                "RUNTIME_MODEL_UNSUPPORTED",
+                f"Kimi model is not supported: {profile.model}",
+            )
+        thinking = _normalize_kimi_reasoning(profile.model, profile.thinking)
+    else:
+        thinking = profile.thinking
+
+    if profile.mode not in _KNOWN_MODES:
+        raise RuntimeAdapterError(
+            "RUNTIME_MODE_UNSUPPORTED",
+            f"Runtime mode is not supported: {profile.mode}",
+        )
+
+    return replace(
+        profile,
+        provider=provider,
+        thinking=thinking,
     )
 
 
@@ -845,6 +905,8 @@ class RuntimeAdapter(Protocol):
     """Evolvable Paseo-shaped capabilities consumed by the V8 Kernel."""
 
     adapter_name: str
+
+    def normalize_profile(self, profile: RuntimeProfile) -> RuntimeProfile: ...
 
     def materialize(
         self,
@@ -1911,6 +1973,10 @@ class PaseoRuntimeAdapter:
             tuple[str, RuntimeObservation],
         ] = {}
         self._deferred_repository_checks: set[str] = set()
+
+    def normalize_profile(self, profile: RuntimeProfile) -> RuntimeProfile:
+        """Validate and normalize provider/model/reasoning/mode for Paseo."""
+        return _normalize_runtime_profile(profile)
 
     def observed_worker_turn_capacity(
         self,
@@ -3614,6 +3680,10 @@ class InMemoryRuntimeAdapter:
         self.workspace_root = Path(workspace_root)
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self._states: dict[str, _RuntimeState] = {}
+
+    def normalize_profile(self, profile: RuntimeProfile) -> RuntimeProfile:
+        """Validate and normalize provider/model/reasoning/mode for the fake."""
+        return _normalize_runtime_profile(profile)
 
     def materialize(
         self,

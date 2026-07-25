@@ -1194,6 +1194,13 @@ class Kernel:
         self.publication = publication
         self.runtime = runtime
         self.verifier = verifier
+        if (runtime_profile is not None or frontier_runtime_profile is not None) and (
+            runtime_config is not None
+        ):
+            raise KernelError(
+                "RUNTIME_PROFILE_INJECTION_CONFLICT",
+                "runtime_profile injection is only allowed when runtime_config is None",
+            )
         self.repository_path = Path(repository_path).resolve()
         self.integration_branch = integration_branch
         self.writer_generation = writer_generation
@@ -1228,6 +1235,93 @@ class Kernel:
         connection = sqlite3.connect(self.store_path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @staticmethod
+    def _profile_to_dict(profile: RuntimeProfile) -> dict[str, Any]:
+        return {
+            "name": profile.name,
+            "provider": profile.provider,
+            "model": profile.model,
+            "thinking": profile.thinking,
+            "mode": profile.mode,
+            "features": dict(profile.features),
+        }
+
+    @staticmethod
+    def _profile_from_dict(data: dict[str, Any]) -> RuntimeProfile:
+        return RuntimeProfile(
+            name=str(data["name"]),
+            provider=str(data["provider"]),
+            model=str(data["model"]),
+            thinking=str(data["thinking"]),
+            mode=str(data["mode"]),
+            features=dict(data.get("features") or {}),
+        )
+
+    def _resolve_worker_profile(
+        self,
+        *,
+        repository: str,
+        difficulty: str,
+    ) -> RuntimeProfile:
+        """Resolve and normalize the Worker profile for the configured Adapter."""
+
+        if self.runtime_config is not None:
+            profile = resolve_worker_profile(
+                self.runtime_config,
+                repository=repository,
+                difficulty=difficulty,
+            )
+        elif self.runtime_profile is not None:
+            profile = self.runtime_profile
+        else:
+            raise KernelError(
+                "RUNTIME_PROFILE_MISSING",
+                "Kernel has no runtime_config or runtime_profile to resolve a Worker profile",
+            )
+        normalize = getattr(self.runtime, "normalize_profile", None)
+        if not callable(normalize):
+            raise KernelError(
+                "RUNTIME_ADAPTER_INVALID",
+                f"Runtime adapter {self.runtime.adapter_name} does not advertise normalize_profile",
+            )
+        try:
+            return normalize(profile)
+        except RuntimeAdapterError as error:
+            raise KernelError(
+                error.code,
+                error.detail,
+            ) from error
+
+    def _resolve_frontier_profile(self, *, repository: str) -> RuntimeProfile:
+        """Resolve and normalize the frontier/recovery profile."""
+
+        if self.frontier_runtime_profile is not None:
+            profile = self.frontier_runtime_profile
+        elif self.runtime_config is not None:
+            profile = resolve_worker_profile(
+                self.runtime_config,
+                repository=repository,
+                difficulty="frontier",
+            )
+        else:
+            raise KernelError(
+                "RUNTIME_PROFILE_MISSING",
+                "Kernel has no runtime_config or frontier_runtime_profile to resolve a frontier profile",
+            )
+        normalize = getattr(self.runtime, "normalize_profile", None)
+        if not callable(normalize):
+            raise KernelError(
+                "RUNTIME_ADAPTER_INVALID",
+                f"Runtime adapter {self.runtime.adapter_name} does not advertise normalize_profile",
+            )
+        try:
+            return normalize(profile)
+        except RuntimeAdapterError as error:
+            raise KernelError(
+                error.code,
+                error.detail,
+            ) from error
 
     @staticmethod
     def ensure_store_schema(connection: sqlite3.Connection) -> None:
@@ -1841,6 +1935,31 @@ class Kernel:
                 "RESOURCE_CLAIMS_INVALID",
                 "Plan Node Resource Claims are invalid",
             )
+
+        # Resolve and freeze the Worker Runtime Profile before committing durable
+        # Admission/Attempt state. Configuration changes after this point cannot
+        # alter the profile selected for this Admission.
+        difficulty = str(work_node.get("difficulty"))
+        runtime_profile = self._resolve_worker_profile(
+            repository=state["repository"],
+            difficulty=difficulty,
+        )
+        state["runtime_profile"] = self._profile_to_dict(runtime_profile)
+        state["profile_digest"] = runtime_profile.digest
+        recovery_policy = work_node.get("recovery_policy") or {}
+        if (
+            isinstance(recovery_policy, dict)
+            and recovery_policy.get("semantic_attempts", 1) > 1
+        ):
+            recovery_profile = self._resolve_frontier_profile(
+                repository=state["repository"],
+            )
+            state["frontier_runtime_profile"] = self._profile_to_dict(recovery_profile)
+            state["frontier_profile_digest"] = recovery_profile.digest
+        else:
+            state["frontier_runtime_profile"] = None
+            state["frontier_profile_digest"] = None
+
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             active = connection.execute(
@@ -3590,7 +3709,21 @@ class Kernel:
     ):
         prompt = self._prompt_from_state(state)
         attempt_ordinal = int(state.get("attempt_ordinal", 1))
-        if attempt_ordinal == 1 and self.runtime_profile is not None:
+
+        # Admissions committed after this repair persist an immutable profile
+        # snapshot. Materialization must consume that frozen selection; it must
+        # not re-resolve from mutable runtime_config or constructor injection.
+        frozen_key = (
+            "frontier_runtime_profile"
+            if attempt_ordinal > 1
+            else "runtime_profile"
+        )
+        frozen_profile_data = state.get(frozen_key)
+        if isinstance(frozen_profile_data, dict):
+            selected_profile = self._profile_from_dict(frozen_profile_data)
+        elif attempt_ordinal == 1 and self.runtime_profile is not None:
+            # Legacy constructor-injection seam: only reachable for pre-repair
+            # state or when runtime_config is None.
             selected_profile = self.runtime_profile
         elif attempt_ordinal > 1 and self.frontier_runtime_profile is not None:
             selected_profile = self.frontier_runtime_profile
@@ -4337,7 +4470,10 @@ class Kernel:
             )
             return self._outcome(state)
         if directive.action == "start_frontier_attempt":
-            if self.frontier_runtime_profile is None:
+            frontier_profile_data = state.get("frontier_runtime_profile")
+            if frontier_profile_data is None and (
+                self.frontier_runtime_profile is None
+            ):
                 state.update(
                     {
                         "status": "blocked",
