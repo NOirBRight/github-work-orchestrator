@@ -46,6 +46,8 @@ from .runtime import (
     resolve_review_profile,
 )
 
+REPAIR_PACKET_MAX_BYTES = 64 * 1024
+
 
 class KernelError(RuntimeError):
     def __init__(self, code: str, detail: str):
@@ -1065,10 +1067,10 @@ class RecoveryLadder:
             "causes": bounded_causes,
         }
         rendered = canonical_bytes(packet).decode("utf-8")
-        if len(rendered.encode("utf-8")) > 16_384:
+        if len(rendered.encode("utf-8")) > REPAIR_PACKET_MAX_BYTES:
             raise KernelError(
                 "RECOVERY_PACKET_TOO_LARGE",
-                "bounded Recovery Packet exceeds 16k bytes",
+                "Repair Packet exceeds the 64 KiB UTF-8 envelope bound",
             )
         return rendered
 

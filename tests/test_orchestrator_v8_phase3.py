@@ -745,6 +745,136 @@ def test_runtime_materializes_cross_provider_typed_review_axis(tmp_path):
     assert len(axis.output_digest) == 64
 
 
+def test_repair_packet_accepts_two_valid_axis_envelopes(tmp_path):
+    work_node, worker_runtime, worker_binding, observation = _execute_candidate(
+        tmp_path,
+        risk="standard",
+    )
+    profile = resolve_review_profile(
+        _runtime_config(),
+        repository="local/phase-three",
+        selector="standard_axis",
+    )
+    client = InMemoryPaseoClient()
+    adapter = PaseoRuntimeAdapter(client)
+    axis_observations = []
+    for axis_name in ("standards", "spec"):
+        request = _review_axis_request(
+            worker_binding,
+            observation,
+            axis=axis_name,
+        )
+        binding = adapter.materialize_review_axis(
+            request,
+            profile,
+            parent_agent_id=worker_binding.agent_id,
+        )
+        finding = {
+            "severity": "hard",
+            "code": f"{axis_name.upper()}_NEAR_LIMIT",
+            "source": "CONTEXT.md",
+            "location": "result.txt:1",
+            "message": "",
+        }
+        envelope = {
+            "schema_version": 1,
+            "action_key": request.action_key,
+            "candidate_sha": request.candidate_sha,
+            "axis": axis_name,
+            "fixed_input_digest": request.fixed_input_digest,
+            "findings": [finding],
+        }
+        empty_envelope = json.dumps(envelope, separators=(",", ":"))
+        finding["message"] = "x" * (
+            16_384 - len(empty_envelope.encode("utf-8"))
+        )
+        encoded_envelope = json.dumps(envelope, separators=(",", ":"))
+        assert len(encoded_envelope.encode("utf-8")) == 16_384
+        client.set_output(
+            binding.agent_id,
+            f"GWO_REVIEW_AXIS {encoded_envelope}",
+        )
+        axis_observations.append(adapter.observe_review_axis(request, binding))
+
+    causes = [
+        {
+            "type": "review_blocker",
+            "axis": axis.axis,
+            "finding": dict(axis.findings[0]),
+        }
+        for axis in axis_observations
+    ]
+    ladder = RecoveryLadder(semantic_attempts=2, repair_rounds=1)
+    packet = ladder.recovery_packet(
+        candidate_sha=observation.result_claim.candidate_sha,
+        acceptance_digest="b" * 64,
+        changed_files=["result.txt"],
+        causes=causes,
+    )
+
+    assert json.loads(packet)["causes"] == causes
+    assert 30 * 1024 < len(packet.encode("utf-8")) <= 64 * 1024
+    store_path = tmp_path / "repair-prompt.sqlite3"
+    kernel = Kernel(
+        store_path=store_path,
+        publication=LocalPlanPublication(store_path),
+        runtime=worker_runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=Path(worker_binding.repository_path),
+        integration_branch="main",
+        writer_generation="phase-3",
+    )
+    repair_prompt = kernel._recovery_prompt(
+        work_node,
+        packet,
+        same_attempt=True,
+    )
+    assert json.loads(repair_prompt.text)["repair_round"]["causes"] == causes
+    assert len(repair_prompt.text.encode("utf-8")) <= 64 * 1024
+
+    boundary_cause = {
+        "type": "review_blocker",
+        "axis": "standards",
+        "finding": {
+            "severity": "hard",
+            "code": "EXACT_PACKET_BOUNDARY",
+            "source": "CONTEXT.md",
+            "location": "result.txt:1",
+            "message": "x",
+        },
+    }
+    boundary_seed = ladder.recovery_packet(
+        candidate_sha="a" * 40,
+        acceptance_digest="b" * 64,
+        changed_files=["result.txt"],
+        causes=[boundary_cause],
+    )
+    boundary_cause["finding"]["message"] += "x" * (
+        64 * 1024 - len(boundary_seed.encode("utf-8"))
+    )
+    boundary_packet = ladder.recovery_packet(
+        candidate_sha="a" * 40,
+        acceptance_digest="b" * 64,
+        changed_files=["result.txt"],
+        causes=[boundary_cause],
+    )
+    assert len(boundary_packet.encode("utf-8")) == 64 * 1024
+    assert (
+        json.loads(boundary_packet)["causes"][0]["finding"]["message"]
+        == boundary_cause["finding"]["message"]
+    )
+
+    boundary_cause["finding"]["message"] += "x"
+    with pytest.raises(KernelError) as raised:
+        ladder.recovery_packet(
+            candidate_sha="a" * 40,
+            acceptance_digest="b" * 64,
+            changed_files=["result.txt"],
+            causes=[boundary_cause],
+        )
+    assert raised.value.code == "RECOVERY_PACKET_TOO_LARGE"
+
+
 def test_review_child_transport_retry_is_bounded_and_readback_first(tmp_path):
     _node, _worker_runtime, worker_binding, observation = _execute_candidate(
         tmp_path,
@@ -1459,7 +1589,7 @@ def test_recovery_ladder_is_bounded_and_runtime_loss_never_fails_node():
             }
         ],
     )
-    assert len(packet.encode("utf-8")) <= 16_384
+    assert len(packet.encode("utf-8")) <= 64 * 1024
     assert "full_transcript" not in packet
     assert json.loads(packet)["acceptance_digest"] == "b" * 64
 
@@ -1484,7 +1614,7 @@ def test_recovery_ladder_is_bounded_and_runtime_loss_never_fails_node():
         causes=review_causes,
     )
     assert json.loads(review_packet)["causes"] == review_causes
-    assert len(review_packet.encode("utf-8")) <= 16_384
+    assert len(review_packet.encode("utf-8")) <= 64 * 1024
 
 
 def test_terminal_worker_without_result_enters_one_bounded_repair_round(
@@ -3204,7 +3334,7 @@ def test_dual_axis_review_blockers_produce_exact_restart_stable_repair_prompt(
     ]
     assert repair_round["changed_files"] == ["result.txt"]
     assert len(repair_round["acceptance_digest"]) == 64
-    assert len(repair_prompt.text.encode("utf-8")) <= 16_384
+    assert len(repair_prompt.text.encode("utf-8")) <= 64 * 1024
     assert "required check did not pass" not in repair_prompt.text
     assert "result-hosted" not in repair_prompt.text
     assert "hosted_only" not in repair_prompt.text

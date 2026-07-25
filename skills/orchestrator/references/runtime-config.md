@@ -214,6 +214,13 @@ canonically, persists the round/action/digests before delivery, and adopts
 that identity after restart. An already reserved or accepted Repair Prompt is
 never sent again merely because Coordinator process state was lost.
 
+Each Review axis output has its own 16 KiB envelope. The combined Repair Packet
+has one explicit 64 KiB UTF-8 envelope bound so two individually valid
+near-limit axis outputs fit alongside the bounded acceptance and changed-file
+metadata. Review findings retain every typed field and their observed order;
+the Kernel never truncates, summarizes, or suppresses them. It rejects the
+whole packet only when the rendered UTF-8 payload exceeds 64 KiB.
+
 Paseo 0.1.110 advertises `low/high/max` for Kimi K2.7 while its daemon accepts
 `on` and rejects the tested `high/max` values. GWO therefore permits the exact
 K2.7 `kimi-cli` value `on` as a narrow discovery compatibility exception. K3
