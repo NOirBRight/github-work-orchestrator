@@ -262,6 +262,7 @@ def main() -> int:
         ignore_cleanup_errors=True,
     ) as temporary:
         repository = Path(temporary) / "repository"
+        worker_release_gate = Path(temporary) / "worker-release.ready"
         subprocess.run(
             ["git", "init", "-b", "main", str(repository)],
             check=True,
@@ -305,10 +306,13 @@ def main() -> int:
                 skill_catalog=InMemorySkillCatalog(
                     {
                         "live-continuation-delay": (
-                            "For this timing E2E only, wait 45 seconds before "
-                            "editing files. Then implement the frozen Plan Node, "
-                            "run its focused check, commit, and return the "
-                            "GWO_RESULT Result Claim."
+                            "For this timing E2E only, do not edit or commit "
+                            "until the external release sentinel exists at the "
+                            f"exact path {worker_release_gate}. Wait for it in "
+                            "one bounded shell command rather than consuming "
+                            "repeated Agent turns. Then implement the frozen "
+                            "Plan Node, run its focused check, commit, and "
+                            "return the GWO_RESULT Result Claim."
                         )
                     }
                 ),
@@ -436,6 +440,8 @@ def main() -> int:
                 raise AssertionError("declared GWO ownership was not preserved")
             if binding.native_finish_notification_supported:
                 raise AssertionError("detached CLI claimed native finish notification")
+            with worker_release_gate.open("x", encoding="utf-8") as release:
+                release.write("binding-inspected\n")
 
             _wait_for_terminal_result_claim(
                 client,
