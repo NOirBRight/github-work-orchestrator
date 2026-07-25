@@ -51,6 +51,39 @@ PASEO_PROMPT_DELIVERY_PHASES = (
     "dropped",
 )
 
+_PASEO_DAEMON_TRANSPORT_SCRIPT = r"""
+import { pathToFileURL } from "node:url";
+
+const [clientModulePath, operation] = process.argv.slice(1);
+let input = "";
+for await (const chunk of process.stdin) {
+  input += chunk;
+}
+const request = JSON.parse(input);
+const { connectToDaemon } = await import(pathToFileURL(clientModulePath).href);
+const client = await connectToDaemon({});
+try {
+  let response;
+  if (operation === "list") {
+    response = await client.getPaseoWorktreeList({
+      repoRoot: request.repoRoot,
+    });
+  } else if (operation === "archive") {
+    response = await client.archivePaseoWorktree({
+      repoRoot: request.repoRoot,
+      worktreePath: request.worktreePath,
+      branchName: request.branchName,
+      scope: request.scope,
+    });
+  } else {
+    throw new Error(`Unsupported GWO Paseo daemon operation: ${operation}`);
+  }
+  process.stdout.write(JSON.stringify(response));
+} finally {
+  await client.close();
+}
+"""
+
 
 class RuntimeAdapterError(RuntimeError):
     def __init__(
@@ -1457,7 +1490,11 @@ class PaseoClient(Protocol):
         repository_path: str,
     ) -> tuple[dict[str, Any], ...]: ...
 
-    def archive_worktree(self, worktree_name: str) -> None: ...
+    def archive_worktree(
+        self,
+        repository_path: str,
+        worktree_name: str,
+    ) -> None: ...
 
     def observed_worker_turn_capacity(
         self,
@@ -1723,12 +1760,17 @@ class InMemoryPaseoClient:
             archived=True,
         )
 
-    def archive_worktree(self, worktree_name: str) -> None:
+    def archive_worktree(
+        self,
+        repository_path: str,
+        worktree_name: str,
+    ) -> None:
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", worktree_name) is None:
             raise RuntimeAdapterError(
                 "PASEO_WORKTREE_NAME_INVALID",
                 "Paseo worktree archive requires a name, not a path",
             )
+        repository = Path(repository_path).resolve()
         self.archived_worktree_names.append(worktree_name)
         matches = {
             Path(record.workspace).resolve()
@@ -1761,6 +1803,15 @@ class InMemoryPaseoClient:
                     )
                 ),
                 None,
+            )
+        if (
+            not isinstance(repository_value, str)
+            or Path(repository_value).resolve() != repository
+        ):
+            raise RuntimeAdapterError(
+                "PASEO_WORKTREE_IDENTITY_MISMATCH",
+                "Paseo worktree does not belong to the requested repository",
+                failure_class="ambiguous",
             )
         if workspace.exists() and isinstance(repository_value, str) and repository_value:
             _git(
@@ -1799,6 +1850,7 @@ class PaseoCliClient:
         self.executable = shutil.which(executable) or executable
         self._command_prefix = (self.executable,)
         self._command_environment: dict[str, str] | None = None
+        self._daemon_command_prefix: tuple[str, ...] | None = None
         self._create_receipts: set[tuple[str, str]] = set()
         self._create_receipt_lock = threading.Lock()
         if sys.platform == "win32" and Path(self.executable).suffix.lower() in {
@@ -1818,6 +1870,16 @@ class PaseoCliClient:
                 / "node-entrypoint-runner.js"
             )
             if app_executable.is_file() and runner.is_file():
+                daemon_client_module = (
+                    resources
+                    / "app.asar"
+                    / "node_modules"
+                    / "@getpaseo"
+                    / "cli"
+                    / "dist"
+                    / "utils"
+                    / "client.js"
+                )
                 self._command_prefix = (
                     str(app_executable),
                     "--disable-warning=DEP0040",
@@ -1833,12 +1895,97 @@ class PaseoCliClient:
                         / "index.js"
                     ),
                 )
+                self._daemon_command_prefix = (
+                    str(app_executable),
+                    "--disable-warning=DEP0040",
+                    "--input-type=module",
+                    "--eval",
+                    _PASEO_DAEMON_TRANSPORT_SCRIPT,
+                    str(daemon_client_module),
+                )
                 self._command_environment = {
                     **os.environ,
                     "ELECTRON_RUN_AS_NODE": "1",
                     "PASEO_NODE_ENV": "production",
                     "PASEO_DESKTOP_MANAGED": "1",
                 }
+
+    def _run_daemon_request(
+        self,
+        operation: str,
+        payload: dict[str, Any],
+        *,
+        failure_class: str = "ambiguous",
+    ) -> Any:
+        if self._daemon_command_prefix is None:
+            raise RuntimeAdapterError(
+                "PASEO_NATIVE_TRANSPORT_UNAVAILABLE",
+                "Installed Paseo does not expose its repository-bound daemon transport",
+                failure_class="permanent",
+            )
+        try:
+            result = subprocess.run(
+                [*self._daemon_command_prefix, operation],
+                input=json.dumps(payload, separators=(",", ":")),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=self._command_environment,
+                timeout=30,
+            )
+        except OSError as error:
+            self._raise_process_start_error(
+                error,
+                failure_class=failure_class,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeAdapterError(
+                "PASEO_DAEMON_REQUEST_TIMEOUT",
+                "Paseo daemon request timed out",
+                failure_class="transient",
+            ) from error
+        if result.returncode != 0:
+            detail = (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "Paseo daemon operation failed"
+            )
+            raise RuntimeAdapterError(
+                "PASEO_DAEMON_REQUEST_FAILED",
+                detail,
+                failure_class=self.classify_failure(
+                    detail,
+                    default=failure_class,
+                ),
+            )
+        try:
+            response = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise RuntimeAdapterError(
+                "PASEO_READBACK_INVALID",
+                "Paseo daemon returned non-JSON lifecycle data",
+                failure_class="ambiguous",
+            ) from error
+        daemon_error = (
+            response.get("error")
+            if isinstance(response, dict)
+            else None
+        )
+        if isinstance(daemon_error, dict):
+            detail = str(
+                daemon_error.get("message")
+                or "Paseo daemon operation failed"
+            )
+            raise RuntimeAdapterError(
+                str(daemon_error.get("code") or "PASEO_DAEMON_REQUEST_FAILED"),
+                detail,
+                failure_class=self.classify_failure(
+                    detail,
+                    default=failure_class,
+                ),
+            )
+        return response
+
     @staticmethod
     def classify_failure(message: str, *, default: str = "transient") -> str:
         lowered = message.casefold()
@@ -2392,9 +2539,10 @@ class PaseoCliClient:
         self,
         repository_path: str,
     ) -> tuple[dict[str, Any], ...]:
-        payload = self._run(
-            ["worktree", "ls", "--json"],
-            cwd=Path(repository_path).resolve(),
+        repository = Path(repository_path).resolve()
+        payload = self._run_daemon_request(
+            "list",
+            {"repoRoot": str(repository)},
             failure_class="ambiguous",
         )
         values = payload.get("worktrees") if isinstance(payload, dict) else None
@@ -2412,7 +2560,11 @@ class PaseoCliClient:
                     "Paseo worktree listing contains an invalid record",
                     failure_class="ambiguous",
                 )
-            path = value.get("path") or value.get("Path")
+            path = (
+                value.get("worktreePath")
+                or value.get("path")
+                or value.get("Path")
+            )
             head = value.get("head") or value.get("Head")
             branch = (
                 value.get("branchName")
@@ -2444,13 +2596,39 @@ class PaseoCliClient:
             )
         return tuple(records)
 
-    def archive_worktree(self, worktree_name: str) -> None:
+    def archive_worktree(
+        self,
+        repository_path: str,
+        worktree_name: str,
+    ) -> None:
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", worktree_name) is None:
             raise RuntimeAdapterError(
                 "PASEO_WORKTREE_NAME_INVALID",
                 "Paseo worktree archive requires a name, not a path",
             )
-        self._run(["worktree", "archive", worktree_name, "--json"])
+        repository = Path(repository_path).resolve()
+        matches = [
+            record
+            for record in self.list_worktrees(str(repository))
+            if record.get("native_name") == worktree_name
+        ]
+        if len(matches) != 1:
+            raise RuntimeAdapterError(
+                "PASEO_WORKTREE_IDENTITY_AMBIGUOUS",
+                "repository-bound Paseo readback did not identify one worktree",
+                failure_class="ambiguous",
+            )
+        record = matches[0]
+        self._run_daemon_request(
+            "archive",
+            {
+                "repoRoot": str(repository),
+                "worktreePath": str(Path(str(record["path"])).resolve()),
+                "branchName": record.get("branch_name"),
+                "scope": "worktree",
+            },
+            failure_class="ambiguous",
+        )
 
     def capabilities(self, provider: str) -> ProviderCapabilities:
         """Fresh capability readback for one canonical Paseo provider."""
@@ -4324,7 +4502,7 @@ class PaseoRuntimeAdapter:
                 self.client.archive(binding.agent_id)
             if registration is not None:
                 assert native_name is not None
-                self.client.archive_worktree(native_name)
+                self.client.archive_worktree(str(repository), native_name)
                 delete_temporary_branch_cas(
                     repository,
                     registration,
@@ -4461,7 +4639,10 @@ class PaseoRuntimeAdapter:
             agent_archived = self.client.inspect(binding.agent_id).archived
             if registration is not None:
                 assert native_name is not None
-                self.client.archive_worktree(native_name)
+                self.client.archive_worktree(
+                    binding.repository_path,
+                    native_name,
+                )
                 delete_temporary_branch_cas(
                     repository,
                     registration,

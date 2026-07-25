@@ -596,21 +596,41 @@ def test_retire_after_integration_physically_removes_ignored_cache_worktree(
     assert runtime.retire_after_integration(binding, authorization).complete is True
 
 
-def test_paseo_client_archives_only_a_parsed_worktree_name(monkeypatch):
+def test_paseo_client_archives_only_a_repository_bound_parsed_worktree_name(
+    tmp_path,
+    monkeypatch,
+):
     client = PaseoCliClient("paseo")
-    commands: list[list[str]] = []
+    repository = (tmp_path / "repository").resolve()
+    workspace = (tmp_path / "gwo-0123456789abcdef").resolve()
+    commands: list[tuple[str, dict[str, object]]] = []
 
-    def _record(command, **_kwargs):
-        commands.append(command)
-        return {}
+    monkeypatch.setattr(
+        client,
+        "list_worktrees",
+        lambda repository_path: (
+            {
+                "path": str(workspace),
+                "head": "a" * 40,
+                "branch_name": "gwo/temporary",
+                "native_name": workspace.name,
+            },
+        )
+        if Path(repository_path).resolve() == repository
+        else (),
+    )
 
-    monkeypatch.setattr(client, "_run", _record)
+    def _record(operation, payload, **_kwargs):
+        commands.append((operation, payload))
+        return {"success": True, "error": None}
 
-    client.archive_worktree("gwo-0123456789abcdef")
+    monkeypatch.setattr(client, "_run_daemon_request", _record)
 
-    assert commands == [
-        ["worktree", "archive", "gwo-0123456789abcdef", "--json"]
-    ]
+    client.archive_worktree(str(repository), workspace.name)
+
+    assert commands[0][0] == "archive"
+    assert commands[0][1]["repoRoot"] == str(repository)
+    assert commands[0][1]["worktreePath"] == str(workspace)
 
 
 def test_cli_maps_real_wks_agent_payload_to_native_worktree_list_name(
@@ -624,14 +644,14 @@ def test_cli_maps_real_wks_agent_payload_to_native_worktree_list_name(
     repository.mkdir()
     workspace.mkdir()
     client = PaseoCliClient("paseo")
-    commands: list[tuple[list[str], Path | None]] = []
+    requests: list[tuple[str, dict[str, object]]] = []
 
-    def _run(command, **kwargs):
-        commands.append((command, kwargs.get("cwd")))
+    def _request(operation, payload, **_kwargs):
+        requests.append((operation, payload))
         return {
             "worktrees": [
                 {
-                    "path": str(workspace),
+                    "worktreePath": str(workspace),
                     "head": "a" * 40,
                     "branchName": "gwo/issue-88-review",
                     "createdAt": "2026-07-26T00:00:00.000Z",
@@ -639,7 +659,7 @@ def test_cli_maps_real_wks_agent_payload_to_native_worktree_list_name(
             ]
         }
 
-    monkeypatch.setattr(client, "_run", _run)
+    monkeypatch.setattr(client, "_run_daemon_request", _request)
     agent = client._agent(
         {
             "Id": "agent_01k1x88",
@@ -668,9 +688,76 @@ def test_cli_maps_real_wks_agent_payload_to_native_worktree_list_name(
     assert agent.workspace_id == "wks_01k1x88"
     assert native_name == "gwo-issue-88"
     assert native_name != agent.workspace_id
-    assert commands == [
-        (["worktree", "ls", "--json"], repository.resolve())
+    assert requests == [
+        ("list", {"repoRoot": str(repository.resolve())})
     ]
+
+
+def test_cli_repository_bound_list_reaches_real_paseo_daemon():
+    repository = Path(__file__).resolve().parents[1]
+    client = PaseoCliClient("paseo")
+
+    worktrees = client.list_worktrees(str(repository))
+
+    current = next(
+        record
+        for record in worktrees
+        if Path(str(record["path"])).resolve() == repository.resolve()
+    )
+    assert current["native_name"] == repository.name
+    assert re.fullmatch(r"[0-9a-f]{40}", str(current["head"]))
+    assert current["branch_name"] == _git(repository, "branch", "--show-current")
+
+
+def test_cli_archive_request_binds_the_listed_repository_identity(
+    tmp_path,
+    monkeypatch,
+):
+    repository = (tmp_path / "repository").resolve()
+    workspace = (tmp_path / "gwo-retirement-transport").resolve()
+    repository.mkdir()
+    workspace.mkdir()
+    client = PaseoCliClient("paseo")
+    requests: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        client,
+        "list_worktrees",
+        lambda repository_path: (
+            {
+                "path": str(workspace),
+                "head": "a" * 40,
+                "branch_name": "gwo/retirement-transport",
+                "native_name": workspace.name,
+            },
+        )
+        if Path(repository_path).resolve() == repository
+        else (),
+    )
+    monkeypatch.setattr(
+        client,
+        "_run_daemon_request",
+        lambda operation, payload, **_kwargs: requests.append(
+            (operation, payload)
+        )
+        or {"success": True, "removedAgents": [], "error": None},
+        raising=False,
+    )
+
+    client.archive_worktree(str(repository), workspace.name)
+
+    assert requests == [
+        (
+            "archive",
+            {
+                "repoRoot": str(repository),
+                "worktreePath": str(workspace),
+                "branchName": "gwo/retirement-transport",
+                "scope": "worktree",
+            },
+        )
+    ]
+    assert workspace.is_dir()
 
 
 class _NativeArchivingPaseoClient:
@@ -725,7 +812,8 @@ class _NativeArchivingPaseoClient:
             archived=True,
         )
 
-    def archive_worktree(self, worktree_name):
+    def archive_worktree(self, repository_path, worktree_name):
+        assert Path(repository_path).resolve() == self.repository.resolve()
         assert worktree_name == Path(self.record.workspace).name
         self.archived_worktree_names.append(worktree_name)
         _git(

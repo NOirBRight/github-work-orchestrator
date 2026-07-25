@@ -724,6 +724,150 @@ def test_reconstruction_preserves_integration_batch_identity(tmp_path):
     assert {state["integrated_sha"] for state in states} == {"f" * 40}
 
 
+def _completed_review_retirements(node):
+    from gwo_v8.retirement import (
+        authorize_review_after_evidence,
+        completed_review_retirement,
+        review_retirement_readback,
+    )
+
+    review_evidence = next(
+        item for item in node.evidence if item.kind == "review"
+    )
+    records = {}
+    for child in node.review_children:
+        authorization = authorize_review_after_evidence(
+            worker_binding=node.runtime_binding,
+            review_binding=child.binding,
+            review_evidence=review_evidence,
+        )
+        readback = review_retirement_readback(
+            authorization=authorization,
+            workspace_disposition="shared_preserved",
+            agent_archived=True,
+            directory_absent=False,
+            worktree_absent=False,
+            branch_deleted=False,
+        )
+        records[f"{child.binding.axis}:{child.recovery_ordinal}"] = (
+            completed_review_retirement(authorization, readback)
+        )
+    return records
+
+
+def test_reconstruction_does_not_trust_review_children_retired_without_records(
+    tmp_path,
+):
+    compiled, durable = _durable_readback(
+        tmp_path,
+        count=1,
+        reviewed=frozenset({1}),
+    )
+    node = replace(
+        _node(compiled, 1),
+        review_children_retired=True,
+        review_retirements={},
+    )
+
+    result = StoreReconstructor().reconstruct(
+        AuthoritativeRepositoryReadback.from_durable(
+            durable,
+            compiled.repository,
+            nodes=(node,),
+        ),
+        tmp_path / "forged-review-retired-bool.sqlite3",
+    )
+
+    assert "REVIEW_RETIREMENT_READBACK_CONTRADICTION" in result.blockers
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    (
+        "absolute_path",
+        "identity_mismatch",
+        "complete_without_readback",
+    ),
+)
+def test_reconstruction_rejects_forged_review_retirement_records(
+    tmp_path,
+    forgery,
+):
+    compiled, durable = _durable_readback(
+        tmp_path,
+        count=1,
+        reviewed=frozenset({1}),
+    )
+    original = _node(compiled, 1)
+    records = _completed_review_retirements(original)
+    axis_key = sorted(records)[0]
+    forged = json.loads(json.dumps(records))
+    authorization = forged[axis_key]["authorization"]
+    if forgery == "absolute_path":
+        authorization["workspace"] = str(ROOT.resolve())
+    elif forgery == "identity_mismatch":
+        authorization["agent_id"] = "review-agent:forged"
+        identity = {
+            key: value
+            for key, value in authorization.items()
+            if key != "authorization_digest"
+        }
+        authorization["authorization_digest"] = digest_value(identity)
+    else:
+        forged[axis_key]["evidence"] = None
+    node = replace(
+        original,
+        review_children_retired=True,
+        review_retirements=forged,
+    )
+
+    result = StoreReconstructor().reconstruct(
+        AuthoritativeRepositoryReadback.from_durable(
+            durable,
+            compiled.repository,
+            nodes=(node,),
+        ),
+        tmp_path / f"forged-review-retirement-{forgery}.sqlite3",
+    )
+
+    assert "REVIEW_RETIREMENT_READBACK_CONTRADICTION" in result.blockers
+
+
+def test_reconstruction_derives_review_children_retired_from_typed_records(
+    tmp_path,
+):
+    compiled, durable = _durable_readback(
+        tmp_path,
+        count=1,
+        reviewed=frozenset({1}),
+    )
+    original = _node(compiled, 1)
+    node = replace(
+        original,
+        review_children_retired=False,
+        review_retirements=_completed_review_retirements(original),
+    )
+    destination = tmp_path / "review-retirement-roundtrip.sqlite3"
+
+    result = StoreReconstructor().reconstruct(
+        AuthoritativeRepositoryReadback.from_durable(
+            durable,
+            compiled.repository,
+            nodes=(node,),
+        ),
+        destination,
+    )
+
+    assert result.status == "reconstructed", result.blockers
+    with sqlite3.connect(destination) as connection:
+        state = json.loads(
+            connection.execute(
+                "SELECT state_json FROM v8_node_execution_state"
+            ).fetchone()[0]
+        )
+    assert state["review_children_retired"] is True
+
+
 def test_reconstruction_preserves_publication_hosted_and_resume_progress(tmp_path):
     compiled = _compiled(1, hosted=True)
     durable = InMemoryDurablePlanControl()

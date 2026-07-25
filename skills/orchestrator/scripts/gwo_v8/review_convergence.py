@@ -28,6 +28,7 @@ from .retirement import (
     completed_review_retirement,
     failed_review_retirement,
     pending_review_retirement,
+    validate_review_retirement_records,
 )
 from .runtime import (
     ReviewAxisBinding,
@@ -1044,9 +1045,39 @@ class ReviewConvergence:
                 "REVIEW_RETIREMENT_UNSUPPORTED",
                 "Runtime Adapter has no typed Review retirement seam",
             )
+        retirements = state.setdefault("review_retirements", {})
+        try:
+            retirement_validation = validate_review_retirement_records(
+                records=retirements,
+                worker_binding=binding,
+                review_bindings={
+                    key: self._review_binding_from_state(saved)
+                    for key, saved in bindings.items()
+                    if isinstance(saved, dict)
+                },
+                review_evidence=gate.evidence,
+            )
+        except RetirementError as error:
+            state["review_children_retired"] = False
+            state.update(
+                self._review_retirement_wait(
+                    candidate_sha,
+                    error_code=error.code,
+                )
+            )
+            self._persist_state(state)
+            return ReviewConvergenceDecision(
+                status="waiting",
+                observation=observation,
+            )
+        derived_children_retired = (
+            retirement_validation.children_retired
+        )
+        if state.get("review_children_retired") != derived_children_retired:
+            state["review_children_retired"] = derived_children_retired
+            self._persist_state(state)
         if not state.get("review_children_retired"):
             self._assert_writer(state)
-            retirements = state.setdefault("review_retirements", {})
             for key, saved in bindings.items():
                 if not isinstance(saved, dict):
                     continue
@@ -1144,7 +1175,24 @@ class ReviewConvergence:
                         observation=observation,
                     )
                 self._persist_state(state)
-            state["review_children_retired"] = True
+            completed_validation = validate_review_retirement_records(
+                records=retirements,
+                worker_binding=binding,
+                review_bindings={
+                    key: self._review_binding_from_state(saved)
+                    for key, saved in bindings.items()
+                    if isinstance(saved, dict)
+                },
+                review_evidence=gate.evidence,
+            )
+            state["review_children_retired"] = (
+                completed_validation.children_retired
+            )
+            if not state["review_children_retired"]:
+                raise ReviewConvergenceError(
+                    "REVIEW_RETIREMENT_READBACK_INCOMPLETE",
+                    "typed Review retirement records did not derive completion",
+                )
             self._persist_state(state)
         if gate.status == "rejected":
             # A rejected gate is authoritative on its own; human approval is

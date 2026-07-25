@@ -224,6 +224,185 @@ class ReviewRetirementReadback:
         )
 
 
+@dataclass(frozen=True)
+class ValidatedReviewRetirements:
+    records: dict[str, dict[str, Any]]
+    children_retired: bool
+
+
+def _contains_absolute_path(value: Any) -> bool:
+    if isinstance(value, str):
+        return Path(value).is_absolute()
+    if isinstance(value, dict):
+        return any(_contains_absolute_path(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_absolute_path(item) for item in value)
+    return False
+
+
+def validate_review_retirement_records(
+    *,
+    records: Any,
+    worker_binding: RuntimeBinding,
+    review_bindings: Mapping[str, ReviewAxisBinding],
+    review_evidence: TypedEvidence | None,
+) -> ValidatedReviewRetirements:
+    """Validate durable Review cleanup facts and derive their completion."""
+
+    if not isinstance(records, dict) or any(
+        not isinstance(key, str) or not isinstance(value, dict)
+        for key, value in records.items()
+    ):
+        raise RetirementError(
+            "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+            "Review retirement records must be an axis-keyed object",
+        )
+    if set(records) - set(review_bindings):
+        raise RetirementError(
+            "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+            "Review retirement records contain an unknown axis identity",
+        )
+    completed: set[str] = set()
+    authorization_fields = set(
+        ReviewRetirementAuthorization.__dataclass_fields__
+    )
+    readback_fields = set(ReviewRetirementReadback.__dataclass_fields__)
+    record_fields = {"state", "authorization", "error", "evidence"}
+    error_fields = {"code", "failure_class"}
+    worker_identity = _required_binding_identity(worker_binding)
+    for key, record in records.items():
+        if set(record) != record_fields or _contains_absolute_path(record):
+            raise RetirementError(
+                "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+                "Review retirement durable schema is not exact and path-free",
+            )
+        state = record.get("state")
+        if state not in {"pending", "error", "complete"}:
+            raise RetirementError(
+                "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+                "Review retirement state is not typed",
+            )
+        error_value = record.get("error")
+        if state == "error":
+            if (
+                not isinstance(error_value, dict)
+                or set(error_value) != error_fields
+                or any(
+                    not isinstance(error_value.get(field), str)
+                    or not error_value.get(field)
+                    for field in error_fields
+                )
+                or record.get("evidence") is not None
+            ):
+                raise RetirementError(
+                    "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+                    "Review retirement error is not typed",
+                )
+        elif error_value is not None:
+            raise RetirementError(
+                "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+                "non-error Review retirement carries an error",
+            )
+
+        authorization_value = record.get("authorization")
+        if authorization_value is None:
+            if state != "error":
+                raise RetirementError(
+                    "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+                    "Review retirement omitted its typed authorization",
+                )
+            continue
+        if (
+            not isinstance(authorization_value, dict)
+            or set(authorization_value) != authorization_fields
+        ):
+            raise RetirementError(
+                "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+                "Review retirement authorization schema is not exact",
+            )
+        try:
+            authorization = ReviewRetirementAuthorization(
+                **authorization_value
+            )
+            authorization.assert_valid_digest()
+        except (RetirementError, TypeError) as error:
+            raise RetirementError(
+                "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+                "Review retirement authorization is invalid",
+            ) from error
+        child = review_bindings[key]
+        review_parent = child.parent_agent_id or child.declared_parent_agent_id
+        expected = {
+            **worker_identity,
+            "parent_agent_id": worker_binding.agent_id,
+            "parent_workspace_id": worker_binding.workspace_id,
+            "action_key": child.action_key,
+            "axis": child.axis,
+            "agent_id": child.agent_id,
+            "session_id": child.session_id,
+            "workspace_id": child.workspace_id,
+            "candidate_sha": child.candidate_sha,
+        }
+        if (
+            review_evidence is None
+            or review_evidence.kind != "review"
+            or not review_evidence.has_valid_digest()
+            or review_evidence.subject != child.candidate_sha
+            or review_evidence.payload.get("attempt_id")
+            != worker_binding.attempt_id
+            or review_evidence.payload.get("candidate_sha")
+            != child.candidate_sha
+            or review_parent != worker_binding.agent_id
+            or any(
+                authorization.identity.get(field) != value
+                for field, value in expected.items()
+            )
+            or authorization.review_evidence_digest
+            != review_evidence.content_digest
+        ):
+            raise RetirementError(
+                "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+                "Review retirement identity does not match its child Evidence",
+            )
+        evidence_value = record.get("evidence")
+        if state != "complete":
+            if evidence_value is not None:
+                raise RetirementError(
+                    "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+                    "incomplete Review retirement carries completion readback",
+                )
+            continue
+        if (
+            not isinstance(evidence_value, dict)
+            or set(evidence_value) != readback_fields
+        ):
+            raise RetirementError(
+                "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+                "complete Review retirement omitted exact readback",
+            )
+        try:
+            completed_review_retirement(
+                authorization,
+                ReviewRetirementReadback(**evidence_value),
+            )
+        except (RetirementError, TypeError) as error:
+            raise RetirementError(
+                "REVIEW_RETIREMENT_READBACK_CONTRADICTION",
+                "Review retirement completion readback is invalid",
+            ) from error
+        completed.add(key)
+    return ValidatedReviewRetirements(
+        records={
+            key: dict(value)
+            for key, value in records.items()
+        },
+        children_retired=(
+            bool(review_bindings)
+            and completed == set(review_bindings)
+        ),
+    )
+
+
 def pending_review_retirement(
     authorization: ReviewRetirementAuthorization,
 ) -> dict[str, Any]:

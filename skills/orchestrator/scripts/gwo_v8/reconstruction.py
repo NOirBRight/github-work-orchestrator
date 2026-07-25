@@ -22,7 +22,9 @@ from .retirement import (
     RetirementAuthorization,
     RetirementError,
     RetirementReadback,
+    ValidatedReviewRetirements,
     completed_retirement,
+    validate_review_retirement_records,
 )
 from .runtime import (
     ReviewAxisBinding,
@@ -118,6 +120,7 @@ class AuthoritativeNodeReadback:
         activation_id: str,
         contract_digest: str,
         result_digest: str | None,
+        review_retirement_validation: ValidatedReviewRetirements,
     ) -> dict[str, Any]:
         claim = self.result_claim()
         review_evidence = next(
@@ -211,8 +214,10 @@ class AuthoritativeNodeReadback:
             "review_evidence": (
                 None if review_evidence is None else asdict(review_evidence)
             ),
-            "review_children_retired": self.review_children_retired,
-            "review_retirements": self.review_retirements,
+            "review_children_retired": (
+                review_retirement_validation.children_retired
+            ),
+            "review_retirements": review_retirement_validation.records,
             "integrated_sha": self.integrated_sha,
             "integration_source_ref": self.integration_source_ref,
             "integration_batch_id": self.integration_batch_id,
@@ -341,6 +346,7 @@ class StoreReconstructor:
         tuple[str, ...],
         dict[str, dict[str, Any]],
         dict[str, str | None],
+        dict[str, ValidatedReviewRetirements],
     ]:
         blockers: set[str] = set()
         if (
@@ -371,6 +377,9 @@ class StoreReconstructor:
         attempts: set[str] = set()
         runtimes: set[str] = set()
         results: dict[str, str | None] = {}
+        review_retirement_validations: dict[
+            str, ValidatedReviewRetirements
+        ] = {}
         allowed_statuses = {
             "running",
             "waiting",
@@ -795,6 +804,39 @@ class StoreReconstructor:
                         or gate.evidence.payload != review_evidence.payload
                     ):
                         blockers.add("REVIEW_EVIDENCE_INVALID")
+            if binding is not None:
+                try:
+                    review_retirement_validation = (
+                        validate_review_retirement_records(
+                            records=node.review_retirements,
+                            worker_binding=binding,
+                            review_bindings={
+                                (
+                                    f"{item.binding.axis}:"
+                                    f"{item.recovery_ordinal}"
+                                ): item.binding
+                                for item in node.review_children
+                            },
+                            review_evidence=review_evidence,
+                        )
+                    )
+                except RetirementError:
+                    blockers.add(
+                        "REVIEW_RETIREMENT_READBACK_CONTRADICTION"
+                    )
+                else:
+                    review_retirement_validations[node.node_key] = (
+                        review_retirement_validation
+                    )
+                    if (
+                        node.review_children_retired
+                        and not review_retirement_validation.children_retired
+                    ):
+                        blockers.add(
+                            "REVIEW_RETIREMENT_READBACK_CONTRADICTION"
+                        )
+            elif node.review_retirements or node.review_children_retired:
+                blockers.add("REVIEW_RETIREMENT_READBACK_CONTRADICTION")
             retirement = node.retirement
             if retirement is not None:
                 retirement_record_valid = (
@@ -955,7 +997,12 @@ class StoreReconstructor:
                     or evidence.payload.get("candidate_sha") not in candidates
                 ):
                     blockers.add("INTEGRATION_BATCH_RELATION_INVALID")
-        return tuple(sorted(blockers)), work_nodes, results
+        return (
+            tuple(sorted(blockers)),
+            work_nodes,
+            results,
+            review_retirement_validations,
+        )
 
     def reconstruct(
         self,
@@ -964,7 +1011,12 @@ class StoreReconstructor:
     ) -> ReconstructionResult:
         path = Path(store_path)
         self._prepare_schema(path)
-        blockers, work_nodes, results = self._validated(readback)
+        (
+            blockers,
+            work_nodes,
+            results,
+            review_retirement_validations,
+        ) = self._validated(readback)
         source_digest = digest_value(
             {
                 "receipt": readback.receipt.as_dict(),
@@ -986,6 +1038,15 @@ class StoreReconstructor:
                     activation_id=readback.receipt.activation_id,
                     contract_digest=str(plan_node["contract_digest"]),
                     result_digest=results[node.node_key],
+                    review_retirement_validation=(
+                        review_retirement_validations.get(
+                            node.node_key,
+                            ValidatedReviewRetirements(
+                                records={},
+                                children_retired=False,
+                            ),
+                        )
+                    ),
                 )
                 connection.execute(
                     """
