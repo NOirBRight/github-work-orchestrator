@@ -50,6 +50,7 @@ REPAIR_PACKET_MAX_BYTES = 64 * 1024
 REPAIR_CHANGED_FILES_MAX_BYTES = 4 * 1024
 REPAIR_CHANGED_FILE_MAX_CHARACTERS = 256
 REVIEW_AXIS_MATERIALIZATION_EXECUTIONS = 3
+REVIEW_AXIS_OBSERVATION_READBACKS = 3
 
 
 class KernelError(RuntimeError):
@@ -5079,6 +5080,54 @@ class Kernel:
                     )
                     state.setdefault("review_axis_errors", {}).pop(key, None)
                     bindings[key] = asdict(child_binding)
+                if child_binding is not None:
+                    action = materialization_actions[key]
+                    if (
+                        error is not None
+                        and error.code
+                        not in {
+                            "REVIEW_AXIS_OUTPUT_MISSING",
+                            "REVIEW_AXIS_OUTPUT_INVALID",
+                        }
+                        and error.failure_class in {"ambiguous", "transient"}
+                    ):
+                        observation_readbacks = (
+                            int(action.get("observation_readbacks", 0)) + 1
+                        )
+                        action.update(
+                            {
+                                "observation_readbacks": observation_readbacks,
+                                "last_error": _runtime_error_record(error),
+                            }
+                        )
+                        state.setdefault("review_axis_errors", {})[key] = error.code
+                        if (
+                            observation_readbacks
+                            < REVIEW_AXIS_OBSERVATION_READBACKS
+                        ):
+                            action["state"] = "observation_pending"
+                            error = RuntimeAdapterError(
+                                "REVIEW_AXIS_OBSERVATION_PENDING",
+                                (
+                                    f"{error.code}: Review child observation "
+                                    "will retry against the existing binding"
+                                ),
+                                failure_class=error.failure_class,
+                            )
+                        else:
+                            action["state"] = "blocked"
+                            error = RuntimeAdapterError(
+                                "REVIEW_AXIS_OBSERVATION_RETRIES_EXHAUSTED",
+                                (
+                                    "Review child observation exhausted three "
+                                    "readback-first reconcile cycles"
+                                ),
+                                failure_class="permanent",
+                            )
+                    elif error is None:
+                        action.pop("observation_readbacks", None)
+                        action["last_error"] = None
+                        state.setdefault("review_axis_errors", {}).pop(key, None)
                 if child_binding is None and materialized_here:
                     assert error is not None
                     action = materialization_actions[key]
@@ -5170,6 +5219,9 @@ class Kernel:
                     if error.code == "REVIEW_AXIS_MATERIALIZATION_PENDING":
                         materialization_pending.append(request)
                         continue
+                    if error.code == "REVIEW_AXIS_OBSERVATION_PENDING":
+                        running = True
+                        continue
                     if error.code not in {
                         "REVIEW_AXIS_OUTPUT_MISSING",
                         "REVIEW_AXIS_OUTPUT_INVALID",
@@ -5249,6 +5301,9 @@ class Kernel:
                             continue
                         if error.code == "REVIEW_AXIS_MATERIALIZATION_PENDING":
                             recovery_materialization_pending.append(request)
+                            continue
+                        if error.code == "REVIEW_AXIS_OBSERVATION_PENDING":
+                            recovery_running = True
                             continue
                         raise error
                     assert captured is not None

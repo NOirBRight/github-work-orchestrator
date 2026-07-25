@@ -380,6 +380,27 @@ class _ParallelReviewAxisRuntime(_ReviewingInMemoryRuntime):
         )
 
 
+class _ReviewObservationRecoveryRuntime(_ReviewMaterializationRecoveryRuntime):
+    def __init__(self, workspace_root: Path, *, standards_failures: int):
+        super().__init__(workspace_root)
+        self.standards_observation_failures = standards_failures
+        self.review_observation_calls = []
+
+    def observe_review_axis(self, request, binding):
+        self.review_observation_calls.append(request.axis)
+        if (
+            request.axis == "standards"
+            and self.standards_observation_failures > 0
+        ):
+            self.standards_observation_failures -= 1
+            raise RuntimeAdapterError(
+                "PASEO_READ_TRANSIENT",
+                "synthetic transient TLS observation failure",
+                failure_class="transient",
+            )
+        return super().observe_review_axis(request, binding)
+
+
 def _review_materialization_kernel(tmp_path, runtime):
     repository = _temporary_repository(tmp_path)
     intent, source, _policy = _multi_ready_inputs(count=1)
@@ -464,6 +485,44 @@ def test_required_review_axis_materialization_launches_in_parallel(tmp_path):
     assert outcome.status == "complete"
     assert set(runtime.primary_threads) == {"standards", "spec"}
     assert len(set(runtime.primary_threads.values())) == 2
+
+
+def test_review_axis_transient_observation_retries_existing_binding(
+    tmp_path,
+):
+    runtime = _ReviewObservationRecoveryRuntime(
+        tmp_path / "runtime",
+        standards_failures=1,
+    )
+    kernel, compiled, work_node = _review_materialization_kernel(tmp_path, runtime)
+
+    first = kernel.reconcile_once("local/phase-four-a")
+    first_state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        work_node["node_key"],
+    )
+    second = kernel.reconcile_once("local/phase-four-a")
+
+    assert first.status == "waiting"
+    assert first.wait_condition == "review_axis"
+    assert second.status == "complete"
+    assert first.attempt_id == second.attempt_id
+    assert first.attempt_ordinal == second.attempt_ordinal == 1
+    assert first_state is not None
+    assert set(first_state["review_bindings"]) == {"standards:0", "spec:0"}
+    assert (
+        first_state["review_materialization_actions"]["standards:0"]["executions"]
+        == 1
+    )
+    assert [axis for axis, _key in runtime.review_materialization_calls].count(
+        "standards"
+    ) == 1
+    assert [axis for axis, _key in runtime.review_materialization_calls].count(
+        "spec"
+    ) == 1
+    assert runtime.review_observation_calls.count("standards") == 2
+    assert runtime.review_observation_calls.count("spec") == 1
 
 
 def test_review_axis_materialization_recovers_across_reconcile_cycles_without_worker_attempt(

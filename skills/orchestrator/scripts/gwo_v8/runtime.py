@@ -951,12 +951,6 @@ class PaseoClient(Protocol):
 
     def archive(self, agent_id: str) -> None: ...
 
-    def cleanup_orphan_worktree(
-        self,
-        action_key: str,
-        repository_path: str,
-    ) -> None: ...
-
     def observed_worker_turn_capacity(
         self,
         profile: RuntimeProfile | None,
@@ -1163,14 +1157,6 @@ class InMemoryPaseoClient:
             lifecycle="archived",
             archived=True,
         )
-
-    def cleanup_orphan_worktree(
-        self,
-        _action_key: str,
-        _repository_path: str,
-    ) -> None:
-        return None
-
 
 class PaseoCliClient:
     """Concrete Paseo client for the public CLI lifecycle surface."""
@@ -1767,37 +1753,6 @@ class PaseoCliClient:
 
     def archive(self, agent_id: str) -> None:
         self._run(["archive", agent_id, "--json"])
-
-    def cleanup_orphan_worktree(
-        self,
-        action_key: str,
-        repository_path: str,
-    ) -> None:
-        worktree = f"gwo-{digest_bytes(action_key.encode('utf-8'))[:16]}"
-        self._run(
-            ["worktree", "archive", worktree, "--json"],
-            failure_class="ambiguous",
-        )
-        listing = _git(
-            Path(repository_path).resolve(),
-            "worktree",
-            "list",
-            "--porcelain",
-        )
-        if (
-            f"branch refs/heads/{worktree}" in listing
-            or any(
-                line.startswith("worktree ")
-                and Path(line.removeprefix("worktree ")).name == worktree
-                for line in listing.splitlines()
-            )
-        ):
-            raise RuntimeAdapterError(
-                "REVIEW_AXIS_ORPHAN_CLEANUP_AMBIGUOUS",
-                "Paseo Review orphan worktree did not read back archived",
-                failure_class="ambiguous",
-            )
-
 
 class PaseoRuntimeAdapter:
     """Paseo resident-Agent lifecycle with Admission-rooted adoption."""
@@ -3087,29 +3042,6 @@ class PaseoRuntimeAdapter:
             or agent.parent_agent_id not in {None, parent_agent_id}
         )
 
-    def _cleanup_review_orphan(
-        self,
-        agent: PaseoAgentRecord,
-        request: ReviewAxisRequest,
-    ) -> None:
-        self.client.archive(agent.agent_id)
-        if not self.client.inspect(agent.agent_id).archived:
-            raise RuntimeAdapterError(
-                "REVIEW_AXIS_ORPHAN_CLEANUP_AMBIGUOUS",
-                "mismatched Review child did not read back archived",
-                failure_class="ambiguous",
-            )
-        cleanup_worktree = getattr(
-            self.client,
-            "cleanup_orphan_worktree",
-            None,
-        )
-        if callable(cleanup_worktree):
-            cleanup_worktree(
-                request.action_key,
-                str(Path(request.workspace).resolve()),
-            )
-
     def _reconcile_review_action_agent(
         self,
         agent: PaseoAgentRecord,
@@ -3118,7 +3050,7 @@ class PaseoRuntimeAdapter:
         prompt: RuntimePrompt,
         labels: dict[str, str],
         parent_agent_id: str | None,
-    ) -> PaseoAgentRecord | None:
+    ) -> PaseoAgentRecord:
         exact = self._find_one(labels)
         if exact is not None:
             return exact
@@ -3166,8 +3098,15 @@ class PaseoRuntimeAdapter:
             target_prompt_count == 0
             and (label_conflicts or runtime_conflict)
         ):
-            self._cleanup_review_orphan(agent, request)
-            return None
+            raise RuntimeAdapterError(
+                "REVIEW_AXIS_IDENTITY_CONFLICT",
+                (
+                    "Review action identity is occupied by a conflicting "
+                    "runtime resource; Kernel authorization is required "
+                    "before any retirement"
+                ),
+                failure_class="permanent",
+            )
         raise RuntimeAdapterError(
             "REVIEW_AXIS_ORPHAN_AMBIGUOUS",
             "Review action identity remains incomplete without a safe cleanup proof",
@@ -3259,15 +3198,6 @@ class PaseoRuntimeAdapter:
                     labels,
                     parent_agent_id,
                 )
-                if agent is None:
-                    raise RuntimeAdapterError(
-                        "REVIEW_AXIS_ORPHAN_RECONCILED",
-                        (
-                            "non-adoptable Review orphan was cleaned; "
-                            "stable action readback must retry next reconcile"
-                        ),
-                        failure_class="transient",
-                    ) from error
             else:
                 created_here = self._created_in_current_call(
                     created_agent.agent_id,

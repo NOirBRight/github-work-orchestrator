@@ -1108,7 +1108,9 @@ class _ReviewOrphanTrackingPaseoClient(InMemoryPaseoClient):
         self.cleaned_action_keys.append(action_key)
 
 
-def test_review_axis_materialization_cleans_conflicting_exact_orphan(tmp_path):
+def test_review_axis_materialization_blocks_conflicting_orphan_without_cleanup(
+    tmp_path,
+):
     _node, _worker_runtime, worker_binding, observation = _execute_candidate(
         tmp_path,
         risk="standard",
@@ -1141,16 +1143,18 @@ def test_review_axis_materialization_cleans_conflicting_exact_orphan(tmp_path):
         )
     )
 
-    binding = PaseoRuntimeAdapter(client).materialize_review_axis(
-        request,
-        profile,
-        parent_agent_id=worker_binding.agent_id,
-    )
+    with pytest.raises(RuntimeAdapterError) as blocked:
+        PaseoRuntimeAdapter(client).materialize_review_axis(
+            request,
+            profile,
+            parent_agent_id=worker_binding.agent_id,
+        )
 
-    assert client.archived_agent_ids == [orphan.agent_id]
-    assert client.cleaned_action_keys == [request.action_key]
-    assert binding.action_key == request.action_key
-    assert client.prompt_acceptance_count(binding.agent_id, request.to_prompt()) == 1
+    assert blocked.value.code == "REVIEW_AXIS_IDENTITY_CONFLICT"
+    assert blocked.value.failure_class == "permanent"
+    assert client.archived_agent_ids == []
+    assert client.cleaned_action_keys == []
+    assert client.inspect(orphan.agent_id).archived is False
 
 
 def test_review_axis_materialization_repairs_accepted_agent_labels_without_reprompt(
