@@ -596,12 +596,14 @@ def _frozen_profile_dict(**overrides) -> dict[str, Any]:
 @pytest.mark.parametrize(
     "mutation, expected_detail_substring",
     [
-        (lambda s: s.update({"frontier_runtime_profile": {"model": "sol/xhigh"}}), "name"),
+        (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(name=None)}), "name"),
         (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(provider="")}), "provider"),
         (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(thinking=None)}), "thinking"),
         (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(features=False)}), "features"),
         (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(), "frontier_profile_digest": None}), "frontier_profile_digest"),
         (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(), "frontier_profile_digest": "mismatch"}), "does not match"),
+        (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(extra=True)}), "invalid keys"),
+        (lambda s: s.update({"frontier_runtime_profile": _frozen_profile_dict(provider="   ")}), "provider"),
     ],
     ids=[
         "missing_field",
@@ -610,6 +612,8 @@ def _frozen_profile_dict(**overrides) -> dict[str, Any]:
         "invalid_features",
         "missing_digest",
         "digest_mismatch",
+        "extra_key",
+        "whitespace_field",
     ],
 )
 def test_kernel_freeze_legacy_frontier_profile_fails_closed_on_malformed_snapshot(
@@ -657,6 +661,71 @@ def test_kernel_freeze_legacy_frontier_profile_returns_valid_frozen_snapshot(
     state["frontier_profile_digest"] = profile.digest
 
     parsed = kernel._freeze_legacy_frontier_profile(state)
+
+    assert parsed == profile
+
+
+@pytest.mark.parametrize(
+    "state_mutation, expected_substring",
+    [
+        (
+            lambda s: s.pop("profile_digest"),
+            "profile_digest is missing",
+        ),
+        (
+            lambda s: s.update({"profile_digest": "mismatch"}),
+            "profile_digest does not match",
+        ),
+    ],
+    ids=["missing_digest", "digest_mismatch"],
+)
+def test_kernel_profile_from_frozen_state_enforces_digest_parity(
+    state_mutation,
+    expected_substring,
+):
+    profile = RuntimeProfile(
+        name="standard",
+        provider="kimi-cli",
+        model="kimi-code/kimi-for-coding",
+        thinking="on",
+        mode="yolo",
+        features={},
+    )
+    state = {
+        "runtime_profile": Kernel._profile_to_dict(profile),
+        "profile_digest": profile.digest,
+    }
+    state_mutation(state)
+
+    with pytest.raises(KernelError) as error:
+        Kernel._profile_from_frozen_state(
+            state,
+            profile_key="runtime_profile",
+            digest_key="profile_digest",
+        )
+    assert error.value.code == "RUNTIME_PROFILE_FROZEN_INVALID"
+    assert expected_substring in error.value.detail
+
+
+def test_kernel_profile_from_frozen_state_returns_valid_profile():
+    profile = RuntimeProfile(
+        name="standard",
+        provider="kimi-cli",
+        model="kimi-code/kimi-for-coding",
+        thinking="on",
+        mode="yolo",
+        features={"custom": True},
+    )
+    state = {
+        "runtime_profile": Kernel._profile_to_dict(profile),
+        "profile_digest": profile.digest,
+    }
+
+    parsed = Kernel._profile_from_frozen_state(
+        state,
+        profile_key="runtime_profile",
+        digest_key="profile_digest",
+    )
 
     assert parsed == profile
 

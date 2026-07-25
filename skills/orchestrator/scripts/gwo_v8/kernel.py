@@ -1247,22 +1247,43 @@ class Kernel:
             "features": dict(profile.features),
         }
 
+    _RUNTIME_PROFILE_KEYS = {
+        "name",
+        "provider",
+        "model",
+        "thinking",
+        "mode",
+        "features",
+    }
+
     @staticmethod
     def _profile_from_dict(data: dict[str, Any]) -> RuntimeProfile:
         """Strictly parse a frozen RuntimeProfile snapshot from durable state.
 
-        Missing, null, or malformed fields fail closed so restart/config drift
-        cannot silently alter an Admission's profile.
+        Missing, extra, null, or malformed fields fail closed so restart/config
+        drift cannot silently alter an Admission's profile.
         """
+
+        if set(data.keys()) != Kernel._RUNTIME_PROFILE_KEYS:
+            raise KernelError(
+                "RUNTIME_PROFILE_FROZEN_INVALID",
+                f"frozen runtime profile has invalid keys: {sorted(data.keys())!r}",
+            )
 
         def _field(key: str) -> str:
             value = data.get(key)
-            if not isinstance(value, str) or not value:
+            if not isinstance(value, str):
                 raise KernelError(
                     "RUNTIME_PROFILE_FROZEN_INVALID",
                     f"frozen runtime profile has invalid {key}: {value!r}",
                 )
-            return value
+            stripped = value.strip()
+            if not stripped:
+                raise KernelError(
+                    "RUNTIME_PROFILE_FROZEN_INVALID",
+                    f"frozen runtime profile has invalid {key}: {value!r}",
+                )
+            return stripped
 
         name = _field("name")
         provider = _field("provider")
@@ -1349,6 +1370,34 @@ class Kernel:
                 error.detail,
             ) from error
 
+    @staticmethod
+    def _profile_from_frozen_state(
+        state: dict[str, Any],
+        profile_key: str,
+        digest_key: str,
+    ) -> RuntimeProfile:
+        """Parse a frozen profile snapshot and enforce digest parity."""
+
+        frozen = state.get(profile_key)
+        if not isinstance(frozen, dict):
+            raise KernelError(
+                "RUNTIME_PROFILE_FROZEN_INVALID",
+                f"{profile_key} is missing or not a snapshot",
+            )
+        profile = Kernel._profile_from_dict(frozen)
+        expected_digest = state.get(digest_key)
+        if not isinstance(expected_digest, str) or not expected_digest:
+            raise KernelError(
+                "RUNTIME_PROFILE_FROZEN_INVALID",
+                f"{digest_key} is missing or invalid",
+            )
+        if expected_digest != profile.digest:
+            raise KernelError(
+                "RUNTIME_PROFILE_FROZEN_INVALID",
+                f"{digest_key} does not match the frozen profile",
+            )
+        return profile
+
     def _freeze_legacy_frontier_profile(
         self,
         state: dict[str, Any],
@@ -1372,25 +1421,11 @@ class Kernel:
                 state,
             )
             return profile
-        frozen = state["frontier_runtime_profile"]
-        if not isinstance(frozen, dict):
-            raise KernelError(
-                "RUNTIME_PROFILE_FROZEN_INVALID",
-                "frontier_runtime_profile is present but not a snapshot",
-            )
-        profile = self._profile_from_dict(frozen)
-        expected_digest = state.get("frontier_profile_digest")
-        if not isinstance(expected_digest, str) or not expected_digest:
-            raise KernelError(
-                "RUNTIME_PROFILE_FROZEN_INVALID",
-                "frontier_profile_digest is missing or invalid",
-            )
-        if expected_digest != profile.digest:
-            raise KernelError(
-                "RUNTIME_PROFILE_FROZEN_INVALID",
-                "frontier_profile_digest does not match the frozen profile",
-            )
-        return profile
+        return self._profile_from_frozen_state(
+            state,
+            profile_key="frontier_runtime_profile",
+            digest_key="frontier_profile_digest",
+        )
 
     @staticmethod
     def ensure_store_schema(connection: sqlite3.Connection) -> None:
@@ -3785,7 +3820,11 @@ class Kernel:
         if attempt_ordinal == 1:
             frozen_profile_data = state.get("runtime_profile")
             if isinstance(frozen_profile_data, dict):
-                selected_profile = self._profile_from_dict(frozen_profile_data)
+                selected_profile = self._profile_from_frozen_state(
+                    state,
+                    profile_key="runtime_profile",
+                    digest_key="profile_digest",
+                )
             elif self.runtime_profile is not None:
                 # Legacy constructor-injection seam: only reachable for pre-repair
                 # state or when runtime_config is None.
