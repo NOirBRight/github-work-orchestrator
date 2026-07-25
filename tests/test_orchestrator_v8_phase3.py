@@ -1260,25 +1260,28 @@ def test_review_axis_materialization_ambiguous_create_never_cleans_without_orpha
 
 
 def test_review_axis_materialization_tls_transport_is_transient_but_config_is_permanent():
-    assert (
-        PaseoCliClient.classify_failure(
-            "TLS certificate handshake timed out",
-            default="permanent",
-        )
-        == "transient"
+    permanent_failures = (
+        "TLS certificate verify failed",
+        "certificate validation failed for local issuer",
+        "unauthorized provider authentication",
+        "invalid configuration: unknown model",
+        "unknown provider kimi-x",
     )
-    assert (
-        PaseoCliClient.classify_failure(
-            "unauthorized provider authentication",
-        )
-        == "permanent"
+    transient_failures = (
+        "TLS connect timeout",
+        "TLS certificate handshake timed out",
+        "TLS wrong version number",
+        "connection reset by peer",
     )
-    assert (
-        PaseoCliClient.classify_failure(
-            "invalid configuration: unknown model",
-        )
-        == "permanent"
-    )
+
+    assert {
+        PaseoCliClient.classify_failure(message, default="transient")
+        for message in permanent_failures
+    } == {"permanent"}
+    assert {
+        PaseoCliClient.classify_failure(message, default="permanent")
+        for message in transient_failures
+    } == {"transient"}
 
 
 def test_windows_environment_requirement_resolves_logical_paseo_executable(
@@ -1482,9 +1485,19 @@ def test_review_prompt_ambiguity_survives_delayed_visibility_windows(
         for outcome in ambiguous
     )
     assert all(outcome.attempt_state == "reviewing" for outcome in ambiguous)
-    assert client.create_count == 2
+    review_agents = client.find_by_labels(
+        {"gwo.review_candidate": candidate_sha}
+    )
+    assert {
+        agent.labels["gwo.review_axis"] for agent in review_agents
+    } == {"standards", "spec"}
+    assert len(
+        {agent.labels["gwo.action_key"] for agent in review_agents}
+    ) == 2
+    assert client.create_count == 1 + len(review_agents)
     assert client.send_count == 1
     assert len(client.sent_action_keys) == 1
+    assert len(set(client.sent_action_keys)) == 1
     action_key = client.sent_action_keys[0]
     assert {
         outcome.wait_source_ref for outcome in ambiguous

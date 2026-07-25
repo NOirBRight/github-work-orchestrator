@@ -1225,6 +1225,8 @@ class PaseoCliClient:
     def classify_failure(message: str, *, default: str = "transient") -> str:
         lowered = message.casefold()
         permanent_markers = (
+            "certificate verify failed",
+            "certificate validation failed",
             "unauthorized",
             "forbidden",
             "authentication",
@@ -1241,8 +1243,8 @@ class PaseoCliClient:
             "timeout",
             "connection reset",
             "connection refused",
-            "certificate",
             "tls",
+            "wrong version",
             "busy",
             "rate limit",
         )
