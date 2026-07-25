@@ -769,27 +769,50 @@ def test_repair_packet_accepts_two_valid_axis_envelopes(tmp_path):
             profile,
             parent_agent_id=worker_binding.agent_id,
         )
-        finding = {
-            "severity": "hard",
-            "code": f"{axis_name.upper()}_NEAR_LIMIT",
-            "source": "CONTEXT.md",
-            "location": "result.txt:1",
-            "message": "",
-        }
         envelope = {
             "schema_version": 1,
             "action_key": request.action_key,
             "candidate_sha": request.candidate_sha,
             "axis": axis_name,
             "fixed_input_digest": request.fixed_input_digest,
-            "findings": [finding],
+            "findings": [],
         }
-        empty_envelope = json.dumps(envelope, separators=(",", ":"))
-        finding["message"] = "x" * (
-            16_384 - len(empty_envelope.encode("utf-8"))
+        while True:
+            envelope["findings"].append(
+                {
+                    "severity": "hard",
+                    "code": "x",
+                    "source": "x",
+                    "location": "x",
+                    "message": "x",
+                }
+            )
+            encoded_envelope = json.dumps(
+                envelope,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            if len(encoded_envelope.encode("utf-8")) > 16_384:
+                envelope["findings"].pop()
+                break
+        encoded_envelope = json.dumps(
+            envelope,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
         )
-        encoded_envelope = json.dumps(envelope, separators=(",", ":"))
+        envelope["findings"][-1]["message"] += "x" * (
+            16_384 - len(encoded_envelope.encode("utf-8"))
+        )
+        encoded_envelope = json.dumps(
+            envelope,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         assert len(encoded_envelope.encode("utf-8")) == 16_384
+        assert len(envelope["findings"]) >= 200
         client.set_output(
             binding.agent_id,
             f"GWO_REVIEW_AXIS {encoded_envelope}",
@@ -800,20 +823,46 @@ def test_repair_packet_accepts_two_valid_axis_envelopes(tmp_path):
         {
             "type": "review_blocker",
             "axis": axis.axis,
-            "finding": dict(axis.findings[0]),
+            "finding": dict(finding),
         }
         for axis in axis_observations
+        for finding in axis.findings
     ]
+    changed_files = []
+    changed_file_index = 0
+    while True:
+        candidate_files = [*changed_files, f"路径-{changed_file_index}"]
+        encoded_files = json.dumps(
+            candidate_files,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded_files) > 4 * 1024:
+            break
+        changed_files = candidate_files
+        changed_file_index += 1
+    assert len(
+        json.dumps(
+            changed_files,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ) > 4_000
     ladder = RecoveryLadder(semantic_attempts=2, repair_rounds=1)
     packet = ladder.recovery_packet(
         candidate_sha=observation.result_claim.candidate_sha,
         acceptance_digest="b" * 64,
-        changed_files=["result.txt"],
+        changed_files=changed_files,
         causes=causes,
     )
 
-    assert json.loads(packet)["causes"] == causes
-    assert 30 * 1024 < len(packet.encode("utf-8")) <= 64 * 1024
+    packet_value = json.loads(packet)
+    assert packet_value["causes"] == causes
+    assert packet_value["changed_files"] == changed_files
+    assert packet_value["acceptance_digest"] == "b" * 64
+    assert 55 * 1024 < len(packet.encode("utf-8")) <= 64 * 1024
     store_path = tmp_path / "repair-prompt.sqlite3"
     kernel = Kernel(
         store_path=store_path,
@@ -829,8 +878,29 @@ def test_repair_packet_accepts_two_valid_axis_envelopes(tmp_path):
         packet,
         same_attempt=True,
     )
-    assert json.loads(repair_prompt.text)["repair_round"]["causes"] == causes
+    repair_round = json.loads(repair_prompt.text)["repair_round"]
+    assert repair_round["causes"] == causes
+    assert repair_round["changed_files"] == changed_files
+    assert repair_round["acceptance_digest"] == "b" * 64
     assert len(repair_prompt.text.encode("utf-8")) <= 64 * 1024
+
+    with pytest.raises(KernelError) as overlong_path:
+        ladder.recovery_packet(
+            candidate_sha="a" * 40,
+            acceptance_digest="b" * 64,
+            changed_files=["a.py", "x" * 257, "b.py"],
+            causes=causes,
+        )
+    assert overlong_path.value.code == "REPAIR_CHANGED_FILES_TOO_LARGE"
+
+    with pytest.raises(KernelError) as oversized_file_list:
+        ladder.recovery_packet(
+            candidate_sha="a" * 40,
+            acceptance_digest="b" * 64,
+            changed_files=[*changed_files, f"路径-{changed_file_index}"],
+            causes=causes,
+        )
+    assert oversized_file_list.value.code == "REPAIR_CHANGED_FILES_TOO_LARGE"
 
     boundary_cause = {
         "type": "review_blocker",

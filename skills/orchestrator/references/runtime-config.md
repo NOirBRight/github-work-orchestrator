@@ -220,6 +220,10 @@ near-limit axis outputs fit alongside the bounded acceptance and changed-file
 metadata. Review findings retain every typed field and their observed order;
 the Kernel never truncates, summarizes, or suppresses them. It rejects the
 whole packet only when the rendered UTF-8 payload exceeds 64 KiB.
+Changed-file metadata retains the exact ordered path list. Its canonical JSON
+encoding is limited to 4 KiB and each path to 256 characters; exceeding either
+allocation rejects the packet instead of truncating a path, partially
+including an entry, or dropping later files.
 
 Paseo 0.1.110 advertises `low/high/max` for Kimi K2.7 while its daemon accepts
 `on` and rejects the tested `high/max` values. GWO therefore permits the exact

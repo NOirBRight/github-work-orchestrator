@@ -47,6 +47,8 @@ from .runtime import (
 )
 
 REPAIR_PACKET_MAX_BYTES = 64 * 1024
+REPAIR_CHANGED_FILES_MAX_BYTES = 4 * 1024
+REPAIR_CHANGED_FILE_MAX_CHARACTERS = 256
 
 
 class KernelError(RuntimeError):
@@ -1055,15 +1057,28 @@ class RecoveryLadder:
             bounded_causes.append(normalized)
             cause_bytes += len(encoded)
 
+        exact_changed_files = list(changed_files)
+        if (
+            any(
+                not isinstance(path, str)
+                or len(path) > REPAIR_CHANGED_FILE_MAX_CHARACTERS
+                for path in exact_changed_files
+            )
+            or len(canonical_bytes(exact_changed_files))
+            > REPAIR_CHANGED_FILES_MAX_BYTES
+        ):
+            raise KernelError(
+                "REPAIR_CHANGED_FILES_TOO_LARGE",
+                (
+                    "exact changed-file metadata exceeds its bounded "
+                    "Repair Packet allocation"
+                ),
+            )
         packet = {
             "schema_version": 2,
             "candidate_sha": candidate_sha,
             "acceptance_digest": acceptance_digest,
-            "changed_files": bounded(
-                sorted(set(changed_files)),
-                each=256,
-                total=4_096,
-            ),
+            "changed_files": exact_changed_files,
             "causes": bounded_causes,
         }
         rendered = canonical_bytes(packet).decode("utf-8")
