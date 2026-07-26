@@ -20,18 +20,30 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scr
 sys.path.insert(0, str(SCRIPTS))
 
 from gwo_v8 import (  # noqa: E402
+    AuthoritativeNodeReadback,
+    AuthoritativeRepositoryReadback,
     EvidenceVerifier,
+    ExecutionBudgetReadback,
     InMemoryDeliveryControl,
+    InMemoryDurablePlanControl,
     InMemoryRuntimeAdapter,
     Kernel,
     LocalPlanPublication,
     PlanCompiler,
+    ResultClaim,
     ReviewAxisBinding,
     ReviewAxisObservation,
+    RuntimeBinding,
+    RuntimeObservation,
+    RuntimePrompt,
+    StoreReconstructor,
+    TypedEvidence,
     bounded_check_diagnostics,
     check_diagnostics_valid,
     redact_secrets,
+    secrets_policy_digest,
 )
+from gwo_v8._canonical import digest_value  # noqa: E402
 from gwo_v8.evidence import (  # noqa: E402
     CHECK_DIAGNOSTIC_MAX_STREAM_CHARACTERS,
     _CHECK_DIAGNOSTIC_TRUNCATION_PREFIX,
@@ -139,6 +151,7 @@ def _noisy_affected_command() -> list:
             "from pathlib import Path; "
             "sys.stderr.write('x' * 3000 + '\\n'); "
             f"sys.stderr.write('token={SECRET}\\n'); "
+            "sys.stderr.write('INTERNAL-ABCD1234\\n'); "
             "assert Path('module-1.txt').read_text() == 'module 1\\n'"
         ),
     ]
@@ -195,9 +208,10 @@ def _inputs() -> tuple[dict, dict, dict]:
                 "runtime_requirements": {"capabilities": ["git", "local_check"]},
                 "difficulty": "standard",
                 "risk": "standard",
-                # The compiled policy authorizes no Repair Round at all: the
-                # typed recoverable Check condition must still receive the one
-                # bounded Repair Round instead of failing the Plan Node.
+                # The proposal authorizes no Repair Round at all: the
+                # deterministic Compiler must authorize the one bounded
+                # Repair Round for local Check recovery in the PlanSpec so
+                # the Kernel never overrides policy at runtime.
                 "recovery_policy": {
                     "semantic_attempts": 1,
                     "repair_rounds": 0,
@@ -263,6 +277,20 @@ def _inputs() -> tuple[dict, dict, dict]:
         "strict_review": {
             "specialist_requirements": [],
             "human_decision_required": True,
+        },
+        # Explicit deterministic repository secrets policy: the Compiler
+        # freezes it into the PlanSpec with its digest, Runtime capture
+        # redacts with it, and Evidence verification enforces it closed.
+        "secrets_policy": {
+            "version": 1,
+            "patterns": [
+                r"gh[pousr]_[A-Za-z0-9]{16,}",
+                r"INTERNAL-[A-Z0-9]{8}",
+                (
+                    r"(?i)\b(api[_-]?key|token|secret|password|passwd"
+                    r"|authorization)(\s*[:=]\s*|\s+)(\S+)"
+                ),
+            ],
         },
     }
     return intent, source, policy
@@ -459,6 +487,19 @@ def test_failed_check_records_typed_condition_and_repairs_red_to_green(
     )
     kernel, compiled, work_node = _kernel(tmp_path, runtime)
 
+    # The deterministic Compiler authorized the bounded Repair Round and the
+    # explicit repository secrets policy inside the PlanSpec; the Kernel acts
+    # strictly within that compiled policy.
+    assert work_node["recovery_policy"] == {
+        "semantic_attempts": 1,
+        "repair_rounds": 1,
+    }
+    compiled_policy = work_node["output_contract"]["secrets_policy"]
+    assert compiled_policy["policy_digest"] == secrets_policy_digest(
+        compiled_policy
+    )
+    assert r"INTERNAL-[A-Z0-9]{8}" in compiled_policy["patterns"]
+
     repair = kernel.reconcile_once(REPOSITORY)
 
     # The red Checks became a typed recoverable condition with one bounded
@@ -479,6 +520,11 @@ def test_failed_check_records_typed_condition_and_repairs_red_to_green(
     assert failed["module-1-affected"]["suite"] == "affected"
     assert failed["module-1-repository"]["suite"] == "repository"
     assert failed["module-1-affected"]["exit_code"] != 0
+    # Every condition entry is attributed to the exact member Candidate and
+    # Evidence digest — the identities the Integration Batch manifest uses.
+    for entry in failed.values():
+        assert entry["candidate_sha"] == condition["candidate_sha"]
+        assert len(entry["evidence_digest"]) == 64
     diagnostics = failed["module-1-affected"]["diagnostics"]
     assert check_diagnostics_valid(diagnostics)
 
@@ -487,6 +533,7 @@ def test_failed_check_records_typed_condition_and_repairs_red_to_green(
     condition_diagnostics = failed["module-1-affected"]["diagnostics"]
     assert SECRET not in condition_diagnostics["stderr_tail"]
     assert "token=[redacted]" in condition_diagnostics["stderr_tail"]
+    assert "INTERNAL-ABCD1234" not in condition_diagnostics["stderr_tail"]
     assert "AssertionError" in condition_diagnostics["stderr_tail"]
     assert condition_diagnostics["stderr_tail"].startswith(
         _CHECK_DIAGNOSTIC_TRUNCATION_PREFIX
@@ -498,6 +545,9 @@ def test_failed_check_records_typed_condition_and_repairs_red_to_green(
     assert "token=[redacted]" in stderr_tail
     assert causes["module-1-affected"]["suite"] == "affected"
     assert causes["module-1-repository"]["suite"] == "repository"
+    assert causes["module-1-affected"]["candidate_sha"] == (
+        condition["candidate_sha"]
+    )
 
     integrated = kernel.reconcile_once(REPOSITORY)
 
@@ -592,3 +642,688 @@ def test_failed_check_repair_round_is_durable_across_restart(tmp_path):
     assert restarted_state["recoverable_condition"] == condition
     assert runtime.repair_count == 1
     assert runtime.materialization_count == 1
+
+
+def _compiled_plan():
+    compiled = PlanCompiler().compile(*_inputs())
+    plan = json.loads(compiled.canonical_bytes)
+    work_node = next(node for node in plan["nodes"] if node["kind"] == "work")
+    return compiled, work_node
+
+
+def test_zero_round_proposal_compiles_bounded_repair_authorization():
+    compiled, work_node = _compiled_plan()
+
+    # The PlanSpec itself authorizes the one bounded Repair Round for local
+    # Check recovery; nodes without local Checks keep their proposed policy.
+    assert work_node["recovery_policy"] == {
+        "semantic_attempts": 1,
+        "repair_rounds": 1,
+    }
+    plan = json.loads(compiled.canonical_bytes)
+    integration_node = next(
+        node for node in plan["nodes"] if node["kind"] == "integration"
+    )
+    assert integration_node["recovery_policy"] == {
+        "semantic_attempts": 1,
+        "repair_rounds": 0,
+    }
+    secrets_policy = work_node["output_contract"]["secrets_policy"]
+    assert secrets_policy["policy_digest"] == secrets_policy_digest(
+        secrets_policy
+    )
+
+
+def _repairing_node_readback(
+    compiled,
+    work_node,
+    tmp_path,
+    *,
+    repair_rounds_used: int,
+) -> AuthoritativeNodeReadback:
+    base_sha = "2" * 40
+    prompt = RuntimePrompt(
+        text="implement module 1",
+        digest=digest_value("implement module 1"),
+        authority_digest=work_node["contract_digest"],
+    )
+    binding = RuntimeBinding(
+        adapter="paseo",
+        runtime_id="runtime:1",
+        repository=compiled.repository,
+        plan_digest=compiled.digest,
+        node_key=work_node["node_key"],
+        admission_id="admission:1",
+        repository_path=str(tmp_path),
+        workspace=str(tmp_path),
+        prompt_accepted=True,
+        prompt_digest=prompt.digest,
+        attempt_id="attempt:1",
+        agent_id="agent:1",
+        session_id="session:1",
+        workspace_id="workspace:1",
+        runtime_profile="standard",
+        profile_digest="3" * 64,
+        provider="kimi-cli",
+        model="kimi-code/kimi-for-coding",
+        thinking="on",
+        mode="yolo",
+        features_digest="4" * 64,
+        base_sha=base_sha,
+    )
+    # The durable shape of a repairing node mirrors the live Store: the
+    # rejected Candidate and its Evidence are already invalidated, only the
+    # bounded Repair Round budget consumption remains.
+    return AuthoritativeNodeReadback(
+        node_key=work_node["node_key"],
+        goal_key=work_node["goal_key"],
+        work_item_key=work_node["work_item_key"],
+        status="waiting",
+        directive="wait_for_runtime",
+        admission_id="admission:1",
+        admission_state="consumed",
+        attempt_id="attempt:1",
+        attempt_state="repairing",
+        attempt_record_state="running",
+        attempt_terminal_reason=None,
+        budgets=ExecutionBudgetReadback(
+            attempt_ordinal=1,
+            repair_rounds_used=repair_rounds_used,
+            materialization_create_executions=1,
+            materialization_prompt_executions=1,
+            hosted_retry_count=0,
+            runtime_observation_failures=0,
+            runtime_circuits={},
+        ),
+        base_sha=base_sha,
+        prompt=prompt,
+        runtime_binding=binding,
+        candidate_sha=None,
+        wait_condition="runtime_result",
+        wait_source_ref="paseo://attempt/attempt:1/repair",
+        publication_state=None,
+        publication_ref=None,
+        hosted_check_state=None,
+        hosted_check_evidence=(),
+        worker_parked_for_ci=False,
+        resume_sent=True,
+        publication_eligible=None,
+        evidence=(),
+        review_children=(),
+        review_observations=(),
+        held_resource_claims=(),
+        integrated_sha=None,
+        candidate_source_ref=None,
+        integration_source_ref=None,
+    )
+
+
+def test_store_reconstruction_round_trips_compiler_authorized_repair(tmp_path):
+    compiled, work_node = _compiled_plan()
+    durable = InMemoryDurablePlanControl()
+    publication = LocalPlanPublication(
+        tmp_path / "source.sqlite3",
+        durable=durable,
+    )
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="check-recovery",
+    )
+
+    def reconstruct(repair_rounds_used: int):
+        readback = AuthoritativeRepositoryReadback.from_durable(
+            durable,
+            compiled.repository,
+            nodes=(
+                _repairing_node_readback(
+                    compiled,
+                    work_node,
+                    tmp_path,
+                    repair_rounds_used=repair_rounds_used,
+                ),
+            ),
+        )
+        return StoreReconstructor().reconstruct(
+            readback,
+            tmp_path / f"reconstructed-{repair_rounds_used}.sqlite3",
+        )
+
+    # repair_rounds_used == 1 stays within the compiler-authorized bounded
+    # Repair Round: authoritative Store reconstruction round-trips cleanly.
+    result = reconstruct(1)
+    assert result.status == "reconstructed", result.blockers
+    assert "EXECUTION_BUDGET_CONTRADICTION" not in result.blockers
+
+    # A budget beyond the compiled authorization is still caught closed.
+    exceeded = reconstruct(2)
+    assert "EXECUTION_BUDGET_CONTRADICTION" in exceeded.blockers
+
+
+def _provenance_state() -> tuple[dict, dict, TypedEvidence]:
+    definition = {
+        "check_id": "module-1",
+        "suite": "affected",
+        "hosted_only": False,
+        "definition_digest": "d" * 64,
+        "command": ["python", "-c", "raise SystemExit(2)"],
+        "environment_requirements": [],
+    }
+    environment = {"platform": "test"}
+
+    def capture(kind: str, subject: str, source_ref: str, payload: dict):
+        return TypedEvidence._capture(
+            kind=kind,
+            subject=subject,
+            observer_type="runtime_adapter",
+            observer_id="runtime:unit",
+            observed_at="2026-07-26T00:00:00+00:00",
+            source_ref=source_ref,
+            payload=payload,
+        )
+
+    candidate = capture(
+        "candidate",
+        "c" * 40,
+        "runtime://candidate/unit",
+        {"tree_sha": "c" * 40},
+    )
+    genuine = capture(
+        "check",
+        "c" * 40,
+        "runtime://check/genuine",
+        {
+            "check_id": "module-1",
+            "outcome": "failed",
+            "exit_code": 2,
+            "definition_digest": "d" * 64,
+            "command_digest": digest_value(definition["command"]),
+            "observed_tree_digest": "c" * 40,
+            "environment_requirements": [],
+            "environment_identity": environment,
+            "environment_digest": digest_value(environment),
+            "input_projection_digest": "a" * 64,
+            "log_digest": "b" * 64,
+            "diagnostics": {"stdout_tail": "", "stderr_tail": "boom"},
+        },
+    )
+    work_node = {"output_contract": {"checks": [definition]}}
+    state = {
+        "candidate_sha": "c" * 40,
+        "candidate_observation": {
+            "binding": {"runtime_id": "runtime:unit"},
+            "evidence": [candidate.__dict__, genuine.__dict__],
+        },
+    }
+    return state, work_node, genuine
+
+
+def test_repair_causes_require_fully_validated_check_evidence():
+    state, work_node, genuine = _provenance_state()
+    observation = state["candidate_observation"]
+
+    def forged(payload_updates=None, *, envelope=None, subject=None):
+        evidence = dict(genuine.__dict__)
+        payload = dict(genuine.payload)
+        payload.update(payload_updates or {})
+        evidence["payload"] = payload
+        if subject is not None:
+            evidence["subject"] = subject
+        if envelope:
+            evidence.update(envelope)
+        return evidence
+
+    observation["evidence"].extend(
+        [
+            # Wrong command digest: shaped like a failure, but not bound to
+            # the compiled Check Definition.
+            forged({"command_digest": "0" * 64}),
+            # Wrong subject: not bound to the exact Candidate.
+            forged(subject="e" * 40),
+            # Tampered envelope: payload edited after capture.
+            forged({"exit_code": 137}, envelope={"content_digest": "f" * 64}),
+            # Raw secret inside shaped diagnostics.
+            forged(
+                {
+                    "diagnostics": {
+                        "stdout_tail": "",
+                        "stderr_tail": f"token={SECRET}",
+                    }
+                }
+            ),
+            # Missing provenance digests entirely.
+            forged(
+                {
+                    "environment_digest": None,
+                    "input_projection_digest": None,
+                    "log_digest": None,
+                }
+            ),
+        ]
+    )
+
+    failures = Kernel._local_check_failures(state, work_node)
+    causes = Kernel._repair_causes(
+        state,
+        work_node,
+        cause_type="candidate_verification_failure",
+        findings=("local check:module-1 did not pass",),
+    )
+
+    assert [failure["check_id"] for failure in failures] == ["module-1"]
+    assert failures[0]["evidence_digest"] == genuine.content_digest
+    check_causes = [
+        cause for cause in causes if cause["type"] == "local_check_failure"
+    ]
+    assert len(check_causes) == 1
+    assert check_causes[0]["source_ref"] == "runtime://check/genuine"
+    assert check_causes[0]["candidate_sha"] == "c" * 40
+    assert check_causes[0]["evidence_digest"] == genuine.content_digest
+
+
+def _verification_setup():
+    compiled, work_node = _compiled_plan()
+    contract = work_node["output_contract"]
+    check = next(
+        item
+        for item in contract["checks"]
+        if item["check_id"] == "module-1-affected"
+    )
+    binding = RuntimeBinding(
+        adapter="in-memory",
+        runtime_id="runtime:unit",
+        repository=compiled.repository,
+        plan_digest=compiled.digest,
+        node_key=work_node["node_key"],
+        admission_id="admission:unit",
+        repository_path="unused",
+        workspace="unused",
+        prompt_accepted=True,
+        prompt_digest="5" * 64,
+        attempt_id="attempt:1",
+        agent_id="agent:unit",
+        session_id="session:unit",
+        workspace_id="workspace:unit",
+        runtime_profile="standard",
+        profile_digest="6" * 64,
+        provider="in-memory",
+        model="deterministic",
+        thinking=None,
+        mode=None,
+        features_digest="7" * 64,
+        base_sha="8" * 40,
+    )
+    claim = ResultClaim(
+        attempt_id="attempt:1",
+        node_key=work_node["node_key"],
+        candidate_sha="c" * 40,
+    )
+    candidate = TypedEvidence._capture(
+        kind="candidate",
+        subject="c" * 40,
+        observer_type="runtime_adapter",
+        observer_id="runtime:unit",
+        observed_at="2026-07-26T00:00:00+00:00",
+        source_ref="runtime://candidate/unit",
+        payload={"tree_sha": "c" * 40},
+    )
+    environment = {
+        "platform": "test",
+        "python": {"executable": "python", "version": "3"},
+    }
+    base_payload = {
+        "check_id": "module-1-affected",
+        "outcome": "passed",
+        "exit_code": 0,
+        "definition_digest": check["definition_digest"],
+        "command_digest": digest_value(check["command"]),
+        "observed_tree_digest": "c" * 40,
+        "environment_requirements": ["python"],
+        "environment_identity": environment,
+        "environment_digest": digest_value(environment),
+        "input_projection_digest": "a" * 64,
+        "log_digest": "b" * 64,
+    }
+
+    def verify_with(payload_updates):
+        payload = {**base_payload, **payload_updates}
+        evidence = TypedEvidence._capture(
+            kind="check",
+            subject="c" * 40,
+            observer_type="runtime_adapter",
+            observer_id="runtime:unit",
+            observed_at="2026-07-26T00:00:00+00:00",
+            source_ref="runtime://check/unit",
+            payload=payload,
+        )
+        observation = RuntimeObservation(
+            binding=binding,
+            lifecycle="completed",
+            result_claim=claim,
+            evidence=(candidate, evidence),
+        )
+        return EvidenceVerifier().verify(claim, contract, observation)
+
+    return verify_with, contract["secrets_policy"]
+
+
+def test_verifier_fails_closed_on_secrets_policy_mismatch():
+    verify_with, secrets_policy = _verification_setup()
+
+    decision = verify_with(
+        {
+            "diagnostics": {"stdout_tail": "", "stderr_tail": "clean"},
+            "secrets_policy_digest": "0" * 64,
+        }
+    )
+
+    # The mismatched Evidence is excluded closed: it can never ground an
+    # acceptance, and the typed finding names the policy violation.
+    assert decision.status != "accepted"
+    assert any(
+        "secrets policy mismatch" in finding for finding in decision.findings
+    )
+
+
+def test_verifier_fails_closed_on_still_secret_excerpt():
+    verify_with, secrets_policy = _verification_setup()
+
+    decision = verify_with(
+        {
+            "diagnostics": {
+                "stdout_tail": "",
+                "stderr_tail": f"token={SECRET}",
+            },
+            "secrets_policy_digest": secrets_policy["policy_digest"],
+        }
+    )
+
+    assert decision.status != "accepted"
+    assert any(
+        "diagnostics leak secrets" in finding for finding in decision.findings
+    )
+
+    clean = verify_with(
+        {
+            "diagnostics": {
+                "stdout_tail": "",
+                "stderr_tail": "token=[redacted]",
+            },
+            "secrets_policy_digest": secrets_policy["policy_digest"],
+        }
+    )
+    assert not any(
+        "secrets policy" in finding or "leak secrets" in finding
+        for finding in clean.findings
+    )
+
+
+def _batch_inputs() -> tuple[dict, dict, dict]:
+    nodes = []
+    work_items = []
+    definitions = []
+    for ordinal in (1, 2):
+        path = f"module-{ordinal}.txt"
+        content = f"module {ordinal}\n"
+        work_item_key = f"issue:{780 + ordinal}"
+        affected_command = [
+            "python",
+            "-c",
+            f"from pathlib import Path; assert Path('{path}').is_file()",
+        ]
+        repository_command = [
+            "python",
+            "-c",
+            (
+                "from pathlib import Path; "
+                f"assert Path('{path}').read_text() == {content!r}"
+            ),
+        ]
+        work_items.append(
+            {
+                "work_item_key": work_item_key,
+                "tracker_state": "ready-for-agent",
+                "source_ref": f"synthetic://issue/{780 + ordinal}",
+                "title": f"Build module {ordinal}",
+                "outcome_contract": {"path": path, "content": content},
+            }
+        )
+        nodes.append(
+            {
+                "goal_key": "goal:check-recovery",
+                "work_item_key": work_item_key,
+                "kind": "work",
+                "inputs": {"file_changes": [{"path": path, "content": content}]},
+                "output_contract": {
+                    "required_evidence": [
+                        {"kind": "candidate"},
+                        {
+                            "kind": "check",
+                            "check_id": f"module-{ordinal}-affected",
+                        },
+                    ],
+                    "checks": [
+                        {
+                            "check_id": f"module-{ordinal}-affected",
+                            "command": affected_command,
+                        }
+                    ],
+                },
+                "effect_contract": {
+                    "write_scopes": [path],
+                    "external_effects": [],
+                },
+                "resource_claims": [],
+                "runtime_requirements": {"capabilities": ["git", "local_check"]},
+                "difficulty": "standard",
+                "risk": "low",
+                "recovery_policy": {
+                    "semantic_attempts": 1,
+                    "repair_rounds": 0,
+                },
+                "skill_reference": None,
+            }
+        )
+        definitions.extend(
+            [
+                {
+                    "check_id": f"module-{ordinal}-affected",
+                    "version": 1,
+                    "command": affected_command,
+                    "hosted_name": None,
+                    "environment_requirements": ["python"],
+                    "input_selector": [path],
+                    "base_sensitive": False,
+                    "risk": "low",
+                    "hosted_only": False,
+                    "suite": "affected",
+                },
+                {
+                    "check_id": f"module-{ordinal}-repository",
+                    "version": 1,
+                    "command": repository_command,
+                    "hosted_name": None,
+                    "environment_requirements": ["python"],
+                    "input_selector": [path],
+                    "base_sensitive": False,
+                    "risk": "low",
+                    "hosted_only": False,
+                    "suite": "repository",
+                },
+                {
+                    "check_id": f"module-{ordinal}-hosted",
+                    "version": 1,
+                    "command": ["python", "-c", "raise SystemExit(0)"],
+                    "hosted_name": f"Module {ordinal} CI",
+                    "environment_requirements": [],
+                    "input_selector": [path],
+                    "base_sensitive": False,
+                    "risk": "low",
+                    "hosted_only": True,
+                    "suite": "hosted",
+                },
+            ]
+        )
+    intent = {
+        "parent_plan_digest": None,
+        "goals": [
+            {
+                "goal_key": "goal:check-recovery",
+                "objective": "Integrate two independent modules.",
+                "acceptance": ["Both modules are integrated."],
+            }
+        ],
+        "nodes": nodes,
+        "edges": [],
+    }
+    source = {"repository": REPOSITORY, "work_items": work_items}
+    policy = {
+        "version": 3,
+        "low_risk_allowlist": ["module-*.txt"],
+        "check_definitions": definitions,
+        "strict_review": {
+            "specialist_requirements": [],
+            "human_decision_required": True,
+        },
+    }
+    return intent, source, policy
+
+
+class _BatchRepairRuntime(_ReviewingInMemoryRuntime):
+    """Two-member Batch where only one member's repository Check is red."""
+
+    def __init__(self, workspace_root: Path, *, broken_node_key: str):
+        super().__init__(workspace_root)
+        self.broken_node_key = broken_node_key
+        self.repaired_admissions: list[str] = []
+        self.repair_prompts: list[tuple[str, object]] = []
+
+    def repair(self, binding, prompt, *, action_key) -> None:
+        self.repaired_admissions.append(binding.admission_id)
+        self.repair_prompts.append((binding.node_key, prompt))
+        super().repair(binding, prompt, action_key=action_key)
+
+    def resume(self, binding) -> None:
+        state = self._state_for(binding)
+        if (
+            state.result_claim is None
+            and state.node is not None
+            and state.node.get("node_key") == self.broken_node_key
+        ):
+            state.node["inputs"]["file_changes"][0]["content"] = (
+                "module 1\n"
+                if binding.admission_id in self.repaired_admissions
+                else "broken\n"
+            )
+        super().resume(binding)
+
+
+def test_batch_repository_check_failure_targets_only_implicated_member(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    intent, source, policy = _batch_inputs()
+    compiled = PlanCompiler().compile(intent, source, policy)
+    plan = json.loads(compiled.canonical_bytes)
+    work_nodes = {
+        node["inputs"]["file_changes"][0]["path"]: node
+        for node in plan["nodes"]
+        if node["kind"] == "work"
+    }
+    assert set(work_nodes) == {"module-1.txt", "module-2.txt"}
+    member_one = work_nodes["module-1.txt"]
+    member_two = work_nodes["module-2.txt"]
+    assert member_one["recovery_policy"]["repair_rounds"] == 1
+    assert member_two["recovery_policy"]["repair_rounds"] == 1
+    store_path = tmp_path / "check-recovery-batch.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="check-recovery",
+    )
+    runtime = _BatchRepairRuntime(
+        tmp_path / "runtime",
+        broken_node_key=member_one["node_key"],
+    )
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="check-recovery",
+        delivery_control=InMemoryDeliveryControl(
+            hosted_outcomes=("passed", "passed"),
+        ),
+        runtime_config=_runtime_config(),
+    )
+
+    kernel.reconcile_once(REPOSITORY)
+    kernel.reconcile_once(REPOSITORY)
+
+    member_one_state = kernel._read_state(
+        REPOSITORY,
+        compiled.digest,
+        member_one["node_key"],
+    )
+    member_two_state = kernel._read_state(
+        REPOSITORY,
+        compiled.digest,
+        member_two["node_key"],
+    )
+    assert member_one_state is not None
+    assert member_two_state is not None
+
+    # Only the implicated member carries a typed condition, and it names
+    # exactly its own failed repository Check bound to its own Candidate.
+    condition = member_one_state["recoverable_condition"]
+    assert condition is not None
+    assert condition["type"] == "local_check_failure"
+    assert {
+        check["check_id"] for check in condition["checks"]
+    } == {"module-1-repository"}
+    entry = condition["checks"][0]
+    assert entry["suite"] == "repository"
+    assert entry["candidate_sha"] == condition["candidate_sha"]
+    assert len(entry["evidence_digest"]) == 64
+    assert member_one_state["attempt_state"] == "repairing"
+    assert member_one_state["repair_rounds_used"] == 1
+
+    # The unrelated member was never recovered: no condition, no Repair
+    # Round, no repair Prompt, and its parked Worker keeps waiting.
+    assert member_two_state["recoverable_condition"] is None
+    assert member_two_state["repair_rounds_used"] == 0
+    assert member_two_state["attempt_state"] != "repairing"
+    assert all(
+        node_key != member_two["node_key"]
+        for node_key, _prompt in runtime.repair_prompts
+    )
+    packet = json.loads(runtime.repair_prompts[0][1].text)["repair_round"]
+    assert packet["candidate_sha"] == condition["candidate_sha"]
+    assert {
+        cause.get("check_id")
+        for cause in packet["causes"]
+        if cause["type"] == "local_check_failure"
+    } == {"module-1-repository"}
+
+    for _ in range(6):
+        kernel.reconcile_once(REPOSITORY)
+
+    member_one_final = kernel._read_state(
+        REPOSITORY,
+        compiled.digest,
+        member_one["node_key"],
+    )
+    member_two_final = kernel._read_state(
+        REPOSITORY,
+        compiled.digest,
+        member_two["node_key"],
+    )
+    assert member_one_final["status"] == "complete"
+    assert member_one_final["repair_rounds_used"] == 1
+    assert member_two_final["status"] == "complete"
+    # The unrelated member integrated without ever entering recovery.
+    assert member_two_final["repair_rounds_used"] == 0
+    assert len(runtime.repaired_admissions) == 1

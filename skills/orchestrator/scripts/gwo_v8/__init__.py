@@ -33,8 +33,13 @@ from .evidence import (
     VerificationDecision,
     VerifiedResult,
     bounded_check_diagnostics,
+    check_diagnostics_finding,
     check_diagnostics_valid,
+    check_evidence_provenance_finding,
+    default_secrets_policy,
     redact_secrets,
+    secrets_policy_digest,
+    secrets_present,
 )
 from .goal_driver import (
     CoordinatorRuntime,
@@ -273,6 +278,11 @@ __all__ = [
     "VerificationDecision",
     "VerifiedResult",
     "bounded_check_diagnostics",
+    "check_diagnostics_finding",
     "check_diagnostics_valid",
+    "check_evidence_provenance_finding",
+    "default_secrets_policy",
     "redact_secrets",
+    "secrets_policy_digest",
+    "secrets_present",
 ]
