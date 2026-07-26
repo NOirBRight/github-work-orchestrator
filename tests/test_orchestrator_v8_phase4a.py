@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -17,6 +18,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from gwo_v8 import (  # noqa: E402
     DurableWake,
+    DeliveryControlError,
     EvidenceVerifier,
     GoalDriver,
     GoalDriverError,
@@ -351,6 +353,47 @@ class _RepairCountingRuntime(InMemoryRuntimeAdapter):
         return super().retire_after_integration(binding, authorization)
 
 
+class _ParkedBindingReadbackRuntime(_RepairCountingRuntime):
+    def lose_binding(self, admission_id: str) -> None:
+        self._states.pop(admission_id)
+
+    def change_binding_identity(self, admission_id: str) -> None:
+        state = self._states[admission_id]
+        state.binding = replace(
+            state.binding,
+            runtime_id=f"replacement:{state.binding.runtime_id}",
+        )
+
+
+class _CapacityControlledRuntime(_RepairCountingRuntime):
+    def __init__(self, workspace_root: Path):
+        super().__init__(workspace_root)
+        self.worker_turn_capacity = 1
+
+    def observed_worker_turn_capacity(self, _profile):
+        return self.worker_turn_capacity
+
+
+class _AmbiguousInfrastructureRetryDelivery(InMemoryDeliveryControl):
+    def __init__(self):
+        super().__init__(
+            hosted_outcomes=(
+                "pending",
+                "infrastructure_failure",
+                "infrastructure_failure",
+            )
+        )
+        self.retry_dispatch_count = 0
+
+    def retry_hosted_checks(self, repository, candidate_sha) -> None:
+        del repository, candidate_sha
+        self.retry_dispatch_count += 1
+        raise DeliveryControlError(
+            "HOSTED_RETRY_DISPATCH_AMBIGUOUS",
+            "retry command outcome is unknown",
+        )
+
+
 class _ReviewingInMemoryRuntime(InMemoryRuntimeAdapter):
     def materialize_review_axis(
         self,
@@ -426,6 +469,7 @@ class _HostedCodeRepairRuntime(_ReviewingInMemoryRuntime):
         self.resume_count = 0
         self.retirement_count = 0
         self.review_candidates = []
+        self.repair_prompts = []
 
     def materialize(self, admission, prompt=None):
         self.materialization_count += 1
@@ -433,6 +477,7 @@ class _HostedCodeRepairRuntime(_ReviewingInMemoryRuntime):
 
     def repair(self, binding, prompt) -> None:
         self.repair_count += 1
+        self.repair_prompts.append(prompt)
         super().repair(binding, prompt)
         state = self._states[binding.admission_id]
         state.node["inputs"]["file_changes"][0]["content"] = (
@@ -460,6 +505,33 @@ class _HostedCodeRepairRuntime(_ReviewingInMemoryRuntime):
     def retire_after_integration(self, binding, authorization):
         self.retirement_count += 1
         return super().retire_after_integration(binding, authorization)
+
+
+class _PriorRepairHostedCodeFailureRuntime(_HostedCodeRepairRuntime):
+    def __init__(self, workspace_root: Path):
+        super().__init__(workspace_root)
+        self.initial_review_blocker_emitted = False
+
+    def observe_review_axis(self, request, binding):
+        observation = super().observe_review_axis(request, binding)
+        if (
+            request.axis != "standards"
+            or self.initial_review_blocker_emitted
+        ):
+            return observation
+        self.initial_review_blocker_emitted = True
+        return replace(
+            observation,
+            findings=(
+                {
+                    "severity": "hard",
+                    "code": "STD-HOSTED-REPAIR",
+                    "source": "AGENTS.md",
+                    "location": "module-1.txt:1",
+                    "message": "consume the one authorized Repair Round",
+                },
+            ),
+        )
 
 
 class _ReviewMaterializationRecoveryRuntime(_ReviewingInMemoryRuntime):
@@ -1473,6 +1545,272 @@ def test_hosted_infrastructure_failure_retries_same_parked_candidate_only(
     assert state["worker_parked_for_ci"] is True
 
 
+def test_hosted_retry_dispatch_ambiguity_is_durable_and_restart_safe(tmp_path):
+    repository = _temporary_repository(tmp_path)
+    intent, source, _policy = _multi_ready_inputs(count=1)
+    compiled = PlanCompiler().compile(
+        intent,
+        source,
+        _local_first_policy(1),
+    )
+    store_path = tmp_path / "v8.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-4a",
+    )
+    delivery = _AmbiguousInfrastructureRetryDelivery()
+    runtime = _RepairCountingRuntime(tmp_path / "runtime")
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        delivery_control=delivery,
+        runtime_config=_worker_runtime_config(workers=1),
+    )
+
+    parked = kernel.reconcile_once("local/phase-four-a")
+    ambiguous = kernel.reconcile_once("local/phase-four-a")
+    state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        parked.node_key,
+    )
+
+    assert ambiguous.status == "waiting"
+    assert ambiguous.directive == "wait_for_hosted_ci"
+    assert ambiguous.wait_condition == "hosted_ci_retry_ambiguous"
+    assert ambiguous.hosted_retry_count == 1
+    assert state is not None
+    retry_dispatch = state["hosted_retry_dispatch"]
+    assert retry_dispatch["ordinal"] == 1
+    assert retry_dispatch["delivery_state"] == "ambiguous"
+    assert retry_dispatch["error"] == {
+        "code": "HOSTED_RETRY_DISPATCH_AMBIGUOUS"
+    }
+    assert delivery.retry_dispatch_count == 1
+
+    restarted = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        delivery_control=delivery,
+        runtime_config=_worker_runtime_config(workers=1),
+    ).reconcile_once("local/phase-four-a")
+    restarted_state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        parked.node_key,
+    )
+
+    assert restarted.status == "waiting"
+    assert restarted.wait_condition == "hosted_ci_retry_ambiguous"
+    assert restarted.hosted_retry_count == 1
+    assert delivery.retry_dispatch_count == 1
+    assert restarted_state is not None
+    assert restarted_state["hosted_retry_dispatch"] == retry_dispatch
+
+
+@pytest.mark.parametrize("readback", ["lost", "mismatched"])
+def test_hosted_code_failure_requires_exact_parked_binding_without_materializing(
+    tmp_path,
+    readback,
+):
+    repository = _temporary_repository(tmp_path)
+    intent, source, _policy = _multi_ready_inputs(count=1)
+    compiled = PlanCompiler().compile(
+        intent,
+        source,
+        _local_first_policy(1),
+    )
+    store_path = tmp_path / "v8.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-4a",
+    )
+    delivery = InMemoryDeliveryControl(
+        hosted_outcomes=("pending", "code_failure")
+    )
+    runtime = _ParkedBindingReadbackRuntime(tmp_path / "runtime")
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        delivery_control=delivery,
+        runtime_config=_worker_runtime_config(workers=1),
+    )
+
+    parked = kernel.reconcile_once("local/phase-four-a")
+    if readback == "lost":
+        runtime.lose_binding(parked.admission_id)
+    else:
+        runtime.change_binding_identity(parked.admission_id)
+
+    blocked = kernel.reconcile_once("local/phase-four-a")
+
+    assert blocked.status == "blocked"
+    assert blocked.directive == "invoke_coordinator"
+    assert blocked.attempt_state == "runtime_takeover_required"
+    assert blocked.attempt_id == parked.attempt_id
+    assert blocked.admission_id == parked.admission_id
+    assert blocked.hosted_check_state == "code_failure"
+    assert blocked.active_worker_turns == 0
+    assert runtime.materialization_count == 1
+    assert runtime.repair_count == 0
+    assert runtime.retirement_count == 0
+
+
+def test_hosted_code_failure_waits_parked_until_worker_turn_is_available(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    intent, source, _policy = _multi_ready_inputs(count=1)
+    compiled = PlanCompiler().compile(
+        intent,
+        source,
+        _local_first_policy(1),
+    )
+    store_path = tmp_path / "v8.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-4a",
+    )
+    runtime = _CapacityControlledRuntime(tmp_path / "runtime")
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        delivery_control=InMemoryDeliveryControl(
+            hosted_outcomes=("pending", "code_failure")
+        ),
+        runtime_config=_worker_runtime_config(workers=1),
+    )
+
+    parked = kernel.reconcile_once("local/phase-four-a")
+    runtime.worker_turn_capacity = 0
+    waiting = kernel.reconcile_once("local/phase-four-a")
+
+    assert waiting.status == "waiting"
+    assert waiting.directive == "wait_for_capacity"
+    assert waiting.attempt_state == "hosted_code_failure_repair_wait"
+    assert waiting.wait_condition == "worker_capacity"
+    assert waiting.worker_parked_for_ci is True
+    assert waiting.attempt_id == parked.attempt_id
+    assert waiting.active_worker_turns == 0
+    assert runtime.materialization_count == 1
+    assert runtime.repair_count == 0
+
+    runtime.worker_turn_capacity = 1
+    resumed = kernel.reconcile_once("local/phase-four-a")
+
+    assert resumed.attempt_state == "repairing"
+    assert resumed.attempt_id == parked.attempt_id
+    assert resumed.repair_rounds_used == 1
+    assert runtime.materialization_count == 1
+    assert runtime.repair_count == 1
+
+
+def test_hosted_code_failure_restart_keeps_parked_when_claim_is_contended(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    intent, source, _policy = _multi_ready_inputs(count=1)
+    intent["nodes"][0]["resource_claims"] = [
+        "external:test-environment"
+    ]
+    compiled = PlanCompiler().compile(
+        intent,
+        source,
+        _local_first_policy(1),
+    )
+    store_path = tmp_path / "v8.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-4a",
+    )
+    runtime = _RepairCountingRuntime(tmp_path / "runtime")
+    delivery = InMemoryDeliveryControl(
+        hosted_outcomes=("pending", "code_failure")
+    )
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        delivery_control=delivery,
+        runtime_config=_worker_runtime_config(workers=1),
+    )
+
+    parked = kernel.reconcile_once("local/phase-four-a")
+    with sqlite3.connect(store_path) as connection:
+        connection.execute(
+            """
+            UPDATE v8_resource_claims
+            SET attempt_id = 'attempt:contender'
+            WHERE repository = ?
+              AND resource_key = 'external:test-environment'
+            """,
+            ("local/phase-four-a",),
+        )
+
+    restarted = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        delivery_control=delivery,
+        runtime_config=_worker_runtime_config(workers=1),
+    ).reconcile_once("local/phase-four-a")
+
+    assert restarted.status == "waiting"
+    assert restarted.directive == "wait_for_claim"
+    assert restarted.attempt_state == "hosted_code_failure_repair_wait"
+    assert restarted.wait_condition == "resource_claim"
+    assert restarted.worker_parked_for_ci is True
+    assert restarted.attempt_id == parked.attempt_id
+    assert restarted.active_worker_turns == 0
+    assert runtime.materialization_count == 1
+    assert runtime.repair_count == 0
+    with sqlite3.connect(store_path) as connection:
+        assert connection.execute(
+            """
+            SELECT attempt_id FROM v8_resource_claims
+            WHERE repository = ?
+              AND resource_key = 'external:test-environment'
+            """,
+            ("local/phase-four-a",),
+        ).fetchone() == ("attempt:contender",)
+
+
 def test_single_member_hosted_code_failure_repairs_same_attempt_before_republish(
     tmp_path,
 ):
@@ -1494,6 +1832,8 @@ def test_single_member_hosted_code_failure_repairs_same_attempt_before_republish
 
     assert repairing_state is not None
     assert rejected_candidate_sha is not None
+    publication_identity = repairing_state["publication_identity"]
+    assert publication_identity
     assert runtime.repair_count == 1
     assert runtime.retirement_count == 0
     assert repairing_state["attempt_state"] == "repairing"
@@ -1508,7 +1848,10 @@ def test_single_member_hosted_code_failure_repairs_same_attempt_before_republish
     assert repairing_state["candidate_evidence_manifest"] is None
     assert repairing_state["candidate_evidence_manifest_digest"] is None
     assert repairing_state["review_evidence"] is None
-    assert repairing_state["effect_verification"] is None
+    assert (
+        repairing_state["effect_verification"]["subject"]
+        == rejected_candidate_sha
+    )
     assert repairing_state["result_digest"] is None
     assert repairing_state["publication_eligible"] is None
     assert repairing_state["publication_state"] is None
@@ -1525,6 +1868,7 @@ def test_single_member_hosted_code_failure_repairs_same_attempt_before_republish
     )
 
     assert republished_state is not None
+    assert republished_state["publication_identity"] == publication_identity
     assert republished.status == "waiting"
     assert republished.wait_condition == "hosted_ci"
     assert republished.active_worker_turns == 0
@@ -1556,6 +1900,106 @@ def test_single_member_hosted_code_failure_repairs_same_attempt_before_republish
     assert integrated.attempt_id == repair.attempt_id
     assert integrated.attempt_ordinal == 1
     assert runtime.retirement_count == 1
+
+
+def test_hosted_code_failure_repair_packet_is_typed_durable_and_restart_stable(
+    tmp_path,
+):
+    runtime = _HostedCodeRepairRuntime(tmp_path / "runtime")
+    kernel, compiled, _work_node = _review_materialization_kernel(
+        tmp_path,
+        runtime,
+        hosted_outcomes=("code_failure",),
+        repairable=True,
+    )
+
+    repair = kernel.reconcile_once("local/phase-four-a")
+
+    assert repair.attempt_state == "repairing"
+    assert len(runtime.repair_prompts) == 1
+    sent_prompt = runtime.repair_prompts[0]
+    sent_packet = json.loads(sent_prompt.text)["repair_round"]
+    hosted_cause = next(
+        cause
+        for cause in sent_packet["causes"]
+        if cause["type"] == "hosted_ci_code_failure"
+    )
+    assert hosted_cause == {
+        "type": "hosted_ci_code_failure",
+        "check_identity": "Module 1 CI",
+        "definition_digest": hosted_cause["definition_digest"],
+        "source_ref": (
+            f"memory://hosted-checks/{sent_packet['candidate_sha']}"
+        ),
+        "artifact_ref": (
+            f"memory://hosted-checks/{sent_packet['candidate_sha']}"
+        ),
+    }
+    assert len(hosted_cause["definition_digest"]) == 64
+    original_state = kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        repair.node_key,
+    )
+    assert original_state is not None
+    payload_digest = original_state["repair_prompt"]["payload_digest"]
+
+    restarted_kernel = Kernel(
+        store_path=kernel.store_path,
+        publication=kernel.publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=kernel.repository_path,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        delivery_control=kernel.delivery_control,
+        runtime_config=kernel.runtime_config,
+    )
+    restarted_kernel.plan_reconciliation("local/phase-four-a")
+    restarted_state = restarted_kernel._read_state(
+        "local/phase-four-a",
+        compiled.digest,
+        repair.node_key,
+    )
+
+    assert restarted_state is not None
+    assert restarted_state["repair_prompt"]["payload"] == sent_packet
+    assert restarted_state["repair_prompt"]["prompt_digest"] == sent_prompt.digest
+    assert restarted_state["repair_prompt"]["payload_digest"] == payload_digest
+
+
+def test_hosted_code_failure_never_escalates_after_repair_round_is_used(
+    tmp_path,
+):
+    runtime = _PriorRepairHostedCodeFailureRuntime(tmp_path / "runtime")
+    kernel, _compiled, _work_node = _review_materialization_kernel(
+        tmp_path,
+        runtime,
+        hosted_outcomes=("code_failure",),
+        repairable=True,
+    )
+
+    repair = kernel.reconcile_once("local/phase-four-a")
+
+    assert repair.attempt_state == "repairing"
+    assert repair.repair_rounds_used == 1
+    assert runtime.repair_count == 1
+    assert runtime.materialization_count == 1
+
+    blocked = kernel.reconcile_once("local/phase-four-a")
+
+    assert blocked.status == "blocked"
+    assert blocked.directive == "invoke_coordinator"
+    assert blocked.attempt_state == "hosted_code_failure_repair_blocked"
+    assert blocked.admission_id == repair.admission_id
+    assert blocked.attempt_id == repair.attempt_id
+    assert blocked.attempt_ordinal == 1
+    assert blocked.repair_rounds_used == 1
+    assert blocked.hosted_check_state == "code_failure"
+    assert blocked.active_worker_turns == 0
+    assert runtime.materialization_count == 1
+    assert runtime.repair_count == 1
+    assert runtime.retirement_count == 0
 
 
 def test_batch_hosted_failure_stops_without_blind_worker_repair(tmp_path):
@@ -1772,6 +2216,108 @@ def test_explicit_non_shareable_resource_hard_excludes_second_admission(tmp_path
 
     assert len(outcome.admitted_node_keys) == 1
     assert outcome.active_worker_turns == 1
+
+
+def test_parked_attempt_releases_turn_but_retains_external_exclusive_claim(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    intent, source, _policy = _multi_ready_inputs(count=2)
+    for node in intent["nodes"]:
+        node["resource_claims"] = ["external:test-environment"]
+    compiled = PlanCompiler().compile(
+        intent,
+        source,
+        _local_first_policy(2),
+    )
+    store_path = tmp_path / "v8.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-4a",
+    )
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=InMemoryRuntimeAdapter(tmp_path / "runtime"),
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        delivery_control=InMemoryDeliveryControl(
+            hosted_outcomes=("pending", "pending")
+        ),
+        runtime_config=_worker_runtime_config(workers=2),
+    )
+
+    parked = kernel.reconcile_once("local/phase-four-a")
+    still_parked = kernel.reconcile_once("local/phase-four-a")
+
+    assert len(parked.admitted_node_keys) == 1
+    assert still_parked.admitted_node_keys == ()
+    assert still_parked.active_worker_turns == 0
+    assert len(still_parked.node_outcomes) == 1
+    assert still_parked.node_outcomes[0].wait_condition == "hosted_ci"
+    assert still_parked.node_outcomes[0].worker_parked_for_ci is True
+
+
+def test_retirement_completion_releases_retained_claim_and_verifies_attempt(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    intent, source, _policy = _multi_ready_inputs(count=1)
+    intent["nodes"][0]["resource_claims"] = [
+        "external:test-environment"
+    ]
+    compiled = PlanCompiler().compile(
+        intent,
+        source,
+        _local_first_policy(1),
+    )
+    store_path = tmp_path / "v8.sqlite3"
+    publication = LocalPlanPublication(store_path)
+    publication.publish_and_activate(
+        compiled,
+        expected_active_digest=None,
+        writer_generation="phase-4a",
+    )
+    runtime = _RepairCountingRuntime(tmp_path / "runtime")
+    kernel = Kernel(
+        store_path=store_path,
+        publication=publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=repository,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        delivery_control=InMemoryDeliveryControl(
+            hosted_outcomes=("passed",)
+        ),
+        runtime_config=_worker_runtime_config(workers=1),
+    )
+
+    completed = kernel.reconcile_once("local/phase-four-a")
+
+    assert completed.status == "complete"
+    assert completed.retirement_state == "complete"
+    assert runtime.retirement_count == 1
+    with sqlite3.connect(store_path) as connection:
+        assert connection.execute(
+            """
+            SELECT state FROM v8_attempts
+            WHERE attempt_id = ?
+            """,
+            (completed.attempt_id,),
+        ).fetchone() == ("verified",)
+        assert connection.execute(
+            """
+            SELECT COUNT(*) FROM v8_resource_claims
+            WHERE repository = ?
+              AND resource_key = 'external:test-environment'
+            """,
+            ("local/phase-four-a",),
+        ).fetchone() == (0,)
 
 
 def test_one_batch_performs_only_one_target_branch_mutation(

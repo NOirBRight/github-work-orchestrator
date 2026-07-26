@@ -2314,6 +2314,7 @@ class _AmbiguousPublicationDelivery(InMemoryDeliveryControl):
         evidence_manifest_digest,
         *,
         target_branch=None,
+        publication_identity=None,
     ):
         self.publish_attempts += 1
         if self.publish_attempts == 1:
@@ -2326,6 +2327,7 @@ class _AmbiguousPublicationDelivery(InMemoryDeliveryControl):
             candidate_sha,
             evidence_manifest_digest,
             target_branch=target_branch,
+            publication_identity=publication_identity,
         )
 
 
@@ -2440,7 +2442,15 @@ class _FakeGitHubDelivery(GitHubCliDeliveryControl):
             command[:4] == ["gh", "api", "--method", "POST"]
             and command[4].endswith("/pulls")
         ):
-            if self.pull_requests:
+            fields = {
+                item.split("=", 1)[0]: item.split("=", 1)[1]
+                for item in command
+                if "=" in item
+            }
+            if any(
+                pull_request["head"]["ref"] == fields["head"]
+                for pull_request in self.pull_requests
+            ):
                 returncode = 1
                 stderr = "a pull request for this Candidate already exists"
             else:
@@ -2449,15 +2459,13 @@ class _FakeGitHubDelivery(GitHubCliDeliveryControl):
                     returncode == 0
                     or self.pull_request_visible_after_failed_create
                 ):
-                    fields = {
-                        item.split("=", 1)[0]: item.split("=", 1)[1]
-                        for item in command
-                        if "=" in item
-                    }
                     pull_request = {
                         "state": "open",
                         "merged_at": None,
-                        "html_url": "https://github.invalid/pull/1",
+                        "html_url": (
+                            "https://github.invalid/pull/"
+                            f"{len(self.pull_requests) + 1}"
+                        ),
                         "head": {
                             "ref": fields["head"],
                             "sha": self.candidate_sha,
@@ -2505,6 +2513,89 @@ class _FakeGitHubDelivery(GitHubCliDeliveryControl):
             stdout,
             locals().get("stderr", ""),
         )
+
+
+class _MutableFakeGitHubDelivery(_FakeGitHubDelivery):
+    def __init__(self, repository_path: Path):
+        super().__init__(repository_path, "0" * 40)
+        self.remote_branches = {}
+        self.pushes = []
+        self.push_commands = []
+
+    def _command(self, command):
+        if command[:2] == ["git", "ls-remote"]:
+            branch = command[-1].removeprefix("refs/heads/")
+            candidate_sha = self.remote_branches.get(branch)
+            return subprocess.CompletedProcess(
+                command,
+                2 if candidate_sha is None else 0,
+                (
+                    ""
+                    if candidate_sha is None
+                    else f"{candidate_sha}\trefs/heads/{branch}\n"
+                ),
+                "",
+            )
+        if command[:2] == ["git", "push"]:
+            candidate_sha, ref = command[-1].split(":", 1)
+            branch = ref.removeprefix("refs/heads/")
+            self.candidate_sha = candidate_sha
+            self.published = True
+            self.remote_branches[branch] = candidate_sha
+            self.pushes.append((branch, candidate_sha))
+            self.push_commands.append(command)
+            for pull_request in self.pull_requests:
+                if pull_request["head"]["ref"] == branch:
+                    pull_request["head"]["sha"] = candidate_sha
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return super()._command(command)
+
+
+def test_github_delivery_updates_one_stable_branch_and_pull_request_for_repair(
+    tmp_path,
+):
+    repository = _temporary_repository(tmp_path)
+    (repository / "candidate.txt").write_text("first\n", encoding="utf-8")
+    _git(repository, "add", "candidate.txt")
+    _git(repository, "commit", "-m", "first candidate")
+    first_sha = _git(repository, "rev-parse", "HEAD")
+    (repository / "candidate.txt").write_text("repaired\n", encoding="utf-8")
+    _git(repository, "commit", "--amend", "-am", "repaired candidate")
+    repaired_sha = _git(repository, "rev-parse", "HEAD")
+    delivery = _MutableFakeGitHubDelivery(repository)
+
+    first = delivery.publish_once(
+        "owner/repository",
+        first_sha,
+        "e" * 64,
+        target_branch="dev",
+        publication_identity="work:issue-84",
+    )
+    repaired = delivery.publish_once(
+        "owner/repository",
+        repaired_sha,
+        "f" * 64,
+        target_branch="dev",
+        publication_identity="work:issue-84",
+    )
+
+    assert first.candidate_sha != repaired.candidate_sha
+    assert first.publication_identity == repaired.publication_identity
+    assert first.publication_branch == repaired.publication_branch
+    assert first.source_ref == repaired.source_ref
+    assert delivery.pushes == [
+        (first.publication_branch, first_sha),
+        (first.publication_branch, repaired_sha),
+    ]
+    assert delivery.push_commands[1][-2] == (
+        "--force-with-lease="
+        f"refs/heads/{first.publication_branch}:{first_sha}"
+    )
+    assert len(delivery.pull_requests) == 1
+    assert delivery.pull_requests[0]["head"] == {
+        "ref": first.publication_branch,
+        "sha": repaired_sha,
+    }
 
 
 def test_github_delivery_retries_eventually_consistent_publication_readback(
@@ -3021,6 +3112,18 @@ def test_github_delivery_classifies_exact_job_failure(tmp_path):
     )
 
     assert hosted.status == "code_failure"
+    assert hosted.diagnostics == (
+        {
+            "check_identity": "GWO CI / acceptance",
+            "definition_digest": "d" * 64,
+            "source_ref": (
+                "https://github.invalid/actions/runs/53/job/1"
+            ),
+            "artifact_ref": (
+                "https://github.invalid/actions/runs/53/job/1"
+            ),
+        },
+    )
 
 
 def test_kernel_reuses_store_persisted_checks_after_adapter_restart(tmp_path):

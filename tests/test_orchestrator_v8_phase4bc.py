@@ -627,7 +627,27 @@ def test_fresh_store_atomically_reconstructs_native_kernel_state(tmp_path):
             WHERE resource_key = 'module:1'
             """
         ).fetchone()
+        parked_state = next(
+            state
+            for state in (
+                json.loads(row[0])
+                for row in connection.execute(
+                    "SELECT state_json FROM v8_node_execution_state"
+                )
+            )
+            if state["attempt_id"] == "attempt:1"
+        )
+        parked_attempt_state = connection.execute(
+            """
+            SELECT state FROM v8_attempts
+            WHERE attempt_id = 'attempt:1'
+            """
+        ).fetchone()[0]
         assert claim_owner == (None, "attempt:1")
+        assert parked_state["wait_condition"] == "hosted_ci"
+        assert parked_state["publication_state"] == "published"
+        assert parked_state["worker_parked_for_ci"] is True
+        assert parked_attempt_state == "running"
         assert connection.execute(
             """
             SELECT COUNT(*) FROM sqlite_master

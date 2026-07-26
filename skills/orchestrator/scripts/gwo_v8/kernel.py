@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
-from typing import Any, Protocol
+from typing import Any, Iterable, Protocol
 from urllib.parse import quote
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value
@@ -61,6 +61,8 @@ from .runtime import (
 REPAIR_PACKET_MAX_BYTES = 64 * 1024
 REPAIR_CHANGED_FILES_MAX_BYTES = 4 * 1024
 REPAIR_CHANGED_FILE_MAX_CHARACTERS = 256
+HOSTED_DIAGNOSTIC_MAX_COUNT = 32
+HOSTED_DIAGNOSTIC_MAX_CHARACTERS = 2_048
 
 
 class KernelError(RuntimeError):
@@ -83,6 +85,8 @@ class CandidatePublication:
     candidate_sha: str
     evidence_manifest_digest: str
     source_ref: str
+    publication_identity: str | None = None
+    publication_branch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,7 @@ class HostedCheckReadback:
     status: str
     source_ref: str
     definition_digests: tuple[str, ...] = ()
+    diagnostics: tuple[dict[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,6 +110,8 @@ class DeliveryControl(Protocol):
         self,
         repository: str,
         candidate_sha: str,
+        *,
+        publication_identity: str | None = None,
     ) -> CandidatePublication | None: ...
 
     def publish_once(
@@ -114,6 +121,7 @@ class DeliveryControl(Protocol):
         evidence_manifest_digest: str,
         *,
         target_branch: str | None = None,
+        publication_identity: str | None = None,
     ) -> CandidatePublication: ...
 
     def read_hosted_checks(
@@ -167,8 +175,17 @@ class InMemoryDeliveryControl:
         self,
         repository: str,
         candidate_sha: str,
+        *,
+        publication_identity: str | None = None,
     ) -> CandidatePublication | None:
-        return self._publications.get((repository, candidate_sha))
+        publication = self._publications.get((repository, candidate_sha))
+        if (
+            publication is not None
+            and publication_identity is not None
+            and publication.publication_identity != publication_identity
+        ):
+            return None
+        return publication
 
     def publish_once(
         self,
@@ -177,9 +194,14 @@ class InMemoryDeliveryControl:
         evidence_manifest_digest: str,
         *,
         target_branch: str | None = None,
+        publication_identity: str | None = None,
     ) -> CandidatePublication:
         del target_branch
-        existing = self.read_publication(repository, candidate_sha)
+        existing = self.read_publication(
+            repository,
+            candidate_sha,
+            publication_identity=publication_identity,
+        )
         if existing is not None:
             if existing.evidence_manifest_digest != evidence_manifest_digest:
                 raise DeliveryControlError(
@@ -192,7 +214,20 @@ class InMemoryDeliveryControl:
             repository=repository,
             candidate_sha=candidate_sha,
             evidence_manifest_digest=evidence_manifest_digest,
-            source_ref=f"memory://publication/{candidate_sha}",
+            source_ref=(
+                f"memory://publication/{candidate_sha}"
+                if publication_identity is None
+                else f"memory://publication/{publication_identity}"
+            ),
+            publication_identity=publication_identity,
+            publication_branch=(
+                None
+                if publication_identity is None
+                else GitHubCliDeliveryControl._branch(
+                    candidate_sha,
+                    publication_identity,
+                )
+            ),
         )
         self._publications[(repository, candidate_sha)] = publication
         self._last_publication = publication
@@ -213,13 +248,28 @@ class InMemoryDeliveryControl:
         self.hosted_read_candidates.append(candidate_sha)
         if self._hosted_outcomes:
             self._last_hosted_outcome = self._hosted_outcomes.pop(0)
+        source_ref = f"memory://hosted-checks/{candidate_sha}"
+        diagnostics = (
+            tuple(
+                {
+                    "check_identity": str(check["hosted_name"]),
+                    "definition_digest": str(check["definition_digest"]),
+                    "source_ref": source_ref,
+                    "artifact_ref": source_ref,
+                }
+                for check in required_checks
+            )
+            if self._last_hosted_outcome == "code_failure"
+            else ()
+        )
         return HostedCheckReadback(
             candidate_sha=candidate_sha,
             status=self._last_hosted_outcome,
-            source_ref=f"memory://hosted-checks/{candidate_sha}",
+            source_ref=source_ref,
             definition_digests=tuple(
                 sorted(str(check["definition_digest"]) for check in required_checks)
             ),
+            diagnostics=diagnostics,
         )
 
     def retry_hosted_checks(
@@ -295,8 +345,16 @@ class GitHubCliDeliveryControl:
         time.sleep(1)
 
     @staticmethod
-    def _branch(candidate_sha: str) -> str:
-        return f"gwo/candidates/{candidate_sha}"
+    def _branch(
+        candidate_sha: str,
+        publication_identity: str | None = None,
+    ) -> str:
+        if publication_identity is None:
+            return f"gwo/candidates/{candidate_sha}"
+        identity_digest = digest_value(
+            {"publication_identity": publication_identity}
+        )
+        return f"gwo/deliveries/{identity_digest[:24]}"
 
     def _evidence_status(
         self,
@@ -362,8 +420,9 @@ class GitHubCliDeliveryControl:
         repository: str,
         candidate_sha: str,
         target_branch: str,
+        publication_identity: str | None = None,
     ) -> str | None:
-        branch = self._branch(candidate_sha)
+        branch = self._branch(candidate_sha, publication_identity)
         owner = repository.split("/", 1)[0]
         command = [
             self.executable,
@@ -409,7 +468,13 @@ class GitHubCliDeliveryControl:
             for item, identity in identified
             if identity is not None
             and identity[0] == branch
-            and identity != (branch, candidate_sha, target_branch)
+            and (
+                identity[2] != target_branch
+                or (
+                    publication_identity is None
+                    and identity[1] != candidate_sha
+                )
+            )
         ]
         if conflicting:
             raise DeliveryControlError(
@@ -451,15 +516,17 @@ class GitHubCliDeliveryControl:
         repository: str,
         candidate_sha: str,
         target_branch: str,
+        publication_identity: str | None = None,
     ) -> str:
         existing = self._read_candidate_pull_request(
             repository,
             candidate_sha,
             target_branch,
+            publication_identity,
         )
         if existing is not None:
             return existing
-        branch = self._branch(candidate_sha)
+        branch = self._branch(candidate_sha, publication_identity)
         result = self._command(
             [
                 self.executable,
@@ -485,6 +552,7 @@ class GitHubCliDeliveryControl:
                 repository,
                 candidate_sha,
                 target_branch,
+                publication_identity,
             )
         except DeliveryControlError as error:
             if error.code != "PULL_REQUEST_READBACK_AMBIGUOUS":
@@ -511,8 +579,9 @@ class GitHubCliDeliveryControl:
         self,
         repository: str,
         candidate_sha: str,
-    ) -> tuple[CandidatePublication | None, str | None, bool]:
-        branch = self._branch(candidate_sha)
+        publication_identity: str | None = None,
+    ) -> tuple[CandidatePublication | None, str | None, str | None]:
+        branch = self._branch(candidate_sha, publication_identity)
         result = self._command(
             [
                 "git",
@@ -523,7 +592,7 @@ class GitHubCliDeliveryControl:
             ]
         )
         if result.returncode == 2:
-            return None, None, False
+            return None, None, None
         if result.returncode != 0:
             raise DeliveryControlError(
                 "PUBLICATION_READBACK_FAILED",
@@ -533,13 +602,15 @@ class GitHubCliDeliveryControl:
             )
         remote_sha = result.stdout.strip().split(maxsplit=1)[0]
         if remote_sha != candidate_sha:
+            if publication_identity is not None:
+                return None, None, remote_sha
             raise DeliveryControlError(
                 "PUBLICATION_IDENTITY_CONFLICT",
                 "remote Candidate branch does not point at the exact SHA",
             )
         evidence = self._evidence_status(repository, candidate_sha)
         if evidence is None:
-            return None, None, True
+            return None, None, remote_sha
         return (
             CandidatePublication(
                 repository=repository,
@@ -549,20 +620,25 @@ class GitHubCliDeliveryControl:
                     f"https://github.com/{repository}/tree/"
                     f"{quote(branch, safe='/')}"
                 ),
+                publication_identity=publication_identity,
+                publication_branch=branch,
             ),
             evidence[1],
-            True,
+            remote_sha,
         )
 
     def read_publication(
         self,
         repository: str,
         candidate_sha: str,
+        *,
+        publication_identity: str | None = None,
     ) -> CandidatePublication | None:
-        publication, _evidence_state, _branch_exists = (
+        publication, _evidence_state, _remote_sha = (
             self._read_publication_status(
                 repository,
                 candidate_sha,
+                publication_identity,
             )
         )
         return publication
@@ -574,10 +650,12 @@ class GitHubCliDeliveryControl:
         evidence_manifest_digest: str,
         *,
         target_branch: str | None = None,
+        publication_identity: str | None = None,
     ) -> CandidatePublication:
-        existing, evidence_state, branch_exists = self._read_publication_status(
+        existing, evidence_state, remote_sha = self._read_publication_status(
             repository,
             candidate_sha,
+            publication_identity,
         )
         if existing is not None:
             if existing.evidence_manifest_digest != evidence_manifest_digest:
@@ -585,16 +663,21 @@ class GitHubCliDeliveryControl:
                     "PUBLICATION_EVIDENCE_CONFLICT",
                     "published Candidate has another Evidence Manifest",
                 )
-        elif not branch_exists:
-            branch = self._branch(candidate_sha)
-            self._checked(
-                [
-                    "git",
-                    "push",
-                    self.remote,
-                    f"{candidate_sha}:refs/heads/{branch}",
-                ]
-            )
+        elif remote_sha != candidate_sha:
+            branch = self._branch(candidate_sha, publication_identity)
+            command = ["git", "push", self.remote]
+            if remote_sha is not None:
+                if publication_identity is None:
+                    raise DeliveryControlError(
+                        "PUBLICATION_IDENTITY_CONFLICT",
+                        "exact-SHA Candidate branch changed identity",
+                    )
+                command.append(
+                    "--force-with-lease="
+                    f"refs/heads/{branch}:{remote_sha}"
+                )
+            command.append(f"{candidate_sha}:refs/heads/{branch}")
+            self._checked(command)
         if existing is None or evidence_state != "success":
             self._checked(
                 [
@@ -618,14 +701,16 @@ class GitHubCliDeliveryControl:
                 repository,
                 candidate_sha,
                 target_branch,
+                publication_identity,
             )
         )
         receipt = None
         for attempt in range(5):
-            receipt, current_evidence_state, _branch_exists = (
+            receipt, current_evidence_state, _remote_sha = (
                 self._read_publication_status(
                     repository,
                     candidate_sha,
+                    publication_identity,
                 )
             )
             if (
@@ -838,11 +923,47 @@ class GitHubCliDeliveryControl:
         urls = [str(run.get("url")) for run in runs if run.get("url")]
         if urls:
             source_ref = urls[0]
+        diagnostics = ()
+        if status == "code_failure":
+            captured = []
+            failed_runs = [
+                run
+                for run in runs
+                if str(run.get("conclusion") or "") in candidate_failures
+            ]
+            for run in failed_runs[:HOSTED_DIAGNOSTIC_MAX_COUNT]:
+                run_name = str(run.get("name") or "")
+                workflow_name = str(run.get("workflowName") or "")
+                identity = (
+                    run_name
+                    if run_name in expected
+                    else workflow_name
+                    if workflow_name in expected
+                    else ""
+                )
+                if not identity:
+                    continue
+                run_source = str(run.get("url") or source_ref)
+                definition_digest = expected.get(identity)
+                if definition_digest is None:
+                    definition_digest = digest_value(
+                        {"hosted_name": identity}
+                    )
+                captured.append(
+                    {
+                        "check_identity": identity,
+                        "definition_digest": definition_digest,
+                        "source_ref": run_source,
+                        "artifact_ref": run_source,
+                    }
+                )
+            diagnostics = tuple(captured)
         return HostedCheckReadback(
             candidate_sha,
             status,
             source_ref,
             definition_digests,
+            diagnostics,
         )
 
     def retry_hosted_checks(
@@ -1135,6 +1256,7 @@ class ReconcileOutcome:
     hosted_retry_count: int = 0
     integration_batch_id: str | None = None
     integration_batch_sha: str | None = None
+    worker_parked_for_ci: bool = False
     retirement_state: str | None = None
     last_retirement_error: dict[str, str] | None = None
     admitted_node_keys: tuple[str, ...] = field(default=(), compare=False)
@@ -2449,16 +2571,45 @@ class Kernel:
                 rendered=self._render_state(state),
             )
 
-    def _release_attempt_claims(self, state: dict[str, Any]) -> None:
+    def _park_attempt_for_delivery(self, state: dict[str, Any]) -> None:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
+                UPDATE v8_node_states SET state = 'verified'
+                WHERE repository = ? AND plan_digest = ? AND node_key = ?
+                """,
+                (
+                    state["repository"],
+                    state["plan_digest"],
+                    state["node_key"],
+                ),
+            )
+            self._upsert_state(
+                connection,
+                repository=state["repository"],
+                plan_digest=state["plan_digest"],
+                rendered=self._render_state(state),
+            )
+
+    def _complete_attempt_after_retirement(
+        self,
+        state: dict[str, Any],
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
                 UPDATE v8_attempts SET state = 'verified'
-                WHERE attempt_id = ? AND state = 'running'
+                WHERE attempt_id = ? AND state IN ('running', 'verified')
                 """,
                 (state["attempt_id"],),
             )
+            if updated.rowcount != 1:
+                raise KernelError(
+                    "RETIRED_ATTEMPT_STATE_INVALID",
+                    "retirement completed without one retained live Attempt",
+                )
             connection.execute(
                 """
                 DELETE FROM v8_resource_claims
@@ -2639,6 +2790,7 @@ class Kernel:
             "integration_refresh",
             "integration_turn",
             "runtime_available",
+            "resource_claim",
             "worker_capacity",
         }:
             return False
@@ -2821,6 +2973,11 @@ class Kernel:
         for node_key in sorted(projected):
             state = projected[node_key]
             if state.get("wait_condition") != "worker_capacity":
+                continue
+            if (
+                state.get("attempt_state")
+                == "hosted_code_failure_repair_wait"
+            ):
                 continue
             other_turns = sum(
                 cls._state_holds_worker_turn(other)
@@ -3121,6 +3278,8 @@ class Kernel:
             "candidate_sha": None,
             "result_digest": None,
             "publication_eligible": None,
+            "publication_identity": None,
+            "publication_branch": None,
             "publication_state": None,
             "publication_ref": None,
             "hosted_check_state": None,
@@ -4434,6 +4593,30 @@ class Kernel:
                     "exit_code": int(payload.get("exit_code") or 0),
                 }
             )
+        if cause_type == "hosted_ci_code_failure":
+            diagnostics = state.get("hosted_failure_diagnostics")
+            if not isinstance(diagnostics, list) or not diagnostics:
+                raise KernelError(
+                    "HOSTED_FAILURE_DIAGNOSTICS_MISSING",
+                    "hosted code failure has no durable exact-check diagnostics",
+                )
+            for diagnostic in diagnostics:
+                if not isinstance(diagnostic, dict):
+                    raise KernelError(
+                        "HOSTED_FAILURE_DIAGNOSTICS_INVALID",
+                        "durable hosted code failure diagnostic is invalid",
+                    )
+                causes.append(
+                    {
+                        "type": cause_type,
+                        "check_identity": str(diagnostic["check_identity"]),
+                        "definition_digest": str(
+                            diagnostic["definition_digest"]
+                        ),
+                        "source_ref": str(diagnostic["source_ref"]),
+                        "artifact_ref": str(diagnostic["artifact_ref"]),
+                    }
+                )
         if cause_type == "effect_contract_violation" or not causes:
             causes.append(
                 {
@@ -4446,7 +4629,6 @@ class Kernel:
     @staticmethod
     def _invalidate_candidate_delivery(state: dict[str, Any]) -> None:
         ReviewConvergence.invalidate_candidate(state)
-        state.update(EffectContractVerifier.initial_fields())
         state.update(
             {
                 "candidate_sha": None,
@@ -4474,7 +4656,14 @@ class Kernel:
             }
         )
 
-    def _reactivate_parked_attempt(self, state: dict[str, Any]) -> None:
+    def _reserve_parked_repair_turn(
+        self,
+        state: dict[str, Any],
+        work_node: dict[str, Any],
+        *,
+        worker_turn_capacity: int,
+    ) -> bool:
+        claims = sorted(set(work_node.get("resource_claims") or ()))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
@@ -4496,6 +4685,77 @@ class Kernel:
                     "PARKED_ATTEMPT_NOT_REPAIRABLE",
                     "hosted code failure has no recoverable parked Attempt",
                 )
+            other_turns = self._other_active_worker_turns(
+                connection,
+                repository=state["repository"],
+                plan_digest=state["plan_digest"],
+                node_key=state["node_key"],
+            )
+            blocked_claim = None
+            missing_claims = []
+            for claim in claims:
+                occupied = connection.execute(
+                    """
+                    SELECT admission_id, attempt_id
+                    FROM v8_resource_claims
+                    WHERE repository = ? AND resource_key = ?
+                    """,
+                    (state["repository"], claim),
+                ).fetchone()
+                if occupied is None:
+                    missing_claims.append(claim)
+                elif occupied["attempt_id"] != state["attempt_id"]:
+                    blocked_claim = claim
+                    break
+            if other_turns >= worker_turn_capacity or blocked_claim is not None:
+                wait_condition = (
+                    "worker_capacity"
+                    if other_turns >= worker_turn_capacity
+                    else "resource_claim"
+                )
+                state.update(
+                    {
+                        "status": "waiting",
+                        "directive": (
+                            "wait_for_capacity"
+                            if wait_condition == "worker_capacity"
+                            else "wait_for_claim"
+                        ),
+                        "attempt_state": "hosted_code_failure_repair_wait",
+                        "wait_condition": wait_condition,
+                        "wait_source_ref": (
+                            f"capacity://{state['repository']}/workers"
+                            if wait_condition == "worker_capacity"
+                            else f"claim://{state['repository']}/{blocked_claim}"
+                        ),
+                        "wait_event_identity": (
+                            f"worker-capacity:{state['attempt_id']}"
+                            if wait_condition == "worker_capacity"
+                            else f"resource-claim:{blocked_claim}"
+                        ),
+                        "next_check_at": None,
+                    }
+                )
+                self._upsert_state(
+                    connection,
+                    repository=state["repository"],
+                    plan_digest=state["plan_digest"],
+                    rendered=self._render_state(state),
+                )
+                return False
+            for claim in missing_claims:
+                connection.execute(
+                    """
+                    INSERT INTO v8_resource_claims (
+                        repository, resource_key, admission_id, attempt_id
+                    ) VALUES (?, ?, NULL, ?)
+                    """,
+                    (
+                        state["repository"],
+                        claim,
+                        state["attempt_id"],
+                    ),
+                )
             connection.execute(
                 """
                 UPDATE v8_attempts SET state = 'running'
@@ -4514,6 +4774,101 @@ class Kernel:
                     state["node_key"],
                 ),
             )
+            state.update(
+                {
+                    "status": "waiting",
+                    "directive": "reconcile_again",
+                    "attempt_state": "recovery_reserved",
+                    "recovery_reserved_at": _now(),
+                    "wait_condition": "recovery_dispatch",
+                    "wait_source_ref": (
+                        f"store://recovery-dispatch/{state['attempt_id']}"
+                    ),
+                    "wait_event_identity": (
+                        f"recovery-dispatch:{state['attempt_id']}"
+                    ),
+                    "next_check_at": None,
+                }
+            )
+            self._upsert_state(
+                connection,
+                repository=state["repository"],
+                plan_digest=state["plan_digest"],
+                rendered=self._render_state(state),
+            )
+            return True
+
+    def _read_exact_parked_binding(
+        self,
+        state: dict[str, Any],
+    ) -> RuntimeBinding | None:
+        candidate_observation = state.get("candidate_observation")
+        binding_value = (
+            candidate_observation.get("binding")
+            if isinstance(candidate_observation, dict)
+            else None
+        )
+        if not isinstance(binding_value, dict):
+            return None
+        try:
+            expected = RuntimeBinding(**binding_value)
+            profile_key = (
+                "runtime_profile"
+                if int(state.get("attempt_ordinal", 1)) == 1
+                else "frontier_runtime_profile"
+            )
+            digest_key = (
+                "profile_digest"
+                if profile_key == "runtime_profile"
+                else "frontier_profile_digest"
+            )
+            profile = self._profile_from_frozen_state(
+                state,
+                profile_key=profile_key,
+                digest_key=digest_key,
+            )
+            admission = RuntimeAdmission(
+                repository=state["repository"],
+                plan_digest=state["plan_digest"],
+                node_key=state["node_key"],
+                admission_id=state["admission_id"],
+                repository_path=self.repository_path,
+                base_sha=state["base_sha"],
+                runtime_profile=profile,
+                parent_agent_id=self.parent_agent_id,
+            )
+            observed = self.runtime.read_binding(
+                admission,
+                self._prompt_from_state(state),
+            )
+        except (KernelError, RuntimeAdapterError, TypeError):
+            return None
+        return observed if observed == expected else None
+
+    def _block_parked_runtime_takeover(
+        self,
+        state: dict[str, Any],
+    ) -> None:
+        state.update(
+            {
+                "status": "blocked",
+                "directive": "invoke_coordinator",
+                "attempt_state": "runtime_takeover_required",
+                "last_runtime_error": {
+                    "code": "PARKED_RUNTIME_BINDING_READBACK_FAILED",
+                    "failure_class": "ambiguous",
+                },
+                "wait_condition": None,
+                "wait_source_ref": None,
+                "wait_event_identity": None,
+                "next_check_at": None,
+            }
+        )
+        self._write_state(
+            state["repository"],
+            state["plan_digest"],
+            state,
+        )
 
     def _handle_semantic_rejection(
         self,
@@ -4526,6 +4881,7 @@ class Kernel:
         terminal_reason: str,
         findings: tuple[str, ...],
         cause_type: str = "candidate_rejection",
+        allow_frontier_attempt: bool = True,
     ) -> ReconcileOutcome:
         self.publication.assert_writer(
             repository=state["repository"],
@@ -4581,6 +4937,7 @@ class Kernel:
                 "round": repair_round,
                 "action_key": repair_action_key,
                 "prompt_digest": prompt.digest,
+                "payload": json.loads(packet),
                 "payload_digest": digest_value(json.loads(packet)),
                 "delivery_state": "reserved",
             }
@@ -4680,6 +5037,27 @@ class Kernel:
                     "next_check_at": (
                         datetime.now(timezone.utc) + timedelta(seconds=30)
                     ).isoformat(),
+                }
+            )
+            self._write_state(
+                state["repository"],
+                state["plan_digest"],
+                state,
+            )
+            return self._outcome(state)
+        if (
+            directive.action != "repair_same_attempt"
+            and not allow_frontier_attempt
+        ):
+            state.update(
+                {
+                    "status": "blocked",
+                    "directive": "invoke_coordinator",
+                    "attempt_state": "hosted_code_failure_repair_blocked",
+                    "wait_condition": None,
+                    "wait_source_ref": None,
+                    "wait_event_identity": None,
+                    "next_check_at": None,
                 }
             )
             self._write_state(
@@ -4924,6 +5302,92 @@ class Kernel:
             for hosted_name, checks in sorted(by_name.items())
         )
 
+    @staticmethod
+    def _batch_publication_identity(
+        plan_digest: str,
+        member_node_keys: Iterable[str],
+    ) -> str:
+        return (
+            "publication:"
+            + digest_value(
+                {
+                    "plan_digest": plan_digest,
+                    "member_node_keys": sorted(member_node_keys),
+                }
+            )
+        )
+
+    @staticmethod
+    def _bounded_hosted_failure_diagnostics(
+        hosted: HostedCheckReadback,
+        hosted_definitions: tuple[dict[str, Any], ...],
+    ) -> list[dict[str, str]]:
+        expected = {
+            str(definition["hosted_name"]): str(
+                definition["definition_digest"]
+            )
+            for definition in hosted_definitions
+        }
+        if (
+            not hosted.diagnostics
+            or len(hosted.diagnostics) > HOSTED_DIAGNOSTIC_MAX_COUNT
+        ):
+            raise KernelError(
+                "HOSTED_FAILURE_DIAGNOSTICS_INVALID",
+                "hosted code failure omitted bounded exact-check diagnostics",
+            )
+        normalized: list[dict[str, str]] = []
+        seen: set[str] = set()
+        required_keys = {
+            "check_identity",
+            "definition_digest",
+            "source_ref",
+            "artifact_ref",
+        }
+        for diagnostic in hosted.diagnostics:
+            if not isinstance(diagnostic, dict) or set(diagnostic) != required_keys:
+                raise KernelError(
+                    "HOSTED_FAILURE_DIAGNOSTICS_INVALID",
+                    "hosted code failure diagnostic has an invalid shape",
+                )
+            values = {key: diagnostic.get(key) for key in required_keys}
+            if any(
+                not isinstance(value, str)
+                or not value
+                or len(value) > HOSTED_DIAGNOSTIC_MAX_CHARACTERS
+                for value in values.values()
+            ):
+                raise KernelError(
+                    "HOSTED_FAILURE_DIAGNOSTICS_INVALID",
+                    "hosted code failure diagnostic exceeds its bounded policy",
+                )
+            identity = str(values["check_identity"])
+            if (
+                identity in seen
+                or expected.get(identity) != values["definition_digest"]
+            ):
+                raise KernelError(
+                    "HOSTED_FAILURE_DIAGNOSTICS_INVALID",
+                    "hosted code failure diagnostic changed exact Check identity",
+                )
+            seen.add(identity)
+            normalized.append(
+                {
+                    "check_identity": identity,
+                    "definition_digest": str(values["definition_digest"]),
+                    "source_ref": str(values["source_ref"]),
+                    "artifact_ref": str(values["artifact_ref"]),
+                }
+            )
+        return sorted(
+            normalized,
+            key=lambda diagnostic: (
+                diagnostic["check_identity"],
+                diagnostic["source_ref"],
+                diagnostic["artifact_ref"],
+            ),
+        )
+
     def _write_batch_members(
         self,
         repository: str,
@@ -5069,7 +5533,7 @@ class Kernel:
                 candidate_sha=str(state["candidate_sha"]),
                 result_digest=str(state["result_digest"]),
             )
-            self._write_state(repository, plan_digest, state)
+            self._complete_attempt_after_retirement(state)
 
         reconciled = self._read_states(repository, plan_digest)
         goal_keys = {
@@ -5101,6 +5565,7 @@ class Kernel:
             ],
             ...,
         ],
+        worker_turn_capacity: int,
     ) -> None:
         all_states = {
             str(state["node_key"]): state
@@ -5109,7 +5574,8 @@ class Kernel:
         in_flight_ids = {
             str(state["integration_batch_id"])
             for state in all_states.values()
-            if state.get("attempt_state") == "batch_wait"
+            if state.get("attempt_state")
+            in {"batch_wait", "hosted_code_failure_repair_wait"}
             and isinstance(state.get("integration_batch_id"), str)
         }
         if len(in_flight_ids) > 1:
@@ -5144,6 +5610,16 @@ class Kernel:
                     "Integration Batch member state is absent",
                 )
             hosted_definitions = tuple(batch_state["hosted_definitions"])
+            publication_identity = str(
+                batch_state.get("publication_identity")
+                or self._batch_publication_identity(
+                    active.plan_digest,
+                    member_node_keys,
+                )
+            )
+            batch_state["publication_identity"] = publication_identity
+            for state in member_states.values():
+                state["publication_identity"] = publication_identity
         else:
             ready = {
                 node_key: state
@@ -5211,6 +5687,25 @@ class Kernel:
                 units,
                 member_node_keys,
             )
+            retained_publication_identities = {
+                str(state["publication_identity"])
+                for state in ready.values()
+                if isinstance(state.get("publication_identity"), str)
+                and state["publication_identity"]
+            }
+            if len(retained_publication_identities) > 1:
+                raise KernelError(
+                    "PUBLICATION_IDENTITY_CONFLICT",
+                    "Integration Batch members retain different delivery identities",
+                )
+            publication_identity = (
+                next(iter(retained_publication_identities))
+                if retained_publication_identities
+                else self._batch_publication_identity(
+                    active.plan_digest,
+                    member_node_keys,
+                )
+            )
             batch_state = {
                 "repository": repository,
                 "plan_digest": active.plan_digest,
@@ -5227,6 +5722,8 @@ class Kernel:
                     member.evidence_manifest_digest for member in batch.members
                 ],
                 "hosted_definitions": list(hosted_definitions),
+                "publication_identity": publication_identity,
+                "publication_branch": None,
                 "state": "prepared",
                 "publication_state": None,
                 "publication_ref": None,
@@ -5254,6 +5751,7 @@ class Kernel:
                         ).isoformat(),
                         "integration_batch_id": batch_id,
                         "integration_batch_sha": batch.batch_sha,
+                        "publication_identity": publication_identity,
                     }
                 )
             self._write_batch_members(
@@ -5319,10 +5817,12 @@ class Kernel:
                     batch_sha,
                     manifest_digest,
                     target_branch=self.integration_branch,
+                    publication_identity=publication_identity,
                 )
                 if (
                     receipt.candidate_sha != batch_sha
                     or receipt.evidence_manifest_digest != manifest_digest
+                    or receipt.publication_identity != publication_identity
                 ):
                     raise DeliveryControlError(
                         "PUBLICATION_READBACK_FAILED",
@@ -5389,6 +5889,7 @@ class Kernel:
                     "state": "published",
                     "publication_state": "published",
                     "publication_ref": publication_ref,
+                    "publication_branch": receipt.publication_branch,
                     "evidence_manifest_digest": manifest_digest,
                 }
             )
@@ -5397,6 +5898,7 @@ class Kernel:
                     {
                         "publication_state": "published",
                         "publication_ref": publication_ref,
+                        "publication_branch": receipt.publication_branch,
                         "worker_parked_for_ci": bool(hosted_definitions),
                     }
                 )
@@ -5460,6 +5962,35 @@ class Kernel:
                     "hosted Check readback changed Batch identity or definitions",
                 )
             batch_state["hosted_check_state"] = hosted.status
+            if hosted.status == "code_failure":
+                observed_diagnostics = self._bounded_hosted_failure_diagnostics(
+                    hosted,
+                    hosted_definitions,
+                )
+                saved_diagnostics = batch_state.get(
+                    "hosted_failure_diagnostics"
+                )
+                if isinstance(saved_diagnostics, list) and saved_diagnostics:
+                    diagnostics = self._bounded_hosted_failure_diagnostics(
+                        replace(
+                            hosted,
+                            diagnostics=tuple(saved_diagnostics),
+                        ),
+                        hosted_definitions,
+                    )
+                    if diagnostics != observed_diagnostics:
+                        raise KernelError(
+                            "HOSTED_FAILURE_DIAGNOSTICS_CHANGED",
+                            (
+                                "exact-SHA hosted failure diagnostics changed "
+                                "after durable capture"
+                            ),
+                        )
+                else:
+                    diagnostics = observed_diagnostics
+                batch_state["hosted_failure_diagnostics"] = diagnostics
+                for state in member_states.values():
+                    state["hosted_failure_diagnostics"] = diagnostics
             if hosted.status == "pending":
                 for state in member_states.values():
                     state.update(
@@ -5520,21 +6051,35 @@ class Kernel:
                 return
             if hosted.status == "infrastructure_failure":
                 retries = int(batch_state.get("hosted_retry_count", 0))
-                if retries < 2:
-                    self.delivery_control.retry_hosted_checks(
-                        repository,
-                        batch_sha,
-                    )
-                    batch_state["hosted_retry_count"] = retries + 1
+                prior_dispatch = batch_state.get("hosted_retry_dispatch")
+                if (
+                    isinstance(prior_dispatch, dict)
+                    and prior_dispatch.get("delivery_state")
+                    in {"reserved", "ambiguous"}
+                    and prior_dispatch.get("ordinal") == retries
+                ):
+                    if prior_dispatch.get("delivery_state") == "reserved":
+                        prior_dispatch["delivery_state"] = "ambiguous"
+                        prior_dispatch["error"] = {
+                            "code": (
+                                "HOSTED_RETRY_DISPATCH_READBACK_REQUIRED"
+                            )
+                        }
+                        batch_state["hosted_retry_dispatch"] = prior_dispatch
                     batch_state["state"] = "waiting"
                     for state in member_states.values():
                         state.update(
                             {
                                 "status": "waiting",
                                 "directive": "wait_for_hosted_ci",
-                                "wait_condition": "hosted_ci",
+                                "attempt_state": "batch_wait",
+                                "wait_condition": (
+                                    "hosted_ci_retry_ambiguous"
+                                ),
                                 "wait_source_ref": hosted.source_ref,
-                                "wait_event_identity": f"hosted-ci:{batch_sha}",
+                                "wait_event_identity": str(
+                                    prior_dispatch["action_key"]
+                                ),
                                 "next_check_at": (
                                     datetime.now(timezone.utc)
                                     + timedelta(seconds=30)
@@ -5542,7 +6087,112 @@ class Kernel:
                                 "hosted_check_state": (
                                     "infrastructure_failure"
                                 ),
-                                "hosted_retry_count": retries + 1,
+                                "hosted_retry_count": retries,
+                                "hosted_retry_dispatch": prior_dispatch,
+                            }
+                        )
+                    self._write_integration_batch(
+                        repository,
+                        active.plan_digest,
+                        batch_id,
+                        batch_state,
+                    )
+                    self._write_batch_members(
+                        repository,
+                        active.plan_digest,
+                        member_states,
+                    )
+                    return
+                if retries < 2:
+                    retry_ordinal = retries + 1
+                    retry_action_key = (
+                        f"hosted-retry:{batch_id}:{batch_sha}:"
+                        f"{retry_ordinal}"
+                    )
+                    retry_dispatch: dict[str, Any] = {
+                        "ordinal": retry_ordinal,
+                        "action_key": retry_action_key,
+                        "delivery_state": "reserved",
+                    }
+                    batch_state["hosted_retry_count"] = retry_ordinal
+                    batch_state["hosted_retry_dispatch"] = retry_dispatch
+                    batch_state["state"] = "waiting"
+                    for state in member_states.values():
+                        state.update(
+                            {
+                                "status": "waiting",
+                                "directive": "reconcile_again",
+                                "attempt_state": "batch_wait",
+                                "wait_condition": "hosted_ci_retry_dispatch",
+                                "wait_source_ref": hosted.source_ref,
+                                "wait_event_identity": retry_action_key,
+                                "next_check_at": (
+                                    datetime.now(timezone.utc)
+                                    + timedelta(seconds=30)
+                                ).isoformat(),
+                                "hosted_check_state": (
+                                    "infrastructure_failure"
+                                ),
+                                "hosted_retry_count": retry_ordinal,
+                                "hosted_retry_dispatch": retry_dispatch,
+                            }
+                        )
+                    self._write_integration_batch(
+                        repository,
+                        active.plan_digest,
+                        batch_id,
+                        batch_state,
+                    )
+                    self._write_batch_members(
+                        repository,
+                        active.plan_digest,
+                        member_states,
+                    )
+                    try:
+                        self.delivery_control.retry_hosted_checks(
+                            repository,
+                            batch_sha,
+                        )
+                    except DeliveryControlError as error:
+                        retry_dispatch["delivery_state"] = "ambiguous"
+                        retry_dispatch["error"] = {"code": error.code}
+                        batch_state["hosted_retry_dispatch"] = retry_dispatch
+                        for state in member_states.values():
+                            state.update(
+                                {
+                                    "directive": "wait_for_hosted_ci",
+                                    "wait_condition": (
+                                        "hosted_ci_retry_ambiguous"
+                                    ),
+                                    "hosted_retry_dispatch": retry_dispatch,
+                                    "last_delivery_error": {
+                                        "code": error.code,
+                                    },
+                                }
+                            )
+                        self._write_integration_batch(
+                            repository,
+                            active.plan_digest,
+                            batch_id,
+                            batch_state,
+                        )
+                        self._write_batch_members(
+                            repository,
+                            active.plan_digest,
+                            member_states,
+                        )
+                        return
+                    retry_dispatch["delivery_state"] = "accepted"
+                    batch_state["hosted_retry_dispatch"] = retry_dispatch
+                    for state in member_states.values():
+                        state.update(
+                            {
+                                "directive": "wait_for_hosted_ci",
+                                "wait_condition": "hosted_ci",
+                                "wait_event_identity": (
+                                    f"hosted-ci:{batch_sha}"
+                                ),
+                                "hosted_retry_dispatch": retry_dispatch,
                             }
                         )
                     self._write_integration_batch(
@@ -5582,15 +6232,20 @@ class Kernel:
                     active.plan_digest,
                     member_states,
                 )
-                binding, terminal = self._adopt_or_materialize(
+                binding = self._read_exact_parked_binding(state)
+                if binding is None:
+                    self._block_parked_runtime_takeover(state)
+                    return
+                recovery_policy = work_node.get("recovery_policy") or {}
+                repair_available = int(
+                    state.get("repair_rounds_used", 0)
+                ) < int(recovery_policy.get("repair_rounds", 0))
+                if repair_available and not self._reserve_parked_repair_turn(
                     state,
                     work_node,
-                )
-                if terminal is not None:
+                    worker_turn_capacity=worker_turn_capacity,
+                ):
                     return
-                assert binding is not None
-                binding = self._begin_or_adopt_attempt(state, binding)
-                self._reactivate_parked_attempt(state)
                 self._handle_semantic_rejection(
                     state,
                     work_node,
@@ -5603,6 +6258,7 @@ class Kernel:
                         f"Integration Batch {batch_id}",
                     ),
                     cause_type="hosted_ci_code_failure",
+                    allow_frontier_attempt=False,
                 )
                 return
             if hosted.status != "passed":
@@ -5893,6 +6549,7 @@ class Kernel:
         if state is not None and state.get("attempt_state") in {
             "batch_ready",
             "batch_wait",
+            "hosted_code_failure_repair_wait",
             "retirement_pending",
         }:
             return self._outcome(state)
@@ -6313,7 +6970,7 @@ class Kernel:
                 ).isoformat(),
             }
         )
-        self._release_attempt_claims(state)
+        self._park_attempt_for_delivery(state)
         self.runtime.interrupt(binding)
         self._write_state(repository, active.plan_digest, state)
         return self._outcome(state)
@@ -6448,6 +7105,7 @@ class Kernel:
             repository,
             active=active,
             units=units,
+            worker_turn_capacity=worker_capacity,
         )
         self._reconcile_retirements(
             repository,
