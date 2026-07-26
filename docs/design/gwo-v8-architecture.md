@@ -706,7 +706,13 @@ authoritative command runs only once. The Runtime Adapter may observe local
 checks directly; otherwise the Coordinator or Kernel runs the command. A local
 result becomes final Check Evidence only when its exact candidate, definition,
 environment, input projection, outcome, observer, and log digest or reference
-can be proven.
+can be proven. A non-zero exit of an affected or repository Check is recorded
+as a typed recoverable condition, never as a direct terminal outcome: the
+failed Check Evidence carries bounded, secret-redacted stdout/stderr excerpts
+(passing checks keep digest-only provenance), and the same Attempt receives
+the one bounded Repair Round with those excerpts in its Repair Packet before
+the Recovery Ladder may exhaust into a Failed Plan Node. Repair targets the
+exact failed Check from Evidence; no suite is rerun only to obtain logs.
 
 Each valid Review axis is stored locally as soon as it finishes, so recovery
 can retain it for the same Candidate. Compact successful Check and Review

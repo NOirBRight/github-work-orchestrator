@@ -27,6 +27,7 @@ from .evidence import (
     ResultClaim,
     TypedEvidence,
     blocking_review_findings,
+    check_diagnostics_valid,
 )
 from .integration_batch import (
     GitIntegrationBatchAssembler,
@@ -3275,6 +3276,7 @@ class Kernel:
             "attempt_ordinal": 1,
             "repair_rounds_used": 0,
             "attempt_terminal_reason": None,
+            "recoverable_condition": None,
             "candidate_sha": None,
             "result_digest": None,
             "publication_eligible": None,
@@ -4536,6 +4538,57 @@ class Kernel:
             ) from error
 
     @staticmethod
+    def _local_check_failures(
+        state: dict[str, Any],
+        work_node: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Failed local Checks of the current Candidate as typed conditions.
+
+        Each entry carries the exact Check identity, its suite, the failing
+        exit code, the durable source reference, and — when the Runtime
+        Adapter captured them — bounded, secret-redacted diagnostics so a
+        Repair Round can target the failure cause without rerunning the
+        full suite.
+        """
+        definitions = {
+            str(definition.get("check_id")): definition
+            for definition in (work_node.get("output_contract") or {}).get("checks")
+            or ()
+            if isinstance(definition, dict)
+            and definition.get("hosted_only") is not True
+            and definition.get("check_id")
+        }
+        candidate_observation = state.get("candidate_observation")
+        failures: list[dict[str, Any]] = []
+        for evidence in (
+            candidate_observation.get("evidence") or ()
+            if isinstance(candidate_observation, dict)
+            else ()
+        ):
+            if (
+                not isinstance(evidence, dict)
+                or evidence.get("kind") != "check"
+                or (evidence.get("payload") or {}).get("outcome") != "failed"
+            ):
+                continue
+            payload = evidence.get("payload") or {}
+            check_id = str(payload.get("check_id") or "")
+            definition = definitions.get(check_id)
+            if definition is None:
+                continue
+            failure: dict[str, Any] = {
+                "check_id": check_id,
+                "suite": str(definition.get("suite") or "local"),
+                "source_ref": str(evidence.get("source_ref") or ""),
+                "exit_code": int(payload.get("exit_code") or 0),
+            }
+            diagnostics = payload.get("diagnostics")
+            if check_diagnostics_valid(diagnostics):
+                failure["diagnostics"] = dict(diagnostics)
+            failures.append(failure)
+        return failures
+
+    @staticmethod
     def _repair_causes(
         state: dict[str, Any],
         work_node: dict[str, Any],
@@ -4559,40 +4612,19 @@ class Kernel:
                     }
                 )
 
-        definitions = {
-            str(definition.get("check_id")): definition
-            for definition in (work_node.get("output_contract") or {}).get("checks")
-            or ()
-            if isinstance(definition, dict)
-            and definition.get("hosted_only") is not True
-            and definition.get("check_id")
-        }
-        candidate_observation = state.get("candidate_observation")
-        for evidence in (
-            candidate_observation.get("evidence") or ()
-            if isinstance(candidate_observation, dict)
-            else ()
-        ):
-            if (
-                not isinstance(evidence, dict)
-                or evidence.get("kind") != "check"
-                or (evidence.get("payload") or {}).get("outcome") != "failed"
-            ):
-                continue
-            payload = evidence.get("payload") or {}
-            check_id = str(payload.get("check_id") or "")
-            definition = definitions.get(check_id)
-            if definition is None:
-                continue
-            causes.append(
-                {
-                    "type": "local_check_failure",
-                    "check_id": check_id,
-                    "suite": str(definition.get("suite") or "local"),
-                    "source_ref": str(evidence.get("source_ref") or ""),
-                    "exit_code": int(payload.get("exit_code") or 0),
-                }
-            )
+        for failure in Kernel._local_check_failures(state, work_node):
+            cause: dict[str, Any] = {
+                "type": "local_check_failure",
+                "check_id": failure["check_id"],
+                "suite": failure["suite"],
+                "source_ref": failure["source_ref"],
+                "exit_code": failure["exit_code"],
+            }
+            diagnostics = failure.get("diagnostics")
+            if diagnostics is not None:
+                cause["stdout_tail"] = diagnostics["stdout_tail"]
+                cause["stderr_tail"] = diagnostics["stderr_tail"]
+            causes.append(cause)
         if cause_type == "hosted_ci_code_failure":
             diagnostics = state.get("hosted_failure_diagnostics")
             if not isinstance(diagnostics, list) or not diagnostics:
@@ -5130,9 +5162,29 @@ class Kernel:
             activation_id=state["activation_id"],
         )
         policy = work_node.get("recovery_policy") or {}
+        local_check_failures = self._local_check_failures(state, work_node)
+        # A failed Candidate affected Check or Batch repository Check is a
+        # typed recoverable condition, never a direct terminal outcome: it is
+        # recorded durably and always receives the one bounded Repair Round
+        # before the Recovery Ladder may exhaust into a Failed Plan Node.
+        state["recoverable_condition"] = (
+            {
+                "type": "local_check_failure",
+                "cause_type": cause_type,
+                "attempt_id": state.get("attempt_id"),
+                "candidate_sha": state.get("candidate_sha"),
+                "checks": local_check_failures,
+                "recorded_at": _now(),
+            }
+            if local_check_failures
+            else None
+        )
         ladder = RecoveryLadder(
             semantic_attempts=int(policy.get("semantic_attempts", 1)),
-            repair_rounds=int(policy.get("repair_rounds", 0)),
+            repair_rounds=max(
+                int(policy.get("repair_rounds", 0)),
+                1 if local_check_failures else 0,
+            ),
         )
         attempt_ordinal = int(state.get("attempt_ordinal", 1))
         repair_rounds_used = int(state.get("repair_rounds_used", 0))
@@ -7106,6 +7158,8 @@ class Kernel:
             )
         state["result_digest"] = decision.result.result_digest
         state["publication_eligible"] = True
+        # Local acceptance resolves any open recoverable Check condition.
+        state["recoverable_condition"] = None
         effect_evidence = effect_decision.verification
         manifest_evidence = [
             {

@@ -25,7 +25,7 @@ from ._effects import (
     authorized_file_changes,
     normalized_relative_path,
 )
-from .evidence import ResultClaim, TypedEvidence
+from .evidence import ResultClaim, TypedEvidence, bounded_check_diagnostics
 
 if TYPE_CHECKING:
     from .retirement import (
@@ -3614,6 +3614,16 @@ class PaseoRuntimeAdapter:
                         "log_digest": digest_bytes(
                             (f"{result.stdout}\n{result.stderr}").encode("utf-8")
                         ),
+                        **(
+                            {
+                                "diagnostics": bounded_check_diagnostics(
+                                    result.stdout,
+                                    result.stderr,
+                                )
+                            }
+                            if result.returncode != 0
+                            else {}
+                        ),
                     },
                 )
             )
@@ -5153,6 +5163,16 @@ class InMemoryRuntimeAdapter:
                             else {}
                         ),
                         "log_digest": hashlib.sha256(log).hexdigest(),
+                        **(
+                            {
+                                "diagnostics": bounded_check_diagnostics(
+                                    result.stdout,
+                                    result.stderr,
+                                )
+                            }
+                            if result.returncode != 0
+                            else {}
+                        ),
                     },
                 )
             )

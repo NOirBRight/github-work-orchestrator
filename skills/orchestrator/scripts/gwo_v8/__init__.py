@@ -32,6 +32,9 @@ from .evidence import (
     TypedEvidence,
     VerificationDecision,
     VerifiedResult,
+    bounded_check_diagnostics,
+    check_diagnostics_valid,
+    redact_secrets,
 )
 from .goal_driver import (
     CoordinatorRuntime,
@@ -269,4 +272,7 @@ __all__ = [
     "Reconciler",
     "VerificationDecision",
     "VerifiedResult",
+    "bounded_check_diagnostics",
+    "check_diagnostics_valid",
+    "redact_secrets",
 ]

@@ -16,6 +16,74 @@ if TYPE_CHECKING:
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST64 = re.compile(r"^[0-9a-f]{64}$")
 
+CHECK_DIAGNOSTIC_MAX_STREAM_CHARACTERS = 2_048
+_CHECK_DIAGNOSTIC_TRUNCATION_PREFIX = "…[truncated]\n"
+_REDACTED = "[redacted]"
+
+# Secrets policy for local Check diagnostics: excerpts are redacted before
+# they enter durable Evidence, so a failing check cannot leak credentials
+# into the Store, Repair Packets, or Prompts.
+_SECRET_VALUE_PATTERNS = (
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{16,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{16,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(
+        r"(?i)\b(api[_-]?key|token|secret|password|passwd|authorization)"
+        r"(\s*[:=]\s*|\s+)(\S+)"
+    ),
+)
+
+
+def redact_secrets(text: str) -> str:
+    redacted = str(text)
+    for pattern in _SECRET_VALUE_PATTERNS:
+        if pattern.groups >= 3:
+            redacted = pattern.sub(
+                lambda match: match.group(1) + match.group(2) + _REDACTED,
+                redacted,
+            )
+        else:
+            redacted = pattern.sub(_REDACTED, redacted)
+    return redacted
+
+
+def _diagnostic_excerpt(output: str) -> str:
+    redacted = redact_secrets(output)
+    if len(redacted) <= CHECK_DIAGNOSTIC_MAX_STREAM_CHARACTERS:
+        return redacted
+    return _CHECK_DIAGNOSTIC_TRUNCATION_PREFIX + redacted[
+        -CHECK_DIAGNOSTIC_MAX_STREAM_CHARACTERS:
+    ]
+
+
+def bounded_check_diagnostics(stdout: str, stderr: str) -> dict[str, str]:
+    """Bounded, redacted stdout/stderr excerpts of one failed local Check.
+
+    Captured only for non-zero exits so a Repair Round can target the exact
+    failure cause without rerunning the full suite. Passing checks keep
+    digest-only provenance.
+    """
+    return {
+        "stdout_tail": _diagnostic_excerpt(stdout),
+        "stderr_tail": _diagnostic_excerpt(stderr),
+    }
+
+
+def check_diagnostics_valid(diagnostics: Any) -> bool:
+    if not isinstance(diagnostics, dict) or set(diagnostics) != {
+        "stdout_tail",
+        "stderr_tail",
+    }:
+        return False
+    bound = CHECK_DIAGNOSTIC_MAX_STREAM_CHARACTERS + len(
+        _CHECK_DIAGNOSTIC_TRUNCATION_PREFIX
+    )
+    return all(
+        isinstance(value, str) and len(value) <= bound
+        for value in diagnostics.values()
+    )
+
 
 def _required_review_axes(requirement: dict[str, Any]) -> list[str] | None:
     axes = requirement.get("axes")
@@ -295,6 +363,11 @@ class EvidenceVerifier:
             definition = definitions.get(check_id)
             if definition is None:
                 findings.append("check Evidence has no compiled definition")
+                continue
+            if "diagnostics" in evidence.payload and not check_diagnostics_valid(
+                evidence.payload["diagnostics"]
+            ):
+                findings.append(f"check:{check_id} diagnostics are invalid")
                 continue
             if evidence.payload.get("outcome") != "passed":
                 check_source = (
