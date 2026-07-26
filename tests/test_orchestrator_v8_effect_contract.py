@@ -332,6 +332,7 @@ class _AdoptionMustNotRun:
 def _write_tamper(path: str, content: str, *, only_execution: int | None = None):
     def tamper(workspace: Path, ordinal: int) -> None:
         if only_execution is not None and ordinal != only_execution:
+            (workspace / path).unlink(missing_ok=True)
             return
         target = workspace / path
         target.parent.mkdir(parents=True, exist_ok=True)
