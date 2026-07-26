@@ -3678,7 +3678,7 @@ class _RepairCapturePaseoClient(InMemoryPaseoClient):
         self.repair_prompts = []
 
     def send_prompt(self, agent_id, prompt, *, action_key):
-        if ":repair:" in action_key:
+        if action_key.startswith("repair:"):
             self.repair_prompts.append((agent_id, prompt, action_key))
         return super().send_prompt(
             agent_id,

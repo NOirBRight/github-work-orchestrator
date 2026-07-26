@@ -1257,7 +1257,21 @@ class RuntimeAdapter(Protocol):
         observation: RuntimeObservation,
     ) -> RuntimeObservation: ...
 
-    def repair(self, binding: RuntimeBinding, prompt: RuntimePrompt) -> None: ...
+    def read_repair_prompt(
+        self,
+        binding: RuntimeBinding,
+        prompt: RuntimePrompt,
+        *,
+        action_key: str,
+    ) -> str: ...
+
+    def repair(
+        self,
+        binding: RuntimeBinding,
+        prompt: RuntimePrompt,
+        *,
+        action_key: str,
+    ) -> None: ...
 
     def interrupt(self, binding: RuntimeBinding) -> None: ...
 
@@ -3870,17 +3884,65 @@ class PaseoRuntimeAdapter:
             )
         return runtime_observation
 
-    def repair(self, binding: RuntimeBinding, prompt: RuntimePrompt) -> None:
+    @staticmethod
+    def _assert_repair_action_key(
+        binding: RuntimeBinding,
+        prompt: RuntimePrompt,
+        action_key: str,
+    ) -> None:
+        if (
+            binding.attempt_id is None
+            or not action_key.startswith(
+                f"repair:{binding.attempt_id}:"
+            )
+            or not action_key.endswith(f":{prompt.digest}")
+        ):
+            raise RuntimeAdapterError(
+                "REPAIR_ACTION_KEY_INVALID",
+                "Repair Prompt readback changed its stable Attempt identity",
+            )
+
+    def read_repair_prompt(
+        self,
+        binding: RuntimeBinding,
+        prompt: RuntimePrompt,
+        *,
+        action_key: str,
+    ) -> str:
+        if binding.agent_id is None:
+            raise RuntimeAdapterError(
+                "REPAIR_BINDING_INVALID",
+                "Repair Prompt readback requires one Agent identity",
+            )
+        self._assert_repair_action_key(binding, prompt, action_key)
+        count = self.client.prompt_acceptance_count(
+            binding.agent_id,
+            prompt,
+        )
+        if count == 0:
+            return "not_accepted"
+        if count == 1:
+            return "accepted"
+        return "ambiguous"
+
+    def repair(
+        self,
+        binding: RuntimeBinding,
+        prompt: RuntimePrompt,
+        *,
+        action_key: str,
+    ) -> None:
         if binding.agent_id is None or binding.attempt_id is None:
             raise RuntimeAdapterError(
                 "REPAIR_BINDING_INVALID",
                 "Repair requires one Prompt-bound Attempt identity",
             )
+        self._assert_repair_action_key(binding, prompt, action_key)
         prior_output = self.client.read_output(binding.agent_id)
         self.client.send_prompt(
             binding.agent_id,
             prompt,
-            action_key=f"{binding.attempt_id}:repair:{prompt.digest}",
+            action_key=action_key,
         )
         if binding.prompt_digest is not None:
             self.client.update_labels(
@@ -4740,6 +4802,10 @@ class InMemoryRuntimeAdapter:
             else _default_runtime_capabilities()
         )
         self._states: dict[str, _RuntimeState] = {}
+        self._accepted_repair_prompts: dict[
+            tuple[str, str],
+            str,
+        ] = {}
 
     def normalize_profile(self, profile: RuntimeProfile) -> RuntimeProfile:
         """Validate and normalize provider/model/reasoning/mode for the fake."""
@@ -4931,11 +4997,39 @@ class InMemoryRuntimeAdapter:
         self._state_for(binding)
         return observation
 
-    def repair(self, binding: RuntimeBinding, prompt: RuntimePrompt) -> None:
+    def read_repair_prompt(
+        self,
+        binding: RuntimeBinding,
+        prompt: RuntimePrompt,
+        *,
+        action_key: str,
+    ) -> str:
+        self._state_for(binding)
+        accepted_digest = self._accepted_repair_prompts.get(
+            (binding.admission_id, action_key)
+        )
+        if accepted_digest is None:
+            return "not_accepted"
+        return (
+            "accepted"
+            if accepted_digest == prompt.digest
+            else "ambiguous"
+        )
+
+    def repair(
+        self,
+        binding: RuntimeBinding,
+        prompt: RuntimePrompt,
+        *,
+        action_key: str,
+    ) -> None:
         state = self._state_for(binding)
         state.prompt = prompt
         state.result_claim = None
         state.evidence = ()
+        self._accepted_repair_prompts[
+            (binding.admission_id, action_key)
+        ] = prompt.digest
 
     def interrupt(self, binding: RuntimeBinding) -> None:
         self._state_for(binding)

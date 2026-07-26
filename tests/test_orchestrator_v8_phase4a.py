@@ -340,9 +340,13 @@ class _RepairCountingRuntime(InMemoryRuntimeAdapter):
         self.materialization_count += 1
         return super().materialize(admission, prompt)
 
-    def repair(self, binding, prompt) -> None:
+    def repair(self, binding, prompt, *, action_key) -> None:
         self.repair_count += 1
-        super().repair(binding, prompt)
+        super().repair(
+            binding,
+            prompt,
+            action_key=action_key,
+        )
 
     def resume(self, binding) -> None:
         self.resume_count += 1
@@ -475,10 +479,14 @@ class _HostedCodeRepairRuntime(_ReviewingInMemoryRuntime):
         self.materialization_count += 1
         return super().materialize(admission, prompt)
 
-    def repair(self, binding, prompt) -> None:
+    def repair(self, binding, prompt, *, action_key) -> None:
         self.repair_count += 1
         self.repair_prompts.append(prompt)
-        super().repair(binding, prompt)
+        super().repair(
+            binding,
+            prompt,
+            action_key=action_key,
+        )
         state = self._states[binding.admission_id]
         state.node["inputs"]["file_changes"][0]["content"] = (
             "module 1\nhosted repair\n"
@@ -532,6 +540,46 @@ class _PriorRepairHostedCodeFailureRuntime(_HostedCodeRepairRuntime):
                 },
             ),
         )
+
+
+class _InjectedRepairDispatchCrash(BaseException):
+    pass
+
+
+class _RepairDispatchCrashRuntime(_HostedCodeRepairRuntime):
+    def __init__(self, workspace_root: Path, *, readback: str):
+        super().__init__(workspace_root)
+        self.readback = readback
+        self.crash_before_effect = True
+        self.crashed_binding = None
+        self.crashed_prompt = None
+        self.crashed_action_key = None
+        self.readback_prompts = []
+        self.readback_action_keys = []
+
+    def repair(self, binding, prompt, *, action_key=None) -> None:
+        if self.crash_before_effect:
+            self.crash_before_effect = False
+            self.crashed_binding = binding
+            self.crashed_prompt = prompt
+            self.crashed_action_key = action_key
+            raise _InjectedRepairDispatchCrash()
+        return super().repair(
+            binding,
+            prompt,
+            action_key=action_key,
+        )
+
+    def read_repair_prompt(self, binding, prompt, *, action_key):
+        if self.crashed_binding is not None:
+            assert binding == self.crashed_binding
+        self.readback_prompts.append(prompt)
+        self.readback_action_keys.append(action_key)
+        if self.crash_before_effect:
+            return "not_accepted"
+        if self.readback == "not_accepted" and self.repair_count:
+            return "accepted"
+        return self.readback
 
 
 class _ReviewMaterializationRecoveryRuntime(_ReviewingInMemoryRuntime):
@@ -1809,6 +1857,84 @@ def test_hosted_code_failure_restart_keeps_parked_when_claim_is_contended(
             """,
             ("local/phase-four-a",),
         ).fetchone() == ("attempt:contender",)
+
+
+@pytest.mark.parametrize(
+    ("readback", "expected_attempt_state", "expected_repair_count"),
+    [
+        ("not_accepted", "repairing", 1),
+        ("accepted", "repairing", 0),
+        ("ambiguous", "repair_delivery_ambiguous", 0),
+    ],
+)
+def test_reserved_repair_prompt_converges_from_exact_runtime_readback(
+    tmp_path,
+    readback,
+    expected_attempt_state,
+    expected_repair_count,
+):
+    runtime = _RepairDispatchCrashRuntime(
+        tmp_path / "runtime",
+        readback=readback,
+    )
+    kernel, _compiled, _work_node = _review_materialization_kernel(
+        tmp_path,
+        runtime,
+        hosted_outcomes=("code_failure",),
+        repairable=True,
+    )
+    delivery = kernel.delivery_control
+    assert isinstance(delivery, InMemoryDeliveryControl)
+
+    with pytest.raises(_InjectedRepairDispatchCrash):
+        kernel.reconcile_once("local/phase-four-a")
+
+    rejected_candidate_sha = delivery.published_candidate_sha
+    assert rejected_candidate_sha is not None
+    assert runtime.repair_count == 0
+    assert runtime.crashed_binding is not None
+    assert runtime.crashed_prompt is not None
+
+    restarted = Kernel(
+        store_path=kernel.store_path,
+        publication=kernel.publication,
+        runtime=runtime,
+        verifier=EvidenceVerifier(),
+        repository_path=kernel.repository_path,
+        integration_branch="main",
+        writer_generation="phase-4a",
+        delivery_control=delivery,
+        runtime_config=kernel.runtime_config,
+    ).reconcile_once("local/phase-four-a")
+
+    assert restarted.attempt_state == expected_attempt_state
+    assert restarted.attempt_id == runtime.crashed_binding.attempt_id
+    assert restarted.admission_id == runtime.crashed_binding.admission_id
+    assert restarted.active_worker_turns == 1
+    assert runtime.materialization_count == 1
+    assert runtime.repair_count == expected_repair_count
+    assert runtime.crashed_action_key is not None
+    assert runtime.readback_action_keys
+    assert set(runtime.readback_action_keys) == {
+        runtime.crashed_action_key
+    }
+    assert {
+        prompt.digest for prompt in runtime.readback_prompts
+    } == {runtime.crashed_prompt.digest}
+    assert {
+        prompt.text for prompt in runtime.readback_prompts
+    } == {runtime.crashed_prompt.text}
+    assert delivery.publication_count == 1
+    assert delivery.hosted_read_candidates == [rejected_candidate_sha]
+    if readback == "ambiguous":
+        assert restarted.status == "waiting"
+        assert restarted.directive == "wait_for_runtime"
+        assert restarted.wait_condition == "repair_prompt_readback"
+        assert restarted.candidate_sha == rejected_candidate_sha
+    else:
+        assert restarted.wait_condition == "runtime_result"
+        assert restarted.candidate_sha is None
+        assert restarted.repair_rounds_used == 1
 
 
 def test_single_member_hosted_code_failure_repairs_same_attempt_before_republish(

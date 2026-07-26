@@ -4870,6 +4870,246 @@ class Kernel:
             state,
         )
 
+    def _repair_prompt_from_record(
+        self,
+        state: dict[str, Any],
+        work_node: dict[str, Any],
+    ) -> tuple[dict[str, Any], RuntimePrompt]:
+        record = state.get("repair_prompt")
+        if not isinstance(record, dict):
+            raise KernelError(
+                "REPAIR_PROMPT_RECORD_MISSING",
+                "repair delivery has no durable Prompt record",
+            )
+        payload = record.get("payload")
+        if (
+            not isinstance(payload, dict)
+            or digest_value(payload) != record.get("payload_digest")
+        ):
+            raise KernelError(
+                "REPAIR_PROMPT_PAYLOAD_INVALID",
+                "durable Repair Packet changed after reservation",
+            )
+        packet = canonical_bytes(payload).decode("utf-8")
+        prompt = self._recovery_prompt(
+            work_node,
+            packet,
+            same_attempt=True,
+        )
+        repair_round = record.get("round")
+        if (
+            not isinstance(repair_round, int)
+            or isinstance(repair_round, bool)
+            or repair_round != int(state.get("repair_rounds_used", 0)) + 1
+            or record.get("prompt_digest") != prompt.digest
+            or record.get("action_key")
+            != (
+                f"repair:{state['attempt_id']}:{repair_round}:"
+                f"{prompt.digest}"
+            )
+        ):
+            raise KernelError(
+                "REPAIR_PROMPT_IDENTITY_INVALID",
+                "durable Repair Prompt changed its exact action identity",
+            )
+        return record, prompt
+
+    def _read_exact_repair_binding(
+        self,
+        state: dict[str, Any],
+        record: dict[str, Any],
+    ) -> RuntimeBinding | None:
+        binding_value = record.get("runtime_binding")
+        if not isinstance(binding_value, dict):
+            return None
+        try:
+            expected = RuntimeBinding(**binding_value)
+            profile_key = (
+                "runtime_profile"
+                if int(state.get("attempt_ordinal", 1)) == 1
+                else "frontier_runtime_profile"
+            )
+            digest_key = (
+                "profile_digest"
+                if profile_key == "runtime_profile"
+                else "frontier_profile_digest"
+            )
+            profile = self._profile_from_frozen_state(
+                state,
+                profile_key=profile_key,
+                digest_key=digest_key,
+            )
+            admission = RuntimeAdmission(
+                repository=state["repository"],
+                plan_digest=state["plan_digest"],
+                node_key=state["node_key"],
+                admission_id=state["admission_id"],
+                repository_path=self.repository_path,
+                base_sha=state["base_sha"],
+                runtime_profile=profile,
+                parent_agent_id=self.parent_agent_id,
+            )
+            observed = self.runtime.read_binding(
+                admission,
+                self._prompt_from_state(state),
+            )
+        except (KernelError, RuntimeAdapterError, TypeError):
+            return None
+        return observed if observed == expected else None
+
+    def _wait_for_repair_prompt_readback(
+        self,
+        state: dict[str, Any],
+        record: dict[str, Any],
+        prompt: RuntimePrompt,
+        *,
+        error: RuntimeAdapterError | None = None,
+    ) -> ReconcileOutcome:
+        record["delivery_state"] = "ambiguous"
+        state.update(
+            {
+                "status": "waiting",
+                "directive": "wait_for_runtime",
+                "attempt_state": "repair_delivery_ambiguous",
+                "repair_prompt": record,
+                "last_runtime_error": (
+                    _runtime_error_record(error)
+                    if error is not None
+                    else {
+                        "code": "REPAIR_PROMPT_READBACK_AMBIGUOUS",
+                        "failure_class": "ambiguous",
+                    }
+                ),
+                "wait_condition": "repair_prompt_readback",
+                "wait_source_ref": (
+                    f"{self.runtime.adapter_name}://attempt/"
+                    f"{state['attempt_id']}/repair/{prompt.digest}/readback"
+                ),
+                "wait_event_identity": str(record["action_key"]),
+                "next_check_at": (
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat(),
+            }
+        )
+        self._write_state(
+            state["repository"],
+            state["plan_digest"],
+            state,
+        )
+        return self._outcome(state)
+
+    def _accept_repair_prompt_readback(
+        self,
+        state: dict[str, Any],
+        record: dict[str, Any],
+        prompt: RuntimePrompt,
+    ) -> ReconcileOutcome:
+        prior_review_context = self._review_convergence.prior_context(state)
+        record["delivery_state"] = "accepted"
+        self._invalidate_candidate_delivery(state)
+        state.update(
+            {
+                "status": "waiting",
+                "directive": "wait_for_runtime",
+                "attempt_state": "repairing",
+                "recovery_reserved_at": None,
+                "repair_rounds_used": int(record["round"]),
+                "attempt_terminal_reason": None,
+                "prior_review_context": prior_review_context,
+                "repair_prompt": record,
+                "last_runtime_error": None,
+                "wait_condition": "runtime_result",
+                "wait_source_ref": (
+                    f"{self.runtime.adapter_name}://attempt/"
+                    f"{state['attempt_id']}/repair"
+                ),
+                "wait_event_identity": str(record["action_key"]),
+                "next_check_at": (
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat(),
+            }
+        )
+        self._write_state(
+            state["repository"],
+            state["plan_digest"],
+            state,
+        )
+        return self._outcome(state)
+
+    def _reconcile_repair_prompt_delivery(
+        self,
+        state: dict[str, Any],
+        work_node: dict[str, Any],
+    ) -> ReconcileOutcome:
+        record, prompt = self._repair_prompt_from_record(
+            state,
+            work_node,
+        )
+        binding = self._read_exact_repair_binding(state, record)
+        if binding is None:
+            self._block_parked_runtime_takeover(state)
+            return self._outcome(state)
+        action_key = str(record["action_key"])
+        try:
+            readback = self.runtime.read_repair_prompt(
+                binding,
+                prompt,
+                action_key=action_key,
+            )
+        except RuntimeAdapterError as error:
+            return self._wait_for_repair_prompt_readback(
+                state,
+                record,
+                prompt,
+                error=error,
+            )
+        if readback == "accepted":
+            return self._accept_repair_prompt_readback(
+                state,
+                record,
+                prompt,
+            )
+        if readback == "ambiguous":
+            return self._wait_for_repair_prompt_readback(
+                state,
+                record,
+                prompt,
+            )
+        if readback != "not_accepted":
+            raise KernelError(
+                "REPAIR_PROMPT_READBACK_INVALID",
+                "Runtime returned an unknown Repair Prompt status",
+            )
+        try:
+            self.runtime.repair(
+                binding,
+                prompt,
+                action_key=action_key,
+            )
+            readback = self.runtime.read_repair_prompt(
+                binding,
+                prompt,
+                action_key=action_key,
+            )
+        except RuntimeAdapterError as error:
+            return self._wait_for_repair_prompt_readback(
+                state,
+                record,
+                prompt,
+                error=error,
+            )
+        if readback == "accepted":
+            return self._accept_repair_prompt_readback(
+                state,
+                record,
+                prompt,
+            )
+        return self._wait_for_repair_prompt_readback(
+            state,
+            record,
+            prompt,
+        )
+
     def _handle_semantic_rejection(
         self,
         state: dict[str, Any],
@@ -4939,6 +5179,7 @@ class Kernel:
                 "prompt_digest": prompt.digest,
                 "payload": json.loads(packet),
                 "payload_digest": digest_value(json.loads(packet)),
+                "runtime_binding": asdict(binding),
                 "delivery_state": "reserved",
             }
             existing_repair = state.get("repair_prompt")
@@ -4946,29 +5187,10 @@ class Kernel:
                 isinstance(existing_repair, dict)
                 and existing_repair.get("action_key") == repair_action_key
             ):
-                self._invalidate_candidate_delivery(state)
-                state.update(
-                    {
-                        "status": "waiting",
-                        "directive": "wait_for_runtime",
-                        "attempt_state": "repair_delivery_ambiguous",
-                        "wait_condition": "runtime_result",
-                        "wait_source_ref": (
-                            f"{self.runtime.adapter_name}://attempt/"
-                            f"{state['attempt_id']}/repair/{prompt.digest}"
-                        ),
-                        "wait_event_identity": repair_action_key,
-                        "next_check_at": (
-                            datetime.now(timezone.utc) + timedelta(seconds=30)
-                        ).isoformat(),
-                    }
-                )
-                self._write_state(
-                    state["repository"],
-                    state["plan_digest"],
+                return self._reconcile_repair_prompt_delivery(
                     state,
+                    work_node,
                 )
-                return self._outcome(state)
             state.update(
                 {
                     "status": "waiting",
@@ -4994,57 +5216,10 @@ class Kernel:
                 state["plan_digest"],
                 state,
             )
-            try:
-                self.runtime.repair(binding, prompt)
-            except RuntimeAdapterError as error:
-                repair_record["delivery_state"] = "ambiguous"
-                self._invalidate_candidate_delivery(state)
-                state.update(
-                    {
-                        "directive": "wait_for_runtime",
-                        "attempt_state": "repair_delivery_ambiguous",
-                        "repair_prompt": repair_record,
-                        "last_runtime_error": _runtime_error_record(error),
-                        "wait_condition": "runtime_result",
-                    }
-                )
-                self._write_state(
-                    state["repository"],
-                    state["plan_digest"],
-                    state,
-                )
-                return self._outcome(state)
-            repair_record["delivery_state"] = "accepted"
-            self._invalidate_candidate_delivery(state)
-            state.update(
-                {
-                    "status": "waiting",
-                    "directive": "wait_for_runtime",
-                    "attempt_state": "repairing",
-                    "recovery_reserved_at": None,
-                    "repair_rounds_used": repair_rounds_used + 1,
-                    "attempt_terminal_reason": None,
-                    "prior_review_context": prior_review_context,
-                    "repair_prompt": repair_record,
-                    "wait_condition": "runtime_result",
-                    "wait_source_ref": (
-                        f"{self.runtime.adapter_name}://attempt/"
-                        f"{state['attempt_id']}/repair"
-                    ),
-                    "wait_event_identity": (
-                        repair_action_key
-                    ),
-                    "next_check_at": (
-                        datetime.now(timezone.utc) + timedelta(seconds=30)
-                    ).isoformat(),
-                }
-            )
-            self._write_state(
-                state["repository"],
-                state["plan_digest"],
+            return self._reconcile_repair_prompt_delivery(
                 state,
+                work_node,
             )
-            return self._outcome(state)
         if (
             directive.action != "repair_same_attempt"
             and not allow_frontier_attempt
@@ -6546,6 +6721,16 @@ class Kernel:
             active.plan_digest,
             work_node["node_key"],
         )
+        if (
+            state is not None
+            and state.get("attempt_state")
+            in {"repair_dispatching", "repair_delivery_ambiguous"}
+            and isinstance(state.get("repair_prompt"), dict)
+        ):
+            return self._reconcile_repair_prompt_delivery(
+                state,
+                work_node,
+            )
         if state is not None and state.get("attempt_state") in {
             "batch_ready",
             "batch_wait",
