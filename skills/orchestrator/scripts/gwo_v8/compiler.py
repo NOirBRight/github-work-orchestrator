@@ -15,6 +15,7 @@ from ._effects import (
     authorized_file_changes,
     normalized_relative_path,
 )
+from .evidence import default_secrets_policy
 
 
 WORKFLOW_SKILLS = {"implement", "implement-gwo", "orchestrator"}
@@ -65,6 +66,7 @@ CHECK_DEFINITION_FIELDS = {
 EFFECT_CONTRACT_FIELDS = {"write_scopes", "external_effects"}
 RUNTIME_REQUIREMENT_FIELDS = {"capabilities"}
 RECOVERY_POLICY_FIELDS = {"semantic_attempts", "repair_rounds"}
+SECRETS_POLICY_FIELDS = {"version", "patterns"}
 OUTCOME_CONTRACT_FIELDS = {"path", "content", "file_changes"}
 
 
@@ -427,6 +429,49 @@ def _policy_version(policy_snapshot: dict[str, Any]) -> int:
     return version
 
 
+def _compiled_secrets_policy(policy_snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Compile the deterministic repository secrets policy into the PlanSpec.
+
+    The compiled policy, addressed by its digest, authorizes the exact
+    redaction rules the Runtime Adapter must apply to failed local Check
+    diagnostics and the Evidence Verifier must enforce closed.
+    """
+    raw = policy_snapshot.get("secrets_policy")
+    if raw is None:
+        body = default_secrets_policy()
+    else:
+        policy = _require_object(
+            raw,
+            fields=SECRETS_POLICY_FIELDS,
+            label="secrets policy",
+        )
+        version = policy.get("version")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise CompileError(
+                "SECRETS_POLICY_INVALID",
+                "secrets policy version must be a positive integer",
+            )
+        patterns = _require_string_list(
+            policy.get("patterns"),
+            label="secrets policy patterns",
+        )
+        if not patterns:
+            raise CompileError(
+                "SECRETS_POLICY_INVALID",
+                "secrets policy must define at least one pattern",
+            )
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise CompileError(
+                    "SECRETS_POLICY_INVALID",
+                    f"secrets policy pattern is not a valid regex: {error}",
+                ) from error
+        body = {"version": version, "patterns": list(patterns)}
+    return {**body, "policy_digest": digest_value(body)}
+
+
 def _compiled_check_definitions(
     proposal: dict[str, Any],
     policy_snapshot: dict[str, Any],
@@ -744,6 +789,23 @@ class PlanCompiler:
             proposal,
             policy_snapshot,
         )
+        secrets_policy = (
+            _compiled_secrets_policy(policy_snapshot)
+            if _policy_version(policy_snapshot) >= 3
+            else None
+        )
+        recovery_policy = dict(proposal["recovery_policy"])
+        if secrets_policy is not None and any(
+            check.get("hosted_only") is not True for check in compiled_checks
+        ):
+            # A failed Candidate affected Check or Batch repository Check is a
+            # typed recoverable condition, never a direct terminal outcome:
+            # the compiled Recovery Ladder itself authorizes the one bounded
+            # Repair Round, so the Kernel stays strictly within policy.
+            recovery_policy["repair_rounds"] = max(
+                int(recovery_policy.get("repair_rounds") or 0),
+                1,
+            )
         if _policy_version(policy_snapshot) >= 3:
             local_suites = {
                 str(check.get("suite"))
@@ -805,11 +867,17 @@ class PlanCompiler:
         work_node = _node(
             {
                 **proposal,
+                "recovery_policy": recovery_policy,
                 "output_contract": {
                     "required_evidence": required_evidence,
                     "checks": compiled_checks,
                     "review_requirement": review_requirement,
                     "delivery_required": _policy_version(policy_snapshot) >= 3,
+                    **(
+                        {"secrets_policy": secrets_policy}
+                        if secrets_policy is not None
+                        else {}
+                    ),
                 },
                 "skill_reference": skill_reference,
             }

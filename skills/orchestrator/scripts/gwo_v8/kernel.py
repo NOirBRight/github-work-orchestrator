@@ -27,6 +27,9 @@ from .evidence import (
     ResultClaim,
     TypedEvidence,
     blocking_review_findings,
+    check_diagnostics_finding,
+    check_diagnostics_valid,
+    check_evidence_provenance_finding,
 )
 from .integration_batch import (
     GitIntegrationBatchAssembler,
@@ -3275,6 +3278,7 @@ class Kernel:
             "attempt_ordinal": 1,
             "repair_rounds_used": 0,
             "attempt_terminal_reason": None,
+            "recoverable_condition": None,
             "candidate_sha": None,
             "result_digest": None,
             "publication_eligible": None,
@@ -4536,6 +4540,112 @@ class Kernel:
             ) from error
 
     @staticmethod
+    def _local_check_failures(
+        state: dict[str, Any],
+        work_node: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Failed local Checks of the current Candidate as typed conditions.
+
+        Only fully verifier-validated Check Evidence qualifies: exact
+        Candidate/tree, Check Definition and command digests, environment,
+        input projection, authoritative observer, source reference, valid
+        envelope digest, and policy-compliant diagnostics. Each entry is
+        attributed to the exact member Candidate SHA and Evidence digest so
+        a Repair Round targets only the implicated Integration Batch member
+        and never an unrelated Worker.
+        """
+        candidate_sha = state.get("candidate_sha")
+        candidate_observation = state.get("candidate_observation")
+        if not isinstance(candidate_sha, str) or not isinstance(
+            candidate_observation, dict
+        ):
+            return []
+        binding = candidate_observation.get("binding")
+        runtime_id = (
+            binding.get("runtime_id") if isinstance(binding, dict) else None
+        )
+        envelopes: list[TypedEvidence] = []
+        for raw in candidate_observation.get("evidence") or ():
+            if not isinstance(raw, dict):
+                continue
+            try:
+                item = TypedEvidence(**raw)
+            except TypeError:
+                continue
+            if (
+                item.observer_type not in {"runtime_adapter", "kernel"}
+                or not item.observer_id
+                or (
+                    item.observer_type == "runtime_adapter"
+                    and item.observer_id != runtime_id
+                )
+                or not item.has_valid_digest()
+                or item.subject != candidate_sha
+            ):
+                continue
+            envelopes.append(item)
+        candidate_tree = None
+        candidate = next(
+            (item for item in envelopes if item.kind == "candidate"),
+            None,
+        )
+        if candidate is not None:
+            tree = candidate.payload.get("tree_sha")
+            if isinstance(tree, str):
+                candidate_tree = tree
+        definitions = {
+            str(definition.get("check_id")): definition
+            for definition in (work_node.get("output_contract") or {}).get("checks")
+            or ()
+            if isinstance(definition, dict)
+            and definition.get("hosted_only") is not True
+            and definition.get("check_id")
+        }
+        secrets_policy = (work_node.get("output_contract") or {}).get(
+            "secrets_policy"
+        )
+        failures: list[dict[str, Any]] = []
+        for item in envelopes:
+            if (
+                item.kind != "check"
+                or item.payload.get("outcome") != "failed"
+                or not item.source_ref
+            ):
+                continue
+            check_id = str(item.payload.get("check_id") or "")
+            definition = definitions.get(check_id)
+            if definition is None:
+                continue
+            if (
+                check_evidence_provenance_finding(
+                    item,
+                    definition,
+                    candidate_tree=candidate_tree,
+                )
+                is not None
+                or check_diagnostics_finding(
+                    item.payload,
+                    check_id=check_id,
+                    secrets_policy=secrets_policy,
+                )
+                is not None
+            ):
+                continue
+            failure: dict[str, Any] = {
+                "check_id": check_id,
+                "suite": str(definition.get("suite") or "local"),
+                "source_ref": item.source_ref,
+                "exit_code": item.payload["exit_code"],
+                "candidate_sha": candidate_sha,
+                "evidence_digest": item.content_digest,
+            }
+            diagnostics = item.payload.get("diagnostics")
+            if check_diagnostics_valid(diagnostics):
+                failure["diagnostics"] = dict(diagnostics)
+            failures.append(failure)
+        return failures
+
+    @staticmethod
     def _repair_causes(
         state: dict[str, Any],
         work_node: dict[str, Any],
@@ -4559,40 +4669,21 @@ class Kernel:
                     }
                 )
 
-        definitions = {
-            str(definition.get("check_id")): definition
-            for definition in (work_node.get("output_contract") or {}).get("checks")
-            or ()
-            if isinstance(definition, dict)
-            and definition.get("hosted_only") is not True
-            and definition.get("check_id")
-        }
-        candidate_observation = state.get("candidate_observation")
-        for evidence in (
-            candidate_observation.get("evidence") or ()
-            if isinstance(candidate_observation, dict)
-            else ()
-        ):
-            if (
-                not isinstance(evidence, dict)
-                or evidence.get("kind") != "check"
-                or (evidence.get("payload") or {}).get("outcome") != "failed"
-            ):
-                continue
-            payload = evidence.get("payload") or {}
-            check_id = str(payload.get("check_id") or "")
-            definition = definitions.get(check_id)
-            if definition is None:
-                continue
-            causes.append(
-                {
-                    "type": "local_check_failure",
-                    "check_id": check_id,
-                    "suite": str(definition.get("suite") or "local"),
-                    "source_ref": str(evidence.get("source_ref") or ""),
-                    "exit_code": int(payload.get("exit_code") or 0),
-                }
-            )
+        for failure in Kernel._local_check_failures(state, work_node):
+            cause: dict[str, Any] = {
+                "type": "local_check_failure",
+                "check_id": failure["check_id"],
+                "suite": failure["suite"],
+                "candidate_sha": failure["candidate_sha"],
+                "evidence_digest": failure["evidence_digest"],
+                "source_ref": failure["source_ref"],
+                "exit_code": failure["exit_code"],
+            }
+            diagnostics = failure.get("diagnostics")
+            if diagnostics is not None:
+                cause["stdout_tail"] = diagnostics["stdout_tail"]
+                cause["stderr_tail"] = diagnostics["stderr_tail"]
+            causes.append(cause)
         if cause_type == "hosted_ci_code_failure":
             diagnostics = state.get("hosted_failure_diagnostics")
             if not isinstance(diagnostics, list) or not diagnostics:
@@ -5130,6 +5221,23 @@ class Kernel:
             activation_id=state["activation_id"],
         )
         policy = work_node.get("recovery_policy") or {}
+        local_check_failures = self._local_check_failures(state, work_node)
+        # A failed Candidate affected Check or Batch repository Check is a
+        # typed recoverable condition recorded durably; the Recovery Ladder
+        # then decides strictly within the compiled policy, which authorizes
+        # the one bounded Repair Round for local Check recovery.
+        state["recoverable_condition"] = (
+            {
+                "type": "local_check_failure",
+                "cause_type": cause_type,
+                "attempt_id": state.get("attempt_id"),
+                "candidate_sha": state.get("candidate_sha"),
+                "checks": local_check_failures,
+                "recorded_at": _now(),
+            }
+            if local_check_failures
+            else None
+        )
         ladder = RecoveryLadder(
             semantic_attempts=int(policy.get("semantic_attempts", 1)),
             repair_rounds=int(policy.get("repair_rounds", 0)),
@@ -5430,6 +5538,11 @@ class Kernel:
                 "specialist_requirements": [],
                 "human_decision_required": False,
             },
+            **(
+                {"secrets_policy": output_contract["secrets_policy"]}
+                if isinstance(output_contract.get("secrets_policy"), dict)
+                else {}
+            ),
         }
         return self.verifier.verify(
             observation.result_claim,
@@ -7106,6 +7219,8 @@ class Kernel:
             )
         state["result_digest"] = decision.result.result_digest
         state["publication_eligible"] = True
+        # Local acceptance resolves any open recoverable Check condition.
+        state["recoverable_condition"] = None
         effect_evidence = effect_decision.verification
         manifest_evidence = [
             {

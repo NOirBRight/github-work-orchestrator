@@ -25,7 +25,13 @@ from ._effects import (
     authorized_file_changes,
     normalized_relative_path,
 )
-from .evidence import ResultClaim, TypedEvidence
+from .evidence import (
+    ResultClaim,
+    TypedEvidence,
+    bounded_check_diagnostics,
+    default_secrets_policy,
+    secrets_policy_digest,
+)
 
 if TYPE_CHECKING:
     from .retirement import (
@@ -1295,6 +1301,10 @@ class _RuntimeState:
     node: dict[str, Any] | None = None
     result_claim: ResultClaim | None = None
     evidence: tuple[TypedEvidence, ...] = ()
+
+
+def _default_secrets_policy_digest() -> str:
+    return secrets_policy_digest(default_secrets_policy())
 
 
 def _run(command: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -3502,11 +3512,20 @@ class PaseoRuntimeAdapter:
         checks: Any,
         *,
         defer_repository: bool,
+        secrets_policy: Any = None,
     ) -> tuple[TypedEvidence, ...]:
         captured = list(evidence)
         captured_ids = {
             item.payload.get("check_id") for item in captured if item.kind == "check"
         }
+        if isinstance(secrets_policy, dict) and isinstance(
+            secrets_policy.get("policy_digest"), str
+        ):
+            redaction_patterns = secrets_policy.get("patterns")
+            secrets_policy_digest = str(secrets_policy["policy_digest"])
+        else:
+            redaction_patterns = None
+            secrets_policy_digest = _default_secrets_policy_digest()
         for check in checks or ():
             if (
                 not isinstance(check, dict)
@@ -3614,6 +3633,18 @@ class PaseoRuntimeAdapter:
                         "log_digest": digest_bytes(
                             (f"{result.stdout}\n{result.stderr}").encode("utf-8")
                         ),
+                        **(
+                            {
+                                "diagnostics": bounded_check_diagnostics(
+                                    result.stdout,
+                                    result.stderr,
+                                    patterns=redaction_patterns,
+                                ),
+                                "secrets_policy_digest": secrets_policy_digest,
+                            }
+                            if result.returncode != 0
+                            else {}
+                        ),
                     },
                 )
             )
@@ -3644,6 +3675,11 @@ class PaseoRuntimeAdapter:
                 observation.evidence,
                 checks,
                 defer_repository=False,
+                secrets_policy=(
+                    contract.get("secrets_policy")
+                    if isinstance(contract, dict)
+                    else None
+                ),
             ),
         )
         self._deferred_repository_checks.discard(binding.agent_id)
@@ -3869,6 +3905,11 @@ class PaseoRuntimeAdapter:
                     checks,
                     defer_repository=(
                         binding.agent_id in self._deferred_repository_checks
+                    ),
+                    secrets_policy=(
+                        output_contract.get("secrets_policy")
+                        if isinstance(output_contract, dict)
+                        else None
                     ),
                 )
         runtime_observation = RuntimeObservation(
@@ -5084,6 +5125,15 @@ class InMemoryRuntimeAdapter:
             raise RuntimeAdapterError(
                 "RUNTIME_CHECK_INVALID", "output contract checks must be a list"
             )
+        secrets_policy = (node.get("output_contract") or {}).get("secrets_policy")
+        if isinstance(secrets_policy, dict) and isinstance(
+            secrets_policy.get("policy_digest"), str
+        ):
+            redaction_patterns = secrets_policy.get("patterns")
+            secrets_policy_digest = str(secrets_policy["policy_digest"])
+        else:
+            redaction_patterns = None
+            secrets_policy_digest = _default_secrets_policy_digest()
         for check in checks:
             if not isinstance(check, dict) or not isinstance(
                 check.get("command"), list
@@ -5153,6 +5203,18 @@ class InMemoryRuntimeAdapter:
                             else {}
                         ),
                         "log_digest": hashlib.sha256(log).hexdigest(),
+                        **(
+                            {
+                                "diagnostics": bounded_check_diagnostics(
+                                    result.stdout,
+                                    result.stderr,
+                                    patterns=redaction_patterns,
+                                ),
+                                "secrets_policy_digest": secrets_policy_digest,
+                            }
+                            if result.returncode != 0
+                            else {}
+                        ),
                     },
                 )
             )

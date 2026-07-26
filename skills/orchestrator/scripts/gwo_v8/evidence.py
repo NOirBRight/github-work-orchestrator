@@ -16,6 +16,224 @@ if TYPE_CHECKING:
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST64 = re.compile(r"^[0-9a-f]{64}$")
 
+CHECK_DIAGNOSTIC_MAX_STREAM_CHARACTERS = 2_048
+_CHECK_DIAGNOSTIC_TRUNCATION_PREFIX = "…[truncated]\n"
+_REDACTED = "[redacted]"
+
+# The deterministic built-in secrets policy for local Check diagnostics.
+# Repository policy may replace it through the compiled PlanSpec; excerpts
+# are redacted before they enter durable Evidence, so a failing Check cannot
+# leak credentials into the Store, Repair Packets, or Prompts. Patterns with
+# three or more groups redact only the final group (the secret value);
+# shorter patterns redact the whole match.
+DEFAULT_SECRETS_POLICY_PATTERNS: tuple[str, ...] = (
+    r"gh[pousr]_[A-Za-z0-9]{16,}",
+    r"github_pat_[A-Za-z0-9_]{16,}",
+    r"AKIA[0-9A-Z]{16}",
+    r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{8,}",
+    r"(?i)\b(api[_-]?key|token|secret|password|passwd|authorization)"
+    r"(\s*[:=]\s*|\s+)(\S+)",
+)
+
+
+def default_secrets_policy() -> dict[str, Any]:
+    return {"version": 1, "patterns": list(DEFAULT_SECRETS_POLICY_PATTERNS)}
+
+
+def secrets_policy_body(policy: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "version": int(policy.get("version") or 0),
+        "patterns": [str(pattern) for pattern in policy.get("patterns") or ()],
+    }
+
+
+def secrets_policy_digest(policy: dict[str, Any]) -> str:
+    return digest_value(secrets_policy_body(policy))
+
+
+def _compile_secret_patterns(patterns: Any) -> tuple[re.Pattern, ...]:
+    source = (
+        DEFAULT_SECRETS_POLICY_PATTERNS
+        if patterns is None
+        else tuple(str(pattern) for pattern in patterns)
+    )
+    return tuple(re.compile(pattern) for pattern in source)
+
+
+def redact_secrets(text: str, patterns: Any = None) -> str:
+    redacted = str(text)
+    for pattern in _compile_secret_patterns(patterns):
+        if pattern.groups >= 3:
+            redacted = pattern.sub(
+                lambda match: match.group(1) + match.group(2) + _REDACTED,
+                redacted,
+            )
+        else:
+            redacted = pattern.sub(_REDACTED, redacted)
+    return redacted
+
+
+def secrets_present(text: str, patterns: Any = None) -> bool:
+    for pattern in _compile_secret_patterns(patterns):
+        for match in pattern.finditer(str(text)):
+            value = match.group(3) if match.re.groups >= 3 else match.group(0)
+            if value != _REDACTED:
+                return True
+    return False
+
+
+def _diagnostic_excerpt(output: str, patterns: Any = None) -> str:
+    redacted = redact_secrets(output, patterns)
+    if len(redacted) <= CHECK_DIAGNOSTIC_MAX_STREAM_CHARACTERS:
+        return redacted
+    return _CHECK_DIAGNOSTIC_TRUNCATION_PREFIX + redacted[
+        -CHECK_DIAGNOSTIC_MAX_STREAM_CHARACTERS:
+    ]
+
+
+def bounded_check_diagnostics(
+    stdout: str,
+    stderr: str,
+    *,
+    patterns: Any = None,
+) -> dict[str, str]:
+    """Bounded, redacted stdout/stderr excerpts of one failed local Check.
+
+    Captured only for non-zero exits so a Repair Round can target the exact
+    failure cause without rerunning the full suite. Passing checks keep
+    digest-only provenance. Redaction follows the compiled secrets policy
+    whose digest is recorded beside the excerpts.
+    """
+    return {
+        "stdout_tail": _diagnostic_excerpt(stdout, patterns),
+        "stderr_tail": _diagnostic_excerpt(stderr, patterns),
+    }
+
+
+def check_diagnostics_valid(diagnostics: Any) -> bool:
+    if not isinstance(diagnostics, dict) or set(diagnostics) != {
+        "stdout_tail",
+        "stderr_tail",
+    }:
+        return False
+    bound = CHECK_DIAGNOSTIC_MAX_STREAM_CHARACTERS + len(
+        _CHECK_DIAGNOSTIC_TRUNCATION_PREFIX
+    )
+    return all(
+        isinstance(value, str) and len(value) <= bound
+        for value in diagnostics.values()
+    )
+
+
+def check_diagnostics_finding(
+    payload: dict[str, Any],
+    *,
+    check_id: Any,
+    secrets_policy: dict[str, Any] | None,
+) -> str | None:
+    """Fail-closed diagnostics policy validation for one Check Evidence.
+
+    Returns the verifier finding, or None when diagnostics are not required
+    or are fully policy-compliant. Failed Checks must carry diagnostics. A
+    compiled secrets policy requires the recorded policy digest to match
+    exactly, and no excerpt may still contain a policy-secret.
+    """
+    if "diagnostics" not in payload:
+        if payload.get("outcome") == "failed":
+            return f"check:{check_id} failed diagnostics are required"
+        return None
+    diagnostics = payload.get("diagnostics")
+    if not check_diagnostics_valid(diagnostics):
+        return f"check:{check_id} diagnostics are invalid"
+    if isinstance(secrets_policy, dict) and isinstance(
+        secrets_policy.get("policy_digest"), str
+    ):
+        if payload.get("secrets_policy_digest") != secrets_policy["policy_digest"]:
+            return f"check:{check_id} secrets policy mismatch"
+        patterns = secrets_policy.get("patterns")
+    else:
+        patterns = None
+    if any(secrets_present(value, patterns) for value in diagnostics.values()):
+        return f"check:{check_id} diagnostics leak secrets"
+    return None
+
+
+def check_evidence_provenance_finding(
+    evidence: TypedEvidence,
+    definition: dict[str, Any],
+    *,
+    candidate_tree: str | None,
+) -> str | None:
+    """Verifier-grade provenance binding of one Check Evidence item.
+
+    Returns the verifier finding, or None when the Evidence is bound to the
+    exact Candidate tree, Check Definition, command, environment, and input
+    projection.
+    """
+    check_id = evidence.payload.get("check_id")
+    exit_code = evidence.payload.get("exit_code")
+    if evidence.payload.get("outcome") == "failed" and (
+        isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or exit_code == 0
+    ):
+        return f"check:{check_id} failed exit code must be a nonzero integer"
+    if evidence.payload.get("outcome") == "passed" and (
+        isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or exit_code != 0
+    ):
+        return f"check:{check_id} passed exit code must be the integer zero"
+    expected_definition_digest = definition.get("definition_digest")
+    if (
+        not isinstance(expected_definition_digest, str)
+        or evidence.payload.get("definition_digest") != expected_definition_digest
+    ):
+        return f"check:{check_id} definition digest is stale"
+    expected_command_digest = digest_value(definition.get("command"))
+    if evidence.payload.get("command_digest") != expected_command_digest:
+        return f"check:{check_id} command digest is invalid"
+    if (
+        not isinstance(candidate_tree, str)
+        or _SHA40.fullmatch(candidate_tree) is None
+        or evidence.payload.get("observed_tree_digest") != candidate_tree
+    ):
+        return f"check:{check_id} Candidate tree is invalid"
+    if definition.get("base_sensitive") is True and (
+        _SHA40.fullmatch(str(evidence.payload.get("base_sha") or "")) is None
+        or _SHA40.fullmatch(
+            str(evidence.payload.get("observed_base_tree_digest") or "")
+        )
+        is None
+    ):
+        return f"check:{check_id} base-sensitive provenance is invalid"
+    if any(
+        _DIGEST64.fullmatch(str(evidence.payload.get(name) or "")) is None
+        for name in (
+            "environment_digest",
+            "input_projection_digest",
+            "log_digest",
+        )
+    ):
+        return f"check:{check_id} provenance digest is invalid"
+    expected_environment = list(definition.get("environment_requirements") or ())
+    environment_identity = evidence.payload.get("environment_identity")
+    if (
+        evidence.payload.get("environment_requirements") != expected_environment
+        or not isinstance(environment_identity, dict)
+        or environment_identity.get("platform") is None
+        or any(
+            not isinstance(environment_identity.get(requirement), dict)
+            or not environment_identity[requirement].get("executable")
+            or not environment_identity[requirement].get("version")
+            for requirement in expected_environment
+        )
+        or evidence.payload.get("environment_digest")
+        != digest_value(environment_identity)
+    ):
+        return f"check:{check_id} toolchain identity is invalid"
+    return None
+
 
 def _required_review_axes(requirement: dict[str, Any]) -> list[str] | None:
     axes = requirement.get("axes")
@@ -296,6 +514,22 @@ class EvidenceVerifier:
             if definition is None:
                 findings.append("check Evidence has no compiled definition")
                 continue
+            diagnostics_finding = check_diagnostics_finding(
+                evidence.payload,
+                check_id=check_id,
+                secrets_policy=output_contract.get("secrets_policy"),
+            )
+            if diagnostics_finding is not None:
+                findings.append(diagnostics_finding)
+                continue
+            provenance_finding = check_evidence_provenance_finding(
+                evidence,
+                definition,
+                candidate_tree=candidate_tree,
+            )
+            if provenance_finding is not None:
+                findings.append(provenance_finding)
+                continue
             if evidence.payload.get("outcome") != "passed":
                 check_source = (
                     "hosted check"
@@ -303,65 +537,6 @@ class EvidenceVerifier:
                     else "local check"
                 )
                 failed_checks.append(f"{check_source}:{check_id} did not pass")
-                continue
-            expected_definition_digest = definition.get("definition_digest")
-            if (
-                not isinstance(expected_definition_digest, str)
-                or evidence.payload.get("definition_digest")
-                != expected_definition_digest
-            ):
-                findings.append(f"check:{check_id} definition digest is stale")
-                continue
-            expected_command_digest = digest_value(definition.get("command"))
-            if evidence.payload.get("command_digest") != expected_command_digest:
-                findings.append(f"check:{check_id} command digest is invalid")
-                continue
-            if (
-                not isinstance(candidate_tree, str)
-                or _SHA40.fullmatch(candidate_tree) is None
-                or evidence.payload.get("observed_tree_digest") != candidate_tree
-            ):
-                findings.append(f"check:{check_id} Candidate tree is invalid")
-                continue
-            if definition.get("base_sensitive") is True and (
-                _SHA40.fullmatch(str(evidence.payload.get("base_sha") or "")) is None
-                or _SHA40.fullmatch(
-                    str(evidence.payload.get("observed_base_tree_digest") or "")
-                )
-                is None
-            ):
-                findings.append(
-                    f"check:{check_id} base-sensitive provenance is invalid"
-                )
-                continue
-            if any(
-                _DIGEST64.fullmatch(str(evidence.payload.get(name) or "")) is None
-                for name in (
-                    "environment_digest",
-                    "input_projection_digest",
-                    "log_digest",
-                )
-            ):
-                findings.append(f"check:{check_id} provenance digest is invalid")
-                continue
-            expected_environment = list(
-                definition.get("environment_requirements") or ()
-            )
-            environment_identity = evidence.payload.get("environment_identity")
-            if (
-                evidence.payload.get("environment_requirements") != expected_environment
-                or not isinstance(environment_identity, dict)
-                or environment_identity.get("platform") is None
-                or any(
-                    not isinstance(environment_identity.get(requirement), dict)
-                    or not environment_identity[requirement].get("executable")
-                    or not environment_identity[requirement].get("version")
-                    for requirement in expected_environment
-                )
-                or evidence.payload.get("environment_digest")
-                != digest_value(environment_identity)
-            ):
-                findings.append(f"check:{check_id} toolchain identity is invalid")
                 continue
             semantically_valid.append(evidence)
         valid = semantically_valid

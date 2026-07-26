@@ -1150,33 +1150,55 @@ def test_effect_violation_remains_in_mixed_check_and_review_repair_packet():
             ]
         },
     )
+    check_definition = {
+        "check_id": "module-1",
+        "suite": "affected",
+        "hosted_only": False,
+        "definition_digest": "d" * 64,
+        "command": ["python", "-c", "raise SystemExit(2)"],
+        "environment_requirements": [],
+    }
+    environment = {"platform": "test"}
+    candidate = TypedEvidence._capture(
+        kind="candidate",
+        subject="c" * 40,
+        observer_type="runtime_adapter",
+        observer_id="runtime:unit",
+        observed_at="2026-07-26T00:00:00+00:00",
+        source_ref="runtime://candidate/unit",
+        payload={"tree_sha": "c" * 40},
+    )
+    failed_check = TypedEvidence._capture(
+        kind="check",
+        subject="c" * 40,
+        observer_type="runtime_adapter",
+        observer_id="runtime:unit",
+        observed_at="2026-07-26T00:00:00+00:00",
+        source_ref="runtime://check/unit",
+        payload={
+            "check_id": "module-1",
+            "outcome": "failed",
+            "exit_code": 2,
+            "definition_digest": "d" * 64,
+            "command_digest": digest_value(check_definition["command"]),
+            "observed_tree_digest": "c" * 40,
+            "environment_requirements": [],
+            "environment_identity": environment,
+            "environment_digest": digest_value(environment),
+            "input_projection_digest": "a" * 64,
+            "log_digest": "b" * 64,
+            "diagnostics": {"stdout_tail": "", "stderr_tail": "boom"},
+        },
+    )
     state = {
+        "candidate_sha": "c" * 40,
         "review_evidence": review.__dict__,
         "candidate_observation": {
-            "evidence": [
-                {
-                    "kind": "check",
-                    "source_ref": "runtime://check/unit",
-                    "payload": {
-                        "check_id": "module-1",
-                        "outcome": "failed",
-                        "exit_code": 2,
-                    },
-                }
-            ]
+            "binding": {"runtime_id": "runtime:unit"},
+            "evidence": [candidate.__dict__, failed_check.__dict__],
         },
     }
-    work_node = {
-        "output_contract": {
-            "checks": [
-                {
-                    "check_id": "module-1",
-                    "suite": "affected",
-                    "hosted_only": False,
-                }
-            ]
-        }
-    }
+    work_node = {"output_contract": {"checks": [check_definition]}}
 
     causes = Kernel._repair_causes(
         state,
@@ -1190,6 +1212,8 @@ def test_effect_violation_remains_in_mixed_check_and_review_repair_packet():
         "local_check_failure",
         "effect_contract_violation",
     ]
+    assert causes[1]["candidate_sha"] == "c" * 40
+    assert causes[1]["evidence_digest"] == failed_check.content_digest
     assert causes[-1]["messages"] == [
         "changed path 'forbidden.txt' is outside Write Scope"
     ]

@@ -384,6 +384,7 @@ def _node(
         payload={
             "check_id": "local",
             "outcome": "passed",
+            "exit_code": 0,
             "definition_digest": check["definition_digest"],
             "command_digest": digest_value(check["command"]),
             "observed_tree_digest": candidate_sha,
