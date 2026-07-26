@@ -985,8 +985,10 @@ def _verification_setup():
         "log_digest": "b" * 64,
     }
 
-    def verify_with(payload_updates):
+    def verify_with(payload_updates, *, remove=()):
         payload = {**base_payload, **payload_updates}
+        for key in remove:
+            payload.pop(key, None)
         evidence = TypedEvidence._capture(
             kind="check",
             subject="c" * 40,
@@ -1005,6 +1007,83 @@ def _verification_setup():
         return EvidenceVerifier().verify(claim, contract, observation)
 
     return verify_with, contract["secrets_policy"]
+
+
+def _repair_causes_for_failed_payload(payload_updates=None, *, remove=()):
+    state, work_node, genuine = _provenance_state()
+    payload = {**genuine.payload, **(payload_updates or {})}
+    for key in remove:
+        payload.pop(key, None)
+    failed_check = TypedEvidence._capture(
+        kind=genuine.kind,
+        subject=genuine.subject,
+        observer_type=genuine.observer_type,
+        observer_id=genuine.observer_id,
+        observed_at=genuine.observed_at,
+        source_ref=genuine.source_ref,
+        payload=payload,
+    )
+    state["candidate_observation"]["evidence"] = [
+        state["candidate_observation"]["evidence"][0],
+        failed_check.__dict__,
+    ]
+    return Kernel._repair_causes(
+        state,
+        work_node,
+        cause_type="candidate_verification_failure",
+        findings=("local check:module-1 did not pass",),
+    )
+
+
+def test_failed_check_without_diagnostics_is_not_recoverable():
+    verify_with, _secrets_policy = _verification_setup()
+
+    decision = verify_with({"outcome": "failed", "exit_code": 2})
+    causes = _repair_causes_for_failed_payload(remove=("diagnostics",))
+
+    assert decision.status != "accepted"
+    assert any(
+        "failed diagnostics are required" in finding
+        for finding in decision.findings
+    )
+    assert not any(cause["type"] == "local_check_failure" for cause in causes)
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "remove_exit_code"),
+    (
+        pytest.param(None, True, id="missing"),
+        pytest.param(0, False, id="zero"),
+        pytest.param(True, False, id="boolean"),
+        pytest.param("2", False, id="numeric-string"),
+        pytest.param("not-an-integer", False, id="nonnumeric-string"),
+    ),
+)
+def test_failed_check_requires_non_boolean_nonzero_integer_exit_code(
+    exit_code,
+    remove_exit_code,
+):
+    verify_with, secrets_policy = _verification_setup()
+    payload_updates = {
+        "outcome": "failed",
+        "exit_code": exit_code,
+        "diagnostics": {"stdout_tail": "", "stderr_tail": "boom"},
+        "secrets_policy_digest": secrets_policy["policy_digest"],
+    }
+    remove = ("exit_code",) if remove_exit_code else ()
+
+    decision = verify_with(payload_updates, remove=remove)
+    causes = _repair_causes_for_failed_payload(
+        {"exit_code": exit_code},
+        remove=remove,
+    )
+
+    assert decision.status != "accepted"
+    assert any(
+        "failed exit code must be a nonzero integer" in finding
+        for finding in decision.findings
+    )
+    assert not any(cause["type"] == "local_check_failure" for cause in causes)
 
 
 def test_verifier_fails_closed_on_secrets_policy_mismatch():

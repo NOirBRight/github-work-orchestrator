@@ -133,12 +133,14 @@ def check_diagnostics_finding(
 ) -> str | None:
     """Fail-closed diagnostics policy validation for one Check Evidence.
 
-    Returns the verifier finding, or None when the diagnostics are absent or
-    fully policy-compliant. A compiled secrets policy requires the recorded
-    policy digest to match exactly, and no excerpt may still contain a
-    policy-secret.
+    Returns the verifier finding, or None when diagnostics are not required
+    or are fully policy-compliant. Failed Checks must carry diagnostics. A
+    compiled secrets policy requires the recorded policy digest to match
+    exactly, and no excerpt may still contain a policy-secret.
     """
     if "diagnostics" not in payload:
+        if payload.get("outcome") == "failed":
+            return f"check:{check_id} failed diagnostics are required"
         return None
     diagnostics = payload.get("diagnostics")
     if not check_diagnostics_valid(diagnostics):
@@ -169,6 +171,13 @@ def check_evidence_provenance_finding(
     projection.
     """
     check_id = evidence.payload.get("check_id")
+    exit_code = evidence.payload.get("exit_code")
+    if evidence.payload.get("outcome") == "failed" and (
+        isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or exit_code == 0
+    ):
+        return f"check:{check_id} failed exit code must be a nonzero integer"
     expected_definition_digest = definition.get("definition_digest")
     if (
         not isinstance(expected_definition_digest, str)
@@ -507,14 +516,6 @@ class EvidenceVerifier:
             if diagnostics_finding is not None:
                 findings.append(diagnostics_finding)
                 continue
-            if evidence.payload.get("outcome") != "passed":
-                check_source = (
-                    "hosted check"
-                    if definition.get("hosted_only") is True
-                    else "local check"
-                )
-                failed_checks.append(f"{check_source}:{check_id} did not pass")
-                continue
             provenance_finding = check_evidence_provenance_finding(
                 evidence,
                 definition,
@@ -522,6 +523,14 @@ class EvidenceVerifier:
             )
             if provenance_finding is not None:
                 findings.append(provenance_finding)
+                continue
+            if evidence.payload.get("outcome") != "passed":
+                check_source = (
+                    "hosted check"
+                    if definition.get("hosted_only") is True
+                    else "local check"
+                )
+                failed_checks.append(f"{check_source}:{check_id} did not pass")
                 continue
             semantically_valid.append(evidence)
         valid = semantically_valid

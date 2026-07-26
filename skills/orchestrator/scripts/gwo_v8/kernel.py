@@ -4635,7 +4635,7 @@ class Kernel:
                 "check_id": check_id,
                 "suite": str(definition.get("suite") or "local"),
                 "source_ref": item.source_ref,
-                "exit_code": int(item.payload.get("exit_code") or 0),
+                "exit_code": item.payload["exit_code"],
                 "candidate_sha": candidate_sha,
                 "evidence_digest": item.content_digest,
             }

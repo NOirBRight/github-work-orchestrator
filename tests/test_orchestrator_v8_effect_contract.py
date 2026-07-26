@@ -1187,6 +1187,7 @@ def test_effect_violation_remains_in_mixed_check_and_review_repair_packet():
             "environment_digest": digest_value(environment),
             "input_projection_digest": "a" * 64,
             "log_digest": "b" * 64,
+            "diagnostics": {"stdout_tail": "", "stderr_tail": "boom"},
         },
     )
     state = {
