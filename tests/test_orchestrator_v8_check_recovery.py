@@ -1086,6 +1086,33 @@ def test_failed_check_requires_non_boolean_nonzero_integer_exit_code(
     assert not any(cause["type"] == "local_check_failure" for cause in causes)
 
 
+@pytest.mark.parametrize(
+    ("exit_code", "remove_exit_code"),
+    (
+        pytest.param(2, False, id="nonzero"),
+        pytest.param(None, True, id="missing"),
+        pytest.param(False, False, id="boolean"),
+        pytest.param("0", False, id="numeric-string"),
+        pytest.param("not-an-integer", False, id="nonnumeric-string"),
+    ),
+)
+def test_passed_check_requires_non_boolean_integer_zero_exit_code(
+    exit_code,
+    remove_exit_code,
+):
+    verify_with, _secrets_policy = _verification_setup()
+    remove = ("exit_code",) if remove_exit_code else ()
+
+    decision = verify_with({"exit_code": exit_code}, remove=remove)
+
+    assert decision.status != "accepted"
+    assert decision.result is None
+    assert any(
+        "passed exit code must be the integer zero" in finding
+        for finding in decision.findings
+    )
+
+
 def test_verifier_fails_closed_on_secrets_policy_mismatch():
     verify_with, secrets_policy = _verification_setup()
 

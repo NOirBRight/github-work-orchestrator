@@ -178,6 +178,12 @@ def check_evidence_provenance_finding(
         or exit_code == 0
     ):
         return f"check:{check_id} failed exit code must be a nonzero integer"
+    if evidence.payload.get("outcome") == "passed" and (
+        isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or exit_code != 0
+    ):
+        return f"check:{check_id} passed exit code must be the integer zero"
     expected_definition_digest = definition.get("definition_digest")
     if (
         not isinstance(expected_definition_digest, str)
