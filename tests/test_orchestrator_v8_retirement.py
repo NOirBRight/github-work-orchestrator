@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -705,10 +706,16 @@ def test_cli_repository_bound_list_reaches_real_paseo_daemon():
         raise
 
     current = next(
-        record
-        for record in worktrees
-        if Path(str(record["path"])).resolve() == repository.resolve()
+        (
+            record
+            for record in worktrees
+            if Path(str(record["path"])).resolve() == repository.resolve()
+        ),
+        None,
     )
+    if current is None and os.environ.get("GITHUB_ACTIONS") == "true":
+        pytest.skip("GitHub Actions checkout is not a Paseo-managed workspace")
+    assert current is not None
     assert current["native_name"] == repository.name
     assert re.fullmatch(r"[0-9a-f]{40}", str(current["head"]))
     assert current["branch_name"] == _git(repository, "branch", "--show-current")

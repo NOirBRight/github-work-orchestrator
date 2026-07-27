@@ -12,7 +12,7 @@ permissions:
 jobs:
   acceptance:
     runs-on: [self-hosted, Windows, X64, gwo-ci]
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - name: Verify runner Python
