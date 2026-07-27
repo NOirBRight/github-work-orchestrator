@@ -103,7 +103,8 @@ The successor is accepted only when repository evidence proves:
   Campaign compare-and-swap and read-backed receipt;
 - PlanSpec v3 freezes Ticket contracts, Policy Witness, and provider-neutral
   Authority Grants while remaining provider-, model-, CLI-, selector-, and
-  fallback-neutral;
+  fallback-neutral, and exact readback retains those values with the PlanSpec
+  authority-root digest;
 - all semantic Runtime activity uses the exact persisted selector assignment;
 - production and deterministic in-memory Runtime adapters satisfy the same
   conformance suite, and no semantic action starts before full identity,
@@ -155,6 +156,13 @@ The successor is accepted only when repository evidence proves:
   replacement binding survives repair and replacement;
 - up to four compatible accepted Candidates in one Campaign can share one
   exact Batch, PR, and hosted-CI boundary;
+- the root Canary is one real Campaign with four independent Tickets: its three
+  Standard-Assurance accepted Candidates form one compatible multi-member
+  Batch, while its Strict-Assurance accepted Candidate forms a separate
+  Singleton Batch and is never co-batched; each of those two Batches has its
+  own exact Batch SHA, repository-equivalent local verification,
+  pull-request, hosted-CI, Integration-Lease-serialized target integration,
+  and target-readback boundary;
 - every Clean Base Advance member independently reproduces its original
   `PatchIdentityV1` when applied alone to the same advanced target before
   multi-member composition;
@@ -167,6 +175,14 @@ The successor is accepted only when repository evidence proves:
   or unreachable, never interprets or writes V2 state, and leaves V6.1
   authoritative after a failed Guard;
 - restart and delivery recovery preserve Campaign and Work Run identity;
+- root-Canary acceptance proves the complete repair contract: at most three
+  distinct Candidate SHAs, one initial binding plus at most one replacement
+  authorized by terminal-binding Evidence, and a complete Review
+  Finding ledger with typed dispositions for every earlier Finding, without a
+  repair or replacement resetting a bound or the ledger; and
+- root-Canary restart reconstructs durable Campaign state, receipts, and timers
+  so duplicate or lost callbacks cannot duplicate a semantic or external
+  effect;
 - a Candidate is neither Evidence nor a Result, and a code-producing Result
   exists only after the exact accepted Candidate is integrated and read back;
 - an operator can explain any Wait, Decision, or Blocked result from

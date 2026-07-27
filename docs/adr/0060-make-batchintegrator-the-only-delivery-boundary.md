@@ -1,7 +1,7 @@
 ---
 status: accepted
 supersedes: ADR-0040
-amends: ADR-0041, ADR-0047, ADR-0048, ADR-0049, ADR-0057, ADR-0058
+amends: ADR-0041, ADR-0046, ADR-0047, ADR-0048, ADR-0049, ADR-0057, ADR-0058
 ---
 
 # Make BatchIntegrator the only delivery boundary
@@ -33,6 +33,12 @@ Strict Assurance always requires a Singleton Batch. Repository-policy
 classifications for a non-decomposable, high-coupling, or protected
 Interaction Key also require a Singleton Batch. Other accepted Candidates may
 share a Batch only when all pairwise checks pass.
+
+This amends ADR-0046's root-Canary delivery statement: the root Canary remains
+one Campaign, but its three compatible Standard-Assurance Candidates form one
+multi-member Batch while its Strict-Assurance Candidate forms a separate
+Singleton Batch. The Strict Candidate is never co-batched; each Batch retains
+its own exact-Batch delivery boundary.
 
 Clean Base Advance is permitted only when the original base is an ancestor of
 the current target, Candidate and Evidence are unchanged, the target delta has

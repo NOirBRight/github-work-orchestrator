@@ -739,10 +739,24 @@ required Runtime configuration before the activation commit point. Guard
 failure leaves the V6.1 writer and all production state unchanged.
 
 After activation, the root repository runs one real Campaign with four
-independent Tickets and proves the public API, parallel Work Runs, exact
-Runtime assignment, frozen authority, permission parking, CandidateGate,
-bounded repair and replacement, restart, lost-callback recovery, the bounded
-zero-LLM-readback-plus-one-diagnosis stale-binding path, one Campaign-scoped
-Integration Batch, exact PR/CI identity, serial integration readback, and
-cleanup. Passing makes V8 the default for new Campaigns in this repository
-before downstream repositories adopt it.
+independent Tickets. Three Standard-Assurance accepted Candidates form one
+compatible multi-member Integration Batch; the Strict-Assurance accepted
+Candidate forms its own Singleton Batch and is never co-batched. Each Batch
+has its own immutable exact Batch SHA, repository-equivalent local suite,
+pull-request, hosted-CI, target-integration, and target-readback boundary. The
+repository-global Integration Lease remains the sole serializing authority for
+both target mutations.
+
+The root Canary proves the public API, parallel Work Runs, exact Runtime
+assignment, permission parking, CandidateGate, and cleanup. Its acceptance
+readback proves the frozen Authority Grants, Policy Witness, and PlanSpec
+authority-root digest exactly; the complete repair bound of at most three
+distinct Candidate SHAs plus one initial binding and at most one replacement
+binding authorized by terminal-binding Evidence; and the complete
+Review Finding ledger with typed dispositions for every earlier Finding. Repair
+and binding replacement do not reset either bound or the ledger. Restart
+reconstructs the Campaign from durable Campaign state, receipts, and timers;
+duplicate or lost callbacks cannot duplicate a semantic or external effect.
+The Canary also proves the bounded zero-LLM-readback-plus-one-diagnosis
+stale-binding path. Passing makes V8 the default for new Campaigns in this
+repository before downstream repositories adopt it.
