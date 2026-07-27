@@ -1,5 +1,5 @@
 ---
-status: amended by ADR-0038
+status: superseded by ADR-0055
 ---
 
 # Separate Work Items, Plan Nodes, and Attempts

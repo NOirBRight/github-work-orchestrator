@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0056
 ---
 
 # Keep semantic planning transient and non-authoritative

@@ -1,5 +1,5 @@
 ---
-status: amended by ADR-0039
+status: superseded by ADR-0055
 ---
 
 # Define the minimal PlanSpec v2 contract

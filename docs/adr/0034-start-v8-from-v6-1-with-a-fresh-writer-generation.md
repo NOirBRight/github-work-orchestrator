@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: amended by ADR-0046
 supersedes: ADR-0014, ADR-0016, ADR-0027, ADR-0032, ADR-0033
 ---
 
