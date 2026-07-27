@@ -292,11 +292,25 @@ Exit criteria for #119:
 - one real root-repository Campaign proves the architecture's public API,
   four concurrent Work Runs, independent Runtime selectors, frozen authority,
   permission parking, deterministic continuation, standard and strict Review,
-  bounded repair and binding replacement, exact Campaign-scoped Batch,
-  hosted-CI identity, merge readback, and cleanup;
-- restart recovers a deliberately lost callback without duplicating its effect,
-  and a stale binding follows zero-LLM readback plus at most one Coordinator
-  diagnosis;
+  bounded repair and binding replacement, and cleanup. Its three
+  Standard-Assurance accepted Candidates form one compatible multi-member
+  Batch, while its Strict-Assurance accepted Candidate forms a separate
+  Singleton Batch and is never co-batched. Each Batch has its own exact Batch
+  SHA, repository-equivalent local verification, pull-request, hosted-CI,
+  Integration-Lease-serialized target integration, and target-readback
+  boundary;
+- Canary acceptance reads back the frozen Authority Grants, Policy Witness, and
+  PlanSpec authority-root digest exactly. For each Work Run, it proves no more
+  than three distinct Candidate SHAs, one initial Worker binding, and at most
+  one replacement Worker binding authorized by terminal-binding Evidence. The
+  complete Review Finding ledger belongs to that Work Run and spans its Review
+  Subjects, with a typed disposition for every Finding from an earlier Review
+  Subject. Neither repair nor binding replacement resets that Work Run's
+  Candidate or binding bounds or ledger;
+- restart reconstructs durable Campaign state, receipts, and timers; it
+  recovers deliberately lost and duplicate callbacks without duplicating a
+  semantic or external effect, and a stale binding follows zero-LLM readback
+  plus at most one Coordinator diagnosis;
 - no manual Store edit, tracker-label repair, Evidence fabrication, or daemon
   restart is needed; and
 - V8 becomes the default here only after exact acceptance readback.

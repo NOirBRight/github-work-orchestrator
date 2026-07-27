@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: amended by ADR-0060
 amends: ADR-0034
 ---
 
@@ -25,13 +25,27 @@ release gate. The canonical rules are
 [`Cutover`](../design/gwo-v8-lean-architecture.md#cutover).
 
 After activation, this root repository runs one real Campaign with four
-independent Work Runs. The Canary proves Worker parallelism, Formal Review
-Internal Subagents, Candidate and repair bounds, restart/readback, one
-Campaign-scoped Integration Batch, one pull-request and hosted-CI boundary,
-serial target integration, recovery from a lost callback, and the bounded
-zero-LLM-readback-plus-one-diagnosis stale-binding path. Failure stops new
-admissions and preserves durable state; executing V8 work is never silently
-handed to V6.
+independent Tickets. Its three Standard-Assurance accepted Candidates form one
+compatible multi-member Integration Batch. Its Strict-Assurance accepted
+Candidate forms a separate Singleton Batch and is never co-batched. Each of
+those two Batches has its own immutable exact Batch SHA,
+repository-equivalent local verification, pull-request, hosted-CI,
+Integration-Lease-serialized target-integration, and target-readback boundary.
+
+The Canary proves Worker parallelism and Formal Review Internal Subagents, plus
+exact readback of the frozen Authority Grants, Policy Witness, and PlanSpec
+authority-root digest. For each Work Run, it proves the complete bounded repair
+contract: at most three distinct Candidate SHAs; one initial Worker binding
+plus at most one replacement Worker binding authorized by terminal-binding
+Evidence; and the complete Review Finding ledger for that Work Run across its
+Review Subjects, with a typed disposition for every Finding from an earlier
+Review Subject. Within that Work Run, neither repair nor binding replacement
+resets the Candidate or binding bounds or the ledger. Restart rebuilds the
+Campaign from durable Campaign state, receipts, and timers, and duplicate or
+lost callbacks cause no duplicate semantic or external effect. The Canary also
+proves the bounded zero-LLM-readback-plus-one-diagnosis stale-binding path.
+Failure stops new admissions and preserves durable state; executing V8 work is
+never silently handed to V6.
 
 Deterministic tests cover failure paths. V8 cutover does not require a model
 evaluation, scorecard, metrics service, deliberately failing live Ticket, or
