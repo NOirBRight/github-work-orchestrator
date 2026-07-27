@@ -1,100 +1,83 @@
-"""PlanControl's V3-only Campaign-start vertical slice.
+"""V3-only Campaign start control.
 
-This module deliberately does not import the V2 compiler, activation store, or
-Goal/Node driver.  V2 remains an audit decoder for work that was already
-active; new Campaigns begin here as one immutable Ticket Manifest.
+PlanControl persists a canonical preplanning snapshot, reserves Ticket claims
+through one repository-global compare-and-swap record, invokes one semantic
+Planning Pass, compiles provider-neutral PlanSpec v3 bytes, and activates only
+after durable publication and receipt readback.
+
+The module has no dependency on the V2 compiler, decoder, tables, or writer.
+Production composition is lazy and private so importing the package performs
+no I/O.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import json
-from threading import RLock
+from dataclasses import dataclass, replace
+import re
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-from ._canonical import canonical_bytes, digest_bytes, digest_value
-
-
-TRIAGE_LABELS = frozenset(
-    {"needs-triage", "needs-info", "ready-for-agent", "ready-for-human", "wontfix"}
+from ._v3_canonical import (
+    deep_immutable as _deep_immutable,
+    digest as _digest,
+    strict_json_bytes as _strict_json_bytes,
+    strict_json_decode as _strict_json_decode,
 )
-_REQUIRED_ROLES = ("campaign", "worker", "recovery_worker", "review")
-_FORBIDDEN_MANIFEST_FIELDS = frozenset(
-    {
-        "provider",
-        "model",
-        "cli",
-        "runtime",
-        "runtime_binding",
-        "runtime_assignment",
-        "assignment",
-        "profile",
-        "selector",
-        "fallback",
-        "capacity",
-        "timeout",
-        "permission_decision",
-        "lifecycle",
-        "lifecycle_graph",
-        "nodes",
-        "edges",
-        "check",
-        "checks",
-        "review",
-        "reviews",
-        "recovery",
-        "integration",
-        "difficulty",
-        "risk",
-        "predicted_paths",
-    }
+from ._v3_composition import (
+    install_production_factory as _install_production_factory,
+    production_control as _production_control,
+)
+from ._v3_github_control import (
+    ClaimConflict as _ClaimConflict,
+    ContentClient as _ContentClient,
+    GitHubV3Control as _GitHubV3Control,
+    WriterAuthority as _WriterAuthority,
+)
+from ._v3_journal import SQLiteV3Journal as _SQLiteV3Journal
+from ._v3_plan_spec import (
+    _compile_plan,
+    _normalize_intent,
+    _normalize_snapshot,
+    _ready_refs,
+    _require_string,
+    _validate_options_for_tickets,
+    _validate_plan_spec,
+    _versioned_identifier,
+)
+from ._v3_types import (
+    AUTO_PREVIOUS as _AUTO_PREVIOUS,
+    DIGEST_PATTERN as _DIGEST,
+    STATE_ACTIVATION_COMMITTED as _STATE_ACTIVATION_COMMITTED,
+    STATE_ACTIVE_LOCAL as _STATE_ACTIVE_LOCAL,
+    STATE_CLAIMS_RESERVED as _STATE_CLAIMS_RESERVED,
+    STATE_DECISION_REQUIRED as _STATE_DECISION_REQUIRED,
+    STATE_INTENT_ACCEPTED as _STATE_INTENT_ACCEPTED,
+    STATE_PLAN_PUBLISHED as _STATE_PLAN_PUBLISHED,
+    STATE_PLANNING_AMBIGUOUS as _STATE_PLANNING_AMBIGUOUS,
+    STATE_PLANNING_STARTED as _STATE_PLANNING_STARTED,
+    STATE_SNAPSHOTTED as _STATE_SNAPSHOTTED,
+    ActivationReceipt as _ActivationReceipt,
+    ActiveCampaign as _ActiveCampaign,
+    CampaignHandle,
+    Content as _Content,
+    DecisionFinding,
+    JournalRecord as _JournalRecord,
+    PlanControlDecision,
+    PlanControlError,
+    PlanRevision as _PlanRevision,
+    WriterWitness as _WriterWitness,
 )
 
-
-class PlanControlError(RuntimeError):
-    """A stable, fail-closed PlanControl rejection."""
-
-    def __init__(self, code: str, detail: str):
-        super().__init__(detail)
-        self.code = code
-        self.detail = detail
-
-
-@dataclass(frozen=True)
-class SplitCampaignDecision:
-    """The typed alternative to silently truncating a planning input."""
-
-    kind: str
-    snapshot_digest: str
-    actual_bytes: int
-    max_bytes: int
-
-
-class PlanControlDecision(PlanControlError):
-    """A durable Decision is required before PlanControl can publish."""
-
-    def __init__(self, decision: SplitCampaignDecision):
-        super().__init__(
-            "SPLIT_CAMPAIGN_REQUIRED",
-            "the complete selected Ticket snapshot exceeds the planning byte limit",
-        )
-        self.decision = decision
-
-
-@dataclass(frozen=True)
-class CampaignHandle:
-    """Opaque, stable Campaign identity independent of a Plan Revision."""
-
-    repository: str
-    campaign_key: str
+_TICKET_ROLES = frozenset(
+    {"worker", "recovery_worker", "review_primary", "review_strong"}
+)
+_OPAQUE_PROFILE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 
 
 @dataclass(frozen=True)
 class CampaignStartOptions:
-    """The only start options owned by PlanControl in this slice."""
+    """Provider-neutral Runtime Profile references persisted outside PlanSpec."""
 
-    campaign_key: str | None = None
-    expected_previous_revision_digest: str | None = None
+    runtime_profile_overrides: tuple[tuple[str, str, str], ...] = ()
 
     @classmethod
     def from_value(
@@ -103,493 +86,208 @@ class CampaignStartOptions:
         if value is None:
             return cls()
         if isinstance(value, cls):
-            return value
-        if not isinstance(value, Mapping):
-            raise PlanControlError("START_OPTIONS_INVALID", "start options must be an object")
-        unknown = set(value) - {"campaign_key", "expected_previous_revision_digest"}
-        if unknown:
+            raw = value.runtime_profile_overrides
+        elif isinstance(value, Mapping):
+            if set(value) != {"runtime_profile_overrides"}:
+                raise PlanControlError(
+                    "START_OPTIONS_INVALID",
+                    "only runtime_profile_overrides is allowed",
+                )
+            raw = value["runtime_profile_overrides"]
+        else:
+            raise PlanControlError(
+                "START_OPTIONS_INVALID", "start options must be an object"
+            )
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
             raise PlanControlError(
                 "START_OPTIONS_INVALID",
-                f"unsupported start options: {sorted(unknown)}",
+                "runtime_profile_overrides must be a sequence",
             )
-        campaign_key = value.get("campaign_key")
-        previous = value.get("expected_previous_revision_digest")
-        if campaign_key is not None and (not isinstance(campaign_key, str) or not campaign_key):
-            raise PlanControlError("START_OPTIONS_INVALID", "campaign_key must be a non-empty string")
-        if previous is not None and (
-            not isinstance(previous, str) or len(previous) != 64
-        ):
+        normalized: list[tuple[str, str, str]] = []
+        for item in raw:
+            if not isinstance(item, Sequence) or isinstance(item, (str, bytes)):
+                raise PlanControlError(
+                    "START_OPTIONS_INVALID",
+                    "each Runtime override must be (ticket_key, role, profile_ref)",
+                )
+            triple = tuple(item)
+            if len(triple) != 3 or any(
+                not isinstance(part, str) or not part for part in triple
+            ):
+                raise PlanControlError(
+                    "START_OPTIONS_INVALID",
+                    "each Runtime override must contain three non-empty strings",
+                )
+            ticket_key, role, profile_ref = triple
+            if role not in _TICKET_ROLES and not (
+                role.startswith("specialist:")
+                and _versioned_identifier(role.removeprefix("specialist:"))
+            ):
+                raise PlanControlError(
+                    "START_OPTIONS_INVALID",
+                    f"unsupported Ticket Runtime role: {role}",
+                )
+            if not _OPAQUE_PROFILE_REF.fullmatch(profile_ref):
+                raise PlanControlError(
+                    "START_OPTIONS_INVALID", "Runtime Profile ref is invalid"
+                )
+            normalized.append((ticket_key, role, profile_ref))
+        if len({(item[0], item[1]) for item in normalized}) != len(normalized):
             raise PlanControlError(
                 "START_OPTIONS_INVALID",
-                "expected_previous_revision_digest must be a SHA-256 digest",
+                "Runtime overrides repeat an exact Ticket and role",
             )
-        return cls(campaign_key=campaign_key, expected_previous_revision_digest=previous)
-
-
-@dataclass(frozen=True)
-class PlanRevision:
-    """An immutable canonical PlanSpec v3 revision."""
-
-    repository: str
-    campaign_key: str
-    digest: str
-    canonical_bytes: bytes
-    snapshot_digest: str
-
-    @property
-    def plan_spec(self) -> dict[str, Any]:
-        """Return a new decoded projection; callers cannot mutate durable bytes."""
-
-        return json.loads(self.canonical_bytes)
-
-
-@dataclass(frozen=True)
-class ActivationReceiptV3:
-    repository: str
-    campaign_key: str
-    revision_digest: str
-    expected_previous_revision_digest: str | None
-    writer_generation: str
-
-
-@dataclass(frozen=True)
-class ActiveCampaign:
-    handle: CampaignHandle
-    revision: PlanRevision
-    receipt: ActivationReceiptV3
-
-    @property
-    def plan_spec(self) -> dict[str, Any]:
-        return self.revision.plan_spec
-
-    @property
-    def digest(self) -> str:
-        return self.revision.digest
-
-    @property
-    def canonical_bytes(self) -> bytes:
-        return self.revision.canonical_bytes
-
-
-@dataclass(frozen=True)
-class _TicketSnapshot:
-    key: str
-    labels: tuple[str, ...]
-    source: dict[str, str]
-    contract: dict[str, Any]
-    native_blockers: tuple[dict[str, str], ...]
+        return cls(runtime_profile_overrides=tuple(sorted(normalized)))
 
     def as_value(self) -> dict[str, Any]:
         return {
-            "key": self.key,
-            "labels": list(self.labels),
-            "source": self.source,
-            "contract": self.contract,
-            "native_blockers": list(self.native_blockers),
+            "runtime_profile_overrides": [
+                {
+                    "ticket_key": ticket_key,
+                    "role": role,
+                    "profile_ref": profile_ref,
+                }
+                for ticket_key, role, profile_ref in sorted(
+                    self.runtime_profile_overrides
+                )
+            ]
         }
 
 
-@dataclass(frozen=True)
-class CampaignSnapshot:
-    """The complete authoritative start input, normalized before planning."""
-
-    repository: str
-    target_branch: str
-    campaign_source: dict[str, str]
-    policy: dict[str, Any]
-    tickets: tuple[_TicketSnapshot, ...]
-
-    @classmethod
-    def from_value(cls, value: CampaignSnapshot | Mapping[str, Any]) -> CampaignSnapshot:
-        if isinstance(value, cls):
-            return value
-        if not isinstance(value, Mapping):
-            raise PlanControlError("SNAPSHOT_INVALID", "Campaign snapshot must be an object")
-        expected = {"repository", "target_branch", "campaign_source", "policy", "tickets"}
-        if set(value) != expected:
-            raise PlanControlError(
-                "SNAPSHOT_INVALID",
-                "Campaign snapshot must contain repository, target_branch, campaign_source, policy, and tickets",
-            )
-        repository = _nonempty_string(value["repository"], "snapshot repository")
-        target_branch = _nonempty_string(value["target_branch"], "target branch")
-        campaign_source = _frozen_ref(value["campaign_source"], "Campaign source")
-        policy = _json_object(value["policy"], "Policy Witness")
-        raw_tickets = value["tickets"]
-        if not isinstance(raw_tickets, Sequence) or isinstance(raw_tickets, (str, bytes)):
-            raise PlanControlError("SNAPSHOT_INVALID", "tickets must be a list")
-        tickets = tuple(sorted((_ticket_snapshot(ticket) for ticket in raw_tickets), key=lambda ticket: ticket.key))
-        return cls(
-            repository=repository,
-            target_branch=target_branch,
-            campaign_source=campaign_source,
-            policy=policy,
-            tickets=tickets,
-        )
-
-    def as_value(self) -> dict[str, Any]:
-        return {
-            "repository": self.repository,
-            "target_branch": self.target_branch,
-            "campaign_source": self.campaign_source,
-            "policy": self.policy,
-            "tickets": [ticket.as_value() for ticket in self.tickets],
-        }
-
-
-@dataclass(frozen=True)
-class _PlanningReservation:
-    repository: str
-    campaign_key: str
-    snapshot_digest: str
-    planning_id: str
-    state: str
-    intent: dict[str, Any] | None
-
-
-class CampaignSource(Protocol):
+class _CampaignSource(Protocol):
     def snapshot(
         self, repository: str, ready_refs: tuple[str, ...]
-    ) -> CampaignSnapshot | Mapping[str, Any]: ...
+    ) -> Mapping[str, Any]: ...
 
 
-class PlanningPass(Protocol):
-    def plan(self, snapshot: CampaignSnapshot, planning_id: str) -> Mapping[str, Any]: ...
+class _PlanningPass(Protocol):
+    def plan(self, snapshot: object, planning_action_id: str) -> Mapping[str, Any]: ...
 
 
-class PlanControlStore(Protocol):
-    def assert_claims_available(
-        self, handle: CampaignHandle, ticket_keys: tuple[str, ...]
-    ) -> None: ...
-
-    def reserve_planning(
-        self, handle: CampaignHandle, snapshot_digest: str
-    ) -> _PlanningReservation: ...
-
-    def begin_planning(self, reservation: _PlanningReservation) -> bool: ...
-
-    def persist_intent(
-        self, reservation: _PlanningReservation, intent: dict[str, Any]
-    ) -> _PlanningReservation: ...
-
-    def publish_revision(self, revision: PlanRevision) -> None: ...
-
-    def read_revision(self, handle: CampaignHandle, digest: str) -> PlanRevision | None: ...
-
-    def activate(
-        self,
-        handle: CampaignHandle,
-        revision: PlanRevision,
-        *,
-        expected_previous_revision_digest: str | None,
-        writer_generation: str,
-        ticket_keys: tuple[str, ...],
-    ) -> ActivationReceiptV3: ...
-
-    def read_receipt(
-        self, handle: CampaignHandle, revision_digest: str
-    ) -> ActivationReceiptV3 | None: ...
-
-    def finalize_activation(
-        self,
-        handle: CampaignHandle,
-        revision: PlanRevision,
-        receipt: ActivationReceiptV3,
-    ) -> ActiveCampaign: ...
-
-    def read_active(self, handle: CampaignHandle) -> ActiveCampaign | None: ...
-
-
-class InMemoryCampaignSource:
-    """Contract fake for tests; production source readback remains a private adapter."""
-
-    def __init__(
-        self,
-        *,
-        repository: str,
-        target_branch: str,
-        campaign_source: Mapping[str, Any],
-        policy: Mapping[str, Any],
-        tickets: Mapping[str, Mapping[str, Any]],
-    ):
-        self.repository = repository
-        self.target_branch = target_branch
-        self.campaign_source = _copy_json(campaign_source)
-        self.policy = _copy_json(policy)
-        self.tickets = {key: _copy_json(ticket) for key, ticket in tickets.items()}
-        self.calls = 0
-
-    def snapshot(self, repository: str, ready_refs: tuple[str, ...]) -> dict[str, Any]:
-        self.calls += 1
-        if repository != self.repository:
-            raise PlanControlError("SNAPSHOT_REPOSITORY_MISMATCH", "source repository differs")
-        missing = [key for key in ready_refs if key not in self.tickets]
-        if missing:
-            raise PlanControlError(
-                "SNAPSHOT_TICKET_MISSING", f"selected Ticket is absent: {missing[0]}"
-            )
-        return {
-            "repository": self.repository,
-            "target_branch": self.target_branch,
-            "campaign_source": _copy_json(self.campaign_source),
-            "policy": _copy_json(self.policy),
-            "tickets": [_copy_json(self.tickets[key]) for key in ready_refs],
+def _decision_bytes(
+    *,
+    repository: str,
+    campaign_key: str,
+    snapshot_digest: str,
+    planning_action_id: str,
+    findings: tuple[DecisionFinding, ...],
+) -> bytes:
+    return _strict_json_bytes(
+        {
+            "schema_version": 1,
+            "repository": repository,
+            "campaign_key": campaign_key,
+            "snapshot_digest": snapshot_digest,
+            "planning_action_id": planning_action_id,
+            "findings": [finding.as_value() for finding in sorted(findings)],
         }
+    )
 
 
-class InMemoryPlanningPass:
-    """A strict, observable planning-pass fake used by behavior tests."""
-
-    def __init__(self, intent: Mapping[str, Any]):
-        self._intent = _copy_json(intent)
-        self.calls = 0
-        self.planning_ids: list[str] = []
-        self.snapshots: list[CampaignSnapshot] = []
-
-    def plan(self, snapshot: CampaignSnapshot, planning_id: str) -> dict[str, Any]:
-        self.calls += 1
-        self.planning_ids.append(planning_id)
-        self.snapshots.append(snapshot)
-        return _copy_json(self._intent)
-
-
-class InMemoryPlanControlStore:
-    """Atomic in-memory durable control record with Campaign-scoped CAS and claims."""
-
-    def __init__(self):
-        self._lock = RLock()
-        self._planning: dict[tuple[str, str, str], _PlanningReservation] = {}
-        self._revisions: dict[tuple[str, str, str], PlanRevision] = {}
-        self._active: dict[CampaignHandle, ActiveCampaign] = {}
-        self._pending: dict[
-            CampaignHandle, tuple[PlanRevision, ActivationReceiptV3, tuple[str, ...]]
-        ] = {}
-        self._receipts: dict[tuple[CampaignHandle, str], ActivationReceiptV3] = {}
-        self._claims: dict[tuple[str, str], CampaignHandle] = {}
-
-    def reserve_planning(
-        self, handle: CampaignHandle, snapshot_digest: str
-    ) -> _PlanningReservation:
-        key = (handle.repository, handle.campaign_key, snapshot_digest)
-        with self._lock:
-            existing = self._planning.get(key)
-            if existing is not None:
-                return existing
-            reservation = _PlanningReservation(
-                repository=handle.repository,
-                campaign_key=handle.campaign_key,
-                snapshot_digest=snapshot_digest,
-                planning_id=f"planning:{digest_value({'repository': handle.repository, 'campaign_key': handle.campaign_key, 'snapshot_digest': snapshot_digest})}",
-                state="reserved",
-                intent=None,
+def _decision_from_bytes(value: bytes) -> PlanControlDecision:
+    payload = _strict_json_decode(value)
+    expected = {
+        "schema_version",
+        "repository",
+        "campaign_key",
+        "snapshot_digest",
+        "planning_action_id",
+        "findings",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected
+        or payload["schema_version"] != 1
+        or not isinstance(payload["repository"], str)
+        or not payload["repository"]
+        or not isinstance(payload["campaign_key"], str)
+        or not payload["campaign_key"]
+        or not isinstance(payload["snapshot_digest"], str)
+        or not _DIGEST.fullmatch(payload["snapshot_digest"])
+        or not isinstance(payload["planning_action_id"], str)
+        or not payload["planning_action_id"].startswith("planning:")
+        or not isinstance(payload["findings"], list)
+        or not payload["findings"]
+    ):
+        raise PlanControlError(
+            "DECISION_READBACK_INVALID", "Decision record is malformed"
+        )
+    findings_list: list[DecisionFinding] = []
+    for item in payload["findings"]:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"code", "detail", "ticket_key"}
+            or not isinstance(item["code"], str)
+            or not item["code"]
+            or not isinstance(item["detail"], str)
+            or not item["detail"]
+            or (
+                item["ticket_key"] is not None
+                and (
+                    not isinstance(item["ticket_key"], str)
+                    or not item["ticket_key"]
+                )
             )
-            self._planning[key] = reservation
-            return reservation
-
-    def begin_planning(self, reservation: _PlanningReservation) -> bool:
-        key = (reservation.repository, reservation.campaign_key, reservation.snapshot_digest)
-        with self._lock:
-            current = self._planning.get(key)
-            if current is None or current.planning_id != reservation.planning_id:
-                raise PlanControlError("PLANNING_RESERVATION_LOST", "planning reservation changed")
-            if current.intent is not None or current.state == "planning":
-                return False
-            if current.state != "reserved":
-                raise PlanControlError("PLANNING_READBACK_AMBIGUOUS", "planning state is invalid")
-            self._planning[key] = _PlanningReservation(
-                repository=current.repository,
-                campaign_key=current.campaign_key,
-                snapshot_digest=current.snapshot_digest,
-                planning_id=current.planning_id,
-                state="planning",
-                intent=None,
+        ):
+            raise PlanControlError(
+                "DECISION_READBACK_INVALID",
+                "Decision finding is malformed",
             )
-            return True
-
-    def assert_claims_available(
-        self, handle: CampaignHandle, ticket_keys: tuple[str, ...]
-    ) -> None:
-        with self._lock:
-            for ticket_key in ticket_keys:
-                owner = self._claims.get((handle.repository, ticket_key))
-                if owner is not None and owner != handle:
-                    raise PlanControlError(
-                        "TICKET_CLAIM_CONFLICT",
-                        f"Ticket {ticket_key} is claimed by another Campaign",
-                    )
-
-    def persist_intent(
-        self, reservation: _PlanningReservation, intent: dict[str, Any]
-    ) -> _PlanningReservation:
-        key = (reservation.repository, reservation.campaign_key, reservation.snapshot_digest)
-        normalized = _copy_json(intent)
-        with self._lock:
-            current = self._planning.get(key)
-            if current is None or current.planning_id != reservation.planning_id:
-                raise PlanControlError("PLANNING_RESERVATION_LOST", "planning reservation changed")
-            if current.intent is not None:
-                if current.intent != normalized:
-                    raise PlanControlError(
-                        "PLANNING_INTENT_CONFLICT", "a Planning Pass already produced another intent"
-                    )
-                return current
-            if current.state != "planning":
-                raise PlanControlError(
-                    "PLANNING_READBACK_AMBIGUOUS", "Planning Pass was not durably begun"
-                )
-            updated = _PlanningReservation(
-                repository=current.repository,
-                campaign_key=current.campaign_key,
-                snapshot_digest=current.snapshot_digest,
-                planning_id=current.planning_id,
-                state="intended",
-                intent=normalized,
+        findings_list.append(
+            DecisionFinding(
+                code=item["code"],
+                detail=item["detail"],
+                ticket_key=item["ticket_key"],
             )
-            self._planning[key] = updated
-            return updated
-
-    def publish_revision(self, revision: PlanRevision) -> None:
-        key = (revision.repository, revision.campaign_key, revision.digest)
-        with self._lock:
-            existing = self._revisions.get(key)
-            if existing is not None and existing != revision:
-                raise PlanControlError(
-                    "PLAN_REVISION_IMMUTABLE", "an immutable Plan Revision differs at the same digest"
-                )
-            self._revisions[key] = revision
-
-    def read_revision(self, handle: CampaignHandle, digest: str) -> PlanRevision | None:
-        with self._lock:
-            return self._revisions.get((handle.repository, handle.campaign_key, digest))
-
-    def activate(
-        self,
-        handle: CampaignHandle,
-        revision: PlanRevision,
-        *,
-        expected_previous_revision_digest: str | None,
-        writer_generation: str,
-        ticket_keys: tuple[str, ...],
-    ) -> ActivationReceiptV3:
-        with self._lock:
-            pending = self._pending.get(handle)
-            if pending is not None:
-                pending_revision, pending_receipt, _pending_ticket_keys = pending
-                if (
-                    pending_revision == revision
-                    and pending_receipt.expected_previous_revision_digest
-                    == expected_previous_revision_digest
-                ):
-                    return pending_receipt
-                raise PlanControlError(
-                    "ACTIVATION_PENDING_CONFLICT",
-                    "a different Activation is pending receipt readback",
-                )
-            existing = self._active.get(handle)
-            existing_receipt = self._receipts.get((handle, revision.digest))
-            if existing is not None and existing.revision.digest == revision.digest:
-                if (
-                    existing.receipt.expected_previous_revision_digest
-                    != expected_previous_revision_digest
-                ):
-                    raise PlanControlError(
-                        "ACTIVATION_CAS_CONFLICT", "retry has a different expected previous revision"
-                    )
-                return existing.receipt
-            actual_previous = None if existing is None else existing.revision.digest
-            if actual_previous != expected_previous_revision_digest:
-                raise PlanControlError(
-                    "ACTIVATION_CAS_CONFLICT",
-                    "active Campaign revision differs from the expected previous revision",
-                )
-            for ticket_key in ticket_keys:
-                owner = self._claims.get((handle.repository, ticket_key))
-                if owner is not None and owner != handle:
-                    raise PlanControlError(
-                        "TICKET_CLAIM_CONFLICT",
-                        f"Ticket {ticket_key} is claimed by another Campaign",
-                    )
-            for ticket_key in ticket_keys:
-                self._claims[(handle.repository, ticket_key)] = handle
-            receipt = ActivationReceiptV3(
-                repository=handle.repository,
-                campaign_key=handle.campaign_key,
-                revision_digest=revision.digest,
-                expected_previous_revision_digest=expected_previous_revision_digest,
-                writer_generation=writer_generation,
-            )
-            if existing_receipt is not None and existing_receipt != receipt:
-                raise PlanControlError(
-                    "ACTIVATION_RECEIPT_CONFLICT", "a receipt at this revision differs"
-                )
-            self._receipts[(handle, revision.digest)] = receipt
-            self._pending[handle] = (revision, receipt, ticket_keys)
-            return receipt
-
-    def read_receipt(
-        self, handle: CampaignHandle, revision_digest: str
-    ) -> ActivationReceiptV3 | None:
-        with self._lock:
-            return self._receipts.get((handle, revision_digest))
-
-    def finalize_activation(
-        self,
-        handle: CampaignHandle,
-        revision: PlanRevision,
-        receipt: ActivationReceiptV3,
-    ) -> ActiveCampaign:
-        with self._lock:
-            existing = self._active.get(handle)
-            if existing is not None and existing.revision == revision and existing.receipt == receipt:
-                return existing
-            pending = self._pending.get(handle)
-            if pending is None or pending[0] != revision or pending[1] != receipt:
-                raise PlanControlError(
-                    "ACTIVATION_FINALIZE_MISMATCH",
-                    "Activation can finalize only from its read-backed Receipt",
-                )
-            ticket_keys = set(pending[2])
-            for claim_key, owner in tuple(self._claims.items()):
-                if owner == handle and claim_key[1] not in ticket_keys:
-                    del self._claims[claim_key]
-            active = ActiveCampaign(handle=handle, revision=revision, receipt=receipt)
-            self._active[handle] = active
-            del self._pending[handle]
-            return active
-
-    def read_active(self, handle: CampaignHandle) -> ActiveCampaign | None:
-        with self._lock:
-            return self._active.get(handle)
-
-    def claimed_ticket_keys(self, handle: CampaignHandle) -> frozenset[str]:
-        with self._lock:
-            return frozenset(
-                ticket_key
-                for (repository, ticket_key), owner in self._claims.items()
-                if repository == handle.repository and owner == handle
-            )
+        )
+    findings = tuple(sorted(findings_list))
+    if tuple(findings_list) != findings or len(set(findings)) != len(findings):
+        raise PlanControlError(
+            "DECISION_READBACK_INVALID",
+            "Decision findings are not canonical",
+        )
+    return PlanControlDecision(
+        repository=payload["repository"],
+        campaign_key=payload["campaign_key"],
+        snapshot_digest=payload["snapshot_digest"],
+        planning_action_id=payload["planning_action_id"],
+        findings=findings,
+        decision_digest=_digest(value),
+    )
 
 
-class PlanControl:
-    """Own selected-Ticket planning, V3 compilation, publication, and activation."""
+class _PlanControl:
+    """The private PlanControl deep module."""
 
     def __init__(
         self,
         *,
-        source: CampaignSource,
-        planner: PlanningPass,
-        store: PlanControlStore,
+        source: _CampaignSource,
+        planner: _PlanningPass,
+        journal: _SQLiteV3Journal,
+        durable: _GitHubV3Control,
+        writer: _WriterAuthority,
         max_snapshot_bytes: int = 1_000_000,
-        writer_generation: str = "v8",
         checkpoint: Callable[[str], None] | None = None,
     ):
-        if not isinstance(max_snapshot_bytes, int) or max_snapshot_bytes <= 0:
-            raise ValueError("max_snapshot_bytes must be positive")
+        if not isinstance(journal, _SQLiteV3Journal) or not isinstance(
+            durable, _GitHubV3Control
+        ):
+            raise PlanControlError(
+                "PLAN_CONTROL_COMPOSITION_INVALID",
+                "PlanControl requires the independent V3 journal and GitHub CAS",
+            )
+        if max_snapshot_bytes < 1:
+            raise PlanControlError(
+                "PLAN_CONTROL_COMPOSITION_INVALID",
+                "max_snapshot_bytes must be positive",
+            )
         self.source = source
         self.planner = planner
-        self.store = store
+        self.journal = journal
+        self.durable = durable
+        self.writer = writer
         self.max_snapshot_bytes = max_snapshot_bytes
-        self.writer_generation = writer_generation
         self.checkpoint = checkpoint
 
     def start(
@@ -597,466 +295,724 @@ class PlanControl:
         repository: str,
         ready_refs: Sequence[str],
         options: CampaignStartOptions | Mapping[str, Any] | None = None,
+        *,
+        _campaign_key: str | None = None,
+        _expected_previous_revision_digest: str | None | object = _AUTO_PREVIOUS,
     ) -> CampaignHandle:
-        repository = _nonempty_string(repository, "repository")
+        repository = _require_string(repository, "repository")
         refs = _ready_refs(ready_refs)
-        options_value = CampaignStartOptions.from_value(options)
-        snapshot = CampaignSnapshot.from_value(self.source.snapshot(repository, refs))
-        _validate_snapshot(snapshot, repository, refs)
-        snapshot_value = snapshot.as_value()
-        snapshot_bytes = canonical_bytes(snapshot_value)
-        snapshot_digest = digest_bytes(snapshot_bytes)
-        if len(snapshot_bytes) > self.max_snapshot_bytes:
-            raise PlanControlDecision(
-                SplitCampaignDecision(
-                    kind="SplitCampaign",
-                    snapshot_digest=snapshot_digest,
-                    actual_bytes=len(snapshot_bytes),
-                    max_bytes=self.max_snapshot_bytes,
+        option_value = CampaignStartOptions.from_value(options)
+        raw_snapshot = self.source.snapshot(repository, refs)
+        # Canonicalize before any semantic call or durable claim.
+        snapshot = _normalize_snapshot(raw_snapshot, repository, refs)
+        snapshot_bytes = _strict_json_bytes(snapshot)
+        snapshot_digest = _digest(snapshot_bytes)
+        _validate_options_for_tickets(option_value, set(refs))
+        options_bytes = _strict_json_bytes(option_value.as_value())
+        options_digest = _digest(options_bytes)
+        campaign_key = _campaign_key or (
+            "campaign:"
+            + _digest(
+                _strict_json_bytes(
+                    {"repository": repository, "ready_refs": list(refs)}
+                )
+            )[:24]
+        )
+        handle = CampaignHandle(repository, campaign_key)
+        expected_previous = (
+            self.durable.active_digest(handle)
+            if _expected_previous_revision_digest is _AUTO_PREVIOUS
+            else _expected_previous_revision_digest
+        )
+        planning_action_id = (
+            "planning:"
+            + _digest(
+                _strict_json_bytes(
+                    {
+                        "repository": repository,
+                        "campaign_key": campaign_key,
+                        "snapshot_digest": snapshot_digest,
+                    }
                 )
             )
-        campaign_key = options_value.campaign_key or _default_campaign_key(repository, refs)
-        handle = CampaignHandle(repository=repository, campaign_key=campaign_key)
-        self.store.assert_claims_available(
-            handle, tuple(ticket.key for ticket in snapshot.tickets)
         )
-        reservation = self.store.reserve_planning(handle, snapshot_digest)
-        if reservation.intent is None:
-            if not self.store.begin_planning(reservation):
-                raise PlanControlError(
-                    "PLANNING_READBACK_AMBIGUOUS",
-                    "Planning Pass was reserved but its private intent was not read back",
-                )
-            raw_intent = self.planner.plan(snapshot, reservation.planning_id)
-            intent = _validate_plan_intent(raw_intent, snapshot)
-            reservation = self.store.persist_intent(reservation, intent)
-            self._checkpoint("planning_intent_read_back")
-        else:
-            intent = _validate_plan_intent(reservation.intent, snapshot)
-        _raise_decision_requirements(intent, snapshot_digest)
-        revision = _compile_v3(
-            snapshot=snapshot,
+        record = _JournalRecord(
+            repository=repository,
+            campaign_key=campaign_key,
             snapshot_digest=snapshot_digest,
-            handle=handle,
-            intent=intent,
+            state=_STATE_SNAPSHOTTED,
+            snapshot_bytes=snapshot_bytes,
+            options_bytes=options_bytes,
+            options_digest=options_digest,
+            planning_action_id=planning_action_id,
+            expected_previous_revision_digest=expected_previous,
         )
-        self.store.publish_revision(revision)
-        self._checkpoint("plan_published")
-        if self.store.read_revision(handle, revision.digest) != revision:
-            raise PlanControlError(
-                "PLAN_READBACK_MISMATCH", "published Plan Revision did not read back exactly"
-            )
-        self._checkpoint("plan_read_back")
-        receipt = self.store.activate(
-            handle,
-            revision,
-            expected_previous_revision_digest=options_value.expected_previous_revision_digest,
-            writer_generation=self.writer_generation,
-            ticket_keys=tuple(ticket.key for ticket in snapshot.tickets),
+        existing = self.journal.read(repository, campaign_key, snapshot_digest)
+        record = self.journal.save(existing or record)
+        if record.state in {
+            _STATE_DECISION_REQUIRED,
+            _STATE_PLANNING_AMBIGUOUS,
+        }:
+            self._raise_persisted_decision(record)
+        self._checkpoint(_STATE_SNAPSHOTTED)
+        self.durable.publish_artifact(repository, "snapshots", snapshot_bytes)
+        runtime_facts_digest = self.durable.publish_artifact(
+            repository, "runtime-facts", options_bytes
         )
-        self._checkpoint("activation_cas")
-        if self.store.read_receipt(handle, revision.digest) != receipt:
+        if runtime_facts_digest != options_digest:
             raise PlanControlError(
-                "ACTIVATION_RECEIPT_READBACK_MISMATCH",
-                "Activation Receipt did not read back exactly",
+                "RUNTIME_FACTS_DIGEST_MISMATCH",
+                "durable Runtime facts differ from the validated start options",
             )
-        self._checkpoint("activation_receipt_read_back")
-        active = self.store.finalize_activation(handle, revision, receipt)
-        if active.revision != revision or active.receipt != receipt:
+        if len(snapshot_bytes) > self.max_snapshot_bytes:
+            self._raise_decision(
+                record,
+                (
+                    DecisionFinding(
+                        code="SPLIT_CAMPAIGN_REQUIRED",
+                        detail=(
+                            f"snapshot has {len(snapshot_bytes)} bytes; "
+                            f"limit is {self.max_snapshot_bytes}"
+                        ),
+                    ),
+                ),
+                durable_state=False,
+            )
+        witness = self._writer_witness(repository)
+        try:
+            campaign = self.durable.reserve_claims(
+                handle=handle,
+                snapshot_digest=snapshot_digest,
+                runtime_facts_digest=runtime_facts_digest,
+                planning_action_id=planning_action_id,
+                expected_previous_revision_digest=expected_previous,
+                ticket_keys=refs,
+                witness=witness,
+            )
+        except _ClaimConflict as conflict:
+            self._raise_decision(record, conflict.findings, durable_state=False)
+        durable_state = campaign.get("state")
+        if not isinstance(durable_state, str):
             raise PlanControlError(
-                "ACTIVATION_READBACK_MISMATCH",
-                "active Campaign did not read back from the Activation Receipt",
+                "DURABLE_CONTROL_INVALID",
+                "reserved Campaign has no state",
             )
-        return handle
+        record = self.journal.save(
+            replace(
+                record,
+                state=(
+                    record.state
+                    if record.state == _STATE_ACTIVE_LOCAL
+                    else durable_state
+                ),
+                writer_generation=campaign.get("writer_generation"),
+                writer_witness_digest=campaign.get(
+                    "writer_witness_digest"
+                ),
+            )
+        )
+        if durable_state == _STATE_CLAIMS_RESERVED:
+            self._checkpoint(_STATE_CLAIMS_RESERVED)
+        return self._continue(record, campaign, handle)
 
-    def read_active(self, handle: CampaignHandle) -> ActiveCampaign:
-        active = self.store.read_active(handle)
+    def _continue(
+        self,
+        record: _JournalRecord,
+        campaign: dict[str, Any],
+        handle: CampaignHandle,
+    ) -> CampaignHandle:
+        state = campaign["state"]
+        if state in {_STATE_DECISION_REQUIRED, _STATE_PLANNING_AMBIGUOUS}:
+            decision_digest = campaign.get("decision_digest")
+            if not isinstance(decision_digest, str):
+                raise PlanControlError(
+                    "DECISION_READBACK_INVALID",
+                    "durable Decision has no digest",
+                )
+            decision_bytes = self.durable.read_artifact(
+                handle.repository, "decisions", decision_digest
+            )
+            decision = _decision_from_bytes(decision_bytes)
+            self._validate_decision_identity(decision, record)
+            raise decision
+        if state == _STATE_PLANNING_STARTED:
+            self._raise_decision(
+                record,
+                (
+                    DecisionFinding(
+                        code="PLANNING_AMBIGUOUS",
+                        detail=(
+                            "Planning Pass may already have run; "
+                            "a second invocation is forbidden"
+                        ),
+                    ),
+                ),
+                ambiguous=True,
+            )
+        if state == _STATE_CLAIMS_RESERVED:
+            if not self.durable.begin_planning(handle):
+                refreshed = self.durable.campaign(handle)
+                if refreshed is None:
+                    raise PlanControlError(
+                        "CAMPAIGN_RESERVATION_MISSING",
+                        "Campaign disappeared before planning",
+                    )
+                return self._continue(record, refreshed, handle)
+            record = self.journal.save(
+                replace(record, state=_STATE_PLANNING_STARTED)
+            )
+            self._checkpoint(_STATE_PLANNING_STARTED)
+            snapshot_bytes = self._persisted_snapshot(record)
+            planner_view = _deep_immutable(_strict_json_decode(snapshot_bytes))
+            try:
+                raw_intent = self.planner.plan(
+                    planner_view, record.planning_action_id
+                )
+                # Copy the returned object immediately and reject non-JSON.
+                returned_bytes = _strict_json_bytes(raw_intent)
+            except Exception as error:
+                self._raise_decision(
+                    record,
+                    (
+                        DecisionFinding(
+                            code="PLANNING_AMBIGUOUS",
+                            detail=f"Planning reply was not durably accepted: {error}",
+                        ),
+                    ),
+                    ambiguous=True,
+                )
+            self._checkpoint("PLANNING_REPLY_RECEIVED")
+            # The semantic call is an untrusted boundary. Re-read the local and
+            # durable preplanning snapshot before accepting any returned intent.
+            snapshot_bytes = self._persisted_snapshot(record)
+            snapshot = _strict_json_decode(snapshot_bytes)
+            try:
+                intent = _normalize_intent(
+                    _strict_json_decode(returned_bytes), snapshot
+                )
+            except PlanControlError as error:
+                self._raise_decision(
+                    record,
+                    (
+                        DecisionFinding(
+                            code=error.code,
+                            detail=error.detail,
+                        ),
+                    ),
+                )
+            except Exception:
+                self._raise_decision(
+                    record,
+                    (
+                        DecisionFinding(
+                            code="PLAN_INTENT_INVALID",
+                            detail=(
+                                "Planning reply could not be validated as "
+                                "provider-neutral semantic intent"
+                            ),
+                        ),
+                    ),
+                )
+            intent_bytes = _strict_json_bytes(intent)
+            if intent["decision_requirements"]:
+                findings = tuple(
+                    DecisionFinding(
+                        code=item["code"],
+                        detail=item["detail"],
+                        ticket_key=item["ticket_key"],
+                    )
+                    for item in intent["decision_requirements"]
+                )
+                self._raise_decision(record, findings)
+            intent_digest = self.durable.publish_artifact(
+                handle.repository, "intents", intent_bytes
+            )
+            campaign = self.durable.accept_intent(handle, intent_digest)
+            record = self.journal.save(
+                replace(
+                    record,
+                    state=_STATE_INTENT_ACCEPTED,
+                    intent_bytes=intent_bytes,
+                    intent_digest=intent_digest,
+                )
+            )
+            self._checkpoint(_STATE_INTENT_ACCEPTED)
+            state = _STATE_INTENT_ACCEPTED
+        if state == _STATE_INTENT_ACCEPTED:
+            intent_digest = campaign.get("intent_digest")
+            if record.intent_bytes is None:
+                if not isinstance(intent_digest, str):
+                    raise PlanControlError(
+                        "PLAN_INTENT_READBACK_MISMATCH",
+                        "durable Campaign has no Plan Intent digest",
+                    )
+                intent_bytes = self.durable.read_artifact(
+                    handle.repository, "intents", intent_digest
+                )
+                record = self.journal.save(
+                    replace(
+                        record,
+                        intent_bytes=intent_bytes,
+                        intent_digest=intent_digest,
+                    )
+                )
+            revision = self._compile_from_journal(record, handle)
+            plan_digest = self.durable.publish_artifact(
+                handle.repository, "plans", revision.canonical_bytes
+            )
+            if plan_digest != revision.digest:
+                raise PlanControlError(
+                    "PLAN_DIGEST_MISMATCH",
+                    "published PlanSpec digest differs from compilation",
+                )
+            self._checkpoint("PLAN_ARTIFACT_PUBLISHED")
+            readback = self.durable.read_artifact(
+                handle.repository, "plans", revision.digest
+            )
+            if readback != revision.canonical_bytes:
+                raise PlanControlError(
+                    "PLAN_READBACK_MISMATCH",
+                    "published PlanSpec bytes differ",
+                )
+            self._checkpoint("PLAN_READ_BACK")
+            campaign = self.durable.mark_plan_published(
+                handle, revision.digest
+            )
+            record = self.journal.save(
+                replace(
+                    record,
+                    state=_STATE_PLAN_PUBLISHED,
+                    plan_bytes=revision.canonical_bytes,
+                    plan_digest=revision.digest,
+                )
+            )
+            self._checkpoint(_STATE_PLAN_PUBLISHED)
+            state = _STATE_PLAN_PUBLISHED
+        if state == _STATE_PLAN_PUBLISHED:
+            revision = self._revision_from_record(record, handle)
+            witness = self._writer_witness(handle.repository)
+            if (
+                witness.writer_generation != record.writer_generation
+                or witness.digest != record.writer_witness_digest
+            ):
+                self._raise_decision(
+                    record,
+                    (
+                        DecisionFinding(
+                            code="WRITER_WITNESS_CHANGED",
+                            detail=(
+                                "writer authority changed after claim reservation"
+                            ),
+                        ),
+                    ),
+                )
+            receipt_bytes = self.durable.activate(
+                handle=handle, revision=revision, witness=witness
+            )
+            self._checkpoint(_STATE_ACTIVATION_COMMITTED)
+            campaign = self.durable.campaign(handle)
+            if campaign is None:
+                raise PlanControlError(
+                    "ACTIVATION_RECEIPT_INVALID",
+                    "durable activation record disappeared",
+                )
+            receipt = self._receipt_from_bytes(receipt_bytes)
+            self._validate_receipt_identity(
+                receipt,
+                handle=handle,
+                revision=revision,
+                campaign=campaign,
+            )
+            self._checkpoint("ACTIVATION_RECEIPT_READ_BACK")
+            self.journal.finalize(record, revision, receipt_bytes)
+            return handle
+        if state == _STATE_ACTIVATION_COMMITTED:
+            revision = self._revision_from_record(record, handle)
+            receipt_digest = campaign.get("receipt_digest")
+            if not isinstance(receipt_digest, str):
+                raise PlanControlError(
+                    "ACTIVATION_RECEIPT_INVALID",
+                    "committed Campaign has no receipt digest",
+                )
+            receipt_bytes = self.durable.read_artifact(
+                handle.repository, "receipts", receipt_digest
+            )
+            receipt = self._receipt_from_bytes(receipt_bytes)
+            self._validate_receipt_identity(
+                receipt,
+                handle=handle,
+                revision=revision,
+                campaign=campaign,
+            )
+            self.journal.finalize(record, revision, receipt_bytes)
+            return handle
+        raise PlanControlError(
+            "CAMPAIGN_STATE_INVALID", f"unsupported Campaign state {state}"
+        )
+
+    def _persisted_snapshot(self, record: _JournalRecord) -> bytes:
+        local = self.journal.read(
+            record.repository, record.campaign_key, record.snapshot_digest
+        )
+        if local is None or _digest(local.snapshot_bytes) != record.snapshot_digest:
+            raise PlanControlError(
+                "SNAPSHOT_DIGEST_MISMATCH",
+                "local preplanning snapshot did not read back exactly",
+            )
+        durable = self.durable.read_artifact(
+            record.repository, "snapshots", record.snapshot_digest
+        )
+        if durable != local.snapshot_bytes:
+            raise PlanControlError(
+                "SNAPSHOT_READBACK_MISMATCH",
+                "durable and local preplanning snapshots differ",
+            )
+        return local.snapshot_bytes
+
+    def _compile_from_journal(
+        self, record: _JournalRecord, handle: CampaignHandle
+    ) -> _PlanRevision:
+        current = self.journal.read(
+            record.repository, record.campaign_key, record.snapshot_digest
+        )
+        if (
+            current is None
+            or current.intent_bytes is None
+            or current.intent_digest is None
+        ):
+            raise PlanControlError(
+                "PLAN_INTENT_READBACK_MISMATCH",
+                "validated Plan Intent is missing from the V3 journal",
+            )
+        snapshot_bytes = self._persisted_snapshot(current)
+        durable_intent = self.durable.read_artifact(
+            record.repository, "intents", current.intent_digest
+        )
+        if durable_intent != current.intent_bytes:
+            raise PlanControlError(
+                "PLAN_INTENT_READBACK_MISMATCH",
+                "durable and local Plan Intent bytes differ",
+            )
+        revision = _compile_plan(
+            snapshot_bytes=snapshot_bytes,
+            snapshot_digest=current.snapshot_digest,
+            intent_bytes=current.intent_bytes,
+            intent_digest=current.intent_digest,
+            handle=handle,
+        )
+        _validate_plan_spec(revision.canonical_bytes)
+        if _digest(revision.canonical_bytes) != revision.digest:
+            raise PlanControlError(
+                "PLAN_DIGEST_MISMATCH", "PlanSpec authority root changed"
+            )
+        return revision
+
+    def _revision_from_record(
+        self, record: _JournalRecord, handle: CampaignHandle
+    ) -> _PlanRevision:
+        current = self.journal.read(
+            record.repository, record.campaign_key, record.snapshot_digest
+        )
+        if current is None or current.plan_digest is None:
+            campaign = self.durable.campaign(handle)
+            if campaign is None or not isinstance(
+                campaign.get("plan_digest"), str
+            ):
+                raise PlanControlError(
+                    "PLAN_READBACK_MISMATCH",
+                    "published Plan identity is missing",
+                )
+            plan_digest = campaign["plan_digest"]
+            plan_bytes = self.durable.read_artifact(
+                handle.repository, "plans", plan_digest
+            )
+            current = self.journal.save(
+                replace(
+                    record,
+                    state=record.state,
+                    plan_bytes=plan_bytes,
+                    plan_digest=plan_digest,
+                )
+            )
+        if current.plan_bytes is None or current.plan_digest is None:
+            raise PlanControlError(
+                "PLAN_READBACK_MISMATCH", "published Plan bytes are missing"
+            )
+        _validate_plan_spec(current.plan_bytes)
+        if _digest(current.plan_bytes) != current.plan_digest:
+            raise PlanControlError(
+                "PLAN_DIGEST_MISMATCH", "published Plan digest changed"
+            )
+        return _PlanRevision(
+            repository=handle.repository,
+            campaign_key=handle.campaign_key,
+            snapshot_digest=record.snapshot_digest,
+            canonical_bytes=current.plan_bytes,
+            digest=current.plan_digest,
+        )
+
+    def _receipt_from_bytes(self, value: bytes) -> _ActivationReceipt:
+        payload = _strict_json_decode(value)
+        expected = {
+            "schema_version",
+            "repository",
+            "campaign_key",
+            "revision_digest",
+            "expected_previous_revision_digest",
+            "writer_generation",
+            "writer_witness_digest",
+            "snapshot_digest",
+            "planning_action_id",
+            "ticket_keys",
+        }
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != expected
+            or payload["schema_version"] != 3
+            or not isinstance(payload["repository"], str)
+            or not payload["repository"]
+            or not isinstance(payload["campaign_key"], str)
+            or not payload["campaign_key"]
+            or not isinstance(payload["writer_generation"], str)
+            or not payload["writer_generation"]
+            or not isinstance(payload["planning_action_id"], str)
+            or not payload["planning_action_id"]
+            or not isinstance(payload["ticket_keys"], list)
+            or any(
+                not isinstance(item, str) or not item
+                for item in payload["ticket_keys"]
+            )
+            or len(set(payload["ticket_keys"])) != len(payload["ticket_keys"])
+            or payload["ticket_keys"] != sorted(payload["ticket_keys"])
+            or any(
+                not isinstance(payload[field], str)
+                or not _DIGEST.fullmatch(payload[field])
+                for field in (
+                    "revision_digest",
+                    "writer_witness_digest",
+                    "snapshot_digest",
+                )
+            )
+            or (
+                payload["expected_previous_revision_digest"] is not None
+                and (
+                    not isinstance(
+                        payload["expected_previous_revision_digest"], str
+                    )
+                    or not _DIGEST.fullmatch(
+                        payload["expected_previous_revision_digest"]
+                    )
+                )
+            )
+        ):
+            raise PlanControlError(
+                "ACTIVATION_RECEIPT_INVALID",
+                "Activation Receipt schema is invalid",
+            )
+        return _ActivationReceipt(
+            repository=payload["repository"],
+            campaign_key=payload["campaign_key"],
+            revision_digest=payload["revision_digest"],
+            expected_previous_revision_digest=payload[
+                "expected_previous_revision_digest"
+            ],
+            writer_generation=payload["writer_generation"],
+            writer_witness_digest=payload["writer_witness_digest"],
+            snapshot_digest=payload["snapshot_digest"],
+            planning_action_id=payload["planning_action_id"],
+            ticket_keys=tuple(payload["ticket_keys"]),
+        )
+
+    def _validate_receipt_identity(
+        self,
+        receipt: _ActivationReceipt,
+        *,
+        handle: CampaignHandle,
+        revision: _PlanRevision,
+        campaign: Mapping[str, Any],
+    ) -> None:
+        if (
+            receipt.repository != handle.repository
+            or receipt.campaign_key != handle.campaign_key
+            or receipt.revision_digest != revision.digest
+            or receipt.snapshot_digest != revision.snapshot_digest
+            or receipt.expected_previous_revision_digest
+            != campaign.get("expected_previous_revision_digest")
+            or receipt.writer_generation != campaign.get("writer_generation")
+            or receipt.writer_witness_digest
+            != campaign.get("writer_witness_digest")
+            or receipt.planning_action_id
+            != campaign.get("planning_action_id")
+            or list(receipt.ticket_keys) != campaign.get("ticket_keys")
+            or campaign.get("state") != _STATE_ACTIVATION_COMMITTED
+            or campaign.get("receipt_digest")
+            != _digest(_strict_json_bytes(receipt.as_value()))
+        ):
+            raise PlanControlError(
+                "ACTIVATION_RECEIPT_INVALID",
+                "Activation Receipt identities do not match durable control",
+            )
+
+    def _writer_witness(self, repository: str) -> _WriterWitness:
+        witness = self.writer.read(repository)
+        if (
+            witness.repository != repository
+            or not witness.writer_generation
+            or not _DIGEST.fullmatch(witness.digest)
+            or not witness.v8_start_allowed
+        ):
+            raise PlanControlError(
+                "WRITER_AUTHORITY_NOT_READY",
+                "writer authority does not allow V8 Campaign start",
+            )
+        return witness
+
+    def _raise_decision(
+        self,
+        record: _JournalRecord,
+        findings: tuple[DecisionFinding, ...],
+        *,
+        ambiguous: bool = False,
+        durable_state: bool = True,
+    ) -> None:
+        ordered = tuple(sorted(findings))
+        decision_bytes = _decision_bytes(
+            repository=record.repository,
+            campaign_key=record.campaign_key,
+            snapshot_digest=record.snapshot_digest,
+            planning_action_id=record.planning_action_id,
+            findings=ordered,
+        )
+        decision_digest = self.durable.publish_artifact(
+            record.repository, "decisions", decision_bytes
+        )
+        state = (
+            _STATE_PLANNING_AMBIGUOUS
+            if ambiguous
+            else _STATE_DECISION_REQUIRED
+        )
+        self.journal.save(
+            replace(
+                record,
+                state=state,
+                decision_bytes=decision_bytes,
+                decision_digest=decision_digest,
+            )
+        )
+        if durable_state:
+            self.durable.record_decision(
+                CampaignHandle(record.repository, record.campaign_key),
+                decision_digest,
+                ambiguous=ambiguous,
+            )
+        readback = self.durable.read_artifact(
+            record.repository, "decisions", decision_digest
+        )
+        if readback != decision_bytes:
+            raise PlanControlError(
+                "DECISION_READBACK_MISMATCH",
+                "Decision findings did not read back exactly",
+            )
+        decision = _decision_from_bytes(readback)
+        self._validate_decision_identity(decision, record)
+        raise decision
+
+    def _raise_persisted_decision(self, record: _JournalRecord) -> None:
+        if (
+            record.decision_bytes is None
+            or record.decision_digest is None
+            or _digest(record.decision_bytes) != record.decision_digest
+        ):
+            raise PlanControlError(
+                "DECISION_READBACK_MISMATCH",
+                "persisted Decision bytes or digest are missing",
+            )
+        readback = self.durable.read_artifact(
+            record.repository, "decisions", record.decision_digest
+        )
+        if readback != record.decision_bytes:
+            raise PlanControlError(
+                "DECISION_READBACK_MISMATCH",
+                "local and durable Decision bytes differ",
+            )
+        decision = _decision_from_bytes(readback)
+        self._validate_decision_identity(decision, record)
+        raise decision
+
+    @staticmethod
+    def _validate_decision_identity(
+        decision: PlanControlDecision,
+        record: _JournalRecord,
+    ) -> None:
+        if (
+            decision.repository != record.repository
+            or decision.campaign_key != record.campaign_key
+            or decision.snapshot_digest != record.snapshot_digest
+            or decision.planning_action_id != record.planning_action_id
+        ):
+            raise PlanControlError(
+                "DECISION_READBACK_INVALID",
+                "Decision identities differ from the Campaign snapshot",
+            )
+
+    def _read_active(self, handle: CampaignHandle) -> _ActiveCampaign:
+        active = self.journal.read_active(handle)
         if active is None:
-            raise PlanControlError("CAMPAIGN_NOT_ACTIVE", "Campaign has no read-backed active Plan Revision")
-        return active
+            raise PlanControlError(
+                "CAMPAIGN_NOT_ACTIVE",
+                "Campaign has no locally finalized Activation Receipt",
+            )
+        plan_digest, snapshot_digest, receipt_bytes = active
+        plan_bytes = self.durable.read_artifact(
+            handle.repository, "plans", plan_digest
+        )
+        _validate_plan_spec(plan_bytes)
+        revision = _PlanRevision(
+            repository=handle.repository,
+            campaign_key=handle.campaign_key,
+            snapshot_digest=snapshot_digest,
+            canonical_bytes=plan_bytes,
+            digest=plan_digest,
+        )
+        campaign = self.durable.campaign(handle)
+        if campaign is None:
+            raise PlanControlError(
+                "ACTIVATION_RECEIPT_INVALID",
+                "durable active Campaign record is missing",
+            )
+        receipt = self._receipt_from_bytes(receipt_bytes)
+        self._validate_receipt_identity(
+            receipt,
+            handle=handle,
+            revision=revision,
+            campaign=campaign,
+        )
+        return _ActiveCampaign(
+            handle=handle,
+            revision=revision,
+            receipt=receipt,
+        )
 
     def _checkpoint(self, boundary: str) -> None:
         if self.checkpoint is not None:
             self.checkpoint(boundary)
 
-
 def start(
     repository: str,
     ready_refs: Sequence[str],
-    options: CampaignStartOptions | Mapping[str, Any] | None = None,
-    *,
-    control: PlanControl,
+    options: CampaignStartOptions | None = None,
 ) -> CampaignHandle:
-    """Public V8 start seam; only a configured PlanControl may create Campaigns."""
+    """Start one V3 Campaign through lazy production PlanControl composition."""
 
+    control = _production_control()
+    if not isinstance(control, _PlanControl):
+        raise PlanControlError(
+            "PLAN_CONTROL_NOT_CONFIGURED",
+            "a real production V3 PlanControl composition is not installed",
+        )
+    if options is not None and not isinstance(options, CampaignStartOptions):
+        raise PlanControlError(
+            "START_OPTIONS_INVALID",
+            "public start options must be CampaignStartOptions",
+        )
     return control.start(repository, ready_refs, options)
-
-
-def _copy_json(value: Any) -> Any:
-    try:
-        return json.loads(canonical_bytes(value))
-    except (TypeError, ValueError) as error:
-        raise PlanControlError("SNAPSHOT_INVALID", "input must be canonical JSON data") from error
-
-
-def _json_object(value: Any, label: str) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        raise PlanControlError("SNAPSHOT_INVALID", f"{label} must be an object")
-    return _copy_json(value)
-
-
-def _nonempty_string(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise PlanControlError("SNAPSHOT_INVALID", f"{label} must be a non-empty string")
-    return value
-
-
-def _frozen_ref(value: Any, label: str) -> dict[str, str]:
-    if not isinstance(value, Mapping) or set(value) != {"ref", "digest"}:
-        raise PlanControlError("SNAPSHOT_INVALID", f"{label} must contain ref and digest")
-    return {
-        "ref": _nonempty_string(value["ref"], f"{label} ref"),
-        "digest": _nonempty_string(value["digest"], f"{label} digest"),
-    }
-
-
-def _ticket_snapshot(value: Any) -> _TicketSnapshot:
-    if not isinstance(value, Mapping):
-        raise PlanControlError("SNAPSHOT_INVALID", "Ticket snapshot must be an object")
-    expected = {"key", "labels", "source", "contract", "native_blockers"}
-    if set(value) != expected:
-        raise PlanControlError(
-            "SNAPSHOT_INVALID",
-            "Ticket snapshot must contain key, labels, source, contract, and native_blockers",
-        )
-    labels = value["labels"]
-    if not isinstance(labels, Sequence) or isinstance(labels, (str, bytes)) or any(
-        not isinstance(label, str) or not label for label in labels
-    ):
-        raise PlanControlError("SNAPSHOT_INVALID", "Ticket labels must be non-empty strings")
-    blockers = value["native_blockers"]
-    if not isinstance(blockers, Sequence) or isinstance(blockers, (str, bytes)):
-        raise PlanControlError("SNAPSHOT_INVALID", "native_blockers must be a list")
-    normalized_blockers: list[dict[str, str]] = []
-    for blocker in blockers:
-        if not isinstance(blocker, Mapping) or set(blocker) != {"key", "state"}:
-            raise PlanControlError(
-                "SNAPSHOT_INVALID", "each native blocker must contain key and state"
-            )
-        key = _nonempty_string(blocker["key"], "native blocker key")
-        state = _nonempty_string(blocker["state"], "native blocker state").lower()
-        if state not in {"open", "closed"}:
-            raise PlanControlError("SNAPSHOT_INVALID", "native blocker state must be open or closed")
-        normalized_blockers.append({"key": key, "state": state})
-    return _TicketSnapshot(
-        key=_nonempty_string(value["key"], "Ticket key"),
-        labels=tuple(sorted(set(labels))),
-        source=_frozen_ref(value["source"], "Ticket source"),
-        contract=_json_object(value["contract"], "Ticket contract"),
-        native_blockers=tuple(sorted(normalized_blockers, key=lambda blocker: blocker["key"])),
-    )
-
-
-def _ready_refs(value: Sequence[str]) -> tuple[str, ...]:
-    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise PlanControlError("READY_REFS_INVALID", "ready_refs must be a non-empty sequence")
-    refs = tuple(value)
-    if not refs or any(not isinstance(ref, str) or not ref for ref in refs):
-        raise PlanControlError("READY_REFS_INVALID", "ready_refs must be non-empty strings")
-    if len(set(refs)) != len(refs):
-        raise PlanControlError("READY_REFS_INVALID", "ready_refs must not repeat a Ticket")
-    return refs
-
-
-def _validate_snapshot(snapshot: CampaignSnapshot, repository: str, refs: tuple[str, ...]) -> None:
-    if snapshot.repository != repository:
-        raise PlanControlError("SNAPSHOT_REPOSITORY_MISMATCH", "snapshot repository differs")
-    ticket_keys = tuple(ticket.key for ticket in snapshot.tickets)
-    if len(set(ticket_keys)) != len(ticket_keys) or set(ticket_keys) != set(refs):
-        raise PlanControlError(
-            "SNAPSHOT_OMISSION", "authoritative snapshot must contain exactly every selected Ticket"
-        )
-    for ticket in snapshot.tickets:
-        labels = set(ticket.labels)
-        if "ready-for-agent" not in labels or labels.intersection(TRIAGE_LABELS - {"ready-for-agent"}):
-            raise PlanControlError(
-                "TICKET_LABEL_INVALID", f"Ticket {ticket.key} is not exclusively ready-for-agent"
-            )
-        if not ticket.contract:
-            raise PlanControlError("TICKET_CONTRACT_MISSING", f"Ticket {ticket.key} has no contract")
-    _policy_shape(snapshot.policy)
-    _reject_forbidden_manifest_fields(
-        {"tickets": [ticket.as_value() for ticket in snapshot.tickets]}
-    )
-    _assert_acyclic(_native_dependencies(snapshot))
-
-
-def _policy_shape(policy: dict[str, Any]) -> None:
-    required = {"ref", "content", "authority_grants", "allowed_capabilities", "exclusive_resources"}
-    if set(policy) != required:
-        raise PlanControlError(
-            "POLICY_WITNESS_INVALID",
-            "Policy Witness must contain ref, content, authority_grants, allowed_capabilities, and exclusive_resources",
-        )
-    _nonempty_string(policy["ref"], "Policy Witness ref")
-    if not isinstance(policy["content"], Mapping):
-        raise PlanControlError("POLICY_WITNESS_INVALID", "Policy Witness content must be an object")
-    grants = policy["authority_grants"]
-    if not isinstance(grants, Mapping) or set(grants) != set(_REQUIRED_ROLES):
-        raise PlanControlError(
-            "POLICY_WITNESS_INVALID", "Policy Witness must define all required authority roles"
-        )
-    for role in _REQUIRED_ROLES:
-        _canonical_grants(grants[role], f"Policy Witness {role} grants")
-    for field in ("allowed_capabilities", "exclusive_resources"):
-        values = policy[field]
-        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)) or any(
-            not isinstance(item, str) or not item for item in values
-        ):
-            raise PlanControlError("POLICY_WITNESS_INVALID", f"{field} must be a string list")
-
-
-def _canonical_grants(value: Any, label: str) -> list[dict[str, str]]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        raise PlanControlError("POLICY_WITNESS_INVALID", f"{label} must be a list")
-    grants: list[dict[str, str]] = []
-    for grant in value:
-        if not isinstance(grant, Mapping) or set(grant) != {"operation_id", "resource_id"}:
-            raise PlanControlError(
-                "POLICY_WITNESS_INVALID", f"{label} has an invalid Authority Grant"
-            )
-        grants.append(
-            {
-                "operation_id": _nonempty_string(grant["operation_id"], "operation_id"),
-                "resource_id": _nonempty_string(grant["resource_id"], "resource_id"),
-            }
-        )
-    if len({(grant["operation_id"], grant["resource_id"]) for grant in grants}) != len(grants):
-        raise PlanControlError("POLICY_WITNESS_INVALID", f"{label} repeats an Authority Grant")
-    return sorted(grants, key=lambda grant: (grant["operation_id"], grant["resource_id"]))
-
-
-def _reject_forbidden_manifest_fields(value: Any, path: tuple[str, ...] = ()) -> None:
-    if path == ("policy", "witness"):
-        return
-    if isinstance(value, Mapping):
-        for raw_key, child in value.items():
-            if not isinstance(raw_key, str):
-                raise PlanControlError("PLAN_FIELD_INVALID", "manifest field names must be strings")
-            key = raw_key.lower().replace("-", "_")
-            next_path = (*path, key)
-            allowed_authority_review = key == "review" and path and path[-1] == "authority"
-            policy_witness_detail = len(path) >= 2 and path[-2:] == ("policy", "witness")
-            if key in _FORBIDDEN_MANIFEST_FIELDS and not allowed_authority_review and not policy_witness_detail:
-                raise PlanControlError(
-                    "PLAN_FIELD_FORBIDDEN",
-                    f"PlanSpec v3 cannot contain {raw_key} at {'.'.join(next_path)}",
-                )
-            _reject_forbidden_manifest_fields(child, next_path)
-    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        for child in value:
-            _reject_forbidden_manifest_fields(child, path)
-
-
-def _native_dependencies(snapshot: CampaignSnapshot) -> dict[str, set[str]]:
-    dependencies = {ticket.key: set() for ticket in snapshot.tickets}
-    for ticket in snapshot.tickets:
-        for blocker in ticket.native_blockers:
-            dependencies[ticket.key].add(blocker["key"])
-    return dependencies
-
-
-def _assert_acyclic(dependencies: Mapping[str, set[str]]) -> None:
-    visiting: set[str] = set()
-    visited: set[str] = set()
-
-    def visit(key: str) -> None:
-        if key in visiting:
-            raise PlanControlError("DEPENDENCY_CYCLE", "canonical Ticket blockers contain a cycle")
-        if key in visited:
-            return
-        visiting.add(key)
-        for blocker in sorted(dependencies[key]):
-            if blocker in dependencies:
-                visit(blocker)
-        visiting.remove(key)
-        visited.add(key)
-
-    for key in sorted(dependencies):
-        visit(key)
-
-
-def _validate_plan_intent(value: Any, snapshot: CampaignSnapshot) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        raise PlanControlError("PLAN_INTENT_INVALID", "Planning Pass output must be an object")
-    expected = {
-        "admitted_work",
-        "dependency_additions",
-        "exclusive_resources",
-        "capability_requirements",
-        "decision_requirements",
-    }
-    if set(value) != expected:
-        raise PlanControlError(
-            "PLAN_INTENT_INVALID", "Planning Pass output contains unsupported fields"
-        )
-    selected = {ticket.key for ticket in snapshot.tickets}
-    admitted_raw = value["admitted_work"]
-    if not isinstance(admitted_raw, Sequence) or isinstance(admitted_raw, (str, bytes)):
-        raise PlanControlError("PLAN_INTENT_INVALID", "admitted_work must be a list")
-    admitted = tuple(admitted_raw)
-    if set(admitted) != selected or len(admitted) != len(selected):
-        raise PlanControlError(
-            "PLAN_INTENT_OMISSION", "Planning Pass must account for every selected Ticket"
-        )
-    if any(not isinstance(key, str) or not key for key in admitted):
-        raise PlanControlError("PLAN_INTENT_INVALID", "admitted_work contains invalid Ticket key")
-    dependencies = _native_dependencies(snapshot)
-    additions = value["dependency_additions"]
-    if not isinstance(additions, Sequence) or isinstance(additions, (str, bytes)):
-        raise PlanControlError("PLAN_INTENT_INVALID", "dependency_additions must be a list")
-    canonical_additions: list[dict[str, str]] = []
-    for addition in additions:
-        if not isinstance(addition, Mapping) or set(addition) != {"from", "to", "reason"}:
-            raise PlanControlError("PLAN_INTENT_INVALID", "dependency addition must contain from, to, reason")
-        from_key = _nonempty_string(addition["from"], "dependency from")
-        to_key = _nonempty_string(addition["to"], "dependency to")
-        reason = _nonempty_string(addition["reason"], "dependency reason")
-        if from_key not in selected or to_key not in selected or from_key == to_key:
-            raise PlanControlError("PLAN_INTENT_INVALID", "dependency addition is outside selected work")
-        dependencies[from_key].add(to_key)
-        canonical_additions.append({"from": from_key, "to": to_key, "reason": reason})
-    if len({(item["from"], item["to"]) for item in canonical_additions}) != len(canonical_additions):
-        raise PlanControlError("PLAN_INTENT_INVALID", "dependency additions repeat an edge")
-    _assert_acyclic(dependencies)
-    exclusive = _per_ticket_string_lists(
-        value["exclusive_resources"], selected, "exclusive_resources"
-    )
-    allowed_resources = set(snapshot.policy["exclusive_resources"])
-    if any(resource not in allowed_resources for values in exclusive.values() for resource in values):
-        raise PlanControlError(
-            "EXCLUSIVE_RESOURCE_INVALID", "Planning Pass named a resource outside repository policy"
-        )
-    capabilities = _per_ticket_string_lists(
-        value["capability_requirements"], selected, "capability_requirements"
-    )
-    allowed_capabilities = set(snapshot.policy["allowed_capabilities"])
-    if any(capability not in allowed_capabilities for values in capabilities.values() for capability in values):
-        raise PlanControlError(
-            "CAPABILITY_INVALID", "Planning Pass named a capability outside repository policy"
-        )
-    decisions = value["decision_requirements"]
-    if not isinstance(decisions, Sequence) or isinstance(decisions, (str, bytes)):
-        raise PlanControlError("PLAN_INTENT_INVALID", "decision_requirements must be a list")
-    canonical_decisions: list[dict[str, str]] = []
-    for decision in decisions:
-        if not isinstance(decision, Mapping) or set(decision) != {"code", "detail"}:
-            raise PlanControlError("PLAN_INTENT_INVALID", "Decision requirement must contain code and detail")
-        canonical_decisions.append(
-            {
-                "code": _nonempty_string(decision["code"], "Decision code"),
-                "detail": _nonempty_string(decision["detail"], "Decision detail"),
-            }
-        )
-    return {
-        "admitted_work": sorted(admitted),
-        "dependency_additions": sorted(canonical_additions, key=lambda item: (item["from"], item["to"])),
-        "exclusive_resources": {key: sorted(exclusive[key]) for key in sorted(exclusive)},
-        "capability_requirements": {key: sorted(capabilities[key]) for key in sorted(capabilities)},
-        "decision_requirements": sorted(canonical_decisions, key=lambda item: item["code"]),
-    }
-
-
-def _per_ticket_string_lists(value: Any, selected: set[str], label: str) -> dict[str, list[str]]:
-    if not isinstance(value, Mapping) or not set(value).issubset(selected):
-        raise PlanControlError(
-            "PLAN_INTENT_INVALID", f"{label} may name only selected Tickets"
-        )
-    normalized: dict[str, list[str]] = {}
-    for key, raw_values in value.items():
-        if not isinstance(raw_values, Sequence) or isinstance(raw_values, (str, bytes)) or any(
-            not isinstance(item, str) or not item for item in raw_values
-        ):
-            raise PlanControlError("PLAN_INTENT_INVALID", f"{label} values must be string lists")
-        values = list(raw_values)
-        if len(set(values)) != len(values):
-            raise PlanControlError("PLAN_INTENT_INVALID", f"{label} repeats a value")
-        normalized[key] = values
-    for key in selected:
-        normalized.setdefault(key, [])
-    return normalized
-
-
-def _raise_decision_requirements(intent: dict[str, Any], snapshot_digest: str) -> None:
-    decisions = intent["decision_requirements"]
-    if not decisions:
-        return
-    first = decisions[0]
-    error = PlanControlError(first["code"], first["detail"])
-    error.snapshot_digest = snapshot_digest  # type: ignore[attr-defined]
-    raise error
-
-
-def _compile_v3(
-    *,
-    snapshot: CampaignSnapshot,
-    snapshot_digest: str,
-    handle: CampaignHandle,
-    intent: dict[str, Any],
-) -> PlanRevision:
-    policy = _copy_json(snapshot.policy)
-    authority = policy["authority_grants"]
-    policy_digest = digest_value(policy)
-    dependencies = _native_dependencies(snapshot)
-    for addition in intent["dependency_additions"]:
-        dependencies[addition["from"]].add(addition["to"])
-    work: list[dict[str, Any]] = []
-    tickets = {ticket.key: ticket for ticket in snapshot.tickets}
-    for key in sorted(tickets):
-        ticket = tickets[key]
-        work.append(
-            {
-                "key": key,
-                "source": ticket.source,
-                "contract": ticket.contract,
-                "depends_on": sorted(dependencies[key]),
-                "exclusive_resources": intent["exclusive_resources"][key],
-                "capabilities": intent["capability_requirements"][key],
-                "authority": {
-                    "policy_witness_digest": policy_digest,
-                    "worker": {"grants": _canonical_grants(authority["worker"], "worker grants")},
-                    "recovery_worker": {
-                        "grants": _canonical_grants(authority["recovery_worker"], "recovery_worker grants")
-                    },
-                    "review": {"grants": _canonical_grants(authority["review"], "review grants")},
-                },
-            }
-        )
-    plan_spec = {
-        "schema_version": 3,
-        "repository": snapshot.repository,
-        "target_branch": snapshot.target_branch,
-        "campaign": {
-            "key": handle.campaign_key,
-            "source": snapshot.campaign_source,
-            "authority": {
-                "policy_witness_digest": policy_digest,
-                "grants": _canonical_grants(authority["campaign"], "campaign grants"),
-            },
-        },
-        "policy": {"ref": policy["ref"], "digest": policy_digest, "witness": policy},
-        "work": work,
-    }
-    _reject_forbidden_manifest_fields(plan_spec)
-    canonical = canonical_bytes(plan_spec)
-    return PlanRevision(
-        repository=handle.repository,
-        campaign_key=handle.campaign_key,
-        digest=digest_bytes(canonical),
-        canonical_bytes=canonical,
-        snapshot_digest=snapshot_digest,
-    )
-
-
-def _default_campaign_key(repository: str, refs: tuple[str, ...]) -> str:
-    return "campaign:" + digest_value({"repository": repository, "ready_refs": sorted(refs)})[:24]
