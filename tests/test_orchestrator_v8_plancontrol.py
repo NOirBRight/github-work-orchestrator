@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import inspect
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
 from types import MappingProxyType
 import sys
 from threading import Barrier, RLock
@@ -126,11 +128,19 @@ class _Planner:
         self.intent = intent
         self.calls = 0
         self.views: list[object] = []
+        self.coordinator_profiles: list[str | None] = []
         self.mutate_after_return = mutate_after_return
 
-    def plan(self, snapshot, planning_action_id: str):
+    def plan(
+        self,
+        snapshot,
+        planning_action_id: str,
+        *,
+        coordinator_profile_ref: str | None = None,
+    ):
         self.calls += 1
         self.views.append(snapshot)
+        self.coordinator_profiles.append(coordinator_profile_ref)
         assert planning_action_id.startswith("planning:")
         result = self.intent
         if self.mutate_after_return:
@@ -143,8 +153,14 @@ class _FailingPlanner:
         self.detail = detail
         self.calls = 0
 
-    def plan(self, snapshot, planning_action_id: str):
-        del snapshot, planning_action_id
+    def plan(
+        self,
+        snapshot,
+        planning_action_id: str,
+        *,
+        coordinator_profile_ref: str | None = None,
+    ):
+        del snapshot, planning_action_id, coordinator_profile_ref
         self.calls += 1
         raise RuntimeError(self.detail)
 
@@ -353,6 +369,53 @@ def test_strict_canonical_json_rejects_non_json_and_non_finite_values(
     assert planner.calls == 0
 
 
+def test_open_external_native_blocker_fails_closed_before_planning(tmp_path):
+    key = "issue:1"
+    planner = _Planner(_intent(key))
+    ticket = _ticket(
+        key,
+        blockers=({"key": "issue:99", "state": "open"},),
+    )
+    control = _control(tmp_path, source=_Source(ticket), planner=planner)
+
+    with pytest.raises(PlanControlError) as rejected:
+        control.start(REPOSITORY, (key,))
+
+    assert rejected.value.code == "EXTERNAL_BLOCKER_OPEN"
+    assert planner.calls == 0
+
+
+def test_closed_external_native_blocker_is_frozen_but_not_executable(
+    tmp_path,
+):
+    key = "issue:1"
+    ticket = _ticket(
+        key,
+        blockers=({"key": "issue:99", "state": "closed"},),
+    )
+    control = _control(
+        tmp_path,
+        source=_Source(ticket),
+        planner=_Planner(_intent(key)),
+    )
+
+    handle = control.start(REPOSITORY, (key,))
+
+    active = control._read_active(handle)
+    assert active.plan_spec["work"][0]["depends_on"] == []
+    campaign = control.durable.campaign(handle)
+    snapshot = json.loads(
+        control.durable.read_artifact(
+            REPOSITORY,
+            "snapshots",
+            campaign["snapshot_digest"],
+        )
+    )
+    assert snapshot["tickets"][0]["native_blockers"] == [
+        {"key": "issue:99", "state": "closed"}
+    ]
+
+
 @pytest.mark.parametrize(
     ("mutate", "detail"),
     [
@@ -455,6 +518,7 @@ def test_policy_witness_is_a_strict_digest_bound_whitelist(
         {"permission_flags": ["--all"]},
         {"runtime_profile_overrides": [("issue:1", "worker", "--flag")]},
         {"runtime_profile_overrides": [("issue:1", "campaign", "profile:one")]},
+        {"runtime_profile_overrides": [("issue:1", "coordinator", "profile:one")]},
         {
             "runtime_profile_overrides": [
                 ("issue:1", "specialist:unversioned", "profile:one")
@@ -519,6 +583,57 @@ def test_runtime_profile_overrides_are_durable_facts_not_planspec_fields(
         "policy",
         "work",
     }
+
+
+def test_coordinator_override_is_campaign_scoped_durable_and_plan_neutral(
+    tmp_path,
+):
+    key = "issue:1"
+    planner = _Planner(_intent(key))
+    options = CampaignStartOptions(
+        coordinator="profile:coordinator",
+        runtime_profile_overrides=((key, "worker", "profile:worker"),),
+    )
+    configured = _control(
+        tmp_path,
+        source=_Source(_ticket(key)),
+        planner=planner,
+        journal_name="configured.sqlite3",
+    )
+
+    configured_handle = configured.start(REPOSITORY, (key,), options)
+
+    configured_campaign = configured.durable.campaign(configured_handle)
+    configured_facts = json.loads(
+        configured.durable.read_artifact(
+            REPOSITORY,
+            "runtime-facts",
+            configured_campaign["runtime_facts_digest"],
+        )
+    )
+    assert configured_facts == {
+        "coordinator": "profile:coordinator",
+        "runtime_profile_overrides": [
+            {
+                "profile_ref": "profile:worker",
+                "role": "worker",
+                "ticket_key": key,
+            }
+        ],
+    }
+    assert planner.coordinator_profiles == ["profile:coordinator"]
+
+    unconfigured = _control(
+        tmp_path,
+        source=_Source(_ticket(key)),
+        planner=_Planner(_intent(key)),
+        journal_name="unconfigured.sqlite3",
+    )
+    unconfigured_handle = unconfigured.start(REPOSITORY, (key,))
+    assert (
+        configured._read_active(configured_handle).revision.digest
+        == unconfigured._read_active(unconfigured_handle).revision.digest
+    )
 
 
 @pytest.mark.parametrize(
@@ -590,6 +705,64 @@ def test_restart_boundaries_are_idempotent_and_never_repeat_planning(
                 "SELECT state FROM v3_campaign_journal"
             ).fetchone()[0]
         assert state == "ACTIVE_LOCAL"
+
+
+@pytest.mark.parametrize(
+    ("boundary", "decision_expected", "planner_calls"),
+    [
+        ("CLAIMS_RESERVED", False, 1),
+        ("PLANNING_STARTED", True, 0),
+        ("PLANNING_REPLY_RECEIVED", True, 1),
+        ("INTENT_ACCEPTED", False, 1),
+        ("PLAN_PUBLISHED", False, 1),
+        ("ACTIVATION_COMMITTED", False, 1),
+    ],
+)
+def test_restart_rebuilds_from_durable_identity_before_mutable_source(
+    tmp_path,
+    boundary,
+    decision_expected,
+    planner_calls,
+):
+    key = "issue:1"
+    source = _Source(_ticket(key))
+    planner = _Planner(_intent(key))
+    content = _MemoryContent()
+    crashing = _control(
+        tmp_path,
+        source=source,
+        planner=planner,
+        content=content,
+        journal_name="before-crash.sqlite3",
+        checkpoint=_CrashAt(boundary),
+    )
+    options = CampaignStartOptions(coordinator="profile:coordinator")
+
+    with pytest.raises(_CheckpointCrash):
+        crashing.start(REPOSITORY, (key,), options)
+
+    source.tickets[key]["contract"]["body"] = "edited after the crash"
+    source.policy["digest"] = "0" * 64
+    restarted = _control(
+        tmp_path,
+        source=source,
+        planner=planner,
+        content=content,
+        journal_name="rebuilt.sqlite3",
+    )
+    if decision_expected:
+        with pytest.raises(PlanControlDecision):
+            restarted.start(REPOSITORY, (key,))
+    else:
+        handle = restarted.start(REPOSITORY, (key,))
+        assert restarted._read_active(handle).plan_spec["work"][0][
+            "contract"
+        ] == _contract(key)
+
+    assert source.calls == 1
+    assert planner.calls == planner_calls
+    if planner_calls:
+        assert planner.coordinator_profiles == ["profile:coordinator"]
 
 
 def test_repository_global_claim_cas_blocks_overlap_before_loser_planning(
@@ -781,6 +954,28 @@ def test_semantically_invalid_planning_reply_uses_typed_decision_boundary(
     assert planner.calls == 1
 
 
+def test_malformed_planning_text_keeps_plan_intent_error_fidelity(tmp_path):
+    keys = ("issue:1", "issue:2")
+    invalid = _intent(*keys)
+    invalid["dependency_additions"] = [
+        {"from": keys[1], "to": keys[0], "reason": ""}
+    ]
+    planner = _Planner(invalid)
+    control = _control(
+        tmp_path,
+        source=_Source(*(_ticket(key) for key in keys)),
+        planner=planner,
+    )
+
+    with pytest.raises(PlanControlDecision) as rejected:
+        control.start(REPOSITORY, keys)
+
+    assert [finding.code for finding in rejected.value.findings] == [
+        "PLAN_INTENT_INVALID"
+    ]
+    assert planner.calls == 1
+
+
 def test_planning_exception_is_durable_ambiguity_and_never_reinvoked(tmp_path):
     key = "issue:1"
     planner = _FailingPlanner()
@@ -808,7 +1003,7 @@ def test_planning_exception_is_durable_ambiguity_and_never_reinvoked(tmp_path):
         "PLANNING_AMBIGUOUS"
     )
     assert not hasattr(control.durable, "abandon")
-    assert hasattr(gh3.PendingClaimAbandonmentAuthority, "authorize")
+    assert not hasattr(gh3, "PendingClaimAbandonmentAuthority")
 
 
 def test_oversize_snapshot_is_durable_typed_split_decision(tmp_path):
@@ -1183,7 +1378,10 @@ def test_successor_revision_uses_private_cas_seam_and_stable_handle(tmp_path):
     source.tickets[key]["contract"]["body"] = "Successor frozen contract."
 
     second_handle = control.start(
-        REPOSITORY, (key,), _campaign_key="campaign:stable"
+        REPOSITORY,
+        (key,),
+        _campaign_key="campaign:stable",
+        _expected_previous_revision_digest=first.revision.digest,
     )
 
     second = control._read_active(second_handle)
@@ -1205,7 +1403,7 @@ def test_successor_revision_uses_private_cas_seam_and_stable_handle(tmp_path):
     assert planner.calls == 2
 
 
-def test_pending_campaign_identity_cannot_be_replaced_by_new_snapshot(
+def test_pending_campaign_resumes_persisted_snapshot_before_source_change(
     tmp_path,
 ):
     key = "issue:1"
@@ -1231,13 +1429,15 @@ def test_pending_campaign_identity_cannot_be_replaced_by_new_snapshot(
         content=content,
     )
 
-    with pytest.raises(PlanControlError) as rejected:
-        resumed.start(
-            REPOSITORY, (key,), _campaign_key="campaign:stable"
-        )
+    handle = resumed.start(
+        REPOSITORY, (key,), _campaign_key="campaign:stable"
+    )
 
-    assert rejected.value.code == "CAMPAIGN_IN_PROGRESS_CONFLICT"
-    assert planner.calls == 0
+    assert resumed._read_active(handle).plan_spec["work"][0]["contract"] == (
+        _contract(key)
+    )
+    assert planner.calls == 1
+    assert source.calls == 1
 
 
 def test_source_and_planner_return_mutation_after_copy_cannot_change_plan(
@@ -1276,8 +1476,18 @@ def test_snapshot_is_re_read_after_untrusted_planner_returns(tmp_path):
     key = "issue:1"
 
     class JournalTamperingPlanner(_Planner):
-        def plan(self, snapshot, planning_action_id: str):
-            result = super().plan(snapshot, planning_action_id)
+        def plan(
+            self,
+            snapshot,
+            planning_action_id: str,
+            *,
+            coordinator_profile_ref: str | None = None,
+        ):
+            result = super().plan(
+                snapshot,
+                planning_action_id,
+                coordinator_profile_ref=coordinator_profile_ref,
+            )
             tampered = pc._strict_json_bytes({"tampered": "during planning"})
             with sqlite3.connect(tmp_path / "v3.sqlite3") as connection:
                 connection.execute(
@@ -1379,6 +1589,7 @@ def test_v3_plancontrol_uses_only_v3_tables_and_never_calls_v2_compiler(
             module_root / "_v3_journal.py",
             module_root / "_v3_github_control.py",
             module_root / "_v3_composition.py",
+            module_root / "_v3_production.py",
             module_root / "_v3_plan_spec.py",
             module_root / "_v3_types.py",
         )
@@ -1388,12 +1599,160 @@ def test_v3_plancontrol_uses_only_v3_tables_and_never_calls_v2_compiler(
     assert "v2_" not in sources.lower()
 
 
-def test_root_start_requires_private_real_plancontrol_composition():
-    with pytest.raises(PlanControlError) as missing:
-        start(REPOSITORY, ("issue:1",))
-    assert missing.value.code == "PLAN_CONTROL_NOT_CONFIGURED"
-
+def test_root_start_rejects_invalid_private_composition_override():
     pc._install_production_factory(lambda: object())
     with pytest.raises(PlanControlError) as invalid:
         start(REPOSITORY, ("issue:1",))
     assert invalid.value.code == "PLAN_CONTROL_NOT_CONFIGURED"
+
+
+def test_public_start_lazily_composes_real_production_boundaries(
+    tmp_path,
+    monkeypatch,
+):
+    from gwo_v8 import _v3_production as production
+
+    monkeypatch.setenv("GWO_HOME", str(tmp_path / "gwo-home"))
+    monkeypatch.setenv("GWO_GH_PATH", "gh-v3-test")
+    monkeypatch.setenv("GWO_PLANCONTROL_PLANNER_PATH", "gwo-plan-test")
+    remote: dict[tuple[str, str], tuple[bytes, str]] = {}
+    policy_bytes = json.dumps(_policy()).encode()
+    remote[("main", ".gwo/policy.json")] = (policy_bytes, "blob:policy")
+    writer_record = {
+        "record_id": "writer-transition:production",
+        "repository": REPOSITORY,
+        "kind": "cutover",
+        "status": "cut_over",
+        "previous_writer_generation": "v6.1",
+        "writer_generation": "writer:v8",
+        "activation_id": "activation:production",
+        "plan_digest": "1" * 64,
+        "canary_evidence_digest": "2" * 64,
+        "canary_evidence_refs": ["evidence:production"],
+        "canary_manifest_ref": "manifest:production",
+        "worker_capacity": 8,
+        "coordinator_capacity": 1,
+        "reason": None,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    writer_bytes = json.dumps(
+        {
+            "schema_version": 1,
+            "current": {
+                "repository": REPOSITORY,
+                "writer_generation": "writer:v8",
+                "record_id": writer_record["record_id"],
+            },
+            "records": [writer_record],
+        }
+    ).encode()
+    remote[("gwo-control", ".gwo-v8/writer-transition.json")] = (
+        writer_bytes,
+        "blob:writer",
+    )
+    issue_body = {"value": _contract("issue:1")["body"]}
+    issue_reads = 0
+    planner_requests: list[dict] = []
+
+    def completed(command, payload):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+
+    def fake_run(
+        command,
+        *,
+        input=None,
+        capture_output,
+        text,
+        encoding,
+        timeout,
+        **_kwargs,
+    ):
+        nonlocal issue_reads
+        assert capture_output and text and encoding == "utf-8"
+        assert timeout > 0
+        executable = Path(command[0]).name
+        if executable == "gwo-plan-test":
+            request = json.loads(input)
+            planner_requests.append(request)
+            return completed(command, _intent("issue:1"))
+        assert executable == "gh-v3-test"
+        endpoint = command[command.index("GET") + 1] if "GET" in command else (
+            command[command.index("PUT") + 1]
+        )
+        if endpoint == f"repos/{REPOSITORY}":
+            return completed(command, {"default_branch": "main"})
+        if endpoint == f"repos/{REPOSITORY}/git/ref/heads/main":
+            return completed(command, {"object": {"sha": "a" * 40}})
+        if endpoint == f"repos/{REPOSITORY}/issues/1":
+            issue_reads += 1
+            return completed(
+                command,
+                {
+                    "number": 1,
+                    "state": "open",
+                    "title": "Ticket issue:1",
+                    "body": issue_body["value"],
+                    "html_url": f"https://github.test/{REPOSITORY}/issues/1",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "labels": [{"name": "ready-for-agent"}],
+                },
+            )
+        if endpoint == (
+            f"repos/{REPOSITORY}/issues/1/dependencies/blocked_by"
+        ):
+            return completed(command, [[]])
+        marker = f"repos/{REPOSITORY}/contents/"
+        assert endpoint.startswith(marker)
+        path = endpoint.removeprefix(marker)
+        if "GET" in command:
+            branch = next(
+                item.removeprefix("ref=")
+                for item in command
+                if item.startswith("ref=")
+            )
+            current = remote.get((branch, path))
+            if current is None:
+                return subprocess.CompletedProcess(
+                    command, 1, stdout="", stderr="HTTP 404: Not Found"
+                )
+            content, sha = current
+            return completed(
+                command,
+                {
+                    "content": base64.b64encode(content).decode(),
+                    "sha": sha,
+                },
+            )
+        request = json.loads(input)
+        branch = request["branch"]
+        current = remote.get((branch, path))
+        actual_sha = None if current is None else current[1]
+        if request.get("sha") != actual_sha:
+            return subprocess.CompletedProcess(
+                command, 1, stdout="", stderr="HTTP 409: conflict"
+            )
+        content = base64.b64decode(request["content"])
+        sha = "blob:" + pc._digest(content)
+        remote[(branch, path)] = (content, sha)
+        return completed(command, {"content": {"sha": sha}})
+
+    monkeypatch.setattr(production.subprocess, "run", fake_run)
+
+    options = CampaignStartOptions(coordinator="profile:coordinator")
+    first = start(REPOSITORY, ("issue:1",), options)
+    issue_body["value"] = "edited after durable activation"
+    second = start(REPOSITORY, ("issue:1",))
+
+    assert first == second
+    assert issue_reads == 1
+    assert len(planner_requests) == 1
+    assert planner_requests[0]["coordinator_profile_ref"] == (
+        "profile:coordinator"
+    )
+    assert any("/plans/" in path for _branch, path in remote)
+    assert any("/receipts/" in path for _branch, path in remote)

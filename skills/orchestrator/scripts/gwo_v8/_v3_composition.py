@@ -19,7 +19,9 @@ def install_production_factory(
     _factory = factory
 
 
-def production_control() -> PlanControlService | None:
-    if _factory is None:
-        return None
-    return _factory()
+def production_control(repository: str) -> PlanControlService:
+    if _factory is not None:
+        return _factory()
+    from ._v3_production import build_production_control
+
+    return build_production_control(repository)

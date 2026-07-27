@@ -47,21 +47,6 @@ class WriterAuthority(Protocol):
     def read(self, repository: str) -> WriterWitness: ...
 
 
-class PendingClaimAbandonmentAuthority(Protocol):
-    """Future explicit-abandon proof boundary; claim release is not #109."""
-
-    def authorize(
-        self,
-        *,
-        repository: str,
-        campaign_key: str,
-        snapshot_digest: str,
-        planning_action_id: str,
-        writer_witness_digest: str,
-        proof_digest: str,
-    ) -> bool: ...
-
-
 class CasRetry(RuntimeError):
     pass
 
@@ -218,6 +203,32 @@ class GitHubV3Control:
                 "DURABLE_CONTROL_INVALID", "Campaign record is malformed"
             )
         return value
+
+    def resume_campaign(
+        self,
+        handle: CampaignHandle,
+        ticket_keys: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        """Read and prove an existing Campaign before mutable source I/O."""
+
+        control, _ = self._read_control(handle.repository)
+        record = control["campaigns"].get(handle.campaign_key)
+        if record is None:
+            return None
+        if not isinstance(record, dict):
+            raise PlanControlError(
+                "DURABLE_CONTROL_INVALID", "Campaign record is malformed"
+            )
+        self._verify_reservation(
+            control,
+            handle=handle,
+            record=record,
+            snapshot_digest=record.get("snapshot_digest"),
+            runtime_facts_digest=record.get("runtime_facts_digest"),
+            planning_action_id=record.get("planning_action_id"),
+            ticket_keys=ticket_keys,
+        )
+        return record
 
     def active_digest(self, handle: CampaignHandle) -> str | None:
         campaign = self.campaign(handle)
@@ -384,9 +395,11 @@ class GitHubV3Control:
             and base_fields.issubset(record)
             and state in states
             and record.get("snapshot_digest") == snapshot_digest
-            and DIGEST_PATTERN.fullmatch(snapshot_digest)
+            and isinstance(snapshot_digest, str)
+            and bool(DIGEST_PATTERN.fullmatch(snapshot_digest))
             and record.get("runtime_facts_digest") == runtime_facts_digest
-            and DIGEST_PATTERN.fullmatch(runtime_facts_digest)
+            and isinstance(runtime_facts_digest, str)
+            and bool(DIGEST_PATTERN.fullmatch(runtime_facts_digest))
             and record.get("planning_action_id") == planning_action_id
             and isinstance(planning_action_id, str)
             and planning_action_id.startswith("planning:")

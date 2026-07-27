@@ -44,9 +44,14 @@ _CAPABILITY_ID = re.compile(
 )
 
 
-def _require_string(value: Any, label: str) -> str:
+def _require_string(
+    value: Any,
+    label: str,
+    *,
+    code: str = "SNAPSHOT_INVALID",
+) -> str:
     if not isinstance(value, str) or not value:
-        raise PlanControlError("SNAPSHOT_INVALID", f"{label} must be a string")
+        raise PlanControlError(code, f"{label} must be a string")
     return value
 
 
@@ -332,11 +337,27 @@ def _normalize_snapshot(
             "SNAPSHOT_OMISSION",
             "snapshot must contain exactly every selected Ticket",
         )
+    selected = set(keys)
+    unresolved_external = sorted(
+        {
+            blocker["key"]
+            for ticket in tickets
+            for blocker in ticket["native_blockers"]
+            if blocker["state"] == "open"
+            and blocker["key"] not in selected
+        }
+    )
+    if unresolved_external:
+        raise PlanControlError(
+            "EXTERNAL_BLOCKER_OPEN",
+            "selected Tickets have unresolved external blockers: "
+            + ", ".join(unresolved_external),
+        )
     dependencies = {
         ticket["key"]: {
             blocker["key"]
             for blocker in ticket["native_blockers"]
-            if blocker["key"] in keys
+            if blocker["state"] == "open" and blocker["key"] in selected
         }
         for ticket in tickets
     }
@@ -432,7 +453,8 @@ def _normalize_intent(value: Any, snapshot: dict[str, Any]) -> dict[str, Any]:
         ticket["key"]: {
             blocker["key"]
             for blocker in ticket["native_blockers"]
-            if blocker["key"] in selected
+            if blocker["state"] == "open"
+            and blocker["key"] in selected
         }
         for ticket in snapshot["tickets"]
     }
@@ -447,9 +469,15 @@ def _normalize_intent(value: Any, snapshot: dict[str, Any]) -> dict[str, Any]:
             raise PlanControlError(
                 "PLAN_INTENT_INVALID", "dependency addition is invalid"
             )
-        source = _require_string(item["from"], "dependency source")
-        target = _require_string(item["to"], "dependency target")
-        reason = _require_string(item["reason"], "dependency reason")
+        source = _require_string(
+            item["from"], "dependency source", code="PLAN_INTENT_INVALID"
+        )
+        target = _require_string(
+            item["to"], "dependency target", code="PLAN_INTENT_INVALID"
+        )
+        reason = _require_string(
+            item["reason"], "dependency reason", code="PLAN_INTENT_INVALID"
+        )
         if source not in selected or target not in selected or source == target:
             raise PlanControlError(
                 "PLAN_INTENT_INVALID",
@@ -509,8 +537,16 @@ def _normalize_intent(value: Any, snapshot: dict[str, Any]) -> dict[str, Any]:
             )
         findings.append(
             {
-                "code": _require_string(finding["code"], "Decision code"),
-                "detail": _require_string(finding["detail"], "Decision detail"),
+                "code": _require_string(
+                    finding["code"],
+                    "Decision code",
+                    code="PLAN_INTENT_INVALID",
+                ),
+                "detail": _require_string(
+                    finding["detail"],
+                    "Decision detail",
+                    code="PLAN_INTENT_INVALID",
+                ),
                 "ticket_key": ticket_key,
             }
         )
@@ -605,8 +641,14 @@ def _compile_plan(
         )
     policy = snapshot["policy"]
     policy_digest = policy["digest"]
+    selected = {ticket["key"] for ticket in snapshot["tickets"]}
     dependencies = {
-        ticket["key"]: {blocker["key"] for blocker in ticket["native_blockers"]}
+        ticket["key"]: {
+            blocker["key"]
+            for blocker in ticket["native_blockers"]
+            if blocker["state"] == "open"
+            and blocker["key"] in selected
+        }
         for ticket in snapshot["tickets"]
     }
     for addition in intent["dependency_additions"]:

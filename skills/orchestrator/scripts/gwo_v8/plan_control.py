@@ -77,6 +77,7 @@ _OPAQUE_PROFILE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 class CampaignStartOptions:
     """Provider-neutral Runtime Profile references persisted outside PlanSpec."""
 
+    coordinator: str | None = None
     runtime_profile_overrides: tuple[tuple[str, str, str], ...] = ()
 
     @classmethod
@@ -86,17 +87,29 @@ class CampaignStartOptions:
         if value is None:
             return cls()
         if isinstance(value, cls):
+            coordinator = value.coordinator
             raw = value.runtime_profile_overrides
         elif isinstance(value, Mapping):
-            if set(value) != {"runtime_profile_overrides"}:
+            if not set(value).issubset(
+                {"coordinator", "runtime_profile_overrides"}
+            ):
                 raise PlanControlError(
                     "START_OPTIONS_INVALID",
-                    "only runtime_profile_overrides is allowed",
+                    "only coordinator and runtime_profile_overrides are allowed",
                 )
-            raw = value["runtime_profile_overrides"]
+            coordinator = value.get("coordinator")
+            raw = value.get("runtime_profile_overrides", ())
         else:
             raise PlanControlError(
                 "START_OPTIONS_INVALID", "start options must be an object"
+            )
+        if coordinator is not None and (
+            not isinstance(coordinator, str)
+            or not _OPAQUE_PROFILE_REF.fullmatch(coordinator)
+        ):
+            raise PlanControlError(
+                "START_OPTIONS_INVALID",
+                "Coordinator Runtime Profile ref is invalid",
             )
         if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
             raise PlanControlError(
@@ -105,6 +118,17 @@ class CampaignStartOptions:
             )
         normalized: list[tuple[str, str, str]] = []
         for item in raw:
+            if isinstance(item, Mapping):
+                if set(item) != {"ticket_key", "role", "profile_ref"}:
+                    raise PlanControlError(
+                        "START_OPTIONS_INVALID",
+                        "each Runtime override has unsupported fields",
+                    )
+                item = (
+                    item["ticket_key"],
+                    item["role"],
+                    item["profile_ref"],
+                )
             if not isinstance(item, Sequence) or isinstance(item, (str, bytes)):
                 raise PlanControlError(
                     "START_OPTIONS_INVALID",
@@ -137,10 +161,14 @@ class CampaignStartOptions:
                 "START_OPTIONS_INVALID",
                 "Runtime overrides repeat an exact Ticket and role",
             )
-        return cls(runtime_profile_overrides=tuple(sorted(normalized)))
+        return cls(
+            coordinator=coordinator,
+            runtime_profile_overrides=tuple(sorted(normalized)),
+        )
 
     def as_value(self) -> dict[str, Any]:
         return {
+            "coordinator": self.coordinator,
             "runtime_profile_overrides": [
                 {
                     "ticket_key": ticket_key,
@@ -161,7 +189,13 @@ class _CampaignSource(Protocol):
 
 
 class _PlanningPass(Protocol):
-    def plan(self, snapshot: object, planning_action_id: str) -> Mapping[str, Any]: ...
+    def plan(
+        self,
+        snapshot: object,
+        planning_action_id: str,
+        *,
+        coordinator_profile_ref: str | None,
+    ) -> Mapping[str, Any]: ...
 
 
 def _decision_bytes(
@@ -302,14 +336,7 @@ class _PlanControl:
         repository = _require_string(repository, "repository")
         refs = _ready_refs(ready_refs)
         option_value = CampaignStartOptions.from_value(options)
-        raw_snapshot = self.source.snapshot(repository, refs)
-        # Canonicalize before any semantic call or durable claim.
-        snapshot = _normalize_snapshot(raw_snapshot, repository, refs)
-        snapshot_bytes = _strict_json_bytes(snapshot)
-        snapshot_digest = _digest(snapshot_bytes)
         _validate_options_for_tickets(option_value, set(refs))
-        options_bytes = _strict_json_bytes(option_value.as_value())
-        options_digest = _digest(options_bytes)
         campaign_key = _campaign_key or (
             "campaign:"
             + _digest(
@@ -319,6 +346,30 @@ class _PlanControl:
             )[:24]
         )
         handle = CampaignHandle(repository, campaign_key)
+        if _expected_previous_revision_digest is _AUTO_PREVIOUS:
+            campaign = self.durable.resume_campaign(handle, refs)
+            if campaign is not None:
+                record = self._restore_from_durable(
+                    handle=handle,
+                    ticket_keys=refs,
+                    campaign=campaign,
+                    requested_options=(
+                        option_value if options is not None else None
+                    ),
+                )
+                if record.state in {
+                    _STATE_DECISION_REQUIRED,
+                    _STATE_PLANNING_AMBIGUOUS,
+                }:
+                    self._raise_persisted_decision(record)
+                return self._continue(record, campaign, handle)
+        raw_snapshot = self.source.snapshot(repository, refs)
+        # Canonicalize before any semantic call or durable claim.
+        snapshot = _normalize_snapshot(raw_snapshot, repository, refs)
+        snapshot_bytes = _strict_json_bytes(snapshot)
+        snapshot_digest = _digest(snapshot_bytes)
+        options_bytes = _strict_json_bytes(option_value.as_value())
+        options_digest = _digest(options_bytes)
         expected_previous = (
             self.durable.active_digest(handle)
             if _expected_previous_revision_digest is _AUTO_PREVIOUS
@@ -415,6 +466,150 @@ class _PlanControl:
             self._checkpoint(_STATE_CLAIMS_RESERVED)
         return self._continue(record, campaign, handle)
 
+    def _restore_from_durable(
+        self,
+        *,
+        handle: CampaignHandle,
+        ticket_keys: tuple[str, ...],
+        campaign: dict[str, Any],
+        requested_options: CampaignStartOptions | None,
+    ) -> _JournalRecord:
+        snapshot_digest = campaign["snapshot_digest"]
+        snapshot_bytes = self.durable.read_artifact(
+            handle.repository, "snapshots", snapshot_digest
+        )
+        snapshot_value = _strict_json_decode(snapshot_bytes)
+        if (
+            not isinstance(snapshot_value, dict)
+            or snapshot_value.get("schema_version") != 1
+        ):
+            raise PlanControlError(
+                "SNAPSHOT_READBACK_MISMATCH",
+                "durable Campaign snapshot schema is invalid",
+            )
+        raw_snapshot = {
+            key: value
+            for key, value in snapshot_value.items()
+            if key != "schema_version"
+        }
+        snapshot = _normalize_snapshot(
+            raw_snapshot, handle.repository, ticket_keys
+        )
+        if (
+            _strict_json_bytes(snapshot) != snapshot_bytes
+            or _digest(snapshot_bytes) != snapshot_digest
+        ):
+            raise PlanControlError(
+                "SNAPSHOT_READBACK_MISMATCH",
+                "durable Campaign snapshot identity changed",
+            )
+
+        options_digest = campaign["runtime_facts_digest"]
+        options_bytes = self.durable.read_artifact(
+            handle.repository, "runtime-facts", options_digest
+        )
+        persisted_options = CampaignStartOptions.from_value(
+            _strict_json_decode(options_bytes)
+        )
+        if _strict_json_bytes(persisted_options.as_value()) != options_bytes:
+            raise PlanControlError(
+                "RUNTIME_FACTS_DIGEST_MISMATCH",
+                "durable Campaign Runtime facts are not canonical",
+            )
+        if (
+            requested_options is not None
+            and requested_options != persisted_options
+        ):
+            raise PlanControlError(
+                "START_OPTIONS_CONFLICT",
+                "Campaign Runtime overrides differ from durable start facts",
+            )
+
+        intent_bytes = None
+        intent_digest = campaign.get("intent_digest")
+        if isinstance(intent_digest, str):
+            intent_bytes = self.durable.read_artifact(
+                handle.repository, "intents", intent_digest
+            )
+            intent = _normalize_intent(
+                _strict_json_decode(intent_bytes), snapshot
+            )
+            if _strict_json_bytes(intent) != intent_bytes:
+                raise PlanControlError(
+                    "PLAN_INTENT_READBACK_MISMATCH",
+                    "durable Plan Intent is not the validated canonical value",
+                )
+
+        decision_bytes = None
+        decision_digest = campaign.get("decision_digest")
+        if isinstance(decision_digest, str):
+            decision_bytes = self.durable.read_artifact(
+                handle.repository, "decisions", decision_digest
+            )
+            _decision_from_bytes(decision_bytes)
+
+        plan_bytes = None
+        plan_digest = campaign.get("plan_digest")
+        if isinstance(plan_digest, str):
+            plan_bytes = self.durable.read_artifact(
+                handle.repository, "plans", plan_digest
+            )
+            _validate_plan_spec(plan_bytes)
+
+        receipt_bytes = None
+        receipt_digest = campaign.get("receipt_digest")
+        if isinstance(receipt_digest, str):
+            receipt_bytes = self.durable.read_artifact(
+                handle.repository, "receipts", receipt_digest
+            )
+            self._receipt_from_bytes(receipt_bytes)
+
+        restored = _JournalRecord(
+            repository=handle.repository,
+            campaign_key=handle.campaign_key,
+            snapshot_digest=snapshot_digest,
+            state=campaign["state"],
+            snapshot_bytes=snapshot_bytes,
+            options_bytes=options_bytes,
+            options_digest=options_digest,
+            planning_action_id=campaign["planning_action_id"],
+            expected_previous_revision_digest=campaign[
+                "expected_previous_revision_digest"
+            ],
+            writer_generation=campaign["writer_generation"],
+            writer_witness_digest=campaign["writer_witness_digest"],
+            intent_bytes=intent_bytes,
+            intent_digest=intent_digest,
+            decision_bytes=decision_bytes,
+            decision_digest=decision_digest,
+            plan_bytes=plan_bytes,
+            plan_digest=plan_digest,
+            receipt_bytes=receipt_bytes,
+            receipt_digest=receipt_digest,
+        )
+        existing = self.journal.read(
+            handle.repository, handle.campaign_key, snapshot_digest
+        )
+        if existing is not None and (
+            existing.snapshot_bytes != restored.snapshot_bytes
+            or existing.options_bytes != restored.options_bytes
+            or existing.options_digest != restored.options_digest
+            or existing.planning_action_id != restored.planning_action_id
+            or existing.expected_previous_revision_digest
+            != restored.expected_previous_revision_digest
+        ):
+            raise PlanControlError(
+                "JOURNAL_IDENTITY_CONFLICT",
+                "local Campaign identity differs from durable artifacts",
+            )
+        if existing is not None and existing.state in {
+            _STATE_ACTIVE_LOCAL,
+            _STATE_DECISION_REQUIRED,
+            _STATE_PLANNING_AMBIGUOUS,
+        }:
+            return existing
+        return self.journal.save(restored)
+
     def _continue(
         self,
         record: _JournalRecord,
@@ -466,7 +661,11 @@ class _PlanControl:
             planner_view = _deep_immutable(_strict_json_decode(snapshot_bytes))
             try:
                 raw_intent = self.planner.plan(
-                    planner_view, record.planning_action_id
+                    planner_view,
+                    record.planning_action_id,
+                    coordinator_profile_ref=CampaignStartOptions.from_value(
+                        _strict_json_decode(record.options_bytes)
+                    ).coordinator,
                 )
                 # Copy the returned object immediately and reject non-JSON.
                 returned_bytes = _strict_json_bytes(raw_intent)
@@ -1004,7 +1203,7 @@ def start(
 ) -> CampaignHandle:
     """Start one V3 Campaign through lazy production PlanControl composition."""
 
-    control = _production_control()
+    control = _production_control(repository)
     if not isinstance(control, _PlanControl):
         raise PlanControlError(
             "PLAN_CONTROL_NOT_CONFIGURED",
