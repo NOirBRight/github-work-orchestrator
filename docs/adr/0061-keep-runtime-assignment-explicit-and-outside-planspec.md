@@ -5,23 +5,43 @@ amends: ADR-0037, ADR-0042, ADR-0044, ADR-0055, ADR-0059
 
 # Keep Runtime assignment explicit and outside PlanSpec
 
-V8 separates model choice from semantic planning. Host-global configuration
-defines role defaults for Coordinator, Worker, Recovery Worker, Review
-`primary`, Review `strong`, and optional specialists. Repository configuration
-may override those defaults. One Campaign start may additionally provide an
-exact Ticket-to-Runtime-Profile override for selected Tickets.
+V8 separates Runtime assignment from semantic planning. Runtime assignment
+uses these exact selectors:
 
-Resolution order is exact Ticket override, repository role configuration, then
-host-global role configuration. Missing required configuration fails closed.
-The selected Runtime Profile and configuration provenance are recorded as
-Runtime facts, but provider, model, reasoning, and selector names never enter
-Ticket, Plan Intent, PlanSpec, or Candidate identity.
+- Campaign-scoped `coordinator`;
+- Ticket-scoped `worker`;
+- Ticket-scoped `recovery_worker`;
+- Ticket-scoped `review_primary`;
+- Ticket-scoped `review_strong`; and
+- Ticket-scoped `specialist:<policy-id>`.
+
+The `coordinator` selector resolves Campaign-start Coordinator override,
+repository `coordinator` role mapping, then host-global `coordinator` role
+mapping. Every Ticket-scoped selector resolves exact Campaign-start
+`(ticket_key, role)` override, repository role mapping, then host-global role
+mapping. There is no Ticket-wide shorthand and no Ticket override for
+Coordinator.
+
+Each mapping names one required primary Runtime Profile and at most one
+optional availability fallback. Missing required configuration fails closed.
+Different selectors and primary/fallback positions may intentionally resolve
+to the same Profile.
+
+Campaign-start overrides are persisted with the Campaign. For each stable
+Runtime action, RuntimeGateway records selector, configuration source, resolved
+Profile digest, and whether the optional fallback was selected. Retries,
+resume, readback, and same-binding recovery reuse that assignment.
+
+Availability fallback is permitted only before any Agent identity may exist
+for the stable action. After identity, RuntimeGateway recovers the same
+binding. A replacement Worker requires terminal-binding Evidence and uses the
+already resolved `recovery_worker` assignment.
 
 PlanControl may declare factual Runtime capabilities such as required tools or
 execution features. It cannot infer difficulty, assign a model, rank profiles,
-or convert a semantic opinion into a stronger Runtime. RuntimeGateway applies
-only the user's deterministic configuration. Primary and fallback, or Review
-`primary` and `strong`, may intentionally resolve to the same Profile.
+or convert a semantic opinion into a stronger Runtime. Provider, model,
+reasoning setting, CLI, selector, Profile, configuration source, and fallback
+never enter PlanSpec.
 
 V8 therefore supports different models for different roles and explicit
 different models for selected Tickets without adding an LLM router, risk

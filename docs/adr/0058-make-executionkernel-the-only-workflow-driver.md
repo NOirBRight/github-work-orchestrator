@@ -6,10 +6,30 @@ amends: ADR-0024, ADR-0029, ADR-0031, ADR-0045, ADR-0050, ADR-0053
 # Make ExecutionKernel the only workflow driver
 
 V8 has one persisted deterministic state machine and next-action authority:
-ExecutionKernel. The public `advance(goal_handle, wake_ref?)` operation loads
-the Campaign state, confirms authoritative readback, performs every currently
-due bounded transition or effect, persists the results, and returns exactly
-one of `Running`, `Wait`, `Decision`, `Complete`, or `Blocked`.
+ExecutionKernel. The complete public surface is:
+
+```text
+start(repository, ready_refs, options?) -> CampaignHandle
+advance(campaign_handle, wake_ref?) -> Running | Wait | Decision | Complete | Blocked
+inspect(campaign_handle) -> Diagnostics
+```
+
+`advance` loads Campaign state, confirms authoritative readback, performs every
+currently due bounded transition or effect, persists the results, and returns
+exactly one public outcome.
+
+After readback, status derivation is deterministic and ordered:
+
+1. `Complete` when all required work and delivery are terminal and accepted;
+2. otherwise `Running` when any semantic or deterministic action is active or
+   currently due;
+3. otherwise `Decision` when a named durable choice is required;
+4. otherwise `Wait` when a named observable event or due time can continue the
+   Campaign; and
+5. otherwise `Blocked` when no authorized action, Decision, or wake remains.
+
+Repair is a nested Work Run phase and therefore contributes `Running`; it is
+not a sixth public status.
 
 ExecutionKernel owns lifecycle state, idempotency keys, budgets, Worker Slot
 accounting, Wait conditions, due-action ordering, and transition validity. It
@@ -25,11 +45,9 @@ with a wake reference. `next_check_at` timers call it without inventing an
 event. Events remain hints, and ExecutionKernel changes state only after
 authoritative readback.
 
-GoalDriver and Kernel Reconciliation are not separate V8 modules. A legacy
-host callback or `reconcile --once` command may remain temporarily as a thin
-compatibility wrapper around `ExecutionKernel.advance`, but it owns no durable
-state, scheduling rule, retry budget, or semantic decision. New code does not
-introduce a GoalDriver service or a second reconciliation state machine.
+Legacy driver and reconciliation entrypoints are removed. New code does not
+introduce a second driver service, public compatibility operation, or
+reconciliation state machine.
 
 This leaves one understandable control path:
 
@@ -44,4 +62,4 @@ event | due timer | manual call
 
 Crash recovery replays the same idempotent operation from persisted Campaign
 state. Removing the forwarding layer does not remove liveness recovery; it
-prevents GoalDriver, Watchdog, and Kernel from competing for ownership of it.
+prevents wrappers, Watchdog, and Kernel from competing for ownership of it.

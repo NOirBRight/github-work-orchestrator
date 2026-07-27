@@ -1,31 +1,28 @@
 ---
-status: amended by ADR-0055
+status: amended by ADR-0044, ADR-0055, ADR-0057, and ADR-0061
 amends: ADR-0026, ADR-0030, ADR-0037, ADR-0039
 ---
 
 # Derive Candidate assurance and remove difficulty from PlanSpec
 
-An upstream Ticket is the V8 Work Item. `/to-tickets` adapts a source Issue,
-Spec, or conversation into executable Tickets; a configured tracker may store
-each Ticket as a GitHub Issue. GWO consumes that Ticket contract without
-requiring `/to-tickets` to emit GWO-specific execution metadata.
+An upstream Ticket carries the V8 behavioral contract. `/to-tickets` adapts a requirement
+into executable Tickets; GWO consumes that contract without requiring
+GWO-specific routing metadata.
 
-`difficulty`, Worker Tier, and input `risk` are removed from Ticket, Plan
-Intent, and PlanSpec. Difficulty was an ungrounded model-strength prediction
-and did not drive the V8 Runtime. PlanSpec records only explicit Runtime
-capability requirements. Host-global configuration and repository override map
-the initial and bounded-recovery execution roles to concrete Runtime Profiles.
+`difficulty`, model tier, and input `risk` are absent from Tickets, the
+PlanControl-private planning output, and PlanSpec. They are ungrounded
+predictions and do not select Runtime Profiles. PlanSpec records factual
+capability needs plus provider-neutral Authority Grants and a frozen Policy
+Witness.
 
-After an exact Candidate exists, deterministic Assurance Policy resolves its
-required Checks, Formal Review mode, specialist observations, human decisions,
-and reason codes from the Candidate change surface, Effect Contract, and
-versioned repository policy. A no-Review decision requires a complete
-deterministic allowlist match; configured protected surfaces or effects require
-strict assurance; all other Candidates require standard assurance. Check
-selection uses affected inputs and effects rather than comparing scalar risk
-tiers.
+After an immutable Candidate exists, Assurance Policy derives the Assurance
+Requirement from its complete diff record, Authority Grants, Policy Witness,
+protected surfaces, and observed effects. The requirement names affected
+checks, Formal Review mode, specialist observation, human Decision, and reason
+codes. A no-Review result requires a complete allowlist match; strict
+Assurance follows repository policy; all other Candidates use standard
+Assurance.
 
-The compiled Plan binds the versioned Assurance Policy digest rather than an
-Agent-proposed risk score. The resulting Assurance Requirement and its reasons
-are durable Candidate facts. Concrete Reviewer provider, model, reasoning,
-session, and recovery state remain Runtime facts outside PlanSpec.
+The resulting Assurance Requirement is a durable Candidate fact. Runtime
+selectors, Profiles, providers, models, reasoning, sessions, and recovery state
+remain Runtime facts outside PlanSpec.

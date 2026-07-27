@@ -1,6 +1,7 @@
 ---
 status: accepted
-amends: ADR-0040, ADR-0047, ADR-0048, ADR-0049, ADR-0057, ADR-0058
+supersedes: ADR-0040
+amends: ADR-0041, ADR-0047, ADR-0048, ADR-0049, ADR-0057, ADR-0058
 ---
 
 # Make BatchIntegrator the only delivery boundary
@@ -10,30 +11,51 @@ accepted-Candidate receipts from CandidateGate and owns the complete boundary
 from Candidate queueing through target-branch readback.
 
 When the Integration Lease is free, BatchIntegrator immediately freezes up to
-the configured number of oldest compatible Candidates available at that
-moment. The default Batch size is four with host-global configuration and
-repository override. It does not wait for running Workers, use a timer, predict
-completion, or call an LLM to optimize membership. Strict, non-decomposable,
-or protected-interaction Candidates use a one-member Batch.
+the configured number of oldest compatible Candidates from one Campaign
+available at that moment. The member limit is an integer from one through four,
+default four, with host-global configuration and repository override. The
+oldest eligible Candidate is the seed; remaining Candidates are scanned oldest
+first and added only when pairwise compatible with every frozen member.
+BatchIntegrator freezes when the scan ends or the limit is reached. It does not
+wait for running Work Runs, use a timer, predict completion, or call an LLM.
 
-BatchIntegrator hides:
+Eligibility requires the same Campaign and compatible:
 
-- Batch Compatibility from actual Diff Manifests, Assurance, Interaction Keys,
-  protected surfaces, target identity, and check environment;
-- exact target readback and Clean Base Advance;
-- isolated composition and immutable Batch SHA creation;
-- the repository-equivalent exact-Batch local suite;
-- one push and pull-request boundary;
-- hosted CI observation of that same exact Batch SHA;
-- the repository-scoped Integration Lease, serial target mutation, and durable
-  target-branch readback; and
-- the one bounded Singleton Batch Fallback.
+- target and base identity, or a valid Clean Base Advance;
+- check environment;
+- Policy Witness digest;
+- delivery identity;
+- Assurance Requirement;
+- protected surfaces; and
+- pairwise Interaction Keys.
+
+Strict Assurance always requires a Singleton Batch. Repository-policy
+classifications for a non-decomposable, high-coupling, or protected
+Interaction Key also require a Singleton Batch. Other accepted Candidates may
+share a Batch only when all pairwise checks pass.
+
+Clean Base Advance is permitted only when the original base is an ancestor of
+the current target, Candidate and Evidence are unchanged, the target delta has
+no protected interaction with the Candidate, and Git composes without manual
+resolution.
+
+BatchIntegrator then owns isolated composition, immutable Batch SHA creation,
+the repository-equivalent exact-Batch local suite, one push and pull-request
+boundary, hosted CI, the repository-global Integration Lease, serial target
+mutation, durable target readback, and the single bounded Singleton Batch
+Fallback.
 
 Git, GitHub, pull-request, check-run, and Integration-Lease clients are private
 implementation drivers behind BatchIntegrator, not public workflow modules.
 Keeping them together enforces one invariant at the module boundary: local
-verification, hosted CI, and target Integration all refer to the same immutable
-Batch SHA.
+verification, the pushed branch and pull-request head, and hosted CI all refer
+to the same immutable Batch SHA. Integration names that SHA.
+
+The target may advance to a merge commit rather than equal the Batch SHA.
+Readback therefore proves the Batch SHA is an ancestor of the observed target
+head and that GitHub's pull-request merge mapping connects the pull-request
+head to that target head. Squash or rebase integration rewrites the reviewed
+identity and fails closed.
 
 BatchIntegrator never launches Formal Review, consumes a Worker Slot, invokes a
 Coordinator on the normal path, mutates a member Candidate, or asks a Worker to
@@ -49,6 +71,6 @@ Worker. Changed code becomes a new Candidate and re-enters CandidateGate.
 BatchIntegrator never repeats Review for an unchanged Candidate.
 
 Several Tickets may therefore share one PR and one hosted-CI execution without
-losing per-Ticket Work Identity, Candidate identity, Evidence, or Result
+losing per-Ticket Work Run identity, Candidate identity, Evidence, or Result
 attribution. Target Integration remains singular even while Worker execution
 is fully concurrent.

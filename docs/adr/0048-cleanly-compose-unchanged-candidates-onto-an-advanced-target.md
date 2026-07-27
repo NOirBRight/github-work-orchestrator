@@ -7,8 +7,9 @@ amends: ADR-0036, ADR-0040, ADR-0041, ADR-0047
 
 V8 retains immediate micro-batching: when the Integration Lease is free,
 BatchIntegrator freezes up to the configured number of oldest compatible
-Candidates eligible at that moment. It does not wait for running Workers, use
-a timer, or predict future completion merely to enlarge a Batch.
+Candidates from one Campaign eligible at that moment. It does not wait for
+running Work Runs, use a timer, or predict future completion merely to enlarge
+a Batch.
 
 An unchanged Candidate does not become semantically stale merely because
 another Batch advanced the target branch. BatchIntegrator may use Clean Base
@@ -25,5 +26,6 @@ the Checks that observed that composition.
 
 If ancestry, identity, Interaction Key, clean-composition, or exact-Batch Check
 conditions fail, only the affected work must form a new Candidate. A changed
-Candidate creates a new Review Subject and follows the existing Candidate
-Budget. Unrelated Candidates retain their Evidence.
+Candidate creates a new Review Subject and remains subject to the fixed limit
+of at most three distinct Candidate SHAs for its Work Run. Unrelated
+Candidates retain their Evidence.

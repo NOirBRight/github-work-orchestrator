@@ -2,20 +2,21 @@
 status: amended by ADR-0036 and ADR-0043
 ---
 
-# Bound repair and reasoning escalation before node failure
+# Bound Candidate repair and Worker replacement
 
-V8.0 counts independently verified candidate submissions, not an Agent's
-internal edits, commands, or test runs. A primary implementation Attempt may
-receive at most one formal, findings-driven Repair Round in the same runtime
-binding. If it ends `rejected` or `no_result`, the pre-authorized Recovery
-Ladder creates one fresh `worker_frontier` Attempt. That Attempt also receives
-at most one Repair Round. If the primary profile is already frontier,
-escalation changes Agent and session rather than inventing another tier.
+V8 counts distinct Candidate SHAs, not a Worker's internal edits, commands, or
+test runs. Each Work Run may submit at most three distinct Candidate SHAs
+total. CandidateGate returns one consolidated repair request with the complete
+Review Finding ledger; a changed Candidate re-enters the gate under a new
+Review Subject. An unchanged rejected Candidate cannot obtain another Formal
+Review.
 
-When evidence is genuinely contradictory, the Coordinator may create one
-ordinary read-only diagnostic work Plan Node before the frontier Attempt. V8
-does not add an Advisor entity or automatic Advisor stage. Agent self-report
-does not determine failure. A Plan Node becomes failed only when the semantic
-ladder is exhausted; unresolved dependency, decision, or runtime availability
-instead leaves it blocked. A failed Plan Node does not fail its Task Group Goal
-automatically.
+Each Work Run has one initial Worker binding and at most one replacement
+binding. Replacement requires terminal-binding Evidence for the initial
+binding and uses the configured `recovery_worker` assignment. It does not reset
+the Candidate limit or Review Finding ledger.
+
+Invalid Review transport may retry once through `review_strong` without
+counting as a Candidate submission. Exhausted semantic bounds yield a named
+Decision; unresolved dependencies, external events, or Runtime availability
+yield their existing deterministic Wait or Blocked outcome.

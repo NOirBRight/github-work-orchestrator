@@ -1,327 +1,275 @@
 # GWO V8 lean landing roadmap
 
-Status: accepted landing roadmap. This document does not by itself authorize
-GitHub Issue mutation or production writer cutover.
+Status: accepted sequencing and exit-criteria record for Issues #108–#119.
+This document does not define V8 mechanics, authorize tracker mutation, or
+authorize production writer cutover.
 
-The accepted architecture is
-[`gwo-v8-lean-architecture.md`](gwo-v8-lean-architecture.md). This roadmap
-replaces the historical Phase 0–4C implementation roadmap for new work.
-
-## Current facts
-
-As of 2026-07-27:
-
-- GitHub has no open pull request for this repository.
-- The accepted successor graph is published as Issues #108–#119, and #108 is
-  its only immediately executable frontier Ticket.
-- The local checkout remains on `work/issue-54`, while Issue #54 is closed and
-  that branch has diverged from `origin/main`.
-- The existing V8 implementation is production-shaped but organized around
-  PlanSpec v2, Plan Nodes, GoalDriver, Review axes, Worker tiers, and a large
-  Kernel interface.
-- The historical V8 Epic and its conflicting executable Tickets were removed
-  from the frontier after the successor graph and native blockers were read
-  back.
-- `/to-tickets` remains the external semantic Ticket generator. GWO will not
-  introduce a competing Ticket authoring skill.
-
-The first delivery is therefore one architecture-and-tracker reset, not another
-continuation from a rejected historical Candidate SHA.
+`CONTEXT.md` owns language, accepted ADRs own individual decisions, and
+[`gwo-v8-lean-architecture.md`](gwo-v8-lean-architecture.md) is the sole
+integrated current mechanics contract. The dated requirement and Ticket-source
+record is
+[`gwo-v8-lean-stabilization-spec.md`](gwo-v8-lean-stabilization-spec.md).
 
 ## Landing rules
 
 Every implementation Ticket must:
 
-- deliver one observable vertical behavior through a deep-module interface;
-- include its interface-level deterministic tests;
-- replace or delete the old caller path in the same delivery;
-- avoid a permanent compatibility layer or second state machine;
-- avoid exposing a new lifecycle noun merely to make testing easier;
-- keep exact external action identity and readback-first recovery;
-- run one local acceptance set before one final push/CI boundary; and
-- leave unrelated historical behavior and user work intact.
-
-Test-fixture repair, prompt formatting, state migration, and cleanup are part
-of the Ticket whose interface owns them. They do not become independent
-product Tickets unless they can produce an independently verifiable Result.
-
-Temporary V2-to-V3 projections are permitted only inside the active migration
-Ticket, with an explicit deletion test and no new Campaign writing V2. They
-must be gone before the root-repository Canary.
-
-## Delivery 0 — Freeze the new contract
-
-Outcome:
-
-- land the lean glossary, architecture, ADR chain, and replacement roadmap on a
-  fresh branch from current `origin/main`;
-- preserve the current dirty documentation changes without carrying the
-  already-closed Issue #54 branch history;
-- mark the historical V8 architecture and roadmap as non-executable; and
-- publish one successor stabilization specification suitable for external
-  `/to-tickets`.
-
-Exit:
-
-- `quick_validate.py` and documentation checks pass;
-- no code path, GitHub Issue, label, PR, Runtime, or writer state changes;
-- the successor specification names the historical Issue disposition but does
-  not copy their Candidate-specific recovery instructions.
-
-Expected duration: 0.5–1 working day.
-
-## Delivery 1 — Replace planning with PlanSpec v3 and PlanControl
-
-Outcome:
-
-- versioned PlanSpec v3 decoder and canonical compiler;
-- one complete selected Ready Set becomes one Plan Revision;
-- one bounded Campaign Planning Pass produces narrow typed Plan Intent;
-- deterministic publication, activation, and readback;
-- optional exact Ticket Runtime overrides remain Runtime facts; and
-- new Campaigns contain no generic nodes, difficulty, risk, Checks, Review
-  requirements, recovery ladders, or model fields.
-
-Implementation shape:
-
-- deepen current `entry.py`, `compiler.py`, and `activation.py` behavior behind
-  PlanControl;
-- remove the per-Ticket `v8_ready_set_progress` activation loop;
-- retain a V2 decoder only for quiescent historical readback;
-- reject oversized Planning input with a named split-Campaign Decision.
-
-Exit:
-
-- `start()` compiles, publishes, activates, and reads back one v3 Plan Revision
-  for four independent Tickets;
-- malformed Planning output cannot publish a plan;
-- compiler/publication retry reuses the same Plan Intent and invokes no second
-  LLM pass.
-
-Expected duration: 1.5–3 working days.
-
-## Delivery 2 — Make ExecutionKernel the only driver
-
-Outcome:
-
-- `advance()` is the only persisted transition and next-action operation;
-- Campaign, Work Run, Slot, Wait, Decision, and budget state converge through
-  one interface;
-- GoalDriver and separate Kernel Reconciliation ownership disappear;
-- Campaign Watchdog wakes `advance()` from events and `next_check_at`; and
-- normal scheduling, waiting, refill, and completion use no Coordinator.
-
-Implementation shape:
-
-- first wrap the current durable state behind the new Campaign/Work Run
+- deliver an observable vertical behavior through one owning deep-module
   interface;
-- route every caller to `advance()`;
-- delete GoalDriver state and coordination continuation code after replacement;
-- keep Admission, Attempt, and action rows internal until later storage
-  simplification proves useful.
+- include interface-level deterministic acceptance;
+- replace or delete the predecessor caller path in the same delivery;
+- avoid a permanent compatibility layer or competing state machine;
+- avoid exposing private records as public actors or vocabulary;
+- preserve exact external action identity and readback-first recovery; and
+- keep unrelated historical behavior and user work intact.
 
-Exit:
+Fixture repair, Prompt formatting, storage migration, and cleanup belong to the
+Ticket whose interface owns them. A temporary v2-to-v3 projection is permitted
+only inside its migration Ticket, with a deletion test and no new Campaign
+writing v2. It must be gone before the root Canary.
 
-- four eligible Work Runs acquire four Worker Slots in one advance;
-- a released Slot is filled without a Coordinator turn;
-- lost callbacks converge through a due targeted readback;
-- restart produces no duplicate semantic or external action.
+All mechanics and deterministic defaults referenced by the exit criteria below
+are defined in the
+[`Defaults`](gwo-v8-lean-architecture.md#defaults) and owning-module sections
+of the architecture.
 
-Expected duration: 2–3 working days.
+## Published successor sequence
 
-## Delivery 3 — Route every semantic Runtime through RuntimeGateway
+The native blocker graph was read back on 2026-07-27. Issue #121 subsequently
+landed the self-hosted acceptance runner and is part of the repository base,
+not the V8 Candidate graph.
 
-Outcome:
-
-- Worker, Recovery Worker, Coordinator, and Internal Subagent operations use
-  one RuntimeGateway interface;
-- Runtime Profile precedence is exact Ticket override, repository role, then
-  host-global role;
-- Paseo is an internal Adapter and may launch different underlying CLIs;
-- permission matching, Prompt-file transport, identity readback, command
-  timeout, fallback, checkpoint, fencing, and retirement are local to the
-  module; and
-- cached provider-snapshot failure and empty-workspace leakage converge through
-  typed bounded recovery.
-
-Implementation shape:
-
-- extract current `runtime.py` responsibilities without adding a public method
-  for each Paseo command;
-- give the module a production Paseo Adapter and deterministic in-memory
-  Adapter;
-- add exact permission request operations rather than blanket approval;
-- enforce pre-identity fallback and post-identity same-binding recovery.
-
-Exit:
-
-- configured roles may use different models or CLIs without PlanSpec changes;
-- no caller uses provider names or constructs a Paseo command;
-- timeout and permission delay cannot create a replacement Agent;
-- Terminal Binding Receipt is required before the second Worker Attempt.
-
-Expected duration: 2–4 working days. A required upstream Paseo fix may add
-2–5 working days but does not justify bypassing RuntimeGateway.
-
-## Delivery 4 — Concentrate Candidate verification in CandidateGate
-
-Outcome:
-
-- exact Candidate readback, authority audit, affected deterministic Checks,
-  Assurance, Formal Review, Finding reconciliation, and Repair share one
-  interface;
-- deterministic failures stop before LLM Review;
-- standard Assurance uses one complete `primary` observation;
-- strict Assurance adds at most one specialist or human Decision;
-- Worker self-check and external `code-review` guidance cannot create Formal
-  Review Evidence; and
-- Review and Candidate budgets are enforced across the complete Plan Revision.
-
-Implementation shape:
-
-- move Review-axis and Evidence orchestration out of the 5,000-line Kernel;
-- replace Standards/Spec lifecycle axes with one obligation-complete typed
-  observation;
-- store complete Finding artifacts and compact receipts;
-- delete first-32 and character-slice truncation;
-- replace old internal-order tests with CandidateGate interface tests.
-
-Exit:
-
-- unchanged valid Candidate Evidence is never repeated;
-- changed Candidate gets one fresh complete Review and dispositions every prior
-  Finding;
-- deterministic failure consumes zero Reviewer turns;
-- no path can launch Worker Review, top-level Review Task, or Batch Review.
-
-Expected duration: 2.5–4 working days.
-
-## Delivery 5 — Concentrate repository delivery in BatchIntegrator
-
-Outcome:
-
-- accepted-Candidate queue, compatibility, Clean Base Advance, composition,
-  exact local suite, one PR, hosted CI, Integration lease, merge, readback, and
-  Singleton fallback share one interface;
-- up to four compatible Tickets share one delivery boundary;
-- local, hosted, and target readback all name the same immutable Batch SHA; and
-- no delivery failure repeats unaffected implementation or Formal Review.
-
-Implementation shape:
-
-- merge current `integration_batch.py` and Kernel delivery control into
-  BatchIntegrator;
-- keep Git, GitHub, hosted-check, and lease clients private;
-- freeze an immediate microbatch whenever the lease is free;
-- preserve evidence and split once to Singleton Batches on code-class failure.
-
-Exit:
-
-- four compatible Candidates can cross one PR and hosted CI;
-- strict/protected work uses a Singleton Batch;
-- infrastructure failure retries the same SHA at most twice;
-- only a failing Singleton resumes its Worker and changed code re-enters
-  CandidateGate.
-
-Expected duration: 2–3.5 working days.
-
-## Delivery 6 — Cut over through one Guard and one root Canary
-
-Outcome:
-
-- new Campaigns write only PlanSpec v3;
-- active V2 work is terminal or proven quiescent;
-- one fail-closed read-only Guard changes no state on failure;
-- the root repository runs one real Campaign with four independent Tickets;
-- V8 becomes the default here only after exact acceptance readback; and
-- downstream repositories continue using their current workflow until the root
-  version is published.
-
-The Canary must prove:
-
-- one bounded Coordinator Planning Pass;
-- four concurrent Workers and independent Runtime Profiles;
-- event/timer continuation after a lost callback;
-- exact permissions and a parked interactive wait;
-- Candidate checks before Formal Review;
-- one standard Review and one strict/specialist path;
-- bounded Repair and terminal Runtime recovery;
-- one multi-Candidate Integration Batch, one PR, one hosted CI, and serial
-  target integration;
-- Runtime/workspace retirement; and
-- no manual Store edit, Agent-label repair, Evidence fabrication, or daemon
-  restart.
-
-Expected duration: 2–4 working days, including live Runtime and GitHub
-observation.
-
-## Parallelism and critical path
-
-The work is not safely four-way parallel from the first day because the core
-interfaces define each other's inputs. The expected graph is:
+| Ticket | Outcome | Native blockers |
+| --- | --- | --- |
+| #108 | Land this accepted contract | none |
+| #109 | Start one immutable PlanSpec v3 Campaign | #108 |
+| #110 | Advance four Work Runs without Coordinator continuation | #109 |
+| #111 | Route semantic roles through one RuntimeGateway | #109 |
+| #112 | Bound permission waits and terminal Runtime recovery | #111 |
+| #113 | Resume Campaigns without LLM polling | #110, #112 |
+| #114 | Accept standard Candidates through one CandidateGate | #110, #111 |
+| #115 | Bound strict Review and Review Finding repair | #112, #114 |
+| #116 | Deliver compatible Candidates through one exact Batch | #110, #114 |
+| #117 | Recover Batch failures without repeating unaffected work | #115, #116 |
+| #118 | Cut over new Campaigns through a fail-closed Guard | #113, #117 |
+| #119 | Prove and enable V8 with a four-Ticket root Canary | #118 |
 
 ```mermaid
 flowchart LR
-    D0["0 Contract"] --> D1["1 PlanControl"]
-    D1 --> D2["2 ExecutionKernel"]
-    D1 --> D3["3 RuntimeGateway"]
-    D2 --> D4["4 CandidateGate"]
-    D3 --> D4
-    D2 --> D5["5 BatchIntegrator"]
-    D4 --> D5
-    D3 --> D6["6 Cutover + Canary"]
-    D5 --> D6
+    T108["#108 Contract"] --> T109["#109 PlanControl"]
+    T109 --> T110["#110 ExecutionKernel"]
+    T109 --> T111["#111 RuntimeGateway"]
+    T111 --> T112["#112 Permissions + recovery"]
+    T110 --> T113["#113 Watchdog"]
+    T112 --> T113
+    T110 --> T114["#114 CandidateGate standard"]
+    T111 --> T114
+    T112 --> T115["#115 Strict Review + repair"]
+    T114 --> T115
+    T110 --> T116["#116 Exact Batch"]
+    T114 --> T116
+    T115 --> T117["#117 Batch recovery"]
+    T116 --> T117
+    T113 --> T118["#118 Cutover Guard"]
+    T117 --> T118
+    T118 --> T119["#119 Root Canary"]
 ```
 
-Inside a delivery, fixtures, private Adapters, documentation, and independent
-contract tests may proceed concurrently. Changes to the same deep module and
-its interface integrate serially. Artificially maintaining four active Agents
-when only one interface decision is ready increases conflicts rather than
-throughput.
+## Stage 0 — Contract
 
-Expected elapsed time with focused Agent execution and no external blocker is
-approximately 10–16 working days sequentially, or 7–11 working days with safe
-parallelism. A Paseo provider fix or live-canary instability can extend the
-calendar to 10–15 working days.
+Ticket: #108.
+
+Exit criteria:
+
+- the glossary, reciprocal ADR chain, integrated architecture, subordinate
+  stabilization record, and this roadmap follow the declared normative
+  hierarchy;
+- the public three-method API, five statuses, five modules, Runtime selectors,
+  frozen authority, Campaign activation, Work Run bounds, Batch identity, and
+  defaults have one integrated definition in the architecture;
+- historical V8 architecture and roadmap documents are visibly non-executable;
+- repository package/link validation, diff checks, local acceptance, and exact
+  hosted acceptance pass; and
+- no product Runtime, writer, production execution, or unrelated tracker state
+  changes.
+
+## Stage 1 — PlanControl
+
+Ticket: #109.
+
+Exit criteria:
+
+- `start` creates one Campaign with one active Plan Revision through
+  [`PlanControl and Campaign planning`](gwo-v8-lean-architecture.md#plancontrol-and-campaign-planning);
+- PlanSpec v3 carries the selected Ticket contracts and provider-neutral
+  Authority Grants described by
+  [`PlanSpec v3 and frozen authority`](gwo-v8-lean-architecture.md#planspec-v3-and-frozen-authority);
+- activation uses the Campaign-scoped compare-and-swap and read-backed receipt
+  described by
+  [`Campaign and Plan Revision activation`](gwo-v8-lean-architecture.md#campaign-and-plan-revision-activation);
+- four disjoint Tickets can be claimed by one Campaign, while overlapping
+  Campaign claims fail closed; and
+- new Campaigns contain none of the removed generic graph or Runtime-assignment
+  fields.
+
+## Stage 2 — ExecutionKernel and RuntimeGateway
+
+Tickets: #110 and #111 may proceed in parallel after #109.
+
+Exit criteria for #110:
+
+- `advance` is the only persisted transition and next-action operation;
+- four eligible Work Runs can occupy four Worker Slots without Coordinator
+  scheduling;
+- `inspect` and `advance` agree on the five public statuses; and
+- predecessor workflow driver and separate reconciliation entrypoints are
+  removed.
+
+Exit criteria for #111:
+
+- every semantic action uses the exact selectors and precedence in
+  [`Runtime assignment`](gwo-v8-lean-architecture.md#runtime-assignment);
+- Campaign-start overrides and stable-action assignment receipts survive
+  restart;
+- no caller knows provider names or constructs vendor commands; and
+- PlanSpec remains provider-, model-, CLI-, selector-, and fallback-neutral.
+
+## Stage 3 — Runtime recovery and Campaign liveness
+
+Tickets: #112 then #113.
+
+Exit criteria for #112:
+
+- exact permission matching, three-minute interactive-wait grace, proven park,
+  and resume follow
+  [`Runtime permissions, waits, and recovery`](gwo-v8-lean-architecture.md#runtime-permissions-waits-and-recovery);
+- fallback never crosses the pre-identity boundary;
+- a replacement Worker binding requires terminal-binding Evidence; and
+- one initial plus at most one replacement binding and at most three distinct
+  Candidate SHAs remain bounded across the Work Run.
+
+Exit criteria for #113:
+
+- Runtime and hosted-check events and due timers wake the same `advance`
+  operation;
+- restart reconstructs outstanding wakes without duplicate effects;
+- zero-LLM readback precedes the one stale diagnosis permitted per binding; and
+- healthy Campaigns use no LLM polling.
+
+## Stage 4 — CandidateGate
+
+Tickets: #114 then #115, with #115 also depending on #112.
+
+Exit criteria for #114:
+
+- complete Candidate diff audit and affected deterministic checks precede
+  Formal Review;
+- one standard `review_primary` observation covers the Review Subject; and
+- unchanged valid Evidence is never repeated.
+
+Exit criteria for #115:
+
+- strict Assurance uses the policy-selected specialist or human Decision;
+- invalid transport alone may retry through `review_strong`;
+- changed Candidates receive fresh Review Subjects and disposition every prior
+  Review Finding; and
+- one consolidated repair request preserves the complete Review Finding ledger
+  and Work Run bounds.
+
+## Stage 5 — BatchIntegrator
+
+Tickets: #116 then #117, with #116 also depending on #110.
+
+Exit criteria for #116:
+
+- Batch formation and compatibility follow
+  [`BatchIntegrator`](gwo-v8-lean-architecture.md#batchintegrator);
+- the configured one-to-four member limit, same-Campaign boundary, Singleton
+  rules, oldest-first scan, and pairwise compatibility are deterministic;
+- the local suite, pushed and PR head, and hosted CI all observe one Batch SHA;
+  and
+- target readback proves the exact Batch SHA reachable through the PR merge
+  mapping.
+
+Exit criteria for #117:
+
+- infrastructure retries retain the same Batch SHA;
+- a multi-member code-class failure may split once into Singletons;
+- passing members retain Candidate and Review Evidence; and
+- only a failing Singleton can resume its Work Run with changed code returning
+  through CandidateGate.
+
+## Stage 6 — Cutover and Canary
+
+Tickets: #118 then #119.
+
+Exit criteria for #118:
+
+- one fail-closed read-only Guard proves old-writer quiescence, state
+  compatibility, repository-global writer generation, Integration Lease
+  availability, and required Runtime configuration;
+- failure changes no production state; and
+- activation never permits simultaneous V6 and V8 writers.
+
+Exit criteria for #119:
+
+- one real root-repository Campaign proves the architecture's public API,
+  four concurrent Work Runs, independent Runtime selectors, frozen authority,
+  permission parking, deterministic continuation, standard and strict Review,
+  bounded repair and binding replacement, exact Campaign-scoped Batch,
+  hosted-CI identity, merge readback, and cleanup;
+- no manual Store edit, tracker-label repair, Evidence fabrication, or daemon
+  restart is needed; and
+- V8 becomes the default here only after exact acceptance readback.
+
+## Parallelism and critical path
+
+The safe critical path is:
+
+```text
+#108 -> #109 -> (#110 || #111)
+              #111 -> #112
+              (#110 + #112) -> #113
+              (#110 + #111) -> #114
+              (#112 + #114) -> #115
+              (#110 + #114) -> #116
+              (#115 + #116) -> #117
+              (#113 + #117) -> #118 -> #119
+```
+
+Inside one Ticket, fixtures, private adapters, documentation, and independent
+contract tests may proceed concurrently. Changes to the same deep-module
+interface integrate serially.
 
 ## Historical Issue disposition
 
-The approved replacement Tickets and native blocker graph were published and
-read back before the following transition was applied.
+The replacement Tickets and native blocker graph were published and read back
+before the historical transition below. Closed Issues retain their bodies,
+Candidate facts, and Review Evidence for audit; they are not successor
+instructions.
 
 | Issue | Completed disposition |
 | --- | --- |
-| #51 old V8 cutover | Closed; replaced by #118 and #119 |
-| #69 successor Candidate lineage | Kept open as `needs-triage` beyond V8.0; #112, #115, and #117 cover bounded initial-release recovery |
-| #79 same-Attempt Runtime takeover | Closed; replaced by #112 Terminal Binding Receipt plus second Worker Attempt |
-| #82 production-stabilization Epic | Closed with explicit parent-mutation approval; replaced by #108–#119 |
-| #85–#87 old acceptance/canary/rollout | Closed; replaced by #118 and #119 |
-| #93 inferred Worker capability escalation | Closed as `wontfix`; #111 and #115 use explicit assignment and fixed budgets |
-| #94 and #99 PlanSpec Check Manifest | Closed; #109 keeps Checks out of PlanSpec and #114 derives them from the actual diff |
-| #95 standalone test-suite slimming | Closed; test replacement belongs to every owning successor Ticket |
-| #98 and #101 GoalDriver wake work | Closed; replaced by #113 Campaign Watchdog |
-| #100 durable Check action claims | Closed; exact-action invariants remain private to #114 and #116 |
-| #102 fixture recovery | Closed; completed evidence remains historical and future fixture migration belongs to owning Tickets |
-| #103 Batch split convergence | Closed; replaced by #117 Singleton fallback |
-| #104 hosted failure adoption | Closed; preserved by #117 exact Batch recovery |
-| #105 Paseo provider snapshot recovery | Closed; replaced by #112 RuntimeGateway recovery |
-| #35 OpenCode helper pooling | Keep independent of the lean V8 Campaign unless it becomes a proven RuntimeGateway blocker |
+| #51 and #85–#87 | Closed; replaced by #118 and #119 |
+| #69 | Kept open as `needs-triage` beyond V8.0; current bounded recovery belongs to #112, #115, and #117 |
+| #79 | Closed; replaced by #112 terminal-binding Evidence and one replacement binding |
+| #82 | Closed with explicit parent-mutation approval; replaced by #108–#119 |
+| #93 | Closed as `wontfix`; #111 and #115 use explicit assignment and fixed bounds |
+| #94 and #99 | Closed; #109 keeps checks out of PlanSpec and #114 derives them from the actual Candidate |
+| #95 and #102 | Closed; fixture and test migration belongs to each owning successor Ticket |
+| #98 and #101 | Closed; replaced by #113 |
+| #100 | Closed; exact-action invariants remain private to #114 and #116 |
+| #103 and #104 | Closed; preserved by #117 |
+| #105 | Closed; preserved by #112 |
+| #35 | Independent unless it becomes a proven RuntimeGateway blocker |
 
-The resulting executable frontier starts at #108. Closed historical Issues
-retain their bodies, Candidate facts, Review evidence, and disposition comments
-for audit; they are not executable recovery instructions for the successor.
+## PR and CI strategy during landing
 
-## PR and CI strategy during the refactor
+Before BatchIntegrator is live, use one reviewable PR per Ticket or tightly
+coupled delivery pair. Multiple independently executable Tickets may share a
+PR only when their exact Candidate identities and individual acceptance
+mapping remain explicit. Run repository acceptance on the final composed head
+and push once for final hosted CI.
 
-Before BatchIntegrator is live, use one reviewable PR per delivery or tightly
-coupled delivery pair. Multiple independently executable Tickets may share that
-PR when they compose on one exact SHA and the PR description preserves their
-individual acceptance mapping. Run local acceptance on the final composed SHA
-and push once for final CI.
-
-Do not create a PR per small fixture correction, Reviewer comment, or
-continuation. Do not combine two unfinished deep-module interfaces merely to
-reduce PR count.
-
-After Delivery 5, the root Canary must use BatchIntegrator itself rather than a
+After #116, the root Canary must use BatchIntegrator itself rather than a
 manual approximation.
