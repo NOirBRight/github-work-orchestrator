@@ -11,15 +11,32 @@ permissions:
 
 jobs:
   acceptance:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Windows, X64, gwo-ci]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Verify runner Python
-        run: python -c "import sys; assert sys.version_info[:2] == (3, 13), sys.version"
-      - name: Install test dependency
-        run: python -m pip install pytest
+        shell: pwsh
+        run: |
+          $version = & python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+          if ($LASTEXITCODE -ne 0 -or $version.Trim() -ne "3.13") {
+            Write-Error "Dedicated runner must provide Python 3.13; got '$version'."
+            exit 1
+          }
+      - name: Create isolated test environment
+        shell: pwsh
+        run: |
+          $venvPath = Join-Path $env:RUNNER_TEMP ("gwo-ci-venv-{0}-{1}" -f $env:GITHUB_RUN_ID, $env:GITHUB_RUN_ATTEMPT)
+          & python -m venv $venvPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $venvPython = Join-Path $venvPath "Scripts\python.exe"
+          & $venvPython -m pip install "pytest==9.0.2"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "GWO_CI_PYTHON=$venvPython" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Run repository acceptance
-        run: python -m pytest -q
+        shell: pwsh
+        run: '& "$env:GWO_CI_PYTHON" -m pytest -q'
       - name: Validate Skill packages
-        run: python scripts/quick_validate.py
+        shell: pwsh
+        run: '& "$env:GWO_CI_PYTHON" scripts/quick_validate.py'
