@@ -17,6 +17,22 @@ from .activation import (
     WriterAuthorityControl,
 )
 from .compiler import CompiledPlan, CompileError, PlanCompiler
+from .plan_control import (
+    ActivationReceiptV3,
+    ActiveCampaign,
+    CampaignHandle,
+    CampaignSnapshot,
+    CampaignStartOptions,
+    InMemoryCampaignSource,
+    InMemoryPlanControlStore,
+    InMemoryPlanningPass,
+    PlanControl,
+    PlanControlDecision,
+    PlanControlError,
+    PlanRevision,
+    SplitCampaignDecision,
+    start,
+)
 from .entry import (
     ImplementGwoDecision,
     ImplementGwoEntry,
@@ -248,4 +264,18 @@ __all__ = [
     "Reconciler",
     "VerificationDecision",
     "VerifiedResult",
+    "ActivationReceiptV3",
+    "ActiveCampaign",
+    "CampaignHandle",
+    "CampaignSnapshot",
+    "CampaignStartOptions",
+    "InMemoryCampaignSource",
+    "InMemoryPlanControlStore",
+    "InMemoryPlanningPass",
+    "PlanControl",
+    "PlanControlDecision",
+    "PlanControlError",
+    "PlanRevision",
+    "SplitCampaignDecision",
+    "start",
 ]
