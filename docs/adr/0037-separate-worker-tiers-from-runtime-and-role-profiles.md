@@ -1,23 +1,22 @@
 ---
-status: amended by ADR-0039
+status: amended by ADR-0039, ADR-0042, ADR-0044, ADR-0045, and ADR-0061
 amends: ADR-0026, ADR-0031
 ---
 
-# Separate Worker tiers from Runtime and role profiles
+# Separate Runtime capabilities from role Profiles
 
-Worker tiers express four logical capability levels—light, standard, heavy,
-and frontier—while Runtime Profiles contain concrete provider, model,
-reasoning, mode, and features. Coordinator and Reviewer choices are independent
-Role Bindings rather than invented Worker tiers.
+PlanSpec may state factual Runtime capabilities but never assigns a provider,
+model, CLI, reasoning setting, selector, Profile, or fallback. RuntimeGateway
+resolves one Campaign-scoped `coordinator` selector and the Ticket-scoped
+`worker`, `recovery_worker`, `review_primary`, `review_strong`, and
+`specialist:<policy-id>` selectors from deterministic user configuration.
 
-Global host configuration supplies defaults and host-local repository sections
-override them; versioned repository policy retains semantic risk, review, and
-check requirements. New Admissions record the selected profile digest, and
-configuration changes never rewrite existing Attempts or Plan Revisions.
+Every mapping has one required primary Runtime Profile and at most one optional
+availability fallback. RuntimeGateway persists the selector, configuration
+source, resolved Profile digest, and fallback selection for each stable action.
+Changing configuration never rewrites an existing assignment or Plan Revision.
 
-Configured Worker, Reviewer, and Coordinator capacity counts only top-level
-Agents managed by GWO. A managed parent may create Internal Subagents without
-separate Admission, Attempt, Role Binding, or GWO capacity accounting. Those
-children cannot exceed the parent's Effect Contract, and the parent remains
-responsible for authoritative lifecycle facts, Evidence aggregation, and
-Results.
+Formal Review Internal Subagents consume no Campaign Worker Slot and may use a
+different selector from their parent Worker. They remain read-only under the
+work entry's Authority Grants and Policy Witness. Runtime capability never
+grants semantic or external-effect authority.

@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0034
 supersedes: 0001-two-tier-campaign-orchestration.md, 0004-separate-supervision-from-workspace-and-review-axes.md
 ---
 

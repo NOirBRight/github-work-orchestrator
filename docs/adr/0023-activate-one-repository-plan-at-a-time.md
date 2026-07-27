@@ -1,5 +1,5 @@
 ---
-status: amended by ADR-0035
+status: superseded by ADR-0055
 ---
 
 # Activate one Repository Plan Revision at a time

@@ -1,5 +1,5 @@
 ---
-status: amended by ADR-0040
+status: superseded by ADR-0057
 amends: ADR-0022, ADR-0025, ADR-0026, ADR-0030, ADR-0031, ADR-0036, ADR-0037, ADR-0038
 ---
 

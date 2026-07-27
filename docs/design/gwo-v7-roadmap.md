@@ -1,5 +1,14 @@
 # GWO V7 roadmap
 
+Status: unadopted, superseded historical roadmap. V7 was never the production
+writer. Do not execute this roadmap or generate Tickets from it. The current
+contract is
+[`gwo-v8-lean-architecture.md`](gwo-v8-lean-architecture.md), and the current
+delivery sequence is
+[`gwo-v8-lean-roadmap.md`](gwo-v8-lean-roadmap.md).
+
+The remainder preserves the proposed V7 phases for decision history only.
+
 Phased migration from V6.1.0 to the architecture in
 `gwo-v7-architecture.md`. Each phase lands independently behind the existing
 test suite; V6 mechanisms stay operative until the phase that replaces them

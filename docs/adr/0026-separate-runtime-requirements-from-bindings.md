@@ -1,25 +1,21 @@
 ---
-status: amended by ADR-0037 and ADR-0039
+status: amended by ADR-0037, ADR-0039, ADR-0042, ADR-0044, and ADR-0059
 ---
 
-# Separate Runtime Requirements from Runtime Bindings
+# Separate Runtime requirements from Runtime Bindings
 
-PlanSpec records the capabilities and logical Worker level required by a Plan
-Node, not a fabricated Agent identity. Admission and routing produce
-an observed Runtime Binding for each Attempt, preserving both plan portability
-and an audit of what actually executed.
+PlanSpec records only factual capabilities required by a selected Ticket. It
+does not contain a provider, model, reasoning setting, CLI, Runtime selector,
+Profile, fallback, or fabricated Agent identity.
 
-V8.0 does not require semantic dynamic routing. At Admission, the Kernel
-applies deterministic Runtime Policy to Runtime Requirements, Worker Tier,
-role, and recovery stage. Worker tiers and Coordinator or Reviewer Role
-Bindings resolve to concrete Runtime Profiles in host configuration.
-Materialization asks the selected Adapter to realize that choice.
-Authoritative provider, model, Agent, session, and workspace identities exist
-only after readback and are recorded in Runtime Binding. Replacing the runtime
-or escalating the profile creates a new Attempt and binding without rewriting
-PlanSpec.
+RuntimeGateway resolves the exact role selector through persisted
+Campaign-start overrides, repository role configuration, and host-global role
+configuration. It records the selector, configuration source, resolved Profile
+digest, fallback selection, and authoritative Agent, session, workspace, and
+Runtime Binding identity as Runtime facts outside PlanSpec.
 
-A manually created Coordinator retains its actual runtime. Auto-creation or
-replacement uses the configured Coordinator Role Binding. Other nodes declare
-only the capabilities their contracts need; the Adapter advertises observed
-support independently of provider or model naming.
+Capability requirements and assignment are independent. PlanControl may reject
+a Profile that lacks a required capability, but neither semantic planning nor
+Assurance Requirement may rank Profiles or choose a stronger model. Replacing
+a terminal Worker uses the already resolved `recovery_worker` assignment and
+does not rewrite PlanSpec.

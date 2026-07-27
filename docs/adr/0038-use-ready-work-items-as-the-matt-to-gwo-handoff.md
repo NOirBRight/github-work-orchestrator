@@ -1,24 +1,22 @@
 ---
-status: amended by ADR-0039
+status: amended by ADR-0039, ADR-0050, and ADR-0055
 amends: ADR-0020, ADR-0021
 ---
 
-# Use Ready Work Items as the Matt-to-GWO handoff
+# Use approved Tickets as the upstream-to-GWO handoff
 
-Human-facing Matt planning workflows remain upstream of GWO. `to-spec` is
-optional when a canonical specification already exists; `to-tickets` and
-`triage` converge on `ready-for-agent`, and only those Ready Work Items may
-enter executable Plan Intent. GWO never impersonates the human decisions in
-grilling, ticket approval, or triage.
+Human-facing planning workflows remain upstream of GWO. `/to-tickets` and
+`/triage` may converge on the canonical `ready-for-agent` state, but GWO
+executes only the Ticket references explicitly selected at `start`. It never
+impersonates the human decisions in grilling, Ticket approval, or triage.
 
-Matt `/implement` remains the unchanged single-ticket flow.
-`/implement-gwo` is the explicit durable-campaign entry for one ready ticket,
-a parent Goal/spec, or a ready ticket set. The former `/orchestrator` command
-is a one-release compatibility alias and is removed in V8.1 rather than
-retained as a second shallow workflow.
+PlanControl snapshots the complete selected Ticket contracts and canonical
+blockers into one Campaign Plan Revision, obtains one Campaign Planning Pass,
+and deterministically compiles PlanSpec. Its planning output and compilation
+record remain private. Selected Tickets without dependency edges may execute
+concurrently.
 
-Inside GWO, workflow commands are not valid Plan Node Skill References.
-Workers use focused execution guidance, transient parent Reviewers use
-`code-review`, and the Kernel retains authority over Admission, Evidence,
-publication, recovery, and Integration. This preserves the Matt workflow while
-preventing recursive orchestration and duplicate Review.
+Workflow commands are not PlanSpec fields or execution authority. Workers use
+focused guidance; CandidateGate alone owns Formal Review; the deterministic
+modules retain authority over admission, Evidence, delivery, recovery, and
+integration. This prevents recursive orchestration and duplicate Review.

@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0034
 supersedes: 0005-require-acked-material-room-delivery.md, 0006-compose-worker-and-review-dispatch-receipts.md
 amends: 0003-use-an-event-driven-paseo-coordinator-loop.md
 ---

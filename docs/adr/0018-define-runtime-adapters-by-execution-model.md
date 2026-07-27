@@ -1,44 +1,41 @@
 ---
-status: accepted
+status: amended by ADR-0059
 ---
 
-# Define Runtime Adapters by execution model
+# Define Runtime adapters by execution model
 
-The V8 Runtime Adapter seam is capability-oriented rather than fixed to a number
-of operations. Paseo is its first real resident-agent adapter; direct Codex CLI
-and Claude Code session-process adapters are intended future implementations.
-Provider and model selection remains a separate binding within an adapter, so
-the word "Codex" alone must not stand for both runtime and model.
+RuntimeGateway owns one private provider-neutral adapter contract rather than a
+provider-shaped public interface:
 
-The V8.0 Paseo Adapter must be able to idempotently materialize and read back
-Agent/workspace/session identity, deliver and confirm an initial Prompt, observe
-lifecycle/binding/permission/events, interrupt a current turn while preserving
-its session and workspace, resume that session, and execute read-backed
-retirement actions already authorized by the Kernel. These are capabilities,
-not a mandate to expose a fixed operation count.
+```text
+prepare(RuntimeActionSpec) -> PrepareReceipt | RuntimeFailure
+observe(stable_action_id) -> RuntimeObservation | RuntimeFailure
+command(binding_ref, RuntimeCommand) -> CommandReceipt | RuntimeFailure
+events(after_cursor) -> RuntimeEventPage
+```
 
-An in-memory test fake may exercise the Paseo-shaped contract, but it does not
-count as a second production Adapter or freeze a universal cross-runtime
-interface. The seam may be redesigned when a real second Adapter exposes
-materially different lifecycle behavior.
+`prepare` idempotently resolves or creates Agent, session, and workspace
+identity and stages the Artifact-backed Prompt; it cannot begin semantic
+execution. `observe` proves the stable action, selected Profile digest, all
+identities, Prompt acceptance, lifecycle, permissions, and fencing.
+`RuntimeCommand` is the closed union `start`, `resume`, `park`, `interrupt`,
+`permission_response`, `fence`, and `retire`. `start` or `resume` is legal only
+after authoritative observation of the complete binding and Prompt receipt.
+Events are wake hints, never authoritative state.
 
-Every materialized runtime resource must persist and return its GWO
-`repository_id`, Plan Revision digest, Node Key, and Admission ID, plus Attempt
-ID after the Attempt begins. An Adapter that cannot round-trip these identities
-is not eligible for V8 write execution because Store recovery could not
-distinguish adoption from duplicate creation.
+Every production adapter and the deterministic in-memory adapter passes the
+same contract and failure suite. The in-memory implementation is not a looser
+fake. Profile selection, permission policy, and fallback remain RuntimeGateway
+policy. Retry bounds and semantic budgets remain ExecutionKernel policy. None
+of them is adapter policy.
 
-Coordinator Runtime Requirements include persistent-session resume so Task
-Group Goal continuation survives turn boundaries. A Worker may be disposable;
-if its runtime cannot resume, replacement begins a new Attempt. Mid-turn steer
-is optional. An adapter that lacks it waits for a safe boundary or uses
-interrupt followed by resume rather than pretending that a running Agent
-accepted another Prompt.
+Every materialized resource round-trips repository, Campaign, Plan Revision,
+Work Run, Runtime action, Agent, session, and workspace identity. Events
+accelerate wake-up but never replace authoritative readback. Adapter
+capabilities cannot grant authority: exact permissions remain covered by the
+Work Run's Authority Grants and Policy Witness.
 
-Runtime events accelerate wake-up but never replace authoritative readback by
-Agent, session, or action identity. `interrupt` preserves a resumable runtime;
-`retire` executes a Kernel cleanup decision after ownership ends. Adapter
-support cannot grant cleanup authority. The Adapter also distinguishes an
-active turn from a retained idle session and reports observable Runtime
-availability when its execution model exposes it; retained identity alone does
-not consume a GWO Active Turn Slot.
+The integrated contract is
+[`RuntimeGateway adapter contract`](../design/gwo-v8-lean-architecture.md#runtimegateway-adapter-contract);
+all failure handling follows the single
+[`Runtime failure taxonomy`](../design/gwo-v8-lean-architecture.md#runtime-failure-taxonomy).

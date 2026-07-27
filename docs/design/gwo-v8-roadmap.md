@@ -1,13 +1,13 @@
 # GWO V8 roadmap
 
-Status: accepted direction; code implementation complete through Phase 4C.
-The dedicated GitHub-boundary smoke and three-node live Integration Batch
-acceptance have passed. Production writer transition remains a separate,
-explicitly authorized operational release action. See
-`docs/e2e/gwo-v8-canary.md`. The first real-repository read-only readiness
-check is fail-closed on stale tracker state, missing canonical production
-PlanSpec, and the missing production V6.1 fence adapter; see
-`docs/e2e/gwo-v8-cutover-readiness.md`.
+Status: superseded historical roadmap. Its Phase 0–4C records describe an
+earlier planned lineage, not the plan for the lean V8 refactor. Do not execute
+or generate new Tickets from this document.
+
+The current contract is
+[`gwo-v8-lean-architecture.md`](gwo-v8-lean-architecture.md), and the current
+delivery sequence is
+[`gwo-v8-lean-roadmap.md`](gwo-v8-lean-roadmap.md).
 
 This roadmap starts from the production reality: V6.1 is the current writer
 and V7 was never adopted. V8 does not complete or migrate V7. It introduces a
