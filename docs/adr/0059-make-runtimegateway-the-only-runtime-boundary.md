@@ -80,6 +80,30 @@ may use the single replacement binding with the configured `recovery_worker`
 assignment. Timeout, permission delay, ambiguity, or capacity pressure after
 identity never changes CLI or creates a replacement Agent.
 
+Live provider unavailability after identity opens or reuses one persisted
+episode bound to the exact stable action, Runtime Binding, Profile, provider,
+CLI, Agent, session, workspace, accepted Prompt, and frozen authority.
+RuntimeGateway supplies uniquely identified authoritative live-observation
+receipts and may only read back or resume that same binding. ExecutionKernel
+persists the episode, each accepted receipt, and its counter before returning
+`Wait(RuntimeProviderUnavailable, next_check_at)` for the initial and
+first-retry observations. After persisting the second retry, which is the third
+authoritative live-unavailable observation, it returns the human-owned
+`Decision(RuntimeProviderRecoveryRequired)`.
+
+Only a uniquely persisted authoritative observation receipt advances that
+counter. Cached facts, replayed callbacks or wakes, restart, and repeated
+`advance` without a new live observation neither consume nor reset it.
+Transport unavailability advances only its independent counter and is never
+double-counted as provider unavailability. The episode releases no Slot or
+claim, consumes no semantic, Candidate, or replacement budget, and authorizes
+no fallback, new `prepare` or create, assignment switch, Profile/provider/CLI
+switch, daemon restart, park/terminal/fence inference, or replacement. Only
+independent terminal-binding Evidence may enter the existing one-replacement
+path. Same-binding readback or resume after provider recovery closes the
+episode. The complete response matrix remains defined only in the canonical
+[`Runtime failure taxonomy`](../design/gwo-v8-lean-architecture.md#runtime-failure-taxonomy).
+
 RuntimeGateway makes no semantic delivery, Review, repair, scheduling, budget,
 or model-ranking decision. `review_primary` and `review_strong`, or primary and
 availability fallback, may map to the same user-configured Runtime Profile. V8

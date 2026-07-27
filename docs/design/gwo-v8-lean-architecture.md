@@ -77,7 +77,7 @@ content, enlarge budgets, weaken Assurance Policy, or alter delivery policy.
 | PlanControl | Selected Ticket readback, one Campaign Planning Pass, PlanSpec v3 compilation, Authority Grant compilation, publication, activation, and readback |
 | ExecutionKernel | The only persisted Campaign state machine, capacity owner, budget owner, and next-action authority |
 | RuntimeGateway | Runtime selector resolution, multi-CLI execution, identity readback, exact permission handling, fallback, recovery, and retirement |
-| CandidateGate | Complete Candidate diff audit, affected checks, Assurance Requirement derivation, Formal Review, Review Finding reconciliation, and consolidated repair |
+| CandidateGate | Authoritative Candidate readback, private Candidate receipt and complete diff identity, affected checks, Assurance Requirement derivation, Formal Review, Review Finding reconciliation, and consolidated repair |
 | BatchIntegrator | Campaign-scoped compatibility, composition, exact verification, PR, hosted CI, serial integration, and delivery recovery |
 
 Campaign Watchdog is an event-and-timer wake adapter, not a sixth domain
@@ -96,7 +96,7 @@ flowchart TD
     CP --> PR["Immutable Plan Revision"]
     PR --> EK["ExecutionKernel"]
     EK --> W["Up to four concurrent Work Runs"]
-    W --> CG["CandidateGate"]
+    W -->|Candidate reference wake| CG["CandidateGate"]
     CG -->|Consolidated repair| W
     CG -->|Accepted Candidate| BI["BatchIntegrator"]
     BI --> LC["Exact-Batch local verification"]
@@ -318,6 +318,10 @@ Runtime proven parked releases the Slot. Resumption reacquires capacity before
 semantic execution continues. Review Internal Subagents consume no Worker
 Slot.
 
+A live provider-unavailable observation after identity exists proves neither
+parked, terminal, nor fenced state. By itself it releases no Worker Slot,
+Ticket claim, or Exclusive Resource claim.
+
 Within one Plan Revision, each Work Run permits:
 
 - at most three distinct Candidate SHAs submitted in total;
@@ -376,7 +380,8 @@ documents link here rather than restating variants.
 | Permanent configuration failure before identity | Do not select fallback and do not perform transport retry. | `Blocked(RuntimeConfigurationInvalid)`. |
 | Permanent configuration failure after identity | Preserve and fence as required around the same binding. Replacement remains forbidden unless terminal-binding Evidence permits the one configured replacement. | Human `Decision(RuntimeConfigurationRepairRequired)` when replacement is not proven and authorized. |
 | Runtime transport unavailable | Read back by stable action identity, then persist `Wait(RuntimeTransportUnavailable, next_check_at)` for the initial attempt plus at most two retries. Do not select fallback or replacement. | Before identity: `Blocked(RuntimeTransportUnavailable)`. After identity: human `Decision(RuntimeObservationUnavailable)`. |
-| Live provider recovery after identity | Resume or read back the same binding only. Never change its Profile, provider, CLI, session, or workspace. | Existing same-binding lifecycle applies. |
+| Live provider unavailable after identity | Open or recover one persisted episode keyed by the exact stable action and Runtime Binding. The initial and first-retry authoritative live observations each persist `Wait(RuntimeProviderUnavailable, next_check_at)`. The second retry—the third authoritative live-unavailable observation—returns the terminal result at right. Preserve the exact `stable_action_id`, Runtime Binding, Profile, provider, CLI, Agent, session, workspace, accepted Prompt, and authority-subtree digest throughout. | Human `Decision(RuntimeProviderRecoveryRequired)`. |
+| Live provider recovery after identity | Authoritatively read back and, when lifecycle permits, resume the same binding only. Never change its Profile, provider, CLI, session, or workspace. Successful same-binding recovery closes its persisted provider-unavailable episode. | Existing same-binding lifecycle applies. |
 
 No failure before accepted-Prompt readback consumes a semantic or Candidate
 budget. After a failed create, RuntimeGateway first reads back the stable
@@ -384,6 +389,20 @@ action identity. It may remove only a proven action-owned empty workspace.
 Identity or content ambiguity fences every attributable resource and returns a
 named human Decision; it never guesses adoption, creates a duplicate, or
 reuses unproven content.
+
+Only a uniquely persisted receipt for a new authoritative live-unavailable
+observation advances a post-identity provider-unavailable episode. Cached
+snapshots, duplicate callbacks or wakes, restart recovery, and repeated
+`advance` without a new live observation neither consume nor reset it. A
+transport-unavailable observation uses its independent transport episode and
+budget and is never double-counted as provider unavailability, or vice versa.
+
+Provider unavailability alone does not prove the binding parked, terminal, or
+fenced and does not release capacity or claims. It cannot select fallback,
+issue a new `prepare`, create an Agent or workspace, switch Profile, provider,
+or CLI, restart a daemon, create a replacement, or consume semantic,
+Candidate, or replacement-binding budget. Only independent terminal-binding
+Evidence may authorize the existing one replacement binding.
 
 RuntimeGateway and Campaign Watchdog never restart a provider daemon
 automatically. A daemon restart can terminate unrelated Agents and is outside
@@ -394,36 +413,119 @@ the authorized recovery contract.
 CandidateGate is the only Formal Review entry:
 
 ```text
-immutable Candidate
-  -> complete Candidate diff and scope/authority audit
+Candidate reference wake hint
+  -> authoritative Candidate commit/tree readback
+  -> CandidateDiffRecordV1 + private Candidate receipt
+  -> ExecutionKernel persists the receipt
+  -> scope/authority audit over that exact record
   -> affected deterministic checks
   -> Assurance Requirement
   -> required Formal Review Internal Subagent
   -> Accepted | consolidated repair | Decision | Wait
 ```
 
+The Worker can report only a Candidate reference. Its report and any Runtime
+notification are wake hints. RuntimeGateway transports them but cannot adopt a
+Candidate or advance Work Run state. CandidateGate authoritatively reads back
+the exact Candidate commit and tree, constructs the private
+`CandidateDiffRecordV1` Artifact, and produces a private Candidate receipt.
+That receipt binds Campaign, Plan Revision, Work Run, reported reference, exact
+base and Candidate commit/tree identities, diff schema version and digest, and
+authority-subtree digest. Only after ExecutionKernel persists it may the Work
+Run leave semantic execution for Candidate verification. This is private state
+for that existing transition, not a new gate, and is distinct from the
+accepted-Candidate receipt emitted only after verification succeeds.
+
+### CandidateDiffRecordV1
+
+`CandidateDiffRecordV1` is CandidateGate's complete, immutable diff Artifact.
+It is not a module, workflow node, public API type, status, Evidence, or
+`PatchIdentityV1`. CandidateGate constructs it directly from the exact base and
+Candidate Git trees so Ticket #114 does not depend on BatchIntegrator work in
+Ticket #116.
+
+Its RFC 8785 canonical JSON payload has this logical shape:
+
+```json
+{
+  "schema_version": "CandidateDiffRecordV1",
+  "repository_object_format": "sha1",
+  "base": {"commit_oid": "...", "tree_oid": "..."},
+  "candidate": {"commit_oid": "...", "tree_oid": "..."},
+  "entries": [
+    {
+      "old_path": "...",
+      "new_path": "...",
+      "change_kind": "modify",
+      "old_mode": "100644",
+      "new_mode": "100755",
+      "old_object_type": "blob",
+      "new_object_type": "blob",
+      "old_oid": "...",
+      "new_oid": "..."
+    }
+  ]
+}
+```
+
+`repository_object_format` is the repository's exact `sha1` or `sha256`
+format. Every commit, tree, blob, and gitlink OID is fixed-width lowercase hex:
+40 characters for `sha1` or 64 for `sha256`. Paths are complete
+repository-relative raw Git path bytes,
+encoded as unpadded base64url strings; an absent old or new path, mode, object
+type, or OID is JSON `null`. Modes are six-digit ASCII octal strings.
+Object-type values are `blob` or `gitlink`. Rename and copy inference is
+disabled, so either is represented as delete plus add.
+
+Entries omit unchanged paths. The canonical kind is `add` when the old entry is
+absent, `delete` when the new entry is absent, `type-change` when the logical
+object type or Git file type derived from mode changes, and `modify` for every
+other OID or mode change. Entries are sorted bytewise by decoded raw old path,
+then decoded raw new path, then change kind, treating an absent path as the
+zero-length byte string. The record digest is external to the payload and is:
+
+```text
+SHA-256(
+  ASCII("gwo.candidate-diff-record.v1\0")
+  || RFC8785_CANONICAL_JSON_BYTES(record)
+)
+```
+
+CandidateGate persists one Artifact and uses that same record for scope and
+authority audit, affected Checks, Assurance Requirement derivation, protected
+surfaces, Interaction Keys, and Formal Review. No consumer reconstructs a
+weaker or independently interpreted diff.
+
 Deterministic failure stops before LLM Review. Worker self-checks cannot become
 Formal Review Evidence. An external `code-review` skill may supply heuristics,
 but V8 owns the Review Subject, coverage, transport, typed output, identity,
 budget, and lifecycle.
 
-A Review Subject binds the exact base, Candidate, Ticket contract, standards,
-Check Evidence, Assurance Requirement, Policy Witness, and protocol version.
+A Review Subject binds the exact base and Candidate commit/tree identities,
+`CandidateDiffRecordV1` schema version and digest, Ticket contract, standards,
+Check Evidence, Assurance Requirement, Policy Witness, and Review protocol
+version. Review Evidence is reusable only when the complete Review Subject
+digest is identical, the diff Artifact remains readable, and CandidateGate
+revalidates its digest. A base, Candidate, diff schema, diff digest, or Review
+protocol change creates a fresh Review Subject. A missing, truncated, or
+digest-mismatched diff Artifact fails closed before any Reviewer invocation.
+
 A complete no-Review allowlist match may use zero Reviewer calls. Standard
 Assurance uses one `review_primary` observation. Strict Assurance adds at most
 one `specialist:<policy-id>` observation or human Decision. Invalid Review
 transport may retry once through `review_strong`; a valid rejection is not
 repeated against an unchanged Review Subject.
 
-A changed Candidate creates a new Review Subject. The complete Artifact-backed
-Review Finding ledger is preserved, and every earlier Review Finding receives
-a typed disposition. CandidateGate returns one consolidated repair request
-containing that ledger; Review Findings and repair context are never silently
-truncated.
+A fresh Review Subject preserves the complete Artifact-backed Review Finding
+ledger, and every earlier Review Finding receives a typed disposition.
+CandidateGate returns one consolidated repair request containing that ledger;
+Review Findings and repair context are never silently truncated.
 
-Acceptance emits a compact receipt binding Campaign, Work Run, Candidate,
-authority-subtree digest, Review Subject, Assurance Requirement, and Evidence.
-Only that receipt makes a Candidate eligible for delivery.
+Acceptance emits a compact accepted-Candidate receipt binding Campaign, Work
+Run, persisted Candidate receipt, Candidate commit/tree,
+`CandidateDiffRecordV1` schema and digest, authority-subtree digest, Review
+Subject, Assurance Requirement, and Evidence. Only that accepted-Candidate
+receipt makes a Candidate eligible for delivery.
 
 ## BatchIntegrator
 
@@ -559,12 +661,26 @@ Every external effect has a stable action identity and is read back before
 retry. No local transaction remains open during external I/O. GitHub remains
 the durable business record; local storage is rebuildable control state.
 
+Worker reports and Runtime notifications are wake hints only. RuntimeGateway
+transports them; CandidateGate owns authoritative Candidate commit/tree and
+diff readback; ExecutionKernel owns persistence and lifecycle transition. A
+Candidate Artifact is not Evidence or a Result. A code-producing Result exists
+only after the exact accepted Candidate is integrated and target readback
+proves that integration.
+
 Campaign Watchdog subscribes to Runtime and hosted-check events and owns
 persisted `next_check_at` timers. Events are wake hints only; each wake invokes
 `advance`, which performs authoritative readback. Restart reconstructs timers
 and subscriptions from Campaign state. A due `next_check_at` wake invokes the
 same `advance` path and recovers a lost callback without duplicating its
 effect. Campaign Watchdog never restarts the Paseo daemon automatically.
+
+An original report, duplicate notification, raw log, workspace head, or
+unread-back completion statement neither advances state nor resets the stale
+deadline. Only a durably persisted Candidate receipt whose exact Candidate
+SHA/tree came from authoritative readback and whose `CandidateDiffRecordV1`
+digest was constructed and revalidated over the exact base and Candidate
+objects is trusted Candidate liveness progress.
 
 Detailed admission, action, permission, Review, and delivery records are
 module-private implementation facts. They are not public actors or vocabulary
@@ -580,7 +696,9 @@ The current deterministic defaults are:
 | Batch member limit | 4, maximum 4 | host-global, repository override |
 | Stale-binding deadline | 30 minutes | host-global, repository override |
 | Interactive-wait grace | 3 minutes | host-global, repository override |
-| Runtime availability/transport observations | initial plus at most 2 retries | fixed V8.0 policy |
+| Pre-identity provider-availability observations | initial plus at most 2 retries, independent of transport | fixed V8.0 policy |
+| Post-identity provider-unavailable episode | initial plus at most 2 retries, independent of transport | fixed V8.0 policy |
+| Runtime transport-unavailable episode | initial plus at most 2 retries, independent of provider availability | fixed V8.0 policy |
 | Distinct Candidate SHAs per Work Run | at most 3 | fixed V8.0 policy |
 | Worker bindings per Work Run | initial plus at most one replacement | fixed V8.0 policy |
 

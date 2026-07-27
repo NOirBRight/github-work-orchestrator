@@ -6,9 +6,22 @@ amends: ADR-0022, ADR-0039, ADR-0040
 # Deduplicate Formal Review and verify repository behavior at the Batch
 
 CandidateGate is the sole Formal Review entry. One Review Subject digest binds
-the exact base, Candidate, Ticket contract, standards, Check Evidence,
-Assurance Requirement, Policy Witness, and protocol version. Workers may
-self-check but cannot invoke Formal Review or produce Review Evidence.
+the exact base and Candidate commit/tree identities, the private
+`CandidateDiffRecordV1` schema version and digest, Ticket contract, standards,
+Check Evidence, Assurance Requirement, Policy Witness, and Review protocol
+version. Workers may self-check but cannot invoke Formal Review or produce
+Review Evidence.
+
+CandidateGate persists one complete diff Artifact and uses that same record for
+scope and authority audit, Checks, Assurance, protected surfaces, Interaction
+Keys, and Formal Review. Review Evidence may be reused only when the complete
+Review Subject digest is unchanged, the Artifact remains readable, and its
+digest is revalidated. A base, Candidate, diff schema, diff digest, or protocol
+change creates a fresh Review Subject. A missing, truncated, or mismatched
+record fails closed before a Reviewer is invoked. The canonical private record
+is defined by
+[`CandidateDiffRecordV1`](../design/gwo-v8-lean-architecture.md#candidatediffrecordv1);
+it is deliberately not `PatchIdentityV1`.
 
 A complete no-Review allowlist match requires explicit Assurance Evidence.
 Standard Assurance uses one complete `review_primary` observation. Strict
@@ -17,10 +30,11 @@ or human Decision. Invalid or incomplete Review transport may retry once
 through `review_strong`; a valid rejection is not repeated against an unchanged
 Review Subject.
 
-Changing Candidate SHA creates a new Review Subject. The Artifact-backed Review
-Finding ledger remains complete, and every prior Review Finding receives a
-typed disposition. CandidateGate emits one compact accepted-Candidate receipt;
-BatchIntegrator cannot launch another Formal Review.
+A fresh Review Subject keeps the Artifact-backed Review Finding ledger
+complete, and every prior Review Finding receives a typed disposition.
+CandidateGate emits one compact accepted-Candidate receipt binding the
+persisted Candidate receipt and exact diff identity; BatchIntegrator cannot
+launch another Formal Review.
 
 When the repository-global Integration Lease is free, BatchIntegrator
 immediately freezes a same-Campaign Integration Batch using the configured

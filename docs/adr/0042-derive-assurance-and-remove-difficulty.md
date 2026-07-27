@@ -15,9 +15,14 @@ predictions and do not select Runtime Profiles. PlanSpec records factual
 capability needs plus provider-neutral Authority Grants and a frozen Policy
 Witness.
 
-After an immutable Candidate exists, Assurance Policy derives the Assurance
-Requirement from its complete diff record, Authority Grants, Policy Witness,
-protected surfaces, and observed effects. The requirement names affected
+After CandidateGate authoritatively reads back an immutable Candidate,
+Assurance Policy derives the Assurance Requirement from the same persisted
+[`CandidateDiffRecordV1`](../design/gwo-v8-lean-architecture.md#candidatediffrecordv1)
+used for scope and authority audit, affected Checks, protected surfaces,
+Interaction Keys, and Formal Review. No consumer may reconstruct a weaker or
+independently interpreted diff, and CandidateGate does not substitute
+BatchIntegrator's later `PatchIdentityV1`. The requirement also binds
+Authority Grants, Policy Witness, and observed effects and names affected
 checks, Formal Review mode, specialist observation, human Decision, and reason
 codes. A no-Review result requires a complete allowlist match; strict
 Assurance follows repository policy; all other Candidates use standard

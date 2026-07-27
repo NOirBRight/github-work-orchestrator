@@ -160,11 +160,23 @@ Exit criteria for #112:
   Policy Witness; new or broader operation/resource authority or a changed
   authority root requires an explicitly recorded human Decision,
   deterministic recompilation, and successor Plan Revision;
-- unavailable, configuration-invalid, and transport-unavailable handling
-  produces the exact named outcomes and initial-plus-two retry bounds in the
+- configuration-invalid and transport-unavailable handling produces the exact
+  named outcomes and independently counted initial-plus-two retry bounds in the
   [`Runtime failure taxonomy`](gwo-v8-lean-architecture.md#runtime-failure-taxonomy);
-- fallback never crosses the pre-identity boundary, and post-identity recovery
-  remains on the same binding;
+- post-identity live provider unavailability preserves the exact
+  `stable_action_id`, Runtime Binding, Profile, provider, CLI, Agent, session,
+  workspace, accepted Prompt, and authority; authoritative observations one
+  and two persist
+  `Wait(RuntimeProviderUnavailable, next_check_at)`, while observation three
+  returns human `Decision(RuntimeProviderRecoveryRequired)`;
+- cached facts, duplicate callbacks or wakes, restart, and repeated `advance`
+  without a new live observation neither consume nor reset that episode;
+  transport accounting remains independent, and unavailability releases no
+  Slot or claim and authorizes no fallback, new `prepare` or create,
+  Profile/provider/CLI switch, daemon restart, replacement, or
+  semantic/Candidate/replacement budget use;
+- fallback never crosses the pre-identity boundary; only authoritative
+  same-binding readback or resume after provider recovery closes the episode;
 - pre-Prompt failures consume no semantic or Candidate budget and never restart
   a provider daemon;
 - a replacement Worker binding requires terminal-binding Evidence; and
@@ -175,7 +187,14 @@ Exit criteria for #113:
 
 - Runtime and hosted-check events and due timers wake the same `advance`
   operation;
-- restart reconstructs outstanding wakes without duplicate effects;
+- Worker Candidate-reference reports and Runtime notifications are wake hints;
+  RuntimeGateway transports them without adopting a Candidate;
+- restart reconstructs outstanding wakes without duplicate effects, and only a
+  durably persisted Candidate receipt after authoritative SHA/tree readback and
+  exact diff construction and digest revalidation counts as trusted Candidate
+  liveness progress;
+- raw reports, duplicate notifications, logs, workspace heads, and unread-back
+  completion statements neither advance state nor reset the stale deadline;
 - zero-LLM readback precedes the one stale diagnosis permitted per binding; and
 - healthy Campaigns use no LLM polling.
 
@@ -185,8 +204,19 @@ Tickets: #114 then #115, with #115 also depending on #112.
 
 Exit criteria for #114:
 
-- complete Candidate diff audit and affected deterministic checks precede
-  Formal Review;
+- CandidateGate authoritatively reads the exact Candidate commit/tree from a
+  reported reference, constructs
+  [`CandidateDiffRecordV1`](gwo-v8-lean-architecture.md#candidatediffrecordv1),
+  and ExecutionKernel persists its Candidate receipt before state transition;
+- scope/authority audit, affected Checks, Assurance, protected surfaces,
+  Interaction Keys, and Formal Review consume that same persisted record;
+  CandidateGate does not depend on or substitute `PatchIdentityV1`;
+- Review Evidence reuse requires an identical complete Review Subject digest
+  plus readable, revalidated diff content; base, Candidate, diff
+  schema/digest, or protocol change creates a fresh subject, while missing,
+  truncated, or mismatched content fails before Reviewer invocation;
+- a Candidate is neither Evidence nor a Result, and only accepted,
+  integrated, read-back work can become a code-producing Result;
 - one standard `review_primary` observation covers the Review Subject; and
 - unchanged valid Evidence is never repeated.
 

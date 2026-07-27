@@ -15,6 +15,10 @@ The Watchdog is event-first. Paseo Agent finish, error, permission, and Review
 events, plus hosted-check events, call targeted `ExecutionKernel.advance`.
 Every event is only a wake hint: ExecutionKernel reads authoritative Runtime,
 GitHub, Workspace, and durable-plan state before changing lifecycle state.
+A Worker Candidate-reference report and its notification are also only wake
+hints. RuntimeGateway transports them but cannot adopt a Candidate;
+CandidateGate owns exact commit/tree and diff readback, and ExecutionKernel
+owns persistence and the resulting state transition.
 
 Each ExecutionKernel Wait directive may also carry `next_check_at`. The
 Watchdog owns the due-time queue and invokes the same idempotent advance when

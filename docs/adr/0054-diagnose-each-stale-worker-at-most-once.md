@@ -8,16 +8,19 @@ amends: ADR-0029, ADR-0050, ADR-0053
 The Campaign Watchdog maintains a stale-turn deadline for each active Worker
 binding. The default is thirty minutes without a trusted state change, with
 host-global configuration and repository override. Trusted state changes
-include an authoritative Runtime lifecycle transition, typed Worker
-checkpoint or attention event, workspace head or complete Candidate diff
-record digest change,
-permission event, Result Claim, or other Kernel-owned state transition. Token
-growth and arbitrary log activity are not trusted progress.
+include an authoritative Runtime lifecycle transition, normalized permission
+event, a durably persisted Candidate receipt, or another independently
+observed Kernel-owned state transition. Only a Candidate receipt whose exact
+Candidate SHA/tree came from authoritative readback and whose complete diff
+digest was constructed and revalidated over the exact base and Candidate
+objects, then durably persisted, is trusted Candidate liveness progress. A
+Candidate-reference report, notification, Worker checkpoint text, workspace
+head, raw log, or unread-back completion statement does not reset the deadline.
 
 When the deadline becomes due, the Watchdog first performs zero-LLM targeted
 Runtime, process, Workspace, and Kernel readback. A terminal, idle, permission,
-Result, or otherwise mechanically classified state follows its existing
-deterministic path.
+Candidate-receipt-backed, or otherwise mechanically classified state follows
+its existing deterministic path.
 
 Only when the same binding remains `running` and the readback cannot classify
 it may the Kernel request one Coordinator stale-turn diagnostic for that

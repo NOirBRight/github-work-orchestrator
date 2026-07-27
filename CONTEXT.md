@@ -36,9 +36,10 @@ including its Runtime bindings, Candidate submissions, waits, and outcome.
 _Avoid_: generic graph node, unbounded execution record
 
 **Candidate**:
-An immutable repository Artifact submitted by a Work Run for verification.
-Edits, diagnostics, and uncommitted workspace state are not Candidates.
-_Avoid_: working tree, intermediate patch, Worker self-report
+An immutable repository Artifact identified by an exact commit and tree and
+authoritatively read back from a reference reported by a Worker. A Candidate is
+neither Evidence nor a Result.
+_Avoid_: working tree, intermediate patch, completion report
 
 **Artifact**:
 A produced object with stable identity, such as a Plan Revision, Candidate,
@@ -78,9 +79,9 @@ after deterministic Candidate checks pass.
 _Avoid_: Worker self-review, Batch review, external `code-review` lifecycle
 
 **Review Subject**:
-The immutable identity binding an exact base, Candidate, Ticket contract,
-standards, Check Evidence, Assurance Requirement, Policy Witness, and protocol
-version.
+The immutable identity binding an exact base, Candidate, complete Candidate
+diff identity, Ticket contract, standards, Check Evidence, Assurance
+Requirement, Policy Witness, and protocol version.
 _Avoid_: mutable review conversation, pull-request review
 
 **Evidence**:

@@ -4,11 +4,18 @@ status: amended by ADR-0036, ADR-0039, ADR-0041, and ADR-0043
 
 # Require verified evidence before completion
 
-A Work Run submitting a typed Result Claim has not completed. Independently
-observed Evidence and the fixed acceptance and delivery conditions determine
-completion. Worker self-report never collapses those states. Artifacts are
-produced objects; Evidence is independently observed. Objective Evidence
-checks precede any Formal Review.
+A Worker may report only a Candidate reference. The report and its
+notification are wake hints and do not complete the Work Run. RuntimeGateway
+transports them without adopting their content. CandidateGate authoritatively
+reads back the exact Candidate commit/tree and complete diff identity and
+produces a private Candidate receipt; ExecutionKernel changes persisted state
+only after persisting that receipt.
+
+A Candidate is an Artifact, not Evidence or a Result. Independently observed
+Evidence and the fixed acceptance and delivery conditions determine
+completion. A code-producing Result exists only after the exact accepted
+Candidate is integrated and target readback proves that integration. Objective
+Evidence checks precede any Formal Review.
 
 Result adoption across Plan Revisions requires the same Ticket identity,
 unchanged contract digest, unchanged authority-subtree digest, and applicable
@@ -19,10 +26,12 @@ Typed Evidence uses one common envelope containing its kind, subject,
 observer, observation time, source reference, payload, and content digest.
 V8.0 defines six evidence kinds: `runtime`, `candidate`, `check`, `review`,
 `integration`, and `decision`. Local commands and hosted CI are both `check`
-Evidence with different sources. An Agent's submission is a Result Claim and
-Artifact reference, not self-authenticating Evidence; ExecutionKernel,
-RuntimeGateway, GitHub/CI, or a durable human decision must observe the
-supporting fact.
+Evidence with different sources. `candidate` Evidence is an independent
+observation about a Candidate; the Candidate Artifact itself is not Evidence.
+A Worker report is only a Candidate reference and wake hint, not
+self-authenticating Evidence. ExecutionKernel, CandidateGate, RuntimeGateway,
+GitHub/CI, or a durable human Decision must observe the supporting fact owned
+by its boundary.
 
 The Ticket contract, Authority Grants, Policy Witness, and Assurance
 Requirement determine required Evidence. An Agent, Skill, or Campaign Planning
@@ -47,8 +56,9 @@ readback is missing, or the check or environment does not meet the contract.
 
 RuntimeGateway may produce local Check Evidence only when it directly
 observes the executed tool or process, its outcome, and its binding to the
-Candidate. Without that capability, an Agent's reported command remains a
-Result Claim and another source such as hosted CI must supply the Evidence.
+Candidate. Without that capability, a command mentioned in raw Worker output
+is non-authoritative log text and another source such as hosted CI must supply
+the Evidence.
 
 A failed CandidateGate verification returns one consolidated repair request
 while a Candidate submission remains. Unavailable CI or another missing

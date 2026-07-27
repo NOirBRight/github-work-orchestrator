@@ -84,6 +84,7 @@ The integrated definitions are intentionally not duplicated here:
 | Runtime failure outcomes and retry bounds | [`Runtime failure taxonomy`](gwo-v8-lean-architecture.md#runtime-failure-taxonomy) |
 | Event wakes, due timers, and lost-callback recovery | [`Persistence and liveness`](gwo-v8-lean-architecture.md#persistence-and-liveness) |
 | Candidate checks, Assurance, Review Findings, and repair | [`CandidateGate`](gwo-v8-lean-architecture.md#candidategate) |
+| Authoritative Candidate diff identity | [`CandidateDiffRecordV1`](gwo-v8-lean-architecture.md#candidatediffrecordv1) |
 | Same-Campaign Batch formation and exact delivery identity | [`BatchIntegrator`](gwo-v8-lean-architecture.md#batchintegrator) |
 | Tree-delta identity and per-member Clean Base Advance | [`PatchIdentityV1 and Clean Base Advance`](gwo-v8-lean-architecture.md#patchidentityv1-and-clean-base-advance) |
 | Terminal hosted-check restart adoption | [`Durable hosted result adoption`](gwo-v8-lean-architecture.md#durable-hosted-result-adoption) |
@@ -107,8 +108,15 @@ The successor is accepted only when repository evidence proves:
 - production and deterministic in-memory Runtime adapters satisfy the same
   conformance suite, and no semantic action starts before full identity,
   staged-Prompt, lifecycle, permission, and fence observation;
-- restart or duplicate callbacks cannot duplicate a semantic or external
-  action;
+- a Worker Candidate-reference report and Runtime notification are wake hints;
+  restart, duplicate callbacks, and replay cannot adopt a Candidate or
+  duplicate a semantic, receipt, or external action;
+- only a Candidate receipt covering an exact commit/tree from CandidateGate's
+  authoritative readback and a `CandidateDiffRecordV1` constructed and
+  revalidated over the exact base and Candidate objects, then durably persisted
+  by ExecutionKernel, may advance state or count as trusted Candidate liveness
+  progress; raw reports, logs, workspace heads, and unread-back completion text
+  do not;
 - permission handling cannot exceed both the frozen Authority Grant and Policy
   Witness;
 - an operation or resource beyond frozen authority, or any changed authority
@@ -117,10 +125,32 @@ The successor is accepted only when repository evidence proves:
 - Runtime failure recovery produces the canonical named outcomes and fixed
   retry bounds without post-identity provider switching, pre-Prompt semantic
   budget consumption, or daemon restart;
+- for live provider unavailability after identity, authoritative observations
+  one and two produce `Wait(RuntimeProviderUnavailable, next_check_at)` and
+  observation three produces human
+  `Decision(RuntimeProviderRecoveryRequired)` under the
+  [`Runtime failure taxonomy`](gwo-v8-lean-architecture.md#runtime-failure-taxonomy);
+  conformance and restart replay retain the exact `stable_action_id`, Runtime
+  Binding, Profile, provider, CLI, Agent, session, workspace, accepted Prompt,
+  and authority, count only unique live observations, and keep transport
+  accounting independent;
+- that episode releases no Slot or claim, consumes no semantic, Candidate, or
+  replacement budget, and authorizes no fallback, new `prepare` or create,
+  Profile/provider/CLI switch, daemon restart, or replacement; only
+  authoritative same-binding readback or resume after provider recovery closes
+  it, and only independent terminal-binding Evidence may enter the existing
+  one-replacement path;
 - deterministic Candidate failure consumes no Reviewer turn;
+- CandidateGate persists one canonical `CandidateDiffRecordV1` and uses that
+  identical Artifact for scope/authority audit, Checks, Assurance, protected
+  surfaces, Interaction Keys, and Formal Review without substituting
+  `PatchIdentityV1`;
 - unchanged valid Review Evidence is never repeated;
-- a changed Candidate receives a new Review Subject and dispositions every
-  earlier Review Finding;
+- Review Evidence is reused only for an identical Review Subject digest with a
+  readable, digest-revalidated diff Artifact; changed base, Candidate, diff
+  schema/digest, or protocol creates a fresh subject and missing, truncated, or
+  mismatched diff content fails before Reviewer invocation;
+- a fresh Review Subject dispositions every earlier Review Finding;
 - the limit of three distinct Candidate SHAs and initial plus at most one
   replacement binding survives repair and replacement;
 - up to four compatible accepted Candidates in one Campaign can share one
@@ -136,7 +166,9 @@ The successor is accepted only when repository evidence proves:
 - V8 activation occurs only after all V2-to-V3 compatibility paths are absent
   or unreachable, never interprets or writes V2 state, and leaves V6.1
   authoritative after a failed Guard;
-- restart and delivery recovery preserve Campaign and Work Run identity; and
+- restart and delivery recovery preserve Campaign and Work Run identity;
+- a Candidate is neither Evidence nor a Result, and a code-producing Result
+  exists only after the exact accepted Candidate is integrated and read back;
 - an operator can explain any Wait, Decision, or Blocked result from
   `Diagnostics` without reading a model transcript.
 
