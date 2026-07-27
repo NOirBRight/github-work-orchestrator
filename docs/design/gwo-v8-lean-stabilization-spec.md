@@ -175,11 +175,13 @@ The successor is accepted only when repository evidence proves:
   or unreachable, never interprets or writes V2 state, and leaves V6.1
   authoritative after a failed Guard;
 - restart and delivery recovery preserve Campaign and Work Run identity;
-- root-Canary acceptance proves the complete repair contract: at most three
-  distinct Candidate SHAs, one initial binding plus at most one replacement
-  authorized by terminal-binding Evidence, and a complete Review
-  Finding ledger with typed dispositions for every earlier Finding, without a
-  repair or replacement resetting a bound or the ledger; and
+- root-Canary acceptance proves the complete repair contract for each Work Run:
+  at most three distinct Candidate SHAs; one initial Worker binding plus at
+  most one replacement Worker binding authorized by terminal-binding Evidence;
+  and the complete Review Finding ledger for that Work Run across its Review
+  Subjects, with a typed disposition for every Finding from an earlier Review
+  Subject; neither repair nor binding replacement resets that Work Run's
+  Candidate or binding bounds or ledger; and
 - root-Canary restart reconstructs durable Campaign state, receipts, and timers
   so duplicate or lost callbacks cannot duplicate a semantic or external
   effect;

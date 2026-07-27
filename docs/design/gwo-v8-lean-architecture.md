@@ -750,13 +750,15 @@ both target mutations.
 The root Canary proves the public API, parallel Work Runs, exact Runtime
 assignment, permission parking, CandidateGate, and cleanup. Its acceptance
 readback proves the frozen Authority Grants, Policy Witness, and PlanSpec
-authority-root digest exactly; the complete repair bound of at most three
-distinct Candidate SHAs plus one initial binding and at most one replacement
-binding authorized by terminal-binding Evidence; and the complete
-Review Finding ledger with typed dispositions for every earlier Finding. Repair
-and binding replacement do not reset either bound or the ledger. Restart
-reconstructs the Campaign from durable Campaign state, receipts, and timers;
-duplicate or lost callbacks cannot duplicate a semantic or external effect.
-The Canary also proves the bounded zero-LLM-readback-plus-one-diagnosis
-stale-binding path. Passing makes V8 the default for new Campaigns in this
-repository before downstream repositories adopt it.
+authority-root digest exactly. For each Work Run, acceptance proves at most
+three distinct Candidate SHAs, one initial Worker binding, and at most one
+replacement Worker binding authorized by terminal-binding Evidence. That Work
+Run retains its complete Review Finding ledger across its Review Subjects, with
+a typed disposition for every Finding from an earlier Review Subject. Repair
+and binding replacement do not reset that Work Run's Candidate or binding
+bounds or ledger. Restart reconstructs the Campaign from durable Campaign
+state, receipts, and timers; duplicate or lost callbacks cannot duplicate a
+semantic or external effect. The Canary also proves the bounded
+zero-LLM-readback-plus-one-diagnosis stale-binding path. Passing makes V8 the
+default for new Campaigns in this repository before downstream repositories
+adopt it.

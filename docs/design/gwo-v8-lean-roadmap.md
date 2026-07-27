@@ -300,11 +300,13 @@ Exit criteria for #119:
   Integration-Lease-serialized target integration, and target-readback
   boundary;
 - Canary acceptance reads back the frozen Authority Grants, Policy Witness, and
-  PlanSpec authority-root digest exactly; proves no more than three distinct
-  Candidate SHAs, one initial binding and at most one replacement authorized by
-  terminal-binding Evidence, plus a complete Review
-  Finding ledger with typed dispositions for every earlier Finding; and proves
-  that neither repair nor replacement resets a bound or the ledger;
+  PlanSpec authority-root digest exactly. For each Work Run, it proves no more
+  than three distinct Candidate SHAs, one initial Worker binding, and at most
+  one replacement Worker binding authorized by terminal-binding Evidence. The
+  complete Review Finding ledger belongs to that Work Run and spans its Review
+  Subjects, with a typed disposition for every Finding from an earlier Review
+  Subject. Neither repair nor binding replacement resets that Work Run's
+  Candidate or binding bounds or ledger;
 - restart reconstructs durable Campaign state, receipts, and timers; it
   recovers deliberately lost and duplicate callbacks without duplicating a
   semantic or external effect, and a stale binding follows zero-LLM readback
