@@ -78,10 +78,16 @@ The integrated definitions are intentionally not duplicated here:
 | Runtime-neutral PlanSpec and frozen authority | [`PlanSpec v3 and frozen authority`](gwo-v8-lean-architecture.md#planspec-v3-and-frozen-authority) |
 | One active revision per Campaign and activation receipts | [`Campaign and Plan Revision activation`](gwo-v8-lean-architecture.md#campaign-and-plan-revision-activation) |
 | Exact Runtime selectors and assignment persistence | [`Runtime assignment`](gwo-v8-lean-architecture.md#runtime-assignment) |
+| Private provider-neutral Runtime adapter | [`RuntimeGateway adapter contract`](gwo-v8-lean-architecture.md#runtimegateway-adapter-contract) |
 | Worker Slots and Work Run bounds | [`Worker Slots and Work Run bounds`](gwo-v8-lean-architecture.md#worker-slots-and-work-run-bounds) |
 | Permissions, waits, stale diagnosis, and replacement | [`Runtime permissions, waits, and recovery`](gwo-v8-lean-architecture.md#runtime-permissions-waits-and-recovery) |
+| Runtime failure outcomes and retry bounds | [`Runtime failure taxonomy`](gwo-v8-lean-architecture.md#runtime-failure-taxonomy) |
+| Event wakes, due timers, and lost-callback recovery | [`Persistence and liveness`](gwo-v8-lean-architecture.md#persistence-and-liveness) |
 | Candidate checks, Assurance, Review Findings, and repair | [`CandidateGate`](gwo-v8-lean-architecture.md#candidategate) |
 | Same-Campaign Batch formation and exact delivery identity | [`BatchIntegrator`](gwo-v8-lean-architecture.md#batchintegrator) |
+| Tree-delta identity and per-member Clean Base Advance | [`PatchIdentityV1 and Clean Base Advance`](gwo-v8-lean-architecture.md#patchidentityv1-and-clean-base-advance) |
+| Terminal hosted-check restart adoption | [`Durable hosted result adoption`](gwo-v8-lean-architecture.md#durable-hosted-result-adoption) |
+| Writer-generation migration boundary | [`Cutover`](gwo-v8-lean-architecture.md#cutover) |
 | Fixed and configurable defaults | [`Defaults`](gwo-v8-lean-architecture.md#defaults) |
 
 ## Stabilization acceptance
@@ -98,10 +104,19 @@ The successor is accepted only when repository evidence proves:
   Authority Grants while remaining provider-, model-, CLI-, selector-, and
   fallback-neutral;
 - all semantic Runtime activity uses the exact persisted selector assignment;
+- production and deterministic in-memory Runtime adapters satisfy the same
+  conformance suite, and no semantic action starts before full identity,
+  staged-Prompt, lifecycle, permission, and fence observation;
 - restart or duplicate callbacks cannot duplicate a semantic or external
   action;
 - permission handling cannot exceed both the frozen Authority Grant and Policy
   Witness;
+- an operation or resource beyond frozen authority, or any changed authority
+  root, requires an explicitly recorded human Decision, deterministic
+  Authority Grant recompilation, and a successor Plan Revision;
+- Runtime failure recovery produces the canonical named outcomes and fixed
+  retry bounds without post-identity provider switching, pre-Prompt semantic
+  budget consumption, or daemon restart;
 - deterministic Candidate failure consumes no Reviewer turn;
 - unchanged valid Review Evidence is never repeated;
 - a changed Candidate receives a new Review Subject and dispositions every
@@ -110,8 +125,17 @@ The successor is accepted only when repository evidence proves:
   replacement binding survives repair and replacement;
 - up to four compatible accepted Candidates in one Campaign can share one
   exact Batch, PR, and hosted-CI boundary;
+- every Clean Base Advance member independently reproduces its original
+  `PatchIdentityV1` when applied alone to the same advanced target before
+  multi-member composition;
 - local verification, PR head, and hosted CI name the same Batch SHA, while
   target readback proves that SHA reachable through GitHub's PR merge mapping;
+- restart adopts a valid persisted terminal hosted-result receipt without a
+  provider reread, while identity mismatch or ambiguous attribution preserves
+  evidence and permits neither Singleton fallback nor Worker resume;
+- V8 activation occurs only after all V2-to-V3 compatibility paths are absent
+  or unreachable, never interprets or writes V2 state, and leaves V6.1
+  authoritative after a failed Guard;
 - restart and delivery recovery preserve Campaign and Work Run identity; and
 - an operator can explain any Wait, Decision, or Blocked result from
   `Diagnostics` without reading a model transcript.

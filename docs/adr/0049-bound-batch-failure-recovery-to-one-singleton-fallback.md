@@ -16,12 +16,14 @@ Singleton Batches. V8.0 does not recursively bisect the members, search
 their combinations, or invoke an LLM to attribute the failure.
 
 Each single-member Batch is composed onto the exact current target using Clean
-Base Advance when its requirements still hold, then runs the exact local and
-hosted checks for that delivery SHA. A passing member can integrate without
-reimplementation or Formal Review. A failing member alone receives one
-consolidated repair request containing its Review Finding ledger. Only a
-changed Candidate creates a new Review Subject and counts toward the Work
-Run's limit of at most three distinct Candidate SHAs.
+Base Advance only after its per-member
+[`PatchIdentityV1`](../design/gwo-v8-lean-architecture.md#patchidentityv1-and-clean-base-advance)
+proof still holds, then runs the exact local and hosted checks for that
+delivery SHA. A passing member can integrate without reimplementation or
+Formal Review. A failing member alone receives one consolidated repair request
+containing its Review Finding ledger. Only a changed Candidate creates a new
+Review Subject and counts toward the Work Run's limit of at most three
+distinct Candidate SHAs.
 
 If every member passes alone but the original combination failed,
 BatchIntegrator records an interaction conflict. The oldest eligible Candidate
@@ -35,3 +37,10 @@ Worker Slot. Passing work retires its binding; only the affected parked Worker
 is resumed after reacquiring a Slot. This keeps the normal path to one Batch
 verification, bounds the exceptional path to one singleton split, and avoids
 repeating unaffected implementation or Review.
+
+`DeliveryIdentityMismatch` and `DeliveryAttributionAmbiguous` are integrity
+failures, not code-class or infrastructure failures. BatchIntegrator preserves
+all Candidate provider observations and Evidence and may neither use Singleton
+Batch Fallback nor resume a Worker for either outcome. The authoritative
+hosted-result rules are defined by
+[`Durable hosted result adoption`](../design/gwo-v8-lean-architecture.md#durable-hosted-result-adoption).

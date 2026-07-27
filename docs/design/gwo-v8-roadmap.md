@@ -1,13 +1,13 @@
 # GWO V8 roadmap
 
-Status: superseded historical roadmap. Its Phase 0–4C records describe the
-current implementation lineage but are not the plan for the lean V8
-refactor. Do not execute or generate new Tickets from this document.
+Status: superseded historical roadmap. Its Phase 0–4C records describe an
+earlier planned lineage, not the plan for the lean V8 refactor. Do not execute
+or generate new Tickets from this document.
 
-The accepted architecture is
-[`gwo-v8-lean-architecture.md`](gwo-v8-lean-architecture.md). A replacement
-landing roadmap will be written only after the open V8 Epic and Tickets are
-reconciled against it.
+The current contract is
+[`gwo-v8-lean-architecture.md`](gwo-v8-lean-architecture.md), and the current
+delivery sequence is
+[`gwo-v8-lean-roadmap.md`](gwo-v8-lean-roadmap.md).
 
 This roadmap starts from the production reality: V6.1 is the current writer
 and V7 was never adopted. V8 does not complete or migrate V7. It introduces a

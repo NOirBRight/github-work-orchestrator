@@ -24,9 +24,14 @@ Every implementation Ticket must:
 - keep unrelated historical behavior and user work intact.
 
 Fixture repair, Prompt formatting, storage migration, and cleanup belong to the
-Ticket whose interface owns them. A temporary v2-to-v3 projection is permitted
-only inside its migration Ticket, with a deletion test and no new Campaign
-writing v2. It must be gone before the root Canary.
+Ticket whose interface owns them. V8 never projects V2 into V3. Before the
+Cutover Guard can succeed, all V3-composition or V2-projection compatibility
+adapters, callers, and write paths must be removed or proven unreachable.
+Active V2 execution finishes through its original decoder or is proven
+quiescent/read-only; V8 never resumes, interprets, or writes it. These
+conditions are part of
+[`Cutover`](gwo-v8-lean-architecture.md#cutover), not deferred cleanup before
+the root Canary.
 
 All mechanics and deterministic defaults referenced by the exit criteria below
 are defined in the
@@ -87,7 +92,8 @@ Exit criteria:
 - the public three-method API, five statuses, five modules, Runtime selectors,
   frozen authority, Campaign activation, Work Run bounds, Batch identity, and
   defaults have one integrated definition in the architecture;
-- historical V8 architecture and roadmap documents are visibly non-executable;
+- historical V7 and V8 architecture and roadmap documents are visibly
+  non-executable;
 - repository package/link validation, diff checks, local acceptance, and exact
   hosted acceptance pass; and
 - no product Runtime, writer, production execution, or unrelated tracker state
@@ -129,6 +135,13 @@ Exit criteria for #111:
 
 - every semantic action uses the exact selectors and precedence in
   [`Runtime assignment`](gwo-v8-lean-architecture.md#runtime-assignment);
+- every provider implementation and the deterministic in-memory implementation
+  satisfy the same
+  [`RuntimeGateway adapter contract`](gwo-v8-lean-architecture.md#runtimegateway-adapter-contract)
+  conformance suite;
+- semantic `start` or `resume` is impossible until `observe` proves the stable
+  action, complete identities, staged Prompt, lifecycle, permissions, and
+  fence;
 - Campaign-start overrides and stable-action assignment receipts survive
   restart;
 - no caller knows provider names or constructs vendor commands; and
@@ -143,7 +156,17 @@ Exit criteria for #112:
 - exact permission matching, three-minute interactive-wait grace, proven park,
   and resume follow
   [`Runtime permissions, waits, and recovery`](gwo-v8-lean-architecture.md#runtime-permissions-waits-and-recovery);
-- fallback never crosses the pre-identity boundary;
+- automatic approval matches exactly both the frozen Authority Grant and
+  Policy Witness; new or broader operation/resource authority or a changed
+  authority root requires an explicitly recorded human Decision,
+  deterministic recompilation, and successor Plan Revision;
+- unavailable, configuration-invalid, and transport-unavailable handling
+  produces the exact named outcomes and initial-plus-two retry bounds in the
+  [`Runtime failure taxonomy`](gwo-v8-lean-architecture.md#runtime-failure-taxonomy);
+- fallback never crosses the pre-identity boundary, and post-identity recovery
+  remains on the same binding;
+- pre-Prompt failures consume no semantic or Candidate budget and never restart
+  a provider daemon;
 - a replacement Worker binding requires terminal-binding Evidence; and
 - one initial plus at most one replacement binding and at most three distinct
   Candidate SHAs remain bounded across the Work Run.
@@ -186,6 +209,15 @@ Exit criteria for #116:
   [`BatchIntegrator`](gwo-v8-lean-architecture.md#batchintegrator);
 - the configured one-to-four member limit, same-Campaign boundary, Singleton
   rules, oldest-first scan, and pairwise compatibility are deterministic;
+- every Clean Base Advance member independently reproduces its original
+  [`PatchIdentityV1`](gwo-v8-lean-architecture.md#patchidentityv1-and-clean-base-advance)
+  when applied alone to the same exact advanced target before multi-member
+  composition, and Batch Evidence binds every specified tree, digest, and
+  check;
+- every required terminal hosted check persists the exact keyed
+  [`hosted-result receipt`](gwo-v8-lean-architecture.md#durable-hosted-result-adoption)
+  for its stable delivery action, Batch SHA, suite identity, provider check ID,
+  terminal outcome, and observation digest before integration;
 - the local suite, pushed and PR head, and hosted CI all observe one Batch SHA;
   and
 - target readback proves the exact Batch SHA reachable through the PR merge
@@ -197,7 +229,13 @@ Exit criteria for #117:
 - a multi-member code-class failure may split once into Singletons;
 - passing members retain Candidate and Review Evidence; and
 - only a failing Singleton can resume its Work Run with changed code returning
-  through CandidateGate.
+  through CandidateGate;
+- a persisted integrity-valid terminal
+  [`hosted-result receipt`](gwo-v8-lean-architecture.md#durable-hosted-result-adoption)
+  is adopted after restart without provider reread; and
+- `DeliveryIdentityMismatch` and `DeliveryAttributionAmbiguous` preserve all
+  observations and Evidence and allow neither Singleton fallback nor Worker
+  resume.
 
 ## Stage 6 — Cutover and Canary
 
@@ -208,7 +246,15 @@ Exit criteria for #118:
 - one fail-closed read-only Guard proves old-writer quiescence, state
   compatibility, repository-global writer generation, Integration Lease
   availability, and required Runtime configuration;
-- failure changes no production state; and
+- every V3-composition and V2-projection compatibility adapter, caller, and
+  write path is absent or unreachable before Guard success;
+- active V2 execution finishes through its original decoder or is proven
+  quiescent/read-only, and V8 never resumes, interprets, writes, or projects
+  V2;
+- the durable writer-generation and Activation Receipt commit is the sole
+  authority-transfer point;
+- failure changes no production state and leaves V6.1 writer authority
+  unchanged; and
 - activation never permits simultaneous V6 and V8 writers.
 
 Exit criteria for #119:
@@ -218,6 +264,9 @@ Exit criteria for #119:
   permission parking, deterministic continuation, standard and strict Review,
   bounded repair and binding replacement, exact Campaign-scoped Batch,
   hosted-CI identity, merge readback, and cleanup;
+- restart recovers a deliberately lost callback without duplicating its effect,
+  and a stale binding follows zero-LLM readback plus at most one Coordinator
+  diagnosis;
 - no manual Store edit, tracker-label repair, Evidence fabrication, or daemon
   restart is needed; and
 - V8 becomes the default here only after exact acceptance readback.

@@ -29,3 +29,9 @@ immediately. Candidate Checks, Formal Review Internal Subagents, and Repair
 retain the Work Run's existing Slot. This grace applies only to short interactive
 waits whose answer may arrive promptly, avoiding release/reacquire churn and
 preventing a directly approved Runtime from executing outside GWO capacity.
+
+Interactive-wait grace is not a Runtime transport retry. Transport failures
+use persisted named waits and bounds from the
+[`Runtime failure taxonomy`](../design/gwo-v8-lean-architecture.md#runtime-failure-taxonomy);
+a failure before accepted-Prompt readback consumes no semantic or Candidate
+budget.

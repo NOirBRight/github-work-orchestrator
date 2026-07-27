@@ -13,5 +13,15 @@ creates a fresh store generation, and publishes one repository-global writer
 generation. It does not import V6.1 execution or store identities.
 
 The activation Cutover Guard proves the prior writer quiescent before changing
-authority. V6.1 and V8 are never simultaneous writers. Earlier V7 transition
-ADRs remain as superseded history.
+authority. Before Guard success, every compatibility adapter, caller, and write
+path that could compose V3 state from or project V2 state is absent or
+unreachable. V8 never projects V2 into V3. An active V2 execution either
+finishes through its original decoder or is proven quiescent/read-only; V8
+never resumes, interprets, or writes it.
+
+Guard failure leaves the V6.1 writer generation authoritative and changes no
+production state. Only the durable writer-generation and Activation Receipt
+commit may transfer authority. V6.1 and V8 are never simultaneous writers.
+The complete contract is
+[`Cutover`](../design/gwo-v8-lean-architecture.md#cutover). Earlier V7
+transition ADRs remain as superseded history.

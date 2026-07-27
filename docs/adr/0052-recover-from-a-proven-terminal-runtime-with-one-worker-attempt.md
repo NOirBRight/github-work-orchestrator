@@ -35,3 +35,10 @@ Capacity pressure after identity never selects a fallback. Selection is a
 deterministic ExecutionKernel and RuntimeGateway action; a Coordinator does not
 choose models or providers. Exhausting the binding bound requests a named
 Decision.
+
+Post-identity provider recovery and transport readback always target the same
+binding. Permanent configuration failure preserves that binding and requires
+human `Decision(RuntimeConfigurationRepairRequired)` unless terminal-binding
+Evidence permits the one replacement. The complete behavior is defined once
+in the
+[`Runtime failure taxonomy`](../design/gwo-v8-lean-architecture.md#runtime-failure-taxonomy).

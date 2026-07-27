@@ -37,7 +37,12 @@ share a Batch only when all pairwise checks pass.
 Clean Base Advance is permitted only when the original base is an ancestor of
 the current target, Candidate and Evidence are unchanged, the target delta has
 no protected interaction with the Candidate, and Git composes without manual
-resolution.
+resolution. Every member must independently satisfy the canonical
+[`PatchIdentityV1`](../design/gwo-v8-lean-architecture.md#patchidentityv1-and-clean-base-advance)
+proof against the same exact advanced target before multi-member composition.
+Batch Evidence binds the algorithm version, original and advanced tree pairs,
+both per-member digests, final Batch SHA, and exact checks. Gitlink changes are
+protected Singleton work.
 
 BatchIntegrator then owns isolated composition, immutable Batch SHA creation,
 the repository-equivalent exact-Batch local suite, one push and pull-request
@@ -69,6 +74,17 @@ Only a failing Singleton produces a delivery failure receipt that can cause
 ExecutionKernel to reacquire a Worker Slot and resume that member's parked
 Worker. Changed code becomes a new Candidate and re-enters CandidateGate.
 BatchIntegrator never repeats Review for an unchanged Candidate.
+
+BatchIntegrator durably adopts a terminal hosted result through the receipt
+defined by
+[`Durable hosted result adoption`](../design/gwo-v8-lean-architecture.md#durable-hosted-result-adoption).
+Once that integrity-validated receipt is persisted, restart recovery uses it
+without rereading the provider. Batch, suite, provider-check, or attribution
+mismatch returns `DeliveryIdentityMismatch`; ambiguous attribution returns
+`DeliveryAttributionAmbiguous`. Both preserve every Candidate observation and
+Evidence and forbid Singleton Batch Fallback and Worker resume. Only the
+composition, exact-local, and code-class hosted failures named above may take
+the Singleton path.
 
 Several Tickets may therefore share one PR and one hosted-CI execution without
 losing per-Ticket Work Run identity, Candidate identity, Evidence, or Result

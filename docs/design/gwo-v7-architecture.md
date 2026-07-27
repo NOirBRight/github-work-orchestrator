@@ -1,9 +1,14 @@
 # GWO V7 architecture: a stateful kernel with dynamic orchestration
 
-Status: accepted design, pre-implementation. Governing decisions: ADR 0007
-(stateful gwo CLI), ADR 0008 (dynamic task DAG), ADR 0009 (Runtime Port).
-Implementation is phased in `gwo-v7-roadmap.md`; V6 mechanisms remain
-operative until the replacing phase lands.
+Status: unadopted, superseded historical design. V7 was never the production
+writer. Do not execute this design or generate Tickets from it. The current
+contract is
+[`gwo-v8-lean-architecture.md`](gwo-v8-lean-architecture.md), and the current
+delivery sequence is
+[`gwo-v8-lean-roadmap.md`](gwo-v8-lean-roadmap.md).
+
+The remainder preserves the unadopted ADR 0007/0008/0009 design for decision
+history only.
 
 ## Goals and non-goals
 

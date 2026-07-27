@@ -4,25 +4,38 @@ status: amended by ADR-0059
 
 # Define Runtime adapters by execution model
 
-RuntimeGateway owns one private, capability-oriented adapter seam rather than
-a provider-shaped public interface or a fixed operation count. Paseo is its
-first resident-Agent adapter; direct Codex CLI and Claude Code session-process
-adapters are compatible future implementations. A provider name, model name,
-and execution model remain separate facts.
+RuntimeGateway owns one private provider-neutral adapter contract rather than a
+provider-shaped public interface:
 
-An adapter must idempotently materialize and read back Agent, workspace,
-session, Runtime Binding, and stable action identity; accept Artifact-backed
-Prompt input; observe lifecycle, permission, and event state; park or interrupt
-without losing required identity; resume; fence terminal bindings; and execute
-read-backed retirement already authorized by ExecutionKernel.
+```text
+prepare(RuntimeActionSpec) -> PrepareReceipt | RuntimeFailure
+observe(stable_action_id) -> RuntimeObservation | RuntimeFailure
+command(binding_ref, RuntimeCommand) -> CommandReceipt | RuntimeFailure
+events(after_cursor) -> RuntimeEventPage
+```
 
-An in-memory test fake may exercise the Paseo-shaped contract, but it does not
-count as a second production adapter or freeze a universal cross-Runtime
-interface. The private seam may be redesigned when another adapter exposes
-materially different lifecycle behavior.
+`prepare` idempotently resolves or creates Agent, session, and workspace
+identity and stages the Artifact-backed Prompt; it cannot begin semantic
+execution. `observe` proves the stable action, selected Profile digest, all
+identities, Prompt acceptance, lifecycle, permissions, and fencing.
+`RuntimeCommand` is the closed union `start`, `resume`, `park`, `interrupt`,
+`permission_response`, `fence`, and `retire`. `start` or `resume` is legal only
+after authoritative observation of the complete binding and Prompt receipt.
+Events are wake hints, never authoritative state.
+
+Every production adapter and the deterministic in-memory adapter passes the
+same contract and failure suite. The in-memory implementation is not a looser
+fake. Profile selection, permission policy, and fallback remain RuntimeGateway
+policy. Retry bounds and semantic budgets remain ExecutionKernel policy. None
+of them is adapter policy.
 
 Every materialized resource round-trips repository, Campaign, Plan Revision,
 Work Run, Runtime action, Agent, session, and workspace identity. Events
 accelerate wake-up but never replace authoritative readback. Adapter
 capabilities cannot grant authority: exact permissions remain covered by the
 Work Run's Authority Grants and Policy Witness.
+
+The integrated contract is
+[`RuntimeGateway adapter contract`](../design/gwo-v8-lean-architecture.md#runtimegateway-adapter-contract);
+all failure handling follows the single
+[`Runtime failure taxonomy`](../design/gwo-v8-lean-architecture.md#runtime-failure-taxonomy).

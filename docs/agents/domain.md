@@ -18,9 +18,10 @@ Resolve current V8 documentation in this order:
 5. `docs/design/gwo-v8-lean-roadmap.md` owns delivery sequencing and exit
    criteria only.
 
-The older V8 architecture and roadmap are historical migration records and
-must not generate new implementation work. If current documents disagree,
-apply the order above and repair the lower-precedence document.
+The older V7 and V8 architectures and roadmaps are unadopted or superseded
+historical migration records and must not generate new implementation work.
+If current documents disagree, apply the order above and repair the
+lower-precedence document.
 
 ## Before exploring
 

@@ -1,5 +1,5 @@
 ---
-status: amended by ADR-0036 and ADR-0058
+status: amended by ADR-0036, ADR-0058, and ADR-0059
 ---
 
 # Separate Work Run admission from Runtime Binding
@@ -12,10 +12,16 @@ exclusive claims. The transaction either creates the admission record and
 reserves every claim or changes nothing.
 
 External effects never occur inside that transaction. Each Runtime action uses
-a stable action identity, and RuntimeGateway reads back Agent, session,
-workspace, Prompt acceptance, and Runtime Binding identity before retry.
-Ambiguous materialization retains claims and waits for authoritative readback;
-it never creates a possibly duplicate Agent.
+a stable action identity. RuntimeGateway calls `prepare`, then `observe`; it
+cannot command semantic `start` or `resume` until observation proves the Agent,
+session, workspace, selected Profile digest, Prompt acceptance, and Runtime
+Binding identity. A failed create is read back by stable action identity before
+retry.
+
+Only a proven action-owned empty workspace may be removed. Identity or content
+ambiguity fences attributable resources, retains claims, and requests a named
+human Decision; it never creates a possibly duplicate Agent or adopts
+unproven content.
 
 A Runtime Binding is the observed Profile, adapter, Agent, session, workspace,
 and stable action identity for one Work Run binding. Availability fallback is
@@ -28,3 +34,6 @@ Run until Worker Slots, a genuine Exclusive Resource, or observed Runtime
 availability blocks more work. Waiting for a Slot creates no Runtime identity.
 Elapsed time alone cannot release claims; authoritative readback followed by a
 parked, terminal, or reconciled transition is required.
+
+Provider, configuration, and transport failures follow the canonical
+[`Runtime failure taxonomy`](../design/gwo-v8-lean-architecture.md#runtime-failure-taxonomy).

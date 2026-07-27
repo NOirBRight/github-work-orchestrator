@@ -25,9 +25,11 @@ outstanding event subscriptions and timers.
 
 RuntimeGateway and BatchIntegrator calls must have bounded operation time. A
 local Paseo, GitHub, or other CLI timeout is an operational observation
-followed by identity readback and bounded retry; it is not Candidate rejection
-or permission to create another Agent. The Watchdog never restarts the Paseo
-daemon automatically because that can terminate unrelated live Agents.
+followed by stable-action readback and the persisted waits in the canonical
+[`Runtime failure taxonomy`](../design/gwo-v8-lean-architecture.md#runtime-failure-taxonomy);
+it is not Candidate rejection or permission to create another Agent. The
+Watchdog never restarts the Paseo daemon automatically because that can
+terminate unrelated live Agents.
 
 The Watchdog does not read Worker conversations, infer progress from token or
 log activity, approve unknown permissions, select models, guide implementation,

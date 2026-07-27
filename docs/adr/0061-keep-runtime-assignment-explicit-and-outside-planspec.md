@@ -23,9 +23,10 @@ mapping. There is no Ticket-wide shorthand and no Ticket override for
 Coordinator.
 
 Each mapping names one required primary Runtime Profile and at most one
-optional availability fallback. Missing required configuration fails closed.
-Different selectors and primary/fallback positions may intentionally resolve
-to the same Profile.
+optional availability fallback. Permanent missing or invalid required
+configuration before identity returns `Blocked(RuntimeConfigurationInvalid)`
+without fallback or transport retry. Different selectors and primary/fallback
+positions may intentionally resolve to the same Profile.
 
 Campaign-start overrides are persisted with the Campaign. For each stable
 Runtime action, RuntimeGateway records selector, configuration source, resolved
@@ -36,6 +37,11 @@ Availability fallback is permitted only before any Agent identity may exist
 for the stable action. After identity, RuntimeGateway recovers the same
 binding. A replacement Worker requires terminal-binding Evidence and uses the
 already resolved `recovery_worker` assignment.
+
+A durably selected fallback remains selected even if the primary later
+recovers. Cached availability is advisory; live provider, configuration, and
+transport behavior follows the canonical
+[`Runtime failure taxonomy`](../design/gwo-v8-lean-architecture.md#runtime-failure-taxonomy).
 
 PlanControl may declare factual Runtime capabilities such as required tools or
 execution features. It cannot infer difficulty, assign a model, rank profiles,

@@ -124,9 +124,10 @@ contain only:
 
 The Coordinator cannot rewrite acceptance, add work, expand authority, select
 a model or CLI, predict files, author lifecycle policy, or prescribe Worker
-steps. PlanControl deterministically validates the private output and is the
-only PlanSpec compiler. Compilation, publication, and readback retry the same
-validated output and never repeat the Planning Pass.
+steps. A semantic Coordinator Decision can never expand authority. PlanControl
+deterministically validates the private output and is the only PlanSpec
+compiler. Compilation, publication, and readback retry the same validated
+output and never repeat the Planning Pass.
 
 A configured byte limit bounds the Planning input. Exceeding it returns a
 named split-Campaign Decision; V8 neither truncates contracts nor creates an
@@ -177,11 +178,12 @@ Review Internal Subagents. Operation and resource identifiers are versioned
 repository-policy identifiers, never provider permission strings.
 
 PlanControl compiles every grant deterministically from the frozen Policy
-Witness. Neither the Planning Pass nor Campaign-start Runtime options can add
-an operation or resource. The canonical PlanSpec digest is the authority root.
-The relevant authority-subtree digest is persisted and read back through Work
-Run admission, Prompt acceptance, Runtime Binding, Candidate receipt, Review
-Evidence, and accepted-Candidate receipt.
+Witness. Neither the Planning Pass, a semantic Coordinator Decision, nor
+Campaign-start Runtime options can add an operation or resource. The canonical
+PlanSpec digest is the authority root. The relevant authority-subtree digest
+is persisted and read back through Work Run admission, Prompt acceptance,
+Runtime Binding, Candidate receipt, Review Evidence, and accepted-Candidate
+receipt.
 
 Runtime permission policy belongs to the frozen grants. Deterministic
 PlanControl and BatchIntegrator service authority is not semantic Runtime
@@ -262,6 +264,42 @@ PlanSpec may state factual capabilities, but it never contains a selector,
 Profile, provider, model, reasoning setting, CLI, fallback, or configuration
 source.
 
+## RuntimeGateway adapter contract
+
+RuntimeGateway owns one private provider-neutral adapter contract. Every
+production adapter and the deterministic in-memory adapter implements exactly:
+
+```text
+prepare(RuntimeActionSpec) -> PrepareReceipt | RuntimeFailure
+observe(stable_action_id) -> RuntimeObservation | RuntimeFailure
+command(binding_ref, RuntimeCommand) -> CommandReceipt | RuntimeFailure
+events(after_cursor) -> RuntimeEventPage
+```
+
+`prepare` is idempotent by stable action identity. It resolves or creates the
+Agent, session, and isolated workspace and stages the Artifact-backed Prompt,
+but it cannot begin semantic execution. `observe` authoritatively proves the
+repository, Campaign, Plan Revision, Work Run, stable action, selected Profile,
+Agent, session, workspace, and Runtime Binding identities, plus Prompt
+acceptance, lifecycle, outstanding Permission Requests, and fencing state.
+
+`RuntimeCommand` is a closed union:
+
+```text
+start | resume | park | interrupt | permission_response | fence | retire
+```
+
+RuntimeGateway may issue `start` or `resume` only after `observe` proves the
+complete binding and accepted-Prompt receipt for that stable action. No
+adapter has an implicit launch-on-prepare path. `events` provides cursor-based
+wake hints; it never replaces `observe`.
+
+The deterministic in-memory adapter passes the same contract suite and
+failure cases as production adapters. It is not a looser fake or a second
+policy implementation. Runtime Profile resolution, permission policy, and
+fallback selection remain exclusively in RuntimeGateway. Retry bounds and
+semantic budgets remain ExecutionKernel policy.
+
 ## Worker Slots and Work Run bounds
 
 A Campaign has four Worker Slots by default. The setting is host-global with a
@@ -299,9 +337,12 @@ It auto-approves only when the exact request is covered by both the frozen
 Authority Grant and its Policy Witness. An unmatched, ambiguous, or
 higher-authority request returns `PermissionRequired`.
 
-RuntimeGateway cannot expand authority. A Coordinator may propose an
-alternative already covered by the grant. Expansion requires a durable
-Decision and successor Plan Revision with a newly compiled authority root.
+RuntimeGateway cannot expand authority. A Coordinator may propose only an
+alternative already covered by the same frozen authority subtree. Any new or
+broader operation or resource, or any changed authority root, requires an
+explicitly recorded human Decision, deterministic recompilation, and a
+successor Plan Revision. A semantic Coordinator Decision can never expand
+authority.
 
 An unmatched permission or bounded Coordinator-attention request enters a
 three-minute interactive-wait grace. This default is host-global with a
@@ -321,6 +362,32 @@ Time, permission delay, capacity pressure after identity, and ambiguous
 lifecycle never authorize a replacement. Only terminal-binding Evidence
 proving the exact action, Agent, session, workspace, terminal state, fencing,
 and checkpoint permits ExecutionKernel to start the one replacement binding.
+
+## Runtime failure taxonomy
+
+This table is the canonical Runtime failure policy. ADRs and subordinate
+documents link here rather than restating variants.
+
+| Authoritative observation | Required response | Exhausted or terminal result |
+| --- | --- | --- |
+| Cached provider-unavailable snapshot | Treat it as advisory and perform one live authoritative observation. It selects no fallback or replacement and consumes no retry, binding, semantic, or Candidate budget. | None from the cached fact alone. |
+| Live provider recovery before identity | Use the primary Profile only when no fallback was durably selected. A durably selected fallback remains selected even if the primary later recovers. | Continue the already selected assignment. |
+| Live provider unavailable before identity | Select the configured availability fallback at most once. Without a usable configured fallback, persist `Wait(RuntimeProviderUnavailable, next_check_at)` for the initial observation plus at most two retries. | `Blocked(RuntimeProviderUnavailable)` after the bounded observations. |
+| Permanent configuration failure before identity | Do not select fallback and do not perform transport retry. | `Blocked(RuntimeConfigurationInvalid)`. |
+| Permanent configuration failure after identity | Preserve and fence as required around the same binding. Replacement remains forbidden unless terminal-binding Evidence permits the one configured replacement. | Human `Decision(RuntimeConfigurationRepairRequired)` when replacement is not proven and authorized. |
+| Runtime transport unavailable | Read back by stable action identity, then persist `Wait(RuntimeTransportUnavailable, next_check_at)` for the initial attempt plus at most two retries. Do not select fallback or replacement. | Before identity: `Blocked(RuntimeTransportUnavailable)`. After identity: human `Decision(RuntimeObservationUnavailable)`. |
+| Live provider recovery after identity | Resume or read back the same binding only. Never change its Profile, provider, CLI, session, or workspace. | Existing same-binding lifecycle applies. |
+
+No failure before accepted-Prompt readback consumes a semantic or Candidate
+budget. After a failed create, RuntimeGateway first reads back the stable
+action identity. It may remove only a proven action-owned empty workspace.
+Identity or content ambiguity fences every attributable resource and returns a
+named human Decision; it never guesses adoption, creates a duplicate, or
+reuses unproven content.
+
+RuntimeGateway and Campaign Watchdog never restart a provider daemon
+automatically. A daemon restart can terminate unrelated Agents and is outside
+the authorized recovery contract.
 
 ## CandidateGate
 
@@ -392,11 +459,63 @@ classification of non-decomposable, high-coupling, or protected Interaction
 Key is also Singleton. Other Candidates may batch only when all Interaction
 Keys and protected surfaces are pairwise compatible.
 
-Clean Base Advance is allowed only when the original base is an ancestor of
-the current target, the Candidate and Evidence are unchanged, the target delta
-has no protected interaction with the Candidate, and Git composes without
-manual resolution. The exact composed Batch must still pass its complete local
-and hosted checks.
+### PatchIdentityV1 and Clean Base Advance
+
+`PatchIdentityV1` is a repository-tree delta identity, not Git's heuristic
+`git patch-id`. Define `LP(bytes)` as an unsigned 64-bit big-endian byte length
+followed by those bytes. Its digest is:
+
+```text
+SHA-256(
+  ASCII("gwo.patch-identity.v1\0")
+  || LP(ASCII(repository_object_format))
+  || CONCAT(LP(entry) FOR entry IN SORT_BYTEWISE(encoded_delta_entries))
+)
+```
+
+Each `encoded_delta_entry` is the concatenation of length-prefixed:
+
+1. old path as complete repository-relative Git path bytes with `/` separators,
+   or empty when absent;
+2. new path as complete repository-relative Git path bytes with `/` separators,
+   or empty when absent;
+3. canonical change kind;
+4. old mode as six-digit ASCII octal, or empty when absent;
+5. new mode as six-digit ASCII octal, or empty when absent;
+6. old blob or gitlink object ID as raw object-ID bytes, or empty when absent;
+   and
+7. new blob or gitlink object ID as raw object-ID bytes, or empty when absent.
+
+Unchanged entries are omitted. The canonical change kind is `add` when the old
+entry is absent, `delete` when the new entry is absent, `type-change` when the
+Git object or file type changes, and `modify` for every other object-ID or mode
+change, including an executable-bit change. Entries are sorted bytewise by
+their complete encoding. The algorithm compares Git trees, never worktree
+text. Binary content uses exact object IDs. Rename/copy detection is disabled,
+so a rename or copy is represented as delete plus add. Symlink and executable
+modes participate. Gitlinks use their exact object IDs and are protected
+Singleton work.
+
+Missing objects, case-folding or path-normalization ambiguity, unsafe paths,
+and merge ambiguity fail closed. BatchIntegrator computes and stores the
+original `PatchIdentityV1` for `(base, Candidate)`.
+
+For Clean Base Advance, BatchIntegrator applies each accepted Candidate alone
+to the advanced target in an isolated Git tree. It recomputes
+`PatchIdentityV1(advanced_target, advanced_member_tree)` and requires equality
+with that member's original digest before any multi-member Batch composition.
+It never compares one member with the whole composed Batch.
+
+The Candidate and Review Evidence remain bound to the original Candidate and
+Review Subject; Patch identity cannot authorize cross-SHA Review reuse. Batch
+Evidence binds the algorithm version, original base and Candidate tree,
+original patch digest, advanced target and advanced member tree, recomputed
+patch digest, final Batch SHA, and the exact local and hosted Checks.
+
+Clean Base Advance additionally requires the original base to remain an
+ancestor of the current target, unchanged Candidate and Evidence, no protected
+interaction with the target delta, and clean isolated composition. The final
+Batch must still pass its complete local and hosted checks.
 
 The same immutable Batch SHA must:
 
@@ -409,6 +528,23 @@ commit rather than equal the Batch SHA, so target readback must prove the Batch
 SHA is reachable as an ancestor and that GitHub's PR merge mapping connects the
 PR head to the observed target head. Squash or rebase integration rewrites the
 reviewed identity and therefore fails closed.
+
+### Durable hosted result adoption
+
+Every terminal hosted check produces one integrity-validated receipt keyed by
+the stable delivery action, Batch SHA, check-suite identity, provider check ID,
+terminal outcome, and observation digest.
+
+Once that receipt is durably persisted, restart adopts it without another
+hosted read. A receipt or provider observation whose Batch, suite, check ID, or
+digest mismatches the stable delivery action returns
+`DeliveryIdentityMismatch`. Ambiguous provider attribution returns
+`DeliveryAttributionAmbiguous`.
+
+Both outcomes preserve every Candidate and all Evidence. They are delivery
+identity failures, not code-class failures, and permit neither Singleton Batch
+Fallback nor Worker resume. Only an unambiguous receipt for the exact delivery
+action can drive integration or code-class recovery.
 
 Infrastructure failure retries the unchanged Batch SHA at most twice. A
 composition, exact-local, or code-class hosted failure may dissolve one
@@ -426,8 +562,9 @@ the durable business record; local storage is rebuildable control state.
 Campaign Watchdog subscribes to Runtime and hosted-check events and owns
 persisted `next_check_at` timers. Events are wake hints only; each wake invokes
 `advance`, which performs authoritative readback. Restart reconstructs timers
-and subscriptions from Campaign state. Campaign Watchdog never restarts the
-Paseo daemon automatically.
+and subscriptions from Campaign state. A due `next_check_at` wake invokes the
+same `advance` path and recovers a lost callback without duplicating its
+effect. Campaign Watchdog never restarts the Paseo daemon automatically.
 
 Detailed admission, action, permission, Review, and delivery records are
 module-private implementation facts. They are not public actors or vocabulary
@@ -443,6 +580,7 @@ The current deterministic defaults are:
 | Batch member limit | 4, maximum 4 | host-global, repository override |
 | Stale-binding deadline | 30 minutes | host-global, repository override |
 | Interactive-wait grace | 3 minutes | host-global, repository override |
+| Runtime availability/transport observations | initial plus at most 2 retries | fixed V8.0 policy |
 | Distinct Candidate SHAs per Work Run | at most 3 | fixed V8.0 policy |
 | Worker bindings per Work Run | initial plus at most one replacement | fixed V8.0 policy |
 
@@ -470,13 +608,23 @@ V8.0 does not add:
 
 ## Cutover
 
-New Campaigns write only PlanSpec v3. Existing v2 work finishes through its
-original decoder or becomes quiescent; it is never reinterpreted as v3.
+Activation is the durable writer-generation and Activation Receipt commit
+point. Before Cutover Guard success, all V3-composition and V2-projection
+adapters, callers, and write paths are absent or unreachable. V8 never
+projects or reinterprets PlanSpec v2 as v3.
 
-Activation runs one fail-closed read-only Cutover Guard. The root repository
-then runs one real Campaign with four independent Tickets and proves the public
-API, parallel Work Runs, exact Runtime assignment, frozen authority,
-permission parking, CandidateGate, bounded repair and replacement, restart,
-one Campaign-scoped Integration Batch, exact PR/CI identity, serial integration
-readback, and cleanup. Passing makes V8 the default for new Campaigns in this
-repository before downstream repositories adopt it.
+Active v2 work must finish through its original decoder before cutover or be
+authoritatively quiescent and available only for read-only audit. V8 never
+resumes, interprets, or writes v2. The Guard proves those facts, old-writer
+quiescence, state compatibility, repository-global fence availability, and
+required Runtime configuration before the activation commit point. Guard
+failure leaves the V6.1 writer and all production state unchanged.
+
+After activation, the root repository runs one real Campaign with four
+independent Tickets and proves the public API, parallel Work Runs, exact
+Runtime assignment, frozen authority, permission parking, CandidateGate,
+bounded repair and replacement, restart, lost-callback recovery, the bounded
+zero-LLM-readback-plus-one-diagnosis stale-binding path, one Campaign-scoped
+Integration Batch, exact PR/CI identity, serial integration readback, and
+cleanup. Passing makes V8 the default for new Campaigns in this repository
+before downstream repositories adopt it.

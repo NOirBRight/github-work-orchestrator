@@ -26,6 +26,10 @@ Interaction Keys, and protected-surface policy. Ordinary same-file Candidates
 may share a Batch when all pairwise compatibility checks pass. Strict
 Assurance and repository-policy classifications for non-decomposable,
 high-coupling, or protected Interaction Keys require a Singleton Batch.
+Gitlink changes are protected and always require a Singleton Batch. Pairwise
+compatibility is necessary but never substitutes for the per-member
+[`PatchIdentityV1`](../design/gwo-v8-lean-architecture.md#patchidentityv1-and-clean-base-advance)
+proof required by Clean Base Advance.
 
 Every composed Batch SHA runs the repository-equivalent local suite before its
 first push, then crosses one pull-request and hosted-CI boundary on that exact

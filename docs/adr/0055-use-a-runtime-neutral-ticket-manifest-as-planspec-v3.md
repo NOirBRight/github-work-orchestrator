@@ -73,12 +73,13 @@ CI, integration, and cleanup are fixed module behavior. Deterministic
 PlanControl and BatchIntegrator service authority remains repository policy,
 not semantic Runtime authority.
 
-Authority expansion requires a durable Decision and successor Plan Revision
-with a newly compiled authority root. Plan activation compare-and-swaps
-`(repository, campaign_key)` against the exact expected previous revision
-digest, null initially. One Campaign has one active revision; disjoint
-Campaigns may coexist. The stable Campaign handle does not change across
-successor revisions.
+Any new or broader operation or resource, or a changed authority root, requires
+an explicitly recorded human Decision, deterministic recompilation, and a
+successor Plan Revision. A semantic Coordinator Decision can never expand
+authority. Plan activation compare-and-swaps `(repository, campaign_key)`
+against the exact expected previous revision digest, null initially. One
+Campaign has one active revision; disjoint Campaigns may coexist. The stable
+Campaign handle does not change across successor revisions.
 
 Every Activation Receipt records repository, Campaign key, activated revision
 digest, expected previous revision digest, and repository writer generation.
@@ -93,6 +94,9 @@ readback. The planning output and compilation record are private to
 PlanControl. Only canonical PlanSpec bytes and durable receipts cross the
 module boundary.
 
-PlanSpec v2 records are never reinterpreted as v3. New V8 Campaigns write only
-v3. Cutover requires active v2 work to finish under its original decoder or be
-quiescent; v2 Runtime or Review identity is not silently adopted into v3.
+PlanSpec v2 records are never projected or reinterpreted as v3. Before cutover,
+active v2 work finishes under its original decoder or is authoritatively
+quiescent and available only for read-only audit. V8 never resumes, interprets,
+or writes v2 and never adopts v2 Runtime or Review identity into v3. The
+complete fence is defined by
+[`Cutover`](../design/gwo-v8-lean-architecture.md#cutover).

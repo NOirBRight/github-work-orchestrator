@@ -1,6 +1,6 @@
 ---
 status: amended by ADR-0061
-amends: ADR-0018, ADR-0026, ADR-0044, ADR-0051, ADR-0052, ADR-0053, ADR-0055, ADR-0057
+amends: ADR-0018, ADR-0024, ADR-0026, ADR-0044, ADR-0051, ADR-0052, ADR-0053, ADR-0055, ADR-0057
 ---
 
 # Make RuntimeGateway the only Runtime boundary
@@ -9,6 +9,26 @@ RuntimeGateway is V8's only external execution boundary. ExecutionKernel,
 PlanControl, and CandidateGate exchange typed Runtime requests and receipts
 with it; they never construct Codex, Claude Code, Paseo, shell, Agent, session,
 or provider commands directly.
+
+Every production adapter and the deterministic in-memory adapter implements
+the same private provider-neutral interface:
+
+```text
+prepare(RuntimeActionSpec) -> PrepareReceipt | RuntimeFailure
+observe(stable_action_id) -> RuntimeObservation | RuntimeFailure
+command(binding_ref, RuntimeCommand) -> CommandReceipt | RuntimeFailure
+events(after_cursor) -> RuntimeEventPage
+```
+
+`prepare` may stage identity, workspace, and Artifact-backed Prompt but cannot
+start semantic execution. `observe` must prove the complete binding and Prompt
+receipt—including repository, Campaign, Plan Revision, Work Run, stable
+action, selected Profile, Agent, session, workspace, Runtime Binding,
+lifecycle, permission, and fence state—before RuntimeGateway issues the
+closed-union `start` or `resume` command. The other allowed commands are
+`park`, `interrupt`, `permission_response`, `fence`, and `retire`. Production
+and in-memory implementations pass the same contract suite; Profile and
+permission policy remain in RuntimeGateway.
 
 RuntimeGateway hides:
 
@@ -40,13 +60,16 @@ authority-subtree digest. RuntimeGateway approves the individual request ID,
 never an open-ended `--all` grant. An unmatched, ambiguous, or
 higher-authority request returns `PermissionRequired` to ExecutionKernel.
 
-RuntimeGateway cannot expand authority. A Coordinator may propose one
-alternative already covered by the frozen grant but cannot grant the original
-higher authority. Expansion requires a durable Decision and successor Plan
-Revision with a newly compiled authority root. Interactive-wait grace, parking,
-Slot release, and binding bounds remain ExecutionKernel policy; RuntimeGateway
-only performs and proves the requested park, resume, allow, deny, or readback
-operation.
+RuntimeGateway cannot expand authority. A Coordinator may propose only an
+alternative already covered by the same frozen authority subtree. Any new or
+broader operation or resource, or a changed authority root, requires an
+explicitly recorded human Decision, deterministic recompilation, and a
+successor Plan Revision. A semantic Coordinator Decision can never expand
+authority. Interactive-wait grace, parking, Slot release, and binding bounds
+remain ExecutionKernel policy; RuntimeGateway only performs and proves the
+requested `park`, `resume`, or `permission_response` command and authoritative
+`observe`; allow and deny are `permission_response` payload outcomes, not
+additional adapter commands.
 
 Availability fallback is allowed only before any Agent identity may exist for
 the stable action key and only for the one configured fallback Profile. After
@@ -67,3 +90,8 @@ Live Agent sessions are intentionally not portable between CLIs. Ticket
 contracts, Authority Grants, Policy Witnesses, action identities, workspace
 checkpoints, Candidate SHAs, and typed Evidence remain portable and
 recoverable.
+
+The integrated adapter definition is
+[`RuntimeGateway adapter contract`](../design/gwo-v8-lean-architecture.md#runtimegateway-adapter-contract).
+Provider, configuration, and transport behavior follows the single
+[`Runtime failure taxonomy`](../design/gwo-v8-lean-architecture.md#runtime-failure-taxonomy).
