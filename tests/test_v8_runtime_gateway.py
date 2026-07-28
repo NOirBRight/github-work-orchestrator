@@ -11,17 +11,20 @@ sys.path.insert(0, str(SCRIPTS))
 
 from gwo_v8 import (  # noqa: E402
     CampaignPlanningSubject,
-    CampaignStartRuntimeOverrides,
-    ProfileMapping,
     RuntimeCommand,
     RuntimeConfiguration,
     RuntimeGateway,
     RuntimeGatewayError,
-    RuntimeSelector,
+    WorkRunPurpose,
     WorkRunSubject,
 )
 from gwo_v8.runtime import RuntimeProfile  # noqa: E402
-from gwo_v8.runtime_gateway import ArtifactStore, _InMemoryRuntimeProviderAdapter  # noqa: E402
+from gwo_v8.runtime_gateway import (  # noqa: E402
+    ArtifactStore,
+    CampaignStartRuntimeOverrides,
+    ProfileMapping,
+    _InMemoryRuntimeProviderAdapter,
+)
 
 
 def _profile(name: str) -> RuntimeProfile:
@@ -64,15 +67,21 @@ def _planning(store: ArtifactStore, *, action: str = "planning:one"):
     )
 
 
-def _work(store: ArtifactStore, planning, *, role: str, action: str):
+def _work(
+    store: ArtifactStore,
+    planning,
+    *,
+    purpose: WorkRunPurpose,
+    action: str,
+):
     provisional = WorkRunSubject(
         repository=planning.repository,
         campaign_key=planning.campaign_key,
         campaign_handle=planning.campaign_handle,
         plan_revision_digest=store.put_canonical({"revision": 1}).digest,
-        work_run_key=f"work-run:{role}",
+        work_run_key=f"work-run:{purpose.kind}",
         ticket_key="issue:111",
-        role=role,
+        purpose=purpose,
         prompt_artifact_digest="0" * 64,
         authority_subtree_digest=planning.policy_witness_digest,
         stable_action_id=action,
@@ -107,6 +116,13 @@ def _gateway(tmp_path: Path, configuration: RuntimeConfiguration, **adapter_opti
 
 def test_exact_selector_precedence_and_same_profile_fallback_are_persisted(tmp_path):
     host, repository, override = (_profile("host"), _profile("repository"), _profile("override"))
+    artifacts = ArtifactStore(tmp_path / "artifacts", maximum_bytes=1_048_576)
+    planning = _planning(artifacts)
+    assertion_key = (
+        planning.repository,
+        planning.campaign_key,
+        planning.campaign_handle,
+    )
     configuration = RuntimeConfiguration(
         profiles={item.digest: item for item in (host, repository, override)},
         host_mappings={
@@ -122,24 +138,38 @@ def test_exact_selector_precedence_and_same_profile_fallback_are_persisted(tmp_p
                 "recovery_worker": ProfileMapping(repository.digest),
             }
         },
+        campaign_assertions={
+            assertion_key: CampaignStartRuntimeOverrides(
+                coordinator=ProfileMapping(override.digest, override.digest),
+                ticket_overrides={
+                    ("issue:111", "worker"): ProfileMapping(override.digest),
+                },
+            )
+        },
     )
     gateway, artifacts, adapter = _gateway(tmp_path, configuration)
-    planning = _planning(artifacts)
-    preflight = gateway.planning_preflight(
-        planning,
-        CampaignStartRuntimeOverrides(
-            coordinator=ProfileMapping(override.digest, override.digest),
-            ticket_overrides={
-                ("issue:111", "worker"): ProfileMapping(override.digest),
-            },
-        ),
-    )
+    preflight = gateway.planning_preflight(planning)
     gateway.progress(planning, preflight)
     assert adapter.observe(planning.stable_action_id).profile_digest == override.digest
 
-    worker = _work(artifacts, planning, role="worker", action="work:worker")
-    recovery = _work(artifacts, planning, role="recovery_worker", action="work:recovery")
-    specialist = _work(artifacts, planning, role="specialist:security", action="work:specialist")
+    worker = _work(
+        artifacts,
+        planning,
+        purpose=WorkRunPurpose.implementation(),
+        action="work:worker",
+    )
+    recovery = _work(
+        artifacts,
+        planning,
+        purpose=WorkRunPurpose.terminal_recovery_implementation(),
+        action="work:recovery",
+    )
+    specialist = _work(
+        artifacts,
+        planning,
+        purpose=WorkRunPurpose.specialist_review("security"),
+        action="work:specialist",
+    )
     gateway.progress(worker)
     gateway.progress(recovery)
     gateway.progress(specialist)
@@ -199,7 +229,12 @@ def test_work_run_subject_and_events_cannot_replace_authoritative_readback(tmp_p
     planning = _planning(artifacts)
     preflight = gateway.planning_preflight(planning)
     gateway.progress(planning, preflight)
-    work = _work(artifacts, planning, role="worker", action="work:one")
+    work = _work(
+        artifacts,
+        planning,
+        purpose=WorkRunPurpose.implementation(),
+        action="work:one",
+    )
     first = gateway.progress(work)
     second = gateway.progress(work, wake_cursor=first.wake_cursor)
 

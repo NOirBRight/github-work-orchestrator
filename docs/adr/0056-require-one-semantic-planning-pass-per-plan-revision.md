@@ -75,6 +75,15 @@ protocol/request from the bounded Gateway Artifact Store and validates the
 completed output's exact subject, stable action, authority, and payload
 binding before it returns the opaque receipt.
 
+The semantic method is exactly `planning_preflight(subject)`. Host composition
+supplies an optional Campaign-start assertion in `RuntimeConfiguration`, keyed
+by the exact `(repository, campaign_key, campaign_handle)`; that assertion is
+not a semantic call argument or package-level workflow type. On first use,
+absence means persist the canonical empty override set. For an already bound
+Campaign, absence means reuse the durable binding, while a present assertion
+must equal it exactly. Concurrent first callers are resolved by one durable
+compare-and-set; a loser with different asserted configuration fails closed.
+
 This replaces the earlier zero-Coordinator initial path with a bounded cost:
 one semantic planning turn for the complete Campaign revision, independent of
 Ticket count. Compilation retry and publication/readback recovery reuse the

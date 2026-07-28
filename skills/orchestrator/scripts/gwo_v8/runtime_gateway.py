@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -26,7 +27,7 @@ from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
 from ._canonical import canonical_bytes, digest_value
-from .runtime import RuntimeProfile
+from .runtime_profile import RuntimeProfile
 
 
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -54,6 +55,16 @@ _JOURNAL_LOCK_RETRY_SECONDS = 0.01
 _MAXIMUM_RUNTIME_JOURNAL_BYTES = 16_777_216
 _MAXIMUM_RUNTIME_EVENTS = 64
 _MAXIMUM_RUNTIME_EVENT_PAGE = 16
+_MAXIMUM_RUNTIME_EVENT_READBACKS = 1
+_RUNTIME_WORKSPACE_LAYOUT_VERSION = "1"
+_RUNTIME_WORKSPACE_OWNER_SCHEMA = "gwo.runtime.workspace-owner.v1"
+_RUNTIME_WORKSPACE_OWNER_FILE = "runtime-owner.v1.json"
+_RUNTIME_WORKSPACE_DIRECTORIES = (
+    "runtime-artifacts",
+    "runtime-results",
+    "runtime-schemas",
+)
+_WINDOWS_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _JOURNAL_MUTEX_GUARD = threading.Lock()
 _JOURNAL_MUTEXES: dict[str, threading.Lock] = {}
 
@@ -347,6 +358,484 @@ class ArtifactStore:
         return self._maximum_bytes
 
 
+class _RuntimeWorkspaceFiles:
+    """Action-owned, fixed-name files below one verified Workspace.
+
+    This is a fail-closed defense for non-racing link, junction, reparse-point,
+    hard-link, and journal-redirection attacks.  Python's path APIs cannot
+    provide descriptor-relative no-follow operations portably on Windows, so
+    this helper deliberately does not claim protection against an attacker
+    racing the lstat/resolve/open or lstat/replace sequences.
+    """
+
+    def __init__(
+        self,
+        *,
+        workspace_path: str,
+        workspace_id: str,
+        workspace_slug: str,
+        workspace_base_commit: str,
+        ownership_nonce: str,
+        repository: str,
+        stable_action_id: str,
+        subject_digest: str,
+        spec_identity_digest: str,
+        maximum_bytes: int,
+    ):
+        if (
+            not isinstance(ownership_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{32}", ownership_nonce) is None
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_WORKSPACE_UNSAFE",
+                "Runtime Workspace ownership nonce is invalid",
+            )
+        if (
+            not isinstance(maximum_bytes, int)
+            or isinstance(maximum_bytes, bool)
+            or maximum_bytes < 1
+        ):
+            raise ValueError("maximum_bytes must be a positive integer")
+        self.workspace = Path(workspace_path).resolve()
+        self.runtime_root = self.workspace / ".gwo"
+        self.ownership_nonce = ownership_nonce
+        self.maximum_bytes = maximum_bytes
+        self._marker = {
+            "schema_version": _RUNTIME_WORKSPACE_OWNER_SCHEMA,
+            "layout_version": _RUNTIME_WORKSPACE_LAYOUT_VERSION,
+            "ownership_nonce": ownership_nonce,
+            "repository": repository,
+            "workspace_id": workspace_id,
+            "workspace_slug": workspace_slug,
+            "workspace_path": str(self.workspace),
+            "workspace_base_commit": workspace_base_commit,
+            "stable_action_id": stable_action_id,
+            "subject_digest": subject_digest,
+            "spec_identity_digest": spec_identity_digest,
+        }
+        self._marker_payload = canonical_bytes(self._marker)
+        self.marker_digest = hashlib.sha256(self._marker_payload).hexdigest()
+        self._action_digest = digest_value(
+            {
+                "repository": repository,
+                "stable_action_id": stable_action_id,
+            }
+        )
+
+    @property
+    def marker_path(self) -> Path:
+        return self.runtime_root / _RUNTIME_WORKSPACE_OWNER_FILE
+
+    def artifact_path(self, digest: str) -> Path:
+        return (
+            self.runtime_root
+            / "runtime-artifacts"
+            / f"{_require_digest(digest, 'Workspace artifact digest')}.json"
+        )
+
+    @property
+    def result_path(self) -> Path:
+        return (
+            self.runtime_root
+            / "runtime-results"
+            / f"{self._action_digest}.json"
+        )
+
+    @property
+    def schema_path(self) -> Path:
+        return (
+            self.runtime_root
+            / "runtime-schemas"
+            / f"{self._action_digest}.json"
+        )
+
+    @property
+    def resume_path(self) -> Path:
+        return self.runtime_root / "runtime-artifacts" / "resume.txt"
+
+    @staticmethod
+    def _unsafe(detail: str) -> RuntimeGatewayError:
+        return RuntimeGatewayError("RUNTIME_WORKSPACE_UNSAFE", detail)
+
+    def _assert_contained(self, path: Path, *, strict: bool) -> None:
+        try:
+            resolved = path.resolve(strict=strict)
+            common = Path(
+                os.path.commonpath((str(self.workspace), str(resolved)))
+            )
+        except (OSError, ValueError) as error:
+            raise self._unsafe("Runtime Workspace path containment is invalid") from error
+        if common != self.workspace:
+            raise self._unsafe("Runtime Workspace path escapes its verified root")
+
+    @staticmethod
+    def _lstat(path: Path) -> os.stat_result | None:
+        try:
+            return os.lstat(path)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise RuntimeGatewayError(
+                "RUNTIME_WORKSPACE_UNSAFE",
+                "Runtime Workspace path metadata is unavailable",
+            ) from error
+
+    def _validate_stat(
+        self, path: Path, value: os.stat_result, *, directory: bool
+    ) -> None:
+        if (
+            stat.S_ISLNK(value.st_mode)
+            or getattr(value, "st_file_attributes", 0)
+            & _WINDOWS_REPARSE_POINT
+        ):
+            raise self._unsafe(
+                "Runtime Workspace descendants must not be links or reparse points"
+            )
+        if directory:
+            if not stat.S_ISDIR(value.st_mode):
+                raise self._unsafe("Runtime Workspace parent is not a directory")
+        else:
+            if not stat.S_ISREG(value.st_mode):
+                raise self._unsafe("Runtime Workspace leaf is not a regular file")
+            if getattr(value, "st_nlink", 1) != 1:
+                raise self._unsafe("Runtime Workspace leaf must not be hard-linked")
+        self._assert_contained(path, strict=True)
+
+    def _check_path(
+        self,
+        path: Path,
+        *,
+        directory: bool,
+        missing_leaf_ok: bool = False,
+    ) -> os.stat_result | None:
+        candidate = Path(path)
+        try:
+            relative = candidate.relative_to(self.workspace)
+        except ValueError as error:
+            raise self._unsafe("Runtime Workspace path is outside its verified root") from error
+        if not relative.parts:
+            raise self._unsafe("Runtime Workspace root is not a governed leaf")
+        current = self.workspace
+        for index, part in enumerate(relative.parts):
+            current /= part
+            final = index == len(relative.parts) - 1
+            value = self._lstat(current)
+            if value is None:
+                if final and missing_leaf_ok:
+                    self._assert_contained(current, strict=False)
+                    return None
+                raise self._unsafe("Runtime Workspace governed path is missing")
+            self._validate_stat(
+                current,
+                value,
+                directory=(directory if final else True),
+            )
+        return value
+
+    def _fsync_directory(self, path: Path) -> None:
+        if os.name == "nt":
+            return
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _remove_validated_temporary(self, temporary: Path) -> None:
+        value = self._check_path(
+            temporary,
+            directory=False,
+            missing_leaf_ok=True,
+        )
+        if value is None:
+            return
+        try:
+            temporary.unlink()
+        except OSError as error:
+            raise self._unsafe(
+                "Runtime Workspace temporary leaf could not be removed"
+            ) from error
+        if self._lstat(temporary) is not None:
+            raise self._unsafe("Runtime Workspace temporary leaf still exists")
+        self._fsync_directory(temporary.parent)
+
+    def _atomic_write(
+        self,
+        target: Path,
+        payload: bytes,
+        *,
+        recoverable_temporary: Path | None = None,
+    ) -> None:
+        if len(payload) > self.maximum_bytes:
+            raise RuntimeGatewayError(
+                "RUNTIME_ARTIFACT_TOO_LARGE",
+                "Artifact exceeds the bounded transport limit",
+        )
+        self._check_path(target.parent, directory=True)
+        self._check_path(target, directory=False, missing_leaf_ok=True)
+        temporary = (
+            target.with_name(f"{target.name}.{uuid4().hex}.tmp")
+            if recoverable_temporary is None
+            else Path(recoverable_temporary)
+        )
+        existing_temporary = self._check_path(
+            temporary,
+            directory=False,
+            missing_leaf_ok=True,
+        )
+        if existing_temporary is not None:
+            if recoverable_temporary is None:
+                raise self._unsafe(
+                    "Runtime Workspace temporary leaf already exists"
+                )
+            self._remove_validated_temporary(temporary)
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._check_path(temporary, directory=False)
+            self._check_path(target, directory=False, missing_leaf_ok=True)
+            os.replace(temporary, target)
+            self._fsync_directory(target.parent)
+            self._check_path(target, directory=False)
+            if self._read_bytes(target) != payload:
+                raise self._unsafe("Runtime Workspace atomic write verification failed")
+        except FileExistsError as error:
+            raise self._unsafe("Runtime Workspace temporary leaf already exists") from error
+        except OSError as error:
+            raise self._unsafe("Runtime Workspace atomic write failed") from error
+        finally:
+            self._remove_validated_temporary(temporary)
+
+    def _read_bytes(self, target: Path, *, missing_ok: bool = False) -> bytes | None:
+        try:
+            value = self._check_path(
+                target, directory=False, missing_leaf_ok=True
+            )
+            if value is None:
+                if missing_ok:
+                    return None
+                raise RuntimeGatewayError(
+                    "RUNTIME_ARTIFACT_MISSING",
+                    "required Runtime Workspace Artifact is missing",
+                )
+            with target.open("rb") as handle:
+                payload = handle.read(self.maximum_bytes + 1)
+            self._check_path(target, directory=False)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise RuntimeGatewayError(
+                "RUNTIME_ARTIFACT_MISSING",
+                "required Runtime Workspace Artifact is missing",
+            )
+        except OSError as error:
+            raise self._unsafe("Runtime Workspace governed file is unavailable") from error
+        if len(payload) > self.maximum_bytes:
+            raise RuntimeGatewayError(
+                "RUNTIME_ARTIFACT_TOO_LARGE",
+                "Artifact exceeds the bounded transport limit",
+            )
+        return payload
+
+    def _validate_staging_tree(self, root: Path) -> None:
+        self._check_path(root, directory=True)
+        try:
+            names = {entry.name for entry in os.scandir(root)}
+        except OSError as error:
+            raise self._unsafe("Runtime Workspace staging tree is unreadable") from error
+        allowed = {
+            *_RUNTIME_WORKSPACE_DIRECTORIES,
+            _RUNTIME_WORKSPACE_OWNER_FILE,
+            (
+                f"{_RUNTIME_WORKSPACE_OWNER_FILE}."
+                f"{self.ownership_nonce}.tmp"
+            ),
+        }
+        if not names <= allowed:
+            raise self._unsafe("Runtime Workspace staging tree has foreign entries")
+        for directory_name in _RUNTIME_WORKSPACE_DIRECTORIES:
+            child = root / directory_name
+            value = self._lstat(child)
+            if value is not None:
+                self._validate_stat(child, value, directory=True)
+        marker = root / _RUNTIME_WORKSPACE_OWNER_FILE
+        value = self._lstat(marker)
+        if value is not None:
+            self._validate_stat(marker, value, directory=False)
+        marker_temporary = root / (
+            f"{_RUNTIME_WORKSPACE_OWNER_FILE}."
+            f"{self.ownership_nonce}.tmp"
+        )
+        value = self._lstat(marker_temporary)
+        if value is not None:
+            self._validate_stat(marker_temporary, value, directory=False)
+
+    def establish(self) -> None:
+        """Create or recover exactly this nonce-owned reserved tree."""
+
+        final_value = self._lstat(self.runtime_root)
+        staging = self.workspace / f".gwo-init-{self.ownership_nonce}"
+        staging_value = self._lstat(staging)
+        if final_value is not None:
+            self._validate_stat(self.runtime_root, final_value, directory=True)
+            if staging_value is not None:
+                raise self._unsafe(
+                    "Runtime Workspace has both final and staging ownership trees"
+                )
+            self.verify()
+            return
+        if staging_value is None:
+            self._assert_contained(staging, strict=False)
+            try:
+                os.mkdir(staging)
+            except OSError as error:
+                raise self._unsafe(
+                    "Runtime Workspace ownership staging tree could not be created"
+                ) from error
+        else:
+            self._validate_stat(staging, staging_value, directory=True)
+        self._validate_staging_tree(staging)
+        for directory_name in _RUNTIME_WORKSPACE_DIRECTORIES:
+            directory = staging / directory_name
+            if self._lstat(directory) is None:
+                self._check_path(staging, directory=True)
+                try:
+                    os.mkdir(directory)
+                except OSError as error:
+                    raise self._unsafe(
+                        "Runtime Workspace governed directory could not be created"
+                    ) from error
+            self._check_path(directory, directory=True)
+        staging_marker = staging / _RUNTIME_WORKSPACE_OWNER_FILE
+        staging_marker_temporary = staging / (
+            f"{_RUNTIME_WORKSPACE_OWNER_FILE}."
+            f"{self.ownership_nonce}.tmp"
+        )
+        self._remove_validated_temporary(staging_marker_temporary)
+        existing_marker = self._read_bytes(staging_marker, missing_ok=True)
+        if existing_marker is None:
+            self._atomic_write(
+                staging_marker,
+                self._marker_payload,
+                recoverable_temporary=staging_marker_temporary,
+            )
+        elif existing_marker != self._marker_payload:
+            raise self._unsafe("Runtime Workspace ownership marker is not exact")
+        self._validate_staging_tree(staging)
+        if self._lstat(self.runtime_root) is not None:
+            raise self._unsafe("Runtime Workspace reserved tree appeared unexpectedly")
+        try:
+            os.rename(staging, self.runtime_root)
+            self._fsync_directory(self.workspace)
+        except OSError as error:
+            raise self._unsafe(
+                "Runtime Workspace ownership tree could not be finalized"
+            ) from error
+        self.verify()
+
+    def verify(self) -> None:
+        self._check_path(self.runtime_root, directory=True)
+        for directory_name in _RUNTIME_WORKSPACE_DIRECTORIES:
+            self._check_path(
+                self.runtime_root / directory_name,
+                directory=True,
+            )
+        try:
+            marker = self._read_bytes(self.marker_path)
+        except RuntimeGatewayError as error:
+            if error.code == "RUNTIME_ARTIFACT_MISSING":
+                raise self._unsafe(
+                    "Runtime Workspace ownership marker is absent"
+                ) from error
+            raise
+        if marker != self._marker_payload:
+            raise self._unsafe("Runtime Workspace ownership marker is not exact")
+
+    def assert_record_paths(self, record: Mapping[str, Any]) -> None:
+        self.verify()
+        input_digests = record.get("input_artifact_digests")
+        input_files = record.get("input_files")
+        if (
+            not isinstance(input_digests, list)
+            or not all(isinstance(digest, str) for digest in input_digests)
+            or not isinstance(input_files, dict)
+        ):
+            raise self._unsafe("Runtime Workspace input path record is invalid")
+        expected_inputs = {
+            digest: str(self.artifact_path(digest)) for digest in input_digests
+        }
+        expected = {
+            "workspace_path": str(self.workspace),
+            "workspace_owner_nonce": self.ownership_nonce,
+            "workspace_layout_version": _RUNTIME_WORKSPACE_LAYOUT_VERSION,
+            "workspace_owner_marker_digest": self.marker_digest,
+            "prompt_file": str(
+                self.artifact_path(str(record.get("prompt_artifact_digest")))
+            ),
+            "input_files": expected_inputs,
+            "result_file": str(self.result_path),
+            "output_schema_file": str(self.schema_path),
+        }
+        if any(record.get(key) != value for key, value in expected.items()):
+            raise self._unsafe(
+                "Runtime Workspace journal paths do not match their fixed derivation"
+            )
+
+    def write_artifact(self, digest: str, payload: bytes) -> Path:
+        target = self.artifact_path(digest)
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise RuntimeGatewayError(
+                "RUNTIME_ARTIFACT_DIGEST_MISMATCH",
+                "staged Runtime Artifact is invalid",
+            )
+        self._atomic_write(target, payload)
+        return target
+
+    def read_artifact(self, digest: str) -> bytes:
+        payload = self._read_bytes(self.artifact_path(digest))
+        assert payload is not None
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise RuntimeGatewayError(
+                "RUNTIME_ARTIFACT_DIGEST_MISMATCH",
+                "Artifact bytes do not match their digest",
+            )
+        return payload
+
+    def write_schema(self, payload: bytes) -> str:
+        self._atomic_write(self.schema_path, payload)
+        return hashlib.sha256(payload).hexdigest()
+
+    def read_schema(self, digest: str) -> bytes:
+        _require_digest(digest, "Runtime Workspace schema digest")
+        payload = self._read_bytes(self.schema_path)
+        assert payload is not None
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise RuntimeGatewayError(
+                "RUNTIME_ARTIFACT_DIGEST_MISMATCH",
+                "Runtime Workspace schema bytes do not match their digest",
+            )
+        return payload
+
+    def read_result(self) -> bytes | None:
+        return self._read_bytes(self.result_path, missing_ok=True)
+
+    def verify_result_target(self) -> None:
+        self._check_path(
+            self.result_path,
+            directory=False,
+            missing_leaf_ok=True,
+        )
+
+    def write_resume(self, payload: bytes) -> Path:
+        self._atomic_write(self.resume_path, payload)
+        return self.resume_path
+
+
 def _require_text(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value:
         raise RuntimeGatewayError(
@@ -538,6 +1027,9 @@ class RuntimeConfiguration:
     repository_mappings: Mapping[
         str, Mapping[RuntimeSelector | str, ProfileMapping]
     ] = field(default_factory=dict)
+    campaign_assertions: Mapping[
+        tuple[str, str, str], CampaignStartRuntimeOverrides
+    ] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         profiles = dict(self.profiles)
@@ -571,6 +1063,28 @@ class RuntimeConfiguration:
                 mappings
             )
         object.__setattr__(self, "repository_mappings", repositories)
+        assertions: dict[
+            tuple[str, str, str], CampaignStartRuntimeOverrides
+        ] = {}
+        for key, assertion in self.campaign_assertions.items():
+            if not isinstance(key, tuple) or len(key) != 3:
+                raise RuntimeGatewayError(
+                    "RUNTIME_CONFIGURATION_INVALID",
+                    "Campaign Runtime assertions require an exact repository, Campaign key, and handle",
+                )
+            repository, campaign_key, campaign_handle = key
+            normalized_key = (
+                _require_text(repository, "repository"),
+                _require_text(campaign_key, "campaign_key"),
+                _require_text(campaign_handle, "campaign_handle"),
+            )
+            if type(assertion) is not CampaignStartRuntimeOverrides:
+                raise RuntimeGatewayError(
+                    "RUNTIME_CONFIGURATION_INVALID",
+                    "Campaign Runtime assertion has an invalid host value",
+                )
+            assertions[normalized_key] = assertion
+        object.__setattr__(self, "campaign_assertions", assertions)
 
 
 def _normalize_mappings(
@@ -654,6 +1168,76 @@ class CampaignPlanningSubject:
 
 
 @dataclass(frozen=True)
+class WorkRunPurpose:
+    """Closed semantic purpose; exact Runtime selectors remain Gateway-private."""
+
+    kind: str
+    policy_id: str | None = None
+
+    def __post_init__(self) -> None:
+        ordinary = {
+            "implementation",
+            "terminal_recovery_implementation",
+            "formal_review",
+            "invalid_review_payload_retry",
+        }
+        if self.kind in ordinary and self.policy_id is None:
+            return
+        if (
+            self.kind == "specialist_review"
+            and isinstance(self.policy_id, str)
+            and _SPECIALIST_RE.fullmatch(f"specialist:{self.policy_id}") is not None
+        ):
+            return
+        raise RuntimeGatewayError(
+            "RUNTIME_SUBJECT_INVALID",
+            "Work Run purpose is outside the closed semantic union",
+        )
+
+    @classmethod
+    def implementation(cls) -> "WorkRunPurpose":
+        return cls("implementation")
+
+    @classmethod
+    def terminal_recovery_implementation(cls) -> "WorkRunPurpose":
+        return cls("terminal_recovery_implementation")
+
+    @classmethod
+    def formal_review(cls) -> "WorkRunPurpose":
+        return cls("formal_review")
+
+    @classmethod
+    def invalid_review_payload_retry(cls) -> "WorkRunPurpose":
+        return cls("invalid_review_payload_retry")
+
+    @classmethod
+    def specialist_review(cls, policy_id: str) -> "WorkRunPurpose":
+        return cls("specialist_review", policy_id)
+
+    def canonical(self) -> dict[str, str | None]:
+        return {"kind": self.kind, "policy_id": self.policy_id}
+
+
+def _selector_for_purpose(purpose: WorkRunPurpose) -> RuntimeSelector:
+    if type(purpose) is not WorkRunPurpose:
+        raise RuntimeGatewayError(
+            "RUNTIME_SUBJECT_INVALID",
+            "Work Run purpose must be one exact semantic value",
+        )
+    ordinary = {
+        "implementation": "worker",
+        "terminal_recovery_implementation": "recovery_worker",
+        "formal_review": "review_primary",
+        "invalid_review_payload_retry": "review_strong",
+    }
+    if purpose.kind in ordinary:
+        return RuntimeSelector.ticket(ordinary[purpose.kind])
+    assert purpose.kind == "specialist_review"
+    assert purpose.policy_id is not None
+    return RuntimeSelector.ticket(f"specialist:{purpose.policy_id}")
+
+
+@dataclass(frozen=True)
 class WorkRunSubject:
     """The only post-Plan subject accepted by RuntimeGateway."""
 
@@ -663,7 +1247,7 @@ class WorkRunSubject:
     plan_revision_digest: str
     work_run_key: str
     ticket_key: str
-    role: str
+    purpose: WorkRunPurpose
     prompt_artifact_digest: str
     authority_subtree_digest: str
     stable_action_id: str
@@ -678,7 +1262,11 @@ class WorkRunSubject:
             "stable_action_id",
         ):
             _require_text(getattr(self, field_name), field_name)
-        RuntimeSelector.ticket(self.role)
+        if type(self.purpose) is not WorkRunPurpose:
+            raise RuntimeGatewayError(
+                "RUNTIME_SUBJECT_INVALID",
+                "Work Run purpose must be one exact semantic value",
+            )
         _require_digest(self.plan_revision_digest, "plan_revision_digest")
         _require_digest(self.prompt_artifact_digest, "prompt_artifact_digest")
         _require_digest(self.authority_subtree_digest, "authority_subtree_digest")
@@ -706,7 +1294,7 @@ class WorkRunSubject:
             "plan_revision_digest": self.plan_revision_digest,
             "work_run_key": self.work_run_key,
             "ticket_key": self.ticket_key,
-            "role": self.role,
+            "purpose": self.purpose.canonical(),
             "prompt_artifact_digest": self.prompt_artifact_digest,
             "authority_subtree_digest": self.authority_subtree_digest,
             "stable_action_id": self.stable_action_id,
@@ -800,13 +1388,38 @@ class _PermissionRequest:
         _require_digest(self.subject_digest, "subject_digest")
 
 
+def _permission_request_from_value(value: object) -> _PermissionRequest:
+    if not isinstance(value, dict) or set(value) != {
+        "request_id",
+        "operation_id",
+        "resource_id",
+        "binding_ref",
+        "authority_subtree_digest",
+        "stable_action_id",
+        "subject_digest",
+    }:
+        raise RuntimeGatewayError(
+            "RUNTIME_OBSERVATION_INVALID",
+            "completed permission request proof is malformed",
+        )
+    try:
+        return _PermissionRequest(**value)
+    except (TypeError, RuntimeGatewayError) as error:
+        raise RuntimeGatewayError(
+            "RUNTIME_OBSERVATION_INVALID",
+            "completed permission request proof is invalid",
+        ) from error
+
+
 @dataclass(frozen=True)
 class _CompletedPermissionResponse:
     """One bounded provider-neutral proof of a completed permission effect."""
 
     request_id: str
     decision: str
+    request: _PermissionRequest
     request_digest: str
+    provider_receipt: Mapping[str, Any]
     provider_receipt_digest: str
     stable_action_id: str
     subject_digest: str
@@ -825,6 +1438,16 @@ class _CompletedPermissionResponse:
         _require_digest(self.subject_digest, "subject_digest")
         _require_digest(self.request_digest, "request_digest")
         _require_digest(self.provider_receipt_digest, "provider_receipt_digest")
+        if type(self.request) is not _PermissionRequest:
+            raise RuntimeGatewayError(
+                "RUNTIME_OBSERVATION_INVALID",
+                "completed permission request proof is invalid",
+            )
+        if not isinstance(self.provider_receipt, Mapping):
+            raise RuntimeGatewayError(
+                "RUNTIME_OBSERVATION_INVALID",
+                "completed permission provider receipt proof is invalid",
+            )
         if self.decision not in {"allow", "deny"}:
             raise RuntimeGatewayError(
                 "RUNTIME_COMMAND_INVALID", "permission decision must be exactly allow or deny"
@@ -896,24 +1519,44 @@ class _BoundRuntimeObservation:
         return self.planning_output_artifact_digest
 
 
-def _completed_permission_effect_matches(
-    command: PermissionResponse,
+def _completed_permission_evidence_is_bound(
     observation: _BoundRuntimeObservation,
 ) -> bool:
-    """Check the one retained completion proof and exact request absence."""
+    """Validate the retained proof against independent observation identity."""
 
     evidence = observation.completed_permission_response
     return (
         type(evidence) is _CompletedPermissionResponse
-        and evidence.request_id == command.request_id
-        and evidence.decision == command.decision
-        and _DIGEST_RE.fullmatch(evidence.request_digest) is not None
-        and _DIGEST_RE.fullmatch(evidence.provider_receipt_digest) is not None
+        and type(evidence.request) is _PermissionRequest
+        and evidence.request_id == evidence.request.request_id
+        and evidence.request_digest == digest_value(asdict(evidence.request))
+        and evidence.provider_receipt_digest
+        == digest_value(dict(evidence.provider_receipt))
         and evidence.stable_action_id == observation.stable_action_id
         and evidence.subject_digest == observation.subject_digest
         and evidence.binding_ref == observation.binding_ref
-        and command.request_id
+        and evidence.request.stable_action_id == observation.stable_action_id
+        and evidence.request.subject_digest == observation.subject_digest
+        and evidence.request.binding_ref == observation.binding_ref
+        and evidence.request.authority_subtree_digest
+        == observation.authority_subtree_digest
+        and evidence.request_id
         not in {request.request_id for request in observation.permission_requests}
+    )
+
+
+def _completed_permission_effect_matches(
+    command: PermissionResponse,
+    observation: _BoundRuntimeObservation,
+) -> bool:
+    """Check one exact replay against the complete retained effect proof."""
+
+    evidence = observation.completed_permission_response
+    return (
+        _completed_permission_evidence_is_bound(observation)
+        and evidence is not None
+        and evidence.request_id == command.request_id
+        and evidence.decision == command.decision
     )
 
 @dataclass(frozen=True)
@@ -975,6 +1618,14 @@ class _PaseoAgentReadback:
     pending_permissions: tuple[tuple[str, str], ...]
 
 
+class _ProviderNotDispatched(RuntimeError):
+    """Private proof that provider process creation never dispatched."""
+
+    def __init__(self, cause: Exception):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 class _PaseoCliTransport:
     """Concrete V3-only JSON transport for the documented Paseo 0.2.3 surface."""
 
@@ -1008,13 +1659,16 @@ class _PaseoCliTransport:
         started = time.monotonic()
         command_deadline = started + self._timeout_seconds
         hard_deadline = command_deadline + _PASEO_CLEANUP_GRACE_SECONDS
-        process = subprocess.Popen(
-            [self._executable, *args],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-        )
+        try:
+            process = subprocess.Popen(
+                [self._executable, *args],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+            )
+        except Exception as error:
+            raise _ProviderNotDispatched(error) from error
         if process.stdout is None or process.stderr is None:
             cleanup_deadline = min(
                 hard_deadline,
@@ -1342,10 +1996,13 @@ class _PaseoRuntimeProviderAdapter:
             self._events,
             self._workspace_intents,
             self._next_event_cursor,
+            self._event_scan_cursor,
         ) = self._load()
 
     @staticmethod
     def _failure(error: Exception) -> _RuntimeFailure:
+        if isinstance(error, _ProviderNotDispatched):
+            error = error.cause
         if isinstance(error, (OSError, TimeoutError)):
             return _RuntimeFailure.transport()
         if isinstance(error, RuntimeGatewayError):
@@ -1388,6 +2045,7 @@ class _PaseoRuntimeProviderAdapter:
         list[_RuntimeEvent],
         dict[str, dict[str, str]],
         int,
+        int,
     ]:
         with self._journal.exclusive():
             return self._load_unlocked()
@@ -1399,10 +2057,11 @@ class _PaseoRuntimeProviderAdapter:
         list[_RuntimeEvent],
         dict[str, dict[str, str]],
         int,
+        int,
     ]:
         value = self._journal.read_unlocked()
         if value is None:
-            return {}, [], {}, 1
+            return {}, [], {}, 1, 0
         if not isinstance(value, dict):
             raise RuntimeGatewayError(
                 "RUNTIME_STORE_INVALID", "Paseo Runtime action record is invalid"
@@ -1418,6 +2077,12 @@ class _PaseoRuntimeProviderAdapter:
             raise RuntimeGatewayError(
                 "RUNTIME_STORE_INVALID", "Paseo Runtime action record is invalid"
             )
+        for action in actions.values():
+            if type(action.get("wake_terminal_emitted", False)) is not bool:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "Paseo Runtime terminal wake state is invalid",
+                )
         raw_intents = value.get("workspace_intents", {})
         if not isinstance(raw_intents, dict):
             raise RuntimeGatewayError(
@@ -1429,38 +2094,30 @@ class _PaseoRuntimeProviderAdapter:
                 not isinstance(action, str)
                 or not isinstance(intent, dict)
                 or frozenset(intent)
-                not in {
-                    frozenset(
-                        {
-                            "repository_path",
-                            "base_commit",
-                            "slug",
-                            "spec_identity_digest",
-                        }
-                    ),
-                    frozenset(
-                        {
-                            "repository_path",
-                            "base_commit",
-                            "slug",
-                            "spec_identity_digest",
-                            "phase",
-                        }
-                    ),
-                }
+                != frozenset(
+                    {
+                        "repository_path",
+                        "base_commit",
+                        "slug",
+                        "spec_identity_digest",
+                        "ownership_nonce",
+                        "layout_version",
+                        "phase",
+                    }
+                )
             ):
                 raise RuntimeGatewayError(
                     "RUNTIME_STORE_INVALID", "Paseo Workspace intent record is invalid"
                 )
             normalized = dict(intent)
-            # A legacy intent was durable immediately before create.  Treat it
-            # as create-pending so a V3 restart can only read back, never
-            # duplicate the provider effect.
-            normalized.setdefault("phase", "create_pending")
             if (
                 any(not isinstance(part, str) or not part for part in normalized.values())
                 or normalized["phase"] not in {"recorded", "create_pending"}
                 or _GIT_COMMIT_RE.fullmatch(normalized["base_commit"]) is None
+                or re.fullmatch(r"[0-9a-f]{32}", normalized["ownership_nonce"])
+                is None
+                or normalized["layout_version"]
+                != _RUNTIME_WORKSPACE_LAYOUT_VERSION
             ):
                 raise RuntimeGatewayError(
                     "RUNTIME_STORE_INVALID", "Paseo Workspace intent record is invalid"
@@ -1513,11 +2170,22 @@ class _PaseoRuntimeProviderAdapter:
             raise RuntimeGatewayError(
                 "RUNTIME_STORE_INVALID", "Paseo Runtime event cursor is invalid"
             )
+        event_scan_cursor = value.get("event_scan_cursor", 0)
+        if (
+            not isinstance(event_scan_cursor, int)
+            or isinstance(event_scan_cursor, bool)
+            or event_scan_cursor < 0
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID",
+                "Paseo Runtime event scan cursor is invalid",
+            )
         return (
             dict(actions),
             events[-_MAXIMUM_RUNTIME_EVENTS:],
             normalized_intents,
             next_event_cursor,
+            event_scan_cursor,
         )
 
     def _save(self) -> None:
@@ -1526,6 +2194,7 @@ class _PaseoRuntimeProviderAdapter:
             "events": self._events,
             "workspace_intents": self._workspace_intents,
             "next_event_cursor": self._next_event_cursor,
+            "event_scan_cursor": self._event_scan_cursor,
         }
         self._journal.replace_unlocked(
             {
@@ -1534,6 +2203,7 @@ class _PaseoRuntimeProviderAdapter:
                 "events": [asdict(event) for event in state["events"]],
                 "workspace_intents": state["workspace_intents"],
                 "next_event_cursor": state["next_event_cursor"],
+                "event_scan_cursor": state["event_scan_cursor"],
             }
         )
 
@@ -1543,11 +2213,13 @@ class _PaseoRuntimeProviderAdapter:
         events: list[_RuntimeEvent],
         workspace_intents: dict[str, dict[str, str]],
         next_event_cursor: int,
+        event_scan_cursor: int,
     ) -> None:
         self._actions = actions
         self._events = events
         self._workspace_intents = workspace_intents
         self._next_event_cursor = next_event_cursor
+        self._event_scan_cursor = event_scan_cursor
 
     def _refresh(self) -> None:
         with self._journal.exclusive():
@@ -1561,6 +2233,7 @@ class _PaseoRuntimeProviderAdapter:
                 "events": loaded[1],
                 "workspace_intents": loaded[2],
                 "next_event_cursor": loaded[3],
+                "event_scan_cursor": loaded[4],
             }
             candidate = deepcopy(durable)
             try:
@@ -1580,6 +2253,7 @@ class _PaseoRuntimeProviderAdapter:
                 candidate["events"],
                 candidate["workspace_intents"],
                 candidate["next_event_cursor"],
+                candidate["event_scan_cursor"],
             )
             return result
 
@@ -1633,13 +2307,13 @@ class _PaseoRuntimeProviderAdapter:
 
         def commit(state: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
             current = state["actions"].get(stable_action_id)
+            if isinstance(current, dict) and already_claimed(current):
+                return False, deepcopy(current)
             if current == expected:
                 updated = deepcopy(current)
                 update(updated)
                 state["actions"][stable_action_id] = updated
                 return True, deepcopy(updated)
-            if isinstance(current, dict) and already_claimed(current):
-                return False, deepcopy(current)
             raise RuntimeGatewayError(
                 "RUNTIME_ACTION_STATE_CHANGED",
                 "Paseo provider-effect claim lost its durable CAS",
@@ -1662,17 +2336,37 @@ class _PaseoRuntimeProviderAdapter:
         if agent.archived is True:
             return "retired"
         value = agent.lifecycle.casefold()
+        if output_exists:
+            if (
+                any(
+                    record.get(key) is True
+                    for key in ("pending_park", "pending_resume", "parked")
+                )
+                or record.get("pending_stop_command") is not None
+            ):
+                self._persist_record_update(
+                    record,
+                    lambda updated: updated.update(
+                        {
+                            "pending_park": False,
+                            "pending_resume": False,
+                            "parked": False,
+                            "pending_stop_command": None,
+                        }
+                    ),
+                )
+            return "completed"
         if value in {"running", "busy"}:
             if record.get("pending_resume") is True or record.get("parked") is True:
                 self._persist_record_update(
                     record,
-                        lambda updated: updated.update(
-                            {
-                                "pending_resume": False,
-                                "parked": False,
-                                "pending_stop_command": None,
-                            }
-                        ),
+                    lambda updated: updated.update(
+                        {
+                            "pending_resume": False,
+                            "parked": False,
+                            "pending_stop_command": None,
+                        }
+                    ),
                 )
             return "running"
         if value == "idle" and record.get("pending_resume") is True:
@@ -1696,23 +2390,6 @@ class _PaseoRuntimeProviderAdapter:
                 )
             return "parked"
         if value in {"idle", "closed", "completed", "complete", "finished"}:
-            if output_exists:
-                if any(
-                    record.get(key) is True
-                    for key in ("pending_park", "pending_resume", "parked")
-                ):
-                    self._persist_record_update(
-                        record,
-                        lambda updated: updated.update(
-                            {
-                                "pending_park": False,
-                                "pending_resume": False,
-                                "parked": False,
-                                "pending_stop_command": None,
-                            }
-                        ),
-                    )
-                return "completed"
             if value == "idle" and (
                 permission_pending or permission_response_pending
             ):
@@ -1881,16 +2558,15 @@ class _PaseoRuntimeProviderAdapter:
             registered[1],
             expected_base_commit=(workspace_base_commit if require_pinned_base else None),
         )
+        files = self._workspace_files_from_record(record, subject)
+        files.assert_record_paths(record)
         fenced = record.get("fenced", False)
         if type(fenced) is not bool:
             raise ValueError("prepared fence state is invalid")
         prompt_digest = _require_digest(
             record.get("prompt_artifact_digest"), "prepared prompt artifact digest"
         )
-        prompt_file = record.get("prompt_file")
-        if not isinstance(prompt_file, str) or not prompt_file:
-            raise ValueError("prepared prompt file is invalid")
-        self._artifacts.read_file(Path(prompt_file), prompt_digest)
+        files.read_artifact(prompt_digest)
         input_digests = record.get("input_artifact_digests")
         input_files = record.get("input_files")
         if (
@@ -1900,17 +2576,12 @@ class _PaseoRuntimeProviderAdapter:
         ):
             raise ValueError("prepared input Artifact record is invalid")
         for digest in input_digests:
-            path = input_files.get(digest)
-            if not isinstance(path, str) or not path:
-                raise ValueError("prepared input Artifact file is invalid")
-            self._artifacts.read_file(Path(path), _require_digest(digest, "input artifact digest"))
+            files.read_artifact(_require_digest(digest, "input artifact digest"))
         schema_file = record.get("output_schema_file")
         schema_digest = record.get("output_schema_digest")
         if not isinstance(schema_file, str) or not schema_file:
             raise ValueError("prepared output schema file is invalid")
-        self._artifacts.read_file(
-            Path(schema_file), _require_digest(schema_digest, "output schema digest")
-        )
+        files.read_schema(_require_digest(schema_digest, "output schema digest"))
         return subject, profile, prompt_digest
 
     def _prepared(self, record: Mapping[str, Any]) -> _PreparedRuntimeObservation:
@@ -1942,14 +2613,13 @@ class _PaseoRuntimeProviderAdapter:
         if isinstance(output_digest, str):
             output = self._artifacts.read_json(output_digest)
         else:
-            try:
-                output_ref, output = self._artifacts.put_json_file(
-                    Path(record["result_file"])
-                )
-            except RuntimeGatewayError as error:
-                if error.code == "RUNTIME_ARTIFACT_MISSING":
-                    return None
-                raise
+            files = self._workspace_files_from_record(record, subject)
+            files.assert_record_paths(record)
+            payload = files.read_result()
+            if payload is None:
+                return None
+            output = ArtifactStore._canonical_json(payload)
+            output_ref = self._artifacts.put(payload)
             output_digest = output_ref.digest
         if (
             not isinstance(output, dict)
@@ -2111,14 +2781,39 @@ class _PaseoRuntimeProviderAdapter:
             record, subject, agent.agent_id
         )
         pending_response = record.get("pending_permission_response")
+        pending_request: _PermissionRequest | None = None
+        if isinstance(pending_response, dict) and "request" in pending_response:
+            try:
+                pending_request = _permission_request_from_value(
+                    pending_response["request"]
+                )
+            except RuntimeGatewayError as error:
+                raise ValueError(
+                    "Paseo pending permission response is invalid"
+                ) from error
         if pending_response is not None and (
             not isinstance(pending_response, dict)
             or set(pending_response)
-            != {"request_id", "decision", "request_digest", "provider_receipt"}
+            != {
+                "request_id",
+                "decision",
+                "request",
+                "request_digest",
+                "provider_receipt",
+            }
             or not isinstance(pending_response["request_id"], str)
             or pending_response["decision"] not in {"allow", "deny"}
+            or type(pending_request) is not _PermissionRequest
+            or pending_request.request_id != pending_response["request_id"]
+            or pending_request.stable_action_id != subject.stable_action_id
+            or pending_request.subject_digest != subject.digest
+            or pending_request.binding_ref != binding_ref
+            or pending_request.authority_subtree_digest
+            != subject.authority_digest
             or not isinstance(pending_response["request_digest"], str)
             or _DIGEST_RE.fullmatch(pending_response["request_digest"]) is None
+            or pending_response["request_digest"]
+            != digest_value(asdict(pending_request))
             or (
                 pending_response["provider_receipt"] is not None
                 and (
@@ -2183,6 +2878,7 @@ class _PaseoRuntimeProviderAdapter:
             completion_record = {
                 "request_id": pending_response["request_id"],
                 "decision": pending_response["decision"],
+                "request": pending_response["request"],
                 "request_digest": pending_response["request_digest"],
                 "provider_receipt": receipt,
                 "provider_receipt_digest": digest_value(receipt),
@@ -2443,6 +3139,7 @@ class _PaseoRuntimeProviderAdapter:
         if not isinstance(value, dict) or set(value) != {
             "request_id",
             "decision",
+            "request",
             "request_digest",
             "provider_receipt",
             "provider_receipt_digest",
@@ -2452,6 +3149,12 @@ class _PaseoRuntimeProviderAdapter:
         }:
             raise ValueError("Paseo completed permission response is invalid")
         receipt = value["provider_receipt"]
+        try:
+            request = _permission_request_from_value(value["request"])
+        except RuntimeGatewayError as error:
+            raise ValueError(
+                "Paseo completed permission response is invalid"
+            ) from error
         if (
             not isinstance(receipt, dict)
             or set(receipt) != {"requestId", "agentId", "agentShortId", "name", "result"}
@@ -2470,6 +3173,7 @@ class _PaseoRuntimeProviderAdapter:
             )
             or value["decision"] not in {"allow", "deny"}
             or _DIGEST_RE.fullmatch(value["request_digest"]) is None
+            or value["request_digest"] != digest_value(asdict(request))
             or _DIGEST_RE.fullmatch(value["provider_receipt_digest"]) is None
             or value["provider_receipt_digest"] != digest_value(receipt)
             or receipt["requestId"] != value["request_id"][:8]
@@ -2480,6 +3184,11 @@ class _PaseoRuntimeProviderAdapter:
             or value["stable_action_id"] != subject.stable_action_id
             or value["subject_digest"] != subject.digest
             or value["binding_ref"] != f"paseo:{agent_id}"
+            or request.request_id != value["request_id"]
+            or request.stable_action_id != subject.stable_action_id
+            or request.subject_digest != subject.digest
+            or request.binding_ref != value["binding_ref"]
+            or request.authority_subtree_digest != subject.authority_digest
         ):
             raise RuntimeGatewayError(
                 "RUNTIME_IDENTITY_AMBIGUOUS",
@@ -2488,7 +3197,9 @@ class _PaseoRuntimeProviderAdapter:
         return _CompletedPermissionResponse(
             request_id=value["request_id"],
             decision=value["decision"],
+            request=request,
             request_digest=value["request_digest"],
+            provider_receipt=deepcopy(receipt),
             provider_receipt_digest=value["provider_receipt_digest"],
             stable_action_id=value["stable_action_id"],
             subject_digest=value["subject_digest"],
@@ -2583,24 +3294,6 @@ class _PaseoRuntimeProviderAdapter:
         )
         return workspace
 
-    def _stage_artifact(self, workspace_path: Path, artifact: ArtifactRef) -> Path:
-        payload = self._artifacts.read_bytes(artifact.digest)
-        target = workspace_path / ".gwo" / "runtime-artifacts" / f"{artifact.digest}.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(f"{target.name}.{uuid4().hex}.tmp")
-        temporary.write_bytes(payload)
-        os.replace(temporary, target)
-        with target.open("rb") as handle:
-            staged = handle.read(self._artifacts.maximum_bytes + 1)
-        if (
-            len(staged) > self._artifacts.maximum_bytes
-            or hashlib.sha256(staged).hexdigest() != artifact.digest
-        ):
-            raise RuntimeGatewayError(
-                "RUNTIME_ARTIFACT_DIGEST_MISMATCH", "staged Runtime Artifact is invalid"
-            )
-        return target
-
     @staticmethod
     def _spec_identity_digest(spec: _RuntimeActionSpec) -> str:
         return digest_value(
@@ -2613,6 +3306,125 @@ class _PaseoRuntimeProviderAdapter:
                 ],
             }
         )
+
+    @staticmethod
+    def _record_spec_identity_digest(record: Mapping[str, Any]) -> str:
+        input_digests = record.get("input_artifact_digests")
+        if (
+            not isinstance(input_digests, list)
+            or not all(isinstance(digest, str) for digest in input_digests)
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_WORKSPACE_UNSAFE",
+                "Runtime Workspace input identity is invalid",
+            )
+        return digest_value(
+            {
+                "subject_digest": record.get("subject_digest"),
+                "profile_digest": record.get("profile_digest"),
+                "prompt_artifact_digest": record.get("prompt_artifact_digest"),
+                "input_artifact_digests": input_digests,
+            }
+        )
+
+    def _workspace_files(
+        self,
+        *,
+        workspace_path: str,
+        workspace_id: str,
+        workspace_slug: str,
+        workspace_base_commit: str,
+        ownership_nonce: str,
+        subject: RuntimeSubject,
+        spec_identity_digest: str,
+    ) -> _RuntimeWorkspaceFiles:
+        return _RuntimeWorkspaceFiles(
+            workspace_path=workspace_path,
+            workspace_id=workspace_id,
+            workspace_slug=workspace_slug,
+            workspace_base_commit=workspace_base_commit,
+            ownership_nonce=ownership_nonce,
+            repository=subject.repository,
+            stable_action_id=subject.stable_action_id,
+            subject_digest=subject.digest,
+            spec_identity_digest=spec_identity_digest,
+            maximum_bytes=self._artifacts.maximum_bytes,
+        )
+
+    def _workspace_files_from_record(
+        self,
+        record: Mapping[str, Any],
+        subject: RuntimeSubject | None = None,
+    ) -> _RuntimeWorkspaceFiles:
+        if subject is None:
+            subject, _profile = self._record_subject(record)
+        required = {
+            key: record.get(key)
+            for key in (
+                "workspace_path",
+                "workspace_id",
+                "workspace_slug",
+                "workspace_base_commit",
+                "workspace_owner_nonce",
+            )
+        }
+        if not all(isinstance(value, str) and value for value in required.values()):
+            raise RuntimeGatewayError(
+                "RUNTIME_WORKSPACE_UNSAFE",
+                "Runtime Workspace ownership record is invalid",
+            )
+        if (
+            record.get("workspace_layout_version")
+            != _RUNTIME_WORKSPACE_LAYOUT_VERSION
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_WORKSPACE_UNSAFE",
+                "Runtime Workspace layout version is invalid",
+            )
+        return self._workspace_files(
+            workspace_path=required["workspace_path"],
+            workspace_id=required["workspace_id"],
+            workspace_slug=required["workspace_slug"],
+            workspace_base_commit=required["workspace_base_commit"],
+            ownership_nonce=required["workspace_owner_nonce"],
+            subject=subject,
+            spec_identity_digest=self._record_spec_identity_digest(record),
+        )
+
+    @staticmethod
+    def _verify_reserved_runtime_tree_absent(
+        context: RuntimeRepositoryContext, base_commit: str
+    ) -> None:
+        """Reserve casefold-equivalent ``.gwo`` before any mutating effect."""
+
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(context.path),
+                    "ls-tree",
+                    "-z",
+                    "--name-only",
+                    base_commit,
+                ],
+                capture_output=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError("repository reserved-tree readback timed out") from error
+        if result.returncode != 0:
+            raise OSError("repository reserved-tree readback failed")
+        top_level_names = (
+            os.fsdecode(name)
+            for name in result.stdout.split(b"\0")
+            if name
+        )
+        if any(name.casefold() == ".gwo" for name in top_level_names):
+            raise RuntimeGatewayError(
+                "RUNTIME_WORKSPACE_UNSAFE",
+                "The pinned repository base owns a casefold-equivalent reserved .gwo tree",
+            )
 
     @staticmethod
     def _action_matches_spec(
@@ -2639,6 +3451,7 @@ class _PaseoRuntimeProviderAdapter:
         self._artifacts.get(str(action["prompt_artifact_digest"]))
         for digest in action["input_artifact_digests"]:
             self._artifacts.get(digest)
+        self._verify_staged_workspace(action, require_pinned_base=True)
         return _PrepareReceipt(spec.stable_action_id, str(action["workspace_id"]))
 
     def _ensure_workspace_intent(
@@ -2650,12 +3463,21 @@ class _PaseoRuntimeProviderAdapter:
         """Freeze complete local workspace identity before any Paseo call."""
 
         stable_action_id = spec.stable_action_id
+        existing = self._workspace_intents.get(stable_action_id)
+        ownership_nonce = (
+            uuid4().hex
+            if existing is None
+            else existing.get("ownership_nonce")
+            if isinstance(existing, dict)
+            else None
+        )
         expected_without_base = {
             "repository_path": str(Path(context.path).resolve()),
             "slug": slug,
             "spec_identity_digest": self._spec_identity_digest(spec),
+            "ownership_nonce": ownership_nonce,
+            "layout_version": _RUNTIME_WORKSPACE_LAYOUT_VERSION,
         }
-        existing = self._workspace_intents.get(stable_action_id)
         if existing is None:
             base_commit = self._git_readback(
                 Path(context.path), "rev-parse", f"{context.base_ref}^{{commit}}"
@@ -2696,6 +3518,11 @@ class _PaseoRuntimeProviderAdapter:
                 )
                 or not isinstance(current.get("base_commit"), str)
                 or _GIT_COMMIT_RE.fullmatch(current["base_commit"]) is None
+                or not isinstance(current.get("ownership_nonce"), str)
+                or re.fullmatch(r"[0-9a-f]{32}", current["ownership_nonce"])
+                is None
+                or current.get("layout_version")
+                != _RUNTIME_WORKSPACE_LAYOUT_VERSION
                 or current.get("phase") not in {"recorded", "create_pending"}
             ):
                 raise RuntimeGatewayError(
@@ -2725,11 +3552,20 @@ class _PaseoRuntimeProviderAdapter:
             "base_commit": base_commit,
             "slug": slug,
             "spec_identity_digest": self._spec_identity_digest(spec),
+            "ownership_nonce": existing_intent.get("ownership_nonce"),
+            "layout_version": existing_intent.get("layout_version"),
             "phase": existing_intent.get("phase"),
         }
         if (
             existing_intent != expected_intent
             or not isinstance(base_commit, str)
+            or not isinstance(existing_intent.get("ownership_nonce"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{32}", existing_intent["ownership_nonce"]
+            )
+            is None
+            or existing_intent.get("layout_version")
+            != _RUNTIME_WORKSPACE_LAYOUT_VERSION
             or existing_intent.get("phase") not in {"recorded", "create_pending"}
         ):
             raise RuntimeGatewayError(
@@ -2738,6 +3574,7 @@ class _PaseoRuntimeProviderAdapter:
             )
         if _GIT_COMMIT_RE.fullmatch(base_commit) is None:
             raise ValueError("Paseo Workspace intent base commit is invalid")
+        self._verify_reserved_runtime_tree_absent(context, base_commit)
         recovered = self._workspace_by_identity(slug=slug)
         if recovered is not None:
             self._verify_workspace_repository(
@@ -2775,31 +3612,31 @@ class _PaseoRuntimeProviderAdapter:
                 "Paseo Workspace create claim lost its exact intent CAS",
             )
 
-        if not self._transact(claim_create):
-            raise RuntimeGatewayError(
-                "RUNTIME_MATERIALIZATION_PENDING",
-                "Paseo Workspace creation awaits exact action-owned Workspace readback",
-            )
         create_args = [
             "workspace", "create", "--isolation", "worktree", "--path", str(context.path),
             "--mode", "branch-off", "--worktree-slug", slug,
             "--base", base_commit, "--title", slug, "--json",
         ]
+        _PaseoCliTransport.validate_arguments(create_args)
+        if not self._transact(claim_create):
+            raise RuntimeGatewayError(
+                "RUNTIME_MATERIALIZATION_PENDING",
+                "Paseo Workspace creation awaits exact action-owned Workspace readback",
+            )
         try:
             workspace = self._call(create_args)
         except Exception as create_error:
             # Every acknowledgement loss keeps the pre-existing exact
             # readback-first recovery path: a registry-proved Workspace is
-            # safe to adopt.  Only a typed permanent reject combined with a
-            # precise negative readback proves a retry is safe enough to drop
-            # the create intent.
+            # safe to adopt.  Otherwise only process-creation failure proves
+            # the provider call was not dispatched and permits intent removal.
             recovered = self._workspace_by_identity(slug=slug)
             if recovered is not None:
                 self._verify_workspace_repository(
                     context, recovered[1], expected_base_commit=base_commit
                 )
                 return (*recovered, base_commit)
-            if not self._is_definitive_command_rejection(create_error):
+            if not self._was_not_dispatched(create_error):
                 raise
             claimed_intent = deepcopy(self._workspace_intents.get(stable_action_id))
 
@@ -2830,24 +3667,8 @@ class _PaseoRuntimeProviderAdapter:
         return (*registered, base_commit)
 
     @staticmethod
-    def _action_file_paths(
-        workspace_path: Path, subject: RuntimeSubject
-    ) -> tuple[Path, Path]:
-        action_digest = digest_value(
-            {
-                "repository": subject.repository,
-                "stable_action_id": subject.stable_action_id,
-            }
-        )
-        return (
-            workspace_path / ".gwo" / "runtime-results" / f"{action_digest}.json",
-            workspace_path / ".gwo" / "runtime-schemas" / f"{action_digest}.json",
-        )
-
-    @staticmethod
-    def _write_output_schema(schema_target: Path, spec: _RuntimeActionSpec) -> str:
-        schema_target.parent.mkdir(parents=True, exist_ok=True)
-        payload = canonical_bytes(
+    def _output_schema_payload(spec: _RuntimeActionSpec) -> bytes:
+        return canonical_bytes(
             {
                     "type": "object",
                     "required": [
@@ -2866,8 +3687,6 @@ class _PaseoRuntimeProviderAdapter:
                     },
             }
         )
-        schema_target.write_bytes(payload)
-        return hashlib.sha256(payload).hexdigest()
 
     def prepare(self, spec: _RuntimeActionSpec) -> _PrepareReceipt | _RuntimeFailure:
         try:
@@ -2906,27 +3725,51 @@ class _PaseoRuntimeProviderAdapter:
             workspace_id, workspace_path, workspace_base_commit = self._workspace_for_prepare(
                 spec, context, slug
             )
+            ownership_nonce = intent.get("ownership_nonce")
+            if not isinstance(ownership_nonce, str):
+                raise RuntimeGatewayError(
+                    "RUNTIME_WORKSPACE_UNSAFE",
+                    "Runtime Workspace ownership nonce is absent",
+                )
+            files = self._workspace_files(
+                workspace_path=workspace_path,
+                workspace_id=workspace_id,
+                workspace_slug=slug,
+                workspace_base_commit=workspace_base_commit,
+                ownership_nonce=ownership_nonce,
+                subject=spec.subject,
+                spec_identity_digest=self._spec_identity_digest(spec),
+            )
+            files.establish()
             prompt = self._artifacts.get(spec.prompt_artifact.digest)
             staged = {
-                artifact.digest: self._stage_artifact(Path(workspace_path), artifact)
+                artifact.digest: files.write_artifact(
+                    artifact.digest,
+                    self._artifacts.read_bytes(artifact.digest),
+                )
                 for artifact in (prompt, *spec.input_artifacts)
             }
             target = staged[prompt.digest]
-            result_target, schema_target = self._action_file_paths(
-                Path(workspace_path), spec.subject
+            schema_digest = files.write_schema(
+                self._output_schema_payload(spec)
             )
-            schema_digest = self._write_output_schema(schema_target, spec)
             action_record = {
                 "subject": spec.subject.canonical(), "subject_digest": spec.subject_digest,
                 "profile": asdict(spec.profile), "profile_digest": spec.profile.digest,
                 "prompt_artifact_digest": prompt.digest, "workspace_id": workspace_id,
-                "workspace_path": workspace_path, "workspace_slug": slug,
+                "workspace_path": str(files.workspace), "workspace_slug": slug,
                 "workspace_base_commit": workspace_base_commit,
+                "workspace_owner_nonce": ownership_nonce,
+                "workspace_layout_version": _RUNTIME_WORKSPACE_LAYOUT_VERSION,
+                "workspace_owner_marker_digest": files.marker_digest,
                 "prompt_file": str(target), "fenced": False,
                 "input_artifact_digests": [item.digest for item in spec.input_artifacts],
-                "input_files": {digest: str(path) for digest, path in staged.items()},
-                "result_file": str(result_target),
-                "output_schema_file": str(schema_target),
+                "input_files": {
+                    item.digest: str(staged[item.digest])
+                    for item in spec.input_artifacts
+                },
+                "result_file": str(files.result_path),
+                "output_schema_file": str(files.schema_path),
                 "output_schema_digest": schema_digest,
             }
             # Persist the complete action record and removal of the create
@@ -3008,8 +3851,17 @@ class _PaseoRuntimeProviderAdapter:
         except Exception as error:
             return self._failure(error)
 
-    def _start_agent(self, stable_action_id: str, record: Mapping[str, Any]) -> None:
+    def _start_agent_arguments(
+        self, stable_action_id: str, record: Mapping[str, Any]
+    ) -> list[str]:
         subject, profile = self._record_subject(record)
+        files = self._workspace_files_from_record(record, subject)
+        files.assert_record_paths(record)
+        files.read_artifact(str(record["prompt_artifact_digest"]))
+        for digest in record["input_artifact_digests"]:
+            files.read_artifact(str(digest))
+        files.read_schema(str(record["output_schema_digest"]))
+        files.verify_result_target()
         labels = self._labels(
             _RuntimeActionSpec(
                 stable_action_id,
@@ -3026,61 +3878,40 @@ class _PaseoRuntimeProviderAdapter:
             "Every governed input Artifact is at "
             ".gwo/runtime-artifacts/SHA-256.json; verify each referenced digest. "
             "Write the canonical GWO result JSON atomically to "
-            f"{Path(record['result_file']).relative_to(record['workspace_path']).as_posix()}."
+            f"{files.result_path.relative_to(files.workspace).as_posix()}."
         )
         args = [
             "run", "--background", "--title", f"GWO {stable_action_id}",
             "--provider", "kimi" if profile.provider == "kimi-cli" else profile.provider,
             "--model", profile.model, "--thinking", profile.thinking, "--mode", profile.mode,
             "--workspace", record["workspace_id"], "--cwd", record["workspace_path"],
-            "--output-schema", record["output_schema_file"],
+            "--output-schema", str(files.schema_path),
         ]
         for key, value in sorted(labels.items()):
             args.extend(["--label", f"{key}={value}"])
-        self._call([*args, "--json", bootstrap])
+        return [*args, "--json", bootstrap]
 
-    @staticmethod
-    def _write_resume_file(record: Mapping[str, Any]) -> Path:
+    def _write_resume_file(self, record: Mapping[str, Any]) -> Path:
         """Atomically stage and re-read the replayable Paseo resume prompt."""
 
-        resume_file = (
-            Path(str(record["workspace_path"]))
-            / ".gwo"
-            / "runtime-artifacts"
-            / "resume.txt"
-        )
+        subject, _profile = self._record_subject(record)
+        files = self._workspace_files_from_record(record, subject)
+        files.assert_record_paths(record)
         payload = b"Resume the accepted GWO action from the verified Prompt Artifact."
-        resume_file.parent.mkdir(parents=True, exist_ok=True)
-        temporary = resume_file.with_name(f"{resume_file.name}.{uuid4().hex}.tmp")
-        try:
-            temporary.write_bytes(payload)
-            os.replace(temporary, resume_file)
-            if resume_file.read_bytes() != payload:
-                raise OSError("Paseo resume prompt verification failed")
-        finally:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
-        return resume_file
+        return files.write_resume(payload)
 
     @staticmethod
-    def _is_definitive_command_rejection(error: Exception) -> bool:
-        """Only typed non-ambiguous rejects prove the provider did not act."""
+    def _was_not_dispatched(error: Exception) -> bool:
+        """Only process-creation failure proves a claimed effect never began."""
 
-        return isinstance(error, RuntimeGatewayError) and error.code not in {
-            "RUNTIME_TRANSPORT_UNAVAILABLE",
-            "RUNTIME_COMMAND_ACK_LOST",
-            "RUNTIME_EFFECT_AMBIGUOUS",
-            "RUNTIME_MATERIALIZATION_PENDING",
-        }
+        return isinstance(error, _ProviderNotDispatched)
 
-    def _restore_pending_after_definitive_rejection(
+    def _restore_claim_not_dispatched(
         self,
         record: dict[str, Any],
         previous: Mapping[str, Any],
     ) -> None:
-        """CAS-restore only the exact claim after a typed rejected command."""
+        """CAS-restore one exact claim after proved process-creation failure."""
 
         expected = deepcopy(record)
         restored = deepcopy(dict(previous))
@@ -3171,6 +4002,10 @@ class _PaseoRuntimeProviderAdapter:
                     return _RuntimeFailure(
                         "RUNTIME_COMMAND_INVALID", "start requires an unfenced Prepared Runtime action"
                     )
+                start_args = self._start_agent_arguments(
+                    stable_action_id, record
+                )
+                _PaseoCliTransport.validate_arguments(start_args)
                 pending_before = deepcopy(record)
                 claimed = self._claim_record_update(
                     record,
@@ -3183,7 +4018,7 @@ class _PaseoRuntimeProviderAdapter:
                         "RUNTIME_MATERIALIZATION_PENDING",
                         "Paseo start already has one durable effect owner",
                     )
-                self._start_agent(stable_action_id, record)
+                self._call(start_args)
             elif not isinstance(observation, _BoundRuntimeObservation):
                 return _RuntimeFailure("RUNTIME_COMMAND_INVALID", "only start is allowed before Runtime binding exists")
             elif (
@@ -3196,6 +4031,13 @@ class _PaseoRuntimeProviderAdapter:
             elif command is RuntimeCommand.RETIRE and observation.lifecycle == "retired":
                 return _CommandReceipt(stable_action_id, command)
             elif type(command) is PermissionResponse:
+                if observation.lifecycle in {"completed", "retired"}:
+                    if _completed_permission_effect_matches(command, observation):
+                        return _CommandReceipt(stable_action_id, command)
+                    return _RuntimeFailure(
+                        "RUNTIME_PERMISSION_REQUEST_UNKNOWN",
+                        "terminal Runtime bindings reject new permission responses",
+                    )
                 matching = [
                     request
                     for request in observation.permission_requests
@@ -3212,21 +4054,26 @@ class _PaseoRuntimeProviderAdapter:
                         "permission response does not bind one exact pending request",
                     )
                 permission_pending_before = deepcopy(record)
+                permission_args = [
+                    "permit",
+                    command.decision,
+                    observation.agent_id,
+                    command.request_id,
+                    "--json",
+                ]
+                _PaseoCliTransport.validate_arguments(permission_args)
                 pending_value = {
                     "request_id": command.request_id,
                     "decision": command.decision,
+                    "request": asdict(matching[0]),
                     "request_digest": digest_value(asdict(matching[0])),
                     "provider_receipt": None,
                 }
                 claimed = self._claim_record_update(
                     record,
                     already_claimed=lambda current: (
-                        isinstance(current.get("pending_permission_response"), dict)
-                        and all(
-                            current["pending_permission_response"].get(key)
-                            == value
-                            for key, value in pending_value.items()
-                            if key != "provider_receipt"
+                        isinstance(
+                            current.get("pending_permission_response"), dict
                         )
                     ),
                     update=lambda updated: updated.__setitem__(
@@ -3239,23 +4086,14 @@ class _PaseoRuntimeProviderAdapter:
                         "Paseo permission response already has one durable effect owner",
                     )
                 try:
-                    receipt = self._call(
-                        [
-                            "permit", command.decision, observation.agent_id,
-                            command.request_id, "--json",
-                        ]
-                    )
+                    receipt = self._call(permission_args)
                 except Exception as call_error:
-                    # This is deliberately narrower than the surrounding
-                    # command handler.  A typed non-ambiguous failure *from
-                    # the permit call itself* proves Paseo rejected it before
-                    # effect, so the exact pre-call record may be retried.
-                    # Receipt parsing or identity validation happens below
-                    # after the provider returned successfully and must keep
-                    # the pending ambiguity evidence intact.
-                    if self._is_definitive_command_rejection(call_error):
+                    # Only process-creation failure proves permit was never
+                    # dispatched.  Every provider/native/protocol failure
+                    # after that boundary retains ambiguity evidence.
+                    if self._was_not_dispatched(call_error):
                         try:
-                            self._restore_pending_after_definitive_rejection(
+                            self._restore_claim_not_dispatched(
                                 record, permission_pending_before
                             )
                         except Exception as rollback_error:
@@ -3279,6 +4117,15 @@ class _PaseoRuntimeProviderAdapter:
                 # provider effect.  Do not leave an unsendable durable intent
                 # behind if this write fails.
                 resume_file = self._write_resume_file(record)
+                resume_args = [
+                    "send",
+                    "--no-wait",
+                    "--json",
+                    observation.agent_id,
+                    "--prompt-file",
+                    str(resume_file),
+                ]
+                _PaseoCliTransport.validate_arguments(resume_args)
                 pending_before = deepcopy(record)
                 claimed = self._claim_record_update(
                     record,
@@ -3293,7 +4140,7 @@ class _PaseoRuntimeProviderAdapter:
                         "RUNTIME_MATERIALIZATION_PENDING",
                         "Paseo resume already has one durable effect owner",
                     )
-                self._call(["send", "--no-wait", "--json", observation.agent_id, "--prompt-file", str(resume_file)])
+                self._call(resume_args)
             elif command in {RuntimeCommand.PARK, RuntimeCommand.INTERRUPT}:
                 if observation.lifecycle in {"completed", "retired"}:
                     return _RuntimeFailure(
@@ -3301,13 +4148,13 @@ class _PaseoRuntimeProviderAdapter:
                         "park and interrupt require an active Runtime binding",
                     )
                 stop_command = _transition_name(command)
+                stop_args = ["stop", observation.agent_id, "--json"]
+                _PaseoCliTransport.validate_arguments(stop_args)
                 pending_before = deepcopy(record)
                 claimed = self._claim_record_update(
                     record,
-                    already_claimed=lambda current: (
-                        current.get("pending_park") is True
-                        and current.get("pending_stop_command") == stop_command
-                    ),
+                    already_claimed=lambda current: current.get("pending_park")
+                    is True,
                     update=lambda updated: updated.update(
                         {
                             "pending_park": True,
@@ -3322,13 +4169,23 @@ class _PaseoRuntimeProviderAdapter:
                         "RUNTIME_MATERIALIZATION_PENDING",
                         "Paseo stop already has one durable effect owner",
                     )
-                self._call(["stop", observation.agent_id, "--json"])
+                self._call(stop_args)
             elif command is RuntimeCommand.FENCE:
                 if record.get("pending_fence") is True:
                     return _RuntimeFailure(
                         "RUNTIME_MATERIALIZATION_PENDING",
                         "Paseo fence already has one durable effect owner",
                     )
+                _PaseoCliTransport.validate_arguments(
+                    [
+                        "agent",
+                        "update",
+                        observation.agent_id,
+                        "--label",
+                        "gwo.runtime_fenced=true",
+                        "--json",
+                    ]
+                )
                 pending_before = deepcopy(record)
                 fence_claim_id = uuid4().hex
                 claimed = self._claim_record_update(
@@ -3339,6 +4196,7 @@ class _PaseoRuntimeProviderAdapter:
                             "pending_fence": True,
                             "pending_fence_claim_id": fence_claim_id,
                             "pending_fence_quiesced": False,
+                            "wake_terminal_emitted": False,
                         }
                     ),
                 )
@@ -3352,11 +4210,23 @@ class _PaseoRuntimeProviderAdapter:
                 fence_provider_call_started = True
                 self._client.update_labels(observation.agent_id, {"gwo.runtime_fenced": "true"})
             elif command is RuntimeCommand.RETIRE:
+                retire_args = [
+                    "archive",
+                    observation.agent_id,
+                    "--force",
+                    "--json",
+                ]
+                _PaseoCliTransport.validate_arguments(retire_args)
                 pending_before = deepcopy(record)
                 claimed = self._claim_record_update(
                     record,
                     already_claimed=lambda current: current.get("pending_retire") is True,
-                    update=lambda updated: updated.__setitem__("pending_retire", True),
+                    update=lambda updated: updated.update(
+                        {
+                            "pending_retire": True,
+                            "wake_terminal_emitted": False,
+                        }
+                    ),
                 )
                 if not claimed:
                     pending_before = None
@@ -3364,16 +4234,16 @@ class _PaseoRuntimeProviderAdapter:
                         "RUNTIME_MATERIALIZATION_PENDING",
                         "Paseo retirement already has one durable effect owner",
                     )
-                self._call(["archive", observation.agent_id, "--force", "--json"])
+                self._call(retire_args)
             return _CommandReceipt(stable_action_id, command)
         except Exception as error:
-            definitive_rejection = (
+            not_dispatched = (
                 pending_before is not None
-                and self._is_definitive_command_rejection(error)
+                and self._was_not_dispatched(error)
             )
-            if definitive_rejection:
+            if not_dispatched:
                 try:
-                    self._restore_pending_after_definitive_rejection(record, pending_before)
+                    self._restore_claim_not_dispatched(record, pending_before)
                 except Exception as rollback_error:
                     return self._failure(rollback_error)
             elif fence_provider_call_started and fence_claim_id is not None:
@@ -3391,13 +4261,35 @@ class _PaseoRuntimeProviderAdapter:
             cursor = 0 if after_cursor is None else int(after_cursor)
             if cursor < 0:
                 raise ValueError("event cursor cannot be negative")
-            self._refresh()
-            observed_states: list[tuple[str, str, str]] = []
-            for stable_action_id in sorted(self._actions):
-                observation = self.observe(stable_action_id)
-                if isinstance(observation, _RuntimeFailure):
-                    return observation
-                state = {
+
+            def claim_scan(state: dict[str, Any]) -> str | None:
+                eligible = sorted(
+                    stable_action_id
+                    for stable_action_id, record in state["actions"].items()
+                    if isinstance(record, dict)
+                    and record.get("wake_terminal_emitted") is not True
+                )
+                if not eligible:
+                    return None
+                selected = eligible[state["event_scan_cursor"] % len(eligible)]
+                state["event_scan_cursor"] += _MAXIMUM_RUNTIME_EVENT_READBACKS
+                return selected
+
+            stable_action_id = self._transact(claim_scan)
+            observation: object | None = None
+            if stable_action_id is not None:
+                try:
+                    observation = self.observe(stable_action_id)
+                except Exception:
+                    # Wake hints are deliberately non-authoritative.  A stale
+                    # action misses this hint but cannot block other actions.
+                    observation = None
+            if (
+                stable_action_id is not None
+                and observation is not None
+                and not isinstance(observation, _RuntimeFailure)
+            ):
+                observed_state = {
                     "lifecycle": observation.lifecycle,
                     "fenced": observation.fenced,
                     "permission_requests": (
@@ -3406,31 +4298,29 @@ class _PaseoRuntimeProviderAdapter:
                         else []
                     ),
                 }
-                state_digest = digest_value(state)
-                observed_states.append(
-                    (stable_action_id, state_digest, observation.lifecycle)
-                )
+                state_digest = digest_value(observed_state)
+                lifecycle = observation.lifecycle
 
-            def commit(state: dict[str, Any]) -> None:
-                for stable_action_id, state_digest, lifecycle in observed_states:
+                def commit_observation(state: dict[str, Any]) -> None:
                     record = state["actions"].get(stable_action_id)
                     if not isinstance(record, dict):
-                        continue
-                    if record.get("wake_state_digest") == state_digest:
-                        continue
-                    record["wake_state_digest"] = state_digest
-                    event_cursor = state["next_event_cursor"]
-                    state["next_event_cursor"] = event_cursor + 1
-                    state["events"].append(
-                        _RuntimeEvent(
-                            cursor=str(event_cursor),
-                            stable_action_id=stable_action_id,
-                            kind=f"state:{lifecycle}",
+                        return
+                    if record.get("wake_state_digest") != state_digest:
+                        record["wake_state_digest"] = state_digest
+                        event_cursor = state["next_event_cursor"]
+                        state["next_event_cursor"] = event_cursor + 1
+                        state["events"].append(
+                            _RuntimeEvent(
+                                cursor=str(event_cursor),
+                                stable_action_id=stable_action_id,
+                                kind=f"state:{lifecycle}",
+                            )
                         )
-                    )
-                    del state["events"][:-_MAXIMUM_RUNTIME_EVENTS]
+                        del state["events"][:-_MAXIMUM_RUNTIME_EVENTS]
+                    if lifecycle in {"completed", "retired"}:
+                        record["wake_terminal_emitted"] = True
 
-            self._transact(commit)
+                self._transact(commit_observation)
             available = [
                 event for event in self._events if int(event.cursor) > cursor
             ]
@@ -3594,7 +4484,6 @@ class RuntimeGateway:
     def planning_preflight(
         self,
         subject: CampaignPlanningSubject,
-        overrides: CampaignStartRuntimeOverrides | None = None,
     ) -> PlanningPreflightReceipt:
         if type(subject) is not CampaignPlanningSubject:
             raise RuntimeGatewayError(
@@ -3605,6 +4494,19 @@ class RuntimeGateway:
         # Resolve and statically validate without persisting a Campaign first:
         # a production host/context/profile defect must be a pure preflight
         # failure, never a partial campaign claim.
+        assertion_key = (
+            subject.repository,
+            subject.campaign_key,
+            subject.campaign_handle,
+        )
+        assertion_present = (
+            assertion_key in self._configuration.campaign_assertions
+        )
+        asserted_overrides = (
+            self._configuration.campaign_assertions[assertion_key].canonical()
+            if assertion_present
+            else None
+        )
         existing_campaign = self._data["campaigns"].get(subject.campaign_handle)
         if existing_campaign is not None:
             if (
@@ -3616,13 +4518,20 @@ class RuntimeGateway:
                     "Campaign handle was read back for another repository or Campaign key",
                 )
             candidate_overrides = existing_campaign.get("overrides")
-            if overrides is not None and candidate_overrides != overrides.canonical():
+            if (
+                assertion_present
+                and candidate_overrides != asserted_overrides
+            ):
                 raise RuntimeGatewayError(
                     "RUNTIME_CAMPAIGN_IDENTITY_MISMATCH",
                     "Campaign handle was read back with different Runtime overrides",
                 )
         else:
-            candidate_overrides = (overrides or CampaignStartRuntimeOverrides()).canonical()
+            candidate_overrides = (
+                asserted_overrides
+                if assertion_present
+                else CampaignStartRuntimeOverrides().canonical()
+            )
         assignment = self._resolve_assignment(
             subject.repository,
             RuntimeSelector.coordinator(),
@@ -3672,8 +4581,8 @@ class RuntimeGateway:
                         "Campaign handle was read back for another repository or Campaign key",
                     )
                 if (
-                    overrides is not None
-                    and durable_campaign.get("overrides") != overrides.canonical()
+                    assertion_present
+                    and durable_campaign.get("overrides") != asserted_overrides
                 ):
                     raise RuntimeGatewayError(
                         "RUNTIME_CAMPAIGN_IDENTITY_MISMATCH",
@@ -3892,6 +4801,16 @@ class RuntimeGateway:
             )
         self._validate_bound_observation(subject, record, observation)
         if type(command) is PermissionResponse:
+            if observation.lifecycle in {"completed", "retired"}:
+                if _completed_permission_effect_matches(command, observation):
+                    self._record_observation(record, observation)
+                    return self._progress_receipt(
+                        subject, observation, command=command
+                    )
+                raise RuntimeGatewayError(
+                    "RUNTIME_PERMISSION_REQUEST_UNKNOWN",
+                    "terminal Runtime bindings reject new permission responses",
+                )
             matching = [
                 request
                 for request in observation.permission_requests
@@ -3954,7 +4873,7 @@ class RuntimeGateway:
             )
         assignment = self._resolve_assignment(
             subject.repository,
-            RuntimeSelector.ticket(subject.role),
+            _selector_for_purpose(subject.purpose),
             subject.ticket_key,
             campaign["overrides"],
         )
@@ -4322,17 +5241,7 @@ class RuntimeGateway:
         completed = observation.completed_permission_response
         completed_valid = (
             completed is None
-            or (
-                type(completed) is _CompletedPermissionResponse
-                and _DIGEST_RE.fullmatch(completed.request_digest) is not None
-                and _DIGEST_RE.fullmatch(completed.provider_receipt_digest) is not None
-                and completed.stable_action_id == subject.stable_action_id
-                and completed.subject_digest == subject.digest
-                and completed.binding_ref == observation.binding_ref
-                and completed.decision in {"allow", "deny"}
-                and isinstance(completed.request_id, str)
-                and bool(completed.request_id)
-            )
+            or _completed_permission_evidence_is_bound(observation)
         )
         identifiers_are_exact = all(
             isinstance(value, str) and bool(value)
@@ -4639,6 +5548,27 @@ def _mapping_from_value(value: object) -> ProfileMapping:
     )
 
 
+def _purpose_from_value(value: object) -> WorkRunPurpose:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"kind", "policy_id"}
+    ):
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID",
+            "persisted Work Run purpose is malformed",
+        )
+    try:
+        return WorkRunPurpose(
+            kind=value["kind"],
+            policy_id=value["policy_id"],
+        )
+    except (TypeError, RuntimeGatewayError) as error:
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID",
+            "persisted Work Run purpose is invalid",
+        ) from error
+
+
 def _subject_from_canonical(value: object) -> RuntimeSubject:
     if not isinstance(value, dict):
         raise RuntimeGatewayError(
@@ -4668,7 +5598,7 @@ def _subject_from_canonical(value: object) -> RuntimeSubject:
                 plan_revision_digest=value["plan_revision_digest"],
                 work_run_key=value["work_run_key"],
                 ticket_key=value["ticket_key"],
-                role=value["role"],
+                purpose=_purpose_from_value(value["purpose"]),
                 prompt_artifact_digest=value["prompt_artifact_digest"],
                 authority_subtree_digest=value["authority_subtree_digest"],
                 stable_action_id=value["stable_action_id"],
@@ -4693,6 +5623,7 @@ class _InMemoryAction:
     pending_permissions: list[tuple[str, str, str]] = field(default_factory=list)
     completed_permission_response: _CompletedPermissionResponse | None = None
     wake_state_digest: str | None = None
+    wake_terminal_emitted: bool = False
 
 
 class _InMemoryRuntimeProviderAdapter:
@@ -4710,6 +5641,7 @@ class _InMemoryRuntimeProviderAdapter:
         self._actions: dict[str, _InMemoryAction] = {}
         self._events: list[_RuntimeEvent] = []
         self._next_event_cursor = 1
+        self._event_scan_cursor = 0
         self._lose_prepare_ack_once = lose_prepare_ack_once
         self._lose_command_ack_once = lose_command_ack_once
         self._pending_permissions = {
@@ -4734,6 +5666,8 @@ class _InMemoryRuntimeProviderAdapter:
     def _complete_action(self, action: _InMemoryAction) -> None:
         """Publish output only when the deterministic action actually completes."""
 
+        if action.lifecycle in {"completed", "retired"}:
+            return
         action.output_artifact_digest = self._artifacts.put_canonical(
             {
                 "schema_version": "gwo.runtime.output.v1",
@@ -4908,17 +5842,31 @@ class _InMemoryRuntimeProviderAdapter:
         if command is RuntimeCommand.RETIRE and action.lifecycle == "retired":
             return _CommandReceipt(action.spec.stable_action_id, command)
         if type(command) is PermissionResponse:
+            if action.lifecycle in {"completed", "retired"}:
+                observed = self.observe(stable_action_id)
+                if isinstance(observed, _RuntimeFailure):
+                    return observed
+                if (
+                    isinstance(observed, _BoundRuntimeObservation)
+                    and _completed_permission_effect_matches(command, observed)
+                ):
+                    return _CommandReceipt(action.spec.stable_action_id, command)
+                return _RuntimeFailure(
+                    "RUNTIME_PERMISSION_REQUEST_UNKNOWN",
+                    "terminal Runtime bindings reject new permission responses",
+                )
             matching = [
                 request
                 for request in action.pending_permissions
                 if request[0] == command.request_id
             ]
             if len(matching) != 1:
-                completed = action.completed_permission_response
+                observed = self.observe(stable_action_id)
+                if isinstance(observed, _RuntimeFailure):
+                    return observed
                 if (
-                    type(completed) is _CompletedPermissionResponse
-                    and completed.request_id == command.request_id
-                    and completed.decision == command.decision
+                    isinstance(observed, _BoundRuntimeObservation)
+                    and _completed_permission_effect_matches(command, observed)
                 ):
                     return _CommandReceipt(action.spec.stable_action_id, command)
                 return _RuntimeFailure(
@@ -4927,30 +5875,28 @@ class _InMemoryRuntimeProviderAdapter:
                 )
             request_id, operation_id, resource_id = matching[0]
             action.pending_permissions.remove(matching[0])
+            completed_request = _PermissionRequest(
+                request_id=request_id,
+                operation_id=operation_id,
+                resource_id=resource_id,
+                binding_ref=action.binding_ref,
+                authority_subtree_digest=action.spec.subject.authority_digest,
+                stable_action_id=stable_action_id,
+                subject_digest=action.spec.subject.digest,
+            )
+            provider_receipt = {
+                "adapter": "in-memory.v1",
+                "request_id": request_id,
+                "decision": command.decision,
+                "binding_ref": action.binding_ref,
+            }
             action.completed_permission_response = _CompletedPermissionResponse(
                 request_id=request_id,
                 decision=command.decision,
-                request_digest=digest_value(
-                    asdict(
-                        _PermissionRequest(
-                            request_id=request_id,
-                            operation_id=operation_id,
-                            resource_id=resource_id,
-                            binding_ref=action.binding_ref,
-                            authority_subtree_digest=action.spec.subject.authority_digest,
-                            stable_action_id=stable_action_id,
-                            subject_digest=action.spec.subject.digest,
-                        )
-                    )
-                ),
-                provider_receipt_digest=digest_value(
-                    {
-                        "adapter": "in-memory.v1",
-                        "request_id": request_id,
-                        "decision": command.decision,
-                        "binding_ref": action.binding_ref,
-                    }
-                ),
+                request=completed_request,
+                request_digest=digest_value(asdict(completed_request)),
+                provider_receipt=provider_receipt,
+                provider_receipt_digest=digest_value(provider_receipt),
                 stable_action_id=stable_action_id,
                 subject_digest=action.spec.subject.digest,
                 binding_ref=action.binding_ref,
@@ -4999,8 +5945,10 @@ class _InMemoryRuntimeProviderAdapter:
             action.lifecycle = "parked"
         elif command is RuntimeCommand.FENCE:
             action.fenced = True
+            action.wake_terminal_emitted = False
         elif command is RuntimeCommand.RETIRE:
             action.lifecycle = "retired"
+            action.wake_terminal_emitted = False
         if self._lose_command_ack_once is command:
             self._lose_command_ack_once = None
             return _RuntimeFailure(
@@ -5016,32 +5964,48 @@ class _InMemoryRuntimeProviderAdapter:
                 raise ValueError("event cursor cannot be negative")
         except (TypeError, ValueError):
             return _RuntimeFailure("RUNTIME_EVENT_CURSOR_INVALID", "event cursor is invalid")
-        for stable_action_id, action in sorted(self._actions.items()):
-            observation = self.observe(stable_action_id)
-            if isinstance(observation, _RuntimeFailure):
-                return observation
-            state = {
-                "lifecycle": observation.lifecycle,
-                "fenced": observation.fenced,
-                "permission_requests": (
-                    [asdict(request) for request in observation.permission_requests]
-                    if isinstance(observation, _BoundRuntimeObservation)
-                    else []
-                ),
-            }
-            state_digest = digest_value(state)
-            if action.wake_state_digest == state_digest:
-                continue
-            action.wake_state_digest = state_digest
-            self._events.append(
-                _RuntimeEvent(
-                    str(self._next_event_cursor),
-                    stable_action_id,
-                    f"state:{observation.lifecycle}",
-                )
-            )
-            self._next_event_cursor += 1
-            del self._events[:-_MAXIMUM_RUNTIME_EVENTS]
+        eligible = sorted(
+            stable_action_id
+            for stable_action_id, action in self._actions.items()
+            if action.wake_terminal_emitted is not True
+        )
+        if eligible:
+            stable_action_id = eligible[self._event_scan_cursor % len(eligible)]
+            self._event_scan_cursor += _MAXIMUM_RUNTIME_EVENT_READBACKS
+            action = self._actions[stable_action_id]
+            try:
+                observation = self.observe(stable_action_id)
+            except Exception:
+                observation = None
+            if observation is not None and not isinstance(
+                observation, _RuntimeFailure
+            ):
+                state = {
+                    "lifecycle": observation.lifecycle,
+                    "fenced": observation.fenced,
+                    "permission_requests": (
+                        [
+                            asdict(request)
+                            for request in observation.permission_requests
+                        ]
+                        if isinstance(observation, _BoundRuntimeObservation)
+                        else []
+                    ),
+                }
+                state_digest = digest_value(state)
+                if action.wake_state_digest != state_digest:
+                    action.wake_state_digest = state_digest
+                    self._events.append(
+                        _RuntimeEvent(
+                            str(self._next_event_cursor),
+                            stable_action_id,
+                            f"state:{observation.lifecycle}",
+                        )
+                    )
+                    self._next_event_cursor += 1
+                    del self._events[:-_MAXIMUM_RUNTIME_EVENTS]
+                if observation.lifecycle in {"completed", "retired"}:
+                    action.wake_terminal_emitted = True
         available = [event for event in self._events if int(event.cursor) > cursor]
         events = tuple(available[:_MAXIMUM_RUNTIME_EVENT_PAGE])
         latest_cursor = self._next_event_cursor - 1

@@ -24,6 +24,13 @@ configuration preflight over the exact planning subject and returns a bound
 opaque receipt. Preflight creates no Agent, session, workspace, provider
 action, claim, or capacity reservation.
 
+The Work Run subject carries a closed semantic purpose, not a selector string:
+implementation, terminal-recovery implementation, Formal Review, invalid
+Review payload retry, or specialist review with one policy ID. The
+purpose-to-selector mapping remains private to RuntimeGateway. The immutable
+provider-neutral `RuntimeProfile` value is defined in a neutral module rather
+than imported from predecessor runtime implementation code.
+
 The caller surface is deliberately small: planning preflight, typed subject
 progress (which accepts a wake cursor), and a typed closed-union transition
 request by stable action. Subject progress owns all prepare/observe and
@@ -33,6 +40,12 @@ progress call; no caller can use an event as state or obtain a raw provider
 operation. PlanControl consumes only opaque preflight and Artifact-backed
 planning receipts, never assignment, adapter, CLI, Profile, session, Runtime
 Binding, Agent, or workspace facts.
+
+The exact public operations are `planning_preflight(subject)`,
+`progress(subject, preflight=None, wake_cursor=None)`, and
+`transition(stable_action_id, transition)`. Campaign-start configuration
+assertions enter through host-composed `RuntimeConfiguration`, keyed by exact
+Campaign identity, rather than by widening the semantic preflight signature.
 
 Only the host configuration assembler reads immutable Runtime Profile
 provider/model facts and supplies the composed `RuntimeConfiguration`; that
@@ -86,6 +99,13 @@ Absence without that receipt is ambiguous and cannot recover an acknowledged
 permission decision. A fenced Bound action cannot resume. Production
 wake cursors persist only readback lifecycle, exact pending-permission, and
 fence changes; they remain advisory and never replace `observe`.
+
+Each wake poll claims and durably advances one fair-scan position before doing
+at most one action readback. A failed readback is an isolated missed hint, not
+an event-stream failure or a reason to retry the same action immediately.
+Terminal state is stored and pageable once; that action is then omitted from
+future scans until a state-changing fence or retire claim atomically re-arms
+it. Proven non-dispatch restores the previous terminal marker.
 
 RuntimeGateway hides:
 
@@ -141,14 +161,56 @@ so the bound session reference is explicitly adapter-derived as
 `paseo-agent:<agent-id>`. Non-empty Profile features fail closed until the CLI
 can both set and read them.
 
-Before the provider may create a Workspace, start an Agent, or resume an Agent,
-the adapter durably records the exact pending effect. A missing label or
+The pinned base commit must not contain a casefold-equivalent `.gwo` top-level
+entry, including `.GWO` or a tracked link. The durable Workspace intent also
+contains an unpredictable
+ownership nonce and layout version before provider creation. Once exact
+Workspace registry and Git identity are proved, the adapter creates or
+crash-recovers a nonce-bound marker and the fixed
+`runtime-artifacts`, `runtime-schemas`, and `runtime-results` directories.
+Recorded paths are evidence only: restart derives each artifact, schema,
+result, and resume path again and requires exact equality. Before every
+governed create, read, or replace it rejects links, Windows reparse points,
+non-directory parents, non-regular or multiply linked leaves, and resolved
+paths outside the verified Workspace. Atomic writes use unique exclusive
+temporary files, flush before replacement, and verify the final bytes.
+Ownership-marker creation uses one deterministic nonce-owned temporary name.
+Restart removes or rebuilds that orphan only after proving containment,
+regular-file type, no reparse point, and a single link.
+This protects the stated non-racing link/reparse threat. It intentionally does
+not claim descriptor-grade protection against a local attacker racing between
+portable path checks and the subsequent open or replacement.
+
+An unrecorded Workspace may require read-only Agent or Workspace registry
+discovery before its local path is known. Those readbacks are not provider
+effects. Once the path is known, unsafe local state fails closed before any
+Workspace create, run, send, permit, stop, label update, or archive effect.
+
+Before the provider may create a Workspace, start an Agent, resume an Agent,
+answer a permission, park, fence, or retire an Agent, the adapter validates all
+local files and complete provider arguments, then durably records the exact
+pending effect. A missing label or
 Workspace after an acknowledgement loss remains `RuntimeMaterializationPending`;
-it cannot authorize a second create, run, or send. Workspace adoption requires
+it cannot authorize a second create, run, send, permit, stop, update, or
+archive. Only provider-process creation failure proves non-dispatch and permits
+an exact CAS restoration of the claim. Timeout, bounded-output overflow,
+malformed protocol, native error, and receipt-verification failure occur after
+the dispatch boundary and retain ambiguity evidence. Workspace adoption requires
 one exact slug/isolation/cwd readback and repository identity proof; duplicate
-slug candidates are ambiguous. A definitive absent fence label clears only the
-pending fence intent, so the failed transition can later retry without guessing
-that it took effect.
+slug candidates are ambiguous. Fence failure likewise retains its unique claim
+and records quiescence without guessing that the label effect did or did not
+occur.
+
+Verified action-bound output is stronger than every non-retired provider
+lifecycle, including idle, running, and busy, or stale park/resume bookkeeping.
+Adopting it atomically clears all mutually exclusive
+park/resume/stop flags and returns `completed`; a still-running provider with
+output is therefore completed. Completed and retired bindings never send a
+new permission response or regress lifecycle. An exact same-request,
+same-decision replay is accepted only when the completed effect evidence is
+already durable, both digests recompute, the stable action, subject, and
+binding match, and the request is absent from outstanding permissions; every
+other terminal permission request fails as unknown.
 
 Issue #111's permission descriptor is internal to RuntimeGateway. It joins
 the provider's exact request identity with canonical, bounded,

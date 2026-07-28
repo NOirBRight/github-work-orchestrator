@@ -27,7 +27,48 @@ fencing.
 `PermissionResponse(request_id, allow|deny)`. `start` is legal only after an
 authoritative Prepared observation; `resume` is legal only after an
 authoritative parked Bound observation.
-Events are wake hints, never authoritative state.
+Events are wake hints, never authoritative state. One `events` call performs
+at most one authoritative action readback. A durable fair-scan cursor advances
+before that readback, so one stale or failing action cannot block the others;
+terminal actions emit at most one stored terminal wake and leave the scan set.
+A state-changing `fence` or `retire` claim atomically re-arms that action, so
+the later fenced-completed or retired state emits its own wake. Proven
+non-dispatch restores the previous terminal marker with the rest of the claim.
+
+The production adapter persists an effect claim only after all local argument
+and file validation succeeds. It may restore that claim only when process
+creation proves the provider call was not dispatched. Timeout, oversized
+output, malformed output, receipt mismatch, and any other post-dispatch failure
+retain the exact pending claim for readback-first recovery and cannot authorize
+a duplicate provider effect.
+
+The production Workspace reserves `.gwo` for Gateway-owned files. The pinned
+base commit must not contain any casefold-equivalent top-level path, including
+`.GWO`. Before Workspace creation, prepare persists a random ownership nonce;
+after exact registry and Git identity readback it creates or recovers a
+nonce-bound ownership marker and only the fixed artifact, schema, result, and
+resume paths. Marker creation uses one deterministic nonce-owned temporary
+name; restart accepts and removes that orphan only after containment,
+regular-file, non-reparse, and single-link validation. Every parent and leaf is
+checked with `lstat`, reparse-point and link rejection, regular-file or
+directory type checks, resolved containment, and exact path recomputation
+before each read or atomic replacement. This is a non-racing filesystem threat
+model: portable Python and current Windows APIs do not provide a
+descriptor-relative, no-follow primitive for every operation, so the adapter
+does not claim protection against an attacker racing those check/use
+sequences. Read-only Agent and Workspace registry discovery may occur before an
+unrecorded Workspace path is known; an unsafe path still fails before any
+provider-mutating effect.
+
+Verified canonical output dominates every non-retired provider lifecycle,
+including idle, running, and busy, and any stale park or resume flags are
+cleared atomically when completion is adopted.
+Completed and retired bindings reject new permission decisions without calling
+the provider. Only an exact replay of a durably completed same-request,
+same-decision effect is idempotent. Its request and provider-receipt digests
+must recompute, its stable action, subject, and binding must match the
+observation, and the exact request must remain absent from outstanding
+permissions.
 
 Every production adapter and the deterministic in-memory adapter passes the
 same contract and failure suite. The in-memory implementation is not a looser

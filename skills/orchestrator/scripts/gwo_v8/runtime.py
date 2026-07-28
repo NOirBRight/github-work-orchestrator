@@ -22,6 +22,7 @@ from ._effects import (
     normalized_relative_path,
 )
 from .evidence import ResultClaim, TypedEvidence
+from .runtime_profile import RuntimeProfile
 
 
 class RuntimeAdapterError(RuntimeError):
@@ -36,29 +37,6 @@ class RuntimeAdapterError(RuntimeError):
         self.code = code
         self.detail = detail
         self.failure_class = failure_class
-
-
-@dataclass(frozen=True)
-class RuntimeProfile:
-    name: str
-    provider: str
-    model: str
-    thinking: str
-    mode: str
-    features: dict[str, Any]
-
-    @property
-    def digest(self) -> str:
-        return digest_value(
-            {
-                "name": self.name,
-                "provider": self.provider,
-                "model": self.model,
-                "thinking": self.thinking,
-                "mode": self.mode,
-                "features": self.features,
-            }
-        )
 
 
 @dataclass(frozen=True)

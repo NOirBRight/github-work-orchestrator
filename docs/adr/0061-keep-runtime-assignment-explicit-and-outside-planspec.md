@@ -42,6 +42,13 @@ Agent, session, workspace, provider action, or capacity reservation. The
 subsequent Artifact-backed planning receipt is opaque to PlanControl, so the
 persisted source/Profile/fallback facts remain RuntimeGateway-private.
 
+The preflight method accepts only that semantic subject. Host composition
+places an optional exact Campaign-start assertion in `RuntimeConfiguration`
+under `(repository, campaign_key, campaign_handle)`. Absence on an existing
+Campaign reuses the durable configuration; a present assertion must match it.
+The assertion types and raw selector/mapping vocabulary remain host-module
+details rather than package exports.
+
 That preflight record is an exact durable compare-and-set binding of the
 Campaign Planning subject, Campaign-start overrides, and resolved Coordinator
 configuration. Reusing its stable action with a changed source snapshot,
@@ -53,6 +60,16 @@ Availability fallback is permitted only before any Agent identity may exist
 for the stable action. After identity, RuntimeGateway recovers the same
 binding. A replacement Worker requires terminal-binding Evidence and uses the
 already resolved `recovery_worker` assignment.
+
+Work Run callers do not supply selector strings. `WorkRunSubject` carries the
+closed semantic `WorkRunPurpose`: implementation, terminal-recovery
+implementation, Formal Review, invalid Review payload retry, or specialist
+review with one policy ID. RuntimeGateway alone maps those purposes
+to `worker`, `recovery_worker`, `review_primary`, `review_strong`, and
+`specialist:<policy-id>`. Raw strings and subclasses fail closed. The immutable
+provider-neutral `RuntimeProfile` value lives in a neutral module shared by
+the successor gateway and predecessor compatibility code, so RuntimeGateway
+does not import the legacy runtime implementation.
 
 A durably selected fallback remains selected even if the primary later
 recovers. Cached availability is advisory; live provider, configuration, and
