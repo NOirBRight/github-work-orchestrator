@@ -56,6 +56,18 @@ Policy Witness, protocol/request Artifact, override, or configuration fails
 closed rather than silently selecting a fresh assignment. No Work Run can use
 the Planning preflight operation.
 
+The preflight receipt digest includes both the resolved assignment digest and
+the digest of the complete Campaign-start override value, including Ticket
+overrides that do not select the Coordinator. Campaign, preflight, override,
+and assignment records have closed schemas. Every journal load recomputes the
+override, assignment, and receipt identities; changed fields, unknown fields,
+duplicate Ticket override keys, or a valid-looking replacement Profile fail as
+`RuntimeStoreInvalid` before Adapter readback.
+The Campaign record separately cross-binds each planning stable action to the
+same subject and complete override digest. Load requires every preflight to
+have exactly one matching Campaign link, preventing an edit to either record
+from silently rebinding the other.
+
 Preflights and Work Run actions do not own separate stable-action namespaces.
 One shared journal reservation binds each stable action to the kind and digest
 of its complete canonical subject in the same transaction that commits the
@@ -79,17 +91,36 @@ provider-neutral `RuntimeProfile` value lives in a neutral module shared by
 the successor gateway and predecessor compatibility code, so RuntimeGateway
 does not import the legacy runtime implementation.
 Its nested feature JSON is defensively copied and recursively immutable while
-retaining predecessor canonical bytes and digest. Host composition likewise
-defensively copies and freezes the complete `RuntimeConfiguration`, including
-nested repository mappings and Campaign assertions. RuntimeGateway rechecks
-the exact Profile type and digest on every lookup before Adapter or provider
-activity.
+retaining predecessor canonical bytes and digest. The immutable feature
+objects and arrays use composition rather than `dict` or `list` subclasses, so
+builtin base-class mutators, subclass construction, and retained aliases
+cannot bypass the snapshot. `dict(profile.features)` remains compatible for
+V2 readers, while Runtime identity uses an explicit plain-JSON canonical
+projection. Host composition reconstructs and freezes every Profile, selector,
+mapping, nested repository mapping, and Campaign assertion rather than
+retaining caller-owned values. RuntimeGateway rechecks those exact values and
+their registry-key digests on every lookup or resolution before Adapter or
+provider activity. The tuple-backed Profile, selector, mapping, and override
+values reject explicit initializer re-entry and object-attribute mutation.
+RuntimeGateway additionally pins and rechecks the digest of the whole composed
+configuration, so replacing even one exposed registry with another
+individually valid mapping fails before Adapter activity.
 
 The Gateway-owned host Artifact Store returns an Artifact reference only after
 it has exclusively staged, flushed, file-synced, atomically replaced,
 directory-synced where supported, and finally reread the exact digest and
 bytes. A failed put returns no reference and cannot produce a durable semantic
 completion receipt that names the failed target.
+
+All Runtime JSON identities share one closed canonical domain: JSON `null`,
+exact strings and booleans, integers, finite floats, arrays, and objects whose
+keys are exact strings. Encoding disables non-finite numbers and Python key
+coercion. Artifact, journal, and provider ingress reject duplicate object
+names, `NaN`/infinities, invalid UTF-8, and byte representations that are not
+canonical, translating failure at the owning boundary rather than leaking a
+raw JSON exception. The same validator rejects active-reference cycles, values
+beyond its fixed nesting depth, and integers beyond its explicit digit bound,
+normalizing recursion and interpreter integer-limit failures.
 
 A durably selected fallback remains selected even if the primary later
 recovers. Cached availability is advisory; live provider, configuration, and

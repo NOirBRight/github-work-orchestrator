@@ -242,7 +242,10 @@ def test_work_run_subject_and_events_cannot_replace_authoritative_readback(tmp_p
     assert artifacts.get(first.output_artifact_digest)
     assert not hasattr(first, "provider")
     assert not hasattr(first, "binding_ref")
-    assert second.wake_hints
+    # The terminal wake is pageable once; an exact returned cursor must not
+    # replay it.  Progress remains authoritative through fresh observation.
+    assert second.wake_hints == ()
+    assert second.output_artifact_digest == first.output_artifact_digest
     assert adapter.observe_calls.count(work.stable_action_id) >= 2
     changed = WorkRunSubject(
         **{**work.__dict__, "plan_revision_digest": artifacts.put_canonical({"revision": 2}).digest}
