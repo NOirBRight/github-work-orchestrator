@@ -8,9 +8,11 @@ or starting it.  Provider adapters are private implementation details.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from copy import deepcopy
 from enum import Enum
+import errno
 import hashlib
 import json
 import os
@@ -18,6 +20,8 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import threading
+import time
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
@@ -39,6 +43,19 @@ _PASEO_BATCH_META = frozenset("&|<>^%!\"()")
 _MAXIMUM_PASEO_COMMAND_CHARS = 7_500
 _MAXIMUM_PASEO_PERMISSION_TEXT = 4_096
 _MAXIMUM_PASEO_ERROR_JSON_BYTES = 4_096
+_MAXIMUM_PASEO_STREAM_BYTES = 1_048_576
+_MAXIMUM_PASEO_TOTAL_BYTES = 1_572_864
+_PASEO_PIPE_CHUNK_BYTES = 65_536
+_PASEO_PIPE_POLL_SECONDS = 0.005
+_PASEO_POST_EXIT_DRAIN_SECONDS = 0.25
+_PASEO_CLEANUP_GRACE_SECONDS = 0.5
+_JOURNAL_LOCK_TIMEOUT_SECONDS = 5.0
+_JOURNAL_LOCK_RETRY_SECONDS = 0.01
+_MAXIMUM_RUNTIME_JOURNAL_BYTES = 16_777_216
+_MAXIMUM_RUNTIME_EVENTS = 64
+_MAXIMUM_RUNTIME_EVENT_PAGE = 16
+_JOURNAL_MUTEX_GUARD = threading.Lock()
+_JOURNAL_MUTEXES: dict[str, threading.Lock] = {}
 
 
 class RuntimeGatewayError(RuntimeError):
@@ -48,6 +65,128 @@ class RuntimeGatewayError(RuntimeError):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+
+
+class _V3JsonJournal:
+    """Private bounded-lock JSON journal with unique atomic replacements."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.lock_path = self.path.with_name(f"{self.path.name}.lock")
+        mutex_key = str(self.lock_path.resolve())
+        with _JOURNAL_MUTEX_GUARD:
+            self._mutex = _JOURNAL_MUTEXES.setdefault(mutex_key, threading.Lock())
+
+    @contextmanager
+    def exclusive(self):
+        deadline = time.monotonic() + _JOURNAL_LOCK_TIMEOUT_SECONDS
+        if not self._mutex.acquire(timeout=_JOURNAL_LOCK_TIMEOUT_SECONDS):
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_BUSY",
+                "Runtime journal lock could not be acquired within its bound",
+            )
+        handle = None
+        acquired = False
+        try:
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = self.lock_path.open("a+b")
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            while True:
+                try:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError as error:
+                    if error.errno not in {
+                        errno.EACCES,
+                        errno.EAGAIN,
+                        errno.EDEADLK,
+                    }:
+                        raise RuntimeGatewayError(
+                            "RUNTIME_STORE_INVALID",
+                            "Runtime journal lock is unavailable",
+                        ) from error
+                    if time.monotonic() >= deadline:
+                        raise RuntimeGatewayError(
+                            "RUNTIME_STORE_BUSY",
+                            "Runtime journal lock could not be acquired within its bound",
+                        ) from error
+                    time.sleep(_JOURNAL_LOCK_RETRY_SECONDS)
+            yield
+        finally:
+            try:
+                if acquired and handle is not None:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                try:
+                    if handle is not None:
+                        handle.close()
+                finally:
+                    self._mutex.release()
+
+    def read_unlocked(self) -> Any | None:
+        if not self.path.exists():
+            return None
+        try:
+            with self.path.open("rb") as handle:
+                payload = handle.read(_MAXIMUM_RUNTIME_JOURNAL_BYTES + 1)
+            if len(payload) > _MAXIMUM_RUNTIME_JOURNAL_BYTES:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID", "Runtime journal exceeds its byte bound"
+                )
+            return json.loads(payload.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID", "Runtime journal is unreadable"
+            ) from error
+
+    def replace_unlocked(self, value: Any) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f"{self.path.name}.{uuid4().hex}.tmp")
+        try:
+            payload = canonical_bytes(value)
+            if len(payload) > _MAXIMUM_RUNTIME_JOURNAL_BYTES:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID", "Runtime journal exceeds its byte bound"
+                )
+            with temporary.open("wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            if os.name != "nt":
+                directory_fd = os.open(
+                    self.path.parent,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 @dataclass(frozen=True)
@@ -866,24 +1005,194 @@ class _PaseoCliTransport:
 
     def _run(self, args: list[str]) -> Any:
         self.validate_arguments(args, executable=self._executable)
-        try:
-            result = subprocess.run(
-                [self._executable, *args],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=self._timeout_seconds,
+        started = time.monotonic()
+        command_deadline = started + self._timeout_seconds
+        hard_deadline = command_deadline + _PASEO_CLEANUP_GRACE_SECONDS
+        process = subprocess.Popen(
+            [self._executable, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+        )
+        if process.stdout is None or process.stderr is None:
+            cleanup_deadline = min(
+                hard_deadline,
+                time.monotonic() + _PASEO_CLEANUP_GRACE_SECONDS,
             )
-        except subprocess.TimeoutExpired as error:
-            raise TimeoutError("Paseo command timed out") from error
-        if result.returncode != 0:
-            raise self._nonzero_failure(result.stdout, result.stderr)
-        if not result.stdout.strip():
+            self._stop_and_reap(process, cleanup_deadline)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+            raise RuntimeGatewayError(
+                "RUNTIME_TRANSPORT_UNAVAILABLE",
+                "Paseo command pipes are unavailable",
+            )
+        streams = {"stdout": process.stdout, "stderr": process.stderr}
+        buffers = {name: bytearray() for name in streams}
+        stream_totals = {name: 0 for name in streams}
+        total_bytes = 0
+        open_streams = set(streams)
+        stop_reason: str | None = None
+        process_reaped = False
+        close_failed = False
+        returncode: int | None = None
+        parent_exit_drain_deadline: float | None = None
+
+        try:
+            for stream in streams.values():
+                os.set_blocking(stream.fileno(), False)
+            while True:
+                made_progress = False
+                for name in tuple(open_streams):
+                    stream = streams[name]
+                    try:
+                        chunk = os.read(stream.fileno(), _PASEO_PIPE_CHUNK_BYTES)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        stop_reason = "read_failed"
+                        break
+                    if not chunk:
+                        open_streams.remove(name)
+                        continue
+                    made_progress = True
+                    stream_totals[name] += len(chunk)
+                    total_bytes += len(chunk)
+                    stream_remaining = max(
+                        0, _MAXIMUM_PASEO_STREAM_BYTES - len(buffers[name])
+                    )
+                    total_retained = sum(len(buffer) for buffer in buffers.values())
+                    total_remaining = max(
+                        0, _MAXIMUM_PASEO_TOTAL_BYTES - total_retained
+                    )
+                    retain = min(len(chunk), stream_remaining, total_remaining)
+                    buffers[name].extend(chunk[:retain])
+                    if (
+                        stream_totals[name] > _MAXIMUM_PASEO_STREAM_BYTES
+                        or total_bytes > _MAXIMUM_PASEO_TOTAL_BYTES
+                    ):
+                        stop_reason = "overflow"
+                        break
+                if stop_reason is not None:
+                    break
+
+                now = time.monotonic()
+                polled = self._poll(process)
+                if polled is not None:
+                    returncode = polled
+                    if parent_exit_drain_deadline is None:
+                        parent_exit_drain_deadline = min(
+                            command_deadline,
+                            now + _PASEO_POST_EXIT_DRAIN_SECONDS,
+                        )
+                    if not open_streams or now >= parent_exit_drain_deadline:
+                        break
+                elif now >= command_deadline:
+                    stop_reason = "timeout"
+                    break
+
+                if not made_progress:
+                    sleep_until = command_deadline
+                    if parent_exit_drain_deadline is not None:
+                        sleep_until = min(sleep_until, parent_exit_drain_deadline)
+                    remaining = max(0.0, sleep_until - time.monotonic())
+                    if remaining:
+                        time.sleep(min(_PASEO_PIPE_POLL_SECONDS, remaining))
+        except (OSError, ValueError):
+            stop_reason = "read_failed"
+        finally:
+            cleanup_deadline = min(
+                hard_deadline,
+                time.monotonic() + _PASEO_CLEANUP_GRACE_SECONDS,
+            )
+            if self._poll(process) is None:
+                process_reaped = self._stop_and_reap(
+                    process, cleanup_deadline
+                )
+            else:
+                process_reaped = self._confirm_reaped(
+                    process, cleanup_deadline
+                )
+            returncode = process.returncode
+            for stream in streams.values():
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    close_failed = True
+
+        stdout_bytes = bytes(buffers["stdout"])
+        stderr_bytes = bytes(buffers["stderr"])
+        if not process_reaped or close_failed:
+            raise RuntimeGatewayError(
+                "RUNTIME_TRANSPORT_UNAVAILABLE",
+                "Paseo command cleanup could not confirm bounded process exit",
+            )
+        if stop_reason == "timeout":
+            raise TimeoutError("Paseo command timed out")
+        if stop_reason == "overflow":
+            raise RuntimeGatewayError(
+                "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+                "Paseo command output exceeded its bounded capture limit",
+            )
+        if stop_reason == "read_failed":
+            raise RuntimeGatewayError(
+                "RUNTIME_TRANSPORT_UNAVAILABLE",
+                "Paseo command output transport failed",
+            )
+        try:
+            stdout = stdout_bytes.decode("utf-8", errors="strict")
+            stderr = stderr_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise ValueError("Paseo output is not strict UTF-8") from error
+        if returncode != 0:
+            raise self._nonzero_failure(stdout, stderr)
+        if not stdout.strip():
             return {}
         try:
-            return json.loads(result.stdout)
+            return json.loads(stdout)
         except json.JSONDecodeError as error:
             raise ValueError("Paseo JSON response is invalid") from error
+
+    @staticmethod
+    def _poll(process: Any) -> int | None:
+        try:
+            return process.poll()
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _confirm_reaped(process: Any, deadline: float) -> bool:
+        remaining = min(0.05, max(0.0, deadline - time.monotonic()))
+        try:
+            process.wait(timeout=remaining)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return False
+        return process.returncode is not None
+
+    @classmethod
+    def _stop_and_reap(cls, process: Any, deadline: float) -> bool:
+        if cls._poll(process) is not None:
+            return cls._confirm_reaped(process, deadline)
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            process.wait(timeout=min(0.1, remaining))
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        if process.returncode is not None:
+            return True
+        try:
+            process.kill()
+        except OSError:
+            pass
+        return cls._confirm_reaped(process, deadline)
 
     @staticmethod
     def _nonzero_failure(stdout: str, stderr: str) -> RuntimeGatewayError:
@@ -1026,7 +1335,14 @@ class _PaseoRuntimeProviderAdapter:
         self._artifacts = artifacts
         self._contexts = dict(repository_contexts)
         self._state_path = Path(state_path)
-        self._actions, self._events, self._workspace_intents = self._load()
+        self._journal = _V3JsonJournal(self._state_path)
+        self._pending_save_state: dict[str, Any] | None = None
+        (
+            self._actions,
+            self._events,
+            self._workspace_intents,
+            self._next_event_cursor,
+        ) = self._load()
 
     @staticmethod
     def _failure(error: Exception) -> _RuntimeFailure:
@@ -1067,31 +1383,34 @@ class _PaseoRuntimeProviderAdapter:
 
     def _load(
         self,
-    ) -> tuple[dict[str, dict[str, Any]], list[_RuntimeEvent], dict[str, dict[str, str]]]:
-        if not self._state_path.exists():
-            return {}, [], {}
-        try:
-            value = json.loads(self._state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise RuntimeGatewayError(
-                "RUNTIME_STORE_INVALID", "Paseo Runtime action record is unreadable"
-            ) from error
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        list[_RuntimeEvent],
+        dict[str, dict[str, str]],
+        int,
+    ]:
+        with self._journal.exclusive():
+            return self._load_unlocked()
+
+    def _load_unlocked(
+        self,
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        list[_RuntimeEvent],
+        dict[str, dict[str, str]],
+        int,
+    ]:
+        value = self._journal.read_unlocked()
+        if value is None:
+            return {}, [], {}, 1
         if not isinstance(value, dict):
             raise RuntimeGatewayError(
                 "RUNTIME_STORE_INVALID", "Paseo Runtime action record is invalid"
             )
-        # The original repair draft persisted the action map directly.  It
-        # has no events, but its deterministic action records remain valid.
-        if "actions" not in value:
-            if not all(isinstance(item, dict) for item in value.values()):
-                raise RuntimeGatewayError(
-                    "RUNTIME_STORE_INVALID", "Paseo Runtime action record is invalid"
-                )
-            return dict(value), [], {}
         actions = value.get("actions")
         raw_events = value.get("events")
         if (
-            value.get("schema_version") not in {2, 3}
+            value.get("schema_version") != 3
             or not isinstance(actions, dict)
             or not isinstance(raw_events, list)
             or not all(isinstance(item, dict) for item in actions.values())
@@ -1100,18 +1419,53 @@ class _PaseoRuntimeProviderAdapter:
                 "RUNTIME_STORE_INVALID", "Paseo Runtime action record is invalid"
             )
         raw_intents = value.get("workspace_intents", {})
-        if not isinstance(raw_intents, dict) or not all(
-            isinstance(action, str)
-            and isinstance(intent, dict)
-            and set(intent)
-            == {"repository_path", "base_commit", "slug", "spec_identity_digest"}
-            and all(isinstance(part, str) and part for part in intent.values())
-            and _GIT_COMMIT_RE.fullmatch(intent["base_commit"]) is not None
-            for action, intent in raw_intents.items()
-        ):
+        if not isinstance(raw_intents, dict):
             raise RuntimeGatewayError(
                 "RUNTIME_STORE_INVALID", "Paseo Workspace intent record is invalid"
             )
+        normalized_intents: dict[str, dict[str, str]] = {}
+        for action, intent in raw_intents.items():
+            if (
+                not isinstance(action, str)
+                or not isinstance(intent, dict)
+                or frozenset(intent)
+                not in {
+                    frozenset(
+                        {
+                            "repository_path",
+                            "base_commit",
+                            "slug",
+                            "spec_identity_digest",
+                        }
+                    ),
+                    frozenset(
+                        {
+                            "repository_path",
+                            "base_commit",
+                            "slug",
+                            "spec_identity_digest",
+                            "phase",
+                        }
+                    ),
+                }
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID", "Paseo Workspace intent record is invalid"
+                )
+            normalized = dict(intent)
+            # A legacy intent was durable immediately before create.  Treat it
+            # as create-pending so a V3 restart can only read back, never
+            # duplicate the provider effect.
+            normalized.setdefault("phase", "create_pending")
+            if (
+                any(not isinstance(part, str) or not part for part in normalized.values())
+                or normalized["phase"] not in {"recorded", "create_pending"}
+                or _GIT_COMMIT_RE.fullmatch(normalized["base_commit"]) is None
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID", "Paseo Workspace intent record is invalid"
+                )
+            normalized_intents[action] = normalized
         events: list[_RuntimeEvent] = []
         for raw in raw_events:
             if not isinstance(raw, dict):
@@ -1131,38 +1485,170 @@ class _PaseoRuntimeProviderAdapter:
                     "RUNTIME_STORE_INVALID", "Paseo Runtime event record is invalid"
                 ) from error
             events.append(event)
-        return dict(actions), events, {
-            action: dict(intent) for action, intent in raw_intents.items()
-        }
+        cursor_values: list[int] = []
+        for event in events:
+            try:
+                cursor_value = int(event.cursor)
+            except ValueError as error:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID", "Paseo Runtime event cursor is invalid"
+                ) from error
+            if cursor_value < 1:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID", "Paseo Runtime event cursor is invalid"
+                )
+            cursor_values.append(cursor_value)
+        if cursor_values != sorted(set(cursor_values)):
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID", "Paseo Runtime event cursor is invalid"
+            )
+        next_event_cursor = value.get(
+            "next_event_cursor", (cursor_values[-1] + 1 if cursor_values else 1)
+        )
+        if (
+            not isinstance(next_event_cursor, int)
+            or isinstance(next_event_cursor, bool)
+            or next_event_cursor < (cursor_values[-1] + 1 if cursor_values else 1)
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID", "Paseo Runtime event cursor is invalid"
+            )
+        return (
+            dict(actions),
+            events[-_MAXIMUM_RUNTIME_EVENTS:],
+            normalized_intents,
+            next_event_cursor,
+        )
 
     def _save(self) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._state_path.with_suffix(self._state_path.suffix + ".tmp")
-        temporary.write_bytes(
-            canonical_bytes(
-                {
-                    "schema_version": 3,
-                    "actions": self._actions,
-                    "events": [asdict(event) for event in self._events],
-                    "workspace_intents": self._workspace_intents,
-                }
-            )
+        state = self._pending_save_state or {
+            "actions": self._actions,
+            "events": self._events,
+            "workspace_intents": self._workspace_intents,
+            "next_event_cursor": self._next_event_cursor,
+        }
+        self._journal.replace_unlocked(
+            {
+                "schema_version": 3,
+                "actions": state["actions"],
+                "events": [asdict(event) for event in state["events"]],
+                "workspace_intents": state["workspace_intents"],
+                "next_event_cursor": state["next_event_cursor"],
+            }
         )
-        temporary.replace(self._state_path)
+
+    def _publish_state(
+        self,
+        actions: dict[str, dict[str, Any]],
+        events: list[_RuntimeEvent],
+        workspace_intents: dict[str, dict[str, str]],
+        next_event_cursor: int,
+    ) -> None:
+        self._actions = actions
+        self._events = events
+        self._workspace_intents = workspace_intents
+        self._next_event_cursor = next_event_cursor
+
+    def _refresh(self) -> None:
+        with self._journal.exclusive():
+            self._publish_state(*self._load_unlocked())
+
+    def _transact(self, mutation: Callable[[dict[str, Any]], Any]) -> Any:
+        with self._journal.exclusive():
+            loaded = self._load_unlocked()
+            durable = {
+                "actions": loaded[0],
+                "events": loaded[1],
+                "workspace_intents": loaded[2],
+                "next_event_cursor": loaded[3],
+            }
+            candidate = deepcopy(durable)
+            try:
+                result = mutation(candidate)
+                self._pending_save_state = candidate
+                self._save()
+            except Exception:
+                try:
+                    self._publish_state(*self._load_unlocked())
+                except RuntimeGatewayError:
+                    self._publish_state(*loaded)
+                raise
+            finally:
+                self._pending_save_state = None
+            self._publish_state(
+                candidate["actions"],
+                candidate["events"],
+                candidate["workspace_intents"],
+                candidate["next_event_cursor"],
+            )
+            return result
 
     def _persist_record_update(
-        self, record: dict[str, Any], update: Callable[[], None]
+        self,
+        record: dict[str, Any],
+        update: Callable[[dict[str, Any]], None],
     ) -> None:
-        """Save one pre-effect intent or restore the exact prior record."""
+        """CAS one detached action update and publish only after replacement."""
 
-        previous = deepcopy(record)
-        update()
-        try:
-            self._save()
-        except Exception:
-            record.clear()
-            record.update(previous)
-            raise
+        expected = deepcopy(record)
+        stable_action_id = _require_text(
+            expected.get("subject", {}).get("stable_action_id")
+            if isinstance(expected.get("subject"), dict)
+            else None,
+            "persisted stable action id",
+        )
+
+        def commit(state: dict[str, Any]) -> dict[str, Any]:
+            current = state["actions"].get(stable_action_id)
+            if current != expected:
+                raise RuntimeGatewayError(
+                    "RUNTIME_ACTION_STATE_CHANGED",
+                    "Paseo action update lost its durable CAS",
+                )
+            updated = deepcopy(current)
+            update(updated)
+            state["actions"][stable_action_id] = updated
+            return deepcopy(updated)
+
+        updated = self._transact(commit)
+        record.clear()
+        record.update(updated)
+
+    def _claim_record_update(
+        self,
+        record: dict[str, Any],
+        *,
+        already_claimed: Callable[[Mapping[str, Any]], bool],
+        update: Callable[[dict[str, Any]], None],
+    ) -> bool:
+        """Atomically grant one caller ownership of a provider effect."""
+
+        expected = deepcopy(record)
+        stable_action_id = _require_text(
+            expected.get("subject", {}).get("stable_action_id")
+            if isinstance(expected.get("subject"), dict)
+            else None,
+            "persisted stable action id",
+        )
+
+        def commit(state: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+            current = state["actions"].get(stable_action_id)
+            if current == expected:
+                updated = deepcopy(current)
+                update(updated)
+                state["actions"][stable_action_id] = updated
+                return True, deepcopy(updated)
+            if isinstance(current, dict) and already_claimed(current):
+                return False, deepcopy(current)
+            raise RuntimeGatewayError(
+                "RUNTIME_ACTION_STATE_CHANGED",
+                "Paseo provider-effect claim lost its durable CAS",
+            )
+
+        claimed, updated = self._transact(commit)
+        record.clear()
+        record.update(updated)
+        return claimed
 
     def _lifecycle(
         self,
@@ -1178,34 +1664,64 @@ class _PaseoRuntimeProviderAdapter:
         value = agent.lifecycle.casefold()
         if value in {"running", "busy"}:
             if record.get("pending_resume") is True or record.get("parked") is True:
-                record["pending_resume"] = False
-                record["parked"] = False
-                self._save()
+                self._persist_record_update(
+                    record,
+                        lambda updated: updated.update(
+                            {
+                                "pending_resume": False,
+                                "parked": False,
+                                "pending_stop_command": None,
+                            }
+                        ),
+                )
             return "running"
-        if value == "idle" and (permission_pending or permission_response_pending):
-            return "running"
+        if value == "idle" and record.get("pending_resume") is True:
+            raise RuntimeGatewayError(
+                "RUNTIME_MATERIALIZATION_PENDING",
+                "Paseo resume acknowledgement awaits running or output readback",
+            )
+        if value == "idle" and (
+            record.get("pending_park") is True or record.get("parked") is True
+        ):
+            if record.get("pending_park") is True or record.get("parked") is not True:
+                self._persist_record_update(
+                    record,
+                    lambda updated: updated.update(
+                        {
+                            "pending_park": False,
+                            "parked": True,
+                            "pending_stop_command": None,
+                        }
+                    ),
+                )
+            return "parked"
         if value in {"idle", "closed", "completed", "complete", "finished"}:
             if output_exists:
                 if any(
                     record.get(key) is True
                     for key in ("pending_park", "pending_resume", "parked")
                 ):
-                    record["pending_park"] = False
-                    record["pending_resume"] = False
-                    record["parked"] = False
-                    self._save()
+                    self._persist_record_update(
+                        record,
+                        lambda updated: updated.update(
+                            {
+                                "pending_park": False,
+                                "pending_resume": False,
+                                "parked": False,
+                                "pending_stop_command": None,
+                            }
+                        ),
+                    )
                 return "completed"
+            if value == "idle" and (
+                permission_pending or permission_response_pending
+            ):
+                return "running"
             if record.get("pending_resume") is True:
                 raise RuntimeGatewayError(
                     "RUNTIME_MATERIALIZATION_PENDING",
                     "Paseo resume acknowledgement awaits running or output readback",
                 )
-            if record.get("pending_park") is True or record.get("parked") is True:
-                if record.get("pending_park") is True or record.get("parked") is not True:
-                    record["pending_park"] = False
-                    record["parked"] = True
-                    self._save()
-                return "parked"
         raise RuntimeGatewayError(
             "RUNTIME_LIFECYCLE_UNKNOWN",
             "Paseo status does not prove running, parked, completed, or retired",
@@ -1448,8 +1964,12 @@ class _PaseoRuntimeProviderAdapter:
                 "Paseo result Artifact does not bind its exact action",
             )
         if record.get("output_artifact_digest") != output_digest:
-            record["output_artifact_digest"] = output_digest
-            self._save()
+            self._persist_record_update(
+                record,
+                lambda updated: updated.__setitem__(
+                    "output_artifact_digest", output_digest
+                ),
+            )
         return output_digest
 
     def _bound(self, record: dict[str, Any], agent: _PaseoAgentReadback) -> _BoundRuntimeObservation:
@@ -1493,7 +2013,20 @@ class _PaseoRuntimeProviderAdapter:
             )
         fenced = record.get("fenced", False)
         pending_fence = record.get("pending_fence", False)
-        if type(fenced) is not bool or type(pending_fence) is not bool:
+        pending_fence_claim_id = record.get("pending_fence_claim_id")
+        pending_fence_quiesced = record.get("pending_fence_quiesced", False)
+        if (
+            type(fenced) is not bool
+            or type(pending_fence) is not bool
+            or (
+                pending_fence_claim_id is not None
+                and (
+                    not isinstance(pending_fence_claim_id, str)
+                    or not pending_fence_claim_id
+                )
+            )
+            or type(pending_fence_quiesced) is not bool
+        ):
             raise ValueError("Paseo fence state is invalid")
         labels = self._labels(
             _RuntimeActionSpec(
@@ -1512,21 +2045,61 @@ class _PaseoRuntimeProviderAdapter:
                 "RUNTIME_IDENTITY_AMBIGUOUS",
                 "Paseo fence label readback selected another Agent",
             )
+        if fenced_agent is None and (
+            (
+                pending_fence_quiesced
+                and (
+                    not pending_fence
+                    or not isinstance(pending_fence_claim_id, str)
+                )
+            )
+            or (not pending_fence and pending_fence_claim_id is not None)
+        ):
+            raise ValueError("Paseo fence ownership evidence is invalid")
         if fenced_agent is not None and not fenced and pending_fence:
-            record["fenced"] = True
-            record["pending_fence"] = False
+            self._persist_record_update(
+                record,
+                lambda updated: updated.update(
+                    {
+                        "fenced": True,
+                        "pending_fence": False,
+                        "pending_fence_claim_id": None,
+                        "pending_fence_quiesced": False,
+                    }
+                ),
+            )
             fenced = True
-            self._save()
         elif fenced_agent is not None and fenced and pending_fence:
-            record["pending_fence"] = False
-            self._save()
-        elif fenced_agent is None and pending_fence:
-            # An exact negative label query proves that the attempted update
-            # did not take effect.  Clear only the retry intent; the enclosing
-            # command effect check rejects this attempt and a later transition
-            # may safely retry.
-            record["pending_fence"] = False
-            self._save()
+            self._persist_record_update(
+                record,
+                lambda updated: updated.update(
+                    {
+                        "pending_fence": False,
+                        "pending_fence_claim_id": None,
+                        "pending_fence_quiesced": False,
+                    }
+                ),
+            )
+        elif (
+            fenced_agent is None
+            and not fenced
+            and pending_fence
+            and isinstance(pending_fence_claim_id, str)
+            and pending_fence_quiesced
+        ):
+            # Exact negative label readback is retry authority only after the
+            # effect owner durably proved its provider call has returned.
+            # Clear only that quiesced claim under the record CAS.
+            self._persist_record_update(
+                record,
+                lambda updated: updated.update(
+                    {
+                        "pending_fence": False,
+                        "pending_fence_claim_id": None,
+                        "pending_fence_quiesced": False,
+                    }
+                ),
+            )
         if (fenced_agent is not None) != fenced:
             raise RuntimeGatewayError(
                 "RUNTIME_IDENTITY_AMBIGUOUS",
@@ -1585,6 +2158,11 @@ class _PaseoRuntimeProviderAdapter:
             and not response_still_pending
         )
         if agent.archived is True:
+            if record.get("pending_retire") is True:
+                self._persist_record_update(
+                    record,
+                    lambda updated: updated.__setitem__("pending_retire", False),
+                )
             output_digest = record.get("output_artifact_digest")
             if output_digest is not None and not isinstance(output_digest, str):
                 raise ValueError("retired Paseo output Artifact record is invalid")
@@ -1614,9 +2192,11 @@ class _PaseoRuntimeProviderAdapter:
             }
             self._persist_record_update(
                 record,
-                lambda: (
-                    record.pop("pending_permission_response", None),
-                    record.__setitem__("completed_permission_response", completion_record),
+                lambda updated: (
+                    updated.pop("pending_permission_response", None),
+                    updated.__setitem__(
+                        "completed_permission_response", completion_record
+                    ),
                 ),
             )
             completed_permission_response = self._completed_permission_response(
@@ -1628,15 +2208,16 @@ class _PaseoRuntimeProviderAdapter:
                 "RUNTIME_IDENTITY_AMBIGUOUS",
                 "Paseo Bound observation changed the exact Agent identity",
             )
-        binding_changed = False
-        if bound_agent_id is None:
-            record["bound_agent_id"] = agent.agent_id
-            binding_changed = True
-        if record.get("pending_start") is True:
-            record["pending_start"] = False
-            binding_changed = True
-        if binding_changed:
-            self._save()
+        if bound_agent_id is None or record.get("pending_start") is True:
+            self._persist_record_update(
+                record,
+                lambda updated: updated.update(
+                    {
+                        "bound_agent_id": agent.agent_id,
+                        "pending_start": False,
+                    }
+                ),
+            )
         return _BoundRuntimeObservation(
             stable_action_id=subject.stable_action_id,
             binding_ref=binding_ref,
@@ -2020,6 +2601,111 @@ class _PaseoRuntimeProviderAdapter:
             )
         return target
 
+    @staticmethod
+    def _spec_identity_digest(spec: _RuntimeActionSpec) -> str:
+        return digest_value(
+            {
+                "subject_digest": spec.subject_digest,
+                "profile_digest": spec.profile.digest,
+                "prompt_artifact_digest": spec.prompt_artifact.digest,
+                "input_artifact_digests": [
+                    artifact.digest for artifact in spec.input_artifacts
+                ],
+            }
+        )
+
+    @staticmethod
+    def _action_matches_spec(
+        action: object, spec: _RuntimeActionSpec
+    ) -> bool:
+        return (
+            isinstance(action, dict)
+            and action.get("subject_digest") == spec.subject_digest
+            and action.get("profile_digest") == spec.profile.digest
+            and action.get("prompt_artifact_digest")
+            == spec.prompt_artifact.digest
+            and action.get("input_artifact_digests")
+            == [item.digest for item in spec.input_artifacts]
+        )
+
+    def _prepared_receipt_from_action(
+        self, spec: _RuntimeActionSpec, action: dict[str, Any]
+    ) -> _PrepareReceipt:
+        if not self._action_matches_spec(action, spec):
+            raise RuntimeGatewayError(
+                "RUNTIME_ACTION_IDENTITY_MISMATCH",
+                "stable action changed during prepare",
+            )
+        self._artifacts.get(str(action["prompt_artifact_digest"]))
+        for digest in action["input_artifact_digests"]:
+            self._artifacts.get(digest)
+        return _PrepareReceipt(spec.stable_action_id, str(action["workspace_id"]))
+
+    def _ensure_workspace_intent(
+        self,
+        spec: _RuntimeActionSpec,
+        context: RuntimeRepositoryContext,
+        slug: str,
+    ) -> dict[str, str] | None:
+        """Freeze complete local workspace identity before any Paseo call."""
+
+        stable_action_id = spec.stable_action_id
+        expected_without_base = {
+            "repository_path": str(Path(context.path).resolve()),
+            "slug": slug,
+            "spec_identity_digest": self._spec_identity_digest(spec),
+        }
+        existing = self._workspace_intents.get(stable_action_id)
+        if existing is None:
+            base_commit = self._git_readback(
+                Path(context.path), "rev-parse", f"{context.base_ref}^{{commit}}"
+            )
+            if _GIT_COMMIT_RE.fullmatch(base_commit) is None:
+                raise ValueError("configured Workspace base does not resolve to one commit")
+            proposed = {
+                **expected_without_base,
+                "base_commit": base_commit,
+                "phase": "recorded",
+            }
+        else:
+            proposed = dict(existing)
+
+        def commit(state: dict[str, Any]) -> dict[str, str] | None:
+            current_action = state["actions"].get(stable_action_id)
+            if current_action is not None:
+                if not self._action_matches_spec(current_action, spec):
+                    raise RuntimeGatewayError(
+                        "RUNTIME_ACTION_IDENTITY_MISMATCH",
+                        "stable action changed while recording its Workspace intent",
+                    )
+                # A stale adapter may have passed its initial action read
+                # before another process committed Prepared.  The durable
+                # action is authoritative, and any older intent must vanish
+                # in this same transaction.
+                state["workspace_intents"].pop(stable_action_id, None)
+                return None
+            current = state["workspace_intents"].get(stable_action_id)
+            if current is None:
+                state["workspace_intents"][stable_action_id] = deepcopy(proposed)
+                return deepcopy(proposed)
+            if (
+                not isinstance(current, dict)
+                or any(
+                    current.get(key) != value
+                    for key, value in expected_without_base.items()
+                )
+                or not isinstance(current.get("base_commit"), str)
+                or _GIT_COMMIT_RE.fullmatch(current["base_commit"]) is None
+                or current.get("phase") not in {"recorded", "create_pending"}
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_ACTION_IDENTITY_MISMATCH",
+                    "Paseo Workspace intent changed for one stable action",
+                )
+            return deepcopy(current)
+
+        return self._transact(commit)
+
     def _workspace_for_prepare(
         self,
         spec: _RuntimeActionSpec,
@@ -2028,56 +2714,28 @@ class _PaseoRuntimeProviderAdapter:
     ) -> tuple[str, str, str]:
         stable_action_id = spec.stable_action_id
         existing_intent = self._workspace_intents.get(stable_action_id)
-        first_create_attempt = existing_intent is None
-        if first_create_attempt:
-            base_commit = self._git_readback(
-                Path(context.path), "rev-parse", f"{context.base_ref}^{{commit}}"
+        if not isinstance(existing_intent, dict):
+            raise RuntimeGatewayError(
+                "RUNTIME_ACTION_IDENTITY_MISMATCH",
+                "Paseo Workspace intent is absent before prepare readback",
             )
-            if _GIT_COMMIT_RE.fullmatch(base_commit) is None:
-                raise ValueError("configured Workspace base does not resolve to one commit")
-            intent = {
-                "repository_path": str(Path(context.path).resolve()),
-                "base_commit": base_commit,
-                "slug": slug,
-                "spec_identity_digest": digest_value(
-                    {
-                        "subject_digest": spec.subject_digest,
-                        "profile_digest": spec.profile.digest,
-                        "prompt_artifact_digest": spec.prompt_artifact.digest,
-                        "input_artifact_digests": [
-                            artifact.digest for artifact in spec.input_artifacts
-                        ],
-                    }
-                ),
-            }
-            self._workspace_intents[stable_action_id] = intent
-            try:
-                self._save()
-            except Exception:
-                self._workspace_intents.pop(stable_action_id, None)
-                raise
-        else:
-            base_commit = existing_intent.get("base_commit")
-            expected_intent = {
-                "repository_path": str(Path(context.path).resolve()),
-                "base_commit": base_commit,
-                "slug": slug,
-                "spec_identity_digest": digest_value(
-                    {
-                        "subject_digest": spec.subject_digest,
-                        "profile_digest": spec.profile.digest,
-                        "prompt_artifact_digest": spec.prompt_artifact.digest,
-                        "input_artifact_digests": [
-                            artifact.digest for artifact in spec.input_artifacts
-                        ],
-                    }
-                ),
-            }
-            if existing_intent != expected_intent or not isinstance(base_commit, str):
-                raise RuntimeGatewayError(
-                    "RUNTIME_ACTION_IDENTITY_MISMATCH",
-                    "Paseo Workspace intent changed for one stable action",
-                )
+        base_commit = existing_intent.get("base_commit")
+        expected_intent = {
+            "repository_path": str(Path(context.path).resolve()),
+            "base_commit": base_commit,
+            "slug": slug,
+            "spec_identity_digest": self._spec_identity_digest(spec),
+            "phase": existing_intent.get("phase"),
+        }
+        if (
+            existing_intent != expected_intent
+            or not isinstance(base_commit, str)
+            or existing_intent.get("phase") not in {"recorded", "create_pending"}
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_ACTION_IDENTITY_MISMATCH",
+                "Paseo Workspace intent changed for one stable action",
+            )
         if _GIT_COMMIT_RE.fullmatch(base_commit) is None:
             raise ValueError("Paseo Workspace intent base commit is invalid")
         recovered = self._workspace_by_identity(slug=slug)
@@ -2086,7 +2744,38 @@ class _PaseoRuntimeProviderAdapter:
                 context, recovered[1], expected_base_commit=base_commit
             )
             return (*recovered, base_commit)
-        if not first_create_attempt:
+        if existing_intent["phase"] == "create_pending":
+            # There is intentionally no lease or takeover for this phase.
+            # Exact absence cannot distinguish a claim-before-effect crash
+            # from an acknowledgement loss.  Kernel performs bounded polling
+            # and escalates to Blocked; it must never authorize a second
+            # provider create effect.
+            raise RuntimeGatewayError(
+                "RUNTIME_MATERIALIZATION_PENDING",
+                "Paseo Workspace creation awaits exact action-owned Workspace readback",
+            )
+
+        def claim_create(state: dict[str, Any]) -> bool:
+            current = state["workspace_intents"].get(stable_action_id)
+            if current == existing_intent:
+                current["phase"] = "create_pending"
+                return True
+            if (
+                isinstance(current, dict)
+                and current.get("phase") == "create_pending"
+                and all(
+                    current.get(key) == value
+                    for key, value in existing_intent.items()
+                    if key != "phase"
+                )
+            ):
+                return False
+            raise RuntimeGatewayError(
+                "RUNTIME_ACTION_IDENTITY_MISMATCH",
+                "Paseo Workspace create claim lost its exact intent CAS",
+            )
+
+        if not self._transact(claim_create):
             raise RuntimeGatewayError(
                 "RUNTIME_MATERIALIZATION_PENDING",
                 "Paseo Workspace creation awaits exact action-owned Workspace readback",
@@ -2112,18 +2801,17 @@ class _PaseoRuntimeProviderAdapter:
                 return (*recovered, base_commit)
             if not self._is_definitive_command_rejection(create_error):
                 raise
-            saved_intent = self._workspace_intents.get(stable_action_id)
-            if not isinstance(saved_intent, dict):
-                raise RuntimeGatewayError(
-                    "RUNTIME_ACTION_IDENTITY_MISMATCH",
-                    "Paseo Workspace intent changed during create recovery",
-                )
-            self._workspace_intents.pop(stable_action_id, None)
-            try:
-                self._save()
-            except Exception:
-                self._workspace_intents[stable_action_id] = saved_intent
-                raise
+            claimed_intent = deepcopy(self._workspace_intents.get(stable_action_id))
+
+            def clear_rejected_create(state: dict[str, Any]) -> None:
+                if state["workspace_intents"].get(stable_action_id) != claimed_intent:
+                    raise RuntimeGatewayError(
+                        "RUNTIME_ACTION_IDENTITY_MISMATCH",
+                        "Paseo Workspace intent changed during create recovery",
+                    )
+                state["workspace_intents"].pop(stable_action_id)
+
+            self._transact(clear_rejected_create)
             raise create_error
         # ``_call`` returned successfully, so a malformed receipt,
         # non-matching registry identity, absent registry entry, or registry
@@ -2183,20 +2871,10 @@ class _PaseoRuntimeProviderAdapter:
 
     def prepare(self, spec: _RuntimeActionSpec) -> _PrepareReceipt | _RuntimeFailure:
         try:
+            self._refresh()
             existing = self._actions.get(spec.stable_action_id)
             if existing is not None:
-                expected_inputs = [item.digest for item in spec.input_artifacts]
-                if (
-                    existing.get("subject_digest") != spec.subject_digest
-                    or existing.get("profile_digest") != spec.profile.digest
-                    or existing.get("prompt_artifact_digest") != spec.prompt_artifact.digest
-                    or existing.get("input_artifact_digests") != expected_inputs
-                ):
-                    return _RuntimeFailure("RUNTIME_ACTION_IDENTITY_MISMATCH", "stable action changed during prepare")
-                self._artifacts.get(str(existing["prompt_artifact_digest"]))
-                for digest in existing["input_artifact_digests"]:
-                    self._artifacts.get(digest)
-                return _PrepareReceipt(spec.stable_action_id, str(existing["workspace_id"]))
+                return self._prepared_receipt_from_action(spec, existing)
             context = self._contexts.get(spec.subject.repository)
             if context is None:
                 return _RuntimeFailure("RUNTIME_CONFIGURATION_INVALID", "Paseo repository context is missing")
@@ -2205,17 +2883,26 @@ class _PaseoRuntimeProviderAdapter:
                     "RUNTIME_CONFIGURATION_INVALID",
                     "Paseo V3 cannot prove non-empty Runtime Profile features",
                 )
-            if self._one_agent(self._labels(spec), include_archived=True) is not None:
-                return _RuntimeFailure(
-                    "RUNTIME_ACTION_STATE_MISSING",
-                    "Paseo Agent exists but the durable action record is absent",
-                )
             slug = digest_value(
                 {
                     "repository": spec.subject.repository,
                     "stable_action_id": spec.stable_action_id,
                 }
             )[:24]
+            intent = self._ensure_workspace_intent(spec, context, slug)
+            if intent is None:
+                existing = self._actions.get(spec.stable_action_id)
+                if not isinstance(existing, dict):
+                    raise RuntimeGatewayError(
+                        "RUNTIME_ACTION_STATE_CHANGED",
+                        "Prepared action disappeared after stale intent cleanup",
+                    )
+                return self._prepared_receipt_from_action(spec, existing)
+            if self._one_agent(self._labels(spec), include_archived=True) is not None:
+                return _RuntimeFailure(
+                    "RUNTIME_ACTION_STATE_MISSING",
+                    "Paseo Agent exists but the durable action record is absent",
+                )
             workspace_id, workspace_path, workspace_base_commit = self._workspace_for_prepare(
                 spec, context, slug
             )
@@ -2246,20 +2933,40 @@ class _PaseoRuntimeProviderAdapter:
             # intent together.  A crash at any earlier point retains enough
             # immutable identity to recover the same workspace without a
             # second base resolution or create request.
-            saved_intent = self._workspace_intents.get(spec.stable_action_id)
-            self._actions[spec.stable_action_id] = action_record
-            self._workspace_intents.pop(spec.stable_action_id, None)
-            try:
-                self._save()
-            except Exception:
-                # The action map and intent map are one durable transaction.
-                # Do not let a failed replacement publish a Prepared action in
-                # memory or forget the pinned workspace identity.
-                self._actions.pop(spec.stable_action_id, None)
-                if saved_intent is not None:
-                    self._workspace_intents[spec.stable_action_id] = saved_intent
-                raise
-            return _PrepareReceipt(spec.stable_action_id, workspace_id)
+            expected_intent = deepcopy(
+                self._workspace_intents.get(spec.stable_action_id)
+            )
+
+            def commit_action(state: dict[str, Any]) -> None:
+                existing_action = state["actions"].get(spec.stable_action_id)
+                if existing_action is not None:
+                    if not self._action_matches_spec(existing_action, spec):
+                        raise RuntimeGatewayError(
+                            "RUNTIME_ACTION_IDENTITY_MISMATCH",
+                            "stable action changed during prepare commit",
+                        )
+                    state["workspace_intents"].pop(spec.stable_action_id, None)
+                    return
+                if (
+                    not isinstance(expected_intent, dict)
+                    or state["workspace_intents"].get(spec.stable_action_id)
+                    != expected_intent
+                ):
+                    raise RuntimeGatewayError(
+                        "RUNTIME_ACTION_IDENTITY_MISMATCH",
+                        "Paseo Workspace intent changed before Prepared commit",
+                    )
+                state["actions"][spec.stable_action_id] = deepcopy(action_record)
+                state["workspace_intents"].pop(spec.stable_action_id)
+
+            self._transact(commit_action)
+            committed = self._actions.get(spec.stable_action_id)
+            if not isinstance(committed, dict):
+                raise RuntimeGatewayError(
+                    "RUNTIME_ACTION_STATE_CHANGED",
+                    "Prepared action is absent after commit",
+                )
+            return self._prepared_receipt_from_action(spec, committed)
         except Exception as error:
             return self._failure(error)
 
@@ -2267,6 +2974,7 @@ class _PaseoRuntimeProviderAdapter:
         self, stable_action_id: str
     ) -> _PreparedRuntimeObservation | _BoundRuntimeObservation | _RuntimeFailure:
         try:
+            self._refresh()
             record = self._actions.get(stable_action_id)
             if record is None:
                 return _RuntimeFailure.absent(stable_action_id)
@@ -2372,35 +3080,90 @@ class _PaseoRuntimeProviderAdapter:
         record: dict[str, Any],
         previous: Mapping[str, Any],
     ) -> None:
-        """Restore a pre-effect record only after a typed rejected command."""
+        """CAS-restore only the exact claim after a typed rejected command."""
 
-        current = deepcopy(record)
+        expected = deepcopy(record)
+        restored = deepcopy(dict(previous))
+        stable_action_id = _require_text(
+            restored.get("subject", {}).get("stable_action_id")
+            if isinstance(restored.get("subject"), dict)
+            else None,
+            "persisted stable action id",
+        )
+
+        def commit(state: dict[str, Any]) -> dict[str, Any]:
+            if state["actions"].get(stable_action_id) != expected:
+                raise RuntimeGatewayError(
+                    "RUNTIME_ACTION_STATE_CHANGED",
+                    "Paseo rejection rollback lost its durable CAS",
+                )
+            state["actions"][stable_action_id] = deepcopy(restored)
+            return deepcopy(restored)
+
+        updated = self._transact(commit)
         record.clear()
-        record.update(deepcopy(dict(previous)))
-        try:
-            self._save()
-        except Exception:
-            # The durable pre-effect record was already replaced.  Preserve
-            # memory/disk alignment and surface the persistence failure rather
-            # than falsely claiming that the retry intent was cleared.
-            record.clear()
-            record.update(current)
-            raise
+        record.update(updated)
+
+    def _mark_fence_claim_quiesced(
+        self, record: dict[str, Any], claim_id: str
+    ) -> None:
+        """Durably prove one exact fence owner returned without a receipt."""
+
+        stable_action_id = _require_text(
+            record.get("subject", {}).get("stable_action_id")
+            if isinstance(record.get("subject"), dict)
+            else None,
+            "persisted stable action id",
+        )
+
+        def commit(state: dict[str, Any]) -> dict[str, Any]:
+            current = state["actions"].get(stable_action_id)
+            if not isinstance(current, dict):
+                raise RuntimeGatewayError(
+                    "RUNTIME_ACTION_STATE_CHANGED",
+                    "Paseo fence claim disappeared before quiescence",
+                )
+            # The claim id makes this update safe across unrelated record
+            # changes.  If label readback already converged the action, or a
+            # different claim somehow replaced it, never recreate ownership.
+            if (
+                current.get("pending_fence") is not True
+                or current.get("pending_fence_claim_id") != claim_id
+                or current.get("fenced") is True
+            ):
+                return deepcopy(current)
+            updated = deepcopy(current)
+            updated["pending_fence_quiesced"] = True
+            state["actions"][stable_action_id] = updated
+            return deepcopy(updated)
+
+        updated = self._transact(commit)
+        record.clear()
+        record.update(updated)
 
     def command(
         self, stable_action_id: str, command: RuntimeTransition
     ) -> _CommandReceipt | _RuntimeFailure:
         pending_before: dict[str, Any] | None = None
+        fence_provider_call_started = False
+        fence_claim_id: str | None = None
         try:
             if type(command) not in {RuntimeCommand, PermissionResponse}:
                 return _RuntimeFailure("RUNTIME_COMMAND_INVALID", "Runtime command is outside the closed union")
+            self._refresh()
             record = self._actions.get(stable_action_id)
             if record is None:
                 return _RuntimeFailure("RUNTIME_ACTION_UNKNOWN", "Runtime action is unknown")
-            subject, _profile = self._record_subject(record)
             observation = self.observe(stable_action_id)
             if isinstance(observation, _RuntimeFailure):
                 return observation
+            record = self._actions.get(stable_action_id)
+            if record is None:
+                return _RuntimeFailure(
+                    "RUNTIME_ACTION_STATE_CHANGED",
+                    "Runtime action disappeared during command readback",
+                )
+            subject, _profile = self._record_subject(record)
             if command is RuntimeCommand.START:
                 if not isinstance(observation, _PreparedRuntimeObservation):
                     return _RuntimeFailure("RUNTIME_COMMAND_INVALID", "start requires a Prepared Runtime action")
@@ -2409,12 +3172,29 @@ class _PaseoRuntimeProviderAdapter:
                         "RUNTIME_COMMAND_INVALID", "start requires an unfenced Prepared Runtime action"
                     )
                 pending_before = deepcopy(record)
-                self._persist_record_update(
-                    record, lambda: record.__setitem__("pending_start", True)
+                claimed = self._claim_record_update(
+                    record,
+                    already_claimed=lambda current: current.get("pending_start") is True,
+                    update=lambda updated: updated.__setitem__("pending_start", True),
                 )
+                if not claimed:
+                    pending_before = None
+                    return _RuntimeFailure(
+                        "RUNTIME_MATERIALIZATION_PENDING",
+                        "Paseo start already has one durable effect owner",
+                    )
                 self._start_agent(stable_action_id, record)
             elif not isinstance(observation, _BoundRuntimeObservation):
                 return _RuntimeFailure("RUNTIME_COMMAND_INVALID", "only start is allowed before Runtime binding exists")
+            elif (
+                command in {RuntimeCommand.PARK, RuntimeCommand.INTERRUPT}
+                and observation.lifecycle == "parked"
+            ):
+                return _CommandReceipt(stable_action_id, command)
+            elif command is RuntimeCommand.FENCE and observation.fenced is True:
+                return _CommandReceipt(stable_action_id, command)
+            elif command is RuntimeCommand.RETIRE and observation.lifecycle == "retired":
+                return _CommandReceipt(stable_action_id, command)
             elif type(command) is PermissionResponse:
                 matching = [
                     request
@@ -2432,18 +3212,32 @@ class _PaseoRuntimeProviderAdapter:
                         "permission response does not bind one exact pending request",
                     )
                 permission_pending_before = deepcopy(record)
-                self._persist_record_update(
+                pending_value = {
+                    "request_id": command.request_id,
+                    "decision": command.decision,
+                    "request_digest": digest_value(asdict(matching[0])),
+                    "provider_receipt": None,
+                }
+                claimed = self._claim_record_update(
                     record,
-                    lambda: record.__setitem__(
-                        "pending_permission_response",
-                        {
-                            "request_id": command.request_id,
-                            "decision": command.decision,
-                            "request_digest": digest_value(asdict(matching[0])),
-                            "provider_receipt": None,
-                        },
+                    already_claimed=lambda current: (
+                        isinstance(current.get("pending_permission_response"), dict)
+                        and all(
+                            current["pending_permission_response"].get(key)
+                            == value
+                            for key, value in pending_value.items()
+                            if key != "provider_receipt"
+                        )
+                    ),
+                    update=lambda updated: updated.__setitem__(
+                        "pending_permission_response", deepcopy(pending_value)
                     ),
                 )
+                if not claimed:
+                    return _RuntimeFailure(
+                        "RUNTIME_EFFECT_AMBIGUOUS",
+                        "Paseo permission response already has one durable effect owner",
+                    )
                 try:
                     receipt = self._call(
                         [
@@ -2472,8 +3266,8 @@ class _PaseoRuntimeProviderAdapter:
                 )
                 self._persist_record_update(
                     record,
-                    lambda: record["pending_permission_response"].__setitem__(
-                        "provider_receipt", verified
+                    lambda updated: updated["pending_permission_response"].__setitem__(
+                        "provider_receipt", deepcopy(verified)
                     ),
                 )
             elif command is RuntimeCommand.RESUME:
@@ -2486,45 +3280,120 @@ class _PaseoRuntimeProviderAdapter:
                 # behind if this write fails.
                 resume_file = self._write_resume_file(record)
                 pending_before = deepcopy(record)
-                self._persist_record_update(
+                claimed = self._claim_record_update(
                     record,
-                    lambda: record.update({"pending_park": False, "pending_resume": True}),
+                    already_claimed=lambda current: current.get("pending_resume") is True,
+                    update=lambda updated: updated.update(
+                        {"pending_park": False, "pending_resume": True}
+                    ),
                 )
+                if not claimed:
+                    pending_before = None
+                    return _RuntimeFailure(
+                        "RUNTIME_MATERIALIZATION_PENDING",
+                        "Paseo resume already has one durable effect owner",
+                    )
                 self._call(["send", "--no-wait", "--json", observation.agent_id, "--prompt-file", str(resume_file)])
             elif command in {RuntimeCommand.PARK, RuntimeCommand.INTERRUPT}:
+                if observation.lifecycle in {"completed", "retired"}:
+                    return _RuntimeFailure(
+                        "RUNTIME_COMMAND_INVALID",
+                        "park and interrupt require an active Runtime binding",
+                    )
+                stop_command = _transition_name(command)
                 pending_before = deepcopy(record)
-                self._persist_record_update(
+                claimed = self._claim_record_update(
                     record,
-                    lambda: record.update({"pending_park": True, "pending_resume": False}),
+                    already_claimed=lambda current: (
+                        current.get("pending_park") is True
+                        and current.get("pending_stop_command") == stop_command
+                    ),
+                    update=lambda updated: updated.update(
+                        {
+                            "pending_park": True,
+                            "pending_resume": False,
+                            "pending_stop_command": stop_command,
+                        }
+                    ),
                 )
+                if not claimed:
+                    pending_before = None
+                    return _RuntimeFailure(
+                        "RUNTIME_MATERIALIZATION_PENDING",
+                        "Paseo stop already has one durable effect owner",
+                    )
                 self._call(["stop", observation.agent_id, "--json"])
             elif command is RuntimeCommand.FENCE:
+                if record.get("pending_fence") is True:
+                    return _RuntimeFailure(
+                        "RUNTIME_MATERIALIZATION_PENDING",
+                        "Paseo fence already has one durable effect owner",
+                    )
                 pending_before = deepcopy(record)
-                self._persist_record_update(
-                    record, lambda: record.__setitem__("pending_fence", True)
+                fence_claim_id = uuid4().hex
+                claimed = self._claim_record_update(
+                    record,
+                    already_claimed=lambda current: current.get("pending_fence") is True,
+                    update=lambda updated: updated.update(
+                        {
+                            "pending_fence": True,
+                            "pending_fence_claim_id": fence_claim_id,
+                            "pending_fence_quiesced": False,
+                        }
+                    ),
                 )
+                if not claimed:
+                    pending_before = None
+                    fence_claim_id = None
+                    return _RuntimeFailure(
+                        "RUNTIME_MATERIALIZATION_PENDING",
+                        "Paseo fence already has one durable effect owner",
+                    )
+                fence_provider_call_started = True
                 self._client.update_labels(observation.agent_id, {"gwo.runtime_fenced": "true"})
             elif command is RuntimeCommand.RETIRE:
+                pending_before = deepcopy(record)
+                claimed = self._claim_record_update(
+                    record,
+                    already_claimed=lambda current: current.get("pending_retire") is True,
+                    update=lambda updated: updated.__setitem__("pending_retire", True),
+                )
+                if not claimed:
+                    pending_before = None
+                    return _RuntimeFailure(
+                        "RUNTIME_MATERIALIZATION_PENDING",
+                        "Paseo retirement already has one durable effect owner",
+                    )
                 self._call(["archive", observation.agent_id, "--force", "--json"])
             return _CommandReceipt(stable_action_id, command)
         except Exception as error:
-            if (
+            definitive_rejection = (
                 pending_before is not None
                 and self._is_definitive_command_rejection(error)
-            ):
+            )
+            if definitive_rejection:
                 try:
                     self._restore_pending_after_definitive_rejection(record, pending_before)
                 except Exception as rollback_error:
                     return self._failure(rollback_error)
+            elif fence_provider_call_started and fence_claim_id is not None:
+                try:
+                    self._mark_fence_claim_quiesced(record, fence_claim_id)
+                except Exception:
+                    # Failure to persist quiescence leaves the exclusive
+                    # in-flight claim intact, which is safe and restartable.
+                    # Keep the provider's original failure taxonomy.
+                    pass
             return self._failure(error)
 
     def events(self, after_cursor: str | None) -> _RuntimeEventPage | _RuntimeFailure:
         try:
-            start = 0 if after_cursor is None else int(after_cursor)
-            if start < 0:
+            cursor = 0 if after_cursor is None else int(after_cursor)
+            if cursor < 0:
                 raise ValueError("event cursor cannot be negative")
-            changed = False
-            for stable_action_id, record in sorted(self._actions.items()):
+            self._refresh()
+            observed_states: list[tuple[str, str, str]] = []
+            for stable_action_id in sorted(self._actions):
                 observation = self.observe(stable_action_id)
                 if isinstance(observation, _RuntimeFailure):
                     return observation
@@ -2538,22 +3407,42 @@ class _PaseoRuntimeProviderAdapter:
                     ),
                 }
                 state_digest = digest_value(state)
-                if record.get("wake_state_digest") == state_digest:
-                    continue
-                record["wake_state_digest"] = state_digest
-                self._events.append(
-                    _RuntimeEvent(
-                        cursor=str(len(self._events) + 1),
-                        stable_action_id=stable_action_id,
-                        kind=f"state:{observation.lifecycle}",
-                    )
+                observed_states.append(
+                    (stable_action_id, state_digest, observation.lifecycle)
                 )
-                changed = True
-            if changed:
-                self._save()
+
+            def commit(state: dict[str, Any]) -> None:
+                for stable_action_id, state_digest, lifecycle in observed_states:
+                    record = state["actions"].get(stable_action_id)
+                    if not isinstance(record, dict):
+                        continue
+                    if record.get("wake_state_digest") == state_digest:
+                        continue
+                    record["wake_state_digest"] = state_digest
+                    event_cursor = state["next_event_cursor"]
+                    state["next_event_cursor"] = event_cursor + 1
+                    state["events"].append(
+                        _RuntimeEvent(
+                            cursor=str(event_cursor),
+                            stable_action_id=stable_action_id,
+                            kind=f"state:{lifecycle}",
+                        )
+                    )
+                    del state["events"][:-_MAXIMUM_RUNTIME_EVENTS]
+
+            self._transact(commit)
+            available = [
+                event for event in self._events if int(event.cursor) > cursor
+            ]
+            page = tuple(available[:_MAXIMUM_RUNTIME_EVENT_PAGE])
+            latest_cursor = self._next_event_cursor - 1
             return _RuntimeEventPage(
-                events=tuple(self._events[start:]),
-                next_cursor=(None if not self._events else str(len(self._events))),
+                events=page,
+                next_cursor=(
+                    str(int(page[-1].cursor))
+                    if page
+                    else (None if latest_cursor == 0 else str(latest_cursor))
+                ),
             )
         except (TypeError, ValueError):
             return _RuntimeFailure("RUNTIME_EVENT_CURSOR_INVALID", "event cursor is invalid")
@@ -2687,6 +3576,8 @@ class RuntimeGateway:
         | None = None,
     ):
         self._store_path = Path(store_path)
+        self._journal = _V3JsonJournal(self._store_path)
+        self._pending_save_data: dict[str, Any] | None = None
         # Underscored parameters are internal/test composition hooks. Semantic
         # callers construct the default production Gateway through
         # build_runtime_gateway and never receive this Provider seam.
@@ -2710,6 +3601,7 @@ class RuntimeGateway:
                 "RUNTIME_PREFLIGHT_SUBJECT_INVALID",
                 "planning preflight accepts CampaignPlanningSubject only",
             )
+        self._refresh()
         # Resolve and statically validate without persisting a Campaign first:
         # a production host/context/profile defect must be a pure preflight
         # failure, never a partial campaign claim.
@@ -2738,10 +3630,14 @@ class RuntimeGateway:
             candidate_overrides,
         )
         self._validate_static_assignment(subject, assignment)
-        campaign = self._campaign(subject, overrides)
+        campaign_value = {
+            "repository": subject.repository,
+            "campaign_key": subject.campaign_key,
+            "overrides": candidate_overrides,
+        }
         binding = {
             "subject_digest": subject.digest,
-            "campaign_overrides_digest": digest_value(campaign["overrides"]),
+            "campaign_overrides_digest": digest_value(candidate_overrides),
             "assignment": assignment,
         }
         receipt_digest = digest_value(
@@ -2762,16 +3658,44 @@ class RuntimeGateway:
                 ),
             }
         )
-        existing = self._data["preflights"].get(subject.stable_action_id)
         expected = {**binding, "receipt_digest": receipt_digest}
-        if existing is not None and existing != expected:
-            raise RuntimeGatewayError(
-                "RUNTIME_PREFLIGHT_IDENTITY_MISMATCH",
-                "stable planning action is already bound to another subject, options, or configuration",
-            )
-        if existing is None:
-            self._data["preflights"][subject.stable_action_id] = expected
-            self._save()
+
+        def commit(data: dict[str, Any]) -> None:
+            durable_campaign = data["campaigns"].get(subject.campaign_handle)
+            if durable_campaign is not None:
+                if (
+                    durable_campaign.get("repository") != subject.repository
+                    or durable_campaign.get("campaign_key") != subject.campaign_key
+                ):
+                    raise RuntimeGatewayError(
+                        "RUNTIME_CAMPAIGN_IDENTITY_MISMATCH",
+                        "Campaign handle was read back for another repository or Campaign key",
+                    )
+                if (
+                    overrides is not None
+                    and durable_campaign.get("overrides") != overrides.canonical()
+                ):
+                    raise RuntimeGatewayError(
+                        "RUNTIME_CAMPAIGN_IDENTITY_MISMATCH",
+                        "Campaign handle was read back with different Runtime overrides",
+                    )
+                if durable_campaign.get("overrides") != candidate_overrides:
+                    raise RuntimeGatewayError(
+                        "RUNTIME_PREFLIGHT_IDENTITY_MISMATCH",
+                        "Campaign Runtime configuration changed during preflight",
+                    )
+            else:
+                data["campaigns"][subject.campaign_handle] = deepcopy(campaign_value)
+            durable_preflight = data["preflights"].get(subject.stable_action_id)
+            if durable_preflight is not None and durable_preflight != expected:
+                raise RuntimeGatewayError(
+                    "RUNTIME_PREFLIGHT_IDENTITY_MISMATCH",
+                    "stable planning action is already bound to another subject, options, or configuration",
+                )
+            if durable_preflight is None:
+                data["preflights"][subject.stable_action_id] = deepcopy(expected)
+
+        self._transact(commit)
         return PlanningPreflightReceipt(
             subject_digest=subject.digest,
             stable_action_id=subject.stable_action_id,
@@ -2792,6 +3716,7 @@ class RuntimeGateway:
                 "RUNTIME_SUBJECT_INVALID",
                 "RuntimeGateway accepts only Campaign Planning and Plan-Revision Work Run subjects",
             )
+        self._refresh()
         if isinstance(subject, CampaignPlanningSubject):
             persisted_preflight = self._require_preflight(subject, preflight)
         elif preflight is not None:
@@ -2807,7 +3732,9 @@ class RuntimeGateway:
         self._validate_static_assignment(subject, record)
         observation_or_failure = self._observe(subject.stable_action_id)
         if isinstance(observation_or_failure, _RuntimeFailure):
-            if not observation_or_failure.authoritative_absence:
+            if not self._is_authoritative_absence(
+                observation_or_failure, subject.stable_action_id
+            ):
                 self._raise_failure(observation_or_failure)
             if self._record_has_materialization_history(record):
                 raise RuntimeGatewayError(
@@ -2831,7 +3758,12 @@ class RuntimeGateway:
                 observation_or_failure = self._observe(subject.stable_action_id)
                 if isinstance(observation_or_failure, (_PreparedRuntimeObservation, _BoundRuntimeObservation)):
                     pass
-                elif isinstance(observation_or_failure, _RuntimeFailure) and observation_or_failure.authoritative_absence:
+                elif (
+                    isinstance(observation_or_failure, _RuntimeFailure)
+                    and self._is_authoritative_absence(
+                        observation_or_failure, subject.stable_action_id
+                    )
+                ):
                     self._raise_failure(prepared)
                 elif isinstance(observation_or_failure, _RuntimeFailure):
                     self._raise_failure(observation_or_failure)
@@ -2904,6 +3836,7 @@ class RuntimeGateway:
             raise RuntimeGatewayError(
                 "RUNTIME_COMMAND_INVALID", "Runtime command is outside the closed union"
             )
+        self._refresh()
         record = self._data["actions"].get(stable_action_id)
         if not isinstance(record, dict):
             raise RuntimeGatewayError("RUNTIME_ACTION_UNKNOWN", "stable action is unknown")
@@ -2980,38 +3913,6 @@ class RuntimeGateway:
         self._record_observation(record, observation)
         return self._progress_receipt(subject, observation, command=command)
 
-    def _campaign(
-        self,
-        subject: CampaignPlanningSubject,
-        overrides: CampaignStartRuntimeOverrides | None,
-    ) -> dict[str, Any]:
-        existing = self._data["campaigns"].get(subject.campaign_handle)
-        if existing is not None and overrides is None:
-            if (
-                existing.get("repository") != subject.repository
-                or existing.get("campaign_key") != subject.campaign_key
-            ):
-                raise RuntimeGatewayError(
-                    "RUNTIME_CAMPAIGN_IDENTITY_MISMATCH",
-                    "Campaign handle was read back for another repository or Campaign key",
-                )
-            return existing
-        overrides = overrides or CampaignStartRuntimeOverrides()
-        value = {
-            "repository": subject.repository,
-            "campaign_key": subject.campaign_key,
-            "overrides": overrides.canonical(),
-        }
-        if existing is not None and existing != value:
-            raise RuntimeGatewayError(
-                "RUNTIME_CAMPAIGN_IDENTITY_MISMATCH",
-                "Campaign handle was read back with different Runtime overrides",
-            )
-        if existing is None:
-            self._data["campaigns"][subject.campaign_handle] = value
-            self._save()
-        return value if existing is None else existing
-
     def _assignment_for_progress(
         self,
         subject: RuntimeSubject,
@@ -3062,14 +3963,6 @@ class RuntimeGateway:
     def _ensure_assignment(
         self, subject: RuntimeSubject, assignment: dict[str, Any]
     ) -> dict[str, Any]:
-        existing = self._data["actions"].get(subject.stable_action_id)
-        if existing is not None:
-            if existing.get("subject_digest") != subject.digest:
-                raise RuntimeGatewayError(
-                    "RUNTIME_ACTION_IDENTITY_MISMATCH",
-                    "stable action was already bound to another Runtime subject",
-                )
-            return existing
         self._validate_static_assignment(subject, assignment)
         prompt_digest = (
             subject.planning_request_artifact_digest
@@ -3091,11 +3984,35 @@ class RuntimeGateway:
             "lifecycle": None,
             "planning_output_artifact_digest": None,
             "observation_digest": None,
-            "observations": [],
+            "materialization_observed": False,
         }
-        self._data["actions"][subject.stable_action_id] = record
-        self._save()
-        return record
+        identity_fields = (
+            "subject",
+            "subject_digest",
+            "selector",
+            "configuration_source",
+            "profile_digest",
+            "availability_fallback_profile_digest",
+            "fallback_selected",
+            "prompt_artifact_digest",
+        )
+
+        def commit(data: dict[str, Any]) -> None:
+            existing = data["actions"].get(subject.stable_action_id)
+            if existing is None:
+                data["actions"][subject.stable_action_id] = deepcopy(record)
+                return
+            if not isinstance(existing, dict) or any(
+                existing.get(field_name) != record[field_name]
+                for field_name in identity_fields
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_ACTION_IDENTITY_MISMATCH",
+                    "stable action was already bound to another Runtime subject or assignment",
+                )
+
+        self._transact(commit)
+        return self._data["actions"][subject.stable_action_id]
 
     def _resolve_assignment(
         self,
@@ -3179,11 +4096,11 @@ class RuntimeGateway:
 
     @staticmethod
     def _record_has_materialization_history(record: Mapping[str, Any]) -> bool:
-        observations = record.get("observations")
         return (
-            isinstance(observations, list)
-            and bool(observations)
-        ) or record.get("binding_ref") is not None or record.get("lifecycle") is not None
+            record.get("materialization_observed") is True
+            or record.get("binding_ref") is not None
+            or record.get("lifecycle") is not None
+        )
 
     def _resolve_input_artifacts(
         self, subject: RuntimeSubject
@@ -3230,14 +4147,33 @@ class RuntimeGateway:
                 "RUNTIME_PROVIDER_PROTOCOL_INVALID",
                 "Runtime provider observation failed",
             )
-        if isinstance(
-            result,
-            (_PreparedRuntimeObservation, _BoundRuntimeObservation, _RuntimeFailure),
-        ):
+        if type(result) in {_PreparedRuntimeObservation, _BoundRuntimeObservation}:
+            return result
+        if type(result) is _RuntimeFailure:
+            if (
+                result.code == "RUNTIME_ACTION_ABSENT"
+                or result.authoritative_absence is not False
+            ) and not self._is_authoritative_absence(result, stable_action_id):
+                return _RuntimeFailure(
+                    "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+                    "Runtime provider returned malformed absence evidence",
+                )
             return result
         return _RuntimeFailure(
             "RUNTIME_PROVIDER_PROTOCOL_INVALID",
             "Runtime provider observation result is invalid",
+        )
+
+    @staticmethod
+    def _is_authoritative_absence(
+        failure: _RuntimeFailure, stable_action_id: str
+    ) -> bool:
+        return (
+            type(failure) is _RuntimeFailure
+            and failure.code == "RUNTIME_ACTION_ABSENT"
+            and failure.detail == "authoritative stable-action absence"
+            and failure.stable_action_id == stable_action_id
+            and failure.authoritative_absence is True
         )
 
     def _prepare(self, spec: _RuntimeActionSpec) -> _PrepareReceipt | _RuntimeFailure:
@@ -3439,23 +4375,45 @@ class RuntimeGateway:
     ) -> None:
         canonical = asdict(observation)
         observation_digest = digest_value(canonical)
-        record.update(
-            {
-                "binding_ref": observation.binding_ref,
-                "lifecycle": observation.lifecycle,
-                "planning_output_artifact_digest": getattr(
-                    observation, "planning_output_artifact_digest", None
-                ),
-                "observation_digest": observation_digest,
-            }
-        )
-        if observation_digest not in {
-            item["digest"] for item in record["observations"]
-        }:
-            record["observations"].append(
-                {"digest": observation_digest, "observation": canonical}
+        stable_action_id = observation.stable_action_id
+        expected_subject = record.get("subject_digest")
+        expected_profile = record.get("profile_digest")
+        expected_observation = record.get("observation_digest")
+
+        def commit(data: dict[str, Any]) -> dict[str, Any]:
+            current = data["actions"].get(stable_action_id)
+            if (
+                not isinstance(current, dict)
+                or current.get("subject_digest") != expected_subject
+                or current.get("profile_digest") != expected_profile
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_ACTION_IDENTITY_MISMATCH",
+                    "Runtime observation no longer binds the persisted action identity",
+                )
+            durable_observation = current.get("observation_digest")
+            if durable_observation not in {expected_observation, observation_digest}:
+                raise RuntimeGatewayError(
+                    "RUNTIME_ACTION_STATE_CHANGED",
+                    "Runtime observation CAS lost to a newer durable readback",
+                )
+            current.update(
+                {
+                    "binding_ref": observation.binding_ref,
+                    "lifecycle": observation.lifecycle,
+                    "planning_output_artifact_digest": getattr(
+                        observation, "planning_output_artifact_digest", None
+                    ),
+                    "observation_digest": observation_digest,
+                    "materialization_observed": True,
+                }
             )
-        self._save()
+            current.pop("observations", None)
+            return deepcopy(current)
+
+        updated = self._transact(commit)
+        record.clear()
+        record.update(updated)
 
     def _require_bound_observation(self, stable_action_id: str) -> _BoundRuntimeObservation:
         observation = self._observe(stable_action_id)
@@ -3608,14 +4566,13 @@ class RuntimeGateway:
         )
 
     def _load(self) -> dict[str, Any]:
-        if not self._store_path.exists():
+        with self._journal.exclusive():
+            return self._load_unlocked()
+
+    def _load_unlocked(self) -> dict[str, Any]:
+        value = self._journal.read_unlocked()
+        if value is None:
             return {"schema_version": 1, "campaigns": {}, "actions": {}, "preflights": {}}
-        try:
-            value = json.loads(self._store_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise RuntimeGatewayError(
-                "RUNTIME_STORE_INVALID", "RuntimeGateway durable record is unreadable"
-            ) from error
         if (
             not isinstance(value, dict)
             or value.get("schema_version") != 1
@@ -3624,13 +4581,49 @@ class RuntimeGateway:
             raise RuntimeGatewayError(
                 "RUNTIME_STORE_INVALID", "RuntimeGateway durable record has an unknown schema"
             )
-        return value
+        normalized = deepcopy(value)
+        for record in normalized["actions"].values():
+            if not isinstance(record, dict):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID", "RuntimeGateway action record is invalid"
+                )
+            legacy_observations = record.pop("observations", None)
+            if "materialization_observed" not in record:
+                record["materialization_observed"] = bool(legacy_observations)
+            if type(record["materialization_observed"]) is not bool:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway materialization history is invalid",
+                )
+        return normalized
+
+    def _refresh(self) -> None:
+        with self._journal.exclusive():
+            self._data = self._load_unlocked()
+
+    def _transact(self, mutation: Callable[[dict[str, Any]], Any]) -> Any:
+        with self._journal.exclusive():
+            durable = self._load_unlocked()
+            candidate = deepcopy(durable)
+            try:
+                result = mutation(candidate)
+                self._pending_save_data = candidate
+                self._save()
+            except Exception:
+                try:
+                    self._data = self._load_unlocked()
+                except RuntimeGatewayError:
+                    self._data = durable
+                raise
+            finally:
+                self._pending_save_data = None
+            self._data = candidate
+            return result
 
     def _save(self) -> None:
-        self._store_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._store_path.with_suffix(self._store_path.suffix + ".tmp")
-        temporary.write_bytes(canonical_bytes(self._data))
-        temporary.replace(self._store_path)
+        self._journal.replace_unlocked(
+            self._data if self._pending_save_data is None else self._pending_save_data
+        )
 
 
 def _mapping_from_value(value: object) -> ProfileMapping:
@@ -3716,6 +4709,7 @@ class _InMemoryRuntimeProviderAdapter:
         self._artifacts = artifacts
         self._actions: dict[str, _InMemoryAction] = {}
         self._events: list[_RuntimeEvent] = []
+        self._next_event_cursor = 1
         self._lose_prepare_ack_once = lose_prepare_ack_once
         self._lose_command_ack_once = lose_command_ack_once
         self._pending_permissions = {
@@ -3736,6 +4730,24 @@ class _InMemoryRuntimeProviderAdapter:
         self._artifacts.get(action.spec.prompt_artifact.digest)
         for artifact in action.spec.input_artifacts:
             self._artifacts.get(artifact.digest)
+
+    def _complete_action(self, action: _InMemoryAction) -> None:
+        """Publish output only when the deterministic action actually completes."""
+
+        action.output_artifact_digest = self._artifacts.put_canonical(
+            {
+                "schema_version": "gwo.runtime.output.v1",
+                "subject_digest": action.spec.subject_digest,
+                "stable_action_id": action.spec.stable_action_id,
+                "authority_digest": action.spec.subject.authority_digest,
+                "payload": {
+                    "input_artifact_digests": [
+                        artifact.digest for artifact in action.spec.input_artifacts
+                    ]
+                },
+            }
+        ).digest
+        action.lifecycle = "completed"
 
     def prepare(self, spec: _RuntimeActionSpec) -> _PrepareReceipt | _RuntimeFailure:
         existing = self._actions.get(spec.stable_action_id)
@@ -3886,6 +4898,15 @@ class _InMemoryRuntimeProviderAdapter:
             return _RuntimeFailure(
                 "RUNTIME_COMMAND_INVALID", "only start is allowed before Runtime binding exists"
             )
+        if (
+            command in {RuntimeCommand.PARK, RuntimeCommand.INTERRUPT}
+            and action.lifecycle == "parked"
+        ):
+            return _CommandReceipt(action.spec.stable_action_id, command)
+        if command is RuntimeCommand.FENCE and action.fenced is True:
+            return _CommandReceipt(action.spec.stable_action_id, command)
+        if command is RuntimeCommand.RETIRE and action.lifecycle == "retired":
+            return _CommandReceipt(action.spec.stable_action_id, command)
         if type(command) is PermissionResponse:
             matching = [
                 request
@@ -3934,8 +4955,8 @@ class _InMemoryRuntimeProviderAdapter:
                 subject_digest=action.spec.subject.digest,
                 binding_ref=action.binding_ref,
             )
-            if not action.pending_permissions and action.output_artifact_digest is not None:
-                action.lifecycle = "completed"
+            if not action.pending_permissions:
+                self._complete_action(action)
         if command is RuntimeCommand.START:
             if action.lifecycle != "prepared":
                 return _RuntimeFailure(
@@ -3951,22 +4972,11 @@ class _InMemoryRuntimeProviderAdapter:
             # permission keeps the semantic action active.  Match the
             # production normalization and expose a Bound ``running`` state
             # until the pending request is resolved.
-            action.lifecycle = (
-                "running" if action.pending_permissions else "completed"
-            )
-            action.output_artifact_digest = self._artifacts.put_canonical(
-                {
-                    "schema_version": "gwo.runtime.output.v1",
-                    "subject_digest": action.spec.subject_digest,
-                    "stable_action_id": action.spec.stable_action_id,
-                    "authority_digest": action.spec.subject.authority_digest,
-                    "payload": {
-                        "input_artifact_digests": [
-                            artifact.digest for artifact in action.spec.input_artifacts
-                        ]
-                    },
-                }
-            ).digest
+            if action.pending_permissions:
+                action.lifecycle = "running"
+                action.output_artifact_digest = None
+            else:
+                self._complete_action(action)
         elif command is RuntimeCommand.RESUME:
             if action.lifecycle != "parked" or action.fenced is not False:
                 return _RuntimeFailure(
@@ -3974,8 +4984,18 @@ class _InMemoryRuntimeProviderAdapter:
                 )
             action.lifecycle = "running"
         elif command is RuntimeCommand.PARK:
+            if action.lifecycle in {"completed", "retired"}:
+                return _RuntimeFailure(
+                    "RUNTIME_COMMAND_INVALID",
+                    "park requires an active Runtime binding",
+                )
             action.lifecycle = "parked"
         elif command is RuntimeCommand.INTERRUPT:
+            if action.lifecycle in {"completed", "retired"}:
+                return _RuntimeFailure(
+                    "RUNTIME_COMMAND_INVALID",
+                    "interrupt requires an active Runtime binding",
+                )
             action.lifecycle = "parked"
         elif command is RuntimeCommand.FENCE:
             action.fenced = True
@@ -3991,8 +5011,8 @@ class _InMemoryRuntimeProviderAdapter:
 
     def events(self, after_cursor: str | None) -> _RuntimeEventPage | _RuntimeFailure:
         try:
-            start = 0 if after_cursor is None else int(after_cursor)
-            if start < 0:
+            cursor = 0 if after_cursor is None else int(after_cursor)
+            if cursor < 0:
                 raise ValueError("event cursor cannot be negative")
         except (TypeError, ValueError):
             return _RuntimeFailure("RUNTIME_EVENT_CURSOR_INVALID", "event cursor is invalid")
@@ -4014,10 +5034,22 @@ class _InMemoryRuntimeProviderAdapter:
                 continue
             action.wake_state_digest = state_digest
             self._events.append(
-                _RuntimeEvent(str(len(self._events) + 1), stable_action_id, f"state:{observation.lifecycle}")
+                _RuntimeEvent(
+                    str(self._next_event_cursor),
+                    stable_action_id,
+                    f"state:{observation.lifecycle}",
+                )
             )
-        events = tuple(self._events[start:])
+            self._next_event_cursor += 1
+            del self._events[:-_MAXIMUM_RUNTIME_EVENTS]
+        available = [event for event in self._events if int(event.cursor) > cursor]
+        events = tuple(available[:_MAXIMUM_RUNTIME_EVENT_PAGE])
+        latest_cursor = self._next_event_cursor - 1
         return _RuntimeEventPage(
             events=events,
-            next_cursor=(None if not self._events else str(len(self._events))),
+            next_cursor=(
+                events[-1].cursor
+                if events
+                else (None if latest_cursor == 0 else str(latest_cursor))
+            ),
         )

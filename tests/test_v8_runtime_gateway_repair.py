@@ -4,9 +4,12 @@ from dataclasses import asdict, dataclass, replace
 from copy import deepcopy
 import inspect
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -429,8 +432,11 @@ def test_ambiguous_restart_never_reprepares_an_existing_action(tmp_path):
     ),
 )
 def test_transition_keeps_binding_private_for_bound_closed_commands(tmp_path, command):
-    gateway, store, _adapter = _gateway(tmp_path)
+    gateway, store, adapter = _gateway(tmp_path)
     subject = _put_subject_artifacts(store, _subject())
+    adapter._pending_permissions[subject.stable_action_id] = [
+        ("request:active", "write", "repository")
+    ]
     receipt = gateway.planning_preflight(subject)
     gateway.progress(subject, receipt)
 
@@ -444,6 +450,9 @@ def test_start_and_resume_require_their_exact_private_observation_states(tmp_pat
     gateway, store, adapter = _gateway(tmp_path)
     subject = _put_subject_artifacts(store, _subject())
     receipt = gateway.planning_preflight(subject)
+    adapter._pending_permissions[subject.stable_action_id] = [
+        ("request:active", "write", "repository")
+    ]
     record = gateway._assignment_for_progress(subject, gateway._require_preflight(subject, receipt))
     prompt, inputs = gateway._resolve_input_artifacts(subject)
     adapter.prepare(
@@ -465,6 +474,9 @@ def test_start_and_resume_require_their_exact_private_observation_states(tmp_pat
 def test_transition_readback_rejects_noop_command_receipts_and_fenced_resume(tmp_path):
     gateway, store, adapter = _gateway(tmp_path)
     subject = _put_subject_artifacts(store, _subject())
+    adapter._pending_permissions[subject.stable_action_id] = [
+        ("request:active", "write", "repository")
+    ]
     receipt = gateway.planning_preflight(subject)
     gateway.progress(subject, receipt)
     gateway.transition(subject.stable_action_id, RuntimeCommand.PARK)
@@ -494,7 +506,10 @@ def test_in_memory_conforms_for_permission_and_each_closed_transition(tmp_path):
     adapter = _InMemoryRuntimeProviderAdapter(
         store,
         pending_permissions={
-            subject.stable_action_id: (("request:one", "write", "repository:one"),)
+            subject.stable_action_id: (
+                ("request:one", "write", "repository:one"),
+                ("request:final", "write", "repository:two"),
+            )
         },
     )
     gateway = RuntimeGateway(
@@ -512,7 +527,10 @@ def test_in_memory_conforms_for_permission_and_each_closed_transition(tmp_path):
         subject.stable_action_id,
         PermissionResponse(request_id="request:one", decision="allow"),
     )
-    assert adapter.observe(subject.stable_action_id).permission_requests == ()
+    assert [
+        request.request_id
+        for request in adapter.observe(subject.stable_action_id).permission_requests
+    ] == ["request:final"]
     assert gateway.transition(subject.stable_action_id, RuntimeCommand.PARK).status == "parked"
     assert gateway.transition(subject.stable_action_id, RuntimeCommand.RESUME).status == "running"
     assert gateway.transition(subject.stable_action_id, RuntimeCommand.INTERRUPT).status == "parked"
@@ -1053,6 +1071,381 @@ def test_production_fence_timeout_after_effect_recovers_through_pending_intent(t
     assert adapter._actions[subject.stable_action_id]["pending_fence"] is False
 
 
+def test_production_fence_pre_effect_failure_clears_exact_absent_claim_and_retries(
+    tmp_path,
+):
+    (
+        store,
+        source,
+        _workspace,
+        client,
+        adapter,
+        subject,
+        _spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    action_id = subject.stable_action_id
+    adapter._persist_record_update(
+        adapter._actions[action_id],
+        lambda updated: updated.__setitem__(
+            "unrelated_reconciliation_marker", {"must": "survive"}
+        ),
+    )
+    native_update_labels = client.update_labels
+    update_attempts = 0
+    successful_updates = 0
+
+    def fail_once_before_effect(agent_id, labels):
+        nonlocal update_attempts, successful_updates
+        update_attempts += 1
+        if update_attempts == 1:
+            raise TimeoutError("label update failed before effect")
+        successful_updates += 1
+        return native_update_labels(agent_id, labels)
+
+    client.update_labels = fail_once_before_effect  # type: ignore[method-assign]
+    first = adapter.command(action_id, RuntimeCommand.FENCE)
+
+    assert isinstance(first, _RuntimeFailure)
+    assert first.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    durable_pending = json.loads(adapter._state_path.read_text(encoding="utf-8"))
+    assert durable_pending["actions"][action_id]["pending_fence"] is True
+    assert isinstance(
+        durable_pending["actions"][action_id]["pending_fence_claim_id"], str
+    )
+    assert durable_pending["actions"][action_id]["pending_fence_quiesced"] is True
+    assert durable_pending["actions"][action_id]["fenced"] is False
+    assert durable_pending["actions"][action_id][
+        "unrelated_reconciliation_marker"
+    ] == {"must": "survive"}
+
+    restarted = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=adapter._state_path,
+    )
+    restarted._save = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        OSError("negative fence reconciliation save failed")
+    )
+    failed_reconciliation = restarted.observe(action_id)
+
+    assert isinstance(failed_reconciliation, _RuntimeFailure)
+    assert failed_reconciliation.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    assert restarted._actions == durable_pending["actions"]
+    assert json.loads(adapter._state_path.read_text(encoding="utf-8")) == durable_pending
+
+    recovered = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=adapter._state_path,
+    )
+    exact_absence = recovered.observe(action_id)
+
+    assert not isinstance(exact_absence, _RuntimeFailure)
+    assert exact_absence.fenced is False
+    cleared = recovered._actions[action_id]
+    assert cleared["pending_fence"] is False
+    assert cleared["pending_fence_claim_id"] is None
+    assert cleared["pending_fence_quiesced"] is False
+    assert cleared["fenced"] is False
+    assert cleared["unrelated_reconciliation_marker"] == {"must": "survive"}
+
+    retried = recovered.command(action_id, RuntimeCommand.FENCE)
+    assert isinstance(retried, _CommandReceipt)
+    assert update_attempts == 2
+    assert successful_updates == 1
+    final = recovered.observe(action_id)
+    assert not isinstance(final, _RuntimeFailure)
+    assert final.fenced is True
+    assert recovered._actions[action_id]["pending_fence"] is False
+    assert recovered._actions[action_id]["pending_fence_claim_id"] is None
+    assert recovered._actions[action_id]["pending_fence_quiesced"] is False
+    assert recovered._actions[action_id]["unrelated_reconciliation_marker"] == {
+        "must": "survive"
+    }
+
+
+def test_inflight_fence_claim_cannot_be_cleared_or_reissued_until_owner_quiesces(
+    tmp_path,
+):
+    (
+        store,
+        source,
+        _workspace,
+        client,
+        owner,
+        subject,
+        _spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    contender = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=owner._state_path,
+    )
+    action_id = subject.stable_action_id
+    native_update_labels = client.update_labels
+    update_entered = threading.Event()
+    release_update = threading.Event()
+    update_attempts = 0
+    successful_updates = 0
+
+    def block_first_update_before_effect(agent_id, labels):
+        nonlocal update_attempts, successful_updates
+        update_attempts += 1
+        if update_attempts == 1:
+            update_entered.set()
+            assert release_update.wait(5)
+            raise TimeoutError("in-flight label update failed before effect")
+        successful_updates += 1
+        return native_update_labels(agent_id, labels)
+
+    client.update_labels = block_first_update_before_effect  # type: ignore[method-assign]
+    owner_results: list[object] = []
+    worker = threading.Thread(
+        target=lambda: owner_results.append(
+            owner.command(action_id, RuntimeCommand.FENCE)
+        )
+    )
+    worker.start()
+    assert update_entered.wait(5)
+    try:
+        while_inflight = contender.observe(action_id)
+        duplicate = contender.command(action_id, RuntimeCommand.FENCE)
+    finally:
+        release_update.set()
+    worker.join(10)
+
+    assert not worker.is_alive()
+    assert not isinstance(while_inflight, _RuntimeFailure)
+    assert while_inflight.fenced is False
+    assert isinstance(duplicate, _RuntimeFailure)
+    assert duplicate.code == "RUNTIME_MATERIALIZATION_PENDING"
+    assert update_attempts == 1
+    assert len(owner_results) == 1
+    assert isinstance(owner_results[0], _RuntimeFailure)
+    assert owner_results[0].code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    quiesced = json.loads(owner._state_path.read_text(encoding="utf-8"))[
+        "actions"
+    ][action_id]
+    assert quiesced["pending_fence"] is True
+    assert isinstance(quiesced["pending_fence_claim_id"], str)
+    assert quiesced["pending_fence_quiesced"] is True
+    assert quiesced["fenced"] is False
+
+    recovered = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=owner._state_path,
+    )
+    exact_absence = recovered.observe(action_id)
+    assert not isinstance(exact_absence, _RuntimeFailure)
+    assert recovered._actions[action_id]["pending_fence"] is False
+    assert recovered._actions[action_id]["pending_fence_claim_id"] is None
+    assert recovered._actions[action_id]["pending_fence_quiesced"] is False
+
+    retried = recovered.command(action_id, RuntimeCommand.FENCE)
+    assert isinstance(retried, _CommandReceipt)
+    assert update_attempts == 2
+    assert successful_updates == 1
+    final = recovered.observe(action_id)
+    assert not isinstance(final, _RuntimeFailure)
+    assert final.fenced is True
+
+
+def test_successful_fence_call_without_label_readback_never_gets_negative_retry(
+    tmp_path,
+):
+    (
+        _store,
+        _source,
+        _workspace,
+        client,
+        adapter,
+        subject,
+        _spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    action_id = subject.stable_action_id
+    update_attempts = 0
+
+    def accept_without_visible_effect(_agent_id, _labels):
+        nonlocal update_attempts
+        update_attempts += 1
+
+    client.update_labels = accept_without_visible_effect  # type: ignore[method-assign]
+    accepted = adapter.command(action_id, RuntimeCommand.FENCE)
+    assert isinstance(accepted, _CommandReceipt)
+
+    absent = adapter.observe(action_id)
+    assert not isinstance(absent, _RuntimeFailure)
+    assert absent.fenced is False
+    assert adapter._actions[action_id]["pending_fence"] is True
+    assert isinstance(adapter._actions[action_id]["pending_fence_claim_id"], str)
+    assert adapter._actions[action_id]["pending_fence_quiesced"] is False
+    retry = adapter.command(action_id, RuntimeCommand.FENCE)
+    assert isinstance(retry, _RuntimeFailure)
+    assert retry.code == "RUNTIME_MATERIALIZATION_PENDING"
+    assert update_attempts == 1
+
+
+def test_legacy_pending_fence_without_quiesced_proof_never_gets_takeover(tmp_path):
+    (
+        store,
+        source,
+        _workspace,
+        client,
+        adapter,
+        subject,
+        _spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    action_id = subject.stable_action_id
+
+    def make_legacy_pending(updated):
+        updated["pending_fence"] = True
+        updated.pop("pending_fence_quiesced", None)
+
+    adapter._persist_record_update(adapter._actions[action_id], make_legacy_pending)
+    update_attempts = 0
+
+    def record_update(_agent_id, _labels):
+        nonlocal update_attempts
+        update_attempts += 1
+
+    client.update_labels = record_update  # type: ignore[method-assign]
+    restarted = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=adapter._state_path,
+    )
+
+    observed = restarted.observe(action_id)
+    assert not isinstance(observed, _RuntimeFailure)
+    assert observed.fenced is False
+    assert restarted._actions[action_id]["pending_fence"] is True
+    assert "pending_fence_claim_id" not in restarted._actions[action_id]
+    assert "pending_fence_quiesced" not in restarted._actions[action_id]
+    retry = restarted.command(action_id, RuntimeCommand.FENCE)
+    assert isinstance(retry, _RuntimeFailure)
+    assert retry.code == "RUNTIME_MATERIALIZATION_PENDING"
+    assert update_attempts == 0
+
+
+@pytest.mark.parametrize(
+    ("pending", "claim_id", "quiesced"),
+    (
+        (False, None, True),
+        (True, None, True),
+        (False, "residual-fence-claim", False),
+    ),
+)
+def test_invalid_fence_quiescence_evidence_fails_closed(
+    tmp_path, pending, claim_id, quiesced
+):
+    (
+        _store,
+        _source,
+        _workspace,
+        _client,
+        adapter,
+        subject,
+        _spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    action_id = subject.stable_action_id
+    adapter._persist_record_update(
+        adapter._actions[action_id],
+        lambda updated: updated.update(
+            {
+                "pending_fence": pending,
+                "pending_fence_claim_id": claim_id,
+                "pending_fence_quiesced": quiesced,
+            }
+        ),
+    )
+
+    observed = adapter.observe(action_id)
+
+    assert isinstance(observed, _RuntimeFailure)
+    assert observed.code == "RUNTIME_PROVIDER_PROTOCOL_INVALID"
+
+
+def test_label_present_observer_wins_before_fence_owner_returns_ack_loss(
+    tmp_path,
+):
+    (
+        store,
+        source,
+        _workspace,
+        client,
+        owner,
+        subject,
+        _spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    observer = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=owner._state_path,
+    )
+    action_id = subject.stable_action_id
+    native_update_labels = client.update_labels
+    effect_visible = threading.Event()
+    release_owner = threading.Event()
+    update_attempts = 0
+
+    def apply_then_block_before_ack_loss(agent_id, labels):
+        nonlocal update_attempts
+        update_attempts += 1
+        native_update_labels(agent_id, labels)
+        effect_visible.set()
+        assert release_owner.wait(5)
+        raise TimeoutError("label effect applied but acknowledgement lost")
+
+    client.update_labels = apply_then_block_before_ack_loss  # type: ignore[method-assign]
+    owner_results: list[object] = []
+    worker = threading.Thread(
+        target=lambda: owner_results.append(
+            owner.command(action_id, RuntimeCommand.FENCE)
+        )
+    )
+    worker.start()
+    assert effect_visible.wait(5)
+    try:
+        converged = observer.observe(action_id)
+    finally:
+        release_owner.set()
+    worker.join(10)
+
+    assert not worker.is_alive()
+    assert not isinstance(converged, _RuntimeFailure)
+    assert converged.fenced is True
+    assert len(owner_results) == 1
+    assert isinstance(owner_results[0], _RuntimeFailure)
+    assert owner_results[0].code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    durable = json.loads(owner._state_path.read_text(encoding="utf-8"))["actions"][
+        action_id
+    ]
+    assert durable["fenced"] is True
+    assert durable["pending_fence"] is False
+    assert durable["pending_fence_claim_id"] is None
+    assert durable["pending_fence_quiesced"] is False
+    assert update_attempts == 1
+
+
 def test_production_start_ack_loss_with_temporary_absence_never_relaunches(tmp_path):
     store = ArtifactStore(tmp_path / "artifacts")
     source, workspace = _repository_worktree(tmp_path)
@@ -1277,7 +1670,10 @@ def test_private_adapter_shared_lifecycle_conformance(adapter_kind, tmp_path):
         adapter = _InMemoryRuntimeProviderAdapter(
             store,
             pending_permissions={
-                subject.stable_action_id: (("request:one", "write", "repository:one"),)
+                subject.stable_action_id: (
+                    ("permit01-one", "write", "repository:one"),
+                    ("permit02-final", "write", "repository:two"),
+                )
             },
         )
     else:
@@ -1300,25 +1696,36 @@ def test_private_adapter_shared_lifecycle_conformance(adapter_kind, tmp_path):
     assert [event.kind for event in initial_events.events] == ["state:prepared"]
     assert adapter.events(initial_events.next_cursor).events == ()
 
-    assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.START), _RuntimeFailure)
     if client is not None:
-        client.permissions = [_paseo_permission("request:one")]
+        client.permissions = [
+            _paseo_permission("permit01-one"),
+            _paseo_permission("permit02-final"),
+        ]
+    assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.START), _RuntimeFailure)
     bound = adapter.observe(subject.stable_action_id)
     assert not isinstance(bound, _RuntimeFailure)
     assert bound.binding_ref is not None
     assert bound.lifecycle == "running"
-    assert [request.request_id for request in bound.permission_requests] == ["request:one"]
+    assert [request.request_id for request in bound.permission_requests] == [
+        "permit01-one",
+        "permit02-final",
+    ]
+    assert bound.output_artifact_digest is None
 
     assert not isinstance(
         adapter.command(
             subject.stable_action_id,
-            PermissionResponse(request_id="request:one", decision="allow"),
+            PermissionResponse(request_id="permit01-one", decision="allow"),
         ),
         _RuntimeFailure,
     )
     after_permission = adapter.observe(subject.stable_action_id)
     assert not isinstance(after_permission, _RuntimeFailure)
-    assert after_permission.permission_requests == ()
+    assert [request.request_id for request in after_permission.permission_requests] == [
+        "permit02-final"
+    ]
+    assert after_permission.lifecycle == "running"
+    assert after_permission.output_artifact_digest is None
     assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.INTERRUPT), _RuntimeFailure)
     assert adapter.observe(subject.stable_action_id).lifecycle == "parked"
     assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.RESUME), _RuntimeFailure)
@@ -1327,6 +1734,43 @@ def test_private_adapter_shared_lifecycle_conformance(adapter_kind, tmp_path):
     assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.RESUME), _RuntimeFailure)
     assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.FENCE), _RuntimeFailure)
     assert adapter.observe(subject.stable_action_id).fenced is True
+
+    assert not isinstance(
+        adapter.command(
+            subject.stable_action_id,
+            PermissionResponse(request_id="permit02-final", decision="allow"),
+        ),
+        _RuntimeFailure,
+    )
+    if client is not None:
+        action_record = adapter._actions[subject.stable_action_id]
+        Path(action_record["result_file"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(action_record["result_file"]).write_bytes(
+            gateway_module.canonical_bytes(
+                {
+                    "schema_version": "gwo.runtime.output.v1",
+                    "subject_digest": subject.digest,
+                    "stable_action_id": subject.stable_action_id,
+                    "authority_digest": subject.authority_digest,
+                    "payload": {"completed": True},
+                }
+            )
+        )
+        client.agent.lifecycle = "idle"
+    completed = adapter.observe(subject.stable_action_id)
+    assert not isinstance(completed, _RuntimeFailure)
+    assert completed.lifecycle == "completed"
+    assert completed.output_artifact_digest is not None
+    stop_count = len(
+        [args for args in client.commands if args[0] == "stop"]
+    ) if client is not None else None
+    for invalid_command in (RuntimeCommand.PARK, RuntimeCommand.INTERRUPT):
+        invalid = adapter.command(subject.stable_action_id, invalid_command)
+        assert isinstance(invalid, _RuntimeFailure)
+        assert invalid.code == "RUNTIME_COMMAND_INVALID"
+    if client is not None:
+        assert len([args for args in client.commands if args[0] == "stop"]) == stop_count
+
     assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.RETIRE), _RuntimeFailure)
     assert adapter.observe(subject.stable_action_id).lifecycle == "retired"
     if client is not None:
@@ -1570,7 +2014,7 @@ def test_paseo_cli_argument_safety_and_length_prevent_subprocess(monkeypatch):
         calls.append(args)
         raise AssertionError("Paseo subprocess must not run")
 
-    monkeypatch.setattr(gateway_module.subprocess, "run", subprocess_should_not_run)
+    monkeypatch.setattr(gateway_module.subprocess, "Popen", subprocess_should_not_run)
     with pytest.raises(RuntimeGatewayError) as unsafe:
         transport._run(["inspect", "agent&bad", "--json"])
     assert unsafe.value.code == "RUNTIME_VENDOR_ARGUMENT_INVALID"
@@ -1892,11 +2336,29 @@ def test_production_permission_prefix_collision_and_bijection_mismatch_fail_clos
 
 @pytest.mark.parametrize("mutation", ("missing", "changed", "duplicate"))
 def test_prepared_workspace_registry_must_remain_exact(tmp_path, mutation):
-    _store, _source, workspace, client, adapter, subject, _spec = _prepared_paseo_adapter(tmp_path)
-    # This assertion targets Prepared state, not the Bound Agent join.
-    adapter._actions[subject.stable_action_id].pop("bound_agent_id", None)
-    adapter._actions[subject.stable_action_id].pop("pending_start", None)
-    client.agent = None
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=tmp_path / "paseo-actions.json",
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    assert not isinstance(
+        adapter.prepare(
+            _RuntimeActionSpec(
+                subject.stable_action_id,
+                subject,
+                _profile(),
+                prompt,
+                (prompt,),
+            )
+        ),
+        _RuntimeFailure,
+    )
     if mutation == "missing":
         client.workspaces = []
     elif mutation == "changed":
@@ -2375,26 +2837,19 @@ def test_production_preflight_validates_fallback_and_repository_context_before_p
 
 
 def test_paseo_nonzero_json_error_taxonomy_never_treats_permanent_rejection_as_transport(monkeypatch):
-    transport = _PaseoCliTransport("paseo")
-
-    def result_for(code):
-        return SimpleNamespace(
-            returncode=1,
-            stdout=json.dumps({"error": {"code": code, "message": "native detail"}}),
-            stderr="",
-        )
-
-    monkeypatch.setattr(gateway_module.subprocess, "run", lambda *_args, **_kwargs: result_for("DAEMON_NOT_RUNNING"))
-    with pytest.raises(RuntimeGatewayError) as daemon:
-        transport._run(["inspect", "agent:one", "--json"])
-    assert daemon.value.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    daemon = _PaseoCliTransport._nonzero_failure(
+        json.dumps({"error": {"code": "DAEMON_NOT_RUNNING", "message": "native detail"}}),
+        "",
+    )
+    assert daemon.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
 
     for code, expected in (("PERMISSION_NOT_FOUND", "RUNTIME_PERMISSION_REQUEST_UNKNOWN"), ("UNKNOWN_COMMAND", "RUNTIME_PROVIDER_COMMAND_FAILED")):
-        monkeypatch.setattr(gateway_module.subprocess, "run", lambda *_args, _code=code, **_kwargs: result_for(_code))
-        with pytest.raises(RuntimeGatewayError) as permanent:
-            transport._run(["inspect", "agent:one", "--json"])
-        assert permanent.value.code == expected
-        assert "native detail" not in permanent.value.detail
+        permanent = _PaseoCliTransport._nonzero_failure(
+            json.dumps({"error": {"code": code, "message": "native detail"}}),
+            "",
+        )
+        assert permanent.code == expected
+        assert "native detail" not in permanent.detail
 
 
 @pytest.mark.parametrize(
@@ -2880,7 +3335,13 @@ def test_workspace_success_receipt_failure_waits_for_fresh_readback_before_adopt
     assert client.workspaces != []
     assert adapter._actions == {}
     intent = adapter._workspace_intents[subject.stable_action_id]
-    assert set(intent) == {"repository_path", "base_commit", "slug", "spec_identity_digest"}
+    assert set(intent) == {
+        "repository_path",
+        "base_commit",
+        "slug",
+        "spec_identity_digest",
+        "phase",
+    }
     durable = json.loads(adapter._state_path.read_text(encoding="utf-8"))
     assert durable["workspace_intents"][subject.stable_action_id] == intent
     assert len([args for args in client.commands if args[:2] == ["workspace", "create"]]) == 1
@@ -2897,3 +3358,893 @@ def test_workspace_success_receipt_failure_waits_for_fresh_readback_before_adopt
     assert not isinstance(retry, _RuntimeFailure)
     assert subject.stable_action_id in restarted._actions
     assert len([args for args in client.commands if args[:2] == ["workspace", "create"]]) == 1
+
+
+def test_gateway_transaction_reloads_durable_cas_for_preconstructed_instances(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts", maximum_bytes=300_000)
+    first_subject = _put_subject_artifacts(store, _subject())
+    second_subject = replace(
+        first_subject,
+        snapshot_artifact_digest=store.put_canonical({"snapshot": "second"}).digest,
+    )
+    profile = _profile()
+    configuration = RuntimeConfiguration(
+        profiles={profile.digest: profile},
+        host_mappings={"coordinator": ProfileMapping(profile.digest)},
+    )
+    second_profile = replace(profile, name="preconstructed-contender")
+    second_configuration = RuntimeConfiguration(
+        profiles={second_profile.digest: second_profile},
+        host_mappings={"coordinator": ProfileMapping(second_profile.digest)},
+    )
+    first_adapter = _InMemoryRuntimeProviderAdapter(store)
+    second_adapter = _InMemoryRuntimeProviderAdapter(store)
+    journal = tmp_path / "gateway.journal"
+    first = RuntimeGateway(
+        store_path=journal,
+        _adapter=first_adapter,
+        configuration=configuration,
+        _artifacts=store,
+    )
+    # Construct the contender before the first writer commits.  Its in-memory
+    # view is intentionally stale and must not be allowed to overwrite CAS.
+    second = RuntimeGateway(
+        store_path=journal,
+        _adapter=second_adapter,
+        configuration=second_configuration,
+        _artifacts=store,
+    )
+
+    accepted = first.planning_preflight(first_subject)
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        second.planning_preflight(second_subject)
+
+    assert rejected.value.code == "RUNTIME_PREFLIGHT_IDENTITY_MISMATCH"
+    durable = json.loads(journal.read_text(encoding="utf-8"))
+    assert second._data == durable
+    restarted = RuntimeGateway(
+        store_path=journal,
+        _adapter=_InMemoryRuntimeProviderAdapter(store),
+        configuration=configuration,
+        _artifacts=store,
+    )
+    assert restarted.planning_preflight(first_subject) == accepted
+    assert restarted._data == durable
+
+
+def test_gateway_failed_assignment_transaction_never_publishes_or_prepares_on_retry(
+    tmp_path,
+):
+    gateway, store, adapter = _gateway(tmp_path)
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(subject)
+    durable_before = json.loads(gateway._store_path.read_text(encoding="utf-8"))
+    gateway._save = lambda: (_ for _ in ()).throw(OSError("replacement failed"))  # type: ignore[method-assign]
+
+    for _ in range(2):
+        with pytest.raises(OSError, match="replacement failed"):
+            gateway.progress(subject, preflight)
+        assert gateway._data == durable_before
+        assert adapter.prepare_calls == []
+        assert json.loads(gateway._store_path.read_text(encoding="utf-8")) == durable_before
+
+
+def test_gateway_failed_observation_transaction_never_reprepares_or_starts_on_retry(
+    tmp_path,
+):
+    gateway, store, adapter = _gateway(tmp_path)
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(subject)
+    native_save = gateway._save
+    saves = 0
+
+    def fail_observation_commits():
+        nonlocal saves
+        saves += 1
+        if saves >= 2:
+            raise OSError("observation replacement failed")
+        native_save()
+
+    gateway._save = fail_observation_commits  # type: ignore[method-assign]
+    with pytest.raises(OSError, match="observation replacement failed"):
+        gateway.progress(subject, preflight)
+    durable_after_assignment = json.loads(
+        gateway._store_path.read_text(encoding="utf-8")
+    )
+    assert gateway._data == durable_after_assignment
+    assert adapter.prepare_calls == [subject.stable_action_id]
+    assert adapter.created_agent_count == 0
+
+    with pytest.raises(OSError, match="observation replacement failed"):
+        gateway.progress(subject, preflight)
+    assert gateway._data == durable_after_assignment
+    assert adapter.prepare_calls == [subject.stable_action_id]
+    assert adapter.created_agent_count == 0
+
+
+@dataclass(frozen=True)
+class _RuntimeFailureSubclass(_RuntimeFailure):
+    unexpected: str = "unexpected"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        _RuntimeFailure(
+            "RUNTIME_ACTION_ABSENT",
+            "authoritative stable-action absence",
+            stable_action_id="planning:repair",
+            authoritative_absence=False,
+        ),
+        _RuntimeFailure(
+            "RUNTIME_ACTION_ABSENT",
+            "different detail",
+            stable_action_id="planning:repair",
+            authoritative_absence=True,
+        ),
+        _RuntimeFailure(
+            "RUNTIME_ACTION_ABSENT",
+            "authoritative stable-action absence",
+            stable_action_id="planning:other",
+            authoritative_absence=True,
+        ),
+        _RuntimeFailure(
+            "RUNTIME_TRANSPORT_UNAVAILABLE",
+            "authoritative stable-action absence",
+            stable_action_id="planning:repair",
+            authoritative_absence=True,
+        ),
+        _RuntimeFailureSubclass(
+            "RUNTIME_ACTION_ABSENT",
+            "authoritative stable-action absence",
+            stable_action_id="planning:repair",
+            authoritative_absence=True,
+        ),
+    ),
+)
+def test_initial_malformed_absence_never_authorizes_prepare(tmp_path, failure):
+    gateway, store, adapter = _gateway(tmp_path)
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(subject)
+    adapter.observe_failure = failure
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        gateway.progress(subject, preflight)
+
+    assert stopped.value.code == "RUNTIME_PROVIDER_PROTOCOL_INVALID"
+    assert adapter.prepare_calls == []
+
+
+def test_post_prepare_malformed_absence_uses_the_same_exact_predicate(tmp_path):
+    gateway, store, adapter = _gateway(tmp_path)
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(subject)
+    native_observe = adapter.observe
+    observations = 0
+
+    def malformed_second_observe(stable_action_id):
+        nonlocal observations
+        observations += 1
+        if observations == 1:
+            return _RuntimeFailure.absent(stable_action_id)
+        return _RuntimeFailure(
+            "RUNTIME_ACTION_ABSENT",
+            "different detail",
+            stable_action_id=stable_action_id,
+            authoritative_absence=True,
+        )
+
+    adapter.observe = malformed_second_observe  # type: ignore[method-assign]
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        gateway.progress(subject, preflight)
+
+    assert stopped.value.code == "RUNTIME_PROVIDER_PROTOCOL_INVALID"
+    assert adapter.prepare_calls == [subject.stable_action_id]
+    adapter.observe = native_observe  # type: ignore[method-assign]
+
+
+def test_workspace_intent_is_durable_before_the_first_paseo_readback(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    state_path = tmp_path / "paseo-actions.json"
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=state_path,
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))
+    native_run = client._run
+    first_readback_state = None
+
+    def inspect_durable_intent(args):
+        nonlocal first_readback_state
+        if first_readback_state is None:
+            first_readback_state = json.loads(state_path.read_text(encoding="utf-8"))
+        return native_run(args)
+
+    client._run = inspect_durable_intent  # type: ignore[method-assign]
+    result = adapter.prepare(spec)
+
+    assert not isinstance(result, _RuntimeFailure)
+    intent = first_readback_state["workspace_intents"][subject.stable_action_id]
+    assert intent["phase"] == "recorded"
+    assert intent["repository_path"] == str(source.resolve())
+    assert intent["slug"]
+    assert intent["spec_identity_digest"]
+
+
+def test_first_paseo_readback_failure_leaves_only_recorded_workspace_intent(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    state_path = tmp_path / "paseo-actions.json"
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=state_path,
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))
+    native_run = client._run
+
+    def fail_first_readback(args):
+        if args[0] == "ls":
+            raise OSError("first readback unavailable")
+        return native_run(args)
+
+    client._run = fail_first_readback  # type: ignore[method-assign]
+    failed = adapter.prepare(spec)
+
+    assert isinstance(failed, _RuntimeFailure)
+    assert failed.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    durable = json.loads(state_path.read_text(encoding="utf-8"))
+    assert durable["workspace_intents"][subject.stable_action_id]["phase"] == "recorded"
+    assert all(args[:2] != ["workspace", "create"] for args in client.commands)
+    restarted = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=state_path,
+    )
+    assert restarted._workspace_intents == durable["workspace_intents"]
+    assert all(args[:2] != ["workspace", "create"] for args in client.commands)
+
+
+def test_create_pending_restart_readback_never_reissues_workspace_create(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    state_path = tmp_path / "paseo-actions.json"
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=state_path,
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))
+    native_run = client._run
+    create_attempts = 0
+
+    def lose_create_ack_before_effect(args):
+        nonlocal create_attempts
+        if args[:2] == ["workspace", "create"]:
+            create_attempts += 1
+            raise TimeoutError("create acknowledgement lost")
+        return native_run(args)
+
+    client._run = lose_create_ack_before_effect  # type: ignore[method-assign]
+    failed = adapter.prepare(spec)
+    assert isinstance(failed, _RuntimeFailure)
+    assert create_attempts == 1
+    durable = json.loads(state_path.read_text(encoding="utf-8"))
+    assert durable["workspace_intents"][subject.stable_action_id]["phase"] == "create_pending"
+
+    restarted = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=state_path,
+    )
+    retry = restarted.prepare(spec)
+
+    assert isinstance(retry, _RuntimeFailure)
+    assert retry.code == "RUNTIME_MATERIALIZATION_PENDING"
+    assert create_attempts == 1
+
+
+def test_concurrent_workspace_claim_has_one_effect_owner_without_locking_provider(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    state_path = tmp_path / "paseo-actions.json"
+    context = {"owner/repository": RuntimeRepositoryContext(source, "main")}
+    first = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts=context,
+        state_path=state_path,
+    )
+    second = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts=context,
+        state_path=state_path,
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))
+    native_run = client._run
+    create_entered = threading.Event()
+    release_create = threading.Event()
+    create_attempts = 0
+
+    def block_first_create(args):
+        nonlocal create_attempts
+        if args[:2] == ["workspace", "create"]:
+            create_attempts += 1
+            create_entered.set()
+            assert release_create.wait(5)
+        return native_run(args)
+
+    client._run = block_first_create  # type: ignore[method-assign]
+    first_result: list[object] = []
+    worker = threading.Thread(target=lambda: first_result.append(first.prepare(spec)))
+    worker.start()
+    assert create_entered.wait(5)
+
+    contender = second.prepare(spec)
+
+    assert isinstance(contender, _RuntimeFailure)
+    assert contender.code == "RUNTIME_MATERIALIZATION_PENDING"
+    assert create_attempts == 1
+    release_create.set()
+    worker.join(10)
+    assert not worker.is_alive()
+    assert len(first_result) == 1
+    assert not isinstance(first_result[0], _RuntimeFailure)
+    assert create_attempts == 1
+
+
+def test_stale_prepare_after_concurrent_commit_leaves_one_action_and_no_intent(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    state_path = tmp_path / "paseo-actions.json"
+    context = {"owner/repository": RuntimeRepositoryContext(source, "main")}
+    winner = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts=context,
+        state_path=state_path,
+    )
+    stale = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts=context,
+        state_path=state_path,
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(
+        subject.stable_action_id, subject, _profile(), prompt, (prompt,)
+    )
+    native_git_readback = stale._git_readback
+    stale_resolved_base = threading.Event()
+    release_stale = threading.Event()
+
+    def pause_after_stale_base_resolution(path, *arguments):
+        resolved = native_git_readback(path, *arguments)
+        stale_resolved_base.set()
+        assert release_stale.wait(5)
+        return resolved
+
+    stale._git_readback = pause_after_stale_base_resolution  # type: ignore[method-assign]
+    stale_results: list[object] = []
+    worker = threading.Thread(
+        target=lambda: stale_results.append(stale.prepare(spec))
+    )
+    worker.start()
+    assert stale_resolved_base.wait(5)
+    try:
+        winner_result = winner.prepare(spec)
+    finally:
+        release_stale.set()
+    worker.join(10)
+
+    assert not worker.is_alive()
+    assert not isinstance(winner_result, _RuntimeFailure)
+    assert len(stale_results) == 1
+    assert not isinstance(stale_results[0], _RuntimeFailure)
+    assert stale_results[0].workspace_id == winner_result.workspace_id
+    durable = json.loads(state_path.read_text(encoding="utf-8"))
+    assert list(durable["actions"]) == [subject.stable_action_id]
+    assert durable["workspace_intents"] == {}
+    assert sum(
+        args[:2] == ["workspace", "create"] for args in client.commands
+    ) == 1
+
+
+def test_gateway_keeps_only_fixed_materialization_summary_during_many_readbacks(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts", maximum_bytes=300_000)
+    subject = _put_subject_artifacts(store, _subject())
+    profile = _profile()
+    adapter = _InMemoryRuntimeProviderAdapter(
+        store,
+        pending_permissions={
+            subject.stable_action_id: (("request:bounded", "write", "repository"),)
+        },
+    )
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=adapter,
+        configuration=RuntimeConfiguration(
+            profiles={profile.digest: profile},
+            host_mappings={"coordinator": ProfileMapping(profile.digest)},
+        ),
+        _artifacts=store,
+    )
+    preflight = gateway.planning_preflight(subject)
+    gateway.progress(subject, preflight)
+
+    for _ in range(80):
+        gateway.transition(subject.stable_action_id, RuntimeCommand.PARK)
+        gateway.progress(subject, preflight)
+
+    durable = json.loads(gateway._store_path.read_text(encoding="utf-8"))
+    record = durable["actions"][subject.stable_action_id]
+    assert "observations" not in record
+    assert record["materialization_observed"] is True
+    assert isinstance(record["observation_digest"], str)
+    assert gateway._store_path.stat().st_size < 20_000
+
+
+def test_production_events_use_absolute_bounded_ring_and_stale_cursor_pages(
+    tmp_path,
+):
+    (
+        store,
+        source,
+        _workspace,
+        client,
+        adapter,
+        subject,
+        _spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    page = adapter.events(None)
+    cursor = page.next_cursor
+    assert cursor is not None
+
+    for index in range(gateway_module._MAXIMUM_RUNTIME_EVENTS + 25):
+        request_id = f"{index:08x}-bounded-permission"
+        client.permissions = [_paseo_permission(request_id)]
+        page = adapter.events(cursor)
+        assert len(page.events) <= gateway_module._MAXIMUM_RUNTIME_EVENT_PAGE
+        assert page.next_cursor is not None
+        cursor = page.next_cursor
+
+    durable = json.loads(adapter._state_path.read_text(encoding="utf-8"))
+    assert len(durable["events"]) == gateway_module._MAXIMUM_RUNTIME_EVENTS
+    cursors = [int(event["cursor"]) for event in durable["events"]]
+    assert cursors == sorted(set(cursors))
+    assert durable["next_event_cursor"] == cursors[-1] + 1
+    assert adapter._state_path.stat().st_size < 100_000
+    provider_effects_before = [
+        args
+        for args in client.commands
+        if args[0] == "run" or args[:2] in (["permit", "allow"], ["permit", "deny"])
+    ]
+
+    restarted = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=adapter._state_path,
+    )
+    stale_cursor = "0"
+    delivered: list[int] = []
+    while stale_cursor != str(cursors[-1]):
+        stale_page = restarted.events(stale_cursor)
+        assert not isinstance(stale_page, _RuntimeFailure)
+        assert len(stale_page.events) <= gateway_module._MAXIMUM_RUNTIME_EVENT_PAGE
+        delivered.extend(int(event.cursor) for event in stale_page.events)
+        assert stale_page.next_cursor is not None
+        assert stale_page.next_cursor != stale_cursor
+        stale_cursor = stale_page.next_cursor
+
+    assert delivered == cursors
+    assert len(delivered) == len(set(delivered))
+    assert [
+        args
+        for args in client.commands
+        if args[0] == "run" or args[:2] in (["permit", "allow"], ["permit", "deny"])
+    ] == provider_effects_before
+
+
+def test_failed_event_transaction_leaves_live_and_disk_identical(tmp_path):
+    (
+        _store,
+        _source,
+        _workspace,
+        client,
+        adapter,
+        subject,
+        _spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    adapter.events(None)
+    live_before = (
+        deepcopy(adapter._actions),
+        deepcopy(adapter._events),
+        adapter._next_event_cursor,
+    )
+    disk_before = json.loads(adapter._state_path.read_text(encoding="utf-8"))
+    client.permissions = [_paseo_permission("feed0001-bounded")]
+    adapter._save = lambda: (_ for _ in ()).throw(OSError("event save failed"))  # type: ignore[method-assign]
+
+    failed = adapter.events("0")
+
+    assert isinstance(failed, _RuntimeFailure)
+    assert failed.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    assert adapter._actions == live_before[0]
+    assert adapter._events == live_before[1]
+    assert adapter._next_event_cursor == live_before[2]
+    assert json.loads(adapter._state_path.read_text(encoding="utf-8")) == disk_before
+
+
+def _write_paseo_transport_helper(tmp_path: Path) -> Path:
+    helper = tmp_path / "paseo_transport_helper.py"
+    helper.write_text(
+        "\n".join(
+            (
+                "import sys",
+                "import time",
+                "import json",
+                "import os",
+                "import subprocess",
+                "mode = sys.argv[1]",
+                "if mode == 'oversized-valid-json':",
+                "    sys.stdout.buffer.write(b'{\"payload\":\"' + b'x' * 2097152 + b'\"}')",
+                "    sys.stdout.buffer.flush()",
+                "    time.sleep(30)",
+                "elif mode == 'dual-stream':",
+                "    sys.stderr.buffer.write(b'e' * 900000)",
+                "    sys.stderr.buffer.flush()",
+                "    sys.stdout.buffer.write(b'{}')",
+                "    sys.stdout.buffer.flush()",
+                "elif mode == 'timeout':",
+                "    time.sleep(30)",
+                "elif mode == 'invalid-utf8':",
+                "    sys.stdout.buffer.write(b'\\xff')",
+                "    sys.stdout.buffer.flush()",
+                "elif mode == 'inherited-pipe':",
+                "    child = subprocess.Popen(",
+                "        [sys.executable, '-c', 'import time; time.sleep(1)'],",
+                "        stdout=sys.stdout,",
+                "        stderr=sys.stderr,",
+                "        close_fds=False,",
+                "    )",
+                "    sys.stdout.write(json.dumps({'grandchild_pid': child.pid}))",
+                "    sys.stdout.flush()",
+            )
+        ),
+        encoding="utf-8",
+    )
+    return helper
+
+
+def test_paseo_transport_caps_oversized_valid_json_before_parse_and_block(
+    tmp_path, monkeypatch
+):
+    helper = _write_paseo_transport_helper(tmp_path)
+    transport = _PaseoCliTransport(sys.executable, timeout_seconds=60)
+    monkeypatch.setattr(
+        gateway_module.json,
+        "loads",
+        lambda _payload: pytest.fail("oversized valid JSON must never be parsed"),
+    )
+    started = time.monotonic()
+
+    with pytest.raises(RuntimeGatewayError) as oversized:
+        transport._run([str(helper), "oversized-valid-json"])
+
+    assert oversized.value.code == "RUNTIME_PROVIDER_PROTOCOL_INVALID"
+    assert time.monotonic() - started < 5
+
+
+def test_paseo_transport_drains_stdout_and_stderr_concurrently_within_caps(tmp_path):
+    helper = _write_paseo_transport_helper(tmp_path)
+    transport = _PaseoCliTransport(sys.executable, timeout_seconds=10)
+
+    assert transport._run([str(helper), "dual-stream"]) == {}
+
+
+def test_paseo_transport_timeout_and_strict_utf8_taxonomy(tmp_path):
+    helper = _write_paseo_transport_helper(tmp_path)
+    timeout_transport = _PaseoCliTransport(sys.executable, timeout_seconds=1)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        timeout_transport._run([str(helper), "timeout"])
+    assert time.monotonic() - started < 5
+
+    strict_transport = _PaseoCliTransport(sys.executable, timeout_seconds=10)
+    with pytest.raises(ValueError, match="UTF-8"):
+        strict_transport._run([str(helper), "invalid-utf8"])
+
+
+def test_paseo_transport_parent_exit_with_inherited_pipe_is_bounded_and_reaped(
+    tmp_path, monkeypatch
+):
+    helper = _write_paseo_transport_helper(tmp_path)
+    native_popen = gateway_module.subprocess.Popen
+    direct_children = []
+
+    def recording_popen(*args, **kwargs):
+        child = native_popen(*args, **kwargs)
+        direct_children.append(child)
+        return child
+
+    monkeypatch.setattr(gateway_module.subprocess, "Popen", recording_popen)
+    started = time.monotonic()
+    result = _PaseoCliTransport(sys.executable, timeout_seconds=60)._run(
+        [str(helper), "inherited-pipe"]
+    )
+
+    assert isinstance(result["grandchild_pid"], int)
+    assert time.monotonic() - started < 2
+    assert len(direct_children) == 1
+    assert direct_children[0].poll() is not None
+    assert all(
+        not thread.name.startswith("gwo-paseo")
+        for thread in threading.enumerate()
+    )
+    # Let the deliberately inherited grandchild close its pipe naturally so
+    # the test itself leaves no helper process behind.
+    time.sleep(1.1)
+
+
+def test_paseo_transport_unreapable_direct_child_fails_bounded_and_closes_pipes(
+    monkeypatch,
+):
+    class UnreapableProcess:
+        def __init__(self):
+            stdout_read, self.stdout_write = os.pipe()
+            stderr_read, self.stderr_write = os.pipe()
+            self.stdout = os.fdopen(stdout_read, "rb", buffering=0)
+            self.stderr = os.fdopen(stderr_read, "rb", buffering=0)
+            self.returncode = None
+            self.terminate_calls = 0
+            self.kill_calls = 0
+            self.wait_calls = 0
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminate_calls += 1
+            raise OSError("terminate failed")
+
+        def kill(self):
+            self.kill_calls += 1
+            raise OSError("kill failed")
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            raise subprocess.TimeoutExpired("fake-paseo", timeout)
+
+        def close_writers(self):
+            os.close(self.stdout_write)
+            os.close(self.stderr_write)
+
+    fake = UnreapableProcess()
+    monkeypatch.setattr(
+        gateway_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: fake,
+    )
+    started = time.monotonic()
+    with pytest.raises(RuntimeGatewayError) as failed:
+        _PaseoCliTransport("paseo", timeout_seconds=1)._run(
+            ["inspect", "agent:one", "--json"]
+        )
+
+    assert failed.value.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    assert time.monotonic() - started < 3
+    assert fake.terminate_calls == 1
+    assert fake.kill_calls == 1
+    assert fake.wait_calls >= 1
+    assert fake.stdout.closed is True
+    assert fake.stderr.closed is True
+    assert all(
+        not thread.name.startswith("gwo-paseo")
+        for thread in threading.enumerate()
+    )
+    fake.close_writers()
+
+
+@pytest.mark.parametrize(
+    ("reconciliation", "expected_lifecycle"),
+    (
+        ("binding", "running"),
+        ("lifecycle", "parked"),
+        ("fence", "running"),
+        ("output", "completed"),
+    ),
+)
+def test_paseo_reconciliation_save_failure_has_fresh_restart_parity(
+    tmp_path, reconciliation, expected_lifecycle
+):
+    (
+        store,
+        source,
+        _workspace,
+        client,
+        adapter,
+        subject,
+        _spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    if reconciliation == "lifecycle":
+        assert not isinstance(
+            adapter.command(subject.stable_action_id, RuntimeCommand.PARK),
+            _RuntimeFailure,
+        )
+    elif reconciliation == "fence":
+        assert not isinstance(
+            adapter.command(subject.stable_action_id, RuntimeCommand.FENCE),
+            _RuntimeFailure,
+        )
+    elif reconciliation == "output":
+        record = adapter._actions[subject.stable_action_id]
+        Path(record["result_file"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(record["result_file"]).write_bytes(
+            gateway_module.canonical_bytes(
+                {
+                    "schema_version": "gwo.runtime.output.v1",
+                    "subject_digest": subject.digest,
+                    "stable_action_id": subject.stable_action_id,
+                    "authority_digest": subject.authority_digest,
+                    "payload": {"completed": True},
+                }
+            )
+        )
+        client.agent.lifecycle = "idle"
+    live_before = deepcopy(adapter._actions)
+    disk_before = json.loads(adapter._state_path.read_text(encoding="utf-8"))
+    adapter._save = lambda: (_ for _ in ()).throw(OSError("reconcile save failed"))  # type: ignore[method-assign]
+
+    failed = adapter.observe(subject.stable_action_id)
+
+    assert isinstance(failed, _RuntimeFailure)
+    assert failed.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    assert adapter._actions == live_before
+    assert json.loads(adapter._state_path.read_text(encoding="utf-8")) == disk_before
+    restarted = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=adapter._state_path,
+    )
+    recovered = restarted.observe(subject.stable_action_id)
+    assert not isinstance(recovered, _RuntimeFailure)
+    assert recovered.lifecycle == expected_lifecycle
+    if reconciliation == "fence":
+        assert recovered.fenced is True
+    if reconciliation == "output":
+        assert recovered.output_artifact_digest is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        RuntimeCommand.PARK,
+        RuntimeCommand.INTERRUPT,
+        RuntimeCommand.FENCE,
+        RuntimeCommand.RETIRE,
+    ),
+)
+def test_effect_applied_ack_loss_restart_retry_is_idempotent_without_provider_reissue(
+    tmp_path, command
+):
+    (
+        store,
+        source,
+        _workspace,
+        client,
+        adapter,
+        subject,
+        _spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    native_run = client._run
+    native_update_labels = client.update_labels
+    effect_calls = 0
+
+    def lose_cli_ack(args):
+        nonlocal effect_calls
+        if (
+            command in {RuntimeCommand.PARK, RuntimeCommand.INTERRUPT}
+            and args[0] == "stop"
+        ) or (command is RuntimeCommand.RETIRE and args[0] == "archive"):
+            effect_calls += 1
+            native_run(args)
+            raise TimeoutError("provider effect acknowledgement lost")
+        return native_run(args)
+
+    def lose_label_ack(agent_id, labels):
+        nonlocal effect_calls
+        effect_calls += 1
+        native_update_labels(agent_id, labels)
+        raise TimeoutError("provider effect acknowledgement lost")
+
+    if command is RuntimeCommand.FENCE:
+        client.update_labels = lose_label_ack  # type: ignore[method-assign]
+    else:
+        client._run = lose_cli_ack  # type: ignore[method-assign]
+    first = adapter.command(subject.stable_action_id, command)
+
+    assert isinstance(first, _RuntimeFailure)
+    assert first.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    assert effect_calls == 1
+    restarted = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=adapter._state_path,
+    )
+    retried = restarted.command(subject.stable_action_id, command)
+
+    assert isinstance(retried, _CommandReceipt)
+    assert retried.stable_action_id == subject.stable_action_id
+    assert retried.command is command
+    assert effect_calls == 1
+
+
+def test_gateway_park_ack_loss_and_explicit_retry_issue_one_provider_stop(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=tmp_path / "paseo-actions.json",
+    )
+    profile = _profile()
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=adapter,
+        configuration=RuntimeConfiguration(
+            profiles={profile.digest: profile},
+            host_mappings={"coordinator": ProfileMapping(profile.digest)},
+        ),
+        _artifacts=store,
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(subject)
+    assert gateway.progress(subject, preflight).status == "running"
+    native_run = client._run
+
+    def stop_then_lose_ack(args):
+        result = native_run(args)
+        if args[0] == "stop":
+            raise TimeoutError("stop acknowledgement lost")
+        return result
+
+    client._run = stop_then_lose_ack  # type: ignore[method-assign]
+    first = gateway.transition(subject.stable_action_id, RuntimeCommand.PARK)
+    retried = gateway.transition(subject.stable_action_id, RuntimeCommand.PARK)
+
+    assert first.status == "parked"
+    assert retried.status == "parked"
+    assert len([args for args in client.commands if args[0] == "stop"]) == 1
