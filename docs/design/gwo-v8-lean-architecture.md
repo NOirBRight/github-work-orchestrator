@@ -112,6 +112,17 @@ relationships, Campaign source, target, and frozen repository policy. It
 rejects invalid labels, missing contracts, blocker cycles, conflicting Ticket
 claims, and oversized input before spending an LLM turn.
 
+After that immutable snapshot exists, and still before it acquires a Ticket
+claim or requests semantic action, PlanControl forms one pre-Plan
+`CampaignPlanningSubject`. The closed subject binds the repository, stable
+Campaign key and handle, expected previous Plan Revision digest (or `null`),
+snapshot Artifact digest, Policy Witness digest, immutable planning
+protocol/request Artifact digest, and stable action. It asks RuntimeGateway for
+the subject's mechanically read-only planning-configuration preflight receipt.
+The preflight resolves only the required `coordinator` configuration; it
+creates no Agent, session, workspace, provider action, claim, or capacity
+reservation. Missing or invalid configuration fails closed at this point.
+
 Each initial or successor Plan Revision receives one bounded Campaign Planning
 Pass over that complete snapshot. Its output is private to PlanControl and may
 contain only:
@@ -127,7 +138,11 @@ a model or CLI, predict files, author lifecycle policy, or prescribe Worker
 steps. A semantic Coordinator Decision can never expand authority. PlanControl
 deterministically validates the private output and is the only PlanSpec
 compiler. Compilation, publication, and readback retry the same validated
-output and never repeat the Planning Pass.
+output and never repeat the Planning Pass. It requests that one pass only by
+giving RuntimeGateway the preflight receipt and `CampaignPlanningSubject`.
+RuntimeGateway returns an Artifact-backed planning receipt for the same stable
+action; PlanControl consumes that opaque receipt and never receives a provider,
+CLI, Runtime Profile, session, Runtime Binding, adapter, or command fact.
 
 A configured byte limit bounds the Planning input. Exceeding it returns a
 named split-Campaign Decision; V8 neither truncates contracts nor creates an
@@ -266,6 +281,21 @@ source.
 
 ## RuntimeGateway adapter contract
 
+RuntimeGateway accepts only two materialization subjects: the pre-Plan
+`CampaignPlanningSubject` above, and a Plan-Revision Work Run subject that
+binds the repository, Campaign, Plan Revision, Work Run, Ticket, semantic
+role, stable action, authority subtree, and Artifact-backed Prompt. It does
+not fabricate a Plan Revision for planning, and accepts no generic Agent or
+provider subject.
+
+Its caller interface has only three operations: planning-configuration
+preflight, typed subject progress, and cursor-based wake-hint readback.
+Progress owns the complete observe-before-start and readback-first recovery
+loop; callers cannot prepare, observe, command, or inspect a Runtime Binding.
+Campaign-start overrides are durable Campaign configuration, not PlanSpec;
+the gateway persists each stable action's selector, configuration source,
+resolved Profile digest, and fallback choice before any provider operation.
+
 RuntimeGateway owns one private provider-neutral adapter contract. Every
 production adapter and the deterministic in-memory adapter implements exactly:
 
@@ -278,7 +308,11 @@ events(after_cursor) -> RuntimeEventPage
 
 `prepare` is idempotent by stable action identity. It resolves or creates the
 Agent, session, and isolated workspace and stages the Artifact-backed Prompt,
-but it cannot begin semantic execution. `observe` authoritatively proves the
+but it cannot begin semantic execution. The complete Ticket contract,
+planning protocol/request, Review Subject, and Review Finding context travel
+through bounded Artifact references or files, never a short CLI argument; an
+adapter fails closed rather than exceeding an OS or Paseo command-length
+limit. `observe` authoritatively proves the
 repository, Campaign, Plan Revision, Work Run, stable action, selected Profile,
 Agent, session, workspace, and Runtime Binding identities, plus Prompt
 acceptance, lifecycle, outstanding Permission Requests, and fencing state.
@@ -291,8 +325,11 @@ start | resume | park | interrupt | permission_response | fence | retire
 
 RuntimeGateway may issue `start` or `resume` only after `observe` proves the
 complete binding and accepted-Prompt receipt for that stable action. No
-adapter has an implicit launch-on-prepare path. `events` provides cursor-based
-wake hints; it never replaces `observe`.
+adapter has an implicit launch-on-prepare path. After an acknowledged-create
+loss, restart, or ambiguous materialization, it first observes the stable
+action and can neither create a second Agent/workspace/Prompt nor begin a
+second Planning Pass. `events` provides cursor-based wake hints; it never
+replaces `observe`.
 
 The deterministic in-memory adapter passes the same contract suite and
 failure cases as production adapters. It is not a looser fake or a second

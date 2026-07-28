@@ -10,6 +10,24 @@ PlanControl, and CandidateGate exchange typed Runtime requests and receipts
 with it; they never construct Codex, Claude Code, Paseo, shell, Agent, session,
 or provider commands directly.
 
+RuntimeGateway accepts a closed materialization-subject union. Its pre-Plan
+`CampaignPlanningSubject` binds repository, Campaign key and handle, expected
+previous Plan Revision digest or `null`, immutable snapshot Artifact digest,
+Policy Witness digest, planning protocol/request Artifact digest, and stable
+action. Its other member is a Plan-Revision Work Run subject. Planning never
+fabricates a Plan Revision. Before PlanControl claims a Ticket or requests a
+semantic action, the gateway performs a mechanically read-only Coordinator
+configuration preflight over the exact planning subject and returns a bound
+opaque receipt. Preflight creates no Agent, session, workspace, provider
+action, claim, or capacity reservation.
+
+The caller surface is deliberately small: planning preflight, typed subject
+progress, and cursor-based wake-hint readback. Subject progress owns all
+prepare/observe/command choreography, including the readback-first recovery
+loop for Campaign Planning. PlanControl consumes only opaque preflight and
+Artifact-backed planning receipts, never assignment, adapter, CLI, Profile,
+session, or Runtime Binding facts.
+
 Every production adapter and the deterministic in-memory adapter implements
 the same private provider-neutral interface:
 
@@ -51,6 +69,14 @@ boundary. They advertise truthful capabilities, but no caller branches on a
 provider name. The same frozen Ticket contract, authority-subtree digest, and
 action key can therefore be rendered for Codex, Claude Code, Paseo, or another
 compatible execution model without changing PlanSpec or ExecutionKernel.
+
+Complete Ticket contracts, the planning protocol/request, Review Subjects, and
+Review Finding context use bounded Artifact references or files. No provider
+adapter may put these complete payloads in a short command argument: it must
+account for underlying CLI and Paseo command-length limits and fail closed on
+unavailable bounded transport. An ambiguous prepare acknowledgement, callback,
+or restart first observes the stable action; it never creates a second Agent,
+workspace, Prompt, or Planning Pass.
 
 The permission broker is internal to RuntimeGateway. It may automatically allow
 one exact normalized request only when its operation ID and resource ID are

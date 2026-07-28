@@ -33,6 +33,15 @@ Runtime action, RuntimeGateway records selector, configuration source, resolved
 Profile digest, and whether the optional fallback was selected. Retries,
 resume, readback, and same-binding recovery reuse that assignment.
 
+For the initial Planning Pass, RuntimeGateway resolves only the Campaign-scoped
+`coordinator` selector during a mechanically read-only preflight of the exact
+pre-Plan `CampaignPlanningSubject`. PlanControl obtains the bound preflight
+receipt after its immutable source snapshot and before a Ticket claim or
+semantic action; neither the preflight nor assignment persistence creates an
+Agent, session, workspace, provider action, or capacity reservation. The
+subsequent Artifact-backed planning receipt is opaque to PlanControl, so the
+persisted source/Profile/fallback facts remain RuntimeGateway-private.
+
 Availability fallback is permitted only before any Agent identity may exist
 for the stable action. After identity, RuntimeGateway recovers the same
 binding. A replacement Worker requires terminal-binding Evidence and uses the
