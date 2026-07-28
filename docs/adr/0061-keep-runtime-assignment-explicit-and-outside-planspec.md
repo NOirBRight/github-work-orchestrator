@@ -56,6 +56,14 @@ Policy Witness, protocol/request Artifact, override, or configuration fails
 closed rather than silently selecting a fresh assignment. No Work Run can use
 the Planning preflight operation.
 
+Preflights and Work Run actions do not own separate stable-action namespaces.
+One shared journal reservation binds each stable action to the kind and digest
+of its complete canonical subject in the same transaction that commits the
+preflight or assignment. Exact replay is valid; cross-kind or changed-subject
+reuse fails before Adapter or provider activity. A schema-version-1 journal
+without that map rebuilds it from all preflight and action records and rejects
+any conflicting legacy identity.
+
 Availability fallback is permitted only before any Agent identity may exist
 for the stable action. After identity, RuntimeGateway recovers the same
 binding. A replacement Worker requires terminal-binding Evidence and uses the
@@ -70,6 +78,18 @@ to `worker`, `recovery_worker`, `review_primary`, `review_strong`, and
 provider-neutral `RuntimeProfile` value lives in a neutral module shared by
 the successor gateway and predecessor compatibility code, so RuntimeGateway
 does not import the legacy runtime implementation.
+Its nested feature JSON is defensively copied and recursively immutable while
+retaining predecessor canonical bytes and digest. Host composition likewise
+defensively copies and freezes the complete `RuntimeConfiguration`, including
+nested repository mappings and Campaign assertions. RuntimeGateway rechecks
+the exact Profile type and digest on every lookup before Adapter or provider
+activity.
+
+The Gateway-owned host Artifact Store returns an Artifact reference only after
+it has exclusively staged, flushed, file-synced, atomically replaced,
+directory-synced where supported, and finally reread the exact digest and
+bytes. A failed put returns no reference and cannot produce a durable semantic
+completion receipt that names the failed target.
 
 A durably selected fallback remains selected even if the primary later
 recovers. Cached availability is advisory; live provider, configuration, and

@@ -23,6 +23,7 @@ import stat
 import subprocess
 import threading
 import time
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
@@ -263,14 +264,59 @@ class ArtifactStore:
             )
         digest = hashlib.sha256(payload).hexdigest()
         target = self.path_for(digest)
-        self._root.mkdir(parents=True, exist_ok=True)
+        try:
+            self._root.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise RuntimeGatewayError(
+                "RUNTIME_ARTIFACT_UNAVAILABLE",
+                "Artifact Store directory is unavailable",
+            ) from error
         if target.exists():
-            self.get(digest)
-            return ArtifactRef(digest, len(payload), str(target))
+            reference = self._verify_put_target(digest, payload)
+            self._fsync_directory()
+            return reference
         temporary = target.with_name(f"{target.name}.{uuid4().hex}.tmp")
-        temporary.write_bytes(payload)
-        os.replace(temporary, target)
-        return ArtifactRef(digest, len(payload), str(target))
+        temporary_created = False
+        try:
+            try:
+                with temporary.open("xb") as handle:
+                    temporary_created = True
+                    if handle.write(payload) != len(payload):
+                        raise OSError("Artifact temporary write was incomplete")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError as error:
+                raise RuntimeGatewayError(
+                    "RUNTIME_ARTIFACT_UNAVAILABLE",
+                    "Artifact temporary write is unavailable",
+                ) from error
+            try:
+                os.replace(temporary, target)
+            except OSError as replace_error:
+                # Another same-digest writer may have won the atomic replace.
+                # It is safe to adopt only exact bounded bytes at this digest.
+                try:
+                    reference = self._verify_put_target(digest, payload)
+                    self._fsync_directory()
+                    return reference
+                except RuntimeGatewayError as verification_error:
+                    if (
+                        verification_error.code
+                        == "RUNTIME_ARTIFACT_DIGEST_MISMATCH"
+                    ):
+                        raise
+                    raise RuntimeGatewayError(
+                        "RUNTIME_ARTIFACT_UNAVAILABLE",
+                        "Artifact atomic replacement is unavailable",
+                    ) from replace_error
+            self._fsync_directory()
+            return self._verify_put_target(digest, payload)
+        finally:
+            if temporary_created:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def put_canonical(self, value: Any) -> ArtifactRef:
         return self.put(canonical_bytes(value))
@@ -312,6 +358,45 @@ class ArtifactStore:
                 "RUNTIME_ARTIFACT_DIGEST_MISMATCH", "Artifact bytes do not match their digest"
             )
         return ArtifactRef(digest, len(payload), str(target)), payload
+
+    def _verify_put_target(self, digest: str, payload: bytes) -> ArtifactRef:
+        last_error: RuntimeGatewayError | None = None
+        for attempt in range(3):
+            try:
+                reference, observed = self._read(digest)
+            except RuntimeGatewayError as error:
+                last_error = error
+                if error.code == "RUNTIME_ARTIFACT_DIGEST_MISMATCH":
+                    raise
+                if attempt < 2:
+                    time.sleep(0.001)
+                continue
+            if observed != payload:
+                raise RuntimeGatewayError(
+                    "RUNTIME_ARTIFACT_DIGEST_MISMATCH",
+                    "Artifact target bytes do not match the put payload",
+                )
+            return reference
+        assert last_error is not None
+        raise last_error
+
+    def _fsync_directory(self) -> None:
+        if os.name == "nt":
+            return
+        try:
+            directory_fd = os.open(
+                self._root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as error:
+            raise RuntimeGatewayError(
+                "RUNTIME_ARTIFACT_UNAVAILABLE",
+                "Artifact Store directory durability is unavailable",
+            ) from error
 
     def _read_path(self, target: Path) -> bytes:
         try:
@@ -881,6 +966,32 @@ def _require_paseo_profile_argument(value: object, field_name: str) -> str:
         ) from error
 
 
+def _decode_exact_paseo_alias(
+    value: Mapping[str, Any],
+    aliases: tuple[str, ...],
+    field_name: str,
+) -> Any | None:
+    """Decode one native field without silently choosing conflicting aliases."""
+
+    populated = [
+        value[alias]
+        for alias in aliases
+        if alias in value and value[alias] is not None and value[alias] != ""
+    ]
+    if not populated:
+        return None
+    expected = populated[0]
+    if any(
+        type(candidate) is not type(expected) or candidate != expected
+        for candidate in populated[1:]
+    ):
+        raise RuntimeGatewayError(
+            "RUNTIME_IDENTITY_AMBIGUOUS",
+            f"Paseo {field_name} compatibility aliases conflict",
+        )
+    return expected
+
+
 def _require_digest(value: object, field_name: str) -> str:
     if not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None:
         raise RuntimeGatewayError(
@@ -961,9 +1072,9 @@ class CampaignStartRuntimeOverrides:
     )
 
     def __post_init__(self) -> None:
-        if self.coordinator is not None and not isinstance(
-            self.coordinator, ProfileMapping
-        ):
+        if self.coordinator is not None and type(
+            self.coordinator
+        ) is not ProfileMapping:
             raise RuntimeGatewayError(
                 "RUNTIME_OVERRIDE_INVALID", "Coordinator override must be a ProfileMapping"
             )
@@ -988,12 +1099,16 @@ class CampaignStartRuntimeOverrides:
                     "RUNTIME_OVERRIDE_INVALID",
                     "Ticket overrides require an exact Ticket key and exact Ticket role",
                 ) from error
-            if not isinstance(mapping, ProfileMapping):
+            if type(mapping) is not ProfileMapping:
                 raise RuntimeGatewayError(
                     "RUNTIME_OVERRIDE_INVALID", "Ticket override must be a ProfileMapping"
                 )
             normalized[(ticket_key, selector.value)] = mapping
-        object.__setattr__(self, "ticket_overrides", normalized)
+        object.__setattr__(
+            self,
+            "ticket_overrides",
+            MappingProxyType(normalized),
+        )
 
     def canonical(self) -> dict[str, Any]:
         return {
@@ -1034,35 +1149,25 @@ class RuntimeConfiguration:
     def __post_init__(self) -> None:
         profiles = dict(self.profiles)
         for digest, profile in profiles.items():
-            _require_digest(digest, "profile digest")
-            if not isinstance(profile, RuntimeProfile) or profile.digest != digest:
-                raise RuntimeGatewayError(
-                    "RUNTIME_CONFIGURATION_INVALID",
-                    "Profile registry key must equal the immutable Profile digest",
-                )
-            # V3 does not attach provider semantics to these values here.  It
-            # does require that an immutable Profile is a complete, usable
-            # configuration before any campaign can be claimed or materialized.
-            for field_name in ("name", "provider", "model", "thinking", "mode"):
-                value = getattr(profile, field_name)
-                if not isinstance(value, str) or not value.strip():
-                    raise RuntimeGatewayError(
-                        "RUNTIME_CONFIGURATION_INVALID",
-                        f"Runtime Profile {field_name} must be a non-empty string",
-                    )
-            if not isinstance(profile.features, dict):
-                raise RuntimeGatewayError(
-                    "RUNTIME_CONFIGURATION_INVALID",
-                    "Runtime Profile features must be an object",
-                )
-        object.__setattr__(self, "profiles", profiles)
+            _validate_runtime_profile_registry_entry(digest, profile)
+        object.__setattr__(
+            self,
+            "profiles",
+            MappingProxyType(profiles),
+        )
         object.__setattr__(self, "host_mappings", _normalize_mappings(self.host_mappings))
-        repositories: dict[str, dict[RuntimeSelector, ProfileMapping]] = {}
+        repositories: dict[
+            str, Mapping[RuntimeSelector, ProfileMapping]
+        ] = {}
         for repository, mappings in self.repository_mappings.items():
             repositories[_require_text(repository, "repository")] = _normalize_mappings(
                 mappings
             )
-        object.__setattr__(self, "repository_mappings", repositories)
+        object.__setattr__(
+            self,
+            "repository_mappings",
+            MappingProxyType(repositories),
+        )
         assertions: dict[
             tuple[str, str, str], CampaignStartRuntimeOverrides
         ] = {}
@@ -1083,22 +1188,74 @@ class RuntimeConfiguration:
                     "RUNTIME_CONFIGURATION_INVALID",
                     "Campaign Runtime assertion has an invalid host value",
                 )
-            assertions[normalized_key] = assertion
-        object.__setattr__(self, "campaign_assertions", assertions)
+            assertions[normalized_key] = CampaignStartRuntimeOverrides(
+                coordinator=assertion.coordinator,
+                ticket_overrides=dict(assertion.ticket_overrides),
+            )
+        object.__setattr__(
+            self,
+            "campaign_assertions",
+            MappingProxyType(assertions),
+        )
 
 
 def _normalize_mappings(
     value: Mapping[RuntimeSelector | str, ProfileMapping],
-) -> dict[RuntimeSelector, ProfileMapping]:
+) -> Mapping[RuntimeSelector, ProfileMapping]:
     normalized: dict[RuntimeSelector, ProfileMapping] = {}
     for raw_selector, mapping in value.items():
         selector = _selector(raw_selector)
-        if not isinstance(mapping, ProfileMapping):
+        if type(mapping) is not ProfileMapping:
             raise RuntimeGatewayError(
                 "RUNTIME_CONFIGURATION_INVALID", "Runtime mapping must be a ProfileMapping"
             )
         normalized[selector] = mapping
-    return normalized
+    return MappingProxyType(normalized)
+
+
+def _validate_runtime_profile_registry_entry(
+    digest: object,
+    profile: object,
+) -> RuntimeProfile:
+    try:
+        normalized_digest = _require_digest(digest, "profile digest")
+    except RuntimeGatewayError as error:
+        raise RuntimeGatewayError(
+            "RUNTIME_CONFIGURATION_INVALID",
+            "Profile registry key must be a SHA-256 digest",
+        ) from error
+    if type(profile) is not RuntimeProfile:
+        raise RuntimeGatewayError(
+            "RUNTIME_CONFIGURATION_INVALID",
+            "Profile registry value must be one exact immutable Runtime Profile",
+        )
+    try:
+        observed_digest = profile.digest
+    except Exception as error:
+        raise RuntimeGatewayError(
+            "RUNTIME_CONFIGURATION_INVALID",
+            "Runtime Profile canonical identity is invalid",
+        ) from error
+    if observed_digest != normalized_digest:
+        raise RuntimeGatewayError(
+            "RUNTIME_CONFIGURATION_INVALID",
+            "Profile registry key must equal the immutable Profile digest",
+        )
+    # V3 does not attach provider semantics to these values here. It does
+    # require a complete usable value before any campaign or provider effect.
+    for field_name in ("name", "provider", "model", "thinking", "mode"):
+        value = getattr(profile, field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeGatewayError(
+                "RUNTIME_CONFIGURATION_INVALID",
+                f"Runtime Profile {field_name} must be a non-empty string",
+            )
+    if not isinstance(profile.features, dict):
+        raise RuntimeGatewayError(
+            "RUNTIME_CONFIGURATION_INVALID",
+            "Runtime Profile features must be an object",
+        )
+    return profile
 
 
 @dataclass(frozen=True)
@@ -1905,15 +2062,35 @@ class _PaseoCliTransport:
         value = payload.get("agent", payload) if isinstance(payload, dict) else payload
         if not isinstance(value, dict):
             raise ValueError("Paseo inspect response is invalid")
-        observed_id = value.get("id") or value.get("Id") or value.get("agentId")
-        provider = value.get("provider") or value.get("Provider")
-        model = value.get("model") or value.get("Model")
-        thinking = value.get("thinking") or value.get("Thinking")
-        mode = value.get("mode") or value.get("Mode")
-        cwd = value.get("cwd") or value.get("Cwd")
-        lifecycle = value.get("status") or value.get("Status")
-        archived = value.get("archived", value.get("Archived"))
-        pending = value.get("PendingPermissions")
+        observed_id = _decode_exact_paseo_alias(
+            value, ("id", "Id", "agentId", "AgentId"), "Agent id"
+        )
+        provider = _decode_exact_paseo_alias(
+            value, ("provider", "Provider"), "Agent provider"
+        )
+        model = _decode_exact_paseo_alias(
+            value, ("model", "Model"), "Agent model"
+        )
+        thinking = _decode_exact_paseo_alias(
+            value, ("thinking", "Thinking"), "Agent thinking"
+        )
+        mode = _decode_exact_paseo_alias(
+            value, ("mode", "Mode"), "Agent mode"
+        )
+        cwd = _decode_exact_paseo_alias(
+            value, ("cwd", "Cwd"), "Agent cwd"
+        )
+        lifecycle = _decode_exact_paseo_alias(
+            value, ("status", "Status"), "Agent lifecycle"
+        )
+        archived = _decode_exact_paseo_alias(
+            value, ("archived", "Archived"), "Agent archived state"
+        )
+        pending = _decode_exact_paseo_alias(
+            value,
+            ("PendingPermissions", "pendingPermissions"),
+            "Agent pending permissions",
+        )
         if not all(
             isinstance(item, str) and item
             for item in (observed_id, provider, model, thinking, mode, cwd, lifecycle)
@@ -2030,8 +2207,16 @@ class _PaseoRuntimeProviderAdapter:
         candidate = value.get("workspace", value) if isinstance(value, dict) else value
         if not isinstance(candidate, dict):
             raise ValueError("workspace response is invalid")
-        workspace_id = candidate.get("id") or candidate.get("Id") or candidate.get("workspaceId")
-        path = candidate.get("path") or candidate.get("Path") or candidate.get("cwd")
+        workspace_id = _decode_exact_paseo_alias(
+            candidate,
+            ("id", "Id", "workspaceId"),
+            "Workspace id",
+        )
+        path = _decode_exact_paseo_alias(
+            candidate,
+            ("path", "Path", "cwd"),
+            "Workspace path",
+        )
         if not isinstance(workspace_id, str) or not workspace_id or not isinstance(path, str) or not path:
             raise ValueError("workspace identity is incomplete")
         _require_paseo_argument(workspace_id, "Paseo Workspace id")
@@ -2475,7 +2660,11 @@ class _PaseoRuntimeProviderAdapter:
         if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
             raise ValueError("agent list response is invalid")
         agent_ids = [
-            item.get("id") or item.get("Id") or item.get("agentId") or item.get("AgentId")
+            _decode_exact_paseo_alias(
+                item,
+                ("id", "Id", "agentId", "AgentId"),
+                "listed Agent id",
+            )
             for item in values
         ]
         if not all(isinstance(agent_id, str) and agent_id for agent_id in agent_ids):
@@ -3225,11 +3414,9 @@ class _PaseoRuntimeProviderAdapter:
         matches = []
         for item in values:
             workspace_id, workspace_path = self._workspace_payload(item)
-            listed_path = item.get("cwd") or item.get("path") or item.get("Path")
             if (
                 item.get("name") == slug
                 and item.get("isolation") == "worktree"
-                and listed_path == workspace_path
             ):
                 matches.append((workspace_id, workspace_path))
         if len(matches) > 1:
@@ -4570,6 +4757,11 @@ class RuntimeGateway:
         expected = {**binding, "receipt_digest": receipt_digest}
 
         def commit(data: dict[str, Any]) -> None:
+            self._reserve_action_identity(
+                data,
+                subject,
+                conflict_code="RUNTIME_PREFLIGHT_IDENTITY_MISMATCH",
+            )
             durable_campaign = data["campaigns"].get(subject.campaign_handle)
             if durable_campaign is not None:
                 if (
@@ -4633,12 +4825,12 @@ class RuntimeGateway:
                 "RUNTIME_PREFLIGHT_INVALID",
                 "Work Run progress does not accept a planning preflight receipt",
             )
-        wake_hints, next_cursor = self._wake_hints(wake_cursor, subject)
         record = self._assignment_for_progress(
             subject,
             None if not isinstance(subject, CampaignPlanningSubject) else persisted_preflight,
         )
         self._validate_static_assignment(subject, record)
+        wake_hints, next_cursor = self._wake_hints(wake_cursor, subject)
         observation_or_failure = self._observe(subject.stable_action_id)
         if isinstance(observation_or_failure, _RuntimeFailure):
             if not self._is_authoritative_absence(
@@ -4750,6 +4942,7 @@ class RuntimeGateway:
         if not isinstance(record, dict):
             raise RuntimeGatewayError("RUNTIME_ACTION_UNKNOWN", "stable action is unknown")
         subject = _subject_from_canonical(record.get("subject"))
+        self._validate_static_assignment(subject, record)
         if command in {RuntimeCommand.START, RuntimeCommand.RESUME}:
             observed = self._observe(stable_action_id)
             if isinstance(observed, _RuntimeFailure):
@@ -4917,6 +5110,11 @@ class RuntimeGateway:
         )
 
         def commit(data: dict[str, Any]) -> None:
+            self._reserve_action_identity(
+                data,
+                subject,
+                conflict_code="RUNTIME_ACTION_IDENTITY_MISMATCH",
+            )
             existing = data["actions"].get(subject.stable_action_id)
             if existing is None:
                 data["actions"][subject.stable_action_id] = deepcopy(record)
@@ -4932,6 +5130,39 @@ class RuntimeGateway:
 
         self._transact(commit)
         return self._data["actions"][subject.stable_action_id]
+
+    @staticmethod
+    def _subject_identity(subject: RuntimeSubject) -> dict[str, str]:
+        canonical = subject.canonical()
+        return {
+            "subject_kind": str(canonical["kind"]),
+            "subject_digest": subject.digest,
+        }
+
+    @classmethod
+    def _reserve_action_identity(
+        cls,
+        data: dict[str, Any],
+        subject: RuntimeSubject,
+        *,
+        conflict_code: str,
+    ) -> None:
+        identities = data.get("action_identities")
+        if not isinstance(identities, dict):
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID",
+                "RuntimeGateway stable-action identity registry is invalid",
+            )
+        expected = cls._subject_identity(subject)
+        existing = identities.get(subject.stable_action_id)
+        if existing is None:
+            identities[subject.stable_action_id] = expected
+            return
+        if existing != expected:
+            raise RuntimeGatewayError(
+                conflict_code,
+                "stable action was already reserved for another exact Runtime subject",
+            )
 
     def _resolve_assignment(
         self,
@@ -4986,12 +5217,13 @@ class RuntimeGateway:
 
     def _profile(self, digest: str) -> RuntimeProfile:
         try:
-            return self._configuration.profiles[digest]
-        except KeyError as error:
+            profile = self._configuration.profiles[digest]
+        except Exception as error:
             raise RuntimeGatewayError(
                 "RUNTIME_CONFIGURATION_INVALID",
                 "Runtime mapping refers to an unknown immutable Profile",
             ) from error
+        return _validate_runtime_profile_registry_entry(digest, profile)
 
     def _validate_static_assignment(
         self, subject: RuntimeSubject, assignment: Mapping[str, Any]
@@ -5002,16 +5234,19 @@ class RuntimeGateway:
                 "RUNTIME_CONFIGURATION_INVALID", "Runtime assignment lacks a primary Profile"
             )
         profile = self._profile(profile_digest)
+        fallback_digest = assignment.get("availability_fallback_profile_digest")
+        fallback_profile: RuntimeProfile | None = None
+        if fallback_digest is not None:
+            if not isinstance(fallback_digest, str):
+                raise RuntimeGatewayError(
+                    "RUNTIME_CONFIGURATION_INVALID",
+                    "Runtime assignment fallback Profile is invalid",
+                )
+            fallback_profile = self._profile(fallback_digest)
         if self._static_assignment_validator is not None:
             self._static_assignment_validator(subject, profile)
-            fallback_digest = assignment.get("availability_fallback_profile_digest")
-            if fallback_digest is not None:
-                if not isinstance(fallback_digest, str):
-                    raise RuntimeGatewayError(
-                        "RUNTIME_CONFIGURATION_INVALID",
-                        "Runtime assignment fallback Profile is invalid",
-                    )
-                self._static_assignment_validator(subject, self._profile(fallback_digest))
+            if fallback_profile is not None:
+                self._static_assignment_validator(subject, fallback_profile)
 
     @staticmethod
     def _record_has_materialization_history(record: Mapping[str, Any]) -> bool:
@@ -5481,21 +5716,78 @@ class RuntimeGateway:
     def _load_unlocked(self) -> dict[str, Any]:
         value = self._journal.read_unlocked()
         if value is None:
-            return {"schema_version": 1, "campaigns": {}, "actions": {}, "preflights": {}}
+            return {
+                "schema_version": 1,
+                "campaigns": {},
+                "actions": {},
+                "preflights": {},
+                "action_identities": {},
+            }
         if (
             not isinstance(value, dict)
             or value.get("schema_version") != 1
             or not all(isinstance(value.get(key), dict) for key in ("campaigns", "actions", "preflights"))
+            or (
+                "action_identities" in value
+                and not isinstance(value["action_identities"], dict)
+            )
         ):
             raise RuntimeGatewayError(
                 "RUNTIME_STORE_INVALID", "RuntimeGateway durable record has an unknown schema"
             )
         normalized = deepcopy(value)
-        for record in normalized["actions"].values():
+        rebuilt_identities: dict[str, dict[str, str]] = {}
+
+        def rebuild_identity(
+            stable_action_id: object,
+            identity: dict[str, str],
+        ) -> None:
+            if not isinstance(stable_action_id, str) or not stable_action_id:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway stable-action identity key is invalid",
+                )
+            existing = rebuilt_identities.get(stable_action_id)
+            if existing is not None and existing != identity:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway stable action is bound to conflicting subject identities",
+                )
+            rebuilt_identities[stable_action_id] = identity
+
+        for stable_action_id, preflight in normalized["preflights"].items():
+            if (
+                not isinstance(preflight, dict)
+                or not isinstance(preflight.get("subject_digest"), str)
+                or _DIGEST_RE.fullmatch(preflight["subject_digest"]) is None
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway planning preflight identity is invalid",
+                )
+            rebuild_identity(
+                stable_action_id,
+                {
+                    "subject_kind": "campaign_planning",
+                    "subject_digest": preflight["subject_digest"],
+                },
+            )
+        for stable_action_id, record in normalized["actions"].items():
             if not isinstance(record, dict):
                 raise RuntimeGatewayError(
                     "RUNTIME_STORE_INVALID", "RuntimeGateway action record is invalid"
                 )
+            subject = _subject_from_canonical(record.get("subject"))
+            if (
+                subject.canonical() != record.get("subject")
+                or subject.stable_action_id != stable_action_id
+                or record.get("subject_digest") != subject.digest
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway action subject identity is invalid",
+                )
+            rebuild_identity(stable_action_id, self._subject_identity(subject))
             legacy_observations = record.pop("observations", None)
             if "materialization_observed" not in record:
                 record["materialization_observed"] = bool(legacy_observations)
@@ -5504,6 +5796,16 @@ class RuntimeGateway:
                     "RUNTIME_STORE_INVALID",
                     "RuntimeGateway materialization history is invalid",
                 )
+        persisted_identities = normalized.get("action_identities")
+        if (
+            persisted_identities is not None
+            and persisted_identities != rebuilt_identities
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID",
+                "RuntimeGateway stable-action identity registry does not match durable subjects",
+            )
+        normalized["action_identities"] = rebuilt_identities
         return normalized
 
     def _refresh(self) -> None:
@@ -5902,7 +6204,13 @@ class _InMemoryRuntimeProviderAdapter:
                 binding_ref=action.binding_ref,
             )
             if not action.pending_permissions:
-                self._complete_action(action)
+                try:
+                    self._complete_action(action)
+                except RuntimeGatewayError as error:
+                    return _RuntimeFailure(
+                        error.code,
+                        "Runtime output Artifact could not be made durable",
+                    )
         if command is RuntimeCommand.START:
             if action.lifecycle != "prepared":
                 return _RuntimeFailure(
@@ -5922,7 +6230,13 @@ class _InMemoryRuntimeProviderAdapter:
                 action.lifecycle = "running"
                 action.output_artifact_digest = None
             else:
-                self._complete_action(action)
+                try:
+                    self._complete_action(action)
+                except RuntimeGatewayError as error:
+                    return _RuntimeFailure(
+                        error.code,
+                        "Runtime output Artifact could not be made durable",
+                    )
         elif command is RuntimeCommand.RESUME:
             if action.lifecycle != "parked" or action.fenced is not False:
                 return _RuntimeFailure(

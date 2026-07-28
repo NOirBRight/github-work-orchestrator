@@ -319,12 +319,25 @@ observe, command, inspect a Runtime Binding, or treat an event as state.
 Campaign-start overrides are durable Campaign configuration, not PlanSpec;
 the gateway persists each stable action's selector, configuration source,
 resolved Profile digest, and fallback choice before any provider operation.
+Planning preflights and materialized actions share one stable-action identity
+namespace in that same journal: the transaction that commits either record
+also reserves the subject kind and complete canonical-subject digest. Exact
+replay is valid, while any cross-kind or changed-subject reuse fails before
+Adapter readback, preparation, command, or provider effect. A legacy
+schema-version-1 journal without the map rebuilds it under the journal lock
+from all preflights and actions; conflicts make the store invalid.
 Only the host configuration assembler reads immutable Runtime Profile
 provider/model facts and supplies the composed `RuntimeConfiguration`; that
 host-only composition data is not a PlanSpec or semantic-workflow input.
 `RuntimeProfile` is an immutable provider-neutral value in a neutral module
 shared with predecessor compatibility code; the successor gateway does not
 import the predecessor runtime implementation.
+Its nested JSON feature objects and arrays are recursively defensive-copied
+and immutable without changing canonical serialization or digest.
+`RuntimeConfiguration` similarly snapshots and freezes Profile, host, nested
+repository, and Campaign-assertion registries. Every Profile lookup rechecks
+the exact value type and registry-key digest before Adapter or provider
+activity.
 PlanControl, ExecutionKernel, CandidateGate, and other semantic workflow
 callers receive neither those facts nor a vendor command surface. Host
 composition uses provider-neutral `build_runtime_gateway` and
@@ -405,12 +418,25 @@ registry discovery may precede local validation when an unrecorded Workspace
 path is not yet known. Paseo uses a short bootstrap and `--output-schema`,
 but a completed receipt is authoritative only after the Agent atomically writes
 the action-owned Workspace result Artifact; logs are wake hints, never output.
+The host Store publishes an `ArtifactRef` only after a unique exclusive
+temporary create, complete write and flush, file `fsync`, atomic replacement,
+directory `fsync` where supported, and bounded final readback matching both
+digest and exact bytes. Existing targets are verified before adoption and
+concurrent same-digest writers are idempotent. Failure returns no reference
+and cleans only the temporary file owned by that attempt. This host durability
+contract is separate from the non-racing Runtime Workspace filesystem threat
+model below.
 Paseo label list readback establishes the stable action before `inspect`, whose
 Agent ID, provider, model, thinking, mode, current working directory, and
 status must exactly match the binding. Its working directory joins the exact
 recorded workspace ID/name/worktree record, and bounded Git readback proves the
 same repository common directory; a Prepared Workspace also has the configured
 base commit as its `HEAD`.
+Agent and Workspace compatibility aliases use one exact decoder across
+inspect, Agent-list, Workspace-list, and Workspace-create receipt paths:
+missing stays missing, equal populated aliases remain compatible, and
+conflicting populated aliases fail as ambiguous identity rather than selecting
+one spelling.
 
 The pinned base must not contain any casefold-equivalent reserved `.gwo`
 top-level path, including `.GWO`. Before Workspace creation, the durable intent

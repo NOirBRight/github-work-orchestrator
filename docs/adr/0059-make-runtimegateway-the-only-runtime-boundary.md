@@ -47,9 +47,25 @@ The exact public operations are `planning_preflight(subject)`,
 assertions enter through host-composed `RuntimeConfiguration`, keyed by exact
 Campaign identity, rather than by widening the semantic preflight signature.
 
+Planning preflights and materialized actions share one global stable-action
+identity reservation inside the same Gateway journal transaction. The
+reservation binds subject kind plus the digest of the complete canonical
+subject. Exact replay is allowed; cross-kind or changed-subject reuse fails
+before Adapter readback, preparation, command, or any provider effect.
+Schema-version-1 journals without the shared map rebuild it from every
+preflight and action while holding the journal lock; any conflict within or
+between those collections makes the store invalid rather than selecting one.
+
 Only the host configuration assembler reads immutable Runtime Profile
 provider/model facts and supplies the composed `RuntimeConfiguration`; that
 host-only composition data is not a PlanSpec or semantic-workflow input.
+`RuntimeProfile` recursively snapshots feature objects and arrays into
+JSON-compatible immutable values without changing their canonical bytes or
+digest. `RuntimeConfiguration` defensively snapshots and freezes its Profile,
+host, nested repository, and Campaign-assertion registries. Every Profile
+lookup revalidates the exact value type and registry-key digest before an
+Adapter operation or provider effect, so a drifted or malicious registry
+fails as permanent configuration invalidity.
 PlanControl, ExecutionKernel, CandidateGate, and other semantic workflow
 callers receive neither those facts nor a vendor command surface. Host
 composition uses provider-neutral `build_runtime_gateway` and
@@ -147,9 +163,24 @@ and fail closed on unavailable bounded transport. An ambiguous prepare
 acknowledgement, callback, or restart first observes the stable action; it
 never creates a second Agent, workspace, Prompt, or Planning Pass.
 
+Putting bytes into that host Artifact Store uses a unique exclusively-created
+temporary file, complete write plus flush and file `fsync`, atomic replacement,
+directory `fsync` where the platform supports it, and bounded final readback
+that must match both digest and exact bytes. An existing digest target is
+verified before adoption, and concurrent writers of the same bytes are
+idempotent. Replacement or final-verification failure returns no
+`ArtifactRef`; cleanup may remove only the temporary file created by that
+attempt. These host-store durability rules are distinct from the Runtime
+Workspace helper's explicitly non-racing link/reparse threat model.
+
 For the current Paseo transport, stable-action labels are proved by
 `ls --global --label` before `inspect`; `inspect` is compared exactly on Agent
 ID, provider, model, thinking, mode, current working directory, and status.
+All documented Paseo Agent and Workspace compatibility aliases pass through
+one exact decoder: absent values remain missing, equal populated aliases are
+accepted, and conflicting populated aliases fail as ambiguous identity rather
+than choosing the first spelling. This applies to inspect, Agent-list,
+Workspace-list, and Workspace-create receipt identity and path readback.
 The inspected working directory then joins one exact recorded Workspace ID,
 name, and worktree isolation. Its resolved path must differ from the resolved
 source checkout; private bounded Git readback then proves their shared

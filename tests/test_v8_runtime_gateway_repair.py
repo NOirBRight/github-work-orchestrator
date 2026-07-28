@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from copy import deepcopy
+import hashlib
 import inspect
 import json
 import os
@@ -105,6 +106,36 @@ def _put_subject_artifacts(store: ArtifactStore, subject: CampaignPlanningSubjec
         planning_request_artifact_digest=prompt.digest,
         stable_action_id=unsigned.stable_action_id,
     )
+
+
+def _put_work_subject_artifacts(
+    store: ArtifactStore,
+    planning_subject: CampaignPlanningSubject,
+    *,
+    stable_action_id: str,
+    work_run_key: str = "work-run:repair",
+) -> WorkRunSubject:
+    unsigned = WorkRunSubject(
+        repository=planning_subject.repository,
+        campaign_key=planning_subject.campaign_key,
+        campaign_handle=planning_subject.campaign_handle,
+        plan_revision_digest=store.put_canonical({"revision": 1}).digest,
+        work_run_key=work_run_key,
+        ticket_key="issue:111",
+        purpose=gateway_module.WorkRunPurpose.implementation(),
+        prompt_artifact_digest="0" * 64,
+        authority_subtree_digest=planning_subject.policy_witness_digest,
+        stable_action_id=stable_action_id,
+    )
+    prompt = store.put_canonical(
+        {
+            "schema_version": "gwo.runtime.prompt.v1",
+            "subject_digest": unsigned.prompt_binding_digest,
+            "authority_digest": unsigned.authority_digest,
+            "payload": {"complete_contract": "repair #111"},
+        }
+    )
+    return replace(unsigned, prompt_artifact_digest=prompt.digest)
 
 
 def _gateway(tmp_path: Path):
@@ -5709,3 +5740,919 @@ def test_orphaned_nonce_owned_marker_temp_recovers_without_second_create(
             if command[:2] == ["workspace", "create"]
         ]
     ) == 1
+
+
+def _configuration_with_worker(profile: RuntimeProfile) -> RuntimeConfiguration:
+    return RuntimeConfiguration(
+        profiles={profile.digest: profile},
+        host_mappings={
+            "coordinator": ProfileMapping(profile.digest),
+            "worker": ProfileMapping(profile.digest),
+        },
+    )
+
+
+def test_planning_preflight_reservation_rejects_conflicting_work_run_before_adapter_use(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    profile = _profile()
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=adapter,
+        configuration=_configuration_with_worker(profile),
+        _artifacts=store,
+    )
+    planning = _put_subject_artifacts(
+        store,
+        replace(_subject(), stable_action_id="shared:planning-first"),
+    )
+    gateway.planning_preflight(planning)
+    work = _put_work_subject_artifacts(
+        store,
+        planning,
+        stable_action_id=planning.stable_action_id,
+    )
+    operations_before = (
+        list(adapter.observe_calls),
+        list(adapter.prepare_calls),
+        list(adapter.command_calls),
+    )
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        gateway.progress(work)
+
+    assert stopped.value.code == "RUNTIME_ACTION_IDENTITY_MISMATCH"
+    assert (
+        adapter.observe_calls,
+        adapter.prepare_calls,
+        adapter.command_calls,
+    ) == operations_before
+    durable = json.loads((tmp_path / "gateway.journal").read_text(encoding="utf-8"))
+    assert planning.stable_action_id not in durable["actions"]
+    assert durable["preflights"][planning.stable_action_id][
+        "subject_digest"
+    ] == planning.digest
+
+
+def test_work_run_reservation_rejects_conflicting_preflight_without_partial_record(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    profile = _profile()
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=adapter,
+        configuration=_configuration_with_worker(profile),
+        _artifacts=store,
+    )
+    campaign = _put_subject_artifacts(
+        store,
+        replace(_subject(), stable_action_id="planning:campaign-setup"),
+    )
+    gateway.planning_preflight(campaign)
+    work = _put_work_subject_artifacts(
+        store,
+        campaign,
+        stable_action_id="shared:work-first",
+    )
+    gateway.progress(work)
+    conflicting = replace(campaign, stable_action_id=work.stable_action_id)
+    operations_before = (
+        list(adapter.observe_calls),
+        list(adapter.prepare_calls),
+        list(adapter.command_calls),
+    )
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        gateway.planning_preflight(conflicting)
+
+    assert stopped.value.code == "RUNTIME_PREFLIGHT_IDENTITY_MISMATCH"
+    assert (
+        adapter.observe_calls,
+        adapter.prepare_calls,
+        adapter.command_calls,
+    ) == operations_before
+    durable = json.loads((tmp_path / "gateway.journal").read_text(encoding="utf-8"))
+    assert conflicting.stable_action_id not in durable["preflights"]
+    assert durable["actions"][work.stable_action_id]["subject_digest"] == work.digest
+
+
+def test_same_subject_reservation_replays_after_restart(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    profile = _profile()
+    configuration = _configuration_with_worker(profile)
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    store_path = tmp_path / "gateway.journal"
+    gateway = RuntimeGateway(
+        store_path=store_path,
+        _adapter=adapter,
+        configuration=configuration,
+        _artifacts=store,
+    )
+    planning = _put_subject_artifacts(
+        store,
+        replace(_subject(), stable_action_id="planning:exact-replay"),
+    )
+    first_preflight = gateway.planning_preflight(planning)
+    first_progress = gateway.progress(planning, first_preflight)
+
+    restarted = RuntimeGateway(
+        store_path=store_path,
+        _adapter=adapter,
+        configuration=configuration,
+        _artifacts=store,
+    )
+
+    assert restarted.planning_preflight(planning) == first_preflight
+    replayed = restarted.progress(planning, first_preflight)
+    assert replayed.subject_digest == first_progress.subject_digest
+    assert replayed.stable_action_id == first_progress.stable_action_id
+    assert replayed.status == first_progress.status
+    assert (
+        replayed.planning_output_artifact_digest
+        == first_progress.planning_output_artifact_digest
+    )
+    assert adapter.prepare_calls == [planning.stable_action_id]
+
+
+def test_schema_one_reservation_rebuild_rejects_cross_map_identity_conflict(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    profile = _profile()
+    configuration = _configuration_with_worker(profile)
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=_InMemoryRuntimeProviderAdapter(store),
+        configuration=configuration,
+        _artifacts=store,
+    )
+    planning = _put_subject_artifacts(
+        store,
+        replace(_subject(), stable_action_id="planning:legacy-setup"),
+    )
+    gateway.planning_preflight(planning)
+    work = _put_work_subject_artifacts(
+        store,
+        planning,
+        stable_action_id="shared:legacy-conflict",
+    )
+    gateway.progress(work)
+    durable_path = tmp_path / "gateway.journal"
+    durable = json.loads(durable_path.read_text(encoding="utf-8"))
+    durable.pop("action_identities", None)
+    durable["preflights"][work.stable_action_id] = {
+        "subject_digest": planning.digest,
+        "campaign_overrides_digest": "0" * 64,
+        "assignment": durable["preflights"][planning.stable_action_id]["assignment"],
+        "receipt_digest": "1" * 64,
+    }
+    durable_path.write_bytes(gateway_module.canonical_bytes(durable))
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        RuntimeGateway(
+            store_path=durable_path,
+            _adapter=_InMemoryRuntimeProviderAdapter(store),
+            configuration=configuration,
+            _artifacts=store,
+        )
+
+    assert stopped.value.code == "RUNTIME_STORE_INVALID"
+
+
+def test_concurrent_gateways_reserve_only_one_subject_identity(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    profile = _profile()
+    configuration = _configuration_with_worker(profile)
+    store_path = tmp_path / "gateway.journal"
+    setup_gateway = RuntimeGateway(
+        store_path=store_path,
+        _adapter=_InMemoryRuntimeProviderAdapter(store),
+        configuration=configuration,
+        _artifacts=store,
+    )
+    campaign = _put_subject_artifacts(
+        store,
+        replace(_subject(), stable_action_id="planning:concurrency-setup"),
+    )
+    setup_gateway.planning_preflight(campaign)
+    shared_id = "shared:concurrent-first-write"
+    planning = replace(campaign, stable_action_id=shared_id)
+    work = _put_work_subject_artifacts(
+        store,
+        campaign,
+        stable_action_id=shared_id,
+    )
+    planning_gateway = RuntimeGateway(
+        store_path=store_path,
+        _adapter=_InMemoryRuntimeProviderAdapter(store),
+        configuration=configuration,
+        _artifacts=store,
+    )
+    work_gateway = RuntimeGateway(
+        store_path=store_path,
+        _adapter=_InMemoryRuntimeProviderAdapter(store),
+        configuration=configuration,
+        _artifacts=store,
+    )
+    barrier = threading.Barrier(2)
+    outcomes: list[tuple[str, object]] = []
+    outcome_lock = threading.Lock()
+
+    def attempt(kind, operation):
+        barrier.wait()
+        try:
+            result = operation()
+        except RuntimeGatewayError as error:
+            result = error
+        with outcome_lock:
+            outcomes.append((kind, result))
+
+    planning_thread = threading.Thread(
+        target=attempt,
+        args=("planning", lambda: planning_gateway.planning_preflight(planning)),
+    )
+    work_thread = threading.Thread(
+        target=attempt,
+        args=("work", lambda: work_gateway.progress(work)),
+    )
+    planning_thread.start()
+    work_thread.start()
+    planning_thread.join(timeout=30)
+    work_thread.join(timeout=30)
+
+    assert not planning_thread.is_alive()
+    assert not work_thread.is_alive()
+    assert len([result for _kind, result in outcomes if not isinstance(result, Exception)]) == 1
+    failures = [result for _kind, result in outcomes if isinstance(result, RuntimeGatewayError)]
+    assert len(failures) == 1
+    assert failures[0].code in {
+        "RUNTIME_ACTION_IDENTITY_MISMATCH",
+        "RUNTIME_PREFLIGHT_IDENTITY_MISMATCH",
+    }
+    durable = json.loads(store_path.read_text(encoding="utf-8"))
+    persisted = [
+        durable[collection][shared_id]["subject_digest"]
+        for collection in ("preflights", "actions")
+        if shared_id in durable[collection]
+    ]
+    assert persisted in ([planning.digest], [work.digest])
+
+
+def test_runtime_profile_recursively_defends_and_freezes_json_features():
+    original_features = {
+        "flags": {
+            "levels": [1, 2],
+            "nested": {"enabled": True},
+        }
+    }
+    profile = RuntimeProfile(
+        name="immutable",
+        provider="test",
+        model="test-model",
+        thinking="high",
+        mode="safe",
+        features=original_features,
+    )
+    expected_canonical = (
+        b'{"features":{"flags":{"levels":[1,2],"nested":{"enabled":true}}},'
+        b'"mode":"safe","model":"test-model","name":"immutable",'
+        b'"provider":"test","thinking":"high"}'
+    )
+    expected_digest = hashlib.sha256(expected_canonical).hexdigest()
+
+    original_features["flags"]["levels"].append(3)
+    original_features["flags"]["nested"]["enabled"] = False
+
+    assert profile.digest == expected_digest
+    assert gateway_module.canonical_bytes(asdict(profile)) == expected_canonical
+    assert profile.features == {
+        "flags": {
+            "levels": [1, 2],
+            "nested": {"enabled": True},
+        }
+    }
+    with pytest.raises(TypeError):
+        profile.features["flags"]["nested"]["enabled"] = False
+    with pytest.raises(TypeError):
+        profile.features["flags"]["levels"].append(3)
+
+
+def test_runtime_configuration_defensively_copies_and_deeply_freezes_registries():
+    profile = _profile()
+    digest = profile.digest
+    mapping = ProfileMapping(digest)
+    profiles = {digest: profile}
+    host_mappings = {"coordinator": mapping}
+    repository_role_mappings = {"worker": mapping}
+    repository_mappings = {"owner/repository": repository_role_mappings}
+    ticket_overrides = {("issue:111", "worker"): mapping}
+    assertion = CampaignStartRuntimeOverrides(
+        coordinator=mapping,
+        ticket_overrides=ticket_overrides,
+    )
+    assertion_key = ("owner/repository", "campaign:repair", "handle:repair")
+    campaign_assertions = {assertion_key: assertion}
+
+    configuration = RuntimeConfiguration(
+        profiles=profiles,
+        host_mappings=host_mappings,
+        repository_mappings=repository_mappings,
+        campaign_assertions=campaign_assertions,
+    )
+
+    profiles.clear()
+    host_mappings.clear()
+    repository_role_mappings.clear()
+    repository_mappings.clear()
+    ticket_overrides.clear()
+    campaign_assertions.clear()
+
+    assert configuration.profiles[digest] is profile
+    assert configuration.host_mappings[
+        gateway_module.RuntimeSelector.coordinator()
+    ] == mapping
+    assert configuration.repository_mappings["owner/repository"][
+        gateway_module.RuntimeSelector.worker()
+    ] == mapping
+    assert configuration.campaign_assertions[assertion_key].ticket_overrides[
+        ("issue:111", "worker")
+    ] == mapping
+    with pytest.raises(TypeError):
+        configuration.profiles[digest] = profile
+    with pytest.raises(TypeError):
+        configuration.host_mappings[
+            gateway_module.RuntimeSelector.coordinator()
+        ] = mapping
+    with pytest.raises(TypeError):
+        configuration.repository_mappings["owner/repository"][
+            gateway_module.RuntimeSelector.worker()
+        ] = mapping
+    with pytest.raises(TypeError):
+        configuration.campaign_assertions[assertion_key].ticket_overrides[
+            ("issue:112", "worker")
+        ] = mapping
+
+
+@pytest.mark.parametrize("operation", ("preflight", "progress", "transition"))
+@pytest.mark.parametrize(
+    "drift",
+    (
+        lambda profile: replace(profile, name="drifted"),
+        lambda _profile_value: object(),
+    ),
+)
+def test_profile_registry_drift_fails_configuration_before_adapter_operation(
+    tmp_path, operation, drift
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    profile = _profile()
+    configuration = RuntimeConfiguration(
+        profiles={profile.digest: profile},
+        host_mappings={"coordinator": ProfileMapping(profile.digest)},
+    )
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=adapter,
+        configuration=configuration,
+        _artifacts=store,
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    receipt = None
+    if operation in {"progress", "transition"}:
+        receipt = gateway.planning_preflight(subject)
+    if operation == "transition":
+        gateway.progress(subject, receipt)
+    object.__setattr__(
+        configuration,
+        "profiles",
+        {profile.digest: drift(profile)},
+    )
+    operations_before = (
+        list(adapter.observe_calls),
+        list(adapter.prepare_calls),
+        list(adapter.command_calls),
+    )
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        if operation == "preflight":
+            gateway.planning_preflight(subject)
+        elif operation == "progress":
+            gateway.progress(subject, receipt)
+        else:
+            gateway.transition(subject.stable_action_id, RuntimeCommand.FENCE)
+
+    assert stopped.value.code == "RUNTIME_CONFIGURATION_INVALID"
+    assert (
+        adapter.observe_calls,
+        adapter.prepare_calls,
+        adapter.command_calls,
+    ) == operations_before
+
+
+@pytest.mark.parametrize("operation", ("progress", "transition"))
+@pytest.mark.parametrize("fallback_state", ("missing", "drifted", "exact"))
+def test_persisted_fallback_is_always_revalidated_before_adapter_operation(
+    tmp_path, operation, fallback_state
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    primary = _profile()
+    fallback = replace(primary, name="fallback")
+    configuration = RuntimeConfiguration(
+        profiles={
+            primary.digest: primary,
+            fallback.digest: fallback,
+        },
+        host_mappings={
+            "coordinator": ProfileMapping(
+                primary.digest,
+                fallback.digest,
+            )
+        },
+    )
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=adapter,
+        configuration=configuration,
+        _artifacts=store,
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(subject)
+    if operation == "transition":
+        gateway.progress(subject, preflight)
+    profiles = {primary.digest: primary}
+    if fallback_state == "exact":
+        profiles[fallback.digest] = fallback
+    elif fallback_state == "drifted":
+        profiles[fallback.digest] = replace(fallback, name="drifted-fallback")
+    object.__setattr__(configuration, "profiles", profiles)
+    operations_before = (
+        list(adapter.observe_calls),
+        list(adapter.prepare_calls),
+        list(adapter.command_calls),
+    )
+
+    if fallback_state == "exact":
+        if operation == "progress":
+            completed = gateway.progress(subject, preflight)
+        else:
+            completed = gateway.transition(
+                subject.stable_action_id,
+                RuntimeCommand.FENCE,
+            )
+        assert completed.status == "completed"
+        return
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        if operation == "progress":
+            gateway.progress(subject, preflight)
+        else:
+            gateway.transition(
+                subject.stable_action_id,
+                RuntimeCommand.FENCE,
+            )
+
+    assert stopped.value.code == "RUNTIME_CONFIGURATION_INVALID"
+    assert (
+        adapter.observe_calls,
+        adapter.prepare_calls,
+        adapter.command_calls,
+    ) == operations_before
+
+
+def _inspect_payload_with_equal_aliases() -> dict[str, object]:
+    return {
+        "id": "agent:one",
+        "Id": "agent:one",
+        "agentId": "agent:one",
+        "provider": "test",
+        "Provider": "test",
+        "model": "model",
+        "Model": "model",
+        "thinking": "high",
+        "Thinking": "high",
+        "mode": "safe",
+        "Mode": "safe",
+        "cwd": "C:/workspace",
+        "Cwd": "C:/workspace",
+        "status": "running",
+        "Status": "running",
+        "archived": False,
+        "Archived": False,
+        "PendingPermissions": [],
+    }
+
+
+def test_paseo_inspect_accepts_equal_compatibility_aliases():
+    transport = _PaseoCliTransport("paseo")
+    transport._run = lambda _args: _inspect_payload_with_equal_aliases()  # type: ignore[method-assign]
+
+    observed = transport.inspect("agent:one")
+
+    assert observed.agent_id == "agent:one"
+    assert observed.provider == "test"
+    assert observed.model == "model"
+    assert observed.thinking == "high"
+    assert observed.mode == "safe"
+    assert observed.cwd == "C:/workspace"
+    assert observed.lifecycle == "running"
+    assert observed.archived is False
+
+
+@pytest.mark.parametrize(
+    ("alias", "conflict"),
+    (
+        ("Id", "agent:other"),
+        ("Provider", "other-provider"),
+        ("Model", "other-model"),
+        ("Thinking", "low"),
+        ("Mode", "unsafe"),
+        ("Cwd", "C:/other-workspace"),
+        ("Status", "parked"),
+        ("Archived", True),
+    ),
+)
+def test_paseo_inspect_rejects_conflicting_populated_aliases(alias, conflict):
+    payload = _inspect_payload_with_equal_aliases()
+    payload[alias] = conflict
+    transport = _PaseoCliTransport("paseo")
+    transport._run = lambda _args: payload  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        transport.inspect("agent:one")
+
+    assert stopped.value.code == "RUNTIME_IDENTITY_AMBIGUOUS"
+
+
+def test_paseo_workspace_decoder_accepts_equal_compatibility_aliases():
+    assert _PaseoRuntimeProviderAdapter._workspace_payload(
+        {
+            "id": "workspace:one",
+            "Id": "workspace:one",
+            "workspaceId": "workspace:one",
+            "path": "C:/workspace",
+            "Path": "C:/workspace",
+            "cwd": "C:/workspace",
+        }
+    ) == ("workspace:one", "C:/workspace")
+
+
+@pytest.mark.parametrize(
+    ("alias", "conflict"),
+    (
+        ("Id", "workspace:other"),
+        ("workspaceId", "workspace:other"),
+        ("Path", "C:/other-workspace"),
+        ("cwd", "C:/other-workspace"),
+    ),
+)
+def test_paseo_workspace_decoder_rejects_conflicting_populated_aliases(
+    alias, conflict
+):
+    payload = {
+        "id": "workspace:one",
+        "Id": "workspace:one",
+        "workspaceId": "workspace:one",
+        "path": "C:/workspace",
+        "Path": "C:/workspace",
+        "cwd": "C:/workspace",
+    }
+    payload[alias] = conflict
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        _PaseoRuntimeProviderAdapter._workspace_payload(payload)
+
+    assert stopped.value.code == "RUNTIME_IDENTITY_AMBIGUOUS"
+
+
+def test_paseo_agent_list_accepts_equal_compatibility_aliases(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    client.agent = SimpleNamespace(
+        agent_id="agent:one",
+        provider="test",
+        model="test-model",
+        thinking="high",
+        mode="safe",
+        cwd=str(workspace),
+        lifecycle="running",
+        archived=False,
+    )
+    native_run = client._run
+
+    def equal_alias_list(args):
+        if args[:2] == ["ls", "--global"]:
+            client.commands.append(list(args))
+            return [
+                {
+                    "id": "agent:one",
+                    "Id": "agent:one",
+                    "agentId": "agent:one",
+                    "AgentId": "agent:one",
+                }
+            ]
+        return native_run(args)
+
+    client._run = equal_alias_list  # type: ignore[method-assign]
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=tmp_path / "paseo-actions.json",
+    )
+
+    observed = adapter._one_agent(
+        {"gwo.runtime_action": "planning:repair"},
+        include_archived=True,
+    )
+
+    assert observed.agent_id == "agent:one"
+
+
+def test_conflicting_agent_list_aliases_stop_prepare_before_provider_mutation(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    client.agent = SimpleNamespace(
+        agent_id="agent:one",
+        provider="test",
+        model="test-model",
+        thinking="high",
+        mode="safe",
+        cwd=str(workspace),
+        lifecycle="running",
+        archived=False,
+    )
+    native_run = client._run
+
+    def conflicting_agent_list(args):
+        if args[:2] == ["ls", "--global"]:
+            client.commands.append(list(args))
+            return [{"id": "agent:one", "AgentId": "agent:other"}]
+        return native_run(args)
+
+    client._run = conflicting_agent_list  # type: ignore[method-assign]
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=tmp_path / "paseo-actions.json",
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+
+    rejected = adapter.prepare(
+        _RuntimeActionSpec(
+            subject.stable_action_id,
+            subject,
+            _profile(),
+            prompt,
+            (prompt,),
+        )
+    )
+
+    assert isinstance(rejected, _RuntimeFailure)
+    assert rejected.code == "RUNTIME_IDENTITY_AMBIGUOUS"
+    assert adapter._actions == {}
+    assert _mutating_paseo_commands(client.commands) == []
+
+
+def test_conflicting_workspace_list_aliases_do_not_persist_wrong_identity_or_mutate(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    slug = digest_value(
+        {
+            "repository": subject.repository,
+            "stable_action_id": subject.stable_action_id,
+        }
+    )[:24]
+    native_run = client._run
+
+    def conflicting_workspace_list(args):
+        if args[:2] == ["workspace", "ls"]:
+            client.commands.append(list(args))
+            return [
+                {
+                    "id": "workspace:wrong",
+                    "workspaceId": "workspace:one",
+                    "name": slug,
+                    "isolation": "worktree",
+                    "path": str(workspace),
+                    "cwd": str(workspace),
+                }
+            ]
+        return native_run(args)
+
+    client._run = conflicting_workspace_list  # type: ignore[method-assign]
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=tmp_path / "paseo-actions.json",
+    )
+
+    rejected = adapter.prepare(
+        _RuntimeActionSpec(
+            subject.stable_action_id,
+            subject,
+            _profile(),
+            prompt,
+            (prompt,),
+        )
+    )
+
+    assert isinstance(rejected, _RuntimeFailure)
+    assert rejected.code == "RUNTIME_IDENTITY_AMBIGUOUS"
+    assert adapter._actions == {}
+    assert _mutating_paseo_commands(client.commands) == []
+
+
+def test_artifact_store_put_flushes_fsyncs_replaces_and_finally_verifies(
+    tmp_path, monkeypatch
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    payload = b"durable artifact payload"
+    events: list[tuple[str, object]] = []
+    native_fsync = os.fsync
+    native_replace = os.replace
+
+    def recording_fsync(fd):
+        events.append(("fsync", os.fstat(fd).st_size))
+        return native_fsync(fd)
+
+    def recording_replace(source, target):
+        events.append(("replace", (Path(source).name, Path(target).name)))
+        return native_replace(source, target)
+
+    monkeypatch.setattr(gateway_module.os, "fsync", recording_fsync)
+    monkeypatch.setattr(gateway_module.os, "replace", recording_replace)
+
+    reference = store.put(payload)
+
+    assert store.read_bytes(reference.digest) == payload
+    replace_index = next(
+        index for index, event in enumerate(events) if event[0] == "replace"
+    )
+    assert any(
+        event == ("fsync", len(payload))
+        for event in events[:replace_index]
+    )
+    assert not list((tmp_path / "artifacts").glob("*.tmp"))
+
+
+def test_artifact_store_exclusive_temp_never_overwrites_unowned_collision(
+    tmp_path, monkeypatch
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    payload = b"exclusive temporary"
+    digest = hashlib.sha256(payload).hexdigest()
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    collided = root / f"{digest}.fixed.tmp"
+    collided.write_bytes(b"unowned sentinel")
+    monkeypatch.setattr(
+        gateway_module,
+        "uuid4",
+        lambda: SimpleNamespace(hex="fixed"),
+    )
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        store.put(payload)
+
+    assert stopped.value.code == "RUNTIME_ARTIFACT_UNAVAILABLE"
+    assert collided.read_bytes() == b"unowned sentinel"
+    assert not (root / digest).exists()
+
+
+def test_artifact_store_replace_failure_cleans_only_its_temporary(
+    tmp_path, monkeypatch
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    payload = b"replace failure"
+    digest = hashlib.sha256(payload).hexdigest()
+
+    def fail_replace(_source, _target):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(gateway_module.os, "replace", fail_replace)
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        store.put(payload)
+
+    assert stopped.value.code == "RUNTIME_ARTIFACT_UNAVAILABLE"
+    assert not store.path_for(digest).exists()
+    assert not list((tmp_path / "artifacts").glob(f"{digest}.*.tmp"))
+
+
+def test_artifact_store_final_verification_rejects_post_replace_corruption(
+    tmp_path, monkeypatch
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    payload = b"verify after replace"
+    digest = hashlib.sha256(payload).hexdigest()
+    native_replace = os.replace
+
+    def corrupt_after_replace(source, target):
+        native_replace(source, target)
+        Path(target).write_bytes(b"corrupt")
+
+    monkeypatch.setattr(gateway_module.os, "replace", corrupt_after_replace)
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        store.put(payload)
+
+    assert stopped.value.code == "RUNTIME_ARTIFACT_DIGEST_MISMATCH"
+    assert not list((tmp_path / "artifacts").glob(f"{digest}.*.tmp"))
+
+
+def test_artifact_store_concurrent_same_digest_writers_are_idempotent(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    payload = b"same digest from concurrent writers"
+    barrier = threading.Barrier(8)
+    references: list[gateway_module.ArtifactRef] = []
+    failures: list[Exception] = []
+    result_lock = threading.Lock()
+
+    def writer():
+        barrier.wait()
+        try:
+            result = store.put(payload)
+        except Exception as error:
+            with result_lock:
+                failures.append(error)
+        else:
+            with result_lock:
+                references.append(result)
+
+    threads = [threading.Thread(target=writer) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert failures == []
+    assert len(references) == 8
+    assert len({reference.digest for reference in references}) == 1
+    assert store.read_bytes(references[0].digest) == payload
+    assert not list((tmp_path / "artifacts").glob("*.tmp"))
+
+
+def test_artifact_store_existing_corrupt_digest_target_fails_closed(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    payload = b"expected artifact"
+    digest = hashlib.sha256(payload).hexdigest()
+    target = store.path_for(digest)
+    target.parent.mkdir()
+    target.write_bytes(b"corrupt existing target")
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        store.put(payload)
+
+    assert stopped.value.code == "RUNTIME_ARTIFACT_DIGEST_MISMATCH"
+    assert target.read_bytes() == b"corrupt existing target"
+
+
+def test_output_artifact_put_failure_never_persists_completion_or_receipt(
+    tmp_path, monkeypatch
+):
+    gateway, store, adapter = _gateway(tmp_path)
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(subject)
+
+    def fail_output_put(_payload):
+        raise RuntimeGatewayError(
+            "RUNTIME_ARTIFACT_UNAVAILABLE",
+            "simulated durable Artifact failure",
+        )
+
+    monkeypatch.setattr(store, "put", fail_output_put)
+
+    with pytest.raises(RuntimeGatewayError) as stopped:
+        gateway.progress(subject, preflight)
+
+    assert stopped.value.code == "RUNTIME_ARTIFACT_UNAVAILABLE"
+    durable = json.loads((tmp_path / "gateway.journal").read_text(encoding="utf-8"))
+    action = durable["actions"][subject.stable_action_id]
+    assert action["lifecycle"] == "prepared"
+    assert action["planning_output_artifact_digest"] is None
+    assert adapter._actions[subject.stable_action_id].output_artifact_digest is None
