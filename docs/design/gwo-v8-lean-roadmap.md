@@ -47,9 +47,9 @@ not the V8 Candidate graph.
 | Ticket | Outcome | Native blockers |
 | --- | --- | --- |
 | #108 | Land this accepted contract | none |
-| #109 | Start one immutable PlanSpec v3 Campaign | #108 |
+| #109 | Start one immutable PlanSpec v3 Campaign | #108, #111 |
 | #110 | Advance four Work Runs without Coordinator continuation | #109 |
-| #111 | Route semantic roles through one RuntimeGateway | #109 |
+| #111 | Route semantic roles through one RuntimeGateway | #108 |
 | #112 | Bound permission waits and terminal Runtime recovery | #111 |
 | #113 | Resume Campaigns without LLM polling | #110, #112 |
 | #114 | Accept standard Candidates through one CandidateGate | #110, #111 |
@@ -61,9 +61,9 @@ not the V8 Candidate graph.
 
 ```mermaid
 flowchart LR
-    T108["#108 Contract"] --> T109["#109 PlanControl"]
+    T108["#108 Contract"] --> T111["#111 RuntimeGateway seam"]
+    T111 --> T109["#109 PlanControl"]
     T109 --> T110["#110 ExecutionKernel"]
-    T109 --> T111["#111 RuntimeGateway"]
     T111 --> T112["#112 Permissions + recovery"]
     T110 --> T113["#113 Watchdog"]
     T112 --> T113
@@ -99,11 +99,36 @@ Exit criteria:
 - no product Runtime, writer, production execution, or unrelated tracker state
   changes.
 
-## Stage 1 — PlanControl
+## Stage 1 — RuntimeGateway seam and PlanControl
 
-Ticket: #109.
+Tickets: #111 then #109.
 
-Exit criteria:
+Exit criteria for #111:
+
+- every semantic action uses the exact selectors and precedence in
+  [`Runtime assignment`](gwo-v8-lean-architecture.md#runtime-assignment);
+- every provider implementation and the deterministic in-memory implementation
+  satisfy the same
+  [`RuntimeGateway adapter contract`](gwo-v8-lean-architecture.md#runtimegateway-adapter-contract)
+  conformance suite;
+- `start` is possible only from exact Prepared readback with no
+  Agent/session/binding, verified staged Prompt, and boolean fence; it is
+  accepted only after complete Bound readback including normalized permissions.
+  `resume` is possible only from exact unfenced parked Bound readback including
+  normalized permissions;
+- Campaign-start overrides and stable-action assignment receipts survive
+  restart;
+- #111 durably pins the primary Profile and optional fallback candidate, but
+  does not classify provider unavailability/capacity or select a fallback; #112
+  owns that one-time pre-identity availability decision and its bounded retry
+  episode; and
+- only the host configuration assembler reads immutable Runtime Profile
+  provider/model facts. PlanSpec, PlanControl, ExecutionKernel, CandidateGate,
+  and other semantic workflow callers neither receive those facts nor construct
+  vendor commands; and
+- PlanSpec remains provider-, model-, CLI-, selector-, and fallback-neutral.
+
+Exit criteria for #109:
 
 - `start` creates one Campaign with one active Plan Revision through
   [`PlanControl and Campaign planning`](gwo-v8-lean-architecture.md#plancontrol-and-campaign-planning);
@@ -118,9 +143,9 @@ Exit criteria:
 - new Campaigns contain none of the removed generic graph or Runtime-assignment
   fields.
 
-## Stage 2 — ExecutionKernel and RuntimeGateway
+## Stage 2 — ExecutionKernel
 
-Tickets: #110 and #111 may proceed in parallel after #109.
+Ticket: #110, after #109.
 
 Exit criteria for #110:
 
@@ -130,22 +155,6 @@ Exit criteria for #110:
 - `inspect` and `advance` agree on the five public statuses; and
 - predecessor workflow driver and separate reconciliation entrypoints are
   removed.
-
-Exit criteria for #111:
-
-- every semantic action uses the exact selectors and precedence in
-  [`Runtime assignment`](gwo-v8-lean-architecture.md#runtime-assignment);
-- every provider implementation and the deterministic in-memory implementation
-  satisfy the same
-  [`RuntimeGateway adapter contract`](gwo-v8-lean-architecture.md#runtimegateway-adapter-contract)
-  conformance suite;
-- semantic `start` or `resume` is impossible until `observe` proves the stable
-  action, complete identities, staged Prompt, lifecycle, permissions, and
-  fence;
-- Campaign-start overrides and stable-action assignment receipts survive
-  restart;
-- no caller knows provider names or constructs vendor commands; and
-- PlanSpec remains provider-, model-, CLI-, selector-, and fallback-neutral.
 
 ## Stage 3 — Runtime recovery and Campaign liveness
 
@@ -163,6 +172,9 @@ Exit criteria for #112:
 - configuration-invalid and transport-unavailable handling produces the exact
   named outcomes and independently counted initial-plus-two retry bounds in the
   [`Runtime failure taxonomy`](gwo-v8-lean-architecture.md#runtime-failure-taxonomy);
+- an authoritative pre-identity `unavailable` or `capacity_exhausted` result
+  selects the #111-pinned fallback at most once, persists that selection, and
+  never crosses the identity boundary;
 - post-identity live provider unavailability preserves the exact
   `stable_action_id`, Runtime Binding, Profile, provider, CLI, Agent, session,
   workspace, accepted Prompt, and authority; authoritative observations one
@@ -320,8 +332,8 @@ Exit criteria for #119:
 The safe critical path is:
 
 ```text
-#108 -> #109 -> (#110 || #111)
-              #111 -> #112
+#108 -> #111 -> (#109 || #112)
+              #109 -> #110
               (#110 + #112) -> #113
               (#110 + #111) -> #114
               (#112 + #114) -> #115

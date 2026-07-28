@@ -5,7 +5,7 @@ amends: ADR-0037, ADR-0042, ADR-0044, ADR-0055, ADR-0059
 
 # Keep Runtime assignment explicit and outside PlanSpec
 
-V8 separates Runtime assignment from semantic planning. Runtime assignment
+Successor PlanSpec v3 separates Runtime assignment from semantic planning. Runtime assignment
 uses these exact selectors:
 
 - Campaign-scoped `coordinator`;
@@ -42,6 +42,13 @@ Agent, session, workspace, provider action, or capacity reservation. The
 subsequent Artifact-backed planning receipt is opaque to PlanControl, so the
 persisted source/Profile/fallback facts remain RuntimeGateway-private.
 
+That preflight record is an exact durable compare-and-set binding of the
+Campaign Planning subject, Campaign-start overrides, and resolved Coordinator
+configuration. Reusing its stable action with a changed source snapshot,
+Policy Witness, protocol/request Artifact, override, or configuration fails
+closed rather than silently selecting a fresh assignment. No Work Run can use
+the Planning preflight operation.
+
 Availability fallback is permitted only before any Agent identity may exist
 for the stable action. After identity, RuntimeGateway recovers the same
 binding. A replacement Worker requires terminal-binding Evidence and uses the
@@ -51,6 +58,10 @@ A durably selected fallback remains selected even if the primary later
 recovers. Cached availability is advisory; live provider, configuration, and
 transport behavior follows the canonical
 [`Runtime failure taxonomy`](../design/gwo-v8-lean-architecture.md#runtime-failure-taxonomy).
+Issue #111 persists the primary assignment, optional fallback candidate, and
+initial `fallback_selected=false` record. Issue #112 owns authoritative native
+availability classification and the one-time pre-identity mutation to that
+candidate; a transport failure never selects it by inference.
 
 PlanControl may declare factual Runtime capabilities such as required tools or
 execution features. It cannot infer difficulty, assign a model, rank profiles,

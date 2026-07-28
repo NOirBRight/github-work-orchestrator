@@ -5,10 +5,13 @@ amends: ADR-0018, ADR-0024, ADR-0026, ADR-0044, ADR-0051, ADR-0052, ADR-0053, AD
 
 # Make RuntimeGateway the only Runtime boundary
 
-RuntimeGateway is V8's only external execution boundary. ExecutionKernel,
-PlanControl, and CandidateGate exchange typed Runtime requests and receipts
-with it; they never construct Codex, Claude Code, Paseo, shell, Agent, session,
-or provider commands directly.
+RuntimeGateway is the only external semantic Runtime boundary for successor
+PlanSpec v3 Campaigns. Successor PlanControl, ExecutionKernel, and
+CandidateGate exchange typed Runtime requests and receipts with it; they never
+construct Codex, Claude Code, Paseo, shell, Agent, session, or provider
+commands directly. The schema-version-2 Kernel and `runtime.py` adapters are
+predecessor compatibility for existing V2 state until Issue #118 Cutover Guard;
+they are not successor composition inputs and this ADR does not rewrite them.
 
 RuntimeGateway accepts a closed materialization-subject union. Its pre-Plan
 `CampaignPlanningSubject` binds repository, Campaign key and handle, expected
@@ -22,31 +25,65 @@ opaque receipt. Preflight creates no Agent, session, workspace, provider
 action, claim, or capacity reservation.
 
 The caller surface is deliberately small: planning preflight, typed subject
-progress, and cursor-based wake-hint readback. Subject progress owns all
-prepare/observe/command choreography, including the readback-first recovery
-loop for Campaign Planning. PlanControl consumes only opaque preflight and
-Artifact-backed planning receipts, never assignment, adapter, CLI, Profile,
-session, or Runtime Binding facts.
+progress (which accepts a wake cursor), and a typed closed-union transition
+request by stable action. Subject progress owns all prepare/observe and
+start-or-resume choreography, including the readback-first recovery loop for
+Campaign Planning. Event cursors produce advisory wake hints only inside that
+progress call; no caller can use an event as state or obtain a raw provider
+operation. PlanControl consumes only opaque preflight and Artifact-backed
+planning receipts, never assignment, adapter, CLI, Profile, session, Runtime
+Binding, Agent, or workspace facts.
+
+Only the host configuration assembler reads immutable Runtime Profile
+provider/model facts and supplies the composed `RuntimeConfiguration`; that
+host-only composition data is not a PlanSpec or semantic-workflow input.
+PlanControl, ExecutionKernel, CandidateGate, and other semantic workflow
+callers receive neither those facts nor a vendor command surface. Host
+composition uses provider-neutral `build_runtime_gateway` and
+`RuntimeRepositoryContext`; its default production transport is created inside
+the module. The factory accepts the composed configuration but has no direct
+provider, CLI command, transport, raw-adapter, or binding parameter.
 
 Every production adapter and the deterministic in-memory adapter implements
-the same private provider-neutral interface:
+the same module-private provider-neutral interface. Its request, receipt,
+observation, event, permission, and failure types are private implementation
+types; they are neither package exports nor caller contracts:
 
 ```text
 prepare(RuntimeActionSpec) -> PrepareReceipt | RuntimeFailure
-observe(stable_action_id) -> RuntimeObservation | RuntimeFailure
-command(binding_ref, RuntimeCommand) -> CommandReceipt | RuntimeFailure
+observe(stable_action_id) -> PreparedRuntimeObservation | BoundRuntimeObservation | RuntimeFailure
+command(stable_action_id, RuntimeTransition) -> CommandReceipt | RuntimeFailure
 events(after_cursor) -> RuntimeEventPage
 ```
 
-`prepare` may stage identity, workspace, and Artifact-backed Prompt but cannot
-start semantic execution. `observe` must prove the complete binding and Prompt
+`prepare` may stage only an action-owned Workspace and every governed
+Artifact-backed input, including the Prompt;
+it cannot create an Agent, session, Runtime Binding, or semantic execution.
+Only an authoritative typed absence result permits it. Transport failure,
+malformed native return, ambiguity, or any other failure stops progression and
+cannot be treated as absence. A Prepared observation proves the exact subject,
+Profile, authority, Workspace, Prompt, and boolean fence state while
+Agent/session/binding are explicitly absent. `start` is allowed only from that
+state. It may atomically create and start an Agent, but acknowledgement loss
+must immediately read back the stable-action label and accept only an exact
+Bound observation. A Bound observation proves the complete binding and Prompt
 receipt—including repository, Campaign, Plan Revision, Work Run, stable
 action, selected Profile, Agent, session, workspace, Runtime Binding,
-lifecycle, permission, and fence state—before RuntimeGateway issues the
-closed-union `start` or `resume` command. The other allowed commands are
-`park`, `interrupt`, `permission_response`, `fence`, and `retire`. Production
-and in-memory implementations pass the same contract suite; Profile and
-permission policy remain in RuntimeGateway.
+lifecycle, normalized exact permission requests, and boolean fence state.
+`resume` requires an exact parked Bound observation. The other allowed
+commands are `park`, `interrupt`, `PermissionResponse(request_id, allow|deny)`,
+`fence`, and `retire`; a permission response names exactly one request ID and
+can never use an open-ended provider allow. Production and in-memory
+implementations pass the same contract suite; Profile and permission policy
+remain in RuntimeGateway.
+
+Every accepted command receipt, including acknowledgement-loss recovery, must
+be followed by authoritative Bound readback proving its own effect: `start`
+and `resume` are running or completed, `park` and `interrupt` are parked,
+`fence` is exactly true, `retire` is retired, and a `PermissionResponse`
+removes its exact request. A fenced Bound action cannot resume. Production
+wake cursors persist only readback lifecycle, exact pending-permission, and
+fence changes; they remain advisory and never replace `observe`.
 
 RuntimeGateway hides:
 
@@ -58,25 +95,58 @@ RuntimeGateway hides:
 - Review and specialist Internal Subagent launch, including selection of a CLI
   different from the parent Worker;
 - stable Agent, session, action, Prompt, and Workspace identity readback;
-- Artifact-backed Prompt and output transport without silent truncation;
+- bounded, digest-verified Artifact-backed Prompt and output transport without
+  silent truncation, missing input, or canonical-binding drift;
 - structured permission request readback and exact authorization enforcement;
-- pre-identity availability fallback and post-identity same-binding recovery;
+- the durable primary Profile plus optional fallback candidate seam, and
+  post-identity same-binding recovery;
   and
 - bounded command duration, transport retry, and typed Runtime errors.
 
 Provider Adapters remain replaceable implementation plugins behind this
-boundary. They advertise truthful capabilities, but no caller branches on a
-provider name. The same frozen Ticket contract, authority-subtree digest, and
-action key can therefore be rendered for Codex, Claude Code, Paseo, or another
-compatible execution model without changing PlanSpec or ExecutionKernel.
+boundary. They advertise truthful capabilities, but no semantic workflow
+caller branches on a provider name. The same frozen Ticket contract,
+authority-subtree digest, and action key can therefore be rendered for Codex,
+Claude Code, Paseo, or another compatible execution model without changing
+PlanSpec or ExecutionKernel.
 
 Complete Ticket contracts, the planning protocol/request, Review Subjects, and
-Review Finding context use bounded Artifact references or files. No provider
-adapter may put these complete payloads in a short command argument: it must
-account for underlying CLI and Paseo command-length limits and fail closed on
-unavailable bounded transport. An ambiguous prepare acknowledgement, callback,
-or restart first observes the stable action; it never creates a second Agent,
-workspace, Prompt, or Planning Pass.
+Review Finding context use bounded Artifact references or files. The
+Gateway-owned Artifact Store reads every governed input and completed output
+by digest, bounds byte length, requires canonical JSON where the protocol is
+JSON, and verifies the exact subject, stable action, authority, and payload
+binding before the provider sees it or PlanControl consumes it. Paseo's short
+bootstrap references the verified Workspace Prompt file and may use an output
+schema, but a completed receipt is authoritative only when the Agent atomically
+writes the action-owned result Artifact. Logs and events are wake hints, never
+output. No provider adapter may put complete payloads in a short command
+argument: it must account for underlying CLI and Paseo command-length limits
+and fail closed on unavailable bounded transport. An ambiguous prepare
+acknowledgement, callback, or restart first observes the stable action; it
+never creates a second Agent, workspace, Prompt, or Planning Pass.
+
+For the current Paseo transport, stable-action labels are proved by
+`ls --global --label` before `inspect`; `inspect` is compared exactly on Agent
+ID, provider, model, thinking, mode, current working directory, and status.
+The inspected working directory then joins one exact recorded Workspace ID,
+name, and worktree isolation. Its resolved path must differ from the resolved
+source checkout; private bounded Git readback then proves their shared
+repository common directory. The first durable Workspace intent resolves and
+pins one exact base commit, creates from that commit, and a Prepared Workspace
+proves its `HEAD` still equals that pinned commit without re-resolving the
+mutable base ref. Paseo exposes no provider session ID,
+so the bound session reference is explicitly adapter-derived as
+`paseo-agent:<agent-id>`. Non-empty Profile features fail closed until the CLI
+can both set and read them.
+
+Before the provider may create a Workspace, start an Agent, or resume an Agent,
+the adapter durably records the exact pending effect. A missing label or
+Workspace after an acknowledgement loss remains `RuntimeMaterializationPending`;
+it cannot authorize a second create, run, or send. Workspace adoption requires
+one exact slug/isolation/cwd readback and repository identity proof; duplicate
+slug candidates are ambiguous. A definitive absent fence label clears only the
+pending fence intent, so the failed transition can later retry without guessing
+that it took effect.
 
 The permission broker is internal to RuntimeGateway. It may automatically allow
 one exact normalized request only when its operation ID and resource ID are
@@ -105,6 +175,13 @@ workspace, terminal state, fencing, and checkpoint, but only ExecutionKernel
 may use the single replacement binding with the configured `recovery_worker`
 assignment. Timeout, permission delay, ambiguity, or capacity pressure after
 identity never changes CLI or creates a replacement Agent.
+
+Issue #111 pins the primary Profile, optional fallback candidate, and durable
+`fallback_selected=false` initial assignment, but does not classify a native
+provider result as `unavailable` or `capacity_exhausted`. Issue #112 owns that
+authoritative availability classification, the one-time pre-identity update to
+the pinned fallback, and its bounded retry episode; #111's adapter seam must
+therefore fail closed rather than infer that selection from a transport error.
 
 Live provider unavailability after identity opens or reuses one persisted
 episode bound to the exact stable action, Runtime Binding, Profile, provider,

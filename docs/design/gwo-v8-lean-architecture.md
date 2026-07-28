@@ -281,6 +281,11 @@ source.
 
 ## RuntimeGateway adapter contract
 
+This successor PlanSpec v3 contract is supplied by #111 before #109 wires the
+new composition. The schema-version-2 Kernel and `runtime.py` adapters remain
+explicit predecessor compatibility until #118 Cutover Guard. They are not a
+RuntimeGateway bypass for any successor V3 module.
+
 RuntimeGateway accepts only two materialization subjects: the pre-Plan
 `CampaignPlanningSubject` above, and a Plan-Revision Work Run subject that
 binds the repository, Campaign, Plan Revision, Work Run, Ticket, semantic
@@ -289,33 +294,49 @@ not fabricate a Plan Revision for planning, and accepts no generic Agent or
 provider subject.
 
 Its caller interface has only three operations: planning-configuration
-preflight, typed subject progress, and cursor-based wake-hint readback.
-Progress owns the complete observe-before-start and readback-first recovery
-loop; callers cannot prepare, observe, command, or inspect a Runtime Binding.
+preflight, typed subject progress (with an optional wake cursor), and a typed
+closed-union transition request by stable action. Progress owns the complete
+observe-before-start and readback-first recovery loop; callers cannot prepare,
+observe, command, inspect a Runtime Binding, or treat an event as state.
 Campaign-start overrides are durable Campaign configuration, not PlanSpec;
 the gateway persists each stable action's selector, configuration source,
 resolved Profile digest, and fallback choice before any provider operation.
+Only the host configuration assembler reads immutable Runtime Profile
+provider/model facts and supplies the composed `RuntimeConfiguration`; that
+host-only composition data is not a PlanSpec or semantic-workflow input.
+PlanControl, ExecutionKernel, CandidateGate, and other semantic workflow
+callers receive neither those facts nor a vendor command surface. Host
+composition uses provider-neutral `build_runtime_gateway` and
+`RuntimeRepositoryContext`; the factory accepts the composed configuration but
+has no direct provider, CLI, transport, raw-adapter, or binding parameter.
 
-RuntimeGateway owns one private provider-neutral adapter contract. Every
-production adapter and the deterministic in-memory adapter implements exactly:
+RuntimeGateway owns one module-private provider-neutral adapter contract.
+Every production adapter and the deterministic in-memory adapter implements
+exactly:
 
 ```text
 prepare(RuntimeActionSpec) -> PrepareReceipt | RuntimeFailure
-observe(stable_action_id) -> RuntimeObservation | RuntimeFailure
-command(binding_ref, RuntimeCommand) -> CommandReceipt | RuntimeFailure
+observe(stable_action_id) -> PreparedRuntimeObservation | BoundRuntimeObservation | RuntimeFailure
+command(stable_action_id, RuntimeTransition) -> CommandReceipt | RuntimeFailure
 events(after_cursor) -> RuntimeEventPage
 ```
 
 `prepare` is idempotent by stable action identity. It resolves or creates the
-Agent, session, and isolated workspace and stages the Artifact-backed Prompt,
-but it cannot begin semantic execution. The complete Ticket contract,
+action-owned isolated Workspace and stages every governed Artifact-backed
+input, including the Prompt, but it
+cannot create an Agent, session, or Runtime Binding or begin semantic
+execution. Only a typed authoritative absence permits prepare; transport,
+malformed result, and ambiguity fail closed. A Prepared observation proves
+the exact subject, Profile, authority, Workspace, Prompt, and boolean fence
+state while Agent/session/binding are explicitly absent. The complete Ticket contract,
 planning protocol/request, Review Subject, and Review Finding context travel
 through bounded Artifact references or files, never a short CLI argument; an
 adapter fails closed rather than exceeding an OS or Paseo command-length
 limit. `observe` authoritatively proves the
 repository, Campaign, Plan Revision, Work Run, stable action, selected Profile,
 Agent, session, workspace, and Runtime Binding identities, plus Prompt
-acceptance, lifecycle, outstanding Permission Requests, and fencing state.
+acceptance, lifecycle, outstanding normalized Permission Requests, and strict
+boolean fencing state. That is a Bound observation.
 
 `RuntimeCommand` is a closed union:
 
@@ -323,19 +344,47 @@ acceptance, lifecycle, outstanding Permission Requests, and fencing state.
 start | resume | park | interrupt | permission_response | fence | retire
 ```
 
-RuntimeGateway may issue `start` or `resume` only after `observe` proves the
-complete binding and accepted-Prompt receipt for that stable action. No
-adapter has an implicit launch-on-prepare path. After an acknowledged-create
-loss, restart, or ambiguous materialization, it first observes the stable
-action and can neither create a second Agent/workspace/Prompt nor begin a
-second Planning Pass. `events` provides cursor-based wake hints; it never
-replaces `observe`.
+RuntimeGateway may issue `start` only after `observe` proves the exact
+Prepared state; Paseo then atomically creates and starts the Agent. It accepts
+the action only after stable-action label lookup and `inspect` prove the exact
+Bound state. `resume` requires an exact parked Bound observation and uses a
+Prompt file. No adapter has an implicit launch-on-prepare path. After an
+acknowledged-create loss, restart, or ambiguous materialization, it first
+observes the stable action and can neither create a second Agent/workspace/
+Prompt nor begin a second Planning Pass. `events` provides cursor-based wake
+hints; it never replaces `observe`.
 
-The deterministic in-memory adapter passes the same contract suite and
-failure cases as production adapters. It is not a looser fake or a second
-policy implementation. Runtime Profile resolution, permission policy, and
-fallback selection remain exclusively in RuntimeGateway. Retry bounds and
-semantic budgets remain ExecutionKernel policy.
+Every accepted command receipt (including acknowledgement-loss recovery) is
+valid only after Bound readback proves its named effect: start/resume produce
+running or completed, park/interrupt parked, fence exactly true, retire
+retired, and `PermissionResponse` removes the exact request. A fenced parked
+binding cannot resume. Production persists lifecycle, fence, and pending
+permission state changes as advisory cursor wake hints.
+
+The Gateway-owned Artifact Store verifies bounded byte length and digest for
+every input and completed output. Canonical JSON Prompt and output Artifacts
+also prove their exact subject, stable action, authority, and payload binding;
+missing, truncated, oversized, or drifted Artifacts stop progression before a
+provider call or receipt. Paseo uses a short bootstrap and `--output-schema`,
+but a completed receipt is authoritative only after the Agent atomically writes
+the action-owned Workspace result Artifact; logs are wake hints, never output.
+Paseo label list readback establishes the stable action before `inspect`, whose
+Agent ID, provider, model, thinking, mode, current working directory, and
+status must exactly match the binding. Its working directory joins the exact
+recorded workspace ID/name/worktree record, and bounded Git readback proves the
+same repository common directory; a Prepared Workspace also has the configured
+base commit as its `HEAD`. Because Paseo does not
+expose a provider session ID, `paseo-agent:<agent-id>` is an explicit
+adapter-derived session reference; non-empty Profile features fail closed.
+Before Workspace create, run, or resume, the production adapter persists the
+exact pending effect. An acknowledgement-loss readback that is still absent
+returns materialization-pending and cannot repeat that side effect; duplicate
+Workspace slug candidates are ambiguous rather than retryable.
+The deterministic in-memory adapter passes the same
+contract suite and failure cases as production adapters. It is not a looser
+fake or a second policy implementation. Runtime Profile resolution, permission
+policy, and fallback selection remain exclusively in RuntimeGateway. Retry
+bounds and semantic budgets remain ExecutionKernel policy.
 
 ## Worker Slots and Work Run bounds
 

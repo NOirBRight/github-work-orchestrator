@@ -6,7 +6,7 @@ amends: ADR-0029, ADR-0045, ADR-0050, ADR-0055
 
 # Require one semantic planning pass per Plan Revision
 
-PlanControl uses a hybrid boundary. It automates source readback, structural
+Successor PlanSpec v3 PlanControl uses a hybrid boundary. It automates source readback, structural
 validation, deterministic compilation, publication, activation, and durable
 readback, but it does not compile a selected Ticket set without semantic
 inspection.
@@ -65,6 +65,15 @@ to the exact `CampaignPlanningSubject` and stable action. Post-identity
 ambiguity reads back that same action and output; it cannot authorize a second
 Planning Pass. PlanControl sees only the opaque preflight and planning
 receipts, never a provider, CLI, Profile, session, or Runtime Binding.
+
+The preflight is exclusive to `CampaignPlanningSubject`. It is a durable
+compare-and-set binding of that exact subject, Campaign-start overrides, and
+resolved Coordinator configuration; retrying it with changed input, options,
+or configuration under the same stable action fails closed. A Work Run cannot
+enter this pre-Plan operation. Progress reads the complete planning
+protocol/request from the bounded Gateway Artifact Store and validates the
+completed output's exact subject, stable action, authority, and payload
+binding before it returns the opaque receipt.
 
 This replaces the earlier zero-Coordinator initial path with a bounded cost:
 one semantic planning turn for the complete Campaign revision, independent of
