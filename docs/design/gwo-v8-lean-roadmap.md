@@ -47,7 +47,7 @@ not the V8 Candidate graph.
 | Ticket | Outcome | Native blockers |
 | --- | --- | --- |
 | #108 | Land this accepted contract | none |
-| #109 | Start one immutable PlanSpec v3 Campaign | #108, #111 |
+| #109 | Start one immutable PlanSpec v3 Campaign | #111 |
 | #110 | Advance four Work Runs without Coordinator continuation | #109 |
 | #111 | Route semantic roles through one RuntimeGateway | #108 |
 | #112 | Bound permission waits and terminal Runtime recovery | #111 |
@@ -122,6 +122,9 @@ Exit criteria for #111:
   does not classify provider unavailability/capacity or select a fallback; #112
   owns that one-time pre-identity availability decision and its bounded retry
   episode; and
+- #126 is a completed operations prerequisite for this landing; it is not a
+  successor-mechanics ticket and is intentionally absent from this dependency
+  table; and
 - only the host configuration assembler reads immutable Runtime Profile
   provider/model facts. PlanSpec, PlanControl, ExecutionKernel, CandidateGate,
   and other semantic workflow callers neither receive those facts nor construct

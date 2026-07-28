@@ -10,7 +10,7 @@ provider-shaped public interface:
 ```text
 prepare(RuntimeActionSpec) -> PrepareReceipt | RuntimeFailure
 observe(stable_action_id) -> RuntimeObservation | RuntimeFailure
-command(binding_ref, RuntimeCommand) -> CommandReceipt | RuntimeFailure
+command(stable_action_id, RuntimeTransition) -> CommandReceipt | RuntimeFailure
 events(after_cursor) -> RuntimeEventPage
 ```
 
@@ -19,7 +19,8 @@ identity and stages the Artifact-backed Prompt; it cannot begin semantic
 execution. `observe` proves the stable action, selected Profile digest, all
 identities, Prompt acceptance, lifecycle, permissions, and fencing.
 `RuntimeCommand` is the closed union `start`, `resume`, `park`, `interrupt`,
-`permission_response`, `fence`, and `retire`. `start` or `resume` is legal only
+`fence`, and `retire`; the seventh semantic transition is the separately typed
+`PermissionResponse(request_id, allow|deny)`. `start` or `resume` is legal only
 after authoritative observation of the complete binding and Prompt receipt.
 Events are wake hints, never authoritative state.
 

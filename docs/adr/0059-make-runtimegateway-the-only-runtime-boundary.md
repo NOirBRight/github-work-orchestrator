@@ -80,8 +80,10 @@ remain in RuntimeGateway.
 Every accepted command receipt, including acknowledgement-loss recovery, must
 be followed by authoritative Bound readback proving its own effect: `start`
 and `resume` are running or completed, `park` and `interrupt` are parked,
-`fence` is exactly true, `retire` is retired, and a `PermissionResponse`
-removes its exact request. A fenced Bound action cannot resume. Production
+`fence` is exactly true, `retire` is retired, and a `PermissionResponse` first
+has an exact same-decision provider receipt and then removes its exact request.
+Absence without that receipt is ambiguous and cannot recover an acknowledged
+permission decision. A fenced Bound action cannot resume. Production
 wake cursors persist only readback lifecycle, exact pending-permission, and
 fence changes; they remain advisory and never replace `observe`.
 
@@ -148,13 +150,15 @@ slug candidates are ambiguous. A definitive absent fence label clears only the
 pending fence intent, so the failed transition can later retry without guessing
 that it took effect.
 
-The permission broker is internal to RuntimeGateway. It may automatically allow
-one exact normalized request only when its operation ID and resource ID are
-covered by both the frozen Authority Grant and the referenced Policy Witness.
-The request record also binds request identity, Runtime Binding, and
-authority-subtree digest. RuntimeGateway approves the individual request ID,
-never an open-ended `--all` grant. An unmatched, ambiguous, or
-higher-authority request returns `PermissionRequired` to ExecutionKernel.
+Issue #111's permission descriptor is internal to RuntimeGateway. It joins
+the provider's exact request identity with canonical, bounded,
+provider-namespaced operation/resource digests and preserves the Runtime
+Binding and authority-subtree digest; it does not infer authority from a
+provider name or description and does not auto-allow. Issue #112 owns the
+policy decision: it may automatically allow an individual exact request only
+when both exact canonical identifiers are covered by the frozen Authority
+Grant and referenced Policy Witness; otherwise it returns `PermissionRequired`
+to ExecutionKernel. No layer may use an open-ended `--all` grant.
 
 RuntimeGateway cannot expand authority. A Coordinator may propose only an
 alternative already covered by the same frozen authority subtree. Any new or

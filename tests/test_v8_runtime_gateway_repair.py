@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, dataclass, replace
+from copy import deepcopy
 import inspect
 import json
 from pathlib import Path
@@ -544,6 +545,7 @@ class _RecordingPaseoCli:
         self.agent: SimpleNamespace | None = None
         self._agent_labels: dict[str, str] = {}
         self.workspaces: list[dict[str, str]] = []
+        # Internal fake state follows inspect's actionable full-id projection.
         self.permissions: list[dict[str, str]] = []
 
     def _run(self, args):
@@ -582,7 +584,16 @@ class _RecordingPaseoCli:
                 else [{"id": self.agent.agent_id}]
             )
         if args[:2] == ["permit", "ls"]:
-            return list(self.permissions)
+            return [
+                {
+                    "id": item["id"][:8],
+                    "agentId": item["agentId"],
+                    "agentShortId": item["agentId"][:7],
+                    "name": item["tool"],
+                    "description": item["description"],
+                }
+                for item in self.permissions
+            ]
         if args[0] == "run":
             labels = {
                 args[index + 1].split("=", 1)[0]: args[index + 1].split("=", 1)[1]
@@ -616,7 +627,18 @@ class _RecordingPaseoCli:
                 raise TimeoutError("send acknowledgement vanished")
             self.agent.lifecycle = "busy"
         if args[:2] == ["permit", "allow"] or args[:2] == ["permit", "deny"]:
-            self.permissions = [item for item in self.permissions if item["id"] != args[3]]
+            exact = [item for item in self.permissions if item["id"] == args[3]]
+            selected = exact or [item for item in self.permissions if item["id"].startswith(args[3])]
+            if len(selected) != 1:
+                raise OSError("permission id is ambiguous")
+            self.permissions.remove(selected[0])
+            return [{
+                "requestId": args[3][:8],
+                "agentId": args[2],
+                "agentShortId": args[2][:7],
+                "name": selected[0]["tool"],
+                "result": "allowed" if args[1] == "allow" else "denied",
+            }]
         return {}
 
     def _consume_hidden_agent_query(self) -> bool:
@@ -638,7 +660,14 @@ class _RecordingPaseoCli:
 
     def inspect(self, _agent_id):
         assert self.agent is not None
-        return self.agent
+        pending = tuple(
+            (item["id"], item["tool"])
+            for item in self.permissions
+            if item["agentId"] == self.agent.agent_id
+        )
+        payload = dict(vars(self.agent))
+        payload["pending_permissions"] = pending
+        return SimpleNamespace(**payload)
 
     def update_labels(self, _agent_id, labels):
         assert self.agent is not None
@@ -646,6 +675,23 @@ class _RecordingPaseoCli:
         if self.lose_fence_ack_after_effect:
             self.lose_fence_ack_after_effect = False
             raise TimeoutError("label update acknowledgement vanished")
+
+
+def _paseo_permission(
+    request_id: str,
+    *,
+    tool: str = "write",
+    description: str = "repository:one",
+    agent_id: str = "agent:one",
+) -> dict[str, str]:
+    """One real-shape fake permission: inspect full ID plus permit descriptor."""
+
+    return {
+        "id": request_id,
+        "agentId": agent_id,
+        "tool": tool,
+        "description": description,
+    }
 
 
 @pytest.mark.parametrize(
@@ -678,6 +724,26 @@ def test_paseo_inspect_requires_exact_status_and_archived_readback(payload):
 
     with pytest.raises(ValueError):
         transport.inspect("agent:one")
+
+
+def test_paseo_inspect_reads_real_pending_permission_shape():
+    transport = _PaseoCliTransport("paseo")
+    full_id = "permit001-full-opaque-provider-id"
+    transport._run = lambda _args: {  # type: ignore[method-assign]
+        "id": "agent:one",
+        "provider": "test",
+        "model": "model",
+        "thinking": "high",
+        "mode": "safe",
+        "cwd": "C:/workspace",
+        "status": "running",
+        "archived": False,
+        "PendingPermissions": [{"id": full_id, "tool": "filesystem.write"}],
+    }
+
+    observed = transport.inspect("agent:one")
+
+    assert observed.pending_permissions == ((full_id, "filesystem.write"),)
 
 
 def test_production_adapter_constructs_staged_paseo_commands_and_readbacks(tmp_path):
@@ -751,14 +817,7 @@ def test_production_adapter_recovers_workspace_ack_loss_and_uses_exact_permissio
     assert not isinstance(prepared, _RuntimeFailure)
     assert sum(command[:2] == ["workspace", "create"] for command in client.commands) == 1
     adapter.command(subject.stable_action_id, RuntimeCommand.START)
-    client.permissions = [
-        {
-            "agentId": "agent:one",
-            "id": "request:one",
-            "operation": "write",
-            "resource": "repository:one",
-        }
-    ]
+    client.permissions = [_paseo_permission("request:one")]
     bound = adapter.observe(subject.stable_action_id)
     assert not isinstance(bound, _RuntimeFailure)
     assert [item.request_id for item in bound.permission_requests] == ["request:one"]
@@ -822,7 +881,9 @@ def test_production_permission_item_without_owner_fails_closed(tmp_path):
         _RuntimeFailure,
     )
     assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.START), _RuntimeFailure)
-    client.permissions = [{"id": "permission:unknown", "operation": "write", "resource": "repo"}]
+    # The fake's own provider-state shape is malformed; its permit-list
+    # projection therefore fails before a policy request can be emitted.
+    client.permissions = [{"id": "permission:unknown", "tool": "write", "description": "repo"}]
 
     observed = adapter.observe(subject.stable_action_id)
 
@@ -1241,14 +1302,7 @@ def test_private_adapter_shared_lifecycle_conformance(adapter_kind, tmp_path):
 
     assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.START), _RuntimeFailure)
     if client is not None:
-        client.permissions = [
-            {
-                "agentId": "agent:one",
-                "id": "request:one",
-                "operation": "write",
-                "resource": "repository:one",
-            }
-        ]
+        client.permissions = [_paseo_permission("request:one")]
     bound = adapter.observe(subject.stable_action_id)
     assert not isinstance(bound, _RuntimeFailure)
     assert bound.binding_ref is not None
@@ -1447,17 +1501,17 @@ def test_production_permission_ordering_and_events_hash_full_request_records(tmp
     )
     assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.START), _RuntimeFailure)
     client.permissions = [
-        {"agentId": "agent:one", "id": "request:z", "operation": "write", "resource": "repo:z"},
-        {"agentId": "agent:one", "id": "request:a", "operation": "read", "resource": "repo:a"},
+        _paseo_permission("permz001:z", description="repo:z"),
+        _paseo_permission("perma001:a", tool="read", description="repo:a"),
     ]
     observed = adapter.observe(subject.stable_action_id)
     assert not isinstance(observed, _RuntimeFailure)
-    assert [request.request_id for request in observed.permission_requests] == ["request:a", "request:z"]
+    assert [request.request_id for request in observed.permission_requests] == ["perma001:a", "permz001:z"]
     first = adapter.events(None)
     assert not isinstance(first, _RuntimeFailure)
     client.permissions.reverse()
     assert adapter.events(first.next_cursor).events == ()
-    client.permissions[0]["operation"] = "write+review"
+    client.permissions[0]["tool"] = "write+review"
     changed = adapter.events(first.next_cursor)
     assert [event.kind for event in changed.events] == ["state:running"]
 
@@ -1481,9 +1535,7 @@ def test_production_idle_permission_response_readback_proves_effect_but_closed_f
     assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.START), _RuntimeFailure)
     assert client.agent is not None
     client.agent.lifecycle = "idle"
-    client.permissions = [
-        {"agentId": "agent:one", "id": "request:idle", "operation": "write", "resource": "repo"}
-    ]
+    client.permissions = [_paseo_permission("request:idle", description="repo")]
     pending = adapter.observe(subject.stable_action_id)
     assert not isinstance(pending, _RuntimeFailure)
     assert pending.lifecycle == "running"
@@ -1500,9 +1552,7 @@ def test_production_idle_permission_response_readback_proves_effect_but_closed_f
     record = adapter._actions[subject.stable_action_id]
     assert "pending_permission_response" not in record
 
-    client.permissions = [
-        {"agentId": "agent:one", "id": "request:closed", "operation": "write", "resource": "repo"}
-    ]
+    client.permissions = [_paseo_permission("request:closed", description="repo")]
     client.agent.lifecycle = "closed"
     result = adapter.command(
         subject.stable_action_id,
@@ -1527,7 +1577,18 @@ def test_paseo_cli_argument_safety_and_length_prevent_subprocess(monkeypatch):
     with pytest.raises(RuntimeGatewayError) as oversized:
         transport._run(["run", "x" * 8_000, "--json"])
     assert oversized.value.code == "RUNTIME_VENDOR_ARGUMENT_INVALID"
+    for unsafe_value in ('agent" --mode bypass', "agent(test)"):
+        with pytest.raises(RuntimeGatewayError) as unsafe:
+            transport._run(["inspect", unsafe_value, "--json"])
+        assert unsafe.value.code == "RUNTIME_VENDOR_ARGUMENT_INVALID"
     assert calls == []
+
+
+def test_runtime_command_is_six_enum_commands_plus_typed_permission_response():
+    assert {command.value for command in RuntimeCommand} == {
+        "start", "resume", "park", "interrupt", "fence", "retire"
+    }
+    assert "permission_response" not in {command.value for command in RuntimeCommand}
 
 
 def test_production_rejects_unsafe_subject_identity_before_any_cli_call(tmp_path):
@@ -1686,9 +1747,7 @@ def test_gateway_permission_response_idle_readback_and_unremoved_request_fail_cl
     gateway.progress(subject, preflight)
     assert client.agent is not None
     client.agent.lifecycle = "idle"
-    client.permissions = [
-        {"agentId": "agent:one", "id": "request:idle", "operation": "write", "resource": "repo"}
-    ]
+    client.permissions = [_paseo_permission("request:idle", description="repo")]
     accepted = gateway.transition(
         subject.stable_action_id,
         PermissionResponse(request_id="request:idle", decision="allow"),
@@ -1696,15 +1755,19 @@ def test_gateway_permission_response_idle_readback_and_unremoved_request_fail_cl
     assert accepted.status == "running"
     assert "pending_permission_response" not in adapter._actions[subject.stable_action_id]
 
-    client.permissions = [
-        {"agentId": "agent:one", "id": "request:kept", "operation": "write", "resource": "repo"}
-    ]
+    client.permissions = [_paseo_permission("request:kept", description="repo")]
     native_run = client._run
 
     def retain_permission(args):
         if args[:2] == ["permit", "allow"]:
             client.commands.append(list(args))
-            return {}
+            return [{
+                "requestId": args[3][:8],
+                "agentId": args[2],
+                "agentShortId": args[2][:7],
+                "name": "write",
+                "result": "allowed",
+            }]
         return native_run(args)
 
     client._run = retain_permission  # type: ignore[method-assign]
@@ -1714,3 +1777,1123 @@ def test_gateway_permission_response_idle_readback_and_unremoved_request_fail_cl
             PermissionResponse(request_id="request:kept", decision="allow"),
         )
     assert kept.value.code == "RUNTIME_OBSERVATION_INVALID"
+
+
+def _prepared_paseo_adapter(tmp_path, *, state_name: str = "paseo-actions.json"):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=tmp_path / state_name,
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))
+    assert not isinstance(adapter.prepare(spec), _RuntimeFailure)
+    assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.START), _RuntimeFailure)
+    return store, source, workspace, client, adapter, subject, spec
+
+
+def test_production_permission_real_five_field_fixture_joins_and_uses_full_id(tmp_path):
+    _store, _source, _workspace, client, adapter, subject, _spec = _prepared_paseo_adapter(tmp_path)
+    full_id = "permit01-full-provider-request-id"
+    client.permissions = [_paseo_permission(full_id, tool="filesystem.write", description="repo/.gwo")]
+    native_run = client._run
+
+    def real_shape_run(args):
+        if args[:2] == ["permit", "ls"]:
+            return [
+                {
+                    "id": full_id[:8],
+                    "agentId": "agent:one",
+                    "agentShortId": "agent:o",
+                    "name": "filesystem.write",
+                    "description": "repo/.gwo",
+                }
+            ]
+        return native_run(args)
+
+    client._run = real_shape_run  # type: ignore[method-assign]
+    observed = adapter.observe(subject.stable_action_id)
+    assert not isinstance(observed, _RuntimeFailure)
+    assert [request.request_id for request in observed.permission_requests] == [full_id]
+    assert not isinstance(
+        adapter.command(subject.stable_action_id, PermissionResponse(full_id, "allow")),
+        _RuntimeFailure,
+    )
+    assert ["permit", "allow", "agent:one", full_id, "--json"] in client.commands
+
+
+def test_production_permission_rejects_invalid_real_agent_short_id(tmp_path):
+    _store, _source, _workspace, client, adapter, subject, _spec = _prepared_paseo_adapter(tmp_path)
+    full_id = "permit03-provider-request-id"
+    client.permissions = [_paseo_permission(full_id)]
+    native_run = client._run
+
+    def invalid_short_id_run(args):
+        if args[:2] == ["permit", "ls"]:
+            return [{
+                "id": full_id[:8],
+                "agentId": "agent:one",
+                "agentShortId": "wrong:id",
+                "name": "write",
+                "description": "repository:one",
+            }]
+        return native_run(args)
+
+    client._run = invalid_short_id_run  # type: ignore[method-assign]
+    observed = adapter.observe(subject.stable_action_id)
+    assert isinstance(observed, _RuntimeFailure)
+    assert observed.code == "RUNTIME_IDENTITY_AMBIGUOUS"
+
+
+@pytest.mark.parametrize(
+    "permission_values, expected_code",
+    (
+        (
+            (
+                _paseo_permission("prefix01-first-provider-id"),
+                _paseo_permission("prefix01-second-provider-id"),
+            ),
+            "RUNTIME_IDENTITY_AMBIGUOUS",
+        ),
+        ((_paseo_permission("permit02-provider-id"),), "RUNTIME_IDENTITY_AMBIGUOUS"),
+    ),
+)
+def test_production_permission_prefix_collision_and_bijection_mismatch_fail_closed(
+    tmp_path, permission_values, expected_code
+):
+    _store, _source, _workspace, client, adapter, subject, _spec = _prepared_paseo_adapter(tmp_path)
+    client.permissions = list(permission_values)
+    native_run = client._run
+    if expected_code == "RUNTIME_IDENTITY_AMBIGUOUS" and len(permission_values) == 1:
+        def mismatched_permit_list(args):
+            if args[:2] == ["permit", "ls"]:
+                item = permission_values[0]
+                return [
+                    {
+                        "id": "mismatch",
+                        "agentId": item["agentId"],
+                        "agentShortId": item["agentId"][:7],
+                        "name": item["tool"],
+                        "description": item["description"],
+                    }
+                ]
+            return native_run(args)
+
+        client._run = mismatched_permit_list  # type: ignore[method-assign]
+    observed = adapter.observe(subject.stable_action_id)
+    assert isinstance(observed, _RuntimeFailure)
+    assert observed.code == expected_code
+
+
+@pytest.mark.parametrize("mutation", ("missing", "changed", "duplicate"))
+def test_prepared_workspace_registry_must_remain_exact(tmp_path, mutation):
+    _store, _source, workspace, client, adapter, subject, _spec = _prepared_paseo_adapter(tmp_path)
+    # This assertion targets Prepared state, not the Bound Agent join.
+    adapter._actions[subject.stable_action_id].pop("bound_agent_id", None)
+    adapter._actions[subject.stable_action_id].pop("pending_start", None)
+    client.agent = None
+    if mutation == "missing":
+        client.workspaces = []
+    elif mutation == "changed":
+        changed = workspace.parent / "changed-workspace"
+        changed.mkdir()
+        client.workspaces[0]["cwd"] = str(changed)
+    else:
+        client.workspaces.append(dict(client.workspaces[0]))
+
+    observed = adapter.observe(subject.stable_action_id)
+
+    assert isinstance(observed, _RuntimeFailure)
+    assert observed.code == "RUNTIME_IDENTITY_AMBIGUOUS"
+
+
+def test_workspace_action_save_failure_rolls_back_and_retains_pinned_intent(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    state_path = tmp_path / "paseo-actions.json"
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=state_path,
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))
+    native_save = adapter._save
+    saves = 0
+
+    def fail_only_action_commit():
+        nonlocal saves
+        saves += 1
+        if saves == 2:
+            raise OSError("atomic replacement failed")
+        native_save()
+
+    adapter._save = fail_only_action_commit  # type: ignore[method-assign]
+    failed = adapter.prepare(spec)
+    assert isinstance(failed, _RuntimeFailure)
+    assert failed.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    assert subject.stable_action_id not in adapter._actions
+    assert subject.stable_action_id in adapter._workspace_intents
+    assert adapter.observe(subject.stable_action_id).authoritative_absence is True
+    durable = json.loads(state_path.read_text(encoding="utf-8"))
+    assert durable["actions"] == {}
+    assert subject.stable_action_id in durable["workspace_intents"]
+
+    recovered = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=state_path,
+    )
+    assert not isinstance(recovered.prepare(spec), _RuntimeFailure)
+    assert sum(command[:2] == ["workspace", "create"] for command in client.commands) == 1
+
+
+@pytest.mark.parametrize("failure_code", ("RUNTIME_CONFIGURATION_INVALID", "RUNTIME_TRANSPORT_UNAVAILABLE"))
+def test_prepare_failure_with_authoritative_absence_preserves_original_code(tmp_path, failure_code):
+    gateway, store, adapter = _gateway(tmp_path)
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(subject)
+    adapter.prepare = lambda _spec: _RuntimeFailure(failure_code, "original failure")  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeGatewayError) as failed:
+        gateway.progress(subject, preflight)
+
+    assert failed.value.code == failure_code
+
+
+def test_gateway_rejects_unknown_and_permanent_permission_response_without_recovery(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    profile = _profile()
+    subject = _put_subject_artifacts(store, _subject())
+    adapter = _InMemoryRuntimeProviderAdapter(
+        store,
+        pending_permissions={subject.stable_action_id: (("request:one", "write", "repo"),)},
+    )
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=adapter,
+        configuration=RuntimeConfiguration(
+            profiles={profile.digest: profile},
+            host_mappings={"coordinator": ProfileMapping(profile.digest)},
+        ),
+        _artifacts=store,
+    )
+    preflight = gateway.planning_preflight(subject)
+    gateway.progress(subject, preflight)
+    with pytest.raises(RuntimeGatewayError) as unknown:
+        gateway.transition(subject.stable_action_id, PermissionResponse("request:stale", "allow"))
+    assert unknown.value.code == "RUNTIME_PERMISSION_REQUEST_UNKNOWN"
+
+    adapter.command = lambda *_args: _RuntimeFailure("RUNTIME_COMMAND_INVALID", "permanent")  # type: ignore[method-assign]
+    with pytest.raises(RuntimeGatewayError) as permanent:
+        gateway.transition(subject.stable_action_id, PermissionResponse("request:one", "allow"))
+    assert permanent.value.code == "RUNTIME_COMMAND_INVALID"
+
+
+def test_durable_history_with_fresh_memory_adapter_never_reprepares(tmp_path):
+    first_gateway, store, first_adapter = _gateway(tmp_path)
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = first_gateway.planning_preflight(subject)
+    first_gateway.progress(subject, preflight)
+    assert first_adapter.prepare_calls == [subject.stable_action_id]
+
+    fresh_adapter = _InMemoryRuntimeProviderAdapter(store)
+    restarted = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=fresh_adapter,
+        configuration=first_gateway._configuration,
+        _artifacts=store,
+    )
+    with pytest.raises(RuntimeGatewayError) as missing:
+        restarted.progress(subject, preflight)
+    assert missing.value.code == "RUNTIME_BINDING_MISSING"
+    assert fresh_adapter.prepare_calls == []
+
+
+def test_durable_history_with_lost_production_state_never_reprepares(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    context = {"owner/repository": RuntimeRepositoryContext(source, "main")}
+    client = _RecordingPaseoCli(workspace)
+    first_adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts=context,
+        state_path=tmp_path / "first-paseo-actions.json",
+    )
+    profile = _profile()
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=first_adapter,
+        configuration=RuntimeConfiguration(
+            profiles={profile.digest: profile},
+            host_mappings={"coordinator": ProfileMapping(profile.digest)},
+        ),
+        _artifacts=store,
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(subject)
+    gateway.progress(subject, preflight)
+    assert sum(command[0] == "run" for command in client.commands) == 1
+
+    lost_state_adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts=context,
+        state_path=tmp_path / "lost-paseo-actions.json",
+    )
+    restarted = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=lost_state_adapter,
+        configuration=gateway._configuration,
+        _artifacts=store,
+    )
+    with pytest.raises(RuntimeGatewayError) as missing:
+        restarted.progress(subject, preflight)
+    assert missing.value.code == "RUNTIME_BINDING_MISSING"
+    assert sum(command[0] == "run" for command in client.commands) == 1
+
+
+@pytest.mark.parametrize(
+    "failure_kind, expected_code",
+    (
+        ("missing", "RUNTIME_ARTIFACT_MISSING"),
+        ("tampered", "RUNTIME_ARTIFACT_DIGEST_MISMATCH"),
+        ("features", "RUNTIME_CONFIGURATION_INVALID"),
+    ),
+)
+def test_memory_artifact_and_profile_failures_share_strict_conformance_contract(
+    tmp_path, failure_kind, expected_code
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    profile = replace(_profile(), features={"unsupported": True}) if failure_kind == "features" else _profile()
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, profile, prompt, (prompt,))
+    if failure_kind == "features":
+        result = adapter.prepare(spec)
+    else:
+        assert not isinstance(adapter.prepare(spec), _RuntimeFailure)
+        target = store.path_for(prompt.digest)
+        if failure_kind == "missing":
+            target.unlink()
+        else:
+            target.write_bytes(b"tampered")
+        result = adapter.observe(subject.stable_action_id)
+    assert isinstance(result, _RuntimeFailure)
+    assert result.code == expected_code
+
+
+@dataclass(frozen=True)
+class _CampaignPlanningSubjectSubclass(CampaignPlanningSubject):
+    unexpected: str = "unexpected"
+
+
+@dataclass(frozen=True)
+class _WorkRunSubjectSubclass(WorkRunSubject):
+    unexpected: str = "unexpected"
+
+
+def test_public_subject_boundaries_reject_dataclass_subclasses(tmp_path):
+    gateway, store, _adapter = _gateway(tmp_path)
+    planning = _put_subject_artifacts(store, _subject())
+    planning_subclass = _CampaignPlanningSubjectSubclass(**planning.__dict__)
+    with pytest.raises(RuntimeGatewayError) as invalid_planning:
+        gateway.planning_preflight(planning_subclass)
+    assert invalid_planning.value.code == "RUNTIME_PREFLIGHT_SUBJECT_INVALID"
+
+    work_subclass = _WorkRunSubjectSubclass(
+        repository="owner/repository",
+        campaign_key="campaign:repair",
+        campaign_handle="handle:repair",
+        plan_revision_digest="1" * 64,
+        work_run_key="work:one",
+        ticket_key="ticket:one",
+        role="worker",
+        prompt_artifact_digest="2" * 64,
+        authority_subtree_digest="3" * 64,
+        stable_action_id="work:one",
+    )
+    with pytest.raises(RuntimeGatewayError) as invalid_work:
+        gateway.progress(work_subclass)
+    assert invalid_work.value.code == "RUNTIME_SUBJECT_INVALID"
+
+
+@pytest.mark.parametrize(
+    "profile, contexts",
+    (
+        (_profile(), {}),
+        (replace(_profile(), features={"unsupported": True}), "valid"),
+        (replace(_profile(), provider='test" --mode bypass'), "valid"),
+        (replace(_profile(), model="model(test)"), "valid"),
+        (replace(_profile(), thinking=" high"), "valid"),
+        (replace(_profile(), mode="safe "), "valid"),
+        (replace(_profile(), mode="safe&bypass"), "valid"),
+    ),
+)
+def test_production_preflight_rejects_static_context_feature_and_unsafe_profile_before_claim(
+    tmp_path, profile, contexts
+):
+    source, _workspace = _repository_worktree(tmp_path)
+    configuration = RuntimeConfiguration(
+        profiles={profile.digest: profile},
+        host_mappings={"coordinator": ProfileMapping(profile.digest)},
+    )
+    gateway = build_runtime_gateway(
+        store_path=tmp_path / "gateway.journal",
+        configuration=configuration,
+        repository_contexts=(
+            {} if contexts == {} else {"owner/repository": RuntimeRepositoryContext(source, "main")}
+        ),
+    )
+    with pytest.raises(RuntimeGatewayError) as invalid:
+        gateway.planning_preflight(_subject())
+    assert invalid.value.code == "RUNTIME_CONFIGURATION_INVALID"
+    assert gateway._data["campaigns"] == {}
+    assert gateway._data["preflights"] == {}
+
+
+def test_bound_workspace_allows_worker_candidate_commit_but_prepared_rejects_base_drift(tmp_path):
+    _store, _source, workspace, _client, adapter, subject, _spec = _prepared_paseo_adapter(tmp_path)
+    candidate = workspace / "candidate.txt"
+    candidate.write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(workspace), "add", "candidate.txt"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(workspace), "commit", "-m", "candidate"],
+        check=True,
+        capture_output=True,
+    )
+    bound = adapter.observe(subject.stable_action_id)
+    assert not isinstance(bound, _RuntimeFailure)
+    assert bound.binding_ref == "paseo:agent:one"
+
+    store = ArtifactStore(tmp_path / "prepared-artifacts")
+    prepared_root = tmp_path / "prepared"
+    prepared_root.mkdir()
+    source, prepared_workspace = _repository_worktree(prepared_root)
+    prepared_client = _RecordingPaseoCli(prepared_workspace)
+    prepared_adapter = _PaseoRuntimeProviderAdapter(
+        client=prepared_client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=tmp_path / "prepared-actions.json",
+    )
+    prepared_subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(prepared_subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(prepared_subject.stable_action_id, prepared_subject, _profile(), prompt, (prompt,))
+    assert not isinstance(prepared_adapter.prepare(spec), _RuntimeFailure)
+    (prepared_workspace / "base-drift.txt").write_text("drift\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(prepared_workspace), "add", "base-drift.txt"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(prepared_workspace), "commit", "-m", "base drift"],
+        check=True,
+        capture_output=True,
+    )
+    prepared = prepared_adapter.observe(prepared_subject.stable_action_id)
+    assert isinstance(prepared, _RuntimeFailure)
+    assert prepared.code == "RUNTIME_IDENTITY_AMBIGUOUS"
+
+
+def test_first_workspace_intent_save_failure_rolls_back_before_create(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=tmp_path / "paseo-actions.json",
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))
+    adapter._save = lambda: (_ for _ in ()).throw(OSError("intent save failed"))  # type: ignore[method-assign]
+
+    result = adapter.prepare(spec)
+
+    assert isinstance(result, _RuntimeFailure)
+    assert result.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    assert adapter._workspace_intents == {}
+    assert adapter._actions == {}
+    assert all(command[:2] != ["workspace", "create"] for command in client.commands)
+
+
+def test_start_and_resume_save_failure_do_not_send_external_command(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=tmp_path / "paseo-actions.json",
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))
+    assert not isinstance(adapter.prepare(spec), _RuntimeFailure)
+    before_start = list(client.commands)
+    record_before_start = deepcopy(adapter._actions[subject.stable_action_id])
+    adapter._save = lambda: (_ for _ in ()).throw(OSError("start save failed"))  # type: ignore[method-assign]
+    start_failed = adapter.command(subject.stable_action_id, RuntimeCommand.START)
+    assert isinstance(start_failed, _RuntimeFailure)
+    assert adapter._actions[subject.stable_action_id] == record_before_start
+    assert all(command[0] != "run" for command in client.commands[len(before_start):])
+
+    # Recreate an unfenced Bound parked action, then fail the resume intent save.
+    adapter._save = _PaseoRuntimeProviderAdapter._save.__get__(adapter)  # type: ignore[method-assign]
+    assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.START), _RuntimeFailure)
+    assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.PARK), _RuntimeFailure)
+    assert adapter.observe(subject.stable_action_id).lifecycle == "parked"
+    before_resume = list(client.commands)
+    record_before_resume = deepcopy(adapter._actions[subject.stable_action_id])
+    adapter._save = lambda: (_ for _ in ()).throw(OSError("resume save failed"))  # type: ignore[method-assign]
+    resume_failed = adapter.command(subject.stable_action_id, RuntimeCommand.RESUME)
+    assert isinstance(resume_failed, _RuntimeFailure)
+    assert adapter._actions[subject.stable_action_id] == record_before_resume
+    assert all(command[0] != "send" for command in client.commands[len(before_resume):])
+
+
+def test_permission_response_requires_same_decision_receipt_before_removal(tmp_path):
+    _store, _source, _workspace, client, adapter, subject, _spec = _prepared_paseo_adapter(tmp_path)
+    request_id = "receipt1-full-provider-request"
+    client.permissions = [_paseo_permission(request_id)]
+    accepted = adapter.command(subject.stable_action_id, PermissionResponse(request_id, "allow"))
+    assert not isinstance(accepted, _RuntimeFailure)
+    pending = adapter._actions[subject.stable_action_id]["pending_permission_response"]
+    assert pending["provider_receipt"] == {
+        "requestId": request_id[:8],
+        "agentId": "agent:one",
+        "agentShortId": "agent:o",
+        "name": "write",
+        "result": "allowed",
+    }
+    observed = adapter.observe(subject.stable_action_id)
+    assert not isinstance(observed, _RuntimeFailure)
+    assert "pending_permission_response" not in adapter._actions[subject.stable_action_id]
+
+
+@pytest.mark.parametrize(
+    "receipt, expected_code",
+    (
+        ([{"requestId": "receipt2", "agentId": "agent:one", "agentShortId": "agent:o", "name": "write", "result": "denied"}], "RUNTIME_IDENTITY_AMBIGUOUS"),
+        ([{"requestId": "receipt2"}], "RUNTIME_PROVIDER_PROTOCOL_INVALID"),
+    ),
+)
+def test_permission_response_rejects_opposite_or_malformed_provider_receipt(tmp_path, receipt, expected_code):
+    _store, _source, _workspace, client, adapter, subject, _spec = _prepared_paseo_adapter(tmp_path)
+    request_id = "receipt2-full-provider-request"
+    client.permissions = [_paseo_permission(request_id)]
+    native_run = client._run
+
+    def receipt_run(args):
+        if args[:2] == ["permit", "allow"]:
+            native_run(args)
+            return receipt
+        return native_run(args)
+
+    client._run = receipt_run  # type: ignore[method-assign]
+    result = adapter.command(subject.stable_action_id, PermissionResponse(request_id, "allow"))
+    assert isinstance(result, _RuntimeFailure)
+    assert result.code == expected_code
+
+
+def test_permission_response_ack_loss_with_absence_is_effect_ambiguous(tmp_path):
+    _store, _source, _workspace, client, adapter, subject, _spec = _prepared_paseo_adapter(tmp_path)
+    request_id = "receipt3-full-provider-request"
+    client.permissions = [_paseo_permission(request_id)]
+    native_run = client._run
+
+    def remove_then_lose_ack(args):
+        if args[:2] == ["permit", "allow"]:
+            native_run(args)
+            raise TimeoutError("receipt acknowledgement lost")
+        return native_run(args)
+
+    client._run = remove_then_lose_ack  # type: ignore[method-assign]
+    command = adapter.command(subject.stable_action_id, PermissionResponse(request_id, "allow"))
+    assert isinstance(command, _RuntimeFailure)
+    assert command.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    observed = adapter.observe(subject.stable_action_id)
+    assert isinstance(observed, _RuntimeFailure)
+    assert observed.code == "RUNTIME_EFFECT_AMBIGUOUS"
+
+
+@pytest.mark.parametrize("kind", ("unsafe_fallback", "non_git", "bad_base", "unsafe_path"))
+def test_production_preflight_validates_fallback_and_repository_context_before_persisting(
+    tmp_path, kind
+):
+    source, _workspace = _repository_worktree(tmp_path)
+    primary = _profile()
+    fallback = replace(_profile(), name="fallback", mode="unsafe&mode")
+    mapping = ProfileMapping(
+        primary.digest,
+        fallback.digest if kind == "unsafe_fallback" else None,
+    )
+    profiles = {primary.digest: primary}
+    if kind == "unsafe_fallback":
+        profiles[fallback.digest] = fallback
+    if kind == "non_git":
+        non_git = tmp_path / "not-a-repository"
+        non_git.mkdir()
+        context = RuntimeRepositoryContext(non_git, "main")
+    elif kind == "bad_base":
+        context = RuntimeRepositoryContext(source, "not-a-base")
+    elif kind == "unsafe_path":
+        unsafe = tmp_path / "unsafe&context"
+        subprocess.run(
+            ["git", "-C", str(source), "worktree", "add", "-b", "unsafe-context", str(unsafe), "main"],
+            check=True,
+            capture_output=True,
+        )
+        context = RuntimeRepositoryContext(unsafe, "main")
+    else:
+        context = RuntimeRepositoryContext(source, "main")
+    gateway = build_runtime_gateway(
+        store_path=tmp_path / "gateway.journal",
+        configuration=RuntimeConfiguration(
+            profiles=profiles,
+            host_mappings={"coordinator": mapping},
+        ),
+        repository_contexts={"owner/repository": context},
+    )
+    with pytest.raises(RuntimeGatewayError) as invalid:
+        gateway.planning_preflight(_subject())
+    assert invalid.value.code == "RUNTIME_CONFIGURATION_INVALID"
+    assert gateway._data["campaigns"] == {}
+    assert gateway._data["preflights"] == {}
+
+
+def test_paseo_nonzero_json_error_taxonomy_never_treats_permanent_rejection_as_transport(monkeypatch):
+    transport = _PaseoCliTransport("paseo")
+
+    def result_for(code):
+        return SimpleNamespace(
+            returncode=1,
+            stdout=json.dumps({"error": {"code": code, "message": "native detail"}}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(gateway_module.subprocess, "run", lambda *_args, **_kwargs: result_for("DAEMON_NOT_RUNNING"))
+    with pytest.raises(RuntimeGatewayError) as daemon:
+        transport._run(["inspect", "agent:one", "--json"])
+    assert daemon.value.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+
+    for code, expected in (("PERMISSION_NOT_FOUND", "RUNTIME_PERMISSION_REQUEST_UNKNOWN"), ("UNKNOWN_COMMAND", "RUNTIME_PROVIDER_COMMAND_FAILED")):
+        monkeypatch.setattr(gateway_module.subprocess, "run", lambda *_args, _code=code, **_kwargs: result_for(_code))
+        with pytest.raises(RuntimeGatewayError) as permanent:
+            transport._run(["inspect", "agent:one", "--json"])
+        assert permanent.value.code == expected
+        assert "native detail" not in permanent.value.detail
+
+
+@pytest.mark.parametrize(
+    "failure_kind, expected_code",
+    (("missing", "RUNTIME_ARTIFACT_MISSING"), ("tampered", "RUNTIME_ARTIFACT_DIGEST_MISMATCH")),
+)
+def test_memory_observe_validates_a_distinct_input_artifact(tmp_path, failure_kind, expected_code):
+    store = ArtifactStore(tmp_path / "artifacts")
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    separate_input = store.put_canonical({"separate": "governed input"})
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (separate_input,))
+    assert not isinstance(adapter.prepare(spec), _RuntimeFailure)
+    input_path = store.path_for(separate_input.digest)
+    if failure_kind == "missing":
+        input_path.unlink()
+    else:
+        input_path.write_bytes(b"tampered input")
+
+    result = adapter.observe(subject.stable_action_id)
+
+    assert isinstance(result, _RuntimeFailure)
+    assert result.code == expected_code
+
+
+@dataclass(frozen=True)
+class _PermissionResponseSubclass(PermissionResponse):
+    unexpected: str = "unexpected"
+
+
+def test_runtime_transition_boundary_rejects_permission_response_dataclass_subclass(tmp_path):
+    gateway, store, adapter = _gateway(tmp_path)
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(subject)
+    gateway.progress(subject, preflight)
+    subclass = _PermissionResponseSubclass("request:one", "allow")
+
+    with pytest.raises(RuntimeGatewayError) as public_invalid:
+        gateway.transition(subject.stable_action_id, subclass)
+    assert public_invalid.value.code == "RUNTIME_COMMAND_INVALID"
+    private_invalid = adapter.command(subject.stable_action_id, subclass)
+    assert isinstance(private_invalid, _RuntimeFailure)
+    assert private_invalid.code == "RUNTIME_COMMAND_INVALID"
+
+
+@pytest.mark.parametrize("adapter_kind", ("memory", "paseo"))
+def test_permission_response_completion_evidence_replays_once_after_gateway_restart(
+    tmp_path, adapter_kind
+):
+    """A completed adapter effect survives the Gateway's unpersisted receipt window."""
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    subject = _put_subject_artifacts(store, _subject())
+    profile = _profile()
+    client: _RecordingPaseoCli | None = None
+    adapter_state = tmp_path / "paseo-actions.json"
+    if adapter_kind == "memory":
+        adapter = _InMemoryRuntimeProviderAdapter(
+            store,
+            pending_permissions={
+                subject.stable_action_id: (("request:replay", "write", "repository:one"),)
+            },
+        )
+    else:
+        source, workspace = _repository_worktree(tmp_path)
+        client = _RecordingPaseoCli(workspace)
+        adapter = _PaseoRuntimeProviderAdapter(
+            client=client,  # type: ignore[arg-type]
+            artifacts=store,
+            repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+            state_path=adapter_state,
+        )
+    gateway_path = tmp_path / "gateway.journal"
+    configuration = RuntimeConfiguration(
+        profiles={profile.digest: profile},
+        host_mappings={"coordinator": ProfileMapping(profile.digest)},
+    )
+    gateway = RuntimeGateway(
+        store_path=gateway_path,
+        _adapter=adapter,
+        configuration=configuration,
+        _artifacts=store,
+    )
+    preflight = gateway.planning_preflight(subject)
+    gateway.progress(subject, preflight)
+    if client is not None:
+        client.permissions = [_paseo_permission("request:replay")]
+
+    command = PermissionResponse("request:replay", "allow")
+    assert not isinstance(adapter.command(subject.stable_action_id, command), _RuntimeFailure)
+    completed = adapter.observe(subject.stable_action_id)
+    assert not isinstance(completed, _RuntimeFailure)
+    assert completed.completed_permission_response is not None
+    if client is not None:
+        assert len([args for args in client.commands if args[:2] == ["permit", "allow"]]) == 1
+        adapter = _PaseoRuntimeProviderAdapter(
+            client=client,  # type: ignore[arg-type]
+            artifacts=store,
+            repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+            state_path=adapter_state,
+        )
+
+    restarted = RuntimeGateway(
+        store_path=gateway_path,
+        _adapter=adapter,
+        configuration=configuration,
+        _artifacts=store,
+    )
+    replayed = restarted.transition(subject.stable_action_id, command)
+    assert replayed.command == command
+    if client is not None:
+        assert len([args for args in client.commands if args[:2] == ["permit", "allow"]]) == 1
+    with pytest.raises(RuntimeGatewayError) as opposite:
+        restarted.transition(
+            subject.stable_action_id,
+            PermissionResponse("request:replay", "deny"),
+        )
+    assert opposite.value.code == "RUNTIME_PERMISSION_REQUEST_UNKNOWN"
+    with pytest.raises(RuntimeGatewayError) as unknown:
+        restarted.transition(
+            subject.stable_action_id,
+            PermissionResponse("request:unknown", "allow"),
+        )
+    assert unknown.value.code == "RUNTIME_PERMISSION_REQUEST_UNKNOWN"
+
+
+def test_resume_prompt_write_failure_preserves_durable_state_and_can_retry(tmp_path, monkeypatch):
+    _store, _source, _workspace, client, adapter, subject, _spec = _prepared_paseo_adapter(tmp_path)
+    assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.PARK), _RuntimeFailure)
+    assert adapter.observe(subject.stable_action_id).lifecycle == "parked"
+    record_before = deepcopy(adapter._actions[subject.stable_action_id])
+    state_before = json.loads(adapter._state_path.read_text(encoding="utf-8"))
+    command_count = len(client.commands)
+
+    def fail_write(_record):
+        raise OSError("local resume prompt write failed")
+
+    monkeypatch.setattr(adapter, "_write_resume_file", fail_write)
+    failed = adapter.command(subject.stable_action_id, RuntimeCommand.RESUME)
+    assert isinstance(failed, _RuntimeFailure)
+    assert failed.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    assert adapter._actions[subject.stable_action_id] == record_before
+    assert json.loads(adapter._state_path.read_text(encoding="utf-8")) == state_before
+    assert all(args[0] != "send" for args in client.commands[command_count:])
+
+    monkeypatch.setattr(
+        adapter,
+        "_write_resume_file",
+        _PaseoRuntimeProviderAdapter._write_resume_file,
+    )
+    assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.RESUME), _RuntimeFailure)
+    assert any(args[0] == "send" for args in client.commands[command_count:])
+
+
+def test_production_preflight_accepts_safe_git_base_ref_that_is_not_paseo_argv(tmp_path):
+    source, _workspace = _repository_worktree(tmp_path)
+    base_ref = "base&candidate"
+    subprocess.run(
+        ["git", "-C", str(source), "branch", base_ref, "main"],
+        check=True,
+        capture_output=True,
+    )
+    profile = _profile()
+    gateway = build_runtime_gateway(
+        store_path=tmp_path / "gateway.journal",
+        configuration=RuntimeConfiguration(
+            profiles={profile.digest: profile},
+            host_mappings={"coordinator": ProfileMapping(profile.digest)},
+        ),
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, base_ref)},
+    )
+    receipt = gateway.planning_preflight(_subject())
+    assert receipt.stable_action_id == _subject().stable_action_id
+    assert gateway._data["campaigns"] != {}
+
+
+def test_paseo_nonzero_error_json_over_byte_limit_is_never_parsed(monkeypatch):
+    payload = json.dumps({"error": {"code": "DAEMON_NOT_RUNNING"}})
+    payload += "x" * (gateway_module._MAXIMUM_PASEO_ERROR_JSON_BYTES + 1)
+    monkeypatch.setattr(
+        gateway_module.json,
+        "loads",
+        lambda _payload: pytest.fail("oversized Paseo error JSON was parsed"),
+    )
+    error = _PaseoCliTransport._nonzero_failure(payload, "")
+    assert error.code == "RUNTIME_PROVIDER_COMMAND_FAILED"
+
+
+@pytest.mark.parametrize("adapter_kind", ("memory", "paseo"))
+@pytest.mark.parametrize(
+    "failure_kind, expected_code",
+    (("missing", "RUNTIME_ARTIFACT_MISSING"), ("tampered", "RUNTIME_ARTIFACT_DIGEST_MISMATCH")),
+)
+def test_private_adapters_observe_distinct_governed_input_matrix(
+    tmp_path, adapter_kind, failure_kind, expected_code
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    governed_input = store.put_canonical({"governed": "separate input"})
+    if adapter_kind == "memory":
+        adapter = _InMemoryRuntimeProviderAdapter(store)
+    else:
+        source, workspace = _repository_worktree(tmp_path)
+        adapter = _PaseoRuntimeProviderAdapter(
+            client=_RecordingPaseoCli(workspace),  # type: ignore[arg-type]
+            artifacts=store,
+            repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+            state_path=tmp_path / "paseo-actions.json",
+        )
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (governed_input,))
+    assert not isinstance(adapter.prepare(spec), _RuntimeFailure)
+    if adapter_kind == "memory":
+        input_path = store.path_for(governed_input.digest)
+    else:
+        input_path = Path(adapter._actions[subject.stable_action_id]["input_files"][governed_input.digest])
+    if failure_kind == "missing":
+        input_path.unlink()
+    else:
+        input_path.write_bytes(b"tampered governed input")
+
+    observed = adapter.observe(subject.stable_action_id)
+
+    assert isinstance(observed, _RuntimeFailure)
+    assert observed.code == expected_code
+
+
+@pytest.mark.parametrize("adapter_kind", ("memory", "paseo"))
+def test_private_adapters_reject_permission_response_subclasses(adapter_kind, tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    if adapter_kind == "memory":
+        adapter = _InMemoryRuntimeProviderAdapter(store)
+    else:
+        source, workspace = _repository_worktree(tmp_path)
+        adapter = _PaseoRuntimeProviderAdapter(
+            client=_RecordingPaseoCli(workspace),  # type: ignore[arg-type]
+            artifacts=store,
+            repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+            state_path=tmp_path / "paseo-actions.json",
+        )
+
+    invalid = adapter.command("action:subclass", _PermissionResponseSubclass("request:one", "allow"))
+
+    assert isinstance(invalid, _RuntimeFailure)
+    assert invalid.code == "RUNTIME_COMMAND_INVALID"
+
+
+def test_permanent_start_rejection_rolls_back_pending_intent_and_allows_retry(tmp_path):
+    # Use a fresh Prepared action for this exact start boundary so no provider
+    # effect occurred before the rejection.
+    store = ArtifactStore(tmp_path / "start-artifacts")
+    start_root = tmp_path / "start"
+    start_root.mkdir()
+    source, workspace = _repository_worktree(start_root)
+    client = _RecordingPaseoCli(workspace)
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=tmp_path / "start-actions.json",
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    assert not isinstance(
+        adapter.prepare(_RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))),
+        _RuntimeFailure,
+    )
+    record_before = deepcopy(adapter._actions[subject.stable_action_id])
+    native_run = client._run
+
+    def reject_run(args):
+        if args[0] == "run":
+            raise RuntimeGatewayError("RUNTIME_PROVIDER_COMMAND_FAILED", "permanent provider reject")
+        return native_run(args)
+
+    client._run = reject_run  # type: ignore[method-assign]
+    rejected = adapter.command(subject.stable_action_id, RuntimeCommand.START)
+    assert isinstance(rejected, _RuntimeFailure)
+    assert rejected.code == "RUNTIME_PROVIDER_COMMAND_FAILED"
+    assert adapter._actions[subject.stable_action_id] == record_before
+
+    client._run = native_run  # type: ignore[method-assign]
+    assert not isinstance(adapter.command(subject.stable_action_id, RuntimeCommand.START), _RuntimeFailure)
+
+
+def test_permission_permanent_rejection_restores_record_and_retries_exactly_once(tmp_path):
+    _store, _source, _workspace, client, adapter, subject, _spec = _prepared_paseo_adapter(tmp_path)
+    request_id = "permit-reject-full-request"
+    client.permissions = [_paseo_permission(request_id)]
+    settled = adapter.observe(subject.stable_action_id)
+    assert not isinstance(settled, _RuntimeFailure)
+    record_before = deepcopy(adapter._actions[subject.stable_action_id])
+    disk_before = json.loads(adapter._state_path.read_text(encoding="utf-8"))
+    native_run = client._run
+    permit_calls: list[list[str]] = []
+
+    def reject_permit(args):
+        if args[:2] == ["permit", "allow"]:
+            permit_calls.append(list(args))
+            raise RuntimeGatewayError(
+                "RUNTIME_PERMISSION_REQUEST_UNKNOWN", "provider deterministically rejected"
+            )
+        return native_run(args)
+
+    client._run = reject_permit  # type: ignore[method-assign]
+    rejected = adapter.command(
+        subject.stable_action_id, PermissionResponse(request_id, "allow")
+    )
+
+    assert isinstance(rejected, _RuntimeFailure)
+    assert rejected.code == "RUNTIME_PERMISSION_REQUEST_UNKNOWN"
+    assert adapter._actions[subject.stable_action_id] == record_before
+    assert json.loads(adapter._state_path.read_text(encoding="utf-8")) == disk_before
+    assert permit_calls == [["permit", "allow", "agent:one", request_id, "--json"]]
+
+    client._run = native_run  # type: ignore[method-assign]
+    retried = adapter.command(
+        subject.stable_action_id, PermissionResponse(request_id, "allow")
+    )
+
+    assert not isinstance(retried, _RuntimeFailure)
+    assert [args for args in client.commands if args[:2] == ["permit", "allow"]] == permit_calls
+
+
+def test_permission_receipt_verification_failure_retains_pending_ambiguity_evidence(tmp_path):
+    _store, _source, _workspace, client, adapter, subject, _spec = _prepared_paseo_adapter(tmp_path)
+    request_id = "permit-malformed-full-request"
+    client.permissions = [_paseo_permission(request_id)]
+    before_observation = adapter.observe(subject.stable_action_id)
+    assert not isinstance(before_observation, _RuntimeFailure)
+    request = next(
+        request
+        for request in before_observation.permission_requests
+        if request.request_id == request_id
+    )
+    record_before = deepcopy(adapter._actions[subject.stable_action_id])
+    native_run = client._run
+
+    def malformed_success(args):
+        if args[:2] == ["permit", "allow"]:
+            native_run(args)
+            return []
+        return native_run(args)
+
+    client._run = malformed_success  # type: ignore[method-assign]
+    rejected = adapter.command(
+        subject.stable_action_id, PermissionResponse(request_id, "allow")
+    )
+
+    assert isinstance(rejected, _RuntimeFailure)
+    assert rejected.code == "RUNTIME_PROVIDER_PROTOCOL_INVALID"
+    record_after = adapter._actions[subject.stable_action_id]
+    assert record_after != record_before
+    assert record_after["pending_permission_response"] == {
+        "request_id": request_id,
+        "decision": "allow",
+        "request_digest": digest_value(asdict(request)),
+        "provider_receipt": None,
+    }
+    observed = adapter.observe(subject.stable_action_id)
+    assert isinstance(observed, _RuntimeFailure)
+    assert observed.code == "RUNTIME_EFFECT_AMBIGUOUS"
+
+
+def test_workspace_create_permanent_rejection_clears_exact_negative_intent_and_retries(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=tmp_path / "paseo-actions.json",
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))
+    native_run = client._run
+    create_calls: list[list[str]] = []
+
+    def reject_create(args):
+        if args[:2] == ["workspace", "create"]:
+            create_calls.append(list(args))
+            raise RuntimeGatewayError(
+                "RUNTIME_PROVIDER_COMMAND_FAILED", "provider rejected create"
+            )
+        return native_run(args)
+
+    client._run = reject_create  # type: ignore[method-assign]
+    rejected = adapter.prepare(spec)
+
+    assert isinstance(rejected, _RuntimeFailure)
+    assert rejected.code == "RUNTIME_PROVIDER_COMMAND_FAILED"
+    assert adapter._workspace_intents == {}
+    durable_after_reject = json.loads(adapter._state_path.read_text(encoding="utf-8"))
+    assert durable_after_reject["workspace_intents"] == {}
+    assert adapter._actions == {}
+    assert len(create_calls) == 1
+
+    client._run = native_run  # type: ignore[method-assign]
+    retried = adapter.prepare(spec)
+
+    assert not isinstance(retried, _RuntimeFailure)
+    assert [args for args in client.commands if args[:2] == ["workspace", "create"]] == create_calls
+
+
+@pytest.mark.parametrize("failure_kind", ("transport", "readback"))
+def test_workspace_create_ambiguous_or_unreadable_recovery_retains_intent(tmp_path, failure_kind):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=tmp_path / "paseo-actions.json",
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))
+    native_run = client._run
+    workspace_list_calls = 0
+
+    def ambiguous_create(args):
+        nonlocal workspace_list_calls
+        if args[:2] == ["workspace", "ls"]:
+            workspace_list_calls += 1
+            if failure_kind == "readback" and workspace_list_calls == 2:
+                raise OSError("workspace registry readback unavailable")
+        if args[:2] == ["workspace", "create"]:
+            if failure_kind == "transport":
+                raise TimeoutError("workspace create acknowledgement lost")
+            raise RuntimeGatewayError(
+                "RUNTIME_PROVIDER_COMMAND_FAILED", "provider rejected create"
+            )
+        return native_run(args)
+
+    client._run = ambiguous_create  # type: ignore[method-assign]
+    rejected = adapter.prepare(spec)
+
+    assert isinstance(rejected, _RuntimeFailure)
+    assert adapter._actions == {}
+    assert set(adapter._workspace_intents) == {subject.stable_action_id}
+    durable = json.loads(adapter._state_path.read_text(encoding="utf-8"))
+    assert set(durable["workspace_intents"]) == {subject.stable_action_id}
+
+
+@pytest.mark.parametrize(
+    "receipt_kind, expected_code",
+    (("malformed", "RUNTIME_PROVIDER_PROTOCOL_INVALID"), ("mismatch", "RUNTIME_IDENTITY_AMBIGUOUS")),
+)
+def test_workspace_success_receipt_failure_waits_for_fresh_readback_before_adoption(
+    tmp_path, receipt_kind, expected_code
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=tmp_path / "paseo-actions.json",
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))
+    native_run = client._run
+
+    def invalid_success_receipt(args):
+        if args[:2] != ["workspace", "create"]:
+            return native_run(args)
+        native_run(args)
+        if receipt_kind == "malformed":
+            return {"workspace": {"id": "workspace:one"}}
+        return {"workspace": {"id": "workspace:other", "path": str(workspace)}}
+
+    client._run = invalid_success_receipt  # type: ignore[method-assign]
+    rejected = adapter.prepare(spec)
+
+    assert isinstance(rejected, _RuntimeFailure)
+    assert rejected.code == expected_code
+    assert client.workspaces != []
+    assert adapter._actions == {}
+    intent = adapter._workspace_intents[subject.stable_action_id]
+    assert set(intent) == {"repository_path", "base_commit", "slug", "spec_identity_digest"}
+    durable = json.loads(adapter._state_path.read_text(encoding="utf-8"))
+    assert durable["workspace_intents"][subject.stable_action_id] == intent
+    assert len([args for args in client.commands if args[:2] == ["workspace", "create"]]) == 1
+
+    client._run = native_run  # type: ignore[method-assign]
+    restarted = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={"owner/repository": RuntimeRepositoryContext(source, "main")},
+        state_path=adapter._state_path,
+    )
+    retry = restarted.prepare(spec)
+
+    assert not isinstance(retry, _RuntimeFailure)
+    assert subject.stable_action_id in restarted._actions
+    assert len([args for args in client.commands if args[:2] == ["workspace", "create"]]) == 1

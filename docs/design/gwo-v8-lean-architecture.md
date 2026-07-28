@@ -338,10 +338,13 @@ Agent, session, workspace, and Runtime Binding identities, plus Prompt
 acceptance, lifecycle, outstanding normalized Permission Requests, and strict
 boolean fencing state. That is a Bound observation.
 
-`RuntimeCommand` is a closed union:
+`RuntimeTransition` is the closed union of seven typed transitions. Its
+`RuntimeCommand` enum contains six values, while `PermissionResponse` is the
+seventh typed transition:
 
 ```text
-start | resume | park | interrupt | permission_response | fence | retire
+start | resume | park | interrupt | fence | retire
+PermissionResponse(request_id, allow|deny)
 ```
 
 RuntimeGateway may issue `start` only after `observe` proves the exact
@@ -357,8 +360,9 @@ hints; it never replaces `observe`.
 Every accepted command receipt (including acknowledgement-loss recovery) is
 valid only after Bound readback proves its named effect: start/resume produce
 running or completed, park/interrupt parked, fence exactly true, retire
-retired, and `PermissionResponse` removes the exact request. A fenced parked
-binding cannot resume. Production persists lifecycle, fence, and pending
+retired, and `PermissionResponse` has an exact same-decision provider receipt
+and removes the exact request. Absence without that receipt is ambiguous, not
+acknowledgement-loss recovery. A fenced parked binding cannot resume. Production persists lifecycle, fence, and pending
 permission state changes as advisory cursor wake hints.
 
 The Gateway-owned Artifact Store verifies bounded byte length and digest for
@@ -421,11 +425,14 @@ rejected Candidate cannot obtain another Formal Review.
 
 ## Runtime permissions, waits, and recovery
 
-RuntimeGateway normalizes each Permission Request into the exact operation ID,
-resource ID, request identity, Runtime Binding, and authority-subtree digest.
-It auto-approves only when the exact request is covered by both the frozen
-Authority Grant and its Policy Witness. An unmatched, ambiguous, or
-higher-authority request returns `PermissionRequired`.
+Issue #111's RuntimeGateway only joins provider readback and emits an opaque,
+canonical descriptor identity: exact request identity, provider-namespaced
+operation/resource digests, Runtime Binding, and authority-subtree digest. It
+does not infer authority from provider names or natural-language descriptions,
+and it does not decide allow/deny. Issue #112 may auto-allow only when the
+exact canonical operation and resource identifiers are covered by both the
+frozen Authority Grant and its Policy Witness; otherwise it returns
+`PermissionRequired`.
 
 RuntimeGateway cannot expand authority. A Coordinator may propose only an
 alternative already covered by the same frozen authority subtree. Any new or
