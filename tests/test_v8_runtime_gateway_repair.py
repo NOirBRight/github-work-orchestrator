@@ -11720,9 +11720,7 @@ def test_repair_packet_11_memory_command_rejects_malformed_exact_token_before_ef
         for path in store._root.rglob("*")
         if path.is_file()
     }
-    adapter._command_gates[threading.current_thread()] = {
-        subject.stable_action_id: token
-    }
+    adapter._command_gate.replace(subject.stable_action_id, token)
 
     rejected = adapter.command(
         subject.stable_action_id,
