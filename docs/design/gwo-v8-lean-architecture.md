@@ -373,22 +373,24 @@ exactly:
 
 ```text
 prepare(RuntimeActionSpec) -> PrepareReceipt | RuntimeFailure
-read_observation(stable_action_id) -> ObservationRead
-command(stable_action_id, RuntimeTransition, ObservationReadToken) -> CommandReceipt | RuntimeFailure
+observe(stable_action_id) -> PreparedObservation | BoundObservation | RuntimeFailure
+command(stable_action_id, RuntimeTransition) -> CommandReceipt | RuntimeFailure
 events(after_cursor) -> RuntimeEventPage
 ```
 
-`ObservationRead` is the Adapter's only authoritative read value: a sealed,
-closed envelope binding the requested/selected action, complete semantic and
-prepared-spec identity, Workspace and optional binding identity, exact
-observation or closed failure, Artifact evidence, and a causal selected-record
-token. The token is minted at the Adapter's readback/reconciliation
-linearization point, never by a later sample. One pure total validator owns
-the exact outer and nested schemas, complete identity comparison, output
-proof, and failure classification for Gateway progress, acknowledgement-loss
-recovery, commands, and event scans. Receipt and event unions are equally
-closed; subclasses, missing or extra fields, tuple subclasses, unknown
-failures, and cross-action evidence are protocol invalid.
+`ObservationRead` is an adapter-private sealed reconciliation value, not an
+adapter-contract result. It binds the requested/selected action, complete
+semantic and prepared-spec identity, Workspace and optional binding identity,
+exact observation or closed failure, Artifact evidence, and a causal
+selected-record token at one readback linearization point. The adapter uses it
+to validate `observe`; RuntimeGateway validates the resulting public private-
+seam observation against its durable identity and independently proves every
+governed Artifact. One pure total validator owns the exact outer and nested
+schemas, causal-token consistency, and failure classification for Gateway
+progress, acknowledgement-loss recovery, commands, and event scans. Receipt
+and event unions are equally closed; subclasses, missing or extra fields,
+tuple subclasses, unknown failures, and cross-action evidence are protocol
+invalid.
 The validator returns exactly one of `prepared`, `bound`,
 `authoritative_absence`, `fairness_advance`, `failure`, or `invalid`.
 Transport, same-action binding-missing, and same-action
@@ -481,15 +483,18 @@ state-changing fence or retire claim atomically re-arms that action; proven
 non-dispatch restores the former terminal marker. Subject progress performs
 its authoritative observation validation before it polls these advisory
 hints.
-Every mutating command carries the accepted read token. The Adapter compares
-the complete identity and selected-record digest against current state before
-dispatch; a concurrent rebind, reconciliation, or retire therefore rejects an
-old command without changing provider state. Paseo performs the final token,
-selected-record, action, subject, and reconciled-identity check in the same
-durable transaction that grants the effect claim; it never validates one
-record and claims a later sample. The in-memory Adapter validates the complete
-current sealed read and exact token within the same re-entrant lock as its
-effect.
+Every successful `observe` opens one adapter-private, ephemeral command gate
+from its sealed reconciliation read. `command` takes no caller-supplied token,
+consumes that gate exactly once, and rejects a fresh command, an event-only
+read, a stale gate, a previously consumed gate, or a gate from a restarted
+adapter before provider state changes. The Adapter compares the complete
+identity and selected-record digest against current state before dispatch; a
+concurrent rebind, reconciliation, or retire therefore rejects an old gate
+without changing provider state. Paseo performs the final selected-record,
+action, subject, and reconciled-identity check in the same durable transaction
+that grants the effect claim; it never validates one record and claims a later
+sample. The in-memory Adapter validates the complete current sealed read
+within the same re-entrant lock as its effect.
 
 Every accepted command receipt (including acknowledgement-loss recovery) is
 valid only after Bound readback proves its named effect: start/resume produce
@@ -525,8 +530,9 @@ concurrent same-digest writers are idempotent. Failure returns no reference
 and cleans only the temporary file owned by that attempt. This host durability
 contract is separate from the non-racing Runtime Workspace filesystem threat
 model below.
-Completed output uses one shared exact `gwo.runtime.output.v1` proof operation
-in Paseo, the in-memory Adapter, and RuntimeGateway. The object admits only
+Completed output uses one shared exact `gwo.runtime.output.v1` proof operation.
+RuntimeGateway performs its own proof at the authoritative observation edge;
+an Adapter's acceptance cannot substitute for that proof. The object admits only
 schema version, subject, stable action, authority, and payload fields; missing,
 corrupt, cross-action, or extra-field output fails before reconciliation,
 journal mutation, or receipt emission.
@@ -544,7 +550,10 @@ pairs decoded into one scalar remain valid.
 Paseo label list readback establishes the stable action before `inspect`, whose
 Agent ID, provider, model, thinking, mode, current working directory, and
 status must exactly match the binding. Its working directory joins the exact
-recorded workspace ID/name/worktree record, and bounded Git readback proves the
+recorded workspace ID/name/worktree record. Registry selection is target-
+scoped to the action-owned worktree slug and exact durable identity; unrelated
+rows are ignored, conflicting target rows fail closed, and untrusted durable
+network paths are never resolved. Bounded Git readback proves the
 same repository common directory; a Prepared Workspace also has the configured
 base commit as its `HEAD`. Pinned equality applies only to Prepared. Bound
 readback and exact prepare replay re-prove Agent/label identity, common

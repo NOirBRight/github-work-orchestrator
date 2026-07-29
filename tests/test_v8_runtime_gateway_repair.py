@@ -118,6 +118,19 @@ def _event_observation_read(
 ) -> gateway_module._RuntimeObservationRead:
     """Build one detached, causally bound synthetic Adapter read."""
 
+    # Paseo persists its wake snapshot and validates that snapshot against the
+    # action's actual durable subject.  Keep event-race fixtures synthetic
+    # without fabricating an unrelated subject identity into that snapshot.
+    selected_record = adapter._actions[selected_stable_action_id]
+    if isinstance(adapter, _PaseoRuntimeProviderAdapter) and type(selected_record) is dict:
+        subject = gateway_module._subject_from_canonical(selected_record["subject"])
+        object.__setattr__(observation, "subject_digest", subject.digest)
+        object.__setattr__(
+            observation,
+            "authority_subtree_digest",
+            subject.authority_digest,
+        )
+
     identity = gateway_module._RuntimeObservationIdentity(
         stable_action_id=observation.stable_action_id,
         repository=observation.repository,
@@ -160,7 +173,6 @@ def _event_observation_read(
             )
         ),
     )
-    selected_record = adapter._actions[selected_stable_action_id]
     selected_record_digest = (
         gateway_module._runtime_in_memory_selected_record_digest(
             selected_record
@@ -188,20 +200,11 @@ def _event_observation_read(
 
 
 def _adapter_command(adapter, stable_action_id: str, command):
-    """Issue a private Adapter command from one validated causal read."""
+    """Issue a command through the exact observe-gated four-method seam."""
 
-    verdict = gateway_module._ObservationProtocol.validate(
-        adapter.read_observation(stable_action_id),
-        selected_stable_action_id=stable_action_id,
-    )
-    assert verdict.kind in {"prepared", "bound"}
-    assert verdict.observation is not None
-    assert type(verdict.token) is gateway_module._RuntimeObservationReadToken
-    return adapter.command(
-        stable_action_id,
-        command,
-        expected_read_token=verdict.token,
-    )
+    observation = adapter.observe(stable_action_id)
+    assert not isinstance(observation, _RuntimeFailure)
+    return adapter.command(stable_action_id, command)
 
 
 def _put_subject_artifacts(store: ArtifactStore, subject: CampaignPlanningSubject):
@@ -440,18 +443,17 @@ def test_preflight_is_campaign_planning_only_and_cas_binds_subject_options_and_c
 
     alternate = _profile()
     alternate = replace(alternate, name="alternate")
-    restarted = RuntimeGateway(
-        store_path=tmp_path / "gateway.journal",
-        _adapter=_adapter,
-        configuration=RuntimeConfiguration(
-            profiles={alternate.digest: alternate},
-            host_mappings={"coordinator": ProfileMapping(alternate.digest)},
-        ),
-        _artifacts=store,
-    )
     with pytest.raises(RuntimeGatewayError) as stopped:
-        restarted.planning_preflight(subject)
-    assert stopped.value.code == "RUNTIME_PREFLIGHT_IDENTITY_MISMATCH"
+        RuntimeGateway(
+            store_path=tmp_path / "gateway.journal",
+            _adapter=_adapter,
+            configuration=RuntimeConfiguration(
+                profiles={alternate.digest: alternate},
+                host_mappings={"coordinator": ProfileMapping(alternate.digest)},
+            ),
+            _artifacts=store,
+        )
+    assert stopped.value.code == "RUNTIME_STORE_INVALID"
 
 
 def test_artifact_backed_prompt_and_output_are_durable_and_tampering_fails_closed(tmp_path):
@@ -584,7 +586,7 @@ def test_invalid_typed_fence_or_permission_readback_fails_closed(tmp_path, mutat
     subject = _put_subject_artifacts(store, _subject())
     receipt = gateway.planning_preflight(subject)
     gateway.progress(subject, receipt)
-    native_read = adapter.read_observation
+    native_read = adapter._reconcile_observation
 
     def invalid(stable_action_id):
         read = native_read(stable_action_id)
@@ -592,7 +594,7 @@ def test_invalid_typed_fence_or_permission_readback_fails_closed(tmp_path, mutat
         assert not isinstance(observed, _RuntimeFailure)
         return replace(read, result=mutate(observed))
 
-    adapter.read_observation = invalid  # type: ignore[method-assign]
+    adapter._reconcile_observation = invalid  # type: ignore[method-assign]
     with pytest.raises(RuntimeGatewayError) as stopped:
         gateway.progress(subject, receipt)
     assert stopped.value.code == "RUNTIME_PROVIDER_PROTOCOL_INVALID"
@@ -773,19 +775,37 @@ class _RecordingPaseoCli:
         if args[:2] == ["workspace", "create"]:
             self.workspace.mkdir(parents=True, exist_ok=True)
             slug = args[args.index("--worktree-slug") + 1]
+            branch = args[args.index("--new-branch") + 1]
+            registry_workspace = self.workspace.parent / slug
+            if not registry_workspace.exists():
+                os.symlink(
+                    self.workspace,
+                    registry_workspace,
+                    target_is_directory=True,
+                )
+            name = (
+                args[args.index("--title") + 1]
+                if "--title" in args
+                else branch
+            )
             self.workspaces = [
                 {
                     "workspaceId": "workspace:one",
-                    "name": slug,
+                    "name": name,
                     "isolation": "worktree",
                     "project": "project:one",
-                    "cwd": str(self.workspace),
+                    "cwd": str(registry_workspace),
                 }
             ]
             if self.lose_workspace_ack:
                 self.lose_workspace_ack = False
                 raise OSError("workspace acknowledgement vanished")
-            return {"workspace": {"id": "workspace:one", "path": str(self.workspace)}}
+            return {
+                "workspace": {
+                    "id": "workspace:one",
+                    "path": str(registry_workspace),
+                }
+            }
         if args[:2] == ["ls", "--global"]:
             requested = {
                 args[index + 1].split("=", 1)[0]: args[index + 1].split("=", 1)[1]
@@ -1138,12 +1158,14 @@ def test_production_workspace_slug_ambiguity_fails_before_create(tmp_path):
     slug = digest_value(
         {"repository": subject.repository, "stable_action_id": subject.stable_action_id}
     )[:24]
+    target = workspace.parent / slug
+    os.symlink(workspace, target, target_is_directory=True)
     client.workspaces = [
         {
             "workspaceId": f"workspace:{index}",
             "name": slug,
             "isolation": "worktree",
-            "cwd": str(workspace),
+            "cwd": str(target),
         }
         for index in ("one", "two")
     ]
@@ -1313,12 +1335,6 @@ def test_production_fence_pre_effect_failure_clears_exact_absent_claim_and_retri
         _spec,
     ) = _prepared_paseo_adapter(tmp_path)
     action_id = subject.stable_action_id
-    adapter._persist_record_update(
-        adapter._actions[action_id],
-        lambda updated: updated.__setitem__(
-            "wake_state_digest", digest_value({"must": "survive"})
-        ),
-    )
     native_update_labels = client.update_labels
     update_attempts = 0
     successful_updates = 0
@@ -1343,9 +1359,7 @@ def test_production_fence_pre_effect_failure_clears_exact_absent_claim_and_retri
     )
     assert durable_pending["actions"][action_id]["pending_fence_quiesced"] is True
     assert durable_pending["actions"][action_id]["fenced"] is False
-    assert durable_pending["actions"][action_id]["wake_state_digest"] == digest_value(
-        {"must": "survive"}
-    )
+    assert durable_pending["actions"][action_id]["wake_state_digest"] is None
 
     restarted = _PaseoRuntimeProviderAdapter(
         client=client,  # type: ignore[arg-type]
@@ -1382,7 +1396,7 @@ def test_production_fence_pre_effect_failure_clears_exact_absent_claim_and_retri
     assert cleared["pending_fence_claim_id"] is None
     assert cleared["pending_fence_quiesced"] is False
     assert cleared["fenced"] is False
-    assert cleared["wake_state_digest"] == digest_value({"must": "survive"})
+    assert cleared["wake_state_digest"] is None
 
     retried = _adapter_command(recovered, action_id, RuntimeCommand.FENCE)
     assert isinstance(retried, _CommandReceipt)
@@ -1394,9 +1408,7 @@ def test_production_fence_pre_effect_failure_clears_exact_absent_claim_and_retri
     assert recovered._actions[action_id]["pending_fence"] is False
     assert recovered._actions[action_id]["pending_fence_claim_id"] is None
     assert recovered._actions[action_id]["pending_fence_quiesced"] is False
-    assert recovered._actions[action_id]["wake_state_digest"] == digest_value(
-        {"must": "survive"}
-    )
+    assert recovered._actions[action_id]["wake_state_digest"] is None
 
 
 def test_inflight_fence_claim_cannot_be_cleared_or_reissued_until_owner_quiesces(
@@ -2157,7 +2169,7 @@ def test_production_schema_tamper_stops_start_before_run(tmp_path):
     Path(adapter._actions[subject.stable_action_id]["output_schema_file"]).write_bytes(b"tampered")
 
     verdict = gateway_module._ObservationProtocol.validate(
-        adapter.read_observation(subject.stable_action_id),
+        adapter._reconcile_observation(subject.stable_action_id),
         selected_stable_action_id=subject.stable_action_id,
     )
 
@@ -2289,7 +2301,7 @@ def test_production_idle_permission_response_readback_proves_effect_but_closed_f
     assert isinstance(record["completed_permission_response"], dict)
 
     client.permissions = [_paseo_permission("request:closed", description="repo")]
-    closed_read = adapter.read_observation(subject.stable_action_id)
+    closed_read = adapter._reconcile_observation(subject.stable_action_id)
     closed_verdict = gateway_module._ObservationProtocol.validate(
         closed_read,
         selected_stable_action_id=subject.stable_action_id,
@@ -2297,11 +2309,7 @@ def test_production_idle_permission_response_readback_proves_effect_but_closed_f
     assert closed_verdict.kind == "bound"
     assert type(closed_verdict.token) is gateway_module._RuntimeObservationReadToken
     client.agent.lifecycle = "closed"
-    result = adapter.command(
-        subject.stable_action_id,
-        PermissionResponse(request_id="request:closed", decision="allow"),
-        expected_read_token=closed_verdict.token,
-    )
+    result = adapter.observe(subject.stable_action_id)
     assert isinstance(result, _RuntimeFailure)
     assert result.code == "RUNTIME_LIFECYCLE_UNKNOWN"
 
@@ -2555,7 +2563,7 @@ def _paseo_event_adapter(tmp_path, action_ids, *, state_name="paseo-actions.json
     """Seed complete V5 records for event tests that replace provider reads.
 
     The synthetic event-read tests need durable action identities for CAS and
-    cursor state, but deliberately replace ``read_observation`` before any
+    cursor state, but deliberately replace private reconciliation before any
     staged Artifact or provider read occurs.  Derive every row from one real
     Prepared record so journal recovery still exercises the production closed
     schema instead of relying on partial test-only dictionaries.
@@ -3580,16 +3588,12 @@ def test_postdispatch_start_native_error_retains_pending_and_never_reissues(tmp_
 
     client._run = native_run  # type: ignore[method-assign]
     retry_verdict = gateway_module._ObservationProtocol.validate(
-        adapter.read_observation(subject.stable_action_id),
+        adapter._reconcile_observation(subject.stable_action_id),
         selected_stable_action_id=subject.stable_action_id,
     )
     assert retry_verdict.kind == "fairness_advance"
     assert type(retry_verdict.token) is gateway_module._RuntimeObservationReadToken
-    retried = adapter.command(
-        subject.stable_action_id,
-        RuntimeCommand.START,
-        expected_read_token=retry_verdict.token,
-    )
+    retried = adapter.observe(subject.stable_action_id)
     assert isinstance(retried, _RuntimeFailure)
     assert retried.code == "RUNTIME_MATERIALIZATION_PENDING"
     assert len([args for args in client.commands if args[0] == "run"]) == 1
@@ -3815,6 +3819,7 @@ def test_workspace_success_receipt_failure_waits_for_fresh_readback_before_adopt
         "repository_path",
         "base_commit",
         "slug",
+        "branch",
         "spec_identity_digest",
         "ownership_nonce",
         "layout_version",
@@ -3877,9 +3882,10 @@ def test_gateway_transaction_reloads_durable_cas_for_preconstructed_instances(tm
     with pytest.raises(RuntimeGatewayError) as rejected:
         second.planning_preflight(second_subject)
 
-    assert rejected.value.code == "RUNTIME_PREFLIGHT_IDENTITY_MISMATCH"
+    assert rejected.value.code == "RUNTIME_STORE_INVALID"
     durable = json.loads(journal.read_text(encoding="utf-8"))
-    assert second._data == durable
+    assert first._data == durable
+    assert second._data != durable
     restarted = RuntimeGateway(
         store_path=journal,
         _adapter=_InMemoryRuntimeProviderAdapter(store),
@@ -3997,7 +4003,7 @@ def test_post_prepare_malformed_absence_uses_the_same_exact_predicate(tmp_path):
     gateway, store, adapter = _gateway(tmp_path)
     subject = _put_subject_artifacts(store, _subject())
     preflight = gateway.planning_preflight(subject)
-    native_read = adapter.read_observation
+    native_read = adapter._reconcile_observation
     observations = 0
 
     def malformed_second_read(stable_action_id):
@@ -4016,13 +4022,13 @@ def test_post_prepare_malformed_absence_uses_the_same_exact_predicate(tmp_path):
             ),
         )
 
-    adapter.read_observation = malformed_second_read  # type: ignore[method-assign]
+    adapter._reconcile_observation = malformed_second_read  # type: ignore[method-assign]
     with pytest.raises(RuntimeGatewayError) as stopped:
         gateway.progress(subject, preflight)
 
     assert stopped.value.code == "RUNTIME_PROVIDER_PROTOCOL_INVALID"
     assert adapter.prepare_calls == [subject.stable_action_id]
-    adapter.read_observation = native_read  # type: ignore[method-assign]
+    adapter._reconcile_observation = native_read  # type: ignore[method-assign]
 
 
 def test_workspace_intent_is_durable_before_the_first_paseo_readback(tmp_path):
@@ -4880,15 +4886,15 @@ def test_in_memory_terminal_permission_replay_requires_complete_bound_evidence(
         )
     elif tamper == "outstanding_request":
         verdict = gateway_module._ObservationProtocol.validate(
-            adapter.read_observation(subject.stable_action_id),
+            adapter._reconcile_observation(subject.stable_action_id),
             selected_stable_action_id=subject.stable_action_id,
         )
         assert verdict.kind == "bound"
         assert type(verdict.token) is gateway_module._RuntimeObservationReadToken
-        replay = adapter.command(
+        replay = _adapter_command(
+            adapter,
             subject.stable_action_id,
             response,
-            expected_read_token=verdict.token,
         )
         assert isinstance(replay, _RuntimeFailure)
         assert replay.code == "RUNTIME_PERMISSION_REQUEST_UNKNOWN"
@@ -4896,16 +4902,12 @@ def test_in_memory_terminal_permission_replay_requires_complete_bound_evidence(
         actions_before = deepcopy(adapter._actions)
         commands_before = list(adapter.command_calls)
         verdict = gateway_module._ObservationProtocol.validate(
-            adapter.read_observation(subject.stable_action_id),
+            adapter._reconcile_observation(subject.stable_action_id),
             selected_stable_action_id=subject.stable_action_id,
         )
         assert verdict.kind == "failure"
         assert type(verdict.token) is gateway_module._RuntimeObservationReadToken
-        replay = adapter.command(
-            subject.stable_action_id,
-            response,
-            expected_read_token=verdict.token,
-        )
+        replay = adapter.observe(subject.stable_action_id)
         assert isinstance(replay, _RuntimeFailure)
         assert replay.code == "RUNTIME_OBSERVATION_INVALID"
         assert adapter._actions == actions_before
@@ -5103,13 +5105,13 @@ def test_events_use_one_fair_isolated_readback_and_skip_emitted_terminal_actions
             _event_bound_observation(
                 action_id,
                 lifecycle=(
-                    "completed" if action_id == "b:terminal" else "running"
+                        "retired" if action_id == "b:terminal" else "running"
                 ),
                 fenced=False,
             ),
         )
 
-    adapter.read_observation = bounded_read  # type: ignore[method-assign]
+    adapter._reconcile_observation = bounded_read  # type: ignore[method-assign]
     for _ in range(7):
         before = len(calls)
         page = adapter.events(None)
@@ -5125,7 +5127,7 @@ def test_events_use_one_fair_isolated_readback_and_skip_emitted_terminal_actions
             },
             state_path=adapter._state_path,
         )
-        restarted.read_observation = bounded_read  # type: ignore[method-assign]
+        restarted._reconcile_observation = bounded_read  # type: ignore[method-assign]
         adapter = restarted
     for _ in range(7):
         before = len(calls)
@@ -5163,7 +5165,7 @@ def test_production_event_scan_cursor_survives_failure_and_restart_mid_cycle(
             selected_record_digest=read.token.selected_record_digest,
         )
 
-    adapter.read_observation = failed_read  # type: ignore[method-assign]
+    adapter._reconcile_observation = failed_read  # type: ignore[method-assign]
 
     first = adapter.events(None)
 
@@ -5188,10 +5190,10 @@ def test_production_event_scan_cursor_survives_failure_and_restart_mid_cycle(
         return _event_observation_read(
             restarted,
             action_id,
-            _event_bound_observation(action_id, lifecycle="completed"),
+            _event_bound_observation(action_id, lifecycle="retired"),
         )
 
-    restarted.read_observation = read_next  # type: ignore[method-assign]
+    restarted._reconcile_observation = read_next  # type: ignore[method-assign]
     terminal = restarted.events(None)
 
     assert calls == ["b:next"]
@@ -5639,7 +5641,7 @@ def test_postdispatch_protocol_failure_keeps_command_claim_and_blocks_duplicate(
         state_path=adapter._state_path,
     )
     retry_verdict = gateway_module._ObservationProtocol.validate(
-        restarted.read_observation(action_id),
+        restarted._reconcile_observation(action_id),
         selected_stable_action_id=action_id,
     )
     assert retry_verdict.kind in {
@@ -5648,10 +5650,11 @@ def test_postdispatch_protocol_failure_keeps_command_claim_and_blocks_duplicate(
         "failure",
     }
     assert type(retry_verdict.token) is gateway_module._RuntimeObservationReadToken
-    retried = restarted.command(
-        action_id,
-        command,
-        expected_read_token=retry_verdict.token,
+    observed = restarted.observe(action_id)
+    retried = (
+        observed
+        if isinstance(observed, _RuntimeFailure)
+        else restarted.command(action_id, command)
     )
 
     assert isinstance(retried, _RuntimeFailure)
@@ -6026,7 +6029,7 @@ def test_result_and_resume_links_are_rejected_before_provider_effect(tmp_path):
     record = adapter._actions[subject.stable_action_id]
     result_target = Path(record["result_file"])
     result_link_verdict = gateway_module._ObservationProtocol.validate(
-        adapter.read_observation(subject.stable_action_id),
+        adapter._reconcile_observation(subject.stable_action_id),
         selected_stable_action_id=subject.stable_action_id,
     )
     assert result_link_verdict.kind == "prepared"
@@ -6038,11 +6041,7 @@ def test_result_and_resume_links_are_rejected_before_provider_effect(tmp_path):
     os.symlink(outside_result, result_target)
     run_count = len([command for command in client.commands if command[0] == "run"])
 
-    rejected_start = adapter.command(
-        subject.stable_action_id,
-        RuntimeCommand.START,
-        expected_read_token=result_link_verdict.token,
-    )
+    rejected_start = adapter.observe(subject.stable_action_id)
 
     assert isinstance(rejected_start, _RuntimeFailure)
     assert rejected_start.code == "RUNTIME_WORKSPACE_UNSAFE"
@@ -6065,7 +6064,7 @@ def test_result_and_resume_links_are_rejected_before_provider_effect(tmp_path):
     assert not isinstance(adapter.observe(subject.stable_action_id), _RuntimeFailure)
     resume_target = workspace / ".gwo" / "runtime-artifacts" / "resume.txt"
     resume_link_verdict = gateway_module._ObservationProtocol.validate(
-        adapter.read_observation(subject.stable_action_id),
+        adapter._reconcile_observation(subject.stable_action_id),
         selected_stable_action_id=subject.stable_action_id,
     )
     assert resume_link_verdict.kind == "bound"
@@ -6079,10 +6078,11 @@ def test_result_and_resume_links_are_rejected_before_provider_effect(tmp_path):
         [command for command in client.commands if command[0] == "send"]
     )
 
+    observed_resume = adapter.observe(subject.stable_action_id)
+    assert not isinstance(observed_resume, _RuntimeFailure)
     rejected_resume = adapter.command(
         subject.stable_action_id,
         RuntimeCommand.RESUME,
-        expected_read_token=resume_link_verdict.token,
     )
 
     assert isinstance(rejected_resume, _RuntimeFailure)
@@ -7021,6 +7021,7 @@ def test_conflicting_workspace_list_aliases_do_not_persist_wrong_identity_or_mut
     assert _mutating_paseo_commands(client.commands) == []
 
 
+@pytest.mark.real_fsync
 def test_artifact_store_put_flushes_fsyncs_replaces_and_finally_verifies(
     tmp_path, monkeypatch
 ):
@@ -7052,6 +7053,38 @@ def test_artifact_store_put_flushes_fsyncs_replaces_and_finally_verifies(
         for event in events[:replace_index]
     )
     assert not list((tmp_path / "artifacts").glob("*.tmp"))
+
+
+@pytest.mark.real_fsync
+def test_runtime_journal_fsyncs_before_atomic_replace(tmp_path, monkeypatch):
+    journal = gateway_module._V3JsonJournal(tmp_path / "runtime.journal")
+    payload = {"sequence": 1}
+    events: list[tuple[str, object]] = []
+    native_fsync = os.fsync
+    native_replace = os.replace
+
+    def recording_fsync(fd):
+        events.append(("fsync", os.fstat(fd).st_size))
+        return native_fsync(fd)
+
+    def recording_replace(source, target):
+        events.append(("replace", (Path(source).name, Path(target).name)))
+        return native_replace(source, target)
+
+    monkeypatch.setattr(gateway_module.os, "fsync", recording_fsync)
+    monkeypatch.setattr(gateway_module.os, "replace", recording_replace)
+
+    with journal.exclusive():
+        journal.replace_unlocked(payload)
+
+    replace_index = next(
+        index for index, event in enumerate(events) if event[0] == "replace"
+    )
+    assert any(
+        event == ("fsync", len(gateway_module.canonical_bytes(payload)))
+        for event in events[:replace_index]
+    )
+    assert journal.read_unlocked() == payload
 
 
 def test_artifact_store_exclusive_temp_never_overwrites_unowned_collision(
@@ -7415,7 +7448,7 @@ def test_repair_packet_f_memory_completion_publication_is_recoverable(
     assert adapter.created_agent_count == 1
 
 
-def test_repair_packet_g_workspace_registry_collisions_are_global(tmp_path):
+def test_repair_packet_g_workspace_registry_selection_is_target_scoped(tmp_path):
     client = _RecordingPaseoCli(tmp_path / "unused")
     duplicate_path = tmp_path / "duplicate"
     client.workspaces = [
@@ -7439,10 +7472,10 @@ def test_repair_packet_g_workspace_registry_collisions_are_global(tmp_path):
         state_path=tmp_path / "paseo-actions.json",
     )
 
-    with pytest.raises(RuntimeGatewayError) as ambiguous:
-        adapter._workspace_by_identity(slug="stable-slug")
-
-    assert ambiguous.value.code == "RUNTIME_IDENTITY_AMBIGUOUS"
+    assert adapter._workspace_by_identity(slug="stable-slug") == (
+        "workspace:one",
+        str(duplicate_path),
+    )
 
 
 def test_repair_packet_h_bound_prepare_replay_accepts_descendant_commit(tmp_path):
@@ -7731,11 +7764,11 @@ def test_repair_packet_4_bound_prepared_lifecycle_is_rejected_before_persistence
     preflight = gateway.planning_preflight(subject)
     gateway.progress(subject, preflight)
 
-    read = adapter.read_observation(subject.stable_action_id)
+    read = adapter._reconcile_observation(subject.stable_action_id)
     observed = read.result
     assert isinstance(observed, gateway_module._BoundRuntimeObservation)
     forged = replace(observed, lifecycle="prepared")
-    adapter.read_observation = (  # type: ignore[method-assign]
+    adapter._reconcile_observation = (  # type: ignore[method-assign]
         lambda _stable_action_id: replace(read, result=forged)
     )
     journal_path = tmp_path / "gateway.journal"
@@ -8303,7 +8336,7 @@ def test_repair_packet_6_malformed_authoritative_absence_is_typed_without_fairne
         action_id,
         _event_bound_observation(action_id),
     )
-    adapter.read_observation = (  # type: ignore[method-assign]
+    adapter._reconcile_observation = (  # type: ignore[method-assign]
         lambda _stable_action_id: replace(read, result=failure)
     )
     actions_before = deepcopy(adapter._actions)
@@ -8364,7 +8397,7 @@ def test_repair_packet_6_exact_non_observation_failure_preserves_bounded_fairnes
             selected_record_digest=read.token.selected_record_digest,
         )
 
-    adapter.read_observation = failed_read  # type: ignore[method-assign]
+    adapter._reconcile_observation = failed_read  # type: ignore[method-assign]
     actions_before = deepcopy(adapter._actions)
     events_before = deepcopy(adapter._events)
     scan_before = adapter._event_scan_cursor
@@ -8404,7 +8437,7 @@ def test_repair_packet_6_paseo_event_selection_cas_has_one_scanner_winner(
 
     def scan(adapter):
         try:
-            def read_observation(selected_action_id):
+            def _reconcile_observation(selected_action_id):
                 selected.wait()
                 return _event_observation_read(
                     adapter,
@@ -8412,7 +8445,7 @@ def test_repair_packet_6_paseo_event_selection_cas_has_one_scanner_winner(
                     _event_bound_observation(selected_action_id),
                 )
 
-            adapter.read_observation = read_observation  # type: ignore[method-assign]
+            adapter._reconcile_observation = _reconcile_observation  # type: ignore[method-assign]
             results.append(adapter.events(None))
         except BaseException as error:
             errors.append(error)
@@ -8474,7 +8507,7 @@ def test_repair_packet_6_paseo_event_selection_cas_rejects_stale_readback(
         assert publish_allowed.wait(timeout=10)
         return read
 
-    scanner.read_observation = stale_read  # type: ignore[method-assign]
+    scanner._reconcile_observation = stale_read  # type: ignore[method-assign]
     result: list[object] = []
     thread = threading.Thread(
         target=lambda: result.append(scanner.events(None)),
@@ -8484,17 +8517,36 @@ def test_repair_packet_6_paseo_event_selection_cas_rejects_stale_readback(
     assert readback_ready.wait(timeout=10)
 
     if concurrent_change == "selected_record":
+        changed_state = gateway_module._runtime_event_observation_state(
+            _event_observation_read(
+                contender,
+                selected_action_id,
+                _event_bound_observation(selected_action_id, fenced=True),
+            ).result,
+            selected_action_id,
+        )[0]
         contender._transact(
             lambda state: state["actions"][selected_action_id].update(
-                {"wake_state_digest": digest_value({"changed": "selected"})}
+                {
+                    "wake_state": changed_state,
+                    "wake_state_digest": digest_value(changed_state),
+                }
             )
         )
     else:
+        terminal_state = gateway_module._runtime_event_observation_state(
+            _event_observation_read(
+                contender,
+                other_action_id,
+                _event_bound_observation(other_action_id, lifecycle="retired"),
+            ).result,
+            other_action_id,
+        )[0]
         contender._transact(
             lambda state: state["actions"][other_action_id].update(
                 {
-                    "bound_agent_id": "agent:packet6-other",
-                    "binding_established": True,
+                    "wake_state": terminal_state,
+                    "wake_state_digest": digest_value(terminal_state),
                     "wake_terminal_emitted": True,
                 }
             )
@@ -8510,7 +8562,7 @@ def test_repair_packet_6_paseo_event_selection_cas_rejects_stale_readback(
     assert durable["next_event_cursor"] == 1
     assert durable["events"] == []
     assert durable["actions"][selected_action_id]["wake_state_digest"] == (
-        digest_value({"changed": "selected"})
+        digest_value(changed_state)
         if concurrent_change == "selected_record"
         else None
     )
@@ -8524,7 +8576,7 @@ def test_repair_packet_6_paseo_event_selection_cas_rejects_stale_readback(
         repository_contexts=context,
         state_path=state_path,
     )
-    restarted.read_observation = (  # type: ignore[method-assign]
+    restarted._reconcile_observation = (  # type: ignore[method-assign]
         lambda action_id: _event_observation_read(
             restarted,
             action_id,
@@ -8620,7 +8672,7 @@ def test_repair_packet_7_event_readback_requires_one_exact_closed_observation(
             "stable_action_id",
             "planning:packet7-other",
         )
-    adapter.read_observation = (  # type: ignore[method-assign]
+    adapter._reconcile_observation = (  # type: ignore[method-assign]
         lambda _stable_action_id: read
     )
     actions_before = deepcopy(adapter._actions)
@@ -8883,7 +8935,7 @@ def test_repair_packet_7_gateway_independently_proves_closed_completed_output(
     preflight = gateway.planning_preflight(subject)
     completed = gateway.progress(subject, preflight)
     assert completed.status == "completed"
-    native = adapter.read_observation(subject.stable_action_id)
+    native = adapter._reconcile_observation(subject.stable_action_id)
     assert type(native.result) is gateway_module._BoundRuntimeObservation
     malformed_output = store.put_canonical(
         {
@@ -8926,7 +8978,7 @@ def test_repair_packet_7_gateway_independently_proves_closed_completed_output(
             output_artifact_digest=malformed_output.digest,
         ),
     )
-    adapter.read_observation = (  # type: ignore[method-assign]
+    adapter._reconcile_observation = (  # type: ignore[method-assign]
         lambda _stable_action_id: forged
     )
     journal_before = gateway._store_path.read_bytes()
@@ -9072,8 +9124,6 @@ def test_repair_packet_7_command_result_is_one_exact_closed_union(
         subject.stable_action_id
     )
     assert observation_verdict.kind == "bound"
-    read_token = observation_verdict.token
-    assert type(read_token) is gateway_module._RuntimeObservationReadToken
     if malformed_variant.startswith("receipt"):
         if malformed_variant == "receipt_subclass":
             class ReceiptSubclass(_CommandReceipt):
@@ -9129,7 +9179,6 @@ def test_repair_packet_7_command_result_is_one_exact_closed_union(
         gateway._command_with_readback(
             subject.stable_action_id,
             RuntimeCommand.FENCE,
-            expected_read_token=read_token,
         )
 
     assert rejected.value.code == "RUNTIME_PROVIDER_PROTOCOL_INVALID"
@@ -9177,8 +9226,6 @@ def test_repair_packet_7_gateway_stale_read_token_stops_command_before_effect(
     def interleaved_command(
         stable_action_id,
         command,
-        *,
-        expected_read_token,
     ):
         if command is RuntimeCommand.FENCE:
             fence_dispatched.set()
@@ -9186,7 +9233,6 @@ def test_repair_packet_7_gateway_stale_read_token_stops_command_before_effect(
         return native_command(
             stable_action_id,
             command,
-            expected_read_token=expected_read_token,
         )
 
     adapter.command = interleaved_command  # type: ignore[method-assign]
@@ -9259,7 +9305,7 @@ def test_repair_packet_7_same_adapter_event_scanners_have_one_causal_winner(
         selected.wait()
         return read
 
-    adapter.read_observation = blocked_read  # type: ignore[method-assign]
+    adapter._reconcile_observation = blocked_read  # type: ignore[method-assign]
 
     def scan():
         try:
@@ -9361,7 +9407,7 @@ def test_repair_packet_7_gateway_event_boundary_is_one_exact_closed_union(
 
 
 @pytest.mark.parametrize("adapter_kind", ("memory", "paseo"))
-def test_repair_packet_8_adapter_command_requires_a_causal_token_before_mutation(
+def test_repair_packet_8_adapter_command_requires_a_fresh_observation_gate_before_mutation(
     tmp_path,
     adapter_kind,
 ):
@@ -9402,8 +9448,10 @@ def test_repair_packet_8_adapter_command_requires_a_causal_token_before_mutation
         else adapter._state_path.read_bytes()
     )
 
-    with pytest.raises(TypeError):
-        adapter.command(subject.stable_action_id, RuntimeCommand.START)
+    rejected = adapter.command(subject.stable_action_id, RuntimeCommand.START)
+
+    assert type(rejected) is _RuntimeFailure
+    assert rejected.code == "RUNTIME_ACTION_STATE_CHANGED"
 
     assert adapter._actions == actions_before
     if adapter_kind == "memory":
@@ -9412,6 +9460,106 @@ def test_repair_packet_8_adapter_command_requires_a_causal_token_before_mutation
     else:
         assert client.commands == commands_before
         assert adapter._state_path.read_bytes() == durable_before
+
+
+@pytest.mark.parametrize("adapter_kind", ("memory", "paseo"))
+def test_repair_packet_16_private_command_gate_is_one_shot_and_event_reads_do_not_open_it(
+    tmp_path,
+    adapter_kind,
+):
+    store = ArtifactStore(tmp_path / "artifacts", maximum_bytes=300_000)
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(
+        subject.stable_action_id,
+        subject,
+        _profile(),
+        prompt,
+        (prompt,),
+    )
+    client = None
+    if adapter_kind == "memory":
+        adapter = _InMemoryRuntimeProviderAdapter(store)
+    else:
+        source, workspace = _repository_worktree(tmp_path)
+        client = _RecordingPaseoCli(workspace)
+        adapter = _PaseoRuntimeProviderAdapter(
+            client=client,  # type: ignore[arg-type]
+            artifacts=store,
+            repository_contexts={
+                "owner/repository": RuntimeRepositoryContext(source, "main")
+            },
+            state_path=tmp_path / "paseo-actions.json",
+        )
+    assert type(adapter.prepare(spec)) is gateway_module._PrepareReceipt
+
+    no_observe = adapter.command(subject.stable_action_id, RuntimeCommand.START)
+    assert type(no_observe) is _RuntimeFailure
+    assert no_observe.code == "RUNTIME_ACTION_STATE_CHANGED"
+
+    event_only = adapter.events(None)
+    assert not isinstance(event_only, _RuntimeFailure)
+    no_gate_from_event = adapter.command(
+        subject.stable_action_id, RuntimeCommand.START
+    )
+    assert type(no_gate_from_event) is _RuntimeFailure
+    assert no_gate_from_event.code == "RUNTIME_ACTION_STATE_CHANGED"
+
+    observed = adapter.observe(subject.stable_action_id)
+    assert type(observed) is gateway_module._PreparedRuntimeObservation
+    started = adapter.command(subject.stable_action_id, RuntimeCommand.START)
+    assert type(started) is _CommandReceipt
+    consumed = adapter.command(subject.stable_action_id, RuntimeCommand.FENCE)
+    assert type(consumed) is _RuntimeFailure
+    assert consumed.code == "RUNTIME_ACTION_STATE_CHANGED"
+    if adapter_kind == "memory":
+        assert adapter.created_agent_count == 1
+    else:
+        assert client is not None
+        assert len([args for args in client.commands if args[0] == "run"]) == 1
+
+
+def test_repair_packet_16_restart_drops_an_unconsumed_private_command_gate(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts", maximum_bytes=300_000)
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    state_path = tmp_path / "paseo-actions.json"
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=state_path,
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    assert type(
+        adapter.prepare(
+            _RuntimeActionSpec(
+                subject.stable_action_id,
+                subject,
+                _profile(),
+                prompt,
+                (prompt,),
+            )
+        )
+    ) is gateway_module._PrepareReceipt
+    assert type(adapter.observe(subject.stable_action_id)) is gateway_module._PreparedRuntimeObservation
+
+    restarted = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=state_path,
+    )
+    rejected = restarted.command(subject.stable_action_id, RuntimeCommand.START)
+
+    assert type(rejected) is _RuntimeFailure
+    assert rejected.code == "RUNTIME_ACTION_STATE_CHANGED"
+    assert not any(args and args[0] == "run" for args in client.commands)
 
 
 @pytest.mark.parametrize(
@@ -9451,7 +9599,7 @@ def test_repair_packet_8_start_and_resume_use_one_sealed_precommand_read(
 
     reads = []
     command_entries = []
-    native_read = adapter.read_observation
+    native_read = adapter._reconcile_observation
     native_command = adapter.command
 
     def tracked_read(stable_action_id):
@@ -9462,29 +9610,25 @@ def test_repair_packet_8_start_and_resume_use_one_sealed_precommand_read(
     def tracked_command(
         stable_action_id,
         selected_command,
-        *,
-        expected_read_token,
     ):
         command_entries.append(
-            (len(reads), expected_read_token, tuple(reads))
+            (len(reads), tuple(reads))
         )
         return native_command(
             stable_action_id,
             selected_command,
-            expected_read_token=expected_read_token,
         )
 
-    adapter.read_observation = tracked_read  # type: ignore[method-assign]
+    adapter._reconcile_observation = tracked_read  # type: ignore[method-assign]
     adapter.command = tracked_command  # type: ignore[method-assign]
 
     progressed = gateway.transition(subject.stable_action_id, command)
 
     assert progressed.command is command
     assert len(command_entries) == 1
-    read_count_at_command, expected_token, prior_reads = command_entries[0]
+    read_count_at_command, prior_reads = command_entries[0]
     assert read_count_at_command == 1
     assert len(prior_reads) == 1
-    assert expected_token == prior_reads[0].token
 
 
 def test_repair_packet_8_paseo_effect_claim_rechecks_the_sealed_token_in_its_cas(
@@ -9514,7 +9658,7 @@ def test_repair_packet_8_paseo_effect_claim_rechecks_the_sealed_token_in_its_cas
             )
         )
     ) is gateway_module._PrepareReceipt
-    read = adapter.read_observation(subject.stable_action_id)
+    read = adapter._reconcile_observation(subject.stable_action_id)
     verdict = gateway_module._ObservationProtocol.validate(
         read,
         selected_stable_action_id=subject.stable_action_id,
@@ -9529,7 +9673,7 @@ def test_repair_packet_8_paseo_effect_claim_rechecks_the_sealed_token_in_its_cas
     received_tokens = []
 
     def blocked_claim(record, *, already_claimed, update, **kwargs):
-        received_tokens.append(kwargs.get("expected_read_token"))
+        received_tokens.append(kwargs.get("precondition"))
         claim_entered.set()
         assert release_claim.wait(5)
         return native_claim(
@@ -9540,14 +9684,17 @@ def test_repair_packet_8_paseo_effect_claim_rechecks_the_sealed_token_in_its_cas
         )
 
     adapter._claim_record_update = blocked_claim  # type: ignore[method-assign]
+    observed = adapter.observe(subject.stable_action_id)
+    assert type(observed) is gateway_module._PreparedRuntimeObservation
     result = []
 
     def issue_start():
+        observed = adapter.observe(subject.stable_action_id)
+        assert type(observed) is gateway_module._PreparedRuntimeObservation
         result.append(
             adapter.command(
                 subject.stable_action_id,
                 RuntimeCommand.START,
-                expected_read_token=expected_token,
             )
         )
 
@@ -9669,7 +9816,7 @@ def test_repair_packet_8_prepare_readback_never_swallows_nonrecoverable_failure(
     assert adapter.command_calls == []
     assert adapter.created_agent_count == 0
     assert isinstance(
-        adapter.read_observation(subject.stable_action_id).result,
+        adapter._reconcile_observation(subject.stable_action_id).result,
         gateway_module._PreparedRuntimeObservation,
     )
 
@@ -9726,7 +9873,7 @@ def test_repair_packet_8_retained_permission_name_binds_the_normalized_operation
     assert type(
         _adapter_command(adapter, subject.stable_action_id, command)
     ) is _CommandReceipt
-    valid_read = adapter.read_observation(subject.stable_action_id)
+    valid_read = adapter._reconcile_observation(subject.stable_action_id)
     valid_verdict = gateway_module._ObservationProtocol.validate(
         valid_read,
         selected_stable_action_id=subject.stable_action_id,
@@ -9909,7 +10056,7 @@ def test_repair_packet_8_authoritative_paths_have_no_raw_observation_or_result_b
 
     assert "expected_read_token: _RuntimeObservationReadToken | None" not in source
     assert "expected_read_token: _RuntimeObservationReadToken = None" not in source
-    assert "return self.read_observation(stable_action_id).result" not in source
+    assert "return self._reconcile_observation(stable_action_id).result" not in source
     assert "self._observe(" not in source
     assert "self._prepare(" not in progress_source
     assert "_prepare_verdict(" in progress_source
@@ -10189,7 +10336,7 @@ def test_repair_packet_9_gateway_and_memory_reject_tampered_permission_before_ef
     preflight = gateway.planning_preflight(subject)
     gateway.progress(subject, preflight)
     read_verdict = gateway_module._ObservationProtocol.validate(
-        adapter.read_observation(subject.stable_action_id),
+        adapter._reconcile_observation(subject.stable_action_id),
         selected_stable_action_id=subject.stable_action_id,
     )
     assert read_verdict.kind == "bound"
@@ -10211,7 +10358,6 @@ def test_repair_packet_9_gateway_and_memory_reject_tampered_permission_before_ef
     direct_rejected = adapter.command(
         subject.stable_action_id,
         malformed,
-        expected_read_token=read_verdict.token,
     )
 
     assert type(direct_rejected) is _RuntimeFailure
@@ -10236,7 +10382,7 @@ def test_repair_packet_9_paseo_rejects_tampered_permission_before_effect(
     request_id = "request:packet-9-paseo"
     client.permissions = [_paseo_permission(request_id)]
     read_verdict = gateway_module._ObservationProtocol.validate(
-        adapter.read_observation(subject.stable_action_id),
+        adapter._reconcile_observation(subject.stable_action_id),
         selected_stable_action_id=subject.stable_action_id,
     )
     assert read_verdict.kind == "bound"
@@ -10249,7 +10395,6 @@ def test_repair_packet_9_paseo_rejects_tampered_permission_before_effect(
     rejected = adapter.command(
         subject.stable_action_id,
         malformed,
-        expected_read_token=read_verdict.token,
     )
 
     assert type(rejected) is _RuntimeFailure
@@ -10352,7 +10497,7 @@ def test_repair_packet_9_observation_protocol_has_closed_semantic_kinds(
             )
         )
     ) is gateway_module._PrepareReceipt
-    prepared_read = adapter.read_observation(subject.stable_action_id)
+    prepared_read = adapter._reconcile_observation(subject.stable_action_id)
     prepared_verdict = gateway_module._ObservationProtocol.validate(
         prepared_read,
         selected_stable_action_id=subject.stable_action_id,
@@ -10368,14 +10513,15 @@ def test_repair_packet_9_observation_protocol_has_closed_semantic_kinds(
         selected_stable_action_id=subject.stable_action_id,
     )
     assert malicious_verdict.kind == "invalid"
+    observed = adapter.observe(subject.stable_action_id)
+    assert type(observed) is gateway_module._PreparedRuntimeObservation
     receipt = adapter.command(
         subject.stable_action_id,
         RuntimeCommand.START,
-        expected_read_token=prepared_verdict.token,
     )
     assert type(receipt) is _CommandReceipt
     bound_verdict = gateway_module._ObservationProtocol.validate(
-        adapter.read_observation(subject.stable_action_id),
+        adapter._reconcile_observation(subject.stable_action_id),
         selected_stable_action_id=subject.stable_action_id,
     )
     assert bound_verdict.kind == "bound"
@@ -10385,7 +10531,9 @@ def test_repair_packet_9_authoritative_callgraph_keeps_observation_verdicts_seal
     source = inspect.getsource(gateway_module)
     assert "_observe_with_token" not in source
     assert "_validated_command_readback" not in source
-    assert ".observe(" not in source
+    gateway_source = inspect.getsource(RuntimeGateway)
+    assert "self._adapter.observe(stable_action_id)" in gateway_source
+    assert "self._adapter._reconcile_observation(" not in gateway_source
 
     forbidden = {
         "_PreparedRuntimeObservation",
@@ -10435,7 +10583,7 @@ def test_repair_packet_9_malformed_prepare_ambiguity_has_zero_recovery_or_effect
     subject = _put_subject_artifacts(store, _subject())
     preflight = gateway.planning_preflight(subject)
     read_calls = []
-    native_read = adapter.read_observation
+    native_read = adapter._reconcile_observation
 
     def counted_read(stable_action_id):
         read_calls.append(stable_action_id)
@@ -10448,7 +10596,7 @@ def test_repair_packet_9_malformed_prepare_ambiguity_has_zero_recovery_or_effect
             stable_action_id=spec.stable_action_id,
         )
 
-    adapter.read_observation = counted_read  # type: ignore[method-assign]
+    adapter._reconcile_observation = counted_read  # type: ignore[method-assign]
     adapter.prepare = malformed_prepare  # type: ignore[method-assign]
 
     with pytest.raises(RuntimeGatewayError) as rejected:
@@ -10475,20 +10623,20 @@ def test_repair_packet_9_malformed_command_ack_has_zero_recovery_or_effect(
     command_calls_before = list(adapter.command_calls)
     created_before = adapter.created_agent_count
     read_calls = []
-    native_read = adapter.read_observation
+    native_read = adapter._reconcile_observation
 
     def counted_read(stable_action_id):
         read_calls.append(stable_action_id)
         return native_read(stable_action_id)
 
-    def malformed_command(stable_action_id, command, *, expected_read_token):
+    def malformed_command(stable_action_id, command):
         return _RuntimeFailure(
             _Packet9StringSubclass("RUNTIME_COMMAND_ACK_LOST"),
             "malformed command acknowledgement",
             stable_action_id=stable_action_id,
         )
 
-    adapter.read_observation = counted_read  # type: ignore[method-assign]
+    adapter._reconcile_observation = counted_read  # type: ignore[method-assign]
     adapter.command = malformed_command  # type: ignore[method-assign]
 
     with pytest.raises(RuntimeGatewayError) as rejected:
@@ -10580,7 +10728,7 @@ def _packet10_observation_reads(tmp_path):
         )
     )
     assert type(prepared) is gateway_module._PrepareReceipt
-    prepared_read = prepared_adapter.read_observation(
+    prepared_read = prepared_adapter._reconcile_observation(
         prepared_subject.stable_action_id
     )
     assert gateway_module._ObservationProtocol.validate(
@@ -10593,7 +10741,7 @@ def _packet10_observation_reads(tmp_path):
     preflight = gateway.planning_preflight(subject)
     completed = gateway.progress(subject, preflight)
     assert completed.status == "completed"
-    completed_read = adapter.read_observation(subject.stable_action_id)
+    completed_read = adapter._reconcile_observation(subject.stable_action_id)
     assert gateway_module._ObservationProtocol.validate(
         completed_read,
         selected_stable_action_id=subject.stable_action_id,
@@ -11224,7 +11372,7 @@ def test_repair_packet_10_malformed_transport_never_advances_event_scan(
             observation_read.token.selected_record_digest
         ),
     )
-    adapter.read_observation = (  # type: ignore[method-assign]
+    adapter._reconcile_observation = (  # type: ignore[method-assign]
         lambda _stable_action_id: malformed
     )
     actions_before = deepcopy(adapter._actions)
@@ -11323,7 +11471,7 @@ def test_repair_packet_10_event_cursor_exhaustion_is_typed_and_atomic(
             ),
         )
 
-    adapter.read_observation = selected_read  # type: ignore[method-assign]
+    adapter._reconcile_observation = selected_read  # type: ignore[method-assign]
     first = adapter.events(None)
     assert type(first) is gateway_module._RuntimeEventPage
     assert adapter._next_event_cursor == maximum + 1
@@ -11395,11 +11543,9 @@ def test_repair_packet_10_event_scan_counter_wraps_at_exact_bound(
     maximum = (1 << 63) - 1
     action_id = "planning:packet-10-scan-wrap"
     observation = _event_bound_observation(action_id)
-    state = {
-        "lifecycle": observation.lifecycle,
-        "fenced": observation.fenced,
-        "permission_requests": [],
-    }
+    state = gateway_module._runtime_event_observation_state(
+        observation, action_id
+    )[0]
     state_digest = digest_value(state)
     if adapter_kind == "memory":
         adapter = _InMemoryRuntimeProviderAdapter(
@@ -11425,14 +11571,14 @@ def test_repair_packet_10_event_scan_counter_wraps_at_exact_bound(
         )
         action_id = prepared_subject.stable_action_id
         observation = _event_bound_observation(action_id)
-        state = {
-            "lifecycle": observation.lifecycle,
-            "fenced": observation.fenced,
-            "permission_requests": [],
-        }
+        _event_observation_read(adapter, action_id, observation)
+        state = gateway_module._runtime_event_observation_state(
+            observation, action_id
+        )[0]
         state_digest = digest_value(state)
 
         def seed(candidate):
+            candidate["actions"][action_id]["wake_state"] = state
             candidate["actions"][action_id]["wake_state_digest"] = state_digest
             candidate["actions"][action_id]["wake_terminal_emitted"] = False
             candidate["event_scan_cursor"] = maximum
@@ -11440,7 +11586,7 @@ def test_repair_packet_10_event_scan_counter_wraps_at_exact_bound(
         adapter._transact(seed)
         durable_path = adapter._state_path
 
-    adapter.read_observation = (  # type: ignore[method-assign]
+    adapter._reconcile_observation = (  # type: ignore[method-assign]
         lambda selected_action_id: _event_observation_read(
             adapter,
             selected_action_id,
@@ -11516,7 +11662,7 @@ def test_repair_packet_11_memory_command_rejects_malformed_exact_token_before_ef
     running = gateway.progress(subject, preflight)
     assert running.status == "running"
     verdict = gateway_module._ObservationProtocol.validate(
-        adapter.read_observation(subject.stable_action_id),
+        adapter._reconcile_observation(subject.stable_action_id),
         selected_stable_action_id=subject.stable_action_id,
         maximum_artifact_bytes=store.maximum_bytes,
     )
@@ -11576,11 +11722,11 @@ def test_repair_packet_11_memory_command_rejects_malformed_exact_token_before_ef
         for path in store._root.rglob("*")
         if path.is_file()
     }
+    adapter._command_gates[(subject.stable_action_id, threading.get_ident())] = token
 
     rejected = adapter.command(
         subject.stable_action_id,
         RuntimeCommand.PARK,
-        expected_read_token=token,
     )
 
     assert type(rejected) is _RuntimeFailure
@@ -12161,7 +12307,7 @@ def test_repair_packet_13_bound_result_path_is_rejected_before_filesystem_touch(
         raise AssertionError("untrusted journal path reached Path.is_file")
 
     monkeypatch.setattr(Path, "is_file", forbidden_is_file)
-    observed = adapter.read_observation(subject.stable_action_id)
+    observed = adapter._reconcile_observation(subject.stable_action_id)
     verdict = gateway_module._ObservationProtocol.validate(
         observed,
         selected_stable_action_id=subject.stable_action_id,
@@ -12228,7 +12374,7 @@ def test_repair_packet_13_bound_workspace_path_family_is_rejected_before_filesys
     monkeypatch.setattr(Path, "resolve", forbidden_resolve)
     monkeypatch.setattr(Path, "is_file", forbidden_is_file)
     monkeypatch.setattr(gateway_module.os, "lstat", tracked_lstat)
-    observed = adapter.read_observation(action_id)
+    observed = adapter._reconcile_observation(action_id)
     verdict = gateway_module._ObservationProtocol.validate(
         observed,
         selected_stable_action_id=action_id,
@@ -12269,3 +12415,718 @@ def test_repair_packet_13_work_run_purpose_requires_exact_strings_and_cannot_rei
         purpose.__init__("formal_review")
     assert reentered.value.code == "RUNTIME_SUBJECT_INVALID"
     assert purpose.canonical() == {"kind": "implementation", "policy_id": None}
+
+
+def test_repair_packet_16_gateway_transition_uses_the_exact_public_keyword(tmp_path):
+    assert tuple(inspect.signature(RuntimeGateway.transition).parameters) == (
+        "self",
+        "stable_action_id",
+        "transition",
+    )
+    gateway, _store, _adapter = _gateway(tmp_path)
+
+    with pytest.raises(RuntimeGatewayError) as unknown:
+        gateway.transition(
+            stable_action_id="missing:action",
+            transition=RuntimeCommand.START,
+        )
+
+    assert unknown.value.code == "RUNTIME_ACTION_UNKNOWN"
+
+
+def test_repair_packet_16_concurrent_memory_prepare_has_one_linearized_effect(
+    tmp_path,
+    monkeypatch,
+):
+    store = ArtifactStore(tmp_path / "artifacts", maximum_bytes=300_000)
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(
+        subject.stable_action_id,
+        subject,
+        _profile(),
+        prompt,
+        (prompt,),
+    )
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    contenders = 8
+    query_barrier = threading.Barrier(contenders)
+    native_read_bytes = store.read_bytes
+
+    def synchronize_after_absence_query(digest):
+        try:
+            query_barrier.wait(0.5)
+        except threading.BrokenBarrierError:
+            pass
+        return native_read_bytes(digest)
+
+    monkeypatch.setattr(store, "read_bytes", synchronize_after_absence_query)
+    results: list[object] = []
+    workers = [
+        threading.Thread(target=lambda: results.append(adapter.prepare(spec)))
+        for _ in range(contenders)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(10)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(results) == contenders
+    assert all(
+        type(result) is gateway_module._PrepareReceipt for result in results
+    )
+    assert adapter.prepare_calls == [subject.stable_action_id]
+    assert adapter.staged_prompt_count == 1
+    assert len(adapter._actions) == 1
+
+    started = _adapter_command(adapter, subject.stable_action_id, RuntimeCommand.START)
+    assert type(started) is _CommandReceipt
+    completed = adapter.observe(subject.stable_action_id)
+    assert not isinstance(completed, _RuntimeFailure)
+    assert completed.lifecycle == "completed"
+    binding_ref = completed.binding_ref
+
+    replay = adapter.prepare(spec)
+    after_replay = adapter.observe(subject.stable_action_id)
+
+    assert type(replay) is gateway_module._PrepareReceipt
+    assert not isinstance(after_replay, _RuntimeFailure)
+    assert after_replay.lifecycle == "completed"
+    assert after_replay.binding_ref == binding_ref
+    assert adapter.created_agent_count == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "unknown_lifecycle",
+        "invalid_prompt_digest",
+        "changed_prompt_digest",
+        "incomplete_binding_identity",
+        "completed_without_output",
+        "running_with_output",
+        "unobserved_bound_state",
+        "bound_without_history",
+        "snapshot_digest_mismatch",
+        "snapshot_lifecycle_mismatch",
+        "fallback_selected",
+        "missing_output_proof",
+    ),
+)
+def test_repair_packet_16_gateway_loader_rejects_impossible_action_state_before_adapter_read(
+    tmp_path,
+    mutation,
+):
+    gateway, store, _adapter = _gateway(tmp_path)
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(subject)
+    completed = gateway.progress(subject, preflight)
+    assert completed.status == "completed"
+    journal_path = tmp_path / "gateway.journal"
+    durable = json.loads(journal_path.read_text(encoding="utf-8"))
+    record = durable["actions"][subject.stable_action_id]
+
+    if mutation == "unknown_lifecycle":
+        record["lifecycle"] = "provider-invented"
+    elif mutation == "invalid_prompt_digest":
+        record["prompt_artifact_digest"] = "not-a-digest"
+    elif mutation == "changed_prompt_digest":
+        record["prompt_artifact_digest"] = "f" * 64
+    elif mutation == "incomplete_binding_identity":
+        record["session_id"] = None
+    elif mutation == "completed_without_output":
+        record["planning_output_artifact_digest"] = None
+    elif mutation == "running_with_output":
+        record["lifecycle"] = "running"
+    elif mutation == "unobserved_bound_state":
+        record["materialization_observed"] = False
+    elif mutation == "bound_without_history":
+        record["ever_bound"] = False
+    elif mutation == "snapshot_digest_mismatch":
+        record["observation_digest"] = "f" * 64
+    elif mutation == "snapshot_lifecycle_mismatch":
+        record["last_observation"]["lifecycle"] = "retired"
+        record["observation_digest"] = digest_value(
+            record["last_observation"]
+        )
+    elif mutation == "fallback_selected":
+        record["fallback_selected"] = True
+        assignment = {
+            key: record[key]
+            for key in gateway_module._ASSIGNMENT_RECORD_KEYS
+        }
+        record["assignment_digest"] = gateway_module._assignment_digest(
+            subject,
+            assignment,
+        )
+    elif mutation == "missing_output_proof":
+        record["planning_output_artifact_digest"] = "f" * 64
+        record["last_observation"][
+            "planning_output_artifact_digest"
+        ] = "f" * 64
+        record["observation_digest"] = digest_value(
+            record["last_observation"]
+        )
+    else:
+        raise AssertionError(f"unknown mutation {mutation}")
+    journal_path.write_bytes(gateway_module.canonical_bytes(durable))
+    tracking_adapter = _InMemoryRuntimeProviderAdapter(store)
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        RuntimeGateway(
+            store_path=journal_path,
+            _adapter=tracking_adapter,
+            configuration=gateway._configuration,
+            _artifacts=store,
+        )
+
+    assert rejected.value.code == "RUNTIME_STORE_INVALID"
+    assert (
+        tracking_adapter.prepare_calls,
+        tracking_adapter.observe_calls,
+        tracking_adapter.command_calls,
+    ) == ([], [], [])
+
+
+def test_repair_packet_16_gateway_loader_reverse_binds_preflight_assignment(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts", maximum_bytes=300_000)
+    profile = _profile()
+    configuration = _configuration_with_worker(profile)
+    journal_path = tmp_path / "gateway.journal"
+    gateway = RuntimeGateway(
+        store_path=journal_path,
+        _adapter=_InMemoryRuntimeProviderAdapter(store),
+        configuration=configuration,
+        _artifacts=store,
+    )
+    planning = _put_subject_artifacts(store, _subject())
+    gateway.planning_preflight(planning)
+    durable = json.loads(journal_path.read_text(encoding="utf-8"))
+    preflight = durable["preflights"][planning.stable_action_id]
+    preflight["assignment"]["selector"] = "worker"
+    replacement = {
+        **preflight["assignment"],
+        "fallback_selected": False,
+    }
+    preflight["assignment_digest"] = gateway_module._assignment_digest(
+        planning,
+        replacement,
+    )
+    preflight["receipt_digest"] = gateway_module._preflight_receipt_digest(
+        planning.stable_action_id,
+        preflight,
+    )
+    durable["campaigns"][planning.campaign_handle][
+        "preflight_bindings"
+    ][planning.stable_action_id]["assignment_digest"] = preflight[
+        "assignment_digest"
+    ]
+    journal_path.write_bytes(gateway_module.canonical_bytes(durable))
+    tracking_adapter = _InMemoryRuntimeProviderAdapter(store)
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        RuntimeGateway(
+            store_path=journal_path,
+            _adapter=tracking_adapter,
+            configuration=configuration,
+            _artifacts=store,
+        )
+
+    assert rejected.value.code == "RUNTIME_STORE_INVALID"
+    assert (
+        tracking_adapter.prepare_calls,
+        tracking_adapter.observe_calls,
+        tracking_adapter.command_calls,
+    ) == ([], [], [])
+
+
+def test_repair_packet_16_gateway_v1_migrates_atomically_without_adapter_read(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts", maximum_bytes=300_000)
+    profile = _profile()
+    configuration = _configuration_with_worker(profile)
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    journal_path = tmp_path / "gateway.journal"
+    gateway = RuntimeGateway(
+        store_path=journal_path,
+        _adapter=adapter,
+        configuration=configuration,
+        _artifacts=store,
+    )
+    planning = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(planning)
+    work = _put_work_subject_artifacts(
+        store,
+        planning,
+        stable_action_id="work:legacy-v1",
+    )
+    first = gateway.progress(work)
+    assert first.status == "completed"
+    durable = json.loads(journal_path.read_text(encoding="utf-8"))
+    durable["schema_version"] = 1
+    durable.pop("action_identities")
+    journal_path.write_bytes(gateway_module.canonical_bytes(durable))
+    operations_before = (
+        list(adapter.prepare_calls),
+        list(adapter.observe_calls),
+        list(adapter.command_calls),
+    )
+
+    restarted = RuntimeGateway(
+        store_path=journal_path,
+        _adapter=adapter,
+        configuration=configuration,
+        _artifacts=store,
+    )
+
+    assert (
+        adapter.prepare_calls,
+        adapter.observe_calls,
+        adapter.command_calls,
+    ) == operations_before
+    migrated = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert migrated["schema_version"] == 2
+    assert migrated["action_identities"] == {
+        planning.stable_action_id: {
+            "subject_kind": "campaign_planning",
+            "subject_digest": planning.digest,
+        },
+        work.stable_action_id: {
+            "subject_kind": "work_run",
+            "subject_digest": work.digest,
+        },
+    }
+    assert restarted.planning_preflight(planning) == preflight
+    created_before = adapter.created_agent_count
+    replay = restarted.progress(work)
+    assert replay.status == "completed"
+    assert adapter.created_agent_count == created_before
+
+
+def test_repair_packet_16_gateway_v1_conflict_fails_without_rewrite_or_adapter_read(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts", maximum_bytes=300_000)
+    profile = _profile()
+    configuration = _configuration_with_worker(profile)
+    journal_path = tmp_path / "gateway.journal"
+    gateway = RuntimeGateway(
+        store_path=journal_path,
+        _adapter=_InMemoryRuntimeProviderAdapter(store),
+        configuration=configuration,
+        _artifacts=store,
+    )
+    planning = _put_subject_artifacts(store, _subject())
+    gateway.planning_preflight(planning)
+    work = _put_work_subject_artifacts(
+        store,
+        planning,
+        stable_action_id="work:legacy-conflict-source",
+    )
+    gateway.progress(work)
+    durable = json.loads(journal_path.read_text(encoding="utf-8"))
+    conflicting_work = replace(
+        work,
+        stable_action_id=planning.stable_action_id,
+    )
+    action = durable["actions"].pop(work.stable_action_id)
+    action["subject"] = conflicting_work.canonical()
+    action["subject_digest"] = conflicting_work.digest
+    assignment = {
+        key: action[key] for key in gateway_module._ASSIGNMENT_RECORD_KEYS
+    }
+    action["assignment_digest"] = gateway_module._assignment_digest(
+        conflicting_work,
+        assignment,
+    )
+    durable["actions"][planning.stable_action_id] = action
+    durable["schema_version"] = 1
+    durable.pop("action_identities")
+    legacy_bytes = gateway_module.canonical_bytes(durable)
+    journal_path.write_bytes(legacy_bytes)
+    tracking_adapter = _InMemoryRuntimeProviderAdapter(store)
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        RuntimeGateway(
+            store_path=journal_path,
+            _adapter=tracking_adapter,
+            configuration=configuration,
+            _artifacts=store,
+        )
+
+    assert rejected.value.code == "RUNTIME_STORE_INVALID"
+    assert journal_path.read_bytes() == legacy_bytes
+    assert (
+        tracking_adapter.prepare_calls,
+        tracking_adapter.observe_calls,
+        tracking_adapter.command_calls,
+    ) == ([], [], [])
+
+
+def test_repair_packet_16_paseo_terminal_marker_requires_its_wake_digest(
+    tmp_path,
+):
+    (
+        store,
+        source,
+        _workspace,
+        client,
+        adapter,
+        subject,
+        _spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    action_id = subject.stable_action_id
+    bound = adapter.observe(action_id)
+    assert not isinstance(bound, _RuntimeFailure)
+    assert bound.binding_ref is not None
+    state_path = adapter._state_path
+    durable = json.loads(state_path.read_text(encoding="utf-8"))
+    durable["actions"][action_id]["wake_terminal_emitted"] = True
+    durable["actions"][action_id]["wake_state_digest"] = None
+    state_path.write_bytes(gateway_module.canonical_bytes(durable))
+    commands_before = deepcopy(client.commands)
+
+    event_read = adapter.events(None)
+
+    assert isinstance(event_read, _RuntimeFailure)
+    assert event_read.code == "RUNTIME_STORE_INVALID"
+    assert client.commands == commands_before
+    with pytest.raises(RuntimeGatewayError) as restarted:
+        _PaseoRuntimeProviderAdapter(
+            client=client,  # type: ignore[arg-type]
+            artifacts=store,
+            repository_contexts={
+                "owner/repository": RuntimeRepositoryContext(source, "main")
+            },
+            state_path=state_path,
+        )
+    assert restarted.value.code == "RUNTIME_STORE_INVALID"
+    assert client.commands == commands_before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "digest_mismatch",
+        "nonterminal_snapshot",
+        "pending_effect",
+        "unknown_event_action",
+        "unknown_event_kind",
+        "action_intent_overlap",
+    ),
+)
+def test_repair_packet_16_paseo_loader_closes_terminal_wake_state(
+    tmp_path,
+    mutation,
+):
+    (
+        store,
+        source,
+        _workspace,
+        client,
+        adapter,
+        subject,
+        spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    action_id = subject.stable_action_id
+    retired = _adapter_command(
+        adapter,
+        action_id,
+        RuntimeCommand.RETIRE,
+    )
+    assert not isinstance(retired, _RuntimeFailure)
+    page = adapter.events(None)
+    assert not isinstance(page, _RuntimeFailure)
+    record = adapter._actions[action_id]
+    assert record["wake_terminal_emitted"] is True
+    assert record["wake_state"]["lifecycle"] == "retired"
+    state_path = adapter._state_path
+    durable = json.loads(state_path.read_text(encoding="utf-8"))
+    durable_record = durable["actions"][action_id]
+
+    if mutation == "digest_mismatch":
+        durable_record["wake_state_digest"] = "f" * 64
+    elif mutation == "nonterminal_snapshot":
+        durable_record["wake_state"]["lifecycle"] = "running"
+        durable_record["wake_state_digest"] = digest_value(
+            durable_record["wake_state"]
+        )
+    elif mutation == "pending_effect":
+        durable_record["pending_retire"] = True
+    elif mutation == "unknown_event_action":
+        durable["events"][-1]["stable_action_id"] = "missing:action"
+    elif mutation == "unknown_event_kind":
+        durable["events"][-1]["kind"] = "state:provider-invented"
+    elif mutation == "action_intent_overlap":
+        durable["workspace_intents"][action_id] = {
+            "repository_path": str(source.resolve()),
+            "base_commit": durable_record["workspace_base_commit"],
+            "slug": durable_record["workspace_slug"],
+            "branch": f"gwo-{durable_record['workspace_slug']}",
+            "spec_identity_digest": adapter._spec_identity_digest(spec),
+            "ownership_nonce": durable_record["workspace_owner_nonce"],
+            "layout_version": durable_record["workspace_layout_version"],
+            "phase": "recorded",
+        }
+    else:
+        raise AssertionError(f"unknown mutation {mutation}")
+    state_path.write_bytes(gateway_module.canonical_bytes(durable))
+    commands_before = deepcopy(client.commands)
+
+    rejected = adapter.events(page.next_cursor)
+
+    assert isinstance(rejected, _RuntimeFailure)
+    assert rejected.code == "RUNTIME_STORE_INVALID"
+    assert client.commands == commands_before
+    with pytest.raises(RuntimeGatewayError) as restarted:
+        _PaseoRuntimeProviderAdapter(
+            client=client,  # type: ignore[arg-type]
+            artifacts=store,
+            repository_contexts={
+                "owner/repository": RuntimeRepositoryContext(source, "main")
+            },
+            state_path=state_path,
+        )
+    assert restarted.value.code == "RUNTIME_STORE_INVALID"
+    assert client.commands == commands_before
+
+
+def test_repair_packet_16_paseo_branch_off_create_has_a_stable_new_branch(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    native_run = client._run
+    durable_intents = []
+
+    def enforce_paseo_branch_off_schema(args):
+        if args[:2] == ["workspace", "create"]:
+            if "--new-branch" not in args:
+                raise RuntimeGatewayError(
+                    "RUNTIME_VENDOR_ARGUMENT_INVALID",
+                    "branch-off create omitted its deterministic branch identity",
+                )
+            branch = args[args.index("--new-branch") + 1]
+            assert branch == "gwo-869429569d94fc6a5e8f63ab"
+            durable_intents.append(
+                json.loads(
+                    (tmp_path / "paseo-actions.json").read_text(
+                        encoding="utf-8"
+                    )
+                )["workspace_intents"]
+            )
+        return native_run(args)
+
+    client._run = enforce_paseo_branch_off_schema  # type: ignore[method-assign]
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=tmp_path / "paseo-actions.json",
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+
+    prepared = adapter.prepare(
+        _RuntimeActionSpec(
+            subject.stable_action_id,
+            subject,
+            _profile(),
+            prompt,
+            (prompt,),
+        )
+    )
+
+    assert type(prepared) is gateway_module._PrepareReceipt
+    assert adapter.observe(subject.stable_action_id).lifecycle == "prepared"
+    create = next(
+        command
+        for command in client.commands
+        if command[:2] == ["workspace", "create"]
+    )
+    assert create[create.index("--mode") + 1] == "branch-off"
+    assert create[create.index("--new-branch") + 1] == (
+        "gwo-869429569d94fc6a5e8f63ab"
+    )
+    assert durable_intents == [
+        {
+            subject.stable_action_id: {
+                "repository_path": str(source.resolve()),
+                "base_commit": adapter._actions[
+                    subject.stable_action_id
+                ]["workspace_base_commit"],
+                "slug": "869429569d94fc6a5e8f63ab",
+                "branch": "gwo-869429569d94fc6a5e8f63ab",
+                "spec_identity_digest": adapter._spec_identity_digest(
+                    _RuntimeActionSpec(
+                        subject.stable_action_id,
+                        subject,
+                        _profile(),
+                        prompt,
+                        (prompt,),
+                    )
+                ),
+                "ownership_nonce": adapter._actions[
+                    subject.stable_action_id
+                ]["workspace_owner_nonce"],
+                "layout_version": gateway_module._RUNTIME_WORKSPACE_LAYOUT_VERSION,
+                "phase": "create_pending",
+            }
+        }
+    ]
+    assert Path(client.workspaces[0]["cwd"]).name == (
+        "869429569d94fc6a5e8f63ab"
+    )
+    assert subject.stable_action_id not in adapter._workspace_intents
+
+
+def test_repair_packet_16_paseo_ignores_unrelated_registry_duplicates(
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, workspace = _repository_worktree(tmp_path)
+    client = _RecordingPaseoCli(workspace)
+    unrelated = tmp_path / "unrelated-workspace"
+    client.workspaces = [
+        {
+            "workspaceId": "workspace:unrelated",
+            "name": "unrelated-slug",
+            "isolation": "worktree",
+            "cwd": str(unrelated),
+        },
+        {
+            "workspaceId": "workspace:unrelated",
+            "name": "unrelated-slug",
+            "isolation": "worktree",
+            "cwd": str(unrelated),
+        },
+    ]
+    adapter = _PaseoRuntimeProviderAdapter(
+        client=client,  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={
+            "owner/repository": RuntimeRepositoryContext(source, "main")
+        },
+        state_path=tmp_path / "paseo-actions.json",
+    )
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+
+    prepared = adapter.prepare(
+        _RuntimeActionSpec(
+            subject.stable_action_id,
+            subject,
+            _profile(),
+            prompt,
+            (prompt,),
+        )
+    )
+
+    assert type(prepared) is gateway_module._PrepareReceipt
+    assert sum(
+        command[:2] == ["workspace", "create"]
+        for command in client.commands
+    ) == 1
+
+
+def test_repair_packet_16_bound_result_leaf_is_lstat_checked_before_path_touch(
+    tmp_path,
+    monkeypatch,
+):
+    (
+        _store,
+        _source,
+        _workspace,
+        _client,
+        adapter,
+        subject,
+        _spec,
+    ) = _prepared_paseo_adapter(tmp_path)
+    result_path = Path(
+        adapter._actions[subject.stable_action_id]["result_file"]
+    )
+    outside = tmp_path / "outside-result.json"
+    outside.write_text("{}", encoding="utf-8")
+    os.symlink(outside, result_path)
+    touches: list[str] = []
+    native_is_file = Path.is_file
+    native_stat = Path.stat
+    native_open = Path.open
+    native_resolve = Path.resolve
+
+    def track(name, operation):
+        def tracked(path, *args, **kwargs):
+            if Path(path) == result_path:
+                touches.append(name)
+            return operation(path, *args, **kwargs)
+
+        return tracked
+
+    monkeypatch.setattr(Path, "is_file", track("is_file", native_is_file))
+    monkeypatch.setattr(Path, "stat", track("stat", native_stat))
+    monkeypatch.setattr(Path, "open", track("open", native_open))
+    monkeypatch.setattr(Path, "resolve", track("resolve", native_resolve))
+
+    observed = adapter.observe(subject.stable_action_id)
+
+    assert isinstance(observed, _RuntimeFailure)
+    assert observed.code == "RUNTIME_WORKSPACE_UNSAFE"
+    assert touches == []
+
+
+def test_repair_packet_16_gateway_persists_a_cross_bound_observation_snapshot(
+    tmp_path,
+):
+    gateway, store, adapter = _gateway(tmp_path)
+    subject = _put_subject_artifacts(store, _subject())
+    preflight = gateway.planning_preflight(subject)
+    completed = gateway.progress(subject, preflight)
+    assert completed.status == "completed"
+    journal_path = tmp_path / "gateway.journal"
+    durable = json.loads(journal_path.read_text(encoding="utf-8"))
+    record = durable["actions"][subject.stable_action_id]
+
+    assert record["ever_bound"] is True
+    assert type(record["last_observation"]) is dict
+    assert record["observation_digest"] == digest_value(
+        record["last_observation"]
+    )
+    assert record["last_observation"]["stable_action_id"] == (
+        subject.stable_action_id
+    )
+    assert record["last_observation"]["lifecycle"] == record["lifecycle"]
+    assert record["last_observation"]["binding_ref"] == record["binding_ref"]
+    assert record["last_observation"]["workspace_id"] == record["workspace_id"]
+    assert record["last_observation"][
+        "planning_output_artifact_digest"
+    ] == record["planning_output_artifact_digest"]
+
+    record["lifecycle"] = "prepared"
+    journal_path.write_bytes(gateway_module.canonical_bytes(durable))
+    operations_before = (
+        list(adapter.prepare_calls),
+        list(adapter.observe_calls),
+        list(adapter.command_calls),
+    )
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        RuntimeGateway(
+            store_path=journal_path,
+            _adapter=adapter,
+            configuration=gateway._configuration,
+            _artifacts=store,
+        )
+
+    assert rejected.value.code == "RUNTIME_STORE_INVALID"
+    assert (
+        adapter.prepare_calls,
+        adapter.observe_calls,
+        adapter.command_calls,
+    ) == operations_before

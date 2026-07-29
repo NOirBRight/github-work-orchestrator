@@ -69,6 +69,8 @@ before Adapter readback, preparation, command, or any provider effect.
 Schema-version-1 journals without the shared map rebuild it from every
 preflight and action while holding the journal lock; any conflict within or
 between those collections makes the store invalid rather than selecting one.
+Only a completely validated rebuild is atomically published as schema version
+2; a failed rebuild leaves the version-1 bytes untouched.
 Campaign, preflight, override, and assignment records use closed schemas.
 Every load recomputes the complete Campaign-override digest, assignment
 digest, and preflight receipt digest. The opaque receipt binds the whole
@@ -108,29 +110,31 @@ types; they are neither package exports nor caller contracts:
 
 ```text
 prepare(RuntimeActionSpec) -> PrepareReceipt | RuntimeFailure
-read_observation(stable_action_id) -> ObservationRead
-command(stable_action_id, RuntimeTransition, ObservationReadToken) -> CommandReceipt | RuntimeFailure
+observe(stable_action_id) -> PreparedObservation | BoundObservation | RuntimeFailure
+command(stable_action_id, RuntimeTransition) -> CommandReceipt | RuntimeFailure
 events(after_cursor) -> RuntimeEventPage
 ```
 
-The Adapter returns no raw observation at the semantic boundary.
-`ObservationRead` is a sealed closed envelope containing the requested and
+`_reconcile_observation` and its sealed `ObservationRead` are adapter-private
+implementation details, not Protocol operations. They bind the requested and
 selected action, complete subject/Profile/Prompt/input/spec and
 Workspace/binding identity, one exact observation or failure, Artifact
-evidence, and a causal token minted from the reconciled selected record at the
-read linearization point. One pure total validator owns exact type and field
-schemas—including nested permission/completion evidence—identity binding,
-closed failure classification, and Artifact-proof consistency. Progress,
-prepare/command acknowledgement recovery, and event scans consume only its
-verdict. Its closed kinds are `prepared`, `bound`,
-`authoritative_absence`, `fairness_advance`, `failure`, and `invalid`.
-The protocol alone assigns `fairness_advance` to an exact transport,
-same-action binding-missing, or same-action materialization-pending failure;
-event callers do not inspect raw failure codes. Authoritative Gateway and
-Adapter paths branch only on that kind and retain the verdict through command
-readback and durable observation recording. Only the external compatibility
-`observe` projection unwraps at its final edge. Prepare/command receipts,
-failures, and event pages likewise require
+evidence, and a causal record token at the reconciliation linearization point.
+The adapter validates that sealed read before its public private-seam
+`observe` projection returns only a Prepared or Bound observation (or a typed
+failure). RuntimeGateway then independently validates that projection against
+its durable subject and identity and proves every governed Artifact, including
+completed output; it never trusts an Adapter's Artifact acceptance as semantic
+evidence.
+
+One pure total validator owns exact sealed-read type and field schemas,
+including nested permission/completion evidence, closed failure
+classification, and causal-token consistency. Its closed kinds are
+`prepared`, `bound`, `authoritative_absence`, `fairness_advance`, `failure`,
+and `invalid`. The protocol alone assigns `fairness_advance` to an exact
+transport, same-action binding-missing, or same-action
+materialization-pending failure; event callers do not inspect raw failure
+codes. Prepare/command receipts, failures, and event pages likewise require
 exact classes and closed fields; subclasses, missing/extra fields, and
 cross-action values are protocol invalid. Every scalar is checked as its
 exact built-in type before equality, hashing, membership, or conversion, and
@@ -192,15 +196,19 @@ permission decision. Paseo verifies the native receipt name against the
 provider-namespaced operation, then retains the normalized operation ID in
 `name`; ingestion, restart, and readback all require
 `receipt.name == request.operation_id`. A fenced Bound action cannot resume. Production
-wake cursors persist only readback lifecycle, exact pending-permission, and
-fence changes; they remain advisory and never replace authoritative readback.
-The accepted observation token is also the command's pre-effect CAS
-precondition. Both production and in-memory Adapters compare its complete
-identity and selected-record digest before dispatch. A concurrent rebind,
-retire, or reconciliation invalidates a stale command before provider state
-can change. Paseo repeats this check inside the durable effect-claim
-transaction itself; in-memory validates the complete current sealed read and
-the exact token inside the same re-entrant lock as mutation.
+wake cursors persist a closed snapshot of stable action, subject digest,
+lifecycle, exact pending permissions, fence state, and output digest; they
+remain advisory and never replace authoritative readback. A successful
+private-seam `observe` opens one ephemeral, adapter-private, one-shot command
+gate from its sealed read. `command` accepts no caller-supplied token and
+consumes that gate before it can dispatch. A command without a fresh observe,
+after an event-only read, after an earlier consumed command, or after adapter
+restart therefore has zero effect. Both production and in-memory Adapters
+revalidate the complete identity and selected-record digest before dispatch.
+A concurrent rebind, retire, or reconciliation invalidates a stale gate before
+provider state can change. Paseo repeats the check inside the durable
+effect-claim transaction itself; in-memory validates the complete current
+sealed read inside the same re-entrant lock as mutation.
 
 Each wake poll captures one fair-scan selection and performs at most one
 detached action readback before changing durable event state. After a valid
@@ -296,8 +304,12 @@ accepted, and conflicting populated aliases fail as ambiguous identity rather
 than choosing the first spelling. This applies to inspect, Agent-list,
 Workspace-list, and Workspace-create receipt identity and path readback.
 The inspected working directory then joins one exact recorded Workspace ID,
-name, and worktree isolation. Its resolved path must differ from the resolved
-source checkout; private bounded Git readback then proves their shared
+name, and worktree isolation. Workspace-registry selection is target-scoped:
+only the action-owned worktree slug and its exact durable Workspace ID/path
+may participate, while unrelated registry rows cannot create ambiguity.
+Conflicting target candidates fail closed, and untrusted durable network paths
+are rejected without resolution. Its resolved path must differ from the
+resolved source checkout; private bounded Git readback then proves their shared
 repository common directory. The first durable Workspace intent resolves and
 pins one exact base commit, creates from that commit, and a Prepared Workspace
 proves its `HEAD` still equals that pinned commit without re-resolving the

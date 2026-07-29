@@ -74,7 +74,9 @@ of its complete canonical subject in the same transaction that commits the
 preflight or assignment. Exact replay is valid; cross-kind or changed-subject
 reuse fails before Adapter or provider activity. A schema-version-1 journal
 without that map rebuilds it from all preflight and action records and rejects
-any conflicting legacy identity.
+any conflicting legacy identity. The migration writes schema version 2 only
+after the complete rebuilt identity map validates under the journal lock; a
+conflict leaves the version-1 journal unchanged.
 
 Availability fallback is permitted only before any Agent identity may exist
 for the stable action. After identity, RuntimeGateway recovers the same
