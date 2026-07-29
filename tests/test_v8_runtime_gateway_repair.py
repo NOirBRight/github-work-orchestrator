@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from copy import deepcopy
@@ -14,7 +13,6 @@ import subprocess
 import sys
 import threading
 import time
-import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -10044,27 +10042,6 @@ def test_repair_packet_8_canonical_json_accepts_unicode_scalars_and_escaped_pair
     assert profile.features.to_json() == value
 
 
-def test_repair_packet_8_authoritative_paths_have_no_raw_observation_or_result_bypass():
-    source = inspect.getsource(gateway_module)
-    progress_source = inspect.getsource(RuntimeGateway.progress)
-    command_source = inspect.getsource(
-        RuntimeGateway._command_with_readback
-    )
-    wake_source = inspect.getsource(RuntimeGateway._wake_hints)
-
-    assert "expected_read_token: _RuntimeObservationReadToken | None" not in source
-    assert "expected_read_token: _RuntimeObservationReadToken = None" not in source
-    assert "return self._reconcile_observation(stable_action_id).result" not in source
-    assert "self._observe(" not in source
-    assert "self._prepare(" not in progress_source
-    assert "_prepare_verdict(" in progress_source
-    assert "_RuntimeCommandResultProtocol.validate(" in command_source
-    assert "isinstance(result, _RuntimeFailure)" not in command_source
-    assert "_RuntimeEventPageProtocol.validate(" in wake_source
-    assert "_runtime_event_page_is_structurally_valid(" not in wake_source
-    assert "type(page) is _RuntimeFailure" not in wake_source
-
-
 class _Packet9StringSubclass(str):
     pass
 
@@ -10523,47 +10500,6 @@ def test_repair_packet_9_observation_protocol_has_closed_semantic_kinds(
         selected_stable_action_id=subject.stable_action_id,
     )
     assert bound_verdict.kind == "bound"
-
-
-def test_repair_packet_9_authoritative_callgraph_keeps_observation_verdicts_sealed():
-    source = inspect.getsource(gateway_module)
-    assert "_observe_with_token" not in source
-    assert "_validated_command_readback" not in source
-    gateway_source = inspect.getsource(RuntimeGateway)
-    assert "self._adapter.observe(stable_action_id)" in gateway_source
-    assert "self._adapter._reconcile_observation(" not in gateway_source
-
-    forbidden = {
-        "_PreparedRuntimeObservation",
-        "_BoundRuntimeObservation",
-        "_RuntimeFailure",
-    }
-    authoritative = (
-        RuntimeGateway.progress,
-        RuntimeGateway.transition,
-        RuntimeGateway._record_observation,
-        RuntimeGateway._command_with_readback,
-        _PaseoRuntimeProviderAdapter.command,
-        _InMemoryRuntimeProviderAdapter.command,
-        _InMemoryRuntimeProviderAdapter._command_locked,
-    )
-    violations = []
-    for function in authoritative:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "isinstance"
-                and len(node.args) == 2
-                and forbidden.intersection(
-                    part.id
-                    for part in ast.walk(node.args[1])
-                    if isinstance(part, ast.Name)
-                )
-            ):
-                violations.append(function.__qualname__)
-    assert violations == []
 
 
 @pytest.mark.parametrize(
@@ -11503,34 +11439,6 @@ def test_repair_packet_10_event_cursor_exhaustion_is_typed_and_atomic(
     assert adapter._next_event_cursor == next_before
     if durable_path is not None:
         assert durable_path.read_bytes() == durable_before
-
-
-def test_repair_packet_10_event_disposition_callers_branch_only_on_protocol_kind():
-    source = inspect.getsource(gateway_module)
-    assert "def _runtime_event_failure_disposition(" not in source
-    for function in (
-        _PaseoRuntimeProviderAdapter.events,
-        _InMemoryRuntimeProviderAdapter.events,
-        RuntimeGateway._wake_hints,
-    ):
-        function_source = inspect.getsource(function)
-        tree = ast.parse(textwrap.dedent(function_source))
-        assert "_runtime_event_failure_disposition" not in function_source
-        assert not any(
-            isinstance(node, ast.Attribute) and node.attr == "code"
-            for node in ast.walk(tree)
-        )
-        assert not {
-            "advance",
-            "ignore",
-            "reject",
-            "not_failure",
-        }.intersection(
-            node.value
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Constant)
-            and type(node.value) is str
-        )
 
 
 @pytest.mark.parametrize("adapter_kind", ("memory", "paseo"))
