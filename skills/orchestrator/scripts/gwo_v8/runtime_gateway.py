@@ -924,7 +924,6 @@ class _RuntimeWorkspaceFiles:
             raise self._unsafe("Runtime Workspace ownership marker is not exact")
 
     def assert_record_paths(self, record: Mapping[str, Any]) -> None:
-        self.verify()
         input_digests = record.get("input_artifact_digests")
         input_files = record.get("input_files")
         if (
@@ -952,6 +951,10 @@ class _RuntimeWorkspaceFiles:
             raise self._unsafe(
                 "Runtime Workspace journal paths do not match their fixed derivation"
             )
+        # Pointer equivalence is a pure check.  Do it before any stat, resolve,
+        # open, or marker read so a journal path cannot select a filesystem
+        # target merely by being inspected during rejection.
+        self.verify()
 
     def write_artifact(self, digest: str, payload: bytes) -> Path:
         target = self.artifact_path(digest)
@@ -1391,7 +1394,13 @@ def _normalize_mappings(
             raise RuntimeGatewayError(
                 "RUNTIME_CONFIGURATION_INVALID", "Runtime mapping must be a ProfileMapping"
             )
-        normalized[RuntimeSelector(selector.value)] = ProfileMapping(
+        canonical_selector = RuntimeSelector(selector.value)
+        if canonical_selector in normalized:
+            raise RuntimeGatewayError(
+                "RUNTIME_CONFIGURATION_INVALID",
+                "Runtime mappings contain colliding canonical selectors",
+            )
+        normalized[canonical_selector] = ProfileMapping(
             mapping.primary_profile_digest,
             mapping.availability_fallback_profile_digest,
         )
@@ -1682,32 +1691,56 @@ class CampaignPlanningSubject:
         }
 
 
-@dataclass(frozen=True)
-class WorkRunPurpose:
+def _reject_work_run_purpose_reinitialization(*_args: Any, **_kwargs: Any) -> None:
+    raise RuntimeGatewayError(
+        "RUNTIME_SUBJECT_INVALID",
+        "Work Run purpose is a sealed semantic value and cannot be reinitialized",
+    )
+
+
+@dataclass(frozen=True, init=False)
+class WorkRunPurpose(tuple, metaclass=_SealedValueMeta):
     """Closed semantic purpose; exact Runtime selectors remain Gateway-private."""
+
+    __slots__ = ()
 
     kind: str
     policy_id: str | None = None
 
-    def __post_init__(self) -> None:
+    def __new__(cls, kind: str, policy_id: str | None = None) -> "WorkRunPurpose":
+        if type(kind) is not str or (policy_id is not None and type(policy_id) is not str):
+            raise RuntimeGatewayError(
+                "RUNTIME_SUBJECT_INVALID",
+                "Work Run purpose must use exact built-in text values",
+            )
         ordinary = {
             "implementation",
             "terminal_recovery_implementation",
             "formal_review",
             "invalid_review_payload_retry",
         }
-        if self.kind in ordinary and self.policy_id is None:
-            return
+        if kind in ordinary and policy_id is None:
+            return tuple.__new__(cls, (kind, None))
         if (
-            self.kind == "specialist_review"
-            and isinstance(self.policy_id, str)
-            and _SPECIALIST_RE.fullmatch(f"specialist:{self.policy_id}") is not None
+            kind == "specialist_review"
+            and policy_id is not None
+            and _SPECIALIST_RE.fullmatch(f"specialist:{policy_id}") is not None
         ):
-            return
+            return tuple.__new__(cls, (kind, policy_id))
         raise RuntimeGatewayError(
             "RUNTIME_SUBJECT_INVALID",
             "Work Run purpose is outside the closed semantic union",
         )
+
+    __init__ = _reject_work_run_purpose_reinitialization
+
+    @property
+    def kind(self) -> str:
+        return tuple.__getitem__(self, 0)
+
+    @property
+    def policy_id(self) -> str | None:
+        return tuple.__getitem__(self, 1)
 
     @classmethod
     def implementation(cls) -> "WorkRunPurpose":
@@ -3839,21 +3872,77 @@ class _RuntimeProviderAdapter(Protocol):
     def events(self, after_cursor: str | None) -> _RuntimeEventPage | _RuntimeFailure: ...
 
 
-@dataclass(frozen=True)
-class RuntimeRepositoryContext:
+def _reject_repository_context_reinitialization(*_args: Any, **_kwargs: Any) -> None:
+    raise RuntimeGatewayError(
+        "RUNTIME_CONFIGURATION_INVALID",
+        "Runtime repository context is a sealed value and cannot be reinitialized",
+    )
+
+
+class _RuntimeRepositoryContextMeta(_SealedValueMeta):
+    """Keep the sealed constructor's public contract visible to callers."""
+
+    def __call__(cls, path: Path, base_ref: str) -> Any:
+        return cls.__new__(cls, path, base_ref)
+
+
+@dataclass(frozen=True, init=False)
+class RuntimeRepositoryContext(tuple, metaclass=_RuntimeRepositoryContextMeta):
     """Host-owned source checkout used to create action-owned Workspaces."""
+
+    __slots__ = ()
 
     path: Path
     base_ref: str
 
-    def __post_init__(self) -> None:
-        resolved_path = Path(self.path).resolve()
+    def __new__(cls, path: Path, base_ref: str) -> "RuntimeRepositoryContext":
+        resolved_path = Path(path).resolve()
         if not resolved_path.is_dir():
             raise RuntimeGatewayError(
                 "RUNTIME_CONFIGURATION_INVALID", "Paseo repository context path is unavailable"
             )
-        _require_text(self.base_ref, "Runtime repository context base_ref")
-        object.__setattr__(self, "path", resolved_path)
+        exact_base_ref = _require_text(base_ref, "Runtime repository context base_ref")
+        return tuple.__new__(cls, (resolved_path, exact_base_ref))
+
+    __init__ = _reject_repository_context_reinitialization
+
+    @property
+    def path(self) -> Path:
+        return tuple.__getitem__(self, 0)
+
+    @property
+    def base_ref(self) -> str:
+        return tuple.__getitem__(self, 1)
+
+
+def _snapshot_repository_contexts(
+    value: Mapping[str, RuntimeRepositoryContext],
+) -> Mapping[str, RuntimeRepositoryContext]:
+    """Take a private, immutable host snapshot before any Runtime operation."""
+
+    if not isinstance(value, Mapping):
+        raise RuntimeGatewayError(
+            "RUNTIME_CONFIGURATION_INVALID",
+            "Paseo repository contexts must be a mapping",
+        )
+    snapshot: dict[str, RuntimeRepositoryContext] = {}
+    for repository, context in value.items():
+        repository_name = _require_text(repository, "Paseo repository context repository")
+        if type(context) is not RuntimeRepositoryContext:
+            raise RuntimeGatewayError(
+                "RUNTIME_CONFIGURATION_INVALID",
+                "Paseo repository context must be one exact sealed value",
+            )
+        if repository_name in snapshot:
+            raise RuntimeGatewayError(
+                "RUNTIME_CONFIGURATION_INVALID",
+                "Paseo repository context identity is duplicated",
+            )
+        snapshot[repository_name] = RuntimeRepositoryContext(
+            Path(str(context.path)),
+            str(context.base_ref),
+        )
+    return MappingProxyType(snapshot)
 
 
 @dataclass(frozen=True)
@@ -4258,7 +4347,7 @@ class _PaseoRuntimeProviderAdapter:
     ):
         self._client = client
         self._artifacts = artifacts
-        self._contexts = dict(repository_contexts)
+        self._contexts = _snapshot_repository_contexts(repository_contexts)
         self._state_path = Path(state_path)
         self._journal = _V3JsonJournal(self._state_path)
         self._pending_save_state: dict[str, Any] | None = None
@@ -4359,31 +4448,35 @@ class _PaseoRuntimeProviderAdapter:
         actions = value.get("actions")
         raw_events = value.get("events")
         if (
-            value.get("schema_version") != 3
-            or not isinstance(actions, dict)
-            or not isinstance(raw_events, list)
+            frozenset(value)
+            != {
+                "schema_version",
+                "actions",
+                "events",
+                "workspace_intents",
+                "next_event_cursor",
+                "event_scan_cursor",
+            }
+            or value.get("schema_version") != 5
+            or type(actions) is not dict
+            or type(raw_events) is not list
             or len(raw_events) > _MAXIMUM_RUNTIME_EVENTS
-            or not all(isinstance(item, dict) for item in actions.values())
         ):
             raise RuntimeGatewayError(
                 "RUNTIME_STORE_INVALID", "Paseo Runtime action record is invalid"
             )
-        for action in actions.values():
-            if type(action.get("wake_terminal_emitted", False)) is not bool:
-                raise RuntimeGatewayError(
-                    "RUNTIME_STORE_INVALID",
-                    "Paseo Runtime terminal wake state is invalid",
-                )
-        raw_intents = value.get("workspace_intents", {})
-        if not isinstance(raw_intents, dict):
+        for stable_action_id, action in actions.items():
+            _validate_paseo_action_record(stable_action_id, action)
+        raw_intents = value["workspace_intents"]
+        if type(raw_intents) is not dict:
             raise RuntimeGatewayError(
                 "RUNTIME_STORE_INVALID", "Paseo Workspace intent record is invalid"
             )
         normalized_intents: dict[str, dict[str, str]] = {}
         for action, intent in raw_intents.items():
             if (
-                not isinstance(action, str)
-                or not isinstance(intent, dict)
+                type(action) is not str
+                or type(intent) is not dict
                 or frozenset(intent)
                 != frozenset(
                     {
@@ -4402,7 +4495,7 @@ class _PaseoRuntimeProviderAdapter:
                 )
             normalized = dict(intent)
             if (
-                any(not isinstance(part, str) or not part for part in normalized.values())
+                any(type(part) is not str or not part for part in normalized.values())
                 or normalized["phase"] not in {"recorded", "create_pending"}
                 or _GIT_COMMIT_RE.fullmatch(normalized["base_commit"]) is None
                 or re.fullmatch(r"[0-9a-f]{32}", normalized["ownership_nonce"])
@@ -4489,7 +4582,7 @@ class _PaseoRuntimeProviderAdapter:
         }
         self._journal.replace_unlocked(
             {
-                "schema_version": 3,
+                "schema_version": 5,
                 "actions": state["actions"],
                 "events": [asdict(event) for event in state["events"]],
                 "workspace_intents": state["workspace_intents"],
@@ -4962,7 +5055,17 @@ class _PaseoRuntimeProviderAdapter:
             expected_base_commit=workspace_base_commit,
             allow_descendant=not require_pinned_base,
         )
-        files = self._workspace_files_from_record(record, subject)
+        # The registry's exact readback, not the journal text, becomes the
+        # filesystem root.  A matching journal value is still required below.
+        files = self._workspace_files(
+            workspace_path=registered[1],
+            workspace_id=workspace_id,
+            workspace_slug=workspace_slug,
+            workspace_base_commit=workspace_base_commit,
+            ownership_nonce=record["workspace_owner_nonce"],
+            subject=subject,
+            spec_identity_digest=self._record_spec_identity_digest(record),
+        )
         files.assert_record_paths(record)
         fenced = record.get("fenced", False)
         if type(fenced) is not bool:
@@ -5122,14 +5225,19 @@ class _PaseoRuntimeProviderAdapter:
         durable_record = record
         record = deepcopy(record)
         subject, profile = self._record_subject(record)
-        result_file = record.get("result_file")
+        # Establish Workspace registry and repository provenance first.  That
+        # routine rejects every journal path by pure fixed-path comparison
+        # before it reads a marker or touches a filesystem path.
+        (
+            _verified_subject,
+            _verified_profile,
+            _verified_prompt,
+            workspace_head,
+        ) = self._verify_staged_workspace(record, require_pinned_base=False)
+        files = self._workspace_files_from_record(record, subject)
         output_may_exist = isinstance(
             record.get("output_artifact_digest"), str
-        ) or (
-            isinstance(result_file, str)
-            and bool(result_file)
-            and Path(result_file).is_file()
-        )
+        ) or files.result_path.is_file()
         if (
             agent.archived is not True
             and not output_may_exist
@@ -5143,15 +5251,8 @@ class _PaseoRuntimeProviderAdapter:
             )
         # A Bound readback must continue to prove the same staged prompt,
         # inputs, output schema, and workspace registry identity as Prepared.
-        # Never treat a previously accepted artifact as implicitly durable.
-        (
-            _verified_subject,
-            _verified_profile,
-            _verified_prompt,
-            workspace_head,
-        ) = self._verify_staged_workspace(
-            record, require_pinned_base=False
-        )
+        # The initial verification above intentionally happens before result
+        # existence inspection, so reuse its verified Workspace head.
         self._verify_bound_workspace_history(
             record, subject, workspace_head
         )
@@ -5381,7 +5482,7 @@ class _PaseoRuntimeProviderAdapter:
                 "subject_digest": subject.digest,
                 "binding_ref": binding_ref,
             }
-            record.pop("pending_permission_response", None)
+            record["pending_permission_response"] = None
             record["completed_permission_response"] = completion_record
             completed_permission_response = self._completed_permission_response(
                 record, subject, agent.agent_id
@@ -5396,6 +5497,7 @@ class _PaseoRuntimeProviderAdapter:
             record.update(
                 {
                     "bound_agent_id": agent.agent_id,
+                    "binding_established": True,
                     "pending_start": False,
                 }
             )
@@ -5761,7 +5863,11 @@ class _PaseoRuntimeProviderAdapter:
             expected_id, expected_path = expected
             if (
                 matched[0] != expected_id
-                or Path(matched[1]).resolve() != Path(expected_path).resolve()
+                # Both values are durable/provider identity strings.  Do not
+                # resolve the journal-supplied expected value merely to reject
+                # it: that would turn an untrusted UNC/reparse value into a
+                # filesystem touch before registry provenance is established.
+                or matched[1] != expected_path
             ):
                 raise RuntimeGatewayError(
                     "RUNTIME_IDENTITY_AMBIGUOUS",
@@ -6352,6 +6458,27 @@ class _PaseoRuntimeProviderAdapter:
                 "result_file": str(files.result_path),
                 "output_schema_file": str(files.schema_path),
                 "output_schema_digest": schema_digest,
+                # Every recovery-relevant action state is present from the
+                # first durable write.  Restart never supplies a missing
+                # default because that could re-own an already-dispatched
+                # provider effect.
+                "bound_agent_id": None,
+                "binding_established": False,
+                "pending_start": False,
+                "pending_resume": False,
+                "pending_park": False,
+                "parked": False,
+                "pending_stop_command": None,
+                "pending_fence": False,
+                "pending_fence_claim_id": None,
+                "pending_fence_quiesced": False,
+                "pending_retire": False,
+                "pending_permission_response": None,
+                "completed_permission_response": None,
+                "output_artifact_digest": None,
+                "workspace_observed_head_commit": workspace_base_commit,
+                "wake_state_digest": None,
+                "wake_terminal_emitted": False,
             }
             # Persist the complete action record and removal of the create
             # intent together.  A crash at any earlier point retains enough
@@ -7160,7 +7287,7 @@ class _PaseoStaticAssignmentValidator:
     """Factory-owned static capability check, outside the four-method seam."""
 
     def __init__(self, repository_contexts: Mapping[str, RuntimeRepositoryContext]):
-        self._contexts = dict(repository_contexts)
+        self._contexts = _snapshot_repository_contexts(repository_contexts)
 
     def __call__(self, subject: RuntimeSubject, profile: RuntimeProfile) -> None:
         context = self._contexts.get(subject.repository)
@@ -7372,12 +7499,15 @@ class RuntimeGateway:
             candidate_overrides,
         )
         self._validate_static_assignment(subject, assignment)
+        assignment_record = {**assignment, "fallback_selected": False}
+        assignment_digest = _assignment_digest(subject, assignment_record)
         campaign_overrides_digest = digest_value(candidate_overrides)
         subject_value = subject.canonical()
         preflight_binding = {
             "subject": subject_value,
             "subject_digest": subject.digest,
             "campaign_overrides_digest": campaign_overrides_digest,
+            "assignment_digest": assignment_digest,
         }
         campaign_value = {
             "repository": subject.repository,
@@ -7393,6 +7523,7 @@ class RuntimeGateway:
             "subject_digest": subject.digest,
             "campaign_overrides_digest": campaign_overrides_digest,
             "assignment": assignment,
+            "assignment_digest": assignment_digest,
         }
         receipt_digest = digest_value(
             {
@@ -7402,17 +7533,7 @@ class RuntimeGateway:
                 "campaign_overrides_digest": binding[
                     "campaign_overrides_digest"
                 ],
-                "assignment_digest": digest_value(
-                    {
-                        "selector": assignment["selector"],
-                        "configuration_source": assignment["configuration_source"],
-                        "profile_digest": assignment["profile_digest"],
-                        "availability_fallback_profile_digest": assignment[
-                            "availability_fallback_profile_digest"
-                        ],
-                        "fallback_selected": False,
-                    }
-                ),
+                "assignment_digest": assignment_digest,
             }
         )
         expected = {**binding, "receipt_digest": receipt_digest}
@@ -7798,6 +7919,22 @@ class RuntimeGateway:
                     "RUNTIME_ACTION_IDENTITY_MISMATCH",
                     "stable action was already bound to another Runtime subject",
                 )
+            if not _gateway_action_assignment_is_bound(existing, subject):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "stable action assignment is not sealed to its exact Runtime subject",
+                )
+            if isinstance(subject, CampaignPlanningSubject):
+                persisted = self._data["preflights"].get(subject.stable_action_id)
+                if (
+                    type(persisted) is not dict
+                    or existing["assignment_digest"]
+                    != persisted.get("assignment_digest")
+                ):
+                    raise RuntimeGatewayError(
+                        "RUNTIME_STORE_INVALID",
+                        "planning action assignment is not cross-bound to preflight",
+                    )
             return existing
         if isinstance(subject, CampaignPlanningSubject):
             if preflight is None:
@@ -7810,6 +7947,17 @@ class RuntimeGateway:
                 raise RuntimeGatewayError(
                     "RUNTIME_STORE_INVALID",
                     "planning preflight lacks its resolved Runtime assignment",
+                )
+            assignment_record = _assignment_record_from_value(
+                {**assignment, "fallback_selected": False}
+            )
+            if (
+                preflight.get("assignment_digest")
+                != _assignment_digest(subject, assignment_record)
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "planning preflight assignment seal is invalid",
                 )
             return self._ensure_assignment(subject, assignment)
         campaign = self._data["campaigns"].get(subject.campaign_handle)
@@ -7852,8 +8000,15 @@ class RuntimeGateway:
                 "availability_fallback_profile_digest"
             ],
             "fallback_selected": False,
+            "assignment_digest": _assignment_digest(
+                subject,
+                {**assignment, "fallback_selected": False},
+            ),
             "prompt_artifact_digest": prompt_digest,
             "binding_ref": None,
+            "agent_id": None,
+            "session_id": None,
+            "workspace_id": None,
             "lifecycle": None,
             "planning_output_artifact_digest": None,
             "observation_digest": None,
@@ -7867,6 +8022,7 @@ class RuntimeGateway:
             "profile_digest",
             "availability_fallback_profile_digest",
             "fallback_selected",
+            "assignment_digest",
             "prompt_artifact_digest",
         )
 
@@ -8297,6 +8453,7 @@ class RuntimeGateway:
                 "campaign_overrides_digest": persisted.get(
                     "campaign_overrides_digest"
                 ),
+                "assignment_digest": persisted.get("assignment_digest"),
             }
         ):
             raise RuntimeGatewayError(
@@ -8600,19 +8757,26 @@ class RuntimeGateway:
         value = self._journal.read_unlocked()
         if value is None:
             return {
-                "schema_version": 1,
+                "schema_version": 2,
                 "campaigns": {},
                 "actions": {},
                 "preflights": {},
                 "action_identities": {},
             }
         if (
-            not isinstance(value, dict)
-            or value.get("schema_version") != 1
-            or not all(isinstance(value.get(key), dict) for key in ("campaigns", "actions", "preflights"))
-            or (
-                "action_identities" in value
-                and not isinstance(value["action_identities"], dict)
+            type(value) is not dict
+            or frozenset(value)
+            != {
+                "schema_version",
+                "campaigns",
+                "actions",
+                "preflights",
+                "action_identities",
+            }
+            or value.get("schema_version") != 2
+            or not all(
+                type(value.get(key)) is dict
+                for key in ("campaigns", "actions", "preflights", "action_identities")
             )
         ):
             raise RuntimeGatewayError(
@@ -8687,12 +8851,16 @@ class RuntimeGateway:
                         "subject",
                         "subject_digest",
                         "campaign_overrides_digest",
+                        "assignment_digest",
                     }
                     or type(binding["subject_digest"]) is not str
                     or _DIGEST_RE.fullmatch(binding["subject_digest"])
                     is None
                     or binding["campaign_overrides_digest"]
                     != campaign["overrides_digest"]
+                    or type(binding["assignment_digest"]) is not str
+                    or _DIGEST_RE.fullmatch(binding["assignment_digest"])
+                    is None
                 ):
                     raise RuntimeGatewayError(
                         "RUNTIME_STORE_INVALID",
@@ -8734,6 +8902,7 @@ class RuntimeGateway:
                     "subject_digest",
                     "campaign_overrides_digest",
                     "assignment",
+                    "assignment_digest",
                     "receipt_digest",
                 }
                 or type(preflight.get("subject_digest")) is not str
@@ -8777,6 +8946,15 @@ class RuntimeGateway:
                     "RUNTIME_STORE_INVALID",
                     "RuntimeGateway planning preflight receipt digest is invalid",
                 )
+            assignment = _validate_assignment_value(preflight["assignment"])
+            if preflight["assignment_digest"] != _assignment_digest(
+                preflight_subject,
+                {**assignment, "fallback_selected": False},
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway planning preflight assignment seal is invalid",
+                )
             rebuild_identity(
                 stable_action_id,
                 {
@@ -8798,6 +8976,8 @@ class RuntimeGateway:
                 or preflight["subject_digest"] != binding["subject_digest"]
                 or preflight["campaign_overrides_digest"]
                 != binding["campaign_overrides_digest"]
+                or preflight["assignment_digest"]
+                != binding["assignment_digest"]
             ):
                 raise RuntimeGatewayError(
                     "RUNTIME_STORE_INVALID",
@@ -8810,15 +8990,15 @@ class RuntimeGateway:
                 "RuntimeGateway preflight lacks one exact Campaign binding",
             )
         for stable_action_id, record in normalized["actions"].items():
-            if not isinstance(record, dict):
+            if type(record) is not dict or frozenset(record) != _GATEWAY_ACTION_KEYS:
                 raise RuntimeGatewayError(
                     "RUNTIME_STORE_INVALID", "RuntimeGateway action record is invalid"
                 )
             subject = _subject_from_canonical(record.get("subject"))
-            assignment = _validate_assignment_value(
+            assignment = _assignment_record_from_value(
                 {
                     key: record.get(key)
-                    for key in _ASSIGNMENT_KEYS
+                    for key in _ASSIGNMENT_RECORD_KEYS
                 }
             )
             if (
@@ -8826,7 +9006,21 @@ class RuntimeGateway:
                 or subject.stable_action_id != stable_action_id
                 or record.get("subject_digest") != subject.digest
                 or any(record.get(key) != value for key, value in assignment.items())
-                or type(record.get("fallback_selected")) is not bool
+                or record.get("assignment_digest")
+                != _assignment_digest(subject, assignment)
+                or any(
+                    record.get(name) is not None
+                    and (type(record.get(name)) is not str or not record.get(name))
+                    for name in ("binding_ref", "agent_id", "session_id", "workspace_id", "lifecycle")
+                )
+                or any(
+                    record.get(name) is not None
+                    and (
+                        type(record.get(name)) is not str
+                        or _DIGEST_RE.fullmatch(record.get(name)) is None
+                    )
+                    for name in ("planning_output_artifact_digest", "observation_digest")
+                )
             ):
                 raise RuntimeGatewayError(
                     "RUNTIME_STORE_INVALID",
@@ -8840,6 +9034,8 @@ class RuntimeGateway:
                     owning_preflight_subject is None
                     or owning_preflight_subject.canonical()
                     != record["subject"]
+                    or normalized["preflights"][stable_action_id]["assignment_digest"]
+                    != record["assignment_digest"]
                 ):
                     raise RuntimeGatewayError(
                         "RUNTIME_STORE_INVALID",
@@ -8859,9 +9055,6 @@ class RuntimeGateway:
                         "RuntimeGateway Work action lacks its exact Campaign",
                     )
             rebuild_identity(stable_action_id, self._subject_identity(subject))
-            legacy_observations = record.pop("observations", None)
-            if "materialization_observed" not in record:
-                record["materialization_observed"] = bool(legacy_observations)
             if type(record["materialization_observed"]) is not bool:
                 raise RuntimeGatewayError(
                     "RUNTIME_STORE_INVALID",
@@ -8941,6 +9134,28 @@ _ASSIGNMENT_KEYS = frozenset(
         "availability_fallback_profile_digest",
     }
 )
+_ASSIGNMENT_RECORD_KEYS = _ASSIGNMENT_KEYS | frozenset({"fallback_selected"})
+_GATEWAY_ACTION_KEYS = frozenset(
+    {
+        "subject",
+        "subject_digest",
+        "selector",
+        "configuration_source",
+        "profile_digest",
+        "availability_fallback_profile_digest",
+        "fallback_selected",
+        "assignment_digest",
+        "prompt_artifact_digest",
+        "binding_ref",
+        "agent_id",
+        "session_id",
+        "workspace_id",
+        "lifecycle",
+        "planning_output_artifact_digest",
+        "observation_digest",
+        "materialization_observed",
+    }
+)
 _ASSIGNMENT_SOURCES = frozenset(
     {
         "campaign_start.coordinator",
@@ -8979,6 +9194,303 @@ def _validate_assignment_value(value: object) -> dict[str, Any]:
         "profile_digest": primary,
         "availability_fallback_profile_digest": fallback,
     }
+
+
+def _assignment_record_from_value(value: object) -> dict[str, Any]:
+    """Decode the closed, persisted assignment value without recovery defaults."""
+
+    if type(value) is not dict or frozenset(value) != _ASSIGNMENT_RECORD_KEYS:
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID",
+            "persisted Runtime assignment record has an unknown schema",
+        )
+    assignment = _validate_assignment_value(
+        {key: value[key] for key in _ASSIGNMENT_KEYS}
+    )
+    if type(value["fallback_selected"]) is not bool:
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID",
+            "persisted Runtime assignment fallback selection is invalid",
+        )
+    return {**assignment, "fallback_selected": value["fallback_selected"]}
+
+
+def _assignment_digest(subject: RuntimeSubject, value: object) -> str:
+    """Hash the complete assignment provenance, not merely the selected Profile."""
+
+    assignment = _assignment_record_from_value(value)
+    return digest_value(
+        {
+            "schema_version": "gwo.runtime.assignment.v2",
+            "repository": subject.repository,
+            "campaign_key": subject.campaign_key,
+            "campaign_handle": subject.campaign_handle,
+            "subject_digest": subject.digest,
+            **assignment,
+        }
+    )
+
+
+def _gateway_action_assignment_is_bound(
+    record: object,
+    subject: RuntimeSubject,
+) -> bool:
+    if type(record) is not dict or type(record.get("assignment_digest")) is not str:
+        return False
+    try:
+        assignment = _assignment_record_from_value(
+            {key: record.get(key) for key in _ASSIGNMENT_RECORD_KEYS}
+        )
+        return (
+            record.get("subject") == subject.canonical()
+            and record.get("subject_digest") == subject.digest
+            and record["assignment_digest"] == _assignment_digest(subject, assignment)
+        )
+    except (KeyError, RuntimeGatewayError):
+        return False
+
+
+_PASEO_ACTION_KEYS = frozenset(
+    {
+        "subject", "subject_digest", "profile", "profile_digest",
+        "prompt_artifact_digest", "workspace_id", "workspace_path",
+        "workspace_slug", "workspace_base_commit", "workspace_owner_nonce",
+        "workspace_layout_version", "workspace_owner_marker_digest", "prompt_file",
+        "fenced", "input_artifact_digests", "input_files", "result_file",
+        "output_schema_file", "output_schema_digest", "bound_agent_id",
+        "binding_established",
+        "pending_start", "pending_resume", "pending_park", "pending_stop_command",
+        "parked",
+        "pending_fence", "pending_fence_claim_id", "pending_fence_quiesced",
+        "pending_retire", "pending_permission_response",
+        "completed_permission_response", "output_artifact_digest",
+        "workspace_observed_head_commit", "wake_state_digest",
+        "wake_terminal_emitted",
+    }
+)
+
+
+def _validate_paseo_action_record(stable_action_id: object, record: object) -> None:
+    """Reject any incomplete or widened Paseo recovery record before readback."""
+
+    if (
+        type(stable_action_id) is not str
+        or not stable_action_id
+        or type(record) is not dict
+        or frozenset(record) != _PASEO_ACTION_KEYS
+    ):
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID", "Paseo Runtime action record has an unknown schema"
+        )
+    try:
+        subject = _subject_from_canonical(record["subject"])
+        profile = RuntimeProfile(**record["profile"])
+    except (TypeError, RuntimeGatewayError) as error:
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID", "Paseo Runtime action subject or Profile is invalid"
+        ) from error
+    scalar_digests = (
+        "subject_digest", "profile_digest", "prompt_artifact_digest",
+        "workspace_owner_marker_digest", "output_schema_digest",
+    )
+    if (
+        subject.stable_action_id != stable_action_id
+        or subject.canonical() != record["subject"]
+        or subject.digest != record["subject_digest"]
+        or profile.canonical() != record["profile"]
+        or profile.digest != record["profile_digest"]
+        or any(
+            type(record[name]) is not str
+            or _DIGEST_RE.fullmatch(record[name]) is None
+            for name in scalar_digests
+        )
+        or any(
+            type(record[name]) is not str or not record[name]
+            for name in (
+                "workspace_id", "workspace_path", "workspace_slug",
+                "workspace_owner_nonce", "workspace_layout_version", "prompt_file",
+                "result_file", "output_schema_file",
+            )
+        )
+        or _GIT_COMMIT_RE.fullmatch(record["workspace_base_commit"]) is None
+        or _GIT_COMMIT_RE.fullmatch(record["workspace_observed_head_commit"]) is None
+        or record["workspace_layout_version"] != _RUNTIME_WORKSPACE_LAYOUT_VERSION
+        or re.fullmatch(r"[0-9a-f]{32}", record["workspace_owner_nonce"]) is None
+        or type(record["fenced"]) is not bool
+        or type(record["input_artifact_digests"]) is not list
+        or any(
+            type(digest) is not str or _DIGEST_RE.fullmatch(digest) is None
+            for digest in record["input_artifact_digests"]
+        )
+        or len(set(record["input_artifact_digests"])) != len(record["input_artifact_digests"])
+        or type(record["input_files"]) is not dict
+        or set(record["input_files"]) != set(record["input_artifact_digests"])
+        or any(type(path) is not str or not path for path in record["input_files"].values())
+    ):
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID", "Paseo Runtime action identity is invalid"
+        )
+    for name in (
+        "binding_established", "pending_start", "pending_resume", "pending_park",
+        "pending_fence", "parked", "pending_fence_quiesced", "pending_retire",
+        "wake_terminal_emitted",
+    ):
+        if type(record[name]) is not bool:
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID", "Paseo Runtime action recovery state is invalid"
+            )
+    bound_agent_id = record["bound_agent_id"]
+    binding_established = record["binding_established"]
+    if (
+        bound_agent_id is not None
+        and (type(bound_agent_id) is not str or not bound_agent_id)
+    ) or (
+        bound_agent_id is None and binding_established is True
+    ) or (
+        bound_agent_id is not None and binding_established is False
+    ) or (
+        bound_agent_id is not None and record["pending_start"] is True
+    ) or (
+        record["pending_stop_command"] is not None
+        and (
+            type(record["pending_stop_command"]) is not str
+            or record["pending_stop_command"] not in {"park", "interrupt"}
+        )
+    ) or (
+        record["pending_fence_claim_id"] is not None
+        and (
+            type(record["pending_fence_claim_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", record["pending_fence_claim_id"])
+            is None
+        )
+    ) or (
+        record["output_artifact_digest"] is not None
+        and (
+            type(record["output_artifact_digest"]) is not str
+            or _DIGEST_RE.fullmatch(record["output_artifact_digest"]) is None
+        )
+    ) or (
+        record["wake_state_digest"] is not None
+        and (
+            type(record["wake_state_digest"]) is not str
+            or _DIGEST_RE.fullmatch(record["wake_state_digest"]) is None
+        )
+    ):
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID", "Paseo Runtime action recovery state is invalid"
+        )
+    # Once a label readback has established an Agent binding, the durable
+    # marker never returns to Prepared.  Without this proof, deleting only
+    # bound_agent_id could turn a post-dispatch action into a second START.
+    if bound_agent_id is None and (
+        record["fenced"] is True
+        or record["pending_resume"] is True
+        or record["pending_park"] is True
+        or record["parked"] is True
+        or record["pending_stop_command"] is not None
+        or record["pending_fence"] is True
+        or record["pending_fence_claim_id"] is not None
+        or record["pending_fence_quiesced"] is True
+        or record["pending_retire"] is True
+        or record["pending_permission_response"] is not None
+        or record["completed_permission_response"] is not None
+        or record["output_artifact_digest"] is not None
+        or record["wake_terminal_emitted"] is True
+    ):
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID",
+            "Paseo post-binding recovery state lacks its durable Agent binding",
+        )
+    pending_fence = record["pending_fence"]
+    pending_fence_claim_id = record["pending_fence_claim_id"]
+    pending_fence_quiesced = record["pending_fence_quiesced"]
+    if (
+        pending_fence and not isinstance(pending_fence_claim_id, str)
+    ) or (
+        not pending_fence
+        and (
+            pending_fence_claim_id is not None
+            or pending_fence_quiesced is True
+        )
+    ):
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID",
+            "Paseo fence recovery claim is inconsistent",
+        )
+    # These four fields form one closed stop/resume recovery state machine.
+    # `parked` is the last readback-confirmed state; a resume remains pending
+    # while that confirmation is still true, whereas a stop has not yet
+    # reached its idle confirmation and therefore cannot be parked.
+    pending_park = record["pending_park"]
+    pending_resume = record["pending_resume"]
+    parked = record["parked"]
+    pending_stop_command = record["pending_stop_command"]
+    if (
+        (pending_park and (pending_resume or parked))
+        or (pending_park and pending_stop_command not in {"park", "interrupt"})
+        or (not pending_park and pending_stop_command is not None)
+        or (pending_resume and not parked)
+    ):
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID",
+            "Paseo park/resume recovery state has an invalid transition",
+        )
+    _validate_paseo_pending_permission_response(record["pending_permission_response"])
+    completed = record["completed_permission_response"]
+    if completed is not None:
+        if type(record["bound_agent_id"]) is not str:
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID", "Paseo permission completion lacks a bound Agent"
+            )
+        try:
+            _PaseoRuntimeProviderAdapter._completed_permission_response(
+                record, subject, record["bound_agent_id"]
+            )
+        except (TypeError, ValueError, RuntimeGatewayError) as error:
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID", "Paseo permission completion is invalid"
+            ) from error
+
+
+def _validate_paseo_pending_permission_response(value: object) -> None:
+    if value is None:
+        return
+    if type(value) is not dict or set(value) != {
+        "request_id", "decision", "request", "request_digest", "provider_receipt"
+    }:
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID", "Paseo pending permission recovery state is invalid"
+        )
+    try:
+        request = _permission_request_from_value(value["request"])
+    except RuntimeGatewayError as error:
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID", "Paseo pending permission request is invalid"
+        ) from error
+    if (
+        type(value["request_id"]) is not str
+        or value["request_id"] != request.request_id
+        or type(value["decision"]) is not str
+        or value["decision"] not in {"allow", "deny"}
+        or type(value["request_digest"]) is not str
+        or _DIGEST_RE.fullmatch(value["request_digest"]) is None
+        or value["request_digest"] != digest_value(asdict(request))
+        or (
+            value["provider_receipt"] is not None
+            and (
+                type(value["provider_receipt"]) is not dict
+                or set(value["provider_receipt"])
+                != {"requestId", "agentId", "agentShortId", "name", "result"}
+                or not all(
+                    type(part) is str and part
+                    for part in value["provider_receipt"].values()
+                )
+            )
+        )
+    ):
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID", "Paseo pending permission recovery state is invalid"
+        )
 
 
 def _campaign_overrides_from_value(
@@ -9048,6 +9560,26 @@ def _preflight_receipt_digest(
     value: Mapping[str, Any],
 ) -> str:
     assignment = _validate_assignment_value(value.get("assignment"))
+    try:
+        subject = _subject_from_canonical(value.get("subject"))
+    except RuntimeGatewayError as error:
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID", "planning preflight subject is invalid"
+        ) from error
+    if type(subject) is not CampaignPlanningSubject:
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID", "planning preflight subject is not Campaign Planning"
+        )
+    assignment_digest = _require_digest(
+        value.get("assignment_digest"), "assignment_digest"
+    )
+    if assignment_digest != _assignment_digest(
+        subject,
+        {**assignment, "fallback_selected": False},
+    ):
+        raise RuntimeGatewayError(
+            "RUNTIME_STORE_INVALID", "planning preflight assignment seal is invalid"
+        )
     overrides_digest = _require_digest(
         value.get("campaign_overrides_digest"),
         "campaign_overrides_digest",
@@ -9061,9 +9593,7 @@ def _preflight_receipt_digest(
             "subject_digest": subject_digest,
             "stable_action_id": stable_action_id,
             "campaign_overrides_digest": overrides_digest,
-            "assignment_digest": digest_value(
-                {**assignment, "fallback_selected": False}
-            ),
+            "assignment_digest": assignment_digest,
         }
     )
 

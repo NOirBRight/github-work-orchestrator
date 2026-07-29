@@ -128,7 +128,9 @@ Campaign identity. Absence persists empty configuration on first use and
 reuses an existing durable binding; a present assertion must match that
 binding exactly.
 The opaque preflight receipt binds the complete Campaign-start overrides
-digest plus the resolved assignment digest. Campaign, preflight, override, and
+digest plus the resolved assignment digest.  The assignment digest covers the
+closed selector/source/Profile/fallback choice together with repository,
+Campaign, and exact subject provenance. Campaign, preflight, override, and
 assignment schemas are closed, and journal load recomputes each digest before
 any Adapter readback; unrelated Ticket overrides therefore still change the
 receipt.
@@ -326,14 +328,19 @@ observe-before-start and readback-first recovery loop; callers cannot prepare,
 observe, command, inspect a Runtime Binding, or treat an event as state.
 Campaign-start overrides are durable Campaign configuration, not PlanSpec;
 the gateway persists each stable action's selector, configuration source,
-resolved Profile digest, and fallback choice before any provider operation.
+resolved Profile digest, fallback choice, and closed assignment digest before
+any provider operation. A Planning action's seal must equal the independently
+persisted preflight and Campaign cross-binding; an action-local digest rewrite
+cannot select another otherwise valid Profile or source on restart.
 Planning preflights and materialized actions share one stable-action identity
 namespace in that same journal: the transaction that commits either record
 also reserves the subject kind and complete canonical-subject digest. Exact
 replay is valid, while any cross-kind or changed-subject reuse fails before
-Adapter readback, preparation, command, or provider effect. A legacy
-schema-version-1 journal without the map rebuilds it under the journal lock
-from all preflights and actions; conflicts make the store invalid.
+Adapter readback, preparation, command, or provider effect. The current
+Gateway recovery journal is schema version 2 and requires every top-level,
+preflight, Campaign, and action field. Earlier Gateway journal schemas lack
+the complete assignment seal and fail closed rather than being interpreted or
+rebuilt.
 Only the host configuration assembler reads immutable Runtime Profile
 provider/model facts and supplies the composed `RuntimeConfiguration`; that
 host-only composition data is not a PlanSpec or semantic-workflow input.
@@ -350,7 +357,10 @@ than retaining caller values. Every lookup and resolution rechecks exact value
 types and registry-key digests before Adapter or provider activity. The
 tuple-backed public values reject initializer re-entry and object-attribute
 mutation, while RuntimeGateway pins and rechecks the digest of the complete
-composed configuration.
+composed configuration. `RuntimeRepositoryContext` is likewise copied into a
+private sealed snapshot at production-adapter and static-validator entry; a
+caller cannot reinitialize or redirect a later prepare/restart to another
+repository or base ref.
 PlanControl, ExecutionKernel, CandidateGate, and other semantic workflow
 callers receive neither those facts nor a vendor command surface. Host
 composition uses provider-neutral `build_runtime_gateway` and
@@ -567,8 +577,14 @@ Because Paseo does not
 expose a provider session ID, `paseo-agent:<agent-id>` is an explicit
 adapter-derived session reference; non-empty Profile features fail closed.
 Before Workspace create, run, or resume, the production adapter persists the
-exact pending effect. An acknowledgement-loss readback that is still absent
-returns materialization-pending and cannot repeat that side effect; duplicate
+exact pending effect. Paseo's schema-version-5 recovery journal is a closed
+union: every action carries every pending claim (`pending_start` included),
+its idempotent-recovery state, an irreversible `binding_established` proof
+paired with its Agent ID, and exact built-in field types from its first write.
+Missing, widened, malformed, or invalid-transition state fails before Adapter
+readback or a second provider command. An acknowledgement-loss
+readback that is still absent returns materialization-pending and cannot
+repeat that side effect; duplicate
 Workspace identity is validated globally before selection. Every row is
 decoded, and any duplicate raw slug, Workspace ID, resolved path, or exact row
 is ambiguous across all isolation modes. Proven non-dispatch of Workspace
