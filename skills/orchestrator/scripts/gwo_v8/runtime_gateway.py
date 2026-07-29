@@ -15,6 +15,7 @@ from enum import Enum
 import errno
 import hashlib
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -93,6 +94,33 @@ _RUNTIME_WORKSPACE_DIRECTORIES = (
 _WINDOWS_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _JOURNAL_MUTEX_GUARD = threading.Lock()
 _JOURNAL_MUTEXES: dict[str, threading.Lock] = {}
+
+
+def _is_local_absolute_workspace_path(value: object) -> bool:
+    """Accept only a locally rooted Workspace path without touching it.
+
+    Paseo registry, durable-action, and inspect-cwd values are untrusted until
+    this purely lexical check succeeds.  In particular, a Windows UNC/device
+    path must never reach ``Path.resolve`` because resolution can contact a
+    remote host or a device namespace.
+    """
+
+    if type(value) is not str or not value or "\0" in value:
+        return False
+    if os.name == "nt":
+        if value.startswith(("\\\\", "//")):
+            return False
+        drive, tail = ntpath.splitdrive(value)
+        return (
+            len(drive) == 2
+            and drive[1] == ":"
+            and drive[0].isalpha()
+            and bool(tail)
+            and tail[0] in {"\\", "/"}
+        )
+    # POSIX reserves a double-leading slash for implementation-defined network
+    # semantics.  Treat it as untrusted rather than normalizing it locally.
+    return value.startswith("/") and not value.startswith("//")
 
 
 class RuntimeGatewayError(RuntimeError):
@@ -564,6 +592,10 @@ class _RuntimeWorkspaceFiles:
             or maximum_bytes < 1
         ):
             raise ValueError("maximum_bytes must be a positive integer")
+        if not _is_local_absolute_workspace_path(workspace_path):
+            raise self._unsafe(
+                "Runtime Workspace path is not a supported local absolute path"
+            )
         self.workspace = Path(workspace_path).resolve()
         self.runtime_root = self.workspace / ".gwo"
         self.ownership_nonce = ownership_nonce
@@ -2482,6 +2514,54 @@ class _RuntimeObservationReadToken:
     output_artifact_digest: str | None
 
 
+class _OneShotObservationGate:
+    """Private, lifecycle-keyed observe-to-command handoff for both Adapters."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._gates: weakref.WeakKeyDictionary[
+            threading.Thread, dict[str, _RuntimeObservationReadToken]
+        ] = weakref.WeakKeyDictionary()
+
+    def replace(
+        self,
+        stable_action_id: str,
+        token: _RuntimeObservationReadToken | None,
+    ) -> None:
+        """Open one fresh gate or clear its predecessor for this lifecycle."""
+
+        with self._lock:
+            owner = threading.current_thread()
+            gates = self._gates.get(owner)
+            if token is None:
+                if gates is not None:
+                    gates.pop(stable_action_id, None)
+                    if not gates:
+                        self._gates.pop(owner, None)
+                return
+            if gates is None:
+                gates = {}
+                self._gates[owner] = gates
+            gates[stable_action_id] = token
+
+    def consume(self, stable_action_id: str) -> _RuntimeObservationReadToken | None:
+        """Consume exactly one fresh gate for the current Thread lifecycle."""
+
+        with self._lock:
+            owner = threading.current_thread()
+            gates = self._gates.get(owner)
+            token = None if gates is None else gates.pop(stable_action_id, None)
+            if gates is not None and not gates:
+                self._gates.pop(owner, None)
+            return token
+
+    def clear(self) -> None:
+        """An event-only or failed read cannot retain a command capability."""
+
+        with self._lock:
+            self._gates.pop(threading.current_thread(), None)
+
+
 @dataclass(frozen=True, slots=True)
 class _RuntimeObservationRead:
     selected_stable_action_id: str
@@ -4360,13 +4440,7 @@ class _PaseoRuntimeProviderAdapter:
         self._state_path = Path(state_path)
         self._journal = _V3JsonJournal(self._state_path)
         self._pending_save_state: dict[str, Any] | None = None
-        self._command_gate_lock = threading.RLock()
-        # A native thread id is reusable after its thread exits.  The
-        # observation gate instead belongs to the current Python Thread
-        # object and vanishes when that lifecycle is no longer reachable.
-        self._command_gates: weakref.WeakKeyDictionary[
-            threading.Thread, dict[str, _RuntimeObservationReadToken]
-        ] = weakref.WeakKeyDictionary()
+        self._command_gate = _OneShotObservationGate()
         (
             self._actions,
             self._events,
@@ -4600,6 +4674,19 @@ class _PaseoRuntimeProviderAdapter:
             event_scan_cursor,
         )
 
+    @staticmethod
+    def _persisted_state_projection(state: Mapping[str, Any]) -> dict[str, Any]:
+        """Return the exact durable shape emitted by _save."""
+
+        return {
+            "schema_version": 5,
+            "actions": state["actions"],
+            "events": [asdict(event) for event in state["events"]],
+            "workspace_intents": state["workspace_intents"],
+            "next_event_cursor": state["next_event_cursor"],
+            "event_scan_cursor": state["event_scan_cursor"],
+        }
+
     def _save(self) -> None:
         state = self._pending_save_state or {
             "actions": self._actions,
@@ -4608,16 +4695,7 @@ class _PaseoRuntimeProviderAdapter:
             "next_event_cursor": self._next_event_cursor,
             "event_scan_cursor": self._event_scan_cursor,
         }
-        self._journal.replace_unlocked(
-            {
-                "schema_version": 5,
-                "actions": state["actions"],
-                "events": [asdict(event) for event in state["events"]],
-                "workspace_intents": state["workspace_intents"],
-                "next_event_cursor": state["next_event_cursor"],
-                "event_scan_cursor": state["event_scan_cursor"],
-            }
-        )
+        self._journal.replace_unlocked(self._persisted_state_projection(state))
 
     def _publish_state(
         self,
@@ -4650,8 +4728,11 @@ class _PaseoRuntimeProviderAdapter:
             candidate = deepcopy(durable)
             try:
                 result = mutation(candidate)
-                self._pending_save_state = candidate
-                self._save()
+                if canonical_bytes(
+                    self._persisted_state_projection(candidate)
+                ) != canonical_bytes(self._persisted_state_projection(durable)):
+                    self._pending_save_state = candidate
+                    self._save()
             except Exception:
                 try:
                     self._publish_state(*self._load_unlocked())
@@ -4846,8 +4927,35 @@ class _PaseoRuntimeProviderAdapter:
     @classmethod
     def _git_common_dir(cls, path: Path) -> Path:
         value = cls._git_readback(path, "rev-parse", "--git-common-dir")
+        if type(value) is not str or not value or "\0" in value:
+            raise RuntimeGatewayError(
+                "RUNTIME_IDENTITY_AMBIGUOUS",
+                "Git common-directory readback is invalid",
+            )
         candidate = Path(value)
-        return (candidate if candidate.is_absolute() else path / candidate).resolve()
+        if candidate.is_absolute():
+            if not _is_local_absolute_workspace_path(value):
+                raise RuntimeGatewayError(
+                    "RUNTIME_IDENTITY_AMBIGUOUS",
+                    "Git common-directory readback is not a supported local absolute path",
+                )
+            return candidate.resolve()
+        if os.name == "nt":
+            drive, _tail = ntpath.splitdrive(value)
+            if drive or value.startswith(("\\", "/")):
+                raise RuntimeGatewayError(
+                    "RUNTIME_IDENTITY_AMBIGUOUS",
+                    "Git common-directory readback is not a safe relative path",
+                )
+        elif value.startswith("/"):
+            raise RuntimeGatewayError(
+                "RUNTIME_IDENTITY_AMBIGUOUS",
+                "Git common-directory readback is not a safe relative path",
+            )
+        # ``path`` is a validated local Workspace/source root.  A relative Git
+        # result is interpreted only beneath that trusted local root; rooted,
+        # drive-relative, UNC, and device forms were rejected above.
+        return (path / candidate).resolve()
 
     @classmethod
     def _verify_workspace_repository(
@@ -4858,6 +4966,11 @@ class _PaseoRuntimeProviderAdapter:
         expected_base_commit: str | None,
         allow_descendant: bool = False,
     ) -> str:
+        if not _is_local_absolute_workspace_path(workspace_path):
+            raise RuntimeGatewayError(
+                "RUNTIME_IDENTITY_AMBIGUOUS",
+                "Paseo Workspace path is not a supported local absolute path",
+            )
         source = Path(context.path).resolve()
         workspace = Path(workspace_path).resolve()
         if workspace == source:
@@ -5225,7 +5338,7 @@ class _PaseoRuntimeProviderAdapter:
         if (
             not isinstance(base, str)
             or _GIT_COMMIT_RE.fullmatch(base) is None
-            or not isinstance(workspace_path, str)
+            or not _is_local_absolute_workspace_path(workspace_path)
         ):
             raise ValueError("Bound Workspace history identity is invalid")
         previous = record.get("workspace_observed_head_commit", base)
@@ -5883,18 +5996,31 @@ class _PaseoRuntimeProviderAdapter:
         related: list[tuple[str, str, Mapping[str, Any], bool]] = []
         expected_id = None if expected is None else expected[0]
         expected_path = None if expected is None else expected[1]
+        if expected is not None and not _is_local_absolute_workspace_path(
+            expected_path
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_IDENTITY_AMBIGUOUS",
+                "Paseo durable Workspace path is not a supported local absolute path",
+            )
         for item in values:
             workspace_id, workspace_path = self._workspace_payload(item)
             slug_candidate = (
                 item.get("isolation") == "worktree"
                 and item.get("name") == slug
             )
-            if slug_candidate or (
+            is_related = slug_candidate or (
                 expected_id is not None and workspace_id == expected_id
             ) or (
                 expected_path is not None
                 and workspace_path == expected_path
-            ):
+            )
+            if is_related:
+                if not _is_local_absolute_workspace_path(workspace_path):
+                    raise RuntimeGatewayError(
+                        "RUNTIME_IDENTITY_AMBIGUOUS",
+                        "Paseo target Workspace path is not a supported local absolute path",
+                    )
                 related.append(
                     (workspace_id, workspace_path, item, slug_candidate)
                 )
@@ -5911,14 +6037,8 @@ class _PaseoRuntimeProviderAdapter:
                     and (
                         workspace_path == expected_path
                         or (
-                            # Resolve only an exact id + action-owned slug
-                            # candidate.  Unrelated registry paths are never
-                            # touched merely because their name or cwd repeats.
-                            # A durable network path is untrusted input: do not
-                            # resolve it while attempting identity recovery.
-                            type(expected_path) is str
-                            and not expected_path.startswith(("\\\\", "//"))
-                            and
+                            # All target/durable paths were lexical-local
+                            # checked above before either can be resolved.
                             Path(workspace_path).resolve()
                             == Path(str(expected_path)).resolve()
                         )
@@ -5973,6 +6093,16 @@ class _PaseoRuntimeProviderAdapter:
             raise RuntimeGatewayError(
                 "RUNTIME_IDENTITY_AMBIGUOUS",
                 "Paseo target Workspace identity is incomplete",
+            )
+        if not _is_local_absolute_workspace_path(expected_path):
+            raise RuntimeGatewayError(
+                "RUNTIME_IDENTITY_AMBIGUOUS",
+                "Paseo durable Workspace path is not a supported local absolute path",
+            )
+        if not _is_local_absolute_workspace_path(agent_cwd):
+            raise RuntimeGatewayError(
+                "RUNTIME_IDENTITY_AMBIGUOUS",
+                "Paseo inspected Agent cwd is not a supported local absolute path",
             )
         workspace = self._workspace_by_identity(
             slug=expected_slug,
@@ -6686,20 +6816,15 @@ class _PaseoRuntimeProviderAdapter:
             selected_stable_action_id=stable_action_id,
             maximum_artifact_bytes=self._artifacts.maximum_bytes,
         )
-        with self._command_gate_lock:
-            owner = threading.current_thread()
-            gates = self._command_gates.get(owner)
-            if gates is None:
-                gates = {}
-                self._command_gates[owner] = gates
-            gates.pop(stable_action_id, None)
+        self._command_gate.replace(
+            stable_action_id,
+            verdict.token
             if (
                 verdict.kind in {"prepared", "bound"}
                 and type(verdict.token) is _RuntimeObservationReadToken
-            ):
-                gates[stable_action_id] = verdict.token
-            elif not gates:
-                self._command_gates.pop(owner, None)
+            )
+            else None,
+        )
         if verdict.kind in {"prepared", "bound"}:
             assert verdict.observation is not None
             return verdict.observation
@@ -6839,14 +6964,7 @@ class _PaseoRuntimeProviderAdapter:
         try:
             if not _runtime_transition_is_structurally_valid(command):
                 return _RuntimeFailure("RUNTIME_COMMAND_INVALID", "Runtime command is outside the closed union")
-            with self._command_gate_lock:
-                owner = threading.current_thread()
-                gates = self._command_gates.get(owner)
-                precondition = (
-                    None if gates is None else gates.pop(stable_action_id, None)
-                )
-                if gates is not None and not gates:
-                    self._command_gates.pop(owner, None)
+            precondition = self._command_gate.consume(stable_action_id)
             if precondition is None:
                 return _RuntimeFailure(
                     "RUNTIME_ACTION_STATE_CHANGED",
@@ -7187,6 +7305,7 @@ class _PaseoRuntimeProviderAdapter:
             return self._failure(error, stable_action_id)
 
     def events(self, after_cursor: str | None) -> _RuntimeEventPage | _RuntimeFailure:
+        self._command_gate.clear()
         try:
             cursor = _runtime_event_cursor_value(after_cursor)
             if cursor is None:
@@ -8302,6 +8421,7 @@ class RuntimeGateway:
     def _observe_verdict(
         self, stable_action_id: str
     ) -> _RuntimeObservationVerdict:
+        self._refresh_before_adapter_io()
         record = self._data["actions"].get(stable_action_id)
         expected_subject = (
             _subject_from_canonical(record.get("subject"))
@@ -8429,6 +8549,7 @@ class RuntimeGateway:
         self,
         spec: _RuntimeActionSpec,
     ) -> _RuntimePrepareResultVerdict:
+        self._refresh_before_adapter_io()
         try:
             result = self._adapter.prepare(spec)
         except (OSError, TimeoutError):
@@ -8457,6 +8578,7 @@ class RuntimeGateway:
     def _wake_hints(
         self, cursor: str | None, subject: RuntimeSubject
     ) -> tuple[tuple[str, ...], str | None]:
+        self._refresh_before_adapter_io()
         try:
             page = self._adapter.events(cursor)
         except (OSError, TimeoutError):
@@ -8696,6 +8818,7 @@ class RuntimeGateway:
         stable_action_id: str,
         command: RuntimeTransition,
     ) -> _RuntimeObservationVerdict:
+        self._refresh_before_adapter_io()
         try:
             result = self._adapter.command(
                 stable_action_id,
@@ -9253,6 +9376,12 @@ class RuntimeGateway:
         with self._journal.exclusive():
             self._data = self._load_unlocked()
 
+    def _refresh_before_adapter_io(self) -> None:
+        """Prove every durable completed output immediately before Adapter I/O."""
+
+        with self._journal.exclusive():
+            self._data = self._load_unlocked()
+
     def _verify_completed_outputs_unlocked(
         self,
         data: Mapping[str, Any],
@@ -9310,8 +9439,9 @@ class RuntimeGateway:
             try:
                 result = mutation(candidate)
                 self._verify_completed_outputs_unlocked(candidate)
-                self._pending_save_data = candidate
-                self._save()
+                if canonical_bytes(candidate) != canonical_bytes(durable):
+                    self._pending_save_data = candidate
+                    self._save()
             except Exception:
                 try:
                     self._data = self._load_unlocked()
@@ -10366,11 +10496,7 @@ class _InMemoryRuntimeProviderAdapter:
     ):
         self._artifacts = artifacts
         self._read_lock = threading.RLock()
-        # Keep the one-shot gate private to one live calling-thread object,
-        # not a recyclable native thread identifier.
-        self._command_gates: weakref.WeakKeyDictionary[
-            threading.Thread, dict[str, _RuntimeObservationReadToken]
-        ] = weakref.WeakKeyDictionary()
+        self._command_gate = _OneShotObservationGate()
         self._actions: dict[str, _InMemoryAction] = {}
         self._events: list[_RuntimeEvent] = []
         self._next_event_cursor = 1
@@ -10734,20 +10860,15 @@ class _InMemoryRuntimeProviderAdapter:
             selected_stable_action_id=stable_action_id,
             maximum_artifact_bytes=self._artifacts.maximum_bytes,
         )
-        with self._read_lock:
-            owner = threading.current_thread()
-            gates = self._command_gates.get(owner)
-            if gates is None:
-                gates = {}
-                self._command_gates[owner] = gates
-            gates.pop(stable_action_id, None)
+        self._command_gate.replace(
+            stable_action_id,
+            verdict.token
             if (
                 verdict.kind in {"prepared", "bound"}
                 and type(verdict.token) is _RuntimeObservationReadToken
-            ):
-                gates[stable_action_id] = verdict.token
-            elif not gates:
-                self._command_gates.pop(owner, None)
+            )
+            else None,
+        )
         if verdict.kind in {"prepared", "bound"}:
             assert verdict.observation is not None
             return verdict.observation
@@ -10766,13 +10887,7 @@ class _InMemoryRuntimeProviderAdapter:
                     "RUNTIME_COMMAND_INVALID",
                     "Runtime command is outside the closed union",
                 )
-            owner = threading.current_thread()
-            gates = self._command_gates.get(owner)
-            precondition = (
-                None if gates is None else gates.pop(stable_action_id, None)
-            )
-            if gates is not None and not gates:
-                self._command_gates.pop(owner, None)
+            precondition = self._command_gate.consume(stable_action_id)
             if precondition is None:
                 return _RuntimeFailure(
                     "RUNTIME_ACTION_STATE_CHANGED",
@@ -11031,6 +11146,7 @@ class _InMemoryRuntimeProviderAdapter:
         return _CommandReceipt(action.spec.stable_action_id, command)
 
     def events(self, after_cursor: str | None) -> _RuntimeEventPage | _RuntimeFailure:
+        self._command_gate.clear()
         cursor = _runtime_event_cursor_value(after_cursor)
         if cursor is None:
             return _RuntimeFailure("RUNTIME_EVENT_CURSOR_INVALID", "event cursor is invalid")

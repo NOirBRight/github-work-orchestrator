@@ -7021,7 +7021,6 @@ def test_conflicting_workspace_list_aliases_do_not_persist_wrong_identity_or_mut
     assert _mutating_paseo_commands(client.commands) == []
 
 
-@pytest.mark.real_fsync
 def test_artifact_store_put_flushes_fsyncs_replaces_and_finally_verifies(
     tmp_path, monkeypatch
 ):
@@ -7055,7 +7054,6 @@ def test_artifact_store_put_flushes_fsyncs_replaces_and_finally_verifies(
     assert not list((tmp_path / "artifacts").glob("*.tmp"))
 
 
-@pytest.mark.real_fsync
 def test_runtime_journal_fsyncs_before_atomic_replace(tmp_path, monkeypatch):
     journal = gateway_module._V3JsonJournal(tmp_path / "runtime.journal")
     payload = {"sequence": 1}
@@ -13223,3 +13221,420 @@ def test_repair_packet_17_command_gate_isolated_by_thread_lifecycle_not_reused_i
     assert type(adapter.observe(subject.stable_action_id)) is gateway_module._PreparedRuntimeObservation
     started = adapter.command(subject.stable_action_id, RuntimeCommand.START)
     assert type(started) is _CommandReceipt
+
+
+def _packet18_gateway_with_completed_output_and_running_action(
+    tmp_path: Path,
+    adapter_kind: str,
+):
+    """Seed an independently completed output plus one live action.
+
+    The completed output is deliberately produced through a different stable
+    action.  It models action A becoming incomplete after action B has already
+    refreshed the Gateway journal, without relying on a provider-specific
+    completion shortcut.
+    """
+
+    store = ArtifactStore(tmp_path / "artifacts", maximum_bytes=300_000)
+    profile = _profile()
+    configuration = RuntimeConfiguration(
+        profiles={profile.digest: profile},
+        host_mappings={"coordinator": ProfileMapping(profile.digest)},
+    )
+    journal_path = tmp_path / "gateway.journal"
+    completed_subject = _put_subject_artifacts(
+        store,
+        replace(_subject(), stable_action_id="planning:packet18-completed"),
+    )
+    seed = RuntimeGateway(
+        store_path=journal_path,
+        _adapter=_InMemoryRuntimeProviderAdapter(store),
+        configuration=configuration,
+        _artifacts=store,
+    )
+    completed_preflight = seed.planning_preflight(completed_subject)
+    completed = seed.progress(completed_subject, completed_preflight)
+    assert completed.planning_output_artifact_digest is not None
+
+    running_subject = _put_subject_artifacts(
+        store,
+        replace(_subject(), stable_action_id="planning:packet18-running"),
+    )
+    client = None
+    if adapter_kind == "memory":
+        adapter = _InMemoryRuntimeProviderAdapter(
+            store,
+            pending_permissions={
+                running_subject.stable_action_id: (
+                    ("request:packet18", "write", "repository:packet18"),
+                )
+            },
+        )
+    else:
+        source, workspace = _repository_worktree(tmp_path)
+        client = _RecordingPaseoCli(workspace)
+        adapter = _PaseoRuntimeProviderAdapter(
+            client=client,  # type: ignore[arg-type]
+            artifacts=store,
+            repository_contexts={
+                "owner/repository": RuntimeRepositoryContext(source, "main")
+            },
+            state_path=tmp_path / "paseo-actions.json",
+        )
+    gateway = RuntimeGateway(
+        store_path=journal_path,
+        _adapter=adapter,
+        configuration=configuration,
+        _artifacts=store,
+    )
+    running_preflight = gateway.planning_preflight(running_subject)
+    running = gateway.progress(running_subject, running_preflight)
+    assert running.status == "running"
+    return (
+        gateway,
+        store,
+        adapter,
+        client,
+        completed.planning_output_artifact_digest,
+        running_subject,
+        running_preflight,
+    )
+
+
+@pytest.mark.parametrize("adapter_kind", ("memory", "paseo"))
+@pytest.mark.parametrize("boundary", ("observe", "prepare", "command", "events"))
+def test_repair_packet_18_completed_output_loss_blocks_each_adapter_boundary(
+    tmp_path,
+    monkeypatch,
+    adapter_kind,
+    boundary,
+):
+    """Every direct Adapter edge re-proves all older durable outputs first."""
+
+    (
+        gateway,
+        store,
+        adapter,
+        _client,
+        completed_digest,
+        running_subject,
+        running_preflight,
+    ) = _packet18_gateway_with_completed_output_and_running_action(
+        tmp_path,
+        adapter_kind,
+    )
+    calls: list[str] = []
+    output_path = store.path_for(completed_digest)
+    checkpoint: dict[str, bytes] = {}
+    receipt_calls = 0
+
+    def delete_completed_output():
+        if output_path.exists():
+            output_path.unlink()
+        checkpoint["gateway"] = gateway._store_path.read_bytes()
+        if adapter_kind == "paseo":
+            checkpoint["paseo"] = adapter._state_path.read_bytes()
+
+    native_prepare = adapter.prepare
+    native_observe = adapter.observe
+    native_command = adapter.command
+    native_events = adapter.events
+
+    def tracked_prepare(spec):
+        calls.append("prepare")
+        return native_prepare(spec)
+
+    def tracked_observe(stable_action_id):
+        calls.append("observe")
+        result = native_observe(stable_action_id)
+        if boundary == "prepare":
+            delete_completed_output()
+        return result
+
+    def tracked_command(stable_action_id, command):
+        calls.append("command")
+        return native_command(stable_action_id, command)
+
+    def tracked_events(cursor):
+        calls.append("events")
+        return native_events(cursor)
+
+    monkeypatch.setattr(adapter, "prepare", tracked_prepare)
+    monkeypatch.setattr(adapter, "observe", tracked_observe)
+    monkeypatch.setattr(adapter, "command", tracked_command)
+    monkeypatch.setattr(adapter, "events", tracked_events)
+    native_receipt = gateway._progress_receipt
+
+    def tracked_receipt(*args, **kwargs):
+        nonlocal receipt_calls
+        receipt_calls += 1
+        return native_receipt(*args, **kwargs)
+
+    monkeypatch.setattr(gateway, "_progress_receipt", tracked_receipt)
+
+    if boundary == "observe":
+        native_validate = gateway._validate_static_assignment
+
+        def delete_after_initial_refresh(subject, assignment):
+            native_validate(subject, assignment)
+            delete_completed_output()
+
+        monkeypatch.setattr(
+            gateway,
+            "_validate_static_assignment",
+            delete_after_initial_refresh,
+        )
+        invoke = lambda: gateway.progress(running_subject, running_preflight)
+        expected_calls: list[str] = []
+    elif boundary == "prepare":
+        preparing_subject = _put_subject_artifacts(
+            store,
+            replace(_subject(), stable_action_id="planning:packet18-prepare"),
+        )
+        preparing_preflight = gateway.planning_preflight(preparing_subject)
+        calls.clear()
+        invoke = lambda: gateway.progress(preparing_subject, preparing_preflight)
+        expected_calls = ["observe"]
+    elif boundary == "command":
+        native_command_with_readback = gateway._command_with_readback
+
+        def delete_before_command(*args, **kwargs):
+            delete_completed_output()
+            return native_command_with_readback(*args, **kwargs)
+
+        monkeypatch.setattr(
+            gateway,
+            "_command_with_readback",
+            delete_before_command,
+        )
+        invoke = lambda: gateway.transition(
+            running_subject.stable_action_id,
+            RuntimeCommand.FENCE,
+        )
+        expected_calls = ["observe"]
+    else:
+        native_record = gateway._record_observation
+        deleted = False
+
+        def delete_after_reconciliation(record, verdict):
+            nonlocal deleted
+            native_record(record, verdict)
+            if not deleted:
+                deleted = True
+                delete_completed_output()
+
+        monkeypatch.setattr(gateway, "_record_observation", delete_after_reconciliation)
+        invoke = lambda: gateway.progress(running_subject, running_preflight)
+        expected_calls = ["observe"]
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        invoke()
+
+    assert rejected.value.code == "RUNTIME_ARTIFACT_MISSING"
+    assert calls == expected_calls
+    assert receipt_calls == 0
+    assert gateway._store_path.read_bytes() == checkpoint["gateway"]
+    if adapter_kind == "paseo":
+        assert adapter._state_path.read_bytes() == checkpoint["paseo"]
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    (
+        r"\\untrusted-host\share\workspace",
+        r"\\?\C:\device-workspace",
+        r"\\.\C:\device-workspace",
+        r"C:drive-relative",
+        r"\root-relative",
+    ),
+)
+@pytest.mark.parametrize("entry", ("target_registry", "durable_record", "inspect_cwd"))
+def test_repair_packet_18_workspace_paths_fail_before_resolve_filesystem_or_git(
+    tmp_path,
+    monkeypatch,
+    unsafe_path,
+    entry,
+):
+    """Registry, durable, and inspect paths are lexical checks before I/O."""
+
+    _store, source, workspace, client, adapter, subject, _spec = (
+        _prepared_paseo_adapter(tmp_path)
+    )
+    record = adapter._actions[subject.stable_action_id]
+    slug = record["workspace_slug"]
+    workspace_id = record["workspace_id"]
+    native_resolve = Path.resolve
+    calls: list[tuple[str, str]] = []
+
+    def forbidden(name, operation):
+        def wrapped(path, *args, **kwargs):
+            rendered = str(path)
+            if rendered == unsafe_path or rendered.startswith(unsafe_path + "\\"):
+                calls.append((name, rendered))
+                raise AssertionError(
+                    f"{name} touched an untrusted Workspace path"
+                )
+            return operation(path, *args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(Path, "resolve", forbidden("resolve", native_resolve))
+    monkeypatch.setattr(Path, "exists", forbidden("exists", Path.exists))
+    monkeypatch.setattr(Path, "open", forbidden("open", Path.open))
+    monkeypatch.setattr(gateway_module.os, "lstat", forbidden("lstat", os.lstat))
+
+    def forbidden_git(*_args, **_kwargs):
+        raise AssertionError("Git reached an untrusted Workspace path")
+
+    monkeypatch.setattr(adapter, "_git_readback", forbidden_git)
+    if entry == "target_registry":
+        client.workspaces = [
+            {
+                "workspaceId": workspace_id,
+                "name": slug,
+                "isolation": "worktree",
+                "cwd": unsafe_path,
+            }
+        ]
+        invoke = lambda: adapter._workspace_by_identity(
+            slug=slug,
+            expected=(workspace_id, str(workspace)),
+        )
+    elif entry == "durable_record":
+        invoke = lambda: adapter._workspace_by_identity(
+            slug=slug,
+            expected=(workspace_id, unsafe_path),
+        )
+    else:
+        invoke = lambda: adapter._workspace_for_agent(
+            record,
+            RuntimeRepositoryContext(source, "main"),
+            unsafe_path,
+        )
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        invoke()
+
+    assert rejected.value.code == "RUNTIME_IDENTITY_AMBIGUOUS"
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    (
+        r"\\untrusted-host\share\git",
+        r"\\?\C:\device-git",
+        r"\\.\C:\device-git",
+        r"C:drive-relative-git",
+        r"\root-relative-git",
+    ),
+)
+def test_repair_packet_18_git_common_dir_rejects_untrusted_readback_before_resolve(
+    tmp_path,
+    monkeypatch,
+    unsafe_path,
+):
+    """Git must not turn a hostile common-dir readback into path I/O."""
+
+    native_resolve = Path.resolve
+    touched: list[str] = []
+
+    def no_untrusted_resolve(path, *args, **kwargs):
+        if str(path) == unsafe_path:
+            touched.append(str(path))
+            raise AssertionError("resolved an untrusted Git common directory")
+        return native_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", no_untrusted_resolve)
+    monkeypatch.setattr(
+        _PaseoRuntimeProviderAdapter,
+        "_git_readback",
+        staticmethod(lambda *_args: unsafe_path),
+    )
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        _PaseoRuntimeProviderAdapter._git_common_dir(tmp_path)
+
+    assert rejected.value.code == "RUNTIME_IDENTITY_AMBIGUOUS"
+    assert touched == []
+
+
+def test_repair_packet_18_noop_gateway_transaction_skips_journal_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    """A fully verified Gateway no-op keeps real fsync work out of the hot path."""
+
+    gateway, _store, _adapter = _gateway(tmp_path)
+    native_replace = gateway._journal.replace_unlocked
+    replacements = 0
+
+    def record_replacement(value):
+        nonlocal replacements
+        replacements += 1
+        return native_replace(value)
+
+    monkeypatch.setattr(gateway._journal, "replace_unlocked", record_replacement)
+    gateway._transact(lambda _data: None)
+
+    assert replacements == 0
+
+
+def test_repair_packet_18_noop_paseo_transaction_skips_journal_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    """Paseo compares its real persisted projection, including event dataclasses."""
+
+    _store, _source, _workspace, _client, adapter, _subject, _spec = (
+        _prepared_paseo_adapter(tmp_path)
+    )
+    native_replace = adapter._journal.replace_unlocked
+    replacements = 0
+
+    def record_replacement(value):
+        nonlocal replacements
+        replacements += 1
+        return native_replace(value)
+
+    monkeypatch.setattr(adapter._journal, "replace_unlocked", record_replacement)
+    adapter._transact(lambda _state: None)
+
+    assert replacements == 0
+
+
+@pytest.mark.parametrize("adapter_kind", ("memory", "paseo"))
+def test_repair_packet_18_adapters_share_one_lifecycle_keyed_command_gate(
+    tmp_path,
+    adapter_kind,
+):
+    """The shared one-shot gate is cleared by event-only reads and consumes once."""
+
+    store = ArtifactStore(tmp_path / "artifacts", maximum_bytes=300_000)
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(subject.stable_action_id, subject, _profile(), prompt, (prompt,))
+    if adapter_kind == "memory":
+        adapter = _InMemoryRuntimeProviderAdapter(store)
+    else:
+        source, workspace = _repository_worktree(tmp_path)
+        adapter = _PaseoRuntimeProviderAdapter(
+            client=_RecordingPaseoCli(workspace),  # type: ignore[arg-type]
+            artifacts=store,
+            repository_contexts={
+                "owner/repository": RuntimeRepositoryContext(source, "main")
+            },
+            state_path=tmp_path / "paseo-actions.json",
+        )
+    assert isinstance(adapter._command_gate, gateway_module._OneShotObservationGate)
+    assert type(adapter.prepare(spec)) is gateway_module._PrepareReceipt
+    assert type(adapter.observe(subject.stable_action_id)) is gateway_module._PreparedRuntimeObservation
+    assert not isinstance(adapter.events(None), _RuntimeFailure)
+    event_cleared = adapter.command(subject.stable_action_id, RuntimeCommand.START)
+    assert type(event_cleared) is _RuntimeFailure
+    assert event_cleared.code == "RUNTIME_ACTION_STATE_CHANGED"
+    assert type(adapter.observe(subject.stable_action_id)) is gateway_module._PreparedRuntimeObservation
+    assert type(adapter.command(subject.stable_action_id, RuntimeCommand.START)) is _CommandReceipt
+    consumed = adapter.command(subject.stable_action_id, RuntimeCommand.FENCE)
+    assert type(consumed) is _RuntimeFailure
+    assert consumed.code == "RUNTIME_ACTION_STATE_CHANGED"
