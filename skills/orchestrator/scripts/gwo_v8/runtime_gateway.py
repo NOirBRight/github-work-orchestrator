@@ -86,6 +86,7 @@ _RUNTIME_EVENT_KINDS = frozenset(
 _RUNTIME_WORKSPACE_LAYOUT_VERSION = "1"
 _RUNTIME_WORKSPACE_OWNER_SCHEMA = "gwo.runtime.workspace-owner.v1"
 _RUNTIME_WORKSPACE_OWNER_FILE = "runtime-owner.v1.json"
+_RUNTIME_OUTPUT_SCHEMA_VERSION = "gwo.runtime.output.v1"
 _RUNTIME_WORKSPACE_DIRECTORIES = (
     "runtime-artifacts",
     "runtime-results",
@@ -114,7 +115,7 @@ def _is_local_absolute_workspace_path(value: object) -> bool:
         return (
             len(drive) == 2
             and drive[1] == ":"
-            and drive[0].isalpha()
+            and ("A" <= drive[0] <= "Z" or "a" <= drive[0] <= "z")
             and bool(tail)
             and tail[0] in {"\\", "/"}
         )
@@ -130,6 +131,15 @@ class RuntimeGatewayError(RuntimeError):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+
+
+def _load_runtime_artifact_json(payload: bytes) -> Any:
+    try:
+        return load_canonical_json(payload)
+    except CanonicalJsonError as error:
+        raise RuntimeGatewayError(
+            "RUNTIME_ARTIFACT_INVALID", "Artifact is not canonical JSON"
+        ) from error
 
 
 class _V3JsonJournal:
@@ -304,6 +314,22 @@ class ArtifactRef:
 
 
 @dataclass(frozen=True, slots=True)
+class _RuntimeOutputIdentity:
+    subject_digest: str
+    stable_action_id: str
+    authority_digest: str
+
+    def canonical(self) -> dict[str, str]:
+        """Return the sole canonical Runtime-output identity field table."""
+
+        return {
+            "subject_digest": self.subject_digest,
+            "stable_action_id": self.stable_action_id,
+            "authority_digest": self.authority_digest,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class _RuntimeOutputArtifactProof:
     artifact_digest: str
     byte_length: int
@@ -311,6 +337,57 @@ class _RuntimeOutputArtifactProof:
     subject_digest: str
     stable_action_id: str
     authority_digest: str
+
+
+def _runtime_output_schema_bytes(identity: _RuntimeOutputIdentity) -> bytes:
+    identity_fields = identity.canonical()
+    return canonical_bytes(
+        {
+            "type": "object",
+            "required": [
+                "schema_version",
+                *identity_fields,
+                "payload",
+            ],
+            "properties": {
+                "schema_version": {"const": _RUNTIME_OUTPUT_SCHEMA_VERSION},
+                **{
+                    name: {"const": value}
+                    for name, value in identity_fields.items()
+                },
+                "payload": {},
+            },
+            "additionalProperties": False,
+        }
+    )
+
+
+def _prove_runtime_output_bytes(
+    payload: bytes,
+    identity: _RuntimeOutputIdentity,
+    invalid_detail: str,
+) -> _RuntimeOutputArtifactProof:
+    output = _load_runtime_artifact_json(payload)
+    identity_fields = identity.canonical()
+    expected_fields = {
+        "schema_version": _RUNTIME_OUTPUT_SCHEMA_VERSION,
+        **identity_fields,
+    }
+    if (
+        type(output) is not dict
+        or set(output) != {*expected_fields, "payload"}
+        or any(output.get(name) != value for name, value in expected_fields.items())
+    ):
+        raise RuntimeGatewayError(
+            "RUNTIME_OUTPUT_ARTIFACT_INVALID",
+            invalid_detail,
+        )
+    return _RuntimeOutputArtifactProof(
+        artifact_digest=hashlib.sha256(payload).hexdigest(),
+        byte_length=len(payload),
+        schema_version=_RUNTIME_OUTPUT_SCHEMA_VERSION,
+        **identity_fields,
+    )
 
 
 class ArtifactStore:
@@ -507,43 +584,28 @@ class ArtifactStore:
         """Read and prove one exact closed Runtime output Artifact."""
 
         reference, payload = self._read(digest)
-        output = self._canonical_json(payload)
+        proof = _prove_runtime_output_bytes(
+            payload,
+            _RuntimeOutputIdentity(
+                subject_digest=subject_digest,
+                stable_action_id=stable_action_id,
+                authority_digest=authority_digest,
+            ),
+            "Runtime output Artifact does not bind its exact action",
+        )
         if (
-            type(output) is not dict
-            or frozenset(output)
-            != {
-                "schema_version",
-                "subject_digest",
-                "stable_action_id",
-                "authority_digest",
-                "payload",
-            }
-            or output["schema_version"] != "gwo.runtime.output.v1"
-            or output["subject_digest"] != subject_digest
-            or output["stable_action_id"] != stable_action_id
-            or output["authority_digest"] != authority_digest
+            proof.artifact_digest != reference.digest
+            or proof.byte_length != reference.byte_length
         ):
             raise RuntimeGatewayError(
-                "RUNTIME_OUTPUT_ARTIFACT_INVALID",
-                "Runtime output Artifact does not bind its exact action",
+                "RUNTIME_ARTIFACT_DIGEST_MISMATCH",
+                "Artifact bytes do not match their digest",
             )
-        return _RuntimeOutputArtifactProof(
-            artifact_digest=reference.digest,
-            byte_length=reference.byte_length,
-            schema_version="gwo.runtime.output.v1",
-            subject_digest=subject_digest,
-            stable_action_id=stable_action_id,
-            authority_digest=authority_digest,
-        )
+        return proof
 
     @staticmethod
     def _canonical_json(payload: bytes) -> Any:
-        try:
-            return load_canonical_json(payload)
-        except CanonicalJsonError as error:
-            raise RuntimeGatewayError(
-                "RUNTIME_ARTIFACT_INVALID", "Artifact is not canonical JSON"
-            ) from error
+        return _load_runtime_artifact_json(payload)
 
     def path_for(self, digest: str) -> Path:
         _require_digest(digest, "artifact digest")
@@ -2694,7 +2756,7 @@ _RUNTIME_SEALED_SCALAR_SCHEMAS: dict[
         ("byte_length", _runtime_exact_nonnegative_integer),
         (
             "schema_version",
-            _runtime_exact_text_literal("gwo.runtime.output.v1"),
+            _runtime_exact_text_literal(_RUNTIME_OUTPUT_SCHEMA_VERSION),
         ),
         ("subject_digest", _runtime_exact_digest),
         ("stable_action_id", _runtime_exact_nonempty_text),
@@ -5280,6 +5342,11 @@ class _PaseoRuntimeProviderAdapter:
     ) -> tuple[str | None, bytes | None]:
         output_digest = record.get("output_artifact_digest")
         pending_artifact: bytes | None = None
+        identity = _RuntimeOutputIdentity(
+            subject_digest=subject.digest,
+            stable_action_id=subject.stable_action_id,
+            authority_digest=subject.authority_digest,
+        )
         if isinstance(output_digest, str):
             self._artifacts.prove_runtime_output(
                 output_digest,
@@ -5294,28 +5361,13 @@ class _PaseoRuntimeProviderAdapter:
             payload = files.read_result()
             if payload is None:
                 return None, None
-            output = ArtifactStore._canonical_json(payload)
-            output_digest = hashlib.sha256(payload).hexdigest()
-            pending_artifact = payload
-        if (
-            type(output) is not dict
-            or set(output)
-            != {
-                "schema_version",
-                "subject_digest",
-                "stable_action_id",
-                "authority_digest",
-                "payload",
-            }
-            or output.get("schema_version") != "gwo.runtime.output.v1"
-            or output.get("subject_digest") != subject.digest
-            or output.get("stable_action_id") != subject.stable_action_id
-            or output.get("authority_digest") != subject.authority_digest
-        ):
-            raise RuntimeGatewayError(
-                "RUNTIME_OUTPUT_ARTIFACT_INVALID",
+            proof = _prove_runtime_output_bytes(
+                payload,
+                identity,
                 "Paseo result Artifact does not bind its exact action",
             )
+            output_digest = proof.artifact_digest
+            pending_artifact = payload
         if record.get("output_artifact_digest") != output_digest:
             record["output_artifact_digest"] = output_digest
         return output_digest, pending_artifact
@@ -6534,25 +6586,12 @@ class _PaseoRuntimeProviderAdapter:
 
     @staticmethod
     def _output_schema_payload(spec: _RuntimeActionSpec) -> bytes:
-        return canonical_bytes(
-            {
-                    "type": "object",
-                    "required": [
-                        "schema_version",
-                        "subject_digest",
-                        "stable_action_id",
-                        "authority_digest",
-                        "payload",
-                    ],
-                    "properties": {
-                        "schema_version": {"const": "gwo.runtime.output.v1"},
-                        "subject_digest": {"const": spec.subject_digest},
-                        "stable_action_id": {"const": spec.stable_action_id},
-                        "authority_digest": {"const": spec.subject.authority_digest},
-                        "payload": {},
-                    },
-                    "additionalProperties": False,
-            }
+        return _runtime_output_schema_bytes(
+            _RuntimeOutputIdentity(
+                subject_digest=spec.subject_digest,
+                stable_action_id=spec.stable_action_id,
+                authority_digest=spec.subject.authority_digest,
+            )
         )
 
     def prepare(self, spec: _RuntimeActionSpec) -> _PrepareReceipt | _RuntimeFailure:
@@ -10527,12 +10566,15 @@ class _InMemoryRuntimeProviderAdapter:
 
         if action.lifecycle in {"completed", "retired"}:
             return
+        identity = _RuntimeOutputIdentity(
+            subject_digest=action.spec.subject_digest,
+            stable_action_id=action.spec.stable_action_id,
+            authority_digest=action.spec.subject.authority_digest,
+        )
         action.output_artifact_digest = self._artifacts.put_canonical(
             {
-                "schema_version": "gwo.runtime.output.v1",
-                "subject_digest": action.spec.subject_digest,
-                "stable_action_id": action.spec.stable_action_id,
-                "authority_digest": action.spec.subject.authority_digest,
+                "schema_version": _RUNTIME_OUTPUT_SCHEMA_VERSION,
+                **identity.canonical(),
                 "payload": {
                     "input_artifact_digests": [
                         artifact.digest for artifact in action.spec.input_artifacts
