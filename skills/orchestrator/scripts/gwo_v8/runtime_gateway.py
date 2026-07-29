@@ -23,6 +23,7 @@ import stat
 import subprocess
 import threading
 import time
+import weakref
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
@@ -4360,9 +4361,12 @@ class _PaseoRuntimeProviderAdapter:
         self._journal = _V3JsonJournal(self._state_path)
         self._pending_save_state: dict[str, Any] | None = None
         self._command_gate_lock = threading.RLock()
-        self._command_gates: dict[
-            tuple[str, int], _RuntimeObservationReadToken
-        ] = {}
+        # A native thread id is reusable after its thread exits.  The
+        # observation gate instead belongs to the current Python Thread
+        # object and vanishes when that lifecycle is no longer reachable.
+        self._command_gates: weakref.WeakKeyDictionary[
+            threading.Thread, dict[str, _RuntimeObservationReadToken]
+        ] = weakref.WeakKeyDictionary()
         (
             self._actions,
             self._events,
@@ -6683,13 +6687,19 @@ class _PaseoRuntimeProviderAdapter:
             maximum_artifact_bytes=self._artifacts.maximum_bytes,
         )
         with self._command_gate_lock:
-            gate_key = (stable_action_id, threading.get_ident())
-            self._command_gates.pop(gate_key, None)
+            owner = threading.current_thread()
+            gates = self._command_gates.get(owner)
+            if gates is None:
+                gates = {}
+                self._command_gates[owner] = gates
+            gates.pop(stable_action_id, None)
             if (
                 verdict.kind in {"prepared", "bound"}
                 and type(verdict.token) is _RuntimeObservationReadToken
             ):
-                self._command_gates[gate_key] = verdict.token
+                gates[stable_action_id] = verdict.token
+            elif not gates:
+                self._command_gates.pop(owner, None)
         if verdict.kind in {"prepared", "bound"}:
             assert verdict.observation is not None
             return verdict.observation
@@ -6830,9 +6840,13 @@ class _PaseoRuntimeProviderAdapter:
             if not _runtime_transition_is_structurally_valid(command):
                 return _RuntimeFailure("RUNTIME_COMMAND_INVALID", "Runtime command is outside the closed union")
             with self._command_gate_lock:
-                precondition = self._command_gates.pop(
-                    (stable_action_id, threading.get_ident()), None
+                owner = threading.current_thread()
+                gates = self._command_gates.get(owner)
+                precondition = (
+                    None if gates is None else gates.pop(stable_action_id, None)
                 )
+                if gates is not None and not gates:
+                    self._command_gates.pop(owner, None)
             if precondition is None:
                 return _RuntimeFailure(
                     "RUNTIME_ACTION_STATE_CHANGED",
@@ -7500,7 +7514,7 @@ class RuntimeGateway:
             self._store_path.parent / "runtime-artifacts"
         )
         self._static_assignment_validator = _static_assignment_validator
-        self._data = self._load(verify_completed_outputs=True)
+        self._data = self._load()
 
     # Caller interface operation 1.  It neither calls an adapter nor reserves
     # a slot, workspace, session, Agent, or provider action.
@@ -8777,6 +8791,10 @@ class RuntimeGateway:
         wake_cursor: str | None = None,
         wake_hints: tuple[str, ...] = (),
     ) -> RuntimeProgressReceipt:
+        # Receipt emission is an authoritative Gateway boundary.  Re-read the
+        # complete durable state under the Journal lock so an earlier completed
+        # action cannot lose or drift its output while another action advances.
+        self._refresh()
         if verdict.kind != "bound":
             raise RuntimeGatewayError(
                 "RUNTIME_OBSERVATION_INVALID",
@@ -8832,14 +8850,12 @@ class RuntimeGateway:
             output_artifact_digest=observation.output_artifact_digest,
         )
 
-    def _load(self, *, verify_completed_outputs: bool = False) -> dict[str, Any]:
+    def _load(self) -> dict[str, Any]:
         with self._journal.exclusive():
-            return self._load_unlocked(
-                verify_completed_outputs=verify_completed_outputs
-            )
+            return self._load_unlocked(wrap_completed_output_errors=True)
 
     def _load_unlocked(
-        self, *, verify_completed_outputs: bool = False
+        self, *, wrap_completed_output_errors: bool = False
     ) -> dict[str, Any]:
         value = self._journal.read_unlocked()
         if value is None:
@@ -9196,23 +9212,6 @@ class RuntimeGateway:
                     "RUNTIME_STORE_INVALID",
                     "RuntimeGateway action assignment changed from its frozen source",
                 )
-            if verify_completed_outputs:
-                output_digest = record.get(
-                    "planning_output_artifact_digest"
-                )
-                if output_digest is not None:
-                    try:
-                        self._artifacts.prove_runtime_output(
-                            output_digest,
-                            subject_digest=subject.digest,
-                            stable_action_id=subject.stable_action_id,
-                            authority_digest=subject.authority_digest,
-                        )
-                    except RuntimeGatewayError as error:
-                        raise RuntimeGatewayError(
-                            "RUNTIME_STORE_INVALID",
-                            "RuntimeGateway completed output proof is invalid",
-                        ) from error
             if type(subject) is CampaignPlanningSubject:
                 owning_preflight_subject = preflight_subjects.get(
                     stable_action_id
@@ -9229,6 +9228,10 @@ class RuntimeGateway:
                         "RuntimeGateway planning action lacks its exact preflight",
                     )
             rebuild_identity(stable_action_id, self._subject_identity(subject))
+        self._verify_completed_outputs_unlocked(
+            normalized,
+            wrap_artifact_errors=wrap_completed_output_errors,
+        )
         persisted_identities = normalized.get("action_identities")
         if (
             not migrate_v1
@@ -9250,12 +9253,63 @@ class RuntimeGateway:
         with self._journal.exclusive():
             self._data = self._load_unlocked()
 
+    def _verify_completed_outputs_unlocked(
+        self,
+        data: Mapping[str, Any],
+        *,
+        wrap_artifact_errors: bool = False,
+    ) -> None:
+        """Prove every completed output before a Gateway state boundary."""
+
+        actions = data.get("actions")
+        if type(actions) is not dict:
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID",
+                "RuntimeGateway completed-output collection is invalid",
+            )
+        for stable_action_id, record in actions.items():
+            if type(stable_action_id) is not str or type(record) is not dict:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway completed-output record is invalid",
+                )
+            output_digest = record.get("planning_output_artifact_digest")
+            if output_digest is None:
+                continue
+            try:
+                subject = _subject_from_canonical(record.get("subject"))
+            except RuntimeGatewayError as error:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway completed-output subject is invalid",
+                ) from error
+            if subject.stable_action_id != stable_action_id:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway completed-output action is invalid",
+                )
+            try:
+                self._artifacts.prove_runtime_output(
+                    output_digest,
+                    subject_digest=subject.digest,
+                    stable_action_id=subject.stable_action_id,
+                    authority_digest=subject.authority_digest,
+                )
+            except RuntimeGatewayError as error:
+                if not wrap_artifact_errors:
+                    raise
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway completed output proof is invalid",
+                ) from error
+
     def _transact(self, mutation: Callable[[dict[str, Any]], Any]) -> Any:
         with self._journal.exclusive():
             durable = self._load_unlocked()
             candidate = deepcopy(durable)
             try:
                 result = mutation(candidate)
+                self._verify_completed_outputs_unlocked(candidate)
                 self._pending_save_data = candidate
                 self._save()
             except Exception:
@@ -10312,9 +10366,11 @@ class _InMemoryRuntimeProviderAdapter:
     ):
         self._artifacts = artifacts
         self._read_lock = threading.RLock()
-        self._command_gates: dict[
-            tuple[str, int], _RuntimeObservationReadToken
-        ] = {}
+        # Keep the one-shot gate private to one live calling-thread object,
+        # not a recyclable native thread identifier.
+        self._command_gates: weakref.WeakKeyDictionary[
+            threading.Thread, dict[str, _RuntimeObservationReadToken]
+        ] = weakref.WeakKeyDictionary()
         self._actions: dict[str, _InMemoryAction] = {}
         self._events: list[_RuntimeEvent] = []
         self._next_event_cursor = 1
@@ -10679,13 +10735,19 @@ class _InMemoryRuntimeProviderAdapter:
             maximum_artifact_bytes=self._artifacts.maximum_bytes,
         )
         with self._read_lock:
-            gate_key = (stable_action_id, threading.get_ident())
-            self._command_gates.pop(gate_key, None)
+            owner = threading.current_thread()
+            gates = self._command_gates.get(owner)
+            if gates is None:
+                gates = {}
+                self._command_gates[owner] = gates
+            gates.pop(stable_action_id, None)
             if (
                 verdict.kind in {"prepared", "bound"}
                 and type(verdict.token) is _RuntimeObservationReadToken
             ):
-                self._command_gates[gate_key] = verdict.token
+                gates[stable_action_id] = verdict.token
+            elif not gates:
+                self._command_gates.pop(owner, None)
         if verdict.kind in {"prepared", "bound"}:
             assert verdict.observation is not None
             return verdict.observation
@@ -10704,9 +10766,13 @@ class _InMemoryRuntimeProviderAdapter:
                     "RUNTIME_COMMAND_INVALID",
                     "Runtime command is outside the closed union",
                 )
-            precondition = self._command_gates.pop(
-                (stable_action_id, threading.get_ident()), None
+            owner = threading.current_thread()
+            gates = self._command_gates.get(owner)
+            precondition = (
+                None if gates is None else gates.pop(stable_action_id, None)
             )
+            if gates is not None and not gates:
+                self._command_gates.pop(owner, None)
             if precondition is None:
                 return _RuntimeFailure(
                     "RUNTIME_ACTION_STATE_CHANGED",

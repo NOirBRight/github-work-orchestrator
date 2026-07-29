@@ -338,9 +338,12 @@ also reserves the subject kind and complete canonical-subject digest. Exact
 replay is valid, while any cross-kind or changed-subject reuse fails before
 Adapter readback, preparation, command, or provider effect. The current
 Gateway recovery journal is schema version 2 and requires every top-level,
-preflight, Campaign, and action field. Earlier Gateway journal schemas lack
-the complete assignment seal and fail closed rather than being interpreted or
-rebuilt.
+preflight, Campaign, and action field. A closed schema-version-1 journal may
+migrate only while the Journal lock is held: RuntimeGateway validates every
+preflight and action identity, rebuilds their shared reservation map, and
+rejects every conflict without rewriting the version-1 bytes. Only that
+complete validation may atomically publish schema version 2; every other
+earlier or malformed schema fails closed.
 Only the host configuration assembler reads immutable Runtime Profile
 provider/model facts and supplies the composed `RuntimeConfiguration`; that
 host-only composition data is not a PlanSpec or semantic-workflow input.
@@ -594,12 +597,13 @@ Missing, widened, malformed, or invalid-transition state fails before Adapter
 readback or a second provider command. An acknowledgement-loss
 readback that is still absent returns materialization-pending and cannot
 repeat that side effect; duplicate
-Workspace identity is validated globally before selection. Every row is
-decoded, and any duplicate raw slug, Workspace ID, resolved path, or exact row
-is ambiguous across all isolation modes. Proven non-dispatch of Workspace
-create restores `create_pending` to the complete `recorded` intent before any
-registry readback, so independent registry failure cannot strand a
-never-dispatched effect.
+Workspace registry rows are all safely decoded before target selection, but
+uniqueness is judged only among the action-target candidates for its durable
+worktree slug, Workspace ID, and path. Duplicate unrelated rows do not block
+the action; duplicate or conflicting action-target candidates fail closed.
+Proven non-dispatch of Workspace create restores `create_pending` to the
+complete `recorded` intent before any registry readback, so independent
+registry failure cannot strand a never-dispatched effect.
 Verified action-bound output dominates every non-retired provider lifecycle,
 including idle, running, and busy, and clears stale park/resume/stop flags
 atomically. Terminal bindings never send a new permission decision; only exact

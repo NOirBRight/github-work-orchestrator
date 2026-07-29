@@ -11722,7 +11722,9 @@ def test_repair_packet_11_memory_command_rejects_malformed_exact_token_before_ef
         for path in store._root.rglob("*")
         if path.is_file()
     }
-    adapter._command_gates[(subject.stable_action_id, threading.get_ident())] = token
+    adapter._command_gates[threading.current_thread()] = {
+        subject.stable_action_id: token
+    }
 
     rejected = adapter.command(
         subject.stable_action_id,
@@ -13130,3 +13132,94 @@ def test_repair_packet_16_gateway_persists_a_cross_bound_observation_snapshot(
         adapter.observe_calls,
         adapter.command_calls,
     ) == operations_before
+
+
+def test_repair_packet_17_missing_completed_output_blocks_another_preflight_without_journal_mutation(
+    tmp_path,
+):
+    gateway, store, _adapter = _gateway(tmp_path)
+    completed_subject = _put_subject_artifacts(
+        store,
+        replace(_subject(), stable_action_id="planning:packet17-completed"),
+    )
+    completed_preflight = gateway.planning_preflight(completed_subject)
+    completed = gateway.progress(completed_subject, completed_preflight)
+    assert completed.planning_output_artifact_digest is not None
+
+    store.path_for(completed.planning_output_artifact_digest).unlink()
+    journal_before = gateway._store_path.read_bytes()
+    later_subject = _put_subject_artifacts(
+        store,
+        replace(_subject(), stable_action_id="planning:packet17-later"),
+    )
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        gateway.planning_preflight(later_subject)
+
+    assert rejected.value.code == "RUNTIME_ARTIFACT_MISSING"
+    assert gateway._store_path.read_bytes() == journal_before
+
+
+@pytest.mark.parametrize("adapter_kind", ("memory", "paseo"))
+def test_repair_packet_17_command_gate_isolated_by_thread_lifecycle_not_reused_ident(
+    tmp_path,
+    monkeypatch,
+    adapter_kind,
+):
+    """A new thread lifecycle needs its own fresh observe-gate.
+
+    The current-thread lookup below deterministically models a recycled native
+    thread id by changing only the lifecycle object while all calls occur on
+    this test's one native thread.  This avoids relying on OS id reuse.
+    """
+
+    store = ArtifactStore(tmp_path / "artifacts", maximum_bytes=300_000)
+    subject = _put_subject_artifacts(store, _subject())
+    prompt = store.get(subject.planning_request_artifact_digest)
+    spec = _RuntimeActionSpec(
+        subject.stable_action_id,
+        subject,
+        _profile(),
+        prompt,
+        (prompt,),
+    )
+    client = None
+    if adapter_kind == "memory":
+        adapter = _InMemoryRuntimeProviderAdapter(store)
+    else:
+        source, workspace = _repository_worktree(tmp_path)
+        client = _RecordingPaseoCli(workspace)
+        adapter = _PaseoRuntimeProviderAdapter(
+            client=client,  # type: ignore[arg-type]
+            artifacts=store,
+            repository_contexts={
+                "owner/repository": RuntimeRepositoryContext(source, "main")
+            },
+            state_path=tmp_path / "paseo-actions.json",
+        )
+    assert type(adapter.prepare(spec)) is gateway_module._PrepareReceipt
+
+    first_lifecycle = threading.Thread()
+    second_lifecycle = threading.Thread()
+    current_lifecycle = first_lifecycle
+    monkeypatch.setattr(
+        gateway_module.threading,
+        "current_thread",
+        lambda: current_lifecycle,
+    )
+
+    assert type(adapter.observe(subject.stable_action_id)) is gateway_module._PreparedRuntimeObservation
+    current_lifecycle = second_lifecycle
+    leaked = adapter.command(subject.stable_action_id, RuntimeCommand.START)
+
+    assert type(leaked) is _RuntimeFailure
+    assert leaked.code == "RUNTIME_ACTION_STATE_CHANGED"
+    if adapter_kind == "memory":
+        assert adapter.created_agent_count == 0
+    else:
+        assert client is not None
+        assert not any(args and args[0] == "run" for args in client.commands)
+
+    assert type(adapter.observe(subject.stable_action_id)) is gateway_module._PreparedRuntimeObservation
+    started = adapter.command(subject.stable_action_id, RuntimeCommand.START)
+    assert type(started) is _CommandReceipt

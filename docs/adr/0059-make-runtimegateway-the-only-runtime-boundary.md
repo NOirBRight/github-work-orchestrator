@@ -362,11 +362,12 @@ Timeout, bounded-output overflow,
 malformed protocol, native error, and receipt-verification failure occur after
 the dispatch boundary and retain ambiguity evidence. Workspace adoption requires
 one exact slug/isolation/cwd readback and repository identity proof. The entire
-Workspace registry is validated before filtering: every row is decoded and
-any duplicate raw slug, Workspace ID, resolved path, or exact duplicate row is
-globally ambiguous across all isolation modes. Fence failure likewise retains its unique claim
-and records quiescence without guessing that the label effect did or did not
-occur.
+Workspace registry is safely decoded before filtering, but only action-target
+candidates for the durable worktree slug, Workspace ID, and path participate
+in uniqueness or ambiguity. Unrelated duplicate rows therefore do not block
+adoption; duplicate or conflicting action-target candidates fail closed. Fence
+failure likewise retains its unique claim and records quiescence without
+guessing that the label effect did or did not occur.
 
 Verified action-bound output is stronger than every non-retired provider
 lifecycle, including idle, running, and busy, or stale park/resume bookkeeping.
