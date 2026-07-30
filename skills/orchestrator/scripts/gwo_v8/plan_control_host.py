@@ -20,6 +20,7 @@ from .plan_control import (
     _handle_ref,
     _install_start_host,
     _ready_refs,
+    _validate_preflight,
 )
 from .runtime_gateway import (
     ArtifactStore,
@@ -31,9 +32,54 @@ from .runtime_gateway import (
     build_runtime_gateway,
 )
 from ._canonical import digest_value
+from .activation import GitHubCliContentClient, GitHubContentClient
+from .github_snapshot import (
+    GitHubCliIssueReadClient,
+    GitHubIssueReadClient,
+    GitHubReadySnapshotSource,
+)
+from .plan_control_github import (
+    GitHubPlanRepository,
+    WriterGenerationReadback,
+)
+from .transition import GitHubWriterTransitionControl
 
 
 _GatewayBuilder = Callable[..., Any]
+
+
+class _RuntimeAssertionCommitGateway:
+    """Commit the PlanControl mirror only after exact #111 preflight."""
+
+    def __init__(
+        self,
+        *,
+        gateway: Any,
+        repository: PlanControlRepository,
+        handle: CampaignHandle,
+        assertion: CampaignStartRuntimeOverrides,
+    ):
+        self._gateway = gateway
+        self._repository = repository
+        self._handle = handle
+        self._assertion = assertion.canonical()
+
+    def planning_preflight(self, subject):
+        receipt = self._gateway.planning_preflight(subject)
+        _validate_preflight(receipt, subject)
+        saved = self._repository.save_runtime_assertion(
+            self._handle,
+            self._assertion,
+        )
+        if saved != self._assertion:
+            raise PlanControlError(
+                "START_OPTIONS_CONFLICT",
+                "PlanControl Runtime assertion mirror did not read back exactly",
+            )
+        return receipt
+
+    def progress(self, subject, preflight):
+        return self._gateway.progress(subject, preflight)
 
 
 def _mapping(value: Any, label: str) -> ProfileMapping:
@@ -215,14 +261,10 @@ class ProductionPlanControlStartHost:
         if persisted_value is not None:
             persisted = _runtime_overrides(persisted_value, refs)
             _assert_profiles_are_composed(persisted, self._configuration)
+        requested: CampaignStartRuntimeOverrides | None = None
         if options is not None:
             requested = _runtime_overrides(options, refs)
             _assert_profiles_are_composed(requested, self._configuration)
-            saved = self._repository.save_runtime_assertion(
-                handle,
-                requested.canonical(),
-            )
-            persisted = _runtime_overrides(saved, refs)
 
         assertions = dict(self._configuration.campaign_assertions)
         assertion_key = (
@@ -230,14 +272,19 @@ class ProductionPlanControlStartHost:
             handle.campaign_key,
             _handle_ref(handle),
         )
-        if persisted is not None:
-            configured = assertions.get(assertion_key)
-            if configured is not None and configured != persisted:
-                raise PlanControlError(
-                    "START_OPTIONS_CONFLICT",
-                    "Campaign assertion conflicts with host Runtime configuration",
-                )
-            assertions[assertion_key] = persisted
+        configured = assertions.get(assertion_key)
+        selected_assertion = (
+            requested
+            or persisted
+            or configured
+            or CampaignStartRuntimeOverrides()
+        )
+        if configured is not None and configured != selected_assertion:
+            raise PlanControlError(
+                "START_OPTIONS_CONFLICT",
+                "Campaign assertion conflicts with host Runtime configuration",
+            )
+        assertions[assertion_key] = selected_assertion
         try:
             configuration = RuntimeConfiguration(
                 profiles=dict(self._configuration.profiles),
@@ -265,7 +312,12 @@ class ProductionPlanControlStartHost:
         return PlanControl(
             source=self._source,
             artifacts=self._artifacts,
-            gateway=gateway,
+            gateway=_RuntimeAssertionCommitGateway(
+                gateway=gateway,
+                repository=self._repository,
+                handle=handle,
+                assertion=selected_assertion,
+            ),
             repository=self._repository,
             max_snapshot_bytes=self._max_snapshot_bytes,
         ).start(
@@ -302,3 +354,72 @@ def install_plan_control_start(
     )
     _install_start_host(host)
     return host
+
+
+def install_github_plan_control_start(
+    *,
+    repository: str,
+    control_branch: str,
+    target_branch: str,
+    writer_generation: str,
+    runtime_configuration: RuntimeConfiguration,
+    repository_contexts: Mapping[str, RuntimeRepositoryContext],
+    gateway_store_path: Path,
+    artifact_root: Path,
+    policy_path: str = ".gwo-v8/policy-witness.json",
+    state_path: str = ".gwo-v8/plan-control-v3.json",
+    maximum_artifact_bytes: int = 1_048_576,
+    maximum_state_bytes: int = 16_777_216,
+    max_snapshot_bytes: int = 1_048_576,
+    _content_client: GitHubContentClient | None = None,
+    _issue_client: GitHubIssueReadClient | None = None,
+    _writer_control: WriterGenerationReadback | None = None,
+    _gateway_builder: _GatewayBuilder | None = None,
+) -> ProductionPlanControlStartHost:
+    """Install the production GitHub-backed Campaign-start composition.
+
+    The public production entrypoint constructs both semantic source readback
+    and the complete durable PlanControl repository.  Underscored seams exist
+    only for boundary tests; normal callers receive no source or persistence
+    adapter choices.
+    """
+
+    if type(repository) is not str or not repository:
+        raise PlanControlError(
+            "PLAN_CONTROL_COMPOSITION_INVALID",
+            "Production GitHub repository must be exact non-empty text",
+        )
+    content_client = _content_client or GitHubCliContentClient()
+    issue_client = _issue_client or GitHubCliIssueReadClient()
+    writer_control = _writer_control or GitHubWriterTransitionControl(
+        content_client,
+        branch=control_branch,
+        initial_writer=writer_generation,
+    )
+    source = GitHubReadySnapshotSource(
+        content_client=content_client,
+        issue_client=issue_client,
+        control_branch=control_branch,
+        target_branch=target_branch,
+        policy_path=policy_path,
+    )
+    durable_repository = GitHubPlanRepository(
+        content_client,
+        repository=repository,
+        branch=control_branch,
+        writer_generation=writer_generation,
+        writer_control=writer_control,
+        path=state_path,
+        maximum_state_bytes=maximum_state_bytes,
+    )
+    return install_plan_control_start(
+        source=source,
+        repository=durable_repository,
+        runtime_configuration=runtime_configuration,
+        repository_contexts=repository_contexts,
+        gateway_store_path=gateway_store_path,
+        artifact_root=artifact_root,
+        maximum_artifact_bytes=maximum_artifact_bytes,
+        max_snapshot_bytes=max_snapshot_bytes,
+        _gateway_builder=_gateway_builder,
+    )

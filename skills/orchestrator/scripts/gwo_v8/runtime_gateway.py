@@ -35,6 +35,7 @@ from ._canonical import (
     load_canonical_json,
     strict_json_loads,
 )
+from .planning_protocol import planning_output_schema_from_prompt
 from .runtime_profile import (
     RuntimeProfile,
     _SealedValueMeta,
@@ -339,7 +340,10 @@ class _RuntimeOutputArtifactProof:
     authority_digest: str
 
 
-def _runtime_output_schema_bytes(identity: _RuntimeOutputIdentity) -> bytes:
+def _runtime_output_schema_bytes(
+    identity: _RuntimeOutputIdentity,
+    payload_schema: Mapping[str, Any] | None = None,
+) -> bytes:
     identity_fields = identity.canonical()
     return canonical_bytes(
         {
@@ -355,7 +359,7 @@ def _runtime_output_schema_bytes(identity: _RuntimeOutputIdentity) -> bytes:
                     name: {"const": value}
                     for name, value in identity_fields.items()
                 },
-                "payload": {},
+                "payload": {} if payload_schema is None else payload_schema,
             },
             "additionalProperties": False,
         }
@@ -6604,14 +6608,15 @@ class _PaseoRuntimeProviderAdapter:
         )
         return (*registered, base_commit)
 
-    @staticmethod
-    def _output_schema_payload(spec: _RuntimeActionSpec) -> bytes:
+    def _output_schema_payload(self, spec: _RuntimeActionSpec) -> bytes:
+        prompt = self._artifacts.read_json(spec.prompt_artifact.digest)
         return _runtime_output_schema_bytes(
             _RuntimeOutputIdentity(
                 subject_digest=spec.subject_digest,
                 stable_action_id=spec.stable_action_id,
                 authority_digest=spec.subject.authority_digest,
-            )
+            ),
+            planning_output_schema_from_prompt(prompt),
         )
 
     def prepare(self, spec: _RuntimeActionSpec) -> _PrepareReceipt | _RuntimeFailure:
@@ -10605,15 +10610,53 @@ class _InMemoryRuntimeProviderAdapter:
             stable_action_id=action.spec.stable_action_id,
             authority_digest=action.spec.subject.authority_digest,
         )
+        prompt = self._artifacts.read_json(action.spec.prompt_artifact.digest)
+        payload: dict[str, Any]
+        if (
+            type(action.spec.subject) is CampaignPlanningSubject
+            and planning_output_schema_from_prompt(prompt) is not None
+        ):
+            snapshot = self._artifacts.read_json(
+                action.spec.subject.snapshot_artifact_digest
+            )
+            if (
+                type(snapshot) is not dict
+                or type(snapshot.get("tickets")) is not list
+                or any(
+                    type(ticket) is not dict
+                    or type(ticket.get("key")) is not str
+                    or not ticket["key"]
+                    for ticket in snapshot["tickets"]
+                )
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_ARTIFACT_INVALID",
+                    "Campaign Planning snapshot Artifact is malformed",
+                )
+            ticket_keys = [ticket["key"] for ticket in snapshot["tickets"]]
+            if not ticket_keys or len(set(ticket_keys)) != len(ticket_keys):
+                raise RuntimeGatewayError(
+                    "RUNTIME_ARTIFACT_INVALID",
+                    "Campaign Planning snapshot repeats or omits Ticket keys",
+                )
+            payload = {
+                "admitted_work": ticket_keys,
+                "dependency_additions": [],
+                "exclusive_resources": {key: [] for key in ticket_keys},
+                "capability_requirements": {key: [] for key in ticket_keys},
+                "decision_requirements": [],
+            }
+        else:
+            payload = {
+                "input_artifact_digests": [
+                    artifact.digest for artifact in action.spec.input_artifacts
+                ]
+            }
         action.output_artifact_digest = self._artifacts.put_canonical(
             {
                 "schema_version": _RUNTIME_OUTPUT_SCHEMA_VERSION,
                 **identity.canonical(),
-                "payload": {
-                    "input_artifact_digests": [
-                        artifact.digest for artifact in action.spec.input_artifacts
-                    ]
-                },
+                "payload": payload,
             }
         ).digest
         action.lifecycle = "completed"

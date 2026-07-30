@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import re
+import threading
 from typing import Any, Mapping, Protocol, Sequence
 
 from ._canonical import CanonicalJsonError, canonical_bytes, digest_bytes, digest_value, load_canonical_json
+from .planning_protocol import planning_prompt
 from .runtime_gateway import CampaignPlanningSubject, PlanningPreflightReceipt, PlanningReceipt
 
 
@@ -23,6 +25,12 @@ _CAPABILITY = re.compile(r"^[a-z][a-z0-9_]*(?:[.-][a-z0-9][a-z0-9_-]*)*$")
 _AUTO_PREVIOUS = object()
 _TRIAGE = frozenset({"needs-triage", "needs-info", "ready-for-agent", "ready-for-human", "wontfix"})
 _POLICY_ROLES = ("campaign", "worker", "recovery_worker", "review")
+_ROLE_AUTHORITY_GRANTS = {
+    "campaign": (("repository.read.v1", "campaign.snapshot.v1"),),
+    "worker": (("workspace.write.v1", "work-run.workspace.v1"),),
+    "recovery_worker": (("workspace.write.v1", "work-run.workspace.v1"),),
+    "review": (("repository.read.v1", "review.subject.v1"),),
+}
 _OPERATION_ROOTS = frozenset({"artifact", "ci", "git", "github", "repository", "workspace"})
 _RESOURCE_ROOTS = frozenset({"artifact", "campaign", "candidate", "repository", "review", "target", "work-run"})
 
@@ -111,7 +119,23 @@ class ActivationReceipt:
     revision_digest: str
     expected_previous_revision_digest: str | None
     writer_generation: str
+    ready_refs: tuple[str, ...]
     ticket_keys: tuple[str, ...]
+    planning_subject_digest: str
+    planning_stable_action_id: str
+    planning_preflight_receipt_digest: str
+
+
+@dataclass(frozen=True)
+class PlanningReservation:
+    """Repository-global non-executable claim made after exact preflight."""
+
+    repository: str
+    campaign_key: str
+    ticket_keys: tuple[str, ...]
+    subject_digest: str
+    stable_action_id: str
+    preflight_receipt_digest: str
 
 
 @dataclass(frozen=True)
@@ -138,6 +162,7 @@ class ActivePlanReadback:
 @dataclass(frozen=True)
 class _SplitCampaignDecisionRecord:
     handle: CampaignHandle
+    ready_refs: tuple[str, ...]
     ticket_keys: tuple[str, ...]
     expected_previous_revision_digest: str | None
     canonical_bytes: bytes
@@ -147,6 +172,7 @@ class _SplitCampaignDecisionRecord:
 @dataclass(frozen=True)
 class _PlanningAttempt:
     handle: CampaignHandle
+    ready_refs: tuple[str, ...]
     ticket_keys: tuple[str, ...]
     expected_previous_revision_digest: str | None
     snapshot_bytes: bytes
@@ -213,6 +239,10 @@ class PlanControlRepository(Protocol):
         assertion: Mapping[str, Any],
     ) -> Mapping[str, Any]: ...
 
+    def reserve_planning(self, reservation: PlanningReservation) -> None: ...
+
+    def release_planning(self, reservation: PlanningReservation) -> None: ...
+
     def reserve_claims(self, receipt: ActivationReceipt) -> None: ...
 
     def publish_revision(self, revision: PlanRevision) -> None: ...
@@ -238,11 +268,15 @@ class InMemoryPlanRepository:
     def __init__(self, *, writer_generation: str):
         _text(writer_generation, "writer_generation")
         self.writer_generation = writer_generation
+        self._lock = threading.RLock()
         self.attempts: dict[tuple[str, str, str | None], _PlanningAttempt] = {}
         self.claims: dict[tuple[str, str], str] = {}
         self._claim_campaigns: dict[tuple[str, str], str] = {}
         self.pending_reservations: dict[
             tuple[str, str, str], ActivationReceipt
+        ] = {}
+        self.planning_reservations: dict[
+            tuple[str, str, str], PlanningReservation
         ] = {}
         self.split_decisions: dict[
             tuple[str, str, str | None], _SplitCampaignDecisionRecord
@@ -327,10 +361,11 @@ class InMemoryPlanRepository:
         self,
         handle: CampaignHandle,
     ) -> Mapping[str, Any] | None:
-        value = self.runtime_assertions.get(
-            (handle.repository, handle.campaign_key)
-        )
-        return None if value is None else _canonical(value)
+        with self._lock:
+            value = self.runtime_assertions.get(
+                (handle.repository, handle.campaign_key)
+            )
+            return None if value is None else _canonical(value)
 
     def save_runtime_assertion(
         self,
@@ -344,14 +379,15 @@ class InMemoryPlanRepository:
                 "Campaign Runtime assertion must be a canonical object",
             )
         key = (handle.repository, handle.campaign_key)
-        existing = self.runtime_assertions.get(key)
-        if existing is not None and existing != value:
-            raise PlanControlError(
-                "START_OPTIONS_CONFLICT",
-                "Campaign Runtime assertion differs from its durable identity",
-            )
-        self.runtime_assertions[key] = value
-        return _canonical(value)
+        with self._lock:
+            existing = self.runtime_assertions.get(key)
+            if existing is not None and existing != value:
+                raise PlanControlError(
+                    "START_OPTIONS_CONFLICT",
+                    "Campaign Runtime assertion differs from its durable identity",
+                )
+            self.runtime_assertions[key] = value
+            return _canonical(value)
 
     @staticmethod
     def _reservation_key(receipt: ActivationReceipt) -> tuple[str, str, str]:
@@ -361,40 +397,223 @@ class InMemoryPlanRepository:
             receipt.revision_digest,
         )
 
-    def reserve_claims(self, receipt: ActivationReceipt) -> None:
-        reservation_key = self._reservation_key(receipt)
-        existing = self.pending_reservations.get(reservation_key)
-        if existing is not None:
-            if existing != receipt:
-                raise PlanControlError(
-                    "TICKET_RESERVATION_CONFLICT",
-                    "Pending Ticket reservation changed its immutable identity",
-                )
-            return
-        owner = receipt.campaign_key
-        conflicts = sorted(
-            ticket_key
-            for ticket_key in receipt.ticket_keys
-            if (
-                (receipt.repository, ticket_key) in self._claim_campaigns
-                and self._claim_campaigns[(receipt.repository, ticket_key)]
-                != owner
-            )
+    @staticmethod
+    def _planning_reservation_key(
+        reservation: PlanningReservation,
+    ) -> tuple[str, str, str]:
+        return (
+            reservation.repository,
+            reservation.campaign_key,
+            reservation.stable_action_id,
         )
-        for pending in self.pending_reservations.values():
-            if (
-                pending.repository == receipt.repository
-                and pending.campaign_key != receipt.campaign_key
-            ):
-                conflicts.extend(
-                    sorted(set(pending.ticket_keys).intersection(receipt.ticket_keys))
-                )
-        if conflicts:
-            raise PlanControlError(
-                "TICKET_CLAIM_CONFLICT",
-                "Ticket claims overlap: " + ", ".join(sorted(set(conflicts))),
+
+    def reserve_planning(self, reservation: PlanningReservation) -> None:
+        if (
+            type(reservation) is not PlanningReservation
+            or type(reservation.repository) is not str
+            or not reservation.repository
+            or type(reservation.campaign_key) is not str
+            or not reservation.campaign_key
+            or type(reservation.ticket_keys) is not tuple
+            or not reservation.ticket_keys
+            or any(
+                type(ticket_key) is not str or not ticket_key
+                for ticket_key in reservation.ticket_keys
             )
-        self.pending_reservations[reservation_key] = receipt
+            or len(set(reservation.ticket_keys)) != len(
+                reservation.ticket_keys
+            )
+            or type(reservation.subject_digest) is not str
+            or _DIGEST.fullmatch(reservation.subject_digest) is None
+            or type(reservation.stable_action_id) is not str
+            or not reservation.stable_action_id
+            or type(reservation.preflight_receipt_digest) is not str
+            or _DIGEST.fullmatch(reservation.preflight_receipt_digest) is None
+        ):
+            raise PlanControlError(
+                "PLANNING_RESERVATION_INVALID",
+                "Planning reservation must be one exact non-executable claim",
+            )
+        key = self._planning_reservation_key(reservation)
+        with self._lock:
+            existing = self.planning_reservations.get(key)
+            if existing is not None:
+                if existing != reservation:
+                    raise PlanControlError(
+                        "PLANNING_RESERVATION_CONFLICT",
+                        "Planning reservation changed its exact preflight binding",
+                    )
+                return
+            conflicts = {
+                ticket_key
+                for ticket_key in reservation.ticket_keys
+                if (
+                    (reservation.repository, ticket_key)
+                    in self._claim_campaigns
+                    and self._claim_campaigns[
+                        (reservation.repository, ticket_key)
+                    ]
+                    != reservation.campaign_key
+                )
+            }
+            for pending in self.pending_reservations.values():
+                if (
+                    pending.repository == reservation.repository
+                    and pending.campaign_key != reservation.campaign_key
+                ):
+                    conflicts.update(
+                        set(pending.ticket_keys).intersection(
+                            reservation.ticket_keys
+                        )
+                    )
+            for pending in self.planning_reservations.values():
+                if (
+                    pending.repository == reservation.repository
+                    and pending.campaign_key != reservation.campaign_key
+                ):
+                    conflicts.update(
+                        set(pending.ticket_keys).intersection(
+                            reservation.ticket_keys
+                        )
+                    )
+            if conflicts:
+                raise PlanControlError(
+                    "TICKET_CLAIM_CONFLICT",
+                    "Ticket claims overlap: " + ", ".join(sorted(conflicts)),
+                )
+            self.planning_reservations[key] = reservation
+
+    def release_planning(self, reservation: PlanningReservation) -> None:
+        if type(reservation) is not PlanningReservation:
+            raise PlanControlError(
+                "PLANNING_RESERVATION_INVALID",
+                "Planning reservation release requires its exact receipt",
+            )
+        key = self._planning_reservation_key(reservation)
+        with self._lock:
+            existing = self.planning_reservations.get(key)
+            if existing is None:
+                return
+            if existing != reservation:
+                raise PlanControlError(
+                    "PLANNING_RESERVATION_CONFLICT",
+                    "Planning reservation release changed its identity",
+                )
+            self.planning_reservations.pop(key)
+
+    def reserve_claims(self, receipt: ActivationReceipt) -> None:
+        if (
+            type(receipt) is not ActivationReceipt
+            or type(receipt.repository) is not str
+            or not receipt.repository
+            or type(receipt.campaign_key) is not str
+            or not receipt.campaign_key
+            or type(receipt.revision_digest) is not str
+            or _DIGEST.fullmatch(receipt.revision_digest) is None
+            or (
+                receipt.expected_previous_revision_digest is not None
+                and (
+                    type(receipt.expected_previous_revision_digest) is not str
+                    or _DIGEST.fullmatch(
+                        receipt.expected_previous_revision_digest
+                    )
+                    is None
+                )
+            )
+            or type(receipt.writer_generation) is not str
+            or not receipt.writer_generation
+            or receipt.writer_generation != self.writer_generation
+            or type(receipt.ready_refs) is not tuple
+            or type(receipt.ticket_keys) is not tuple
+            or not receipt.ready_refs
+            or not receipt.ticket_keys
+            or any(type(item) is not str or not item for item in receipt.ready_refs)
+            or any(type(item) is not str or not item for item in receipt.ticket_keys)
+            or len(set(receipt.ready_refs)) != len(receipt.ready_refs)
+            or len(set(receipt.ticket_keys)) != len(receipt.ticket_keys)
+            or type(receipt.planning_subject_digest) is not str
+            or _DIGEST.fullmatch(receipt.planning_subject_digest) is None
+            or type(receipt.planning_stable_action_id) is not str
+            or not receipt.planning_stable_action_id
+            or type(receipt.planning_preflight_receipt_digest) is not str
+            or _DIGEST.fullmatch(
+                receipt.planning_preflight_receipt_digest
+            )
+            is None
+        ):
+            raise PlanControlError(
+                "TICKET_RESERVATION_CONFLICT",
+                "Activation reservation requires one exact receipt",
+            )
+        reservation_key = self._reservation_key(receipt)
+        planning_key = (
+            receipt.repository,
+            receipt.campaign_key,
+            receipt.planning_stable_action_id,
+        )
+        expected_planning = PlanningReservation(
+            repository=receipt.repository,
+            campaign_key=receipt.campaign_key,
+            ticket_keys=receipt.ticket_keys,
+            subject_digest=receipt.planning_subject_digest,
+            stable_action_id=receipt.planning_stable_action_id,
+            preflight_receipt_digest=(
+                receipt.planning_preflight_receipt_digest
+            ),
+        )
+        with self._lock:
+            existing = self.pending_reservations.get(reservation_key)
+            if existing is not None:
+                if existing != receipt:
+                    raise PlanControlError(
+                        "TICKET_RESERVATION_CONFLICT",
+                        "Pending Ticket reservation changed its immutable identity",
+                    )
+                return
+            if self.planning_reservations.get(planning_key) != expected_planning:
+                raise PlanControlError(
+                    "PLANNING_RESERVATION_MISSING",
+                    "Plan publication lacks its exact preflight Planning reservation",
+                )
+            owner = receipt.campaign_key
+            conflicts = {
+                ticket_key
+                for ticket_key in receipt.ticket_keys
+                if (
+                    (receipt.repository, ticket_key) in self._claim_campaigns
+                    and self._claim_campaigns[
+                        (receipt.repository, ticket_key)
+                    ]
+                    != owner
+                )
+            }
+            for pending in self.pending_reservations.values():
+                if (
+                    pending.repository == receipt.repository
+                    and pending.campaign_key != receipt.campaign_key
+                ):
+                    conflicts.update(
+                        set(pending.ticket_keys).intersection(
+                            receipt.ticket_keys
+                        )
+                    )
+            for pending in self.planning_reservations.values():
+                if (
+                    pending.repository == receipt.repository
+                    and pending.campaign_key != receipt.campaign_key
+                ):
+                    conflicts.update(
+                        set(pending.ticket_keys).intersection(
+                            receipt.ticket_keys
+                        )
+                    )
+            if conflicts:
+                raise PlanControlError(
+                    "TICKET_CLAIM_CONFLICT",
+                    "Ticket claims overlap: " + ", ".join(sorted(conflicts)),
+                )
+            self.pending_reservations[reservation_key] = receipt
+            self.planning_reservations.pop(planning_key)
 
     def publish_revision(self, revision: PlanRevision) -> None:
         existing = self.revisions.get(revision.digest)
@@ -546,7 +765,39 @@ class PlanControl:
         if active is not None:
             self._repository.finalize_claims(active)
         if expected_previous_revision_digest is _AUTO_PREVIOUS:
-            if active is not None and active.ticket_keys == refs:
+            if active is not None and active.ready_refs == refs:
+                attempt = self._repository.read_attempt(
+                    handle,
+                    active.expected_previous_revision_digest,
+                )
+                if (
+                    attempt is None
+                    or attempt.ready_refs != active.ready_refs
+                    or attempt.ticket_keys != active.ticket_keys
+                    or attempt.compilation_record_artifact_digest is None
+                ):
+                    raise PlanControlError(
+                        "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+                        "Active Campaign has no exact Planning attempt binding",
+                    )
+                self._verify_attempt_artifacts(attempt)
+                preflight = self._gateway.planning_preflight(attempt.subject)
+                _validate_preflight(preflight, attempt.subject)
+                self._read_compilation_record(attempt)
+                record = _read_artifact_json(
+                    self._artifacts,
+                    attempt.compilation_record_artifact_digest,
+                    code="COMPILATION_RECORD_INVALID",
+                )
+                if record["preflight_receipt"] != {
+                    "subject_digest": preflight.subject_digest,
+                    "stable_action_id": preflight.stable_action_id,
+                    "receipt_digest": preflight.receipt_digest,
+                }:
+                    raise PlanControlError(
+                        "RUNTIME_PREFLIGHT_INVALID",
+                        "Active Campaign preflight differs from its exact compiled binding",
+                    )
                 self.read_active(handle)
                 return handle
             expected = None if active is None else active.revision_digest
@@ -561,7 +812,7 @@ class PlanControl:
         if attempt is None:
             attempt = self._new_attempt(handle, refs, expected)
             attempt = self._repository.save_attempt(attempt)
-        elif attempt.ticket_keys != refs:
+        elif attempt.ready_refs != refs:
             raise PlanControlError("PLANNING_ATTEMPT_IDENTITY_CONFLICT", "Campaign attempt has different selected Tickets")
 
         self._verify_attempt_artifacts(attempt)
@@ -577,14 +828,28 @@ class PlanControl:
         intent = _intent_from_bytes(intent_bytes, attempt.snapshot_bytes)
         findings = tuple(DecisionFinding(**item) for item in intent["decision_requirements"])
         if findings:
+            if attempt.revision is not None:
+                raise PlanControlError(
+                    "PLAN_REVISION_PROVENANCE_INVALID",
+                    "Decision-only Planning output cannot have a persisted Plan Revision",
+                )
+            self._repository.release_planning(
+                self._planning_reservation_from_compilation(attempt)
+            )
             raise PlanControlDecision(attempt.snapshot_artifact_digest, findings)
 
-        revision = attempt.revision or _compile_plan(
+        expected_revision = _compile_plan(
             attempt.snapshot_bytes,
             attempt.snapshot_artifact_digest,
             intent_bytes,
             handle,
         )
+        if attempt.revision is not None:
+            _validate_revision_provenance(
+                attempt.revision,
+                expected_revision,
+            )
+        revision = expected_revision
         if attempt.revision is None:
             attempt = self._repository.save_attempt(replace(attempt, revision=revision))
 
@@ -604,13 +869,22 @@ class PlanControl:
         ):
             raise PlanControlError("PLAN_READBACK_INVALID", "PlanSpec Artifact does not read back at its revision digest")
 
+        planning_reservation = self._planning_reservation_from_compilation(
+            attempt
+        )
         receipt = ActivationReceipt(
             repository=handle.repository,
             campaign_key=handle.campaign_key,
             revision_digest=revision.digest,
             expected_previous_revision_digest=expected,
             writer_generation=self._writer_generation(),
-            ticket_keys=refs,
+            ready_refs=refs,
+            ticket_keys=attempt.ticket_keys,
+            planning_subject_digest=planning_reservation.subject_digest,
+            planning_stable_action_id=planning_reservation.stable_action_id,
+            planning_preflight_receipt_digest=(
+                planning_reservation.preflight_receipt_digest
+            ),
         )
 
         # Reservation is durable but cannot replace an active claim.  The
@@ -638,31 +912,121 @@ class PlanControl:
         receipt = self._repository.read_activation(handle)
         if receipt is None:
             raise PlanControlError("ACTIVATION_PENDING", "Campaign has no read-backed Activation Receipt")
-        if receipt.repository != handle.repository or receipt.campaign_key != handle.campaign_key:
-            raise PlanControlError("ACTIVATION_READBACK_INVALID", "Activation Receipt does not bind the CampaignHandle")
+        if (
+            type(receipt) is not ActivationReceipt
+            or receipt.repository != handle.repository
+            or receipt.campaign_key != handle.campaign_key
+            or receipt.writer_generation != self._writer_generation()
+            or type(receipt.ready_refs) is not tuple
+            or type(receipt.ticket_keys) is not tuple
+            or not receipt.ready_refs
+            or len(set(receipt.ready_refs)) != len(receipt.ready_refs)
+            or len(set(receipt.ticket_keys)) != len(receipt.ticket_keys)
+            or any(type(ref) is not str or not ref for ref in receipt.ready_refs)
+            or any(
+                type(ticket_key) is not str or not ticket_key
+                for ticket_key in receipt.ticket_keys
+            )
+            or type(receipt.planning_subject_digest) is not str
+            or _DIGEST.fullmatch(receipt.planning_subject_digest) is None
+            or type(receipt.planning_stable_action_id) is not str
+            or not receipt.planning_stable_action_id
+            or type(receipt.planning_preflight_receipt_digest) is not str
+            or _DIGEST.fullmatch(
+                receipt.planning_preflight_receipt_digest
+            )
+            is None
+        ):
+            raise PlanControlError(
+                "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+                "Activation Receipt does not exactly bind the CampaignHandle and writer generation",
+            )
+        attempt = self._repository.read_attempt(
+            handle,
+            receipt.expected_previous_revision_digest,
+        )
+        if (
+            type(attempt) is not _PlanningAttempt
+            or attempt.ready_refs != receipt.ready_refs
+            or attempt.ticket_keys != receipt.ticket_keys
+            or attempt.subject.digest != receipt.planning_subject_digest
+            or attempt.subject.stable_action_id
+            != receipt.planning_stable_action_id
+            or attempt.compilation_record_artifact_digest is None
+        ):
+            raise PlanControlError(
+                "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+                "Activation Receipt does not exactly bind its Planning attempt",
+            )
+        self._verify_attempt_artifacts(attempt)
+        self._read_compilation_record(attempt)
+        compilation = _read_artifact_json(
+            self._artifacts,
+            attempt.compilation_record_artifact_digest,
+            code="COMPILATION_RECORD_INVALID",
+        )
+        if (
+            compilation["preflight_receipt"]["receipt_digest"]
+            != receipt.planning_preflight_receipt_digest
+        ):
+            raise PlanControlError(
+                "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+                "Activation Receipt does not exactly bind its Planning preflight",
+            )
         revision = self._repository.read_revision(receipt.revision_digest)
-        if revision is None or revision.repository != handle.repository or revision.campaign_key != handle.campaign_key or digest_bytes(revision.canonical_bytes) != receipt.revision_digest:
-            raise PlanControlError("PLAN_READBACK_INVALID", "Activated Plan Revision does not read back exactly")
+        if (
+            type(revision) is not PlanRevision
+            or revision.repository != handle.repository
+            or revision.campaign_key != handle.campaign_key
+            or revision.digest != receipt.revision_digest
+            or digest_bytes(revision.canonical_bytes) != receipt.revision_digest
+        ):
+            raise PlanControlError(
+                "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+                "Activated Plan Revision does not exactly bind the Activation Receipt",
+            )
         _validate_plan_spec(revision.canonical_bytes)
+        plan_spec = revision.plan_spec
+        plan_ticket_keys = tuple(item["key"] for item in plan_spec["work"])
+        if (
+            plan_spec["repository"] != handle.repository
+            or plan_spec["campaign"]["key"] != handle.campaign_key
+            or plan_ticket_keys != receipt.ticket_keys
+        ):
+            raise PlanControlError(
+                "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+                "PlanSpec work, Campaign identity, and Activation Receipt Tickets differ",
+            )
         if (
             _read_artifact_json(
                 self._artifacts,
                 receipt.revision_digest,
                 code="PLAN_READBACK_INVALID",
             )
-            != revision.plan_spec
+            != plan_spec
         ):
             raise PlanControlError("PLAN_READBACK_INVALID", "PlanSpec Artifact does not read back exactly")
-        self._verify_policy_witness(revision.plan_spec)
+        self._verify_policy_witness(plan_spec)
         active_proofs = self._repository.read_claim_proofs(
             handle,
             receipt.revision_digest,
         )
         if (
-            tuple(proof.ticket_key for proof in active_proofs) != receipt.ticket_keys
-            or any(proof.plan_revision_digest != receipt.revision_digest for proof in active_proofs)
+            type(active_proofs) is not tuple
+            or any(type(proof) is not TicketClaimProof for proof in active_proofs)
+            or tuple(proof.ticket_key for proof in active_proofs)
+            != receipt.ticket_keys
+            or any(
+                proof.repository != handle.repository
+                or proof.campaign_key != handle.campaign_key
+                or proof.plan_revision_digest != receipt.revision_digest
+                for proof in active_proofs
+            )
         ):
-            raise PlanControlError("TICKET_CLAIM_READBACK_INVALID", "Activated Ticket claims do not read back for the exact Plan Revision")
+            raise PlanControlError(
+                "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+                "Activated Ticket claims do not exactly bind the active Campaign and Plan Revision",
+            )
         return ActivePlanReadback(
             handle,
             receipt.revision_digest,
@@ -673,10 +1037,8 @@ class PlanControl:
 
     def _new_attempt(self, handle: CampaignHandle, refs: tuple[str, ...], expected: str | None) -> _PlanningAttempt:
         snapshot = _normalize_snapshot(self._source.snapshot(handle.repository, refs), handle.repository, refs)
+        ticket_keys = tuple(ticket["key"] for ticket in snapshot["tickets"])
         policy_witness = {key: value for key, value in snapshot["policy"].items() if key != "digest"}
-        policy_artifact_digest = _put_canonical(self._artifacts, policy_witness)
-        if policy_artifact_digest != snapshot["policy"]["digest"]:
-            raise PlanControlError("POLICY_WITNESS_INVALID", "Policy Witness Artifact digest differs from its frozen witness digest")
         snapshot_bytes = canonical_bytes(snapshot)
         if len(snapshot_bytes) > self._max_snapshot_bytes:
             decision_value = {
@@ -685,7 +1047,8 @@ class PlanControl:
                     "repository": handle.repository,
                     "campaign_key": handle.campaign_key,
                 },
-                "ticket_keys": list(refs),
+                "ready_refs": list(refs),
+                "ticket_keys": list(ticket_keys),
                 "expected_previous_revision_digest": expected,
                 "snapshot_digest": digest_bytes(snapshot_bytes),
                 "snapshot_byte_length": len(snapshot_bytes),
@@ -695,13 +1058,17 @@ class PlanControl:
             decision = self._repository.save_split_decision(
                 _SplitCampaignDecisionRecord(
                     handle=handle,
-                    ticket_keys=refs,
+                    ready_refs=refs,
+                    ticket_keys=ticket_keys,
                     expected_previous_revision_digest=expected,
                     canonical_bytes=canonical_bytes(decision_value),
                     digest=decision_digest,
                 )
             )
             self._raise_split_decision(decision, handle, refs, expected)
+        policy_artifact_digest = _put_canonical(self._artifacts, policy_witness)
+        if policy_artifact_digest != snapshot["policy"]["digest"]:
+            raise PlanControlError("POLICY_WITNESS_INVALID", "Policy Witness Artifact digest differs from its frozen witness digest")
         snapshot_ref = _put_canonical(self._artifacts, snapshot)
         if snapshot_ref != digest_bytes(snapshot_bytes):
             raise PlanControlError("SNAPSHOT_ARTIFACT_MISMATCH", "Snapshot Artifact digest differs from canonical snapshot bytes")
@@ -719,19 +1086,25 @@ class PlanControl:
         )
         request_ref = _put_canonical(
             self._artifacts,
-            {
-                "schema_version": "gwo.runtime.prompt.v1",
-                "subject_digest": provisional.prompt_binding_digest,
-                "authority_digest": policy_digest,
-                "payload": {
-                    "schema_version": 1,
-                    "snapshot_artifact_digest": snapshot_ref,
-                    "policy_witness_digest": policy_digest,
-                },
-            },
+            planning_prompt(
+                subject_digest=provisional.prompt_binding_digest,
+                authority_digest=policy_digest,
+                snapshot_artifact_digest=snapshot_ref,
+                policy_witness_artifact_digest=policy_digest,
+            ),
         )
         subject = replace(provisional, planning_request_artifact_digest=request_ref)
-        return _PlanningAttempt(handle, refs, expected, snapshot_bytes, snapshot_ref, policy_digest, request_ref, subject)
+        return _PlanningAttempt(
+            handle=handle,
+            ready_refs=refs,
+            ticket_keys=ticket_keys,
+            expected_previous_revision_digest=expected,
+            snapshot_bytes=snapshot_bytes,
+            snapshot_artifact_digest=snapshot_ref,
+            policy_witness_digest=policy_digest,
+            planning_request_artifact_digest=request_ref,
+            subject=subject,
+        )
 
     def _raise_split_decision(
         self,
@@ -750,6 +1123,7 @@ class PlanControl:
         expected_keys = {
             "schema_version",
             "campaign",
+            "ready_refs",
             "ticket_keys",
             "expected_previous_revision_digest",
             "snapshot_digest",
@@ -766,10 +1140,11 @@ class PlanControl:
                 "repository": handle.repository,
                 "campaign_key": handle.campaign_key,
             }
-            or value["ticket_keys"] != list(refs)
+            or value["ready_refs"] != list(refs)
+            or value["ticket_keys"] != list(record.ticket_keys)
             or value["expected_previous_revision_digest"] != expected
             or record.handle != handle
-            or record.ticket_keys != refs
+            or record.ready_refs != refs
             or record.expected_previous_revision_digest != expected
             or digest_bytes(record.canonical_bytes) != record.digest
             or _read_artifact_json(
@@ -805,6 +1180,16 @@ class PlanControl:
         # binding is mechanically checked before it is consumed.
         preflight = self._gateway.planning_preflight(attempt.subject)
         _validate_preflight(preflight, attempt.subject)
+        self._repository.reserve_planning(
+            PlanningReservation(
+                repository=attempt.handle.repository,
+                campaign_key=attempt.handle.campaign_key,
+                ticket_keys=attempt.ticket_keys,
+                subject_digest=attempt.subject.digest,
+                stable_action_id=attempt.subject.stable_action_id,
+                preflight_receipt_digest=preflight.receipt_digest,
+            )
+        )
         receipt = self._gateway.progress(attempt.subject, preflight)
         _validate_planning_receipt(receipt, attempt.subject)
         if receipt.status != "completed":
@@ -831,7 +1216,13 @@ class PlanControl:
                 "stable_action_id": receipt.stable_action_id,
                 "status": receipt.status,
                 "receipt_digest": receipt.receipt_digest,
-                "planning_output_artifact_digest": output_digest,
+                "command": None,
+                "wake_cursor": receipt.wake_cursor,
+                "wake_hints": list(receipt.wake_hints),
+                "output_artifact_digest": receipt.output_artifact_digest,
+                "planning_output_artifact_digest": (
+                    receipt.planning_output_artifact_digest
+                ),
             },
             "output_artifact_digest": output_digest,
             "normalized_intent": normalized,
@@ -932,13 +1323,31 @@ class PlanControl:
                 "stable_action_id",
                 "status",
                 "receipt_digest",
+                "command",
+                "wake_cursor",
+                "wake_hints",
+                "output_artifact_digest",
                 "planning_output_artifact_digest",
             }:
                 raise PlanControlError(
                     "COMPILATION_RECORD_INVALID",
                     "Compilation planning receipt is malformed",
                 )
-            planning = PlanningReceipt(**planning_value)
+            wake_hints = planning_value["wake_hints"]
+            if (
+                planning_value["command"] is not None
+                or type(wake_hints) is not list
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Compilation planning receipt is malformed",
+                )
+            planning = PlanningReceipt(
+                **{
+                    **planning_value,
+                    "wake_hints": tuple(wake_hints),
+                }
+            )
             _validate_planning_receipt(planning, subject)
             if (
                 planning.status != "completed"
@@ -979,6 +1388,54 @@ class PlanControl:
                 "COMPILATION_RECORD_INVALID",
                 "Compilation record is missing or malformed",
             ) from error
+
+    def _planning_reservation_from_compilation(
+        self,
+        attempt: _PlanningAttempt,
+    ) -> PlanningReservation:
+        digest = attempt.compilation_record_artifact_digest
+        if digest is None:
+            raise PlanControlError(
+                "COMPILATION_RECORD_INVALID",
+                "Planning reservation has no completed compilation record",
+            )
+        record = _read_artifact_json(
+            self._artifacts,
+            digest,
+            code="COMPILATION_RECORD_INVALID",
+        )
+        preflight = record.get("preflight_receipt")
+        if type(preflight) is not dict or set(preflight) != {
+            "subject_digest",
+            "stable_action_id",
+            "receipt_digest",
+        }:
+            raise PlanControlError(
+                "COMPILATION_RECORD_INVALID",
+                "Planning reservation preflight binding is malformed",
+            )
+        reservation = PlanningReservation(
+            repository=attempt.handle.repository,
+            campaign_key=attempt.handle.campaign_key,
+            ticket_keys=attempt.ticket_keys,
+            subject_digest=preflight["subject_digest"],
+            stable_action_id=preflight["stable_action_id"],
+            preflight_receipt_digest=preflight["receipt_digest"],
+        )
+        expected = PlanningReservation(
+            repository=attempt.handle.repository,
+            campaign_key=attempt.handle.campaign_key,
+            ticket_keys=attempt.ticket_keys,
+            subject_digest=attempt.subject.digest,
+            stable_action_id=attempt.subject.stable_action_id,
+            preflight_receipt_digest=preflight["receipt_digest"],
+        )
+        if reservation != expected:
+            raise PlanControlError(
+                "COMPILATION_RECORD_INVALID",
+                "Planning reservation does not bind the exact compiled subject",
+            )
+        return reservation
 
     def _verify_attempt_artifacts(self, attempt: _PlanningAttempt) -> None:
         """Read back the immutable snapshot and Policy Witness before use."""
@@ -1037,16 +1494,12 @@ class PlanControl:
             attempt.planning_request_artifact_digest,
             code="PLANNING_REQUEST_INVALID",
         )
-        if request != {
-            "schema_version": "gwo.runtime.prompt.v1",
-            "subject_digest": subject.prompt_binding_digest,
-            "authority_digest": attempt.policy_witness_digest,
-            "payload": {
-                "schema_version": 1,
-                "snapshot_artifact_digest": attempt.snapshot_artifact_digest,
-                "policy_witness_digest": attempt.policy_witness_digest,
-            },
-        }:
+        if request != planning_prompt(
+            subject_digest=subject.prompt_binding_digest,
+            authority_digest=attempt.policy_witness_digest,
+            snapshot_artifact_digest=attempt.snapshot_artifact_digest,
+            policy_witness_artifact_digest=attempt.policy_witness_digest,
+        ):
             raise PlanControlError(
                 "PLANNING_REQUEST_INVALID",
                 "Planning request Artifact changed its subject or authority binding",
@@ -1179,10 +1632,29 @@ def _normalize_policy(value: Any) -> dict[str, Any]:
     raw_grants = value["authority_grants"]
     if type(raw_grants) is not dict or set(raw_grants) != set(_POLICY_ROLES):
         raise PlanControlError("POLICY_WITNESS_INVALID", "Policy Witness must supply every authority role")
+    authority_grants = {
+        role: _grants(raw_grants[role], f"{role} grants")
+        for role in _POLICY_ROLES
+    }
+    expected_grants = {
+        role: [
+            {
+                "operation_id": operation_id,
+                "resource_id": resource_id,
+            }
+            for operation_id, resource_id in _ROLE_AUTHORITY_GRANTS[role]
+        ]
+        for role in _POLICY_ROLES
+    }
+    if authority_grants != expected_grants:
+        raise PlanControlError(
+            "POLICY_WITNESS_INVALID",
+            "Policy Witness grants do not match the exact role authority allowlists",
+        )
     core = {
         "schema_version": 1,
         "ref": _text(value["ref"], "Policy Witness ref"),
-        "authority_grants": {role: _grants(raw_grants[role], f"{role} grants") for role in _POLICY_ROLES},
+        "authority_grants": authority_grants,
         "allowed_capabilities": _facts(value["allowed_capabilities"], label="allowed_capabilities", validator=lambda item: _capability(item, "allowed_capabilities")),
         "exclusive_resources": _facts(value["exclusive_resources"], label="exclusive_resources", validator=lambda item: _versioned(item, roots=_RESOURCE_ROOTS, label="exclusive_resources")),
     }
@@ -1241,8 +1713,17 @@ def _normalize_snapshot(value: Any, repository: str, refs: tuple[str, ...]) -> d
         raise PlanControlError("SNAPSHOT_INVALID", "Campaign snapshot schema or repository is invalid")
     tickets = sorted((_normalize_ticket(ticket) for ticket in value["tickets"]), key=lambda item: item["key"])
     keys = tuple(ticket["key"] for ticket in tickets)
-    if keys != refs:
-        raise PlanControlError("SNAPSHOT_OMISSION", "Snapshot must contain every and only selected Tickets")
+    source_refs = tuple(sorted(ticket["source"]["ref"] for ticket in tickets))
+    if (
+        not keys
+        or len(set(keys)) != len(keys)
+        or len(set(source_refs)) != len(source_refs)
+        or source_refs != refs
+    ):
+        raise PlanControlError(
+            "SNAPSHOT_OMISSION",
+            "Snapshot sources must cover every requested ready reference exactly once",
+        )
     selected = set(keys)
     external = sorted({blocker["key"] for ticket in tickets for blocker in ticket["native_blockers"] if blocker["state"] == "open" and blocker["key"] not in selected})
     if external:
@@ -1279,7 +1760,11 @@ def _assert_acyclic(dependencies: Mapping[str, set[str]]) -> None:
 
 
 def _facts_by_ticket(value: Any, selected: set[str], label: str) -> dict[str, list[str]]:
-    if type(value) is not dict or not set(value).issubset(selected):
+    if (
+        type(value) is not dict
+        or any(type(key) is not str or not key for key in value)
+        or not set(value).issubset(selected)
+    ):
         raise PlanControlError("PLAN_INTENT_INVALID", f"{label} names unselected work")
     result = {}
     for key in selected:
@@ -1290,6 +1775,15 @@ def _facts_by_ticket(value: Any, selected: set[str], label: str) -> dict[str, li
     return result
 
 
+def _intent_text(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise PlanControlError(
+            "PLAN_INTENT_INVALID",
+            f"{label} must be non-empty exact text",
+        )
+    return value
+
+
 def _normalize_intent(value: Any, snapshot: dict[str, Any]) -> dict[str, Any]:
     value = _canonical(value, code="PLAN_INTENT_INVALID")
     expected = {"admitted_work", "dependency_additions", "exclusive_resources", "capability_requirements", "decision_requirements"}
@@ -1297,7 +1791,12 @@ def _normalize_intent(value: Any, snapshot: dict[str, Any]) -> dict[str, Any]:
         raise PlanControlError("PLAN_INTENT_INVALID", "Planning output contains unsupported fields")
     selected = {ticket["key"] for ticket in snapshot["tickets"]}
     admitted = value["admitted_work"]
-    if type(admitted) is not list or set(admitted) != selected or len(admitted) != len(selected):
+    if (
+        type(admitted) is not list
+        or any(type(item) is not str or not item for item in admitted)
+        or set(admitted) != selected
+        or len(admitted) != len(selected)
+    ):
         raise PlanControlError("PLAN_INTENT_OMISSION", "Planning output must account for every selected Ticket")
     dependencies = {ticket["key"]: {blocker["key"] for blocker in ticket["native_blockers"] if blocker["state"] == "open" and blocker["key"] in selected} for ticket in snapshot["tickets"]}
     additions = []
@@ -1306,11 +1805,20 @@ def _normalize_intent(value: Any, snapshot: dict[str, Any]) -> dict[str, Any]:
     for item in value["dependency_additions"]:
         if type(item) is not dict or set(item) != {"from", "to", "reason"}:
             raise PlanControlError("PLAN_INTENT_INVALID", "dependency addition is invalid")
-        source, target = _text(item["from"], "dependency source"), _text(item["to"], "dependency target")
+        source, target = (
+            _intent_text(item["from"], "dependency source"),
+            _intent_text(item["to"], "dependency target"),
+        )
         if source not in selected or target not in selected or source == target:
             raise PlanControlError("PLAN_INTENT_INVALID", "dependency addition leaves the selected Ticket set")
         dependencies[source].add(target)
-        additions.append({"from": source, "to": target, "reason": _text(item["reason"], "dependency reason")})
+        additions.append(
+            {
+                "from": source,
+                "to": target,
+                "reason": _intent_text(item["reason"], "dependency reason"),
+            }
+        )
     if len({(item["from"], item["to"]) for item in additions}) != len(additions):
         raise PlanControlError("PLAN_INTENT_INVALID", "dependency additions repeat an edge")
     _assert_acyclic(dependencies)
@@ -1328,9 +1836,19 @@ def _normalize_intent(value: Any, snapshot: dict[str, Any]) -> dict[str, Any]:
         if type(finding) is not dict or set(finding) not in ({"code", "detail"}, {"code", "detail", "ticket_key"}):
             raise PlanControlError("PLAN_INTENT_INVALID", "Decision finding is invalid")
         ticket_key = finding.get("ticket_key")
-        if ticket_key is not None and ticket_key not in selected:
+        if ticket_key is not None and (
+            type(ticket_key) is not str
+            or not ticket_key
+            or ticket_key not in selected
+        ):
             raise PlanControlError("PLAN_INTENT_INVALID", "Decision finding names unselected work")
-        findings.append({"code": _text(finding["code"], "Decision code"), "detail": _text(finding["detail"], "Decision detail"), "ticket_key": ticket_key})
+        findings.append(
+            {
+                "code": _intent_text(finding["code"], "Decision code"),
+                "detail": _intent_text(finding["detail"], "Decision detail"),
+                "ticket_key": ticket_key,
+            }
+        )
     if len({(item["code"], item["detail"], item["ticket_key"]) for item in findings}) != len(findings):
         raise PlanControlError("PLAN_INTENT_INVALID", "Decision findings repeat")
     return {
@@ -1409,6 +1927,25 @@ def _compile_plan(snapshot_bytes: bytes, snapshot_digest: str, intent_bytes: byt
     return PlanRevision(handle.repository, handle.campaign_key, snapshot_digest, payload, digest_bytes(payload))
 
 
+def _validate_revision_provenance(
+    candidate: object,
+    expected: PlanRevision,
+) -> None:
+    if (
+        type(candidate) is not PlanRevision
+        or candidate != expected
+        or candidate.repository != expected.repository
+        or candidate.campaign_key != expected.campaign_key
+        or candidate.snapshot_digest != expected.snapshot_digest
+        or digest_bytes(candidate.canonical_bytes) != candidate.digest
+    ):
+        raise PlanControlError(
+            "PLAN_REVISION_PROVENANCE_INVALID",
+            "Persisted Plan Revision is not the exact deterministic compilation result",
+        )
+    _validate_plan_spec(candidate.canonical_bytes)
+
+
 def _validate_plan_spec(payload: bytes) -> None:
     try:
         plan = load_canonical_json(payload)
@@ -1461,22 +1998,49 @@ def _validate_plan_spec(payload: bytes) -> None:
 
 
 def _validate_preflight(receipt: object, subject: CampaignPlanningSubject) -> None:
-    if getattr(receipt, "subject_digest", None) != subject.digest or getattr(receipt, "stable_action_id", None) != subject.stable_action_id:
+    if (
+        type(receipt) is not PlanningPreflightReceipt
+        or receipt.subject_digest != subject.digest
+        or receipt.stable_action_id != subject.stable_action_id
+    ):
         raise PlanControlError("RUNTIME_PREFLIGHT_INVALID", "RuntimeGateway preflight receipt does not bind the exact Planning subject")
-    _digest(getattr(receipt, "receipt_digest", None), "RuntimeGateway preflight receipt digest")
+    _digest(receipt.receipt_digest, "RuntimeGateway preflight receipt digest")
 
 
 def _validate_planning_receipt(receipt: object, subject: CampaignPlanningSubject) -> None:
-    if getattr(receipt, "subject_digest", None) != subject.digest or getattr(receipt, "stable_action_id", None) != subject.stable_action_id:
+    if (
+        type(receipt) is not PlanningReceipt
+        or receipt.subject_digest != subject.digest
+        or receipt.stable_action_id != subject.stable_action_id
+    ):
         raise PlanControlError("RUNTIME_PLANNING_RECEIPT_INVALID", "RuntimeGateway planning receipt does not bind the exact Planning subject")
-    status = getattr(receipt, "status", None)
+    status = receipt.status
     if type(status) is not str or status not in {"running", "parked", "completed"}:
         raise PlanControlError("RUNTIME_PLANNING_RECEIPT_INVALID", "RuntimeGateway planning receipt has an invalid lifecycle")
-    _digest(getattr(receipt, "receipt_digest", None), "RuntimeGateway planning receipt digest")
-    output = getattr(receipt, "planning_output_artifact_digest", None)
+    _digest(receipt.receipt_digest, "RuntimeGateway planning receipt digest")
+    if (
+        receipt.command is not None
+        or (
+            receipt.wake_cursor is not None
+            and (type(receipt.wake_cursor) is not str or not receipt.wake_cursor)
+        )
+        or type(receipt.wake_hints) is not tuple
+        or any(type(hint) is not str or not hint for hint in receipt.wake_hints)
+    ):
+        raise PlanControlError(
+            "RUNTIME_PLANNING_RECEIPT_INVALID",
+            "RuntimeGateway planning receipt contains malformed progress metadata",
+        )
+    output = receipt.planning_output_artifact_digest
+    output_alias = receipt.output_artifact_digest
     if status == "completed":
         _digest(output, "RuntimeGateway planning output Artifact digest")
-    elif output is not None:
+        if output_alias != output:
+            raise PlanControlError(
+                "RUNTIME_PLANNING_RECEIPT_INVALID",
+                "Completed Planning receipt output digests differ",
+            )
+    elif output is not None or output_alias is not None:
         raise PlanControlError("RUNTIME_PLANNING_RECEIPT_INVALID", "Incomplete Planning receipt cannot name output")
 
 

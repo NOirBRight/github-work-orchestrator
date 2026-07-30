@@ -20,13 +20,22 @@ from .compiler import CompiledPlan, CompileError, PlanCompiler
 from .plan_control import (
     CampaignHandle,
     InMemoryPlanRepository,
+    PlanningReservation,
     PlanControl,
     PlanControlDecision,
     PlanControlError,
     SplitCampaignDecision,
     start,
 )
-from .plan_control_host import install_plan_control_start
+from .plan_control_github import GitHubPlanRepository
+from .github_snapshot import (
+    GitHubCliIssueReadClient,
+    GitHubReadySnapshotSource,
+)
+from .plan_control_host import (
+    install_github_plan_control_start,
+    install_plan_control_start,
+)
 from .entry import (
     ImplementGwoDecision,
     ImplementGwoEntry,
@@ -186,6 +195,9 @@ __all__ = [
     "GitHubContent",
     "GitHubContentClient",
     "GitHubDurablePlanControl",
+    "GitHubPlanRepository",
+    "GitHubCliIssueReadClient",
+    "GitHubReadySnapshotSource",
     "GitHubLegacyWriterControl",
     "GitHubWriterTransitionControl",
     "GitHubCanaryEvidenceControl",
@@ -290,10 +302,12 @@ __all__ = [
     "VerifiedResult",
     "CampaignHandle",
     "InMemoryPlanRepository",
+    "PlanningReservation",
     "PlanControl",
     "PlanControlDecision",
     "PlanControlError",
     "SplitCampaignDecision",
     "install_plan_control_start",
+    "install_github_plan_control_start",
     "start",
 ]
