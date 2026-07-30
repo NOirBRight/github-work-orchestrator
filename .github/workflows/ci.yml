@@ -13,7 +13,7 @@ jobs:
   acceptance:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Windows, X64, gwo-ci]
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -43,6 +43,7 @@ jobs:
           "GWO_CI_PYTHON=$venvPython" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Run repository acceptance
         shell: pwsh
+        timeout-minutes: 30
         run: '& "$env:GWO_CI_PYTHON" -m pytest -q'
       - name: Validate Skill packages
         shell: pwsh
