@@ -3574,14 +3574,14 @@ def test_postdispatch_start_native_error_retains_pending_and_never_reissues(tmp_
     record_before = deepcopy(adapter._actions[subject.stable_action_id])
     native_run = client._run
 
-    def reject_run(args):
+    def reject_run(args, *, allow_empty=False):
         if args[0] == "run":
             client.commands.append(list(args))
             raise RuntimeGatewayError(
                 "RUNTIME_PROVIDER_PROTOCOL_INVALID",
                 "post-dispatch provider output overflow",
             )
-        return native_run(args)
+        return native_run(args, allow_empty=allow_empty)
 
     client._run = reject_run  # type: ignore[method-assign]
     rejected = _adapter_command(
@@ -4185,13 +4185,13 @@ def test_concurrent_workspace_claim_has_one_effect_owner_without_locking_provide
     release_create = threading.Event()
     create_attempts = 0
 
-    def block_first_create(args):
+    def block_first_create(args, *, allow_empty=False):
         nonlocal create_attempts
         if args[:2] == ["workspace", "create"]:
             create_attempts += 1
             create_entered.set()
             assert release_create.wait(5)
-        return native_run(args)
+        return native_run(args, allow_empty=allow_empty)
 
     client._run = block_first_create  # type: ignore[method-assign]
     first_result: list[object] = []
@@ -4718,16 +4718,16 @@ def test_effect_applied_ack_loss_restart_retry_is_idempotent_without_provider_re
     native_update_labels = client.update_labels
     effect_calls = 0
 
-    def lose_cli_ack(args):
+    def lose_cli_ack(args, *, allow_empty=False):
         nonlocal effect_calls
         if (
             command in {RuntimeCommand.PARK, RuntimeCommand.INTERRUPT}
             and args[0] == "stop"
         ) or (command is RuntimeCommand.RETIRE and args[0] == "archive"):
             effect_calls += 1
-            native_run(args)
+            native_run(args, allow_empty=allow_empty)
             raise TimeoutError("provider effect acknowledgement lost")
-        return native_run(args)
+        return native_run(args, allow_empty=allow_empty)
 
     def lose_label_ack(agent_id, labels):
         nonlocal effect_calls
@@ -4785,8 +4785,8 @@ def test_gateway_park_ack_loss_and_explicit_retry_issue_one_provider_stop(tmp_pa
     assert gateway.progress(subject, preflight).status == "running"
     native_run = client._run
 
-    def stop_then_lose_ack(args):
-        result = native_run(args)
+    def stop_then_lose_ack(args, *, allow_empty=False):
+        result = native_run(args, allow_empty=allow_empty)
         if args[0] == "stop":
             raise TimeoutError("stop acknowledgement lost")
         return result
@@ -5395,7 +5395,7 @@ def test_not_dispatched_terminal_transition_restores_wake_terminal_marker(
 
         client.update_labels = fail_update  # type: ignore[method-assign]
     else:
-        def fail_archive(args):
+        def fail_archive(args, *, allow_empty=False):
             if args[0] == "archive":
                 assert adapter._actions[action_id][
                     "wake_terminal_emitted"
@@ -5403,7 +5403,7 @@ def test_not_dispatched_terminal_transition_restores_wake_terminal_marker(
                 raise gateway_module._ProviderNotDispatched(
                     OSError("archive process was not created")
                 )
-            return native_run(args)
+            return native_run(args, allow_empty=allow_empty)
 
         client._run = fail_archive  # type: ignore[method-assign]
 
@@ -5664,7 +5664,7 @@ def test_postdispatch_protocol_failure_keeps_command_claim_and_blocks_duplicate(
     native_run = client._run
     provider_calls = 0
 
-    def fail_after_dispatch(args):
+    def fail_after_dispatch(args, *, allow_empty=False):
         nonlocal provider_calls
         if args[0] == provider_verb:
             provider_calls += 1
@@ -5673,7 +5673,7 @@ def test_postdispatch_protocol_failure_keeps_command_claim_and_blocks_duplicate(
                 "RUNTIME_PROVIDER_PROTOCOL_INVALID",
                 "post-dispatch output was oversized or malformed",
             )
-        return native_run(args)
+        return native_run(args, allow_empty=allow_empty)
 
     client._run = fail_after_dispatch  # type: ignore[method-assign]
     first = _adapter_command(adapter, action_id, command)
@@ -5749,12 +5749,12 @@ def test_explicit_not_dispatched_start_restores_exact_claim_and_can_retry(tmp_pa
     before = deepcopy(adapter._actions[second_subject.stable_action_id])
     native_run = client._run
 
-    def fail_process_creation(args):
+    def fail_process_creation(args, *, allow_empty=False):
         if args[0] == "run":
             raise gateway_module._ProviderNotDispatched(
                 OSError("Popen failed before dispatch")
             )
-        return native_run(args)
+        return native_run(args, allow_empty=allow_empty)
 
     client._run = fail_process_creation  # type: ignore[method-assign]
     failed = _adapter_command(
