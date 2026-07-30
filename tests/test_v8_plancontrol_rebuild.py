@@ -1179,10 +1179,27 @@ def test_policy_authority_grants_are_role_specific_exact_allowlists(role, grant)
 
 
 def test_open_external_blocker_and_pending_planning_do_not_activate():
+    from gwo_v8._canonical import digest_value
     from gwo_v8.plan_control import PlanControlError
 
     blocked = _snapshot()
-    blocked["tickets"][0]["native_blockers"] = [{"key": "issue:108", "state": "open"}]
+    blocker_contract = {
+        "key": "issue:108",
+        "state": "open",
+        "repository": {
+            "full_name": "owner/repository",
+            "url": "https://api.github.com/repos/owner/repository",
+        },
+    }
+    blocked["tickets"][0]["native_blockers"] = [
+        {
+            **blocker_contract,
+            "source": {
+                "ref": "issue:108",
+                "digest": digest_value(blocker_contract),
+            },
+        }
+    ]
     control, _, _, repository = _control(source=_Source(blocked))
     try:
         control.start("owner/repository", ["issue:109"])

@@ -522,26 +522,19 @@ def _canonical_blocker(
             "GITHUB_SNAPSHOT_INVALID",
             "GitHub blocker has a foreign or incomplete Issue identity",
         )
-    frozen_source = {
-        "repository": repository,
-        "number": number,
-        "id": blocker["id"],
-        "node_id": blocker["node_id"],
-        "url": issue_url,
-        "html_url": html_url,
-        "state": state.lower(),
-        "updated_at": blocker["updated_at"],
-    }
-    return {
+    blocker_contract = {
         "key": f"issue:{number}",
         "state": state.lower(),
         "repository": {
             "full_name": repository,
             "url": repository_url,
         },
+    }
+    return {
+        **blocker_contract,
         "source": {
             "ref": f"issue:{number}",
-            "digest": digest_value(frozen_source),
+            "digest": digest_value(blocker_contract),
         },
     }
 

@@ -97,6 +97,26 @@ def _contract(number=109, body="Do the work"):
     }
 
 
+def _frozen_blocker(number=108, *, state="open"):
+    from gwo_v8._canonical import digest_value
+
+    contract = {
+        "key": f"issue:{number}",
+        "state": state,
+        "repository": {
+            "full_name": "owner/repository",
+            "url": "https://api.github.com/repos/owner/repository",
+        },
+    }
+    return {
+        **contract,
+        "source": {
+            "ref": contract["key"],
+            "digest": digest_value(contract),
+        },
+    }
+
+
 class _ContentClient:
     def __init__(self):
         from gwo_v8._canonical import canonical_bytes
@@ -467,32 +487,82 @@ class _RefContentClient:
 
     @staticmethod
     def _writer_value(writer_generation, *, status="cut_over"):
-        record_id = f"writer-record:{writer_generation}"
-        record = {
-            "record_id": record_id,
+        pending = {
+            "record_id": f"writer-record:pending:{writer_generation}",
             "repository": "owner/repository",
-            "kind": "cutover",
-            "status": status,
+            "kind": "cutover_pending",
+            "status": "pending",
             "previous_writer_generation": "v6.1",
             "writer_generation": writer_generation,
-            "activation_id": "activation:cutover",
+            "activation_id": None,
             "plan_digest": "a" * 64,
             "canary_evidence_digest": "b" * 64,
             "canary_evidence_refs": ["github://canary/evidence"],
             "canary_manifest_ref": "github://canary/manifest",
-            "worker_capacity": 8,
-            "coordinator_capacity": 1,
+            "worker_capacity": 0,
+            "coordinator_capacity": 0,
             "reason": None,
             "created_at": "2026-07-30T00:00:00+00:00",
         }
+        record = {
+            **pending,
+            "record_id": f"writer-record:{writer_generation}",
+            "kind": "cutover",
+            "status": "cut_over",
+            "previous_writer_generation": writer_generation,
+            "activation_id": "activation:cutover",
+            "worker_capacity": 8,
+            "coordinator_capacity": 1,
+        }
+        records = [pending, record]
+        current = record
+        if status == "draining":
+            current = {
+                **record,
+                "record_id": f"writer-record:drain:{writer_generation}",
+                "kind": "drain",
+                "status": "draining",
+                "worker_capacity": 0,
+                "coordinator_capacity": 0,
+                "reason": "test drain",
+            }
+            records.append(current)
+        elif status == "pending":
+            current = pending
+        elif status not in {"cut_over", "draining", "pending"}:
+            current = {
+                **record,
+                "record_id": f"writer-record:{status}:{writer_generation}",
+                "status": status,
+            }
+            records.append(current)
         return {
             "schema_version": 1,
             "current": {
                 "repository": "owner/repository",
                 "writer_generation": writer_generation,
-                "record_id": record_id,
+                "record_id": current["record_id"],
             },
-            "records": [record],
+            "records": records,
+        }
+
+    @staticmethod
+    def _activation_value(writer_generation):
+        receipt = {
+            "schema_version": 1,
+            "repository": "owner/repository",
+            "writer_generation": writer_generation,
+            "activation_id": "activation:cutover",
+            "plan_digest": "a" * 64,
+            "expected_previous_digest": None,
+            "plan_record_ref": "github://owner/repository/cutover-plan",
+            "created_at": "2026-07-30T00:00:00+00:00",
+        }
+        return {
+            "schema_version": 1,
+            "repository": "owner/repository",
+            "active_plan_digest": receipt["plan_digest"],
+            "receipts": [receipt],
         }
 
     def __init__(self, writer_generation="writer:one"):
@@ -500,18 +570,29 @@ class _RefContentClient:
         from gwo_v8.activation import GitHubContent
 
         writer = canonical_bytes(self._writer_value(writer_generation))
+        activation = canonical_bytes(self._activation_value(writer_generation))
+        policy = canonical_bytes(_policy())
         self._content_type = GitHubContent
         self._commits = {
             "commit:1": {
                 ".gwo-v8/writer-transition.json": GitHubContent(
                     writer,
                     "blob:writer:one",
-                )
+                ),
+                ".gwo/v8/active-plan.json": GitHubContent(
+                    activation,
+                    "blob:activation:one",
+                ),
+                ".gwo-v8/policy-witness.json": GitHubContent(
+                    policy,
+                    "blob:policy",
+                ),
             }
         }
         self.head = "commit:1"
         self.writes = []
         self.before_ref_cas = None
+        self.activation_barrier = None
 
     def read_ref(self, repository, branch):
         assert repository == "owner/repository"
@@ -522,6 +603,11 @@ class _RefContentClient:
         assert repository == "owner/repository"
         return self._commits[ref_digest].get(path)
 
+    def read(self, repository, branch, path):
+        assert repository == "owner/repository"
+        assert branch == "gwo-control"
+        return self._commits[self.head].get(path)
+
     def compare_and_swap_ref(
         self,
         repository,
@@ -531,9 +617,10 @@ class _RefContentClient:
         changes,
         message,
     ):
-        del message
         assert repository == "owner/repository"
         assert branch == "gwo-control"
+        if "activate Plan Revision" in message and self.activation_barrier is not None:
+            self.activation_barrier.wait()
         if self.before_ref_cas is not None:
             callback = self.before_ref_cas
             self.before_ref_cas = None
@@ -560,6 +647,10 @@ class _RefContentClient:
                 self._writer_value(writer_generation, status=status)
             ),
             "blob:writer:two",
+        )
+        tree[".gwo/v8/active-plan.json"] = self._content_type(
+            canonical_bytes(self._activation_value(writer_generation)),
+            "blob:activation:two",
         )
         self.head = f"commit:{len(self._commits) + 1}"
         self._commits[self.head] = tree
@@ -673,7 +764,7 @@ def test_rp3_2_governed_objects_recover_a_fresh_plancontrol_host(tmp_path):
 
     root = client._commits[client.head][".gwo-v8/plan-control-v3.json"]
     index = load_canonical_json(root.content)
-    assert index["schema_version"] == "gwo.plan.github-index.v3"
+    assert index["schema_version"] == "gwo.plan.github-index.v4"
     assert len(root.content) < 4096
     assert "snapshot_bytes_base64" not in root.content.decode("utf-8")
     assert any(
@@ -1536,3 +1627,365 @@ def test_rp4_12_in_memory_activation_cas_is_lock_serialized():
     ]
     successor_results = race(successors)
     assert sorted(successor_results) == ["ACTIVATION_CAS_CONFLICT", "won"]
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("activation", "historical", "duplicate_json", "transition"),
+)
+def test_rp5_1_writer_ledger_is_complete_and_activation_bound(tamper):
+    from gwo_v8._canonical import canonical_bytes
+    from gwo_v8.plan_control import CampaignHandle, PlanControlError
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+
+    client = _RefContentClient()
+    tree = client._commits[client.head]
+    writer = client._writer_value("writer:one")
+    if tamper == "activation":
+        writer["records"][1]["activation_id"] = "activation:wrong"
+    elif tamper == "historical":
+        writer["records"][0]["canary_evidence_refs"] = "not-a-list"
+    elif tamper == "duplicate_json":
+        tree[".gwo-v8/writer-transition.json"] = client._content_type(
+            b'{"schema_version":1,"schema_version":1,"current":{},"records":[]}',
+            "blob:duplicate-writer",
+        )
+    else:
+        writer["records"].pop(0)
+    if tamper != "duplicate_json":
+        tree[".gwo-v8/writer-transition.json"] = client._content_type(
+            canonical_bytes(writer),
+            f"blob:writer-{tamper}",
+        )
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    with pytest.raises(PlanControlError):
+        repository.active_receipt(CampaignHandle("owner/repository", "campaign:one"))
+    assert client.writes == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "ready_refs",
+        "ticket_keys",
+        "planning_subject_digest",
+        "planning_stable_action_id",
+        "planning_preflight_receipt_digest",
+        "writer_generation",
+        "revision_digest",
+    ),
+)
+def test_rp5_2_tampered_active_receipt_cannot_mutate_claims(tmp_path, field):
+    from dataclasses import replace
+
+    from gwo_v8.plan_control import InMemoryPlanRepository, PlanControl, PlanControlError
+    from gwo_v8.runtime_gateway import ArtifactStore
+
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    repository = InMemoryPlanRepository(writer_generation="writer:one")
+    control = PlanControl(
+        source=_PlanSource(),
+        artifacts=artifacts,
+        gateway=_PlanningGateway(artifacts),
+        repository=repository,
+    )
+    handle = control.start("owner/repository", ["issue:109"])
+    original = repository.active_receipt(handle)
+    replacements = {
+        "ready_refs": ("issue:110",),
+        "ticket_keys": ("issue:110",),
+        "planning_subject_digest": "9" * 64,
+        "planning_stable_action_id": "planning:forged",
+        "planning_preflight_receipt_digest": "8" * 64,
+        "writer_generation": "writer:forged",
+        "revision_digest": "7" * 64,
+    }
+    forged = replace(original, **{field: replacements[field]})
+    repository.activations[(handle.repository, handle.campaign_key)] = forged
+    repository.activation_receipts[
+        (
+            forged.repository,
+            forged.campaign_key,
+            forged.revision_digest,
+            forged.planning_stable_action_id,
+        )
+    ] = forged
+    repository.pending_reservations[repository._reservation_key(forged)] = forged
+    claims_before = dict(repository.claims)
+    owners_before = dict(repository._claim_campaigns)
+    pending_before = dict(repository.pending_reservations)
+    with pytest.raises(PlanControlError) as rejected:
+        control.start("owner/repository", ["issue:109"])
+    assert rejected.value.code in {
+        "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+        "PLAN_REVISION_PROVENANCE_INVALID",
+    }
+    assert repository.claims == claims_before
+    assert repository._claim_campaigns == owners_before
+    assert repository.pending_reservations == pending_before
+
+
+def test_rp5_2_tampered_pending_reservation_cannot_finalize_claims(tmp_path):
+    from dataclasses import replace
+
+    from gwo_v8.plan_control import InMemoryPlanRepository, PlanControl, PlanControlError
+    from gwo_v8.runtime_gateway import ArtifactStore
+
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    repository = InMemoryPlanRepository(writer_generation="writer:one")
+    control = PlanControl(source=_PlanSource(), artifacts=artifacts, gateway=_PlanningGateway(artifacts), repository=repository)
+    handle = control.start("owner/repository", ["issue:109"])
+    receipt = repository.active_receipt(handle)
+    repository.claims.clear()
+    repository._claim_campaigns.clear()
+    forged = replace(receipt, ticket_keys=("issue:110",))
+    repository.pending_reservations[repository._reservation_key(receipt)] = forged
+    before = dict(repository.pending_reservations)
+    with pytest.raises(PlanControlError) as rejected:
+        control.start("owner/repository", ["issue:109"])
+    assert rejected.value.code == "ACTIVE_PLAN_CROSS_BINDING_INVALID"
+    assert repository.claims == {}
+    assert repository.pending_reservations == before
+
+
+def test_rp5_3_draining_allows_only_proven_rollforward(tmp_path):
+    from gwo_v8.plan_control import PlanControlError
+    from gwo_v8.runtime_gateway import ArtifactStore
+
+    client = _RefContentClient()
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    control, repository, gateway = _ref_control(client, artifacts)
+    handle = control.start("owner/repository", ["issue:109"])
+    receipt = repository.active_receipt(handle)
+    # Model a post-activation crash: the Receipt is durable but claims have
+    # not yet been finalized.  Draining can perform only this exact recovery.
+    def crash_boundary(restored):
+        restored.claims.clear()
+        restored._claim_campaigns.clear()
+        restored.pending_reservations[restored._reservation_key(receipt)] = receipt
+
+    repository._mutate("test crash boundary", crash_boundary)
+    client.advance_writer("writer:one", status="draining")
+    assert control.start("owner/repository", ["issue:109"]) == handle
+    assert repository.read_claim_proofs(handle, receipt.revision_digest)
+    completed = repository.read_attempt(
+        handle,
+        receipt.expected_previous_revision_digest,
+    )
+    assert repository.save_attempt(completed) == completed
+    before_progress = gateway.progresses
+    with pytest.raises(PlanControlError) as rejected:
+        _ref_control(client, artifacts, source=_PlanSource("new work"))[0].start(
+            "owner/repository",
+            ["issue:109"],
+            campaign_key="campaign:new",
+        )
+    assert rejected.value.code == "WRITER_FENCE_CONFLICT"
+    assert gateway.progresses == before_progress
+
+
+def test_rp5_4_hydration_retries_one_stable_ref_and_rejects_changed_identity(tmp_path):
+    from gwo_v8.plan_control import PlanControlError
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.plan_control_host import ProductionPlanControlStartHost
+    from gwo_v8.runtime_gateway import ProfileMapping, RuntimeConfiguration
+    from gwo_v8.runtime_profile import RuntimeProfile
+
+    profile = RuntimeProfile(name="coordinator", provider="test", model="model:test", thinking="high", mode="safe", features={})
+    client = _RefContentClient()
+
+    def make_host(name):
+        repository = GitHubPlanRepository(client, repository="owner/repository", branch="gwo-control", writer_generation="writer:one", maximum_state_bytes=4096)
+        return ProductionPlanControlStartHost(
+            source=_PlanSource(),
+            repository=repository,
+            runtime_configuration=RuntimeConfiguration(profiles={profile.digest: profile}, host_mappings={"coordinator": ProfileMapping(profile.digest)}),
+            repository_contexts={},
+            gateway_store_path=tmp_path / f"{name}.gateway.json",
+            artifact_root=tmp_path / f"{name}.artifacts",
+            _gateway_builder=lambda *, artifacts, **_kwargs: _PlanningGateway(artifacts),
+        )
+
+    waiting = make_host("waiting")
+    publisher = make_host("publisher")
+    handle = publisher.start("owner/repository", ["issue:109"])
+    repository = waiting._repository
+    original = repository._hydrate_repo_artifacts
+    changed = False
+
+    def stable_ref_refresh(repo, artifacts):
+        nonlocal changed
+        original(repo, artifacts)
+        if not changed:
+            changed = True
+            client.advance_writer("writer:one")
+
+    repository._hydrate_repo_artifacts = stable_ref_refresh
+    assert waiting.start("owner/repository", ["issue:109"]) == handle
+
+    fresh = make_host("changed")
+    original = fresh._repository._hydrate_repo_artifacts
+
+    def changed_identity(repo, artifacts):
+        original(repo, artifacts)
+        client.advance_writer("writer:other")
+
+    fresh._repository._hydrate_repo_artifacts = changed_identity
+    with pytest.raises(PlanControlError) as rejected:
+        fresh.start("owner/repository", ["issue:109"])
+    assert rejected.value.code in {
+        "DURABLE_STATE_CONCURRENT_CHANGE",
+        "WRITER_FENCE_CONFLICT",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    ("missing", "extra", "wrong_type", "wrong_repository", "wrong_source"),
+)
+def test_rp5_5_blockers_require_one_complete_bound_contract(tmp_path, mutate):
+    from gwo_v8.plan_control import InMemoryPlanRepository, PlanControl, PlanControlError
+    from gwo_v8.runtime_gateway import ArtifactStore
+
+    class BlockedSource(_PlanSource):
+        def snapshot(self, repository, refs):
+            value = super().snapshot(repository, refs)
+            blocker = _frozen_blocker()
+            if mutate == "missing":
+                blocker.pop("source")
+            elif mutate == "extra":
+                blocker["unexpected"] = True
+            elif mutate == "wrong_type":
+                blocker["state"] = 1
+            elif mutate == "wrong_repository":
+                blocker["repository"]["full_name"] = "other/repository"
+            else:
+                blocker["source"]["ref"] = "issue:999"
+            value["tickets"][0]["native_blockers"] = [blocker]
+            return value
+
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    repository = InMemoryPlanRepository(writer_generation="writer:one")
+    gateway = _PlanningGateway(artifacts)
+    with pytest.raises(PlanControlError) as rejected:
+        PlanControl(source=BlockedSource(), artifacts=artifacts, gateway=gateway, repository=repository).start("owner/repository", ["issue:109"])
+    assert rejected.value.code in {"SNAPSHOT_INVALID", "PLAN_CONTROL_INVALID"}
+    assert gateway.preflights == 0 and gateway.progresses == 0
+    assert not repository.attempts and not repository.revisions and not repository.claims
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        ".gwo-v8/canary/state.json",
+        ".gwo-v8/runtime-gateway/state.json",
+        ".gwo-v8/legacy-writer-fence.json",
+        ".gwo-v8/plan-control-v2.json",
+        ".GWO-v8/plan-control-v3.json",
+        ".gwo-v8/plan-control-v3/objects/../index.json",
+    ),
+)
+def test_rp5_6_closed_gwo_namespace_registry_rejects_every_sibling(path):
+    from gwo_v8.plan_control import PlanControlError
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+
+    client = _RefContentClient()
+    with pytest.raises(PlanControlError) as rejected:
+        GitHubPlanRepository(
+            client,
+            repository="owner/repository",
+            branch="gwo-control",
+            writer_generation="writer:one",
+            path=path,
+        )
+    assert rejected.value.code == "PLAN_CONTROL_COMPOSITION_INVALID"
+    assert client.writes == []
+    GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+
+
+def test_rp5_7_installed_github_successor_fences_invalid_lineage(tmp_path):
+    from gwo_v8.plan_control import CampaignHandle, PlanControlError
+    from gwo_v8.plan_control_host import install_github_plan_control_start
+    from gwo_v8.runtime_gateway import ProfileMapping, RuntimeConfiguration
+    from gwo_v8.runtime_profile import RuntimeProfile
+
+    profile = RuntimeProfile(name="coordinator", provider="test", model="model:test", thinking="high", mode="safe", features={})
+    client = _RefContentClient()
+    issue = _IssueClient(body="Initial contract")
+    gateways = []
+
+    def builder(*, artifacts, **_kwargs):
+        gateway = _PlanningGateway(artifacts)
+        gateways.append(gateway)
+        return gateway
+
+    def host(name, source=issue):
+        return install_github_plan_control_start(
+            repository="owner/repository",
+            control_branch="gwo-control",
+            target_branch="main",
+            writer_generation="writer:one",
+            runtime_configuration=RuntimeConfiguration(profiles={profile.digest: profile}, host_mappings={"coordinator": ProfileMapping(profile.digest)}),
+            repository_contexts={},
+            gateway_store_path=tmp_path / f"{name}.gateway.json",
+            artifact_root=tmp_path / f"{name}.artifacts",
+            _content_client=client,
+            _issue_client=source,
+            _gateway_builder=builder,
+        )
+
+    first = host("first")
+    handle = first.start("owner/repository", ["issue:109"])
+    previous = first._repository.active_receipt(handle).revision_digest
+    issue.body = "Successor contract"
+    second = host("second")
+    assert second.start_successor(handle, ["issue:109"], expected_previous_revision_digest=previous) == handle
+    assert second.start_successor(handle, ["issue:109"], expected_previous_revision_digest=previous) == handle
+    restarted = host("restarted")
+    assert restarted.start_successor(handle, ["issue:109"], expected_previous_revision_digest=previous) == handle
+    current = restarted._repository.active_receipt(handle).revision_digest
+    issue.body = "Concurrent successor contract"
+    from concurrent.futures import ThreadPoolExecutor
+
+    concurrent_hosts = (host("concurrent-a"), host("concurrent-b"))
+
+    def concurrent_start(candidate):
+        try:
+            return candidate.start_successor(
+                handle,
+                ["issue:109"],
+                expected_previous_revision_digest=current,
+            )
+        except PlanControlError as error:
+            return error.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(concurrent_start, concurrent_hosts))
+    assert any(outcome == handle for outcome in outcomes)
+    assert all(
+        outcome == handle
+        or outcome in {"DURABLE_CAS_CONFLICT", "ACTIVATION_CAS_CONFLICT"}
+        for outcome in outcomes
+    )
+    assert len(second._repository._read_repo().activation_receipts) == 3
+    progress_before = sum(item.progresses for item in gateways)
+    with pytest.raises(PlanControlError) as stale:
+        second.start_successor(handle, ["issue:109"], expected_previous_revision_digest="f" * 64)
+    assert stale.value.code == "ACTIVATION_CAS_CONFLICT"
+    with pytest.raises(PlanControlError) as missing:
+        second.start_successor(CampaignHandle("owner/repository", "campaign:missing"), ["issue:109"], expected_previous_revision_digest=previous)
+    assert missing.value.code == "ACTIVATION_CAS_CONFLICT"
+    with pytest.raises(PlanControlError) as foreign:
+        second.start_successor(CampaignHandle("other/repository", handle.campaign_key), ["issue:109"], expected_previous_revision_digest=previous)
+    assert foreign.value.code == "START_SUCCESSOR_INVALID"
+    assert sum(item.progresses for item in gateways) == progress_before

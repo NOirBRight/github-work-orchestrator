@@ -418,6 +418,16 @@ class ProductionPlanControlStartHost:
                 "START_SUCCESSOR_INVALID",
                 "successor start requires the exact existing CampaignHandle",
             )
+        fixed_repository = getattr(self._repository, "repository", None)
+        if (
+            type(fixed_repository) is str
+            and fixed_repository
+            and handle.repository != fixed_repository
+        ):
+            raise PlanControlError(
+                "START_SUCCESSOR_INVALID",
+                "successor CampaignHandle belongs to another configured repository",
+            )
         if (
             type(expected_previous_revision_digest) is not str
             or re.fullmatch(r"[0-9a-f]{64}", expected_previous_revision_digest)
@@ -426,6 +436,15 @@ class ProductionPlanControlStartHost:
             raise PlanControlError(
                 "START_SUCCESSOR_INVALID",
                 "successor start requires the exact previous Plan Revision digest",
+            )
+        # Reject a nonexistent Campaign before source readback, #111
+        # configuration, semantic Planning, Artifact publication, or claims.
+        # PlanControl repeats the complete predecessor/replay proof before its
+        # first mutation, so this shallow host fence cannot diverge from it.
+        if self._repository.active_receipt(handle) is None:
+            raise PlanControlError(
+                "ACTIVATION_CAS_CONFLICT",
+                "successor start requires an existing active Campaign receipt",
             )
         raw_refs = _ready_refs(ready_refs)
         canonicalizer = getattr(self._source, "canonical_ready_refs", None)

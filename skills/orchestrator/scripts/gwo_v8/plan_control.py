@@ -271,6 +271,11 @@ class PlanControlRepository(Protocol):
 
     def finalize_claims(self, receipt: ActivationReceipt) -> None: ...
 
+    def read_pending_reservation(
+        self,
+        receipt: ActivationReceipt,
+    ) -> ActivationReceipt | None: ...
+
     def read_activation(self, handle: CampaignHandle) -> ActivationReceipt | None: ...
 
     def read_claim_proofs(
@@ -771,6 +776,13 @@ class InMemoryPlanRepository:
                 self.pending_reservations.pop(key, None)
 
     @_repository_locked
+    def read_pending_reservation(
+        self,
+        receipt: ActivationReceipt,
+    ) -> ActivationReceipt | None:
+        return self.pending_reservations.get(self._reservation_key(receipt))
+
+    @_repository_locked
     def read_activation(self, handle: CampaignHandle) -> ActivationReceipt | None:
         return self.active_receipt(handle)
 
@@ -826,7 +838,43 @@ class PlanControl:
         key = campaign_key or "campaign:" + digest_value({"repository": repository, "ready_refs": list(refs)})[:24]
         handle = CampaignHandle(repository, _text(key, "campaign_key"))
         active = self._repository.active_receipt(handle)
+        if expected_previous_revision_digest is _AUTO_PREVIOUS:
+            expected: str | None | object = _AUTO_PREVIOUS
+        else:
+            expected = _optional_digest(
+                expected_previous_revision_digest,
+                "expected_previous_revision_digest",
+            )
+            # A successor is a recovery of one exact Campaign lineage, not a
+            # second start spelling.  Reject a nonexistent, stale, or foreign
+            # handle before source capture, preflight, Planning, publication,
+            # claims, or even unrelated roll-forward mutation.
+            if active is None:
+                raise PlanControlError(
+                    "ACTIVATION_CAS_CONFLICT",
+                    "Successor request names a Campaign with no active Plan Revision",
+                )
+            if active.revision_digest != expected:
+                replay = self._repository.read_attempt(handle, expected)
+                if (
+                    type(replay) is not _PlanningAttempt
+                    or replay.revision is None
+                    or active.expected_previous_revision_digest != expected
+                    or replay.revision.digest != active.revision_digest
+                ):
+                    raise PlanControlError(
+                        "ACTIVATION_CAS_CONFLICT",
+                        "Successor request names a stale previous Plan Revision digest",
+                    )
         if active is not None:
+            # This is deliberately before every claim-finalization path.  A
+            # topologically plausible forged receipt must never seize Ticket
+            # claims merely because it happens to be current.
+            self._validate_active_receipt(
+                handle,
+                receipt=active,
+                require_claims=False,
+            )
             self._repository.finalize_claims(active)
         if expected_previous_revision_digest is _AUTO_PREVIOUS:
             if active is not None and active.ready_refs == refs:
@@ -866,16 +914,7 @@ class PlanControl:
                 return handle
             expected = None if active is None else active.revision_digest
         else:
-            expected = _optional_digest(expected_previous_revision_digest, "expected_previous_revision_digest")
-            if (
-                active is not None
-                and active.revision_digest != expected
-                and self._repository.read_attempt(handle, expected) is None
-            ):
-                raise PlanControlError(
-                    "ACTIVATION_CAS_CONFLICT",
-                    "Successor request names a stale previous Plan Revision digest",
-                )
+            assert expected is not _AUTO_PREVIOUS
 
         split_decision = self._repository.read_split_decision(handle, expected)
         if split_decision is not None:
@@ -965,6 +1004,11 @@ class PlanControl:
         # predecessor.  Do not ask it to recreate a consumed reservation.
         current = self._repository.active_receipt(handle)
         if current == receipt:
+            self._validate_active_receipt(
+                handle,
+                receipt=current,
+                require_claims=False,
+            )
             self._repository.finalize_claims(current)
             self.read_active(handle)
             return handle
@@ -979,6 +1023,11 @@ class PlanControl:
         self._repository.activate(receipt)
         if self._repository.read_activation(handle) != receipt:
             raise PlanControlError("ACTIVATION_READBACK_INVALID", "Activation Receipt does not read back exactly")
+        self._validate_active_receipt(
+            handle,
+            receipt=receipt,
+            require_claims=False,
+        )
         self._repository.finalize_claims(receipt)
         return handle
 
@@ -989,11 +1038,75 @@ class PlanControl:
         It deliberately has no transition or recovery behavior.
         """
 
+        return self._validate_active_receipt(handle, require_claims=True)
+
+    def _validate_active_receipt(
+        self,
+        handle: CampaignHandle,
+        *,
+        receipt: ActivationReceipt | None = None,
+        require_claims: bool,
+        _allow_hydration_retry: bool = True,
+    ) -> ActivePlanReadback:
+        """Validate every active binding before exposing or mutating it.
+
+        The same closed reconstruction guards ordinary active reads, replay,
+        crash roll-forward, and the claim-finalization precondition.  Keeping
+        that ordering here prevents a forged current pointer from taking a
+        claim before later readback happens to reject it.
+        """
+
         if type(handle) is not CampaignHandle:
             raise PlanControlError("ACTIVE_READBACK_INVALID", "active readback requires an exact CampaignHandle")
-        receipt = self._repository.read_activation(handle)
+        observed = self._repository.read_activation(handle)
+        if receipt is None:
+            receipt = observed
+        elif observed != receipt:
+            raise PlanControlError(
+                "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+                "Activation Receipt changed before its complete cross-binding validation",
+            )
         if receipt is None:
             raise PlanControlError("ACTIVATION_PENDING", "Campaign has no read-backed Activation Receipt")
+        try:
+            return self._validate_active_receipt_once(
+                handle,
+                receipt,
+                require_claims=require_claims,
+            )
+        except PlanControlError as error:
+            refresher = getattr(self._repository, "hydrate_active_artifacts", None)
+            artifact_codes = {
+                "SNAPSHOT_READBACK_INVALID",
+                "POLICY_WITNESS_INVALID",
+                "PLANNING_REQUEST_INVALID",
+                "COMPILATION_RECORD_INVALID",
+                "RUNTIME_PLANNING_OUTPUT_INVALID",
+                "PLAN_READBACK_INVALID",
+            }
+            if (
+                not _allow_hydration_retry
+                or error.code not in artifact_codes
+                or not callable(refresher)
+            ):
+                raise
+            # A production GitHub repository refreshes from one exact control
+            # ref and proves the same active identity before this sole retry.
+            refresher(self._artifacts, handle, receipt)
+            return self._validate_active_receipt(
+                handle,
+                receipt=receipt,
+                require_claims=require_claims,
+                _allow_hydration_retry=False,
+            )
+
+    def _validate_active_receipt_once(
+        self,
+        handle: CampaignHandle,
+        receipt: ActivationReceipt,
+        *,
+        require_claims: bool,
+    ) -> ActivePlanReadback:
         if (
             type(receipt) is not ActivationReceipt
             or receipt.repository != handle.repository
@@ -1041,6 +1154,17 @@ class PlanControl:
                 "Activation Receipt does not exactly bind its Planning attempt",
             )
         self._verify_attempt_artifacts(attempt)
+        snapshot = _snapshot_from_bytes(attempt.snapshot_bytes)
+        if (
+            tuple(ticket["key"] for ticket in snapshot["tickets"])
+            != attempt.ticket_keys
+            or tuple(sorted(ticket["source"]["ref"] for ticket in snapshot["tickets"]))
+            != attempt.ready_refs
+        ):
+            raise PlanControlError(
+                "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+                "Planning attempt Ticket and ready-reference sets differ from its frozen snapshot",
+            )
         intent_bytes = self._read_compilation_record(attempt)
         compilation = _read_artifact_json(
             self._artifacts,
@@ -1104,22 +1228,31 @@ class PlanControl:
             handle,
             receipt.revision_digest,
         )
-        if (
-            type(active_proofs) is not tuple
-            or any(type(proof) is not TicketClaimProof for proof in active_proofs)
-            or tuple(proof.ticket_key for proof in active_proofs)
-            != receipt.ticket_keys
-            or any(
-                proof.repository != handle.repository
-                or proof.campaign_key != handle.campaign_key
-                or proof.plan_revision_digest != receipt.revision_digest
+        proofs_match = (
+            type(active_proofs) is tuple
+            and all(type(proof) is TicketClaimProof for proof in active_proofs)
+            and tuple(proof.ticket_key for proof in active_proofs)
+            == receipt.ticket_keys
+            and all(
+                proof.repository == handle.repository
+                and proof.campaign_key == handle.campaign_key
+                and proof.plan_revision_digest == receipt.revision_digest
                 for proof in active_proofs
             )
-        ):
-            raise PlanControlError(
-                "ACTIVE_PLAN_CROSS_BINDING_INVALID",
-                "Activated Ticket claims do not exactly bind the active Campaign and Plan Revision",
-            )
+        )
+        if require_claims:
+            if not proofs_match:
+                raise PlanControlError(
+                    "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+                    "Activated Ticket claims do not exactly bind the active Campaign and Plan Revision",
+                )
+        else:
+            pending = self._repository.read_pending_reservation(receipt)
+            if not proofs_match and pending != receipt:
+                raise PlanControlError(
+                    "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+                    "Active Campaign has neither exact finalized claims nor its exact pending reservation",
+                )
         return ActivePlanReadback(
             handle,
             receipt.revision_digest,
@@ -1987,7 +2120,7 @@ def _normalize_ticket_contract(
     }
 
 
-def _normalize_ticket(value: Any) -> dict[str, Any]:
+def _normalize_ticket(value: Any, *, repository: str) -> dict[str, Any]:
     expected = {"key", "labels", "source", "contract", "native_blockers"}
     if type(value) is not dict or set(value) != expected:
         raise PlanControlError("SNAPSHOT_INVALID", "Ticket snapshot schema is invalid")
@@ -2006,46 +2139,64 @@ def _normalize_ticket(value: Any) -> dict[str, Any]:
         raise PlanControlError("SNAPSHOT_INVALID", "native_blockers must be a list")
     canonical_blockers = []
     for blocker in blockers:
-        if type(blocker) is not dict or set(blocker) not in (
-            {"key", "state"},
-            {"key", "state", "repository", "source"},
-        ):
+        if type(blocker) is not dict or set(blocker) != {
+            "key",
+            "state",
+            "repository",
+            "source",
+        }:
             raise PlanControlError("SNAPSHOT_INVALID", "native blocker schema is invalid")
         state = _text(blocker["state"], "native blocker state").lower()
         if state not in {"open", "closed"}:
             raise PlanControlError("SNAPSHOT_INVALID", "native blocker state is invalid")
+        blocker_key = _text(blocker["key"], "native blocker key")
+        if re.fullmatch(r"issue:[1-9][0-9]*", blocker_key) is None:
+            raise PlanControlError(
+                "SNAPSHOT_INVALID",
+                "native blocker key must be one canonical Issue identity",
+            )
         normalized_blocker = {
-            "key": _text(blocker["key"], "native blocker key"),
+            "key": blocker_key,
             "state": state,
         }
-        if "repository" in blocker:
-            blocker_repository = blocker["repository"]
-            if (
-                type(blocker_repository) is not dict
-                or set(blocker_repository) != {"full_name", "url"}
-            ):
-                raise PlanControlError(
-                    "SNAPSHOT_INVALID",
-                    "native blocker repository identity is invalid",
-                )
-            normalized_blocker.update(
-                {
-                    "repository": {
-                        "full_name": _text(
-                            blocker_repository["full_name"],
-                            "native blocker repository full_name",
-                        ),
-                        "url": _text(
-                            blocker_repository["url"],
-                            "native blocker repository URL",
-                        ),
-                    },
-                    "source": _frozen_ref(
-                        blocker["source"],
-                        "native blocker source",
-                    ),
-                }
+        blocker_repository = blocker["repository"]
+        if (
+            type(blocker_repository) is not dict
+            or set(blocker_repository) != {"full_name", "url"}
+            or blocker_repository["full_name"] != repository
+            or blocker_repository["url"]
+            != f"https://api.github.com/repos/{repository}"
+        ):
+            raise PlanControlError(
+                "SNAPSHOT_INVALID",
+                "native blocker repository identity is invalid",
             )
+        source = _frozen_ref(
+            blocker["source"],
+            "native blocker source",
+        )
+        source_binding = {
+            "key": blocker_key,
+            "state": state,
+            "repository": {
+                "full_name": repository,
+                "url": f"https://api.github.com/repos/{repository}",
+            },
+        }
+        if (
+            source["ref"] != blocker_key
+            or source["digest"] != digest_value(source_binding)
+        ):
+            raise PlanControlError(
+                "SNAPSHOT_INVALID",
+                "native blocker source does not bind its complete frozen contract",
+            )
+        normalized_blocker.update(
+            {
+                "repository": source_binding["repository"],
+                "source": source,
+            }
+        )
         canonical_blockers.append(normalized_blocker)
     if len({item["key"] for item in canonical_blockers}) != len(canonical_blockers):
         raise PlanControlError("SNAPSHOT_INVALID", "native blockers repeat a Ticket")
@@ -2063,7 +2214,13 @@ def _normalize_snapshot(value: Any, repository: str, refs: tuple[str, ...]) -> d
     expected = {"repository", "target_branch", "campaign_source", "policy", "tickets"}
     if type(value) is not dict or set(value) != expected or value["repository"] != repository or type(value["tickets"]) is not list:
         raise PlanControlError("SNAPSHOT_INVALID", "Campaign snapshot schema or repository is invalid")
-    tickets = sorted((_normalize_ticket(ticket) for ticket in value["tickets"]), key=lambda item: item["key"])
+    tickets = sorted(
+        (
+            _normalize_ticket(ticket, repository=repository)
+            for ticket in value["tickets"]
+        ),
+        key=lambda item: item["key"],
+    )
     keys = tuple(ticket["key"] for ticket in tickets)
     source_refs = tuple(sorted(ticket["source"]["ref"] for ticket in tickets))
     if (
