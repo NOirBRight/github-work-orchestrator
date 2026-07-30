@@ -34,7 +34,6 @@ from ._canonical import (
     canonical_bytes,
     digest_value,
     load_canonical_json,
-    strict_json_loads,
 )
 from .runtime_profile import (
     RuntimeProfile,
@@ -4298,7 +4297,7 @@ class _PaseoCliTransport:
         if not stdout.strip():
             return {}
         try:
-            return strict_json_loads(stdout)
+            return load_canonical_json(stdout)
         except CanonicalJsonError as error:
             raise ValueError("Paseo JSON response is invalid") from error
 
@@ -4353,7 +4352,7 @@ class _PaseoCliTransport:
             if len(payload.encode("utf-8")) > _MAXIMUM_PASEO_ERROR_JSON_BYTES:
                 continue
             try:
-                candidate = strict_json_loads(payload)
+                candidate = load_canonical_json(payload)
             except CanonicalJsonError:
                 continue
             if isinstance(candidate, dict) and isinstance(candidate.get("error"), dict):

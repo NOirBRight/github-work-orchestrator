@@ -3251,18 +3251,33 @@ def test_production_preflight_validates_fallback_and_repository_context_before_p
 
 def test_paseo_nonzero_json_error_taxonomy_never_treats_permanent_rejection_as_transport(monkeypatch):
     daemon = _PaseoCliTransport._nonzero_failure(
-        json.dumps({"error": {"code": "DAEMON_NOT_RUNNING", "message": "native detail"}}),
+        canonical_module.canonical_bytes(
+            {"error": {"code": "DAEMON_NOT_RUNNING", "message": "native detail"}}
+        ).decode("utf-8"),
         "",
     )
     assert daemon.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
 
     for code, expected in (("PERMISSION_NOT_FOUND", "RUNTIME_PERMISSION_REQUEST_UNKNOWN"), ("UNKNOWN_COMMAND", "RUNTIME_PROVIDER_COMMAND_FAILED")):
         permanent = _PaseoCliTransport._nonzero_failure(
-            json.dumps({"error": {"code": code, "message": "native detail"}}),
+            canonical_module.canonical_bytes(
+                {"error": {"code": code, "message": "native detail"}}
+            ).decode("utf-8"),
             "",
         )
         assert permanent.code == expected
         assert "native detail" not in permanent.detail
+
+
+@pytest.mark.parametrize("stream", ("stdout", "stderr"))
+def test_paseo_nonzero_error_envelope_requires_canonical_json(stream):
+    noncanonical = '{"error":{"code":"DAEMON_NOT_RUNNING","message":"native detail"} }'
+    stdout, stderr = (noncanonical, "") if stream == "stdout" else ("", noncanonical)
+
+    rejected = _PaseoCliTransport._nonzero_failure(stdout, stderr)
+
+    assert rejected.code == "RUNTIME_PROVIDER_COMMAND_FAILED"
+    assert rejected.detail == "Paseo command was rejected"
 
 
 @pytest.mark.parametrize(
@@ -4419,6 +4434,9 @@ def _write_paseo_transport_helper(tmp_path: Path) -> Path:
                 "elif mode == 'invalid-utf8':",
                 "    sys.stdout.buffer.write(b'\\xff')",
                 "    sys.stdout.buffer.flush()",
+                "elif mode == 'noncanonical-json':",
+                "    sys.stdout.buffer.write(b'{\"response\":true }')",
+                "    sys.stdout.buffer.flush()",
                 "elif mode == 'inherited-pipe':",
                 "    child = subprocess.Popen(",
                 "        [sys.executable, '-c', 'import time; time.sleep(1)'],",
@@ -4472,6 +4490,14 @@ def test_paseo_transport_timeout_and_strict_utf8_taxonomy(tmp_path):
     strict_transport = _PaseoCliTransport(sys.executable, timeout_seconds=10)
     with pytest.raises(ValueError, match="UTF-8"):
         strict_transport._run([str(helper), "invalid-utf8"])
+
+
+def test_paseo_transport_success_response_requires_canonical_json(tmp_path):
+    helper = _write_paseo_transport_helper(tmp_path)
+    transport = _PaseoCliTransport(sys.executable, timeout_seconds=10)
+
+    with pytest.raises(ValueError, match="Paseo JSON response is invalid"):
+        transport._run([str(helper), "noncanonical-json"])
 
 
 def test_paseo_transport_parent_exit_with_inherited_pipe_is_bounded_and_reaped(
