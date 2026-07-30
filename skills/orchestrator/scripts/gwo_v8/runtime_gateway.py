@@ -7887,18 +7887,18 @@ class RuntimeGateway:
             receipt_digest=receipt_digest,
         )
 
-    def _campaign_start_assertion(
+    def _campaign_start_assertion_identity(
         self,
         repository: str,
         campaign_key: str,
         campaign_handle: str,
-    ) -> CampaignStartRuntimeOverrides | None:
-        """Host-only recovery of #111's authoritative Campaign binding.
+    ) -> str | None:
+        """Host-only opaque proof of #111's authoritative Campaign binding.
 
-        This deliberately is not a RuntimeGateway caller operation.  The host
-        uses it only after preflight, to reconstruct a missing PlanControl
-        mirror from the already validated Gateway journal rather than inventing
-        a replacement assertion from local defaults.
+        This deliberately exposes neither Runtime Profile nor fallback or
+        Ticket override material.  The host may prove/reuse a Campaign-start
+        assertion by its opaque identity, while RuntimeGateway remains its
+        sole durable owner.
         """
 
         if any(
@@ -7924,7 +7924,90 @@ class RuntimeGateway:
             )
         # ``_refresh`` has already proven the complete campaign/preflight
         # cross-binding and canonical override digest before this projection.
-        return _campaign_overrides_from_value(campaign["overrides"])
+        overrides_digest = campaign.get("overrides_digest")
+        if (
+            type(overrides_digest) is not str
+            or _DIGEST_RE.fullmatch(overrides_digest) is None
+            or overrides_digest != digest_value(campaign.get("overrides"))
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID",
+                "Campaign assertion opaque identity is invalid",
+            )
+        return digest_value(
+            {
+                "repository": repository,
+                "campaign_key": campaign_key,
+                "campaign_handle": campaign_handle,
+                "overrides_digest": overrides_digest,
+            }
+        )
+
+    def _planning_readback(
+        self,
+        subject: CampaignPlanningSubject,
+        preflight: PlanningPreflightReceipt,
+    ) -> PlanningReceipt:
+        """Recover one already-materialized Planning action without effects.
+
+        Unlike ``progress``, this seam never prepares, starts, resumes, or
+        sends a command.  It is intentionally private host recovery plumbing
+        for a draining Writer that may only read the exact durable #111 action
+        that was reserved before drain.
+        """
+
+        if type(subject) is not CampaignPlanningSubject:
+            raise RuntimeGatewayError(
+                "RUNTIME_PREFLIGHT_SUBJECT_INVALID",
+                "planning readback accepts CampaignPlanningSubject only",
+            )
+        self._assert_configuration_identity()
+        self._refresh()
+        persisted_preflight = self._require_preflight(subject, preflight)
+        record = self._data["actions"].get(subject.stable_action_id)
+        if type(record) is not dict:
+            raise RuntimeGatewayError(
+                "RUNTIME_ACTION_UNKNOWN",
+                "planning readback has no previously reserved Runtime action",
+            )
+        try:
+            persisted_subject = _subject_from_canonical(record.get("subject"))
+        except RuntimeGatewayError as error:
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID",
+                "planning readback action subject is invalid",
+            ) from error
+        if persisted_subject != subject:
+            raise RuntimeGatewayError(
+                "RUNTIME_PREFLIGHT_IDENTITY_MISMATCH",
+                "planning readback action belongs to another Campaign subject",
+            )
+        self._assignment_for_progress(subject, persisted_preflight)
+        verdict = self._observe_verdict(subject.stable_action_id)
+        if verdict.kind in _RUNTIME_OBSERVATION_FAILURE_VERDICT_KINDS:
+            assert verdict.failure is not None
+            self._raise_failure(verdict.failure)
+        if verdict.kind != "bound":
+            raise RuntimeGatewayError(
+                "RUNTIME_BINDING_MISSING",
+                "planning readback has no existing bound Runtime action",
+            )
+        observation = verdict.observation
+        assert observation is not None
+        self._validate_bound_observation(subject, record, observation)
+        # A provider observation is read-only; no journal write or Runtime
+        # command occurs on this path.
+        receipt = self._progress_receipt(
+            subject,
+            verdict,
+            command=None,
+        )
+        if type(receipt) is not PlanningReceipt:
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID",
+                "planning readback did not reconstruct a Planning receipt",
+            )
+        return receipt
 
     # Caller interface operation 2.  This owns the entire readback-first
     # prepare/observe/start-or-resume loop; callers cannot issue provider

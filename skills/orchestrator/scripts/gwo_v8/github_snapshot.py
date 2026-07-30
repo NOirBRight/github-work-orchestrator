@@ -9,7 +9,7 @@ from typing import Any, Mapping, Protocol
 
 from ._canonical import CanonicalJsonError, digest_value, strict_json_loads
 from .activation import GitHubContentClient
-from .plan_control import PlanControlError
+from .plan_control import PlanControlError, frozen_ticket_contract_digest
 
 
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -723,6 +723,7 @@ class GitHubReadySnapshotSource:
         complete_contract = {
             "id": issue_contract["id"],
             "node_id": issue_contract["node_id"],
+            "number": issue_contract["number"],
             "title": issue_contract["title"],
             "body": issue_contract["body"],
             "state": issue_contract["state"],
@@ -734,19 +735,18 @@ class GitHubReadySnapshotSource:
             "updated_at": issue_contract["updated_at"],
         }
         canonical_blockers = sorted(blockers, key=lambda item: item["key"])
-        frozen_contract = {
-            "number": number,
-            "contract": complete_contract,
-            "labels": labels,
-            "source_ref": ready_ref,
-            "native_blockers": canonical_blockers,
-        }
+        key = f"issue:{number}"
         return {
-            "key": f"issue:{number}",
+            "key": key,
             "labels": labels,
             "source": {
-                "ref": ready_ref,
-                "digest": digest_value(frozen_contract),
+                "ref": key,
+                "digest": frozen_ticket_contract_digest(
+                    key=key,
+                    contract=complete_contract,
+                    labels=labels,
+                    native_blockers=canonical_blockers,
+                ),
             },
             "contract": complete_contract,
             "native_blockers": canonical_blockers,

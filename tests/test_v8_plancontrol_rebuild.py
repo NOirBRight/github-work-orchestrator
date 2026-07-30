@@ -74,6 +74,7 @@ def test_plan_control_preflights_before_claiming_or_planning():
 def _snapshot():
     import hashlib
     import json
+    from gwo_v8.plan_control import frozen_ticket_contract_digest
 
     policy = {
         "schema_version": 1,
@@ -116,6 +117,33 @@ def _snapshot():
         "resolved_commit_oid": "a" * 40,
         "tree_oid": "b" * 40,
     }
+    contract = {
+        "id": 109,
+        "node_id": "ISSUE_109",
+        "number": 109,
+        "title": "Contract",
+        "body": "Do the work",
+        "state": "open",
+        "state_reason": None,
+        "type": None,
+        "repository": {
+            "full_name": "owner/repository",
+            "url": "https://api.github.com/repos/owner/repository",
+        },
+        "labels": [
+            {
+                "id": 1,
+                "node_id": "LABEL_1",
+                "url": "https://api.github.com/repos/owner/repository/labels/ready-for-agent",
+                "name": "ready-for-agent",
+                "color": "0052cc",
+                "default": False,
+                "description": "ready",
+            }
+        ],
+        "comments": [],
+        "updated_at": "2026-07-30T00:00:00Z",
+    }
     return {
         "repository": "owner/repository",
         "target_branch": "main",
@@ -134,33 +162,16 @@ def _snapshot():
             {
                 "key": "issue:109",
                 "labels": ["ready-for-agent"],
-                "source": {"ref": "issue:109", "digest": "2" * 64},
-                "contract": {
-                    "id": 109,
-                    "node_id": "ISSUE_109",
-                    "title": "Contract",
-                    "body": "Do the work",
-                    "state": "open",
-                    "state_reason": None,
-                    "type": None,
-                    "repository": {
-                        "full_name": "owner/repository",
-                        "url": "https://api.github.com/repos/owner/repository",
-                    },
-                    "labels": [
-                        {
-                            "id": 1,
-                            "node_id": "LABEL_1",
-                            "url": "https://api.github.com/repos/owner/repository/labels/ready-for-agent",
-                            "name": "ready-for-agent",
-                            "color": "0052cc",
-                            "default": False,
-                            "description": "ready",
-                        }
-                    ],
-                    "comments": [],
-                    "updated_at": "2026-07-30T00:00:00Z",
+                "source": {
+                    "ref": "issue:109",
+                    "digest": frozen_ticket_contract_digest(
+                        key="issue:109",
+                        contract=contract,
+                        labels=["ready-for-agent"],
+                        native_blockers=[],
+                    ),
                 },
+                "contract": contract,
                 "native_blockers": [],
             }
         ],
@@ -391,33 +402,38 @@ def test_real_gateway_executes_the_closed_five_field_planning_protocol(tmp_path)
         "https://github.com/owner/repository/issues/109",
     ],
 )
-def test_ready_reference_is_distinct_from_the_canonical_ticket_key(ready_ref):
+def test_direct_snapshot_rejects_noncanonical_ticket_source_reference(ready_ref):
+    from gwo_v8.plan_control import PlanControlError
+
     snapshot = _snapshot()
     snapshot["tickets"][0]["source"]["ref"] = ready_ref
     control, _, _, repository = _control(source=_Source(snapshot))
 
-    handle = control.start("owner/repository", [ready_ref])
-    active = repository.active_receipt(handle)
-    plan = control.read_active(handle).plan_spec_bytes
-
-    from gwo_v8._canonical import load_canonical_json
-
-    assert active.ready_refs == (ready_ref,)
-    assert active.ticket_keys == ("issue:109",)
-    assert load_canonical_json(plan)["work"][0]["key"] == "issue:109"
+    with pytest.raises(PlanControlError) as rejected:
+        control.start("owner/repository", [ready_ref])
+    assert rejected.value.code == "SNAPSHOT_INVALID"
+    assert repository.attempts == {}
 
 
 def test_snapshot_source_refs_cover_each_requested_ready_ref_exactly_once():
-    from gwo_v8.plan_control import PlanControlError
+    from gwo_v8.plan_control import PlanControlError, frozen_ticket_contract_digest
 
     snapshot = _snapshot()
+    second_contract = dict(snapshot["tickets"][0]["contract"])
+    second_contract["number"] = 110
     second = {
         **snapshot["tickets"][0],
         "key": "issue:110",
         "source": {
-            **snapshot["tickets"][0]["source"],
-            "digest": "3" * 64,
+            "ref": "issue:110",
+            "digest": frozen_ticket_contract_digest(
+                key="issue:110",
+                contract=second_contract,
+                labels=["ready-for-agent"],
+                native_blockers=[],
+            ),
         },
+        "contract": second_contract,
     }
     snapshot["tickets"].append(second)
     control, _, _, repository = _control(source=_Source(snapshot))
@@ -716,6 +732,16 @@ def test_successor_revision_keeps_handle_and_uses_exact_previous_digest():
     previous = repository.active_receipt(first).revision_digest
     changed = _snapshot()
     changed["tickets"][0]["contract"]["body"] = "Changed frozen contract"
+    from gwo_v8.plan_control import frozen_ticket_contract_digest
+
+    changed["tickets"][0]["source"]["digest"] = (
+        frozen_ticket_contract_digest(
+            key="issue:109",
+            contract=changed["tickets"][0]["contract"],
+            labels=changed["tickets"][0]["labels"],
+            native_blockers=changed["tickets"][0]["native_blockers"],
+        )
+    )
     control, _, _, _ = _control(
         source=_Source(changed),
         artifacts=_artifacts,
@@ -766,6 +792,9 @@ def test_interleaved_successors_keep_old_claims_until_winning_activation_readbac
         planning_subject_digest="c" * 64,
         planning_stable_action_id="planning:loser",
         planning_preflight_receipt_digest="d" * 64,
+        compilation_record_artifact_digest="e" * 64,
+        planning_receipt_digest="f" * 64,
+        planning_output_artifact_digest="0" * 64,
     )
     winning = ActivationReceipt(
         repository=handle.repository,
@@ -778,6 +807,9 @@ def test_interleaved_successors_keep_old_claims_until_winning_activation_readbac
         planning_subject_digest="e" * 64,
         planning_stable_action_id="planning:winner",
         planning_preflight_receipt_digest="f" * 64,
+        compilation_record_artifact_digest="0" * 64,
+        planning_receipt_digest="1" * 64,
+        planning_output_artifact_digest="2" * 64,
     )
 
     for receipt in (losing, winning):
@@ -849,6 +881,23 @@ def test_claim_identity_is_repository_scoped_and_active_readback_is_campaign_sco
             }
             value["tickets"][0]["key"] = self.ticket_key
             value["tickets"][0]["source"]["ref"] = self.ticket_key
+            value["tickets"][0]["contract"]["number"] = int(
+                self.ticket_key.removeprefix("issue:")
+            )
+            value["tickets"][0]["contract"]["repository"] = {
+                "full_name": name,
+                "url": f"https://api.github.com/repos/{name}",
+            }
+            from gwo_v8.plan_control import frozen_ticket_contract_digest
+
+            value["tickets"][0]["source"]["digest"] = (
+                frozen_ticket_contract_digest(
+                    key=self.ticket_key,
+                    contract=value["tickets"][0]["contract"],
+                    labels=value["tickets"][0]["labels"],
+                    native_blockers=value["tickets"][0]["native_blockers"],
+                )
+            )
             return value
 
     def start(name, ticket_key, campaign_key):
@@ -1180,7 +1229,7 @@ def test_policy_authority_grants_are_role_specific_exact_allowlists(role, grant)
 
 def test_open_external_blocker_and_pending_planning_do_not_activate():
     from gwo_v8._canonical import digest_value
-    from gwo_v8.plan_control import PlanControlError
+    from gwo_v8.plan_control import PlanControlError, frozen_ticket_contract_digest
 
     blocked = _snapshot()
     blocker_contract = {
@@ -1200,6 +1249,14 @@ def test_open_external_blocker_and_pending_planning_do_not_activate():
             },
         }
     ]
+    blocked["tickets"][0]["source"]["digest"] = (
+        frozen_ticket_contract_digest(
+            key="issue:109",
+            contract=blocked["tickets"][0]["contract"],
+            labels=blocked["tickets"][0]["labels"],
+            native_blockers=blocked["tickets"][0]["native_blockers"],
+        )
+    )
     control, _, _, repository = _control(source=_Source(blocked))
     try:
         control.start("owner/repository", ["issue:109"])
@@ -1379,7 +1436,7 @@ def test_installed_public_start_persists_exact_runtime_overrides_outside_planspe
             ("issue:109", "worker"): ProfileMapping(alternate.digest)
         },
     )
-    assert repository.read_runtime_assertion(handle) == assertion.canonical()
+    assert not hasattr(repository, "runtime_assertions")
     key = (
         handle.repository,
         handle.campaign_key,
@@ -1448,9 +1505,7 @@ def test_public_start_binds_explicit_empty_runtime_assertion_after_preflight(
 
     handle = host.start("owner/repository", ["issue:109"])
 
-    assert repository.read_runtime_assertion(handle) == (
-        CampaignStartRuntimeOverrides().canonical()
-    )
+    assert not hasattr(repository, "runtime_assertions")
     assert len(gateways[0].preflights) == 1
 
 
@@ -1517,56 +1572,15 @@ def test_public_start_never_binds_runtime_assertion_before_exact_preflight(
             }
         )[:24],
     )
-    assert repository.read_runtime_assertion(handle) is None
+    assert not hasattr(repository, "runtime_assertions")
 
 
-def test_concurrent_runtime_assertion_binding_has_one_exact_cas_winner():
-    import threading
-
-    from gwo_v8.plan_control import (
-        CampaignHandle,
-        InMemoryPlanRepository,
-        PlanControlError,
-    )
+def test_rp6_6_plancontrol_has_no_runtime_assertion_storage():
+    from gwo_v8.plan_control import InMemoryPlanRepository
 
     repository = InMemoryPlanRepository(writer_generation="writer:one")
-    handle = CampaignHandle("owner/repository", "campaign:one")
-    barrier = threading.Barrier(2)
-    assertions = [
-        {"coordinator": None, "ticket_overrides": []},
-        {
-            "coordinator": {
-                "primary_profile_digest": "a" * 64,
-                "availability_fallback_profile_digest": None,
-            },
-            "ticket_overrides": [],
-        },
-    ]
-    outcomes = []
-
-    def bind(value):
-        barrier.wait()
-        try:
-            outcomes.append(
-                ("saved", repository.save_runtime_assertion(handle, value))
-            )
-        except PlanControlError as error:
-            outcomes.append(("error", error.code))
-
-    threads = [
-        threading.Thread(target=bind, args=(value,))
-        for value in assertions
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert sorted(outcome[0] for outcome in outcomes) == ["error", "saved"]
-    assert next(
-        outcome[1] for outcome in outcomes if outcome[0] == "error"
-    ) == "START_OPTIONS_CONFLICT"
-    assert repository.read_runtime_assertion(handle) in assertions
+    assert not hasattr(repository, "runtime_assertions")
+    assert not hasattr(repository, "save_runtime_assertion")
 
 
 class _GitHubPlanStateClient:
@@ -1684,7 +1698,6 @@ def test_github_plan_repository_survives_restart_and_lost_cas_acknowledgement(
 
     assert set(load_canonical_json(state.content)) >= {
         "attempts",
-        "runtime_assertions",
         "planning_reservations",
         "pending_reservations",
         "claims",

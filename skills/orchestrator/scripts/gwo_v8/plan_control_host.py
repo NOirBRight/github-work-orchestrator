@@ -50,25 +50,27 @@ _GatewayBuilder = Callable[..., Any]
 
 
 class _RuntimeAssertionCommitGateway:
-    """Commit the PlanControl mirror only after exact #111 preflight."""
+    """Keep #111 assertion ownership entirely inside RuntimeGateway."""
 
     def __init__(
         self,
         *,
         gateway: Any,
-        repository: PlanControlRepository,
         handle: CampaignHandle,
         assertion: CampaignStartRuntimeOverrides | None,
     ):
         self._gateway = gateway
-        self._repository = repository
         self._handle = handle
         self._assertion = None if assertion is None else assertion.canonical()
 
     def planning_preflight(self, subject):
         receipt = self._gateway.planning_preflight(subject)
         _validate_preflight(receipt, subject)
-        recovered = getattr(self._gateway, "_campaign_start_assertion", None)
+        recovered = getattr(
+            self._gateway,
+            "_campaign_start_assertion_identity",
+            None,
+        )
         if callable(recovered):
             try:
                 authoritative = recovered(
@@ -81,36 +83,26 @@ class _RuntimeAssertionCommitGateway:
                     "RUNTIME_PREFLIGHT_INVALID",
                     "RuntimeGateway could not recover its durable Campaign assertion",
                 ) from error
-            if type(authoritative) is not CampaignStartRuntimeOverrides:
+            if type(authoritative) is not str or not authoritative:
                 raise PlanControlError(
                     "RUNTIME_PREFLIGHT_INVALID",
-                    "RuntimeGateway preflight omitted its durable Campaign assertion",
+                    "RuntimeGateway preflight omitted its durable Campaign assertion identity",
                 )
-            assertion = authoritative.canonical()
-        elif self._assertion is not None:
-            # Boundary doubles implement the narrow #111 caller surface only.
-            # Production RuntimeGateway always supplies the recovery seam.
-            assertion = self._assertion
-        else:
-            assertion = CampaignStartRuntimeOverrides().canonical()
-        if self._assertion is not None and assertion != self._assertion:
-            raise PlanControlError(
-                "START_OPTIONS_CONFLICT",
-                "RuntimeGateway durable assertion conflicts with Campaign start input",
-            )
-        saved = self._repository.save_runtime_assertion(
-            self._handle,
-            assertion,
-        )
-        if saved != assertion:
-            raise PlanControlError(
-                "START_OPTIONS_CONFLICT",
-                "PlanControl Runtime assertion mirror did not read back exactly",
-            )
+        # The preflight has committed/read back the Gateway-owned assertion.
+        # PlanControl sees no Profile, fallback, or override projection.
         return receipt
 
     def progress(self, subject, preflight):
         return self._gateway.progress(subject, preflight)
+
+    def planning_readback(self, subject, preflight):
+        readback = getattr(self._gateway, "_planning_readback", None)
+        if not callable(readback):
+            raise PlanControlError(
+                "RUNTIME_PREFLIGHT_INVALID",
+                "RuntimeGateway omits the recovery-only Planning readback seam",
+            )
+        return readback(subject, preflight)
 
 
 def _mapping(value: Any, label: str) -> ProfileMapping:
@@ -267,21 +259,8 @@ class ProductionPlanControlStartHost:
             Path(artifact_root),
             maximum_bytes=maximum_artifact_bytes,
         )
-        hydrate = getattr(repository, "_hydrate_artifacts", None)
-        if callable(hydrate):
-            # Production GitHub PlanControl derives this cache from immutable
-            # governed objects.  A replacement host never trusts a prior
-            # machine's artifact directory as its durability source.
-            hydrate(self._artifacts)
         self._max_snapshot_bytes = max_snapshot_bytes
         self._gateway_builder = _gateway_builder or _production_gateway_builder
-
-    def _hydrate_governed_artifacts(self) -> None:
-        """Refresh the local cache before consuming remotely discovered facts."""
-
-        hydrate = getattr(self._repository, "_hydrate_artifacts", None)
-        if callable(hydrate):
-            hydrate(self._artifacts)
 
     def _control_for(
         self,
@@ -309,7 +288,6 @@ class ProductionPlanControlStartHost:
             artifacts=self._artifacts,
             gateway=_RuntimeAssertionCommitGateway(
                 gateway=gateway,
-                repository=self._repository,
                 handle=handle,
                 assertion=assertion,
             ),
@@ -346,7 +324,6 @@ class ProductionPlanControlStartHost:
         ready_refs: Sequence[str],
         options: object = None,
     ) -> CampaignHandle:
-        self._hydrate_governed_artifacts()
         if type(repository) is not str or not repository:
             raise PlanControlError(
                 "PLAN_CONTROL_INVALID",
@@ -364,11 +341,6 @@ class ProductionPlanControlStartHost:
         )[:24]
         handle = CampaignHandle(repository, campaign_key)
 
-        persisted_value = self._repository.read_runtime_assertion(handle)
-        persisted: CampaignStartRuntimeOverrides | None = None
-        if persisted_value is not None:
-            persisted = _runtime_overrides(persisted_value, refs)
-            _assert_profiles_are_composed(persisted, self._configuration)
         requested: CampaignStartRuntimeOverrides | None = None
         if options is not None:
             requested = _runtime_overrides(options, refs)
@@ -380,7 +352,7 @@ class ProductionPlanControlStartHost:
             _handle_ref(handle),
         )
         configured = self._configuration.campaign_assertions.get(assertion_key)
-        selected_assertion = requested or persisted or configured
+        selected_assertion = requested or configured
         if configured is not None and configured != selected_assertion:
             raise PlanControlError(
                 "START_OPTIONS_CONFLICT",
@@ -412,7 +384,6 @@ class ProductionPlanControlStartHost:
         durable #111 assertion is recovered rather than replaced.
         """
 
-        self._hydrate_governed_artifacts()
         if type(handle) is not CampaignHandle:
             raise PlanControlError(
                 "START_SUCCESSOR_INVALID",
@@ -437,15 +408,38 @@ class ProductionPlanControlStartHost:
                 "START_SUCCESSOR_INVALID",
                 "successor start requires the exact previous Plan Revision digest",
             )
-        # Reject a nonexistent Campaign before source readback, #111
-        # configuration, semantic Planning, Artifact publication, or claims.
-        # PlanControl repeats the complete predecessor/replay proof before its
-        # first mutation, so this shallow host fence cannot diverge from it.
-        if self._repository.active_receipt(handle) is None:
-            raise PlanControlError(
-                "ACTIVATION_CAS_CONFLICT",
-                "successor start requires an existing active Campaign receipt",
+        # Observe and prove the exact predecessor before hydration, source
+        # reads, Artifact writes, #111 preflight, or a PlanControl mutation.
+        observe = getattr(self._repository, "observe_campaign", None)
+        if callable(observe):
+            observation = observe(handle, expected_previous_revision_digest)
+            hydrate = getattr(self._repository, "hydrate_campaign_artifacts", None)
+            if callable(hydrate):
+                hydrate(self._artifacts, observation)
+        else:
+            active = self._repository.active_receipt(handle)
+            replay = (
+                None
+                if active is None
+                else self._repository.read_attempt(
+                    handle,
+                    expected_previous_revision_digest,
+                )
             )
+            if active is None or (
+                active.revision_digest != expected_previous_revision_digest
+                and (
+                    replay is None
+                    or getattr(replay, "revision", None) is None
+                    or active.expected_previous_revision_digest
+                    != expected_previous_revision_digest
+                    or replay.revision.digest != active.revision_digest
+                )
+            ):
+                raise PlanControlError(
+                    "ACTIVATION_CAS_CONFLICT",
+                    "successor start requires the exact existing active Campaign receipt",
+                )
         raw_refs = _ready_refs(ready_refs)
         canonicalizer = getattr(self._source, "canonical_ready_refs", None)
         refs = (
@@ -453,26 +447,16 @@ class ProductionPlanControlStartHost:
             if callable(canonicalizer)
             else raw_refs
         )
-        persisted_value = self._repository.read_runtime_assertion(handle)
-        persisted = (
-            None
-            if persisted_value is None
-            else _runtime_overrides(persisted_value, refs)
-        )
-        if persisted is not None:
-            _assert_profiles_are_composed(persisted, self._configuration)
         assertion_key = (
             handle.repository,
             handle.campaign_key,
             _handle_ref(handle),
         )
         configured = self._configuration.campaign_assertions.get(assertion_key)
-        if configured is not None and persisted is not None and configured != persisted:
-            raise PlanControlError(
-                "START_OPTIONS_CONFLICT",
-                "Campaign successor assertion conflicts with its durable binding",
-            )
-        assertion = persisted or configured
+        # RuntimeGateway reuses/authenticates its immutable initial assertion
+        # by Campaign identity.  Never parse its old Ticket overrides against
+        # a successor's changed selected set or persist them in PlanControl.
+        assertion = configured
         return self._control_for(
             handle=handle,
             assertion=assertion,

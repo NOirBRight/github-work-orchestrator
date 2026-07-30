@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import base64
 import json
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, TypeVar
 
-from ._canonical import canonical_bytes, digest_bytes, load_canonical_json
+from ._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
 from .activation import GitHubContentClient
 from .plan_control import (
     ActivationReceipt,
@@ -31,8 +31,8 @@ from .runtime_gateway import CampaignPlanningSubject
 from .transition import WriterTransitionRecord
 
 
-_STATE_SCHEMA = "gwo.plan.github-state.v2"
-_INDEX_SCHEMA = "gwo.plan.github-index.v4"
+_STATE_SCHEMA = "gwo.plan.github-state.v3"
+_INDEX_SCHEMA = "gwo.plan.github-index.v5"
 _OBJECT_SCHEMA = "gwo.plan.github-object.v1"
 _OBJECT_MANIFEST_SCHEMA = "gwo.plan.github-object-manifest.v1"
 _DEFAULT_PATH = ".gwo-v8/plan-control-v3.json"
@@ -51,7 +51,6 @@ _T = TypeVar("_T")
 _CATEGORY_NAMES = (
     "attempts",
     "split_decisions",
-    "runtime_assertions",
     "planning_reservations",
     "pending_reservations",
     "claims",
@@ -61,16 +60,232 @@ _CATEGORY_NAMES = (
 )
 
 
+@dataclass(frozen=True)
+class _WriterEdgeRule:
+    """One complete field partition for a legal Writer-lineage edge.
+
+    A field is never silently ignored: it is either copied byte-for-byte from
+    the predecessor, derived by the edge's state transition, or explicitly a
+    fresh-lineage value.  Keeping this beside the durable decoder makes the
+    Writer document a state machine rather than a collection of authority
+    checks.
+    """
+
+    invariant: frozenset[str]
+    derived: frozenset[str]
+    allowed: frozenset[str] = frozenset()
+
+
+_WRITER_RECORD_FIELDS = frozenset(WriterTransitionRecord.__dataclass_fields__)
+_WRITER_EDGE_RULES: dict[tuple[str | None, str], _WriterEdgeRule] = {
+    # There is no predecessor for the first pending V8 lineage.  Its closed
+    # status rule validates every field; the partition remains explicit so
+    # adding a WriterTransitionRecord field cannot create an unchecked root.
+    (None, "pending"): _WriterEdgeRule(
+        invariant=frozenset(),
+        derived=_WRITER_RECORD_FIELDS,
+    ),
+    ("pending", "cut_over"): _WriterEdgeRule(
+        invariant=frozenset(
+            {
+                "repository",
+                "writer_generation",
+                "plan_digest",
+                "canary_evidence_digest",
+                "canary_evidence_refs",
+                "canary_manifest_ref",
+                "reason",
+            }
+        ),
+        derived=frozenset(
+            {
+                "record_id",
+                "kind",
+                "status",
+                "previous_writer_generation",
+                "activation_id",
+                "worker_capacity",
+                "coordinator_capacity",
+                "created_at",
+            }
+        ),
+    ),
+    ("pending", "draining"): _WriterEdgeRule(
+        invariant=frozenset(
+            {
+                "repository",
+                "activation_id",
+                "plan_digest",
+                "canary_evidence_digest",
+                "canary_evidence_refs",
+                "canary_manifest_ref",
+            }
+        ),
+        derived=frozenset(
+            {
+                "record_id",
+                "kind",
+                "status",
+                "previous_writer_generation",
+                "writer_generation",
+                "worker_capacity",
+                "coordinator_capacity",
+                "reason",
+                "created_at",
+            }
+        ),
+    ),
+    ("cut_over", "draining"): _WriterEdgeRule(
+        invariant=frozenset(
+            {
+                "repository",
+                "previous_writer_generation",
+                "writer_generation",
+                "activation_id",
+                "plan_digest",
+                "canary_evidence_digest",
+                "canary_evidence_refs",
+                "canary_manifest_ref",
+            }
+        ),
+        derived=frozenset(
+            {
+                "record_id",
+                "kind",
+                "status",
+                "worker_capacity",
+                "coordinator_capacity",
+                "reason",
+                "created_at",
+            }
+        ),
+    ),
+    ("draining", "rolled_back"): _WriterEdgeRule(
+        invariant=frozenset(
+            {
+                "repository",
+                "activation_id",
+                "plan_digest",
+                "canary_evidence_refs",
+                "canary_manifest_ref",
+                "worker_capacity",
+                "coordinator_capacity",
+                "reason",
+            }
+        ),
+        derived=frozenset(
+            {
+                "record_id",
+                "kind",
+                "status",
+                "previous_writer_generation",
+                "writer_generation",
+                "canary_evidence_digest",
+                "created_at",
+            }
+        ),
+    ),
+    ("rolled_back", "pending"): _WriterEdgeRule(
+        invariant=frozenset({"repository"}),
+        derived=frozenset(
+            {
+                "record_id",
+                "kind",
+                "status",
+                "previous_writer_generation",
+                "activation_id",
+                "worker_capacity",
+                "coordinator_capacity",
+                "reason",
+                "created_at",
+            }
+        ),
+        allowed=frozenset(
+            {
+                "writer_generation",
+                "plan_digest",
+                "canary_evidence_digest",
+                "canary_evidence_refs",
+                "canary_manifest_ref",
+            }
+        ),
+    ),
+}
+
+if any(
+    rule.invariant | rule.derived | rule.allowed != _WRITER_RECORD_FIELDS
+    or (rule.invariant & rule.derived)
+    or (rule.invariant & rule.allowed)
+    or (rule.derived & rule.allowed)
+    for rule in _WRITER_EDGE_RULES.values()
+):  # pragma: no cover - import-time maintainer invariant
+    raise RuntimeError("Writer-lineage edge table does not classify every field")
+
+
 class WriterGenerationReadback(Protocol):
     def read_current(self, repository: str) -> object: ...
 
 
 class _WriterOperation(Enum):
-    """The complete production Writer-authority operation surface."""
+    """Closed PlanControl Writer operation and recovery surface."""
 
     READ = "read"
-    NEW_WORK = "new_work"
-    RECOVERY = "recovery"
+    NEW_ATTEMPT = "new_attempt"
+    NEW_RESERVATION = "new_reservation"
+    SEMANTIC_COMPLETION = "semantic_completion"
+    FIRST_PUBLICATION = "first_publication"
+    FIRST_ACTIVATION = "first_activation"
+    RECOVER_ATTEMPT = "recover_attempt"
+    RECOVER_RESERVATION = "recover_reservation"
+    RECOVER_PUBLICATION = "recover_publication"
+    RECOVER_ACTIVATION = "recover_activation"
+    FINALIZE_COMMITTED_CLAIMS = "finalize_committed_claims"
+
+
+@dataclass(frozen=True)
+class _CampaignObservation:
+    """One target Campaign's coherent control-ref read transaction."""
+
+    ref_digest: str
+    handle: CampaignHandle
+    receipt: ActivationReceipt
+    attempt: _PlanningAttempt
+    revision: PlanRevision
+    writer_authority: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class _StagedArtifactRef:
+    digest: str
+
+
+class _StagedArtifactCache:
+    """In-memory Artifact transaction used by coherent ref hydration.
+
+    A GitHub ref can advance while immutable objects are being read.  Collect
+    verified canonical values first and commit them to the host cache only
+    after the same target observation has been re-read.  This prevents a
+    rejected retry from leaving artifacts from a superseded control-ref view.
+    """
+
+    def __init__(self) -> None:
+        self._values: dict[str, Any] = {}
+
+    def put_canonical(self, value: Any) -> _StagedArtifactRef:
+        payload = canonical_bytes(value)
+        digest = digest_bytes(payload)
+        canonical = load_canonical_json(payload)
+        existing = self._values.get(digest)
+        if existing is not None and canonical_bytes(existing) != payload:
+            raise ValueError("staged Artifact digest collision")
+        self._values[digest] = canonical
+        return _StagedArtifactRef(digest)
+
+    def commit(self, artifacts: Any) -> None:
+        for digest, value in self._values.items():
+            reference = artifacts.put_canonical(value)
+            if getattr(reference, "digest", None) != digest:
+                raise ValueError("staged Artifact digest changed")
 
 
 def _governed_path(value: object, label: str) -> str:
@@ -467,7 +682,6 @@ def _empty_state(repository: str, writer_generation: str) -> dict[str, Any]:
         },
         "attempts": [],
         "split_decisions": [],
-        "runtime_assertions": [],
         "planning_reservations": [],
         "pending_reservations": [],
         "claims": [],
@@ -504,15 +718,6 @@ def _repo_value(
                 item["expected_previous_revision_digest"] or "",
             ),
         ),
-        "runtime_assertions": [
-            {
-                "campaign_key": campaign_key,
-                "assertion": value,
-            }
-            for (_repository, campaign_key), value in sorted(
-                repo.runtime_assertions.items()
-            )
-        ],
         "planning_reservations": sorted(
             (
                 _planning_value(item)
@@ -602,7 +807,6 @@ def _repo_from_state(
     list_fields = {
         "attempts",
         "split_decisions",
-        "runtime_assertions",
         "planning_reservations",
         "pending_reservations",
         "claims",
@@ -646,22 +850,6 @@ def _repo_from_state(
                     "Durable split-Campaign Decisions repeat or cross repositories",
                 )
             repo.split_decisions[key] = decision
-        for raw in state["runtime_assertions"]:
-            item = _exact(
-                raw,
-                {"campaign_key", "assertion"},
-                "Runtime assertion",
-            )
-            key = (
-                repository,
-                _text(item["campaign_key"], "Runtime assertion Campaign"),
-            )
-            if key in repo.runtime_assertions or type(item["assertion"]) is not dict:
-                raise PlanControlError(
-                    "DURABLE_STATE_INVALID",
-                    "Durable Runtime assertion is duplicated or malformed",
-                )
-            repo.runtime_assertions[key] = item["assertion"]
         for raw in state["planning_reservations"]:
             reservation = _planning_from(raw)
             key = repo._planning_reservation_key(reservation)
@@ -908,6 +1096,8 @@ def _writer_index_authority(authority: Mapping[str, str]) -> dict[str, str]:
         "activation_id",
         "plan_digest",
         "canary_evidence_digest",
+        "canary_evidence_refs_digest",
+        "canary_manifest_ref",
     }
     if not required.issubset(authority):
         raise PlanControlError(
@@ -1119,6 +1309,10 @@ class GitHubPlanRepository:
             "activation_id": record.activation_id or "",
             "plan_digest": record.plan_digest or "",
             "canary_evidence_digest": record.canary_evidence_digest or "",
+            "canary_evidence_refs_digest": digest_value(
+                list(record.canary_evidence_refs)
+            ),
+            "canary_manifest_ref": record.canary_manifest_ref or "",
         }
 
     def _decode_writer_records(
@@ -1221,6 +1415,41 @@ class GitHubPlanRepository:
             ]
             if len(active_matches) != 1:
                 raise ValueError("active activation")
+            # The Writer ledger has one immutable Plan-activation lineage as
+            # well.  A selected head is not enough: reject detached, forked,
+            # or replayed historical authority before a Writer record may bind
+            # to any of it.
+            by_plan: dict[str, dict[str, object]] = {}
+            successors: set[str] = set()
+            roots: list[str] = []
+            for receipt in receipts.values():
+                plan_digest = receipt["plan_digest"]
+                if plan_digest in by_plan:
+                    raise ValueError("duplicate activation plan")
+                by_plan[plan_digest] = receipt
+            for receipt in receipts.values():
+                predecessor = receipt["expected_previous_digest"]
+                if predecessor is None:
+                    roots.append(receipt["plan_digest"])
+                    continue
+                if predecessor not in by_plan or predecessor in successors:
+                    raise ValueError("activation predecessor")
+                successors.add(predecessor)
+            if len(roots) != 1:
+                raise ValueError("activation roots")
+            seen: set[str] = set()
+            cursor = active_matches[0]
+            while True:
+                plan_digest = cursor["plan_digest"]
+                if plan_digest in seen:
+                    raise ValueError("activation cycle")
+                seen.add(plan_digest)
+                predecessor = cursor["expected_previous_digest"]
+                if predecessor is None:
+                    break
+                cursor = by_plan[predecessor]
+            if seen != set(by_plan) or roots[0] not in seen:
+                raise ValueError("activation orphan")
             return receipts, active_matches[0]
         except Exception as error:
             raise PlanControlError(
@@ -1235,6 +1464,12 @@ class GitHubPlanRepository:
         receipts: Mapping[str, Mapping[str, object]],
         active: Mapping[str, object],
     ) -> None:
+        """Validate the complete append-only Writer lineage as one machine.
+
+        Every legal edge declares all fields as invariant, derived, or an
+        explicitly constrained change.  This avoids separate status checks
+        drifting into partial authority comparisons.
+        """
         if not records or len({record.record_id for record in records}) != len(records):
             raise PlanControlError(
                 "WRITER_FENCE_READBACK_INVALID",
@@ -1245,40 +1480,10 @@ class GitHubPlanRepository:
         for record in records:
             self._validate_writer_record(record, receipts)
             prior = previous_transition
-            if record.status == "pending":
-                if (
-                    record.kind != "cutover_pending"
-                    or (prior is not None and prior.status != "rolled_back")
-                ):
-                    raise PlanControlError("WRITER_FENCE_READBACK_INVALID", "Writer pending transition has no valid origin")
-            elif record.status == "cut_over":
-                if (
-                    prior is None
-                    or prior.status != "pending"
-                    or prior.writer_generation != record.writer_generation
-                    or prior.plan_digest != record.plan_digest
-                    or prior.canary_evidence_digest != record.canary_evidence_digest
-                    or prior.canary_manifest_ref != record.canary_manifest_ref
-                ):
-                    raise PlanControlError("WRITER_FENCE_READBACK_INVALID", "Writer cutover does not complete its exact pending transition")
-            elif record.status == "draining":
-                if (
-                    prior is None
-                    or prior.status != "cut_over"
-                    or prior.writer_generation != record.writer_generation
-                    or prior.activation_id != record.activation_id
-                    or prior.plan_digest != record.plan_digest
-                ):
-                    raise PlanControlError("WRITER_FENCE_READBACK_INVALID", "Writer drain does not follow its exact cutover")
-            elif record.status == "rolled_back":
-                if (
-                    prior is None
-                    or prior.status != "draining"
-                    or prior.writer_generation != record.previous_writer_generation
-                    or prior.activation_id != record.activation_id
-                    or prior.plan_digest != record.plan_digest
-                ):
-                    raise PlanControlError("WRITER_FENCE_READBACK_INVALID", "Writer rollback does not follow its exact drain")
+            if record.status == "blocked":
+                self._validate_writer_blocked(prior, record)
+            else:
+                self._validate_writer_edge(prior, record, receipts)
             if record.status in {"pending", "cut_over", "draining", "rolled_back"}:
                 if record.record_id in transitionable:
                     raise PlanControlError("WRITER_FENCE_READBACK_INVALID", "Writer transition history forks a record identity")
@@ -1298,6 +1503,117 @@ class GitHubPlanRepository:
             raise PlanControlError(
                 "WRITER_FENCE_CONFLICT",
                 "Writer current record is not bound to the authoritative active Activation Receipt",
+            )
+
+    @staticmethod
+    def _writer_fields_equal(
+        prior: WriterTransitionRecord,
+        record: WriterTransitionRecord,
+        fields: tuple[str, ...],
+        detail: str,
+    ) -> None:
+        if any(getattr(prior, field) != getattr(record, field) for field in fields):
+            raise PlanControlError("WRITER_FENCE_READBACK_INVALID", detail)
+
+    def _validate_writer_edge(
+        self,
+        prior: WriterTransitionRecord | None,
+        record: WriterTransitionRecord,
+        receipts: Mapping[str, Mapping[str, object]],
+    ) -> None:
+        """Closed transition table for every field of every active record."""
+        edge = (None if prior is None else prior.status, record.status)
+        rule = _WRITER_EDGE_RULES.get(edge)
+        if rule is None:
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "Writer transition history has an illegal status edge",
+            )
+        if prior is None:
+            # A root is a genuine V8 cutover, never a no-op rewrite of the
+            # legacy generation.  Its status validator supplies the remaining
+            # field constraints declared in the root table row.
+            if record.previous_writer_generation == record.writer_generation:
+                raise PlanControlError(
+                    "WRITER_FENCE_READBACK_INVALID",
+                    "Writer root pending transition did not change generation",
+                )
+            return
+        self._writer_fields_equal(
+            prior,
+            record,
+            tuple(sorted(rule.invariant)),
+            "Writer transition substituted an invariant lineage field",
+        )
+        if edge == ("pending", "cut_over"):
+            if (
+                record.writer_generation != prior.writer_generation
+                or record.previous_writer_generation != record.writer_generation
+                or record.activation_id is None
+            ):
+                raise PlanControlError(
+                    "WRITER_FENCE_READBACK_INVALID",
+                    "Writer cutover did not derive its generation and Activation fields",
+                )
+        elif edge == ("pending", "draining"):
+            if (
+                record.writer_generation != prior.writer_generation
+                or record.previous_writer_generation != prior.writer_generation
+            ):
+                raise PlanControlError(
+                    "WRITER_FENCE_READBACK_INVALID",
+                    "Writer pending drain did not preserve the V8 generation",
+                )
+        elif edge == ("cut_over", "draining"):
+            # All authority fields, including every canary reference, are
+            # invariant in this table row.  The status validator constrains
+            # capacities/reason without a second partial field comparison.
+            pass
+        elif edge == ("draining", "rolled_back"):
+            if (
+                record.previous_writer_generation != prior.writer_generation
+                or record.writer_generation == prior.writer_generation
+                or record.canary_evidence_digest is not None
+            ):
+                raise PlanControlError(
+                    "WRITER_FENCE_READBACK_INVALID",
+                    "Writer rollback did not derive its restored generation or evidence clearing",
+                )
+            if record.activation_id is not None:
+                receipt = receipts.get(record.activation_id)
+                if (
+                    receipt is None
+                    or receipt["writer_generation"] != prior.writer_generation
+                    or receipt["plan_digest"] != record.plan_digest
+                ):
+                    raise PlanControlError(
+                        "WRITER_FENCE_READBACK_INVALID",
+                        "Writer rollback is not bound to the V8 Activation it rolls back",
+                    )
+        elif edge == ("rolled_back", "pending"):
+            if (
+                record.previous_writer_generation != prior.writer_generation
+                or record.writer_generation == prior.writer_generation
+            ):
+                raise PlanControlError(
+                    "WRITER_FENCE_READBACK_INVALID",
+                    "Writer fresh pending transition does not start from rollback authority",
+                )
+
+    def _validate_writer_blocked(
+        self,
+        prior: WriterTransitionRecord | None,
+        record: WriterTransitionRecord,
+    ) -> None:
+        """Validate non-authority ledger entries without advancing lineage."""
+
+        expected_generation = (
+            "v6.1" if prior is None else prior.writer_generation
+        )
+        if record.previous_writer_generation != expected_generation:
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "Blocked Writer record does not bind the immediately preceding authority",
             )
 
     def _validate_writer_record(
@@ -1335,6 +1651,26 @@ class GitHubPlanRepository:
             or (record.reason is not None and not _nonempty_text(record.reason))
         ):
             raise PlanControlError("WRITER_FENCE_READBACK_INVALID", "Writer Transition Record has invalid closed fields")
+        identity = {
+            "repository": record.repository,
+            "kind": record.kind,
+            "status": record.status,
+            "previous_writer_generation": record.previous_writer_generation,
+            "writer_generation": record.writer_generation,
+            "activation_id": record.activation_id,
+            "plan_digest": record.plan_digest,
+            "canary_evidence_digest": record.canary_evidence_digest,
+            "canary_evidence_refs": record.canary_evidence_refs,
+            "canary_manifest_ref": record.canary_manifest_ref,
+            "worker_capacity": record.worker_capacity,
+            "coordinator_capacity": record.coordinator_capacity,
+            "reason": record.reason,
+        }
+        if record.record_id != f"writer-transition:{digest_value(identity)[:24]}":
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "Writer Transition Record identity does not bind its complete lineage fields",
+            )
         active_status = record.status in {"pending", "cut_over", "draining", "rolled_back"}
         if active_status and not _is_digest(record.plan_digest):
             raise PlanControlError("WRITER_FENCE_READBACK_INVALID", "Writer transition omitted its Plan binding")
@@ -1360,7 +1696,7 @@ class GitHubPlanRepository:
             )
         elif record.status == "draining":
             valid = (
-                _nonempty_text(record.activation_id)
+                (record.activation_id is None or _nonempty_text(record.activation_id))
                 and _is_digest(record.canary_evidence_digest)
                 and bool(record.canary_evidence_refs)
                 and _nonempty_text(record.canary_manifest_ref)
@@ -1370,7 +1706,13 @@ class GitHubPlanRepository:
             )
         elif record.status == "rolled_back":
             valid = (
-                _nonempty_text(record.activation_id)
+                # A pending cutover may be drained/rolled back before an
+                # Activation exists; a committed rollback carries the V8
+                # Activation identity in ``previous_writer_generation``.
+                (record.activation_id is None or _nonempty_text(record.activation_id))
+                and bool(record.canary_evidence_refs)
+                and _nonempty_text(record.canary_manifest_ref)
+                and record.canary_evidence_digest is None
                 and record.worker_capacity == 0
                 and record.coordinator_capacity == 0
                 and _nonempty_text(record.reason)
@@ -1379,7 +1721,7 @@ class GitHubPlanRepository:
             valid = record.worker_capacity == 0 and record.coordinator_capacity == 0 and _nonempty_text(record.reason)
         if not valid:
             raise PlanControlError("WRITER_FENCE_READBACK_INVALID", "Writer Transition Record has an invalid status binding")
-        if record.activation_id is not None:
+        if record.activation_id is not None and record.status != "rolled_back":
             receipt = receipts.get(record.activation_id)
             if (
                 receipt is None
@@ -1826,30 +2168,20 @@ class GitHubPlanRepository:
 
     @staticmethod
     def _new_work_operation(_repo: InMemoryPlanRepository) -> _WriterOperation:
-        return _WriterOperation.NEW_WORK
+        return _WriterOperation.NEW_ATTEMPT
 
     @staticmethod
-    def _rollforward_operation(
+    def _claim_operation(
         repo: InMemoryPlanRepository,
         receipt: ActivationReceipt,
     ) -> _WriterOperation:
         handle = CampaignHandle(receipt.repository, receipt.campaign_key)
-        attempt = repo.read_attempt(
-            handle,
-            receipt.expected_previous_revision_digest,
-        )
         if (
             repo.active_receipt(handle) == receipt
             or repo.read_pending_reservation(receipt) == receipt
-            or (
-                type(attempt) is _PlanningAttempt
-                and attempt.compilation_record_artifact_digest is not None
-                and attempt.revision is not None
-                and attempt.revision.digest == receipt.revision_digest
-            )
         ):
-            return _WriterOperation.RECOVERY
-        return _WriterOperation.NEW_WORK
+            return _WriterOperation.RECOVER_RESERVATION
+        return _WriterOperation.NEW_RESERVATION
 
     @staticmethod
     def _revision_operation(
@@ -1857,16 +2189,66 @@ class GitHubPlanRepository:
         revision: PlanRevision,
     ) -> _WriterOperation:
         if repo.read_revision(revision.digest) == revision:
-            return _WriterOperation.RECOVERY
-        handle = CampaignHandle(revision.repository, revision.campaign_key)
-        if any(
-            attempt.handle == handle
-            and attempt.revision == revision
+            return _WriterOperation.RECOVER_PUBLICATION
+        return _WriterOperation.FIRST_PUBLICATION
+
+    @staticmethod
+    def _attempt_operation(
+        repo: InMemoryPlanRepository,
+        attempt: _PlanningAttempt,
+    ) -> _WriterOperation:
+        existing = repo.read_attempt(
+            attempt.handle,
+            attempt.expected_previous_revision_digest,
+        )
+        reservation = repo.read_planning_reservation(
+            attempt.handle,
+            attempt.subject.stable_action_id,
+        )
+        if (
+            existing is not None
+            and existing.compilation_record_artifact_digest is None
             and attempt.compilation_record_artifact_digest is not None
-            for attempt in repo.attempts.values()
+            and reservation is not None
+            and reservation.subject_digest == attempt.subject.digest
+            and reservation.ticket_keys == attempt.ticket_keys
         ):
-            return _WriterOperation.RECOVERY
-        return _WriterOperation.NEW_WORK
+            return _WriterOperation.SEMANTIC_COMPLETION
+        return (
+            _WriterOperation.RECOVER_ATTEMPT
+            if existing is not None
+            else _WriterOperation.NEW_ATTEMPT
+        )
+
+    @staticmethod
+    def _activation_operation(
+        repo: InMemoryPlanRepository,
+        receipt: ActivationReceipt,
+    ) -> _WriterOperation:
+        handle = CampaignHandle(receipt.repository, receipt.campaign_key)
+        return (
+            _WriterOperation.RECOVER_ACTIVATION
+            if repo.active_receipt(handle) == receipt
+            else _WriterOperation.FIRST_ACTIVATION
+        )
+
+    @staticmethod
+    def _finalize_operation(
+        repo: InMemoryPlanRepository,
+        receipt: ActivationReceipt,
+    ) -> _WriterOperation:
+        handle = CampaignHandle(receipt.repository, receipt.campaign_key)
+        claims = repo.read_campaign_claim_proofs(handle)
+        exact_claims = (
+            tuple(proof.ticket_key for proof in claims) == receipt.ticket_keys
+            and all(proof.plan_revision_digest == receipt.revision_digest for proof in claims)
+        )
+        return (
+            _WriterOperation.FINALIZE_COMMITTED_CLAIMS
+            if repo.active_receipt(handle) == receipt
+            and (repo.read_pending_reservation(receipt) == receipt or exact_claims)
+            else _WriterOperation.FIRST_ACTIVATION
+        )
 
     def _assert_writer_operation(
         self,
@@ -1879,12 +2261,27 @@ class GitHubPlanRepository:
                 "PlanControl Writer operation classification is not closed",
             )
         status = authority.get("status")
-        if operation is _WriterOperation.NEW_WORK and status != "cut_over":
+        cut_over_only = {
+            _WriterOperation.NEW_ATTEMPT,
+            _WriterOperation.NEW_RESERVATION,
+            _WriterOperation.FIRST_PUBLICATION,
+            _WriterOperation.FIRST_ACTIVATION,
+        }
+        draining_recovery = {
+            _WriterOperation.READ,
+            _WriterOperation.RECOVER_ATTEMPT,
+            _WriterOperation.SEMANTIC_COMPLETION,
+            _WriterOperation.RECOVER_RESERVATION,
+            _WriterOperation.RECOVER_PUBLICATION,
+            _WriterOperation.RECOVER_ACTIVATION,
+            _WriterOperation.FINALIZE_COMMITTED_CLAIMS,
+        }
+        if operation in cut_over_only and status != "cut_over":
             raise PlanControlError(
                 "WRITER_FENCE_CONFLICT",
                 "Draining Writer authority cannot begin new PlanControl work",
             )
-        if operation in {_WriterOperation.READ, _WriterOperation.RECOVERY} and status not in {
+        if operation in draining_recovery and status not in {
             "cut_over",
             "draining",
         }:
@@ -1896,22 +2293,12 @@ class GitHubPlanRepository:
     def _read_repo(self) -> InMemoryPlanRepository:
         return self._read()[0]
 
-    def _hydrate_artifacts(self, artifacts: Any) -> None:
-        """Rebuild the local Artifact cache solely from governed Git objects.
-
-        RuntimeGateway's ArtifactStore is an execution cache, not the source
-        of PlanControl durability.  A replacement host may therefore populate
-        an empty cache from the immutable attempt/revision objects before it
-        performs active readback.
-        """
-
-        repo = self._read_repo()
-        self._hydrate_repo_artifacts(repo, artifacts)
-
     def _hydrate_repo_artifacts(
         self,
         repo: InMemoryPlanRepository,
         artifacts: Any,
+        *,
+        observation: _CampaignObservation | None = None,
     ) -> None:
         """Restore governed Artifacts from one already-observed durable state."""
 
@@ -1926,7 +2313,12 @@ class GitHubPlanRepository:
                     f"GitHub governed {label} cannot restore the exact Artifact",
                 ) from error
 
-        for attempt in repo.attempts.values():
+        attempts = (
+            (observation.attempt,)
+            if observation is not None
+            else tuple(repo.attempts.values())
+        )
+        for attempt in attempts:
             try:
                 snapshot = load_canonical_json(attempt.snapshot_bytes)
                 if digest_bytes(attempt.snapshot_bytes) != attempt.snapshot_artifact_digest:
@@ -1973,7 +2365,12 @@ class GitHubPlanRepository:
                     "DURABLE_STATE_INVALID",
                     "GitHub governed Planning attempt cannot hydrate a fresh host",
                 ) from error
-        for revision in repo.revisions.values():
+        revisions = (
+            (observation.revision,)
+            if observation is not None
+            else tuple(repo.revisions.values())
+        )
+        for revision in revisions:
             try:
                 restore(
                     load_canonical_json(revision.canonical_bytes),
@@ -1987,7 +2384,8 @@ class GitHubPlanRepository:
                     "DURABLE_STATE_INVALID",
                     "GitHub governed Plan Revision cannot hydrate a fresh host",
                 ) from error
-        for decision in repo.split_decisions.values():
+        decisions = () if observation is not None else repo.split_decisions.values()
+        for decision in decisions:
             try:
                 restore(
                     load_canonical_json(decision.canonical_bytes),
@@ -2019,6 +2417,163 @@ class GitHubPlanRepository:
             return None
         return receipt, attempt, revision
 
+    def _observation_from_state(
+        self,
+        repo: InMemoryPlanRepository,
+        ref_digest: str,
+        authority: Mapping[str, str],
+        handle: CampaignHandle,
+        expected_previous_revision_digest: str | None = None,
+    ) -> _CampaignObservation:
+        if type(handle) is not CampaignHandle:
+            raise PlanControlError(
+                "START_SUCCESSOR_INVALID",
+                "Campaign observation requires one exact CampaignHandle",
+            )
+        self._assert_repository(handle.repository)
+        identity = self._active_identity(repo, handle)
+        if identity is None:
+            raise PlanControlError(
+                "ACTIVATION_CAS_CONFLICT",
+                "Campaign observation has no exact active receipt, attempt, and revision",
+            )
+        receipt, attempt, revision = identity
+        if (
+            expected_previous_revision_digest is not None
+            and receipt.revision_digest != expected_previous_revision_digest
+        ):
+            replay = repo.read_attempt(
+                handle,
+                expected_previous_revision_digest,
+            )
+            if (
+                type(replay) is not _PlanningAttempt
+                or replay.revision is None
+                or receipt.expected_previous_revision_digest
+                != expected_previous_revision_digest
+                or replay.revision.digest != receipt.revision_digest
+            ):
+                raise PlanControlError(
+                    "ACTIVATION_CAS_CONFLICT",
+                    "Campaign observation does not match the required predecessor revision",
+                )
+        return _CampaignObservation(
+            ref_digest=ref_digest,
+            handle=handle,
+            receipt=receipt,
+            attempt=attempt,
+            revision=revision,
+            writer_authority=tuple(sorted(authority.items())),
+        )
+
+    def observe_campaign(
+        self,
+        handle: CampaignHandle,
+        expected_previous_revision_digest: str,
+    ) -> _CampaignObservation:
+        """Read one successor predecessor from exactly one control-ref OID."""
+
+        if (
+            type(expected_previous_revision_digest) is not str
+            or not _is_digest(expected_previous_revision_digest)
+        ):
+            raise PlanControlError(
+                "START_SUCCESSOR_INVALID",
+                "Campaign observation requires one exact predecessor digest",
+            )
+        if self._uses_ref_cas:
+            repo, ref_digest, _before, authority = self._read_ref_state()
+            return self._observation_from_state(
+                repo,
+                ref_digest,
+                authority,
+                handle,
+                expected_previous_revision_digest,
+            )
+        repo, _blob, _before = self._read()
+        return self._observation_from_state(
+            repo,
+            "legacy",
+            {
+                "repository": self.repository,
+                "writer_generation": self.writer_generation,
+            },
+            handle,
+            expected_previous_revision_digest,
+        )
+
+    def hydrate_campaign_artifacts(
+        self,
+        artifacts: Any,
+        observation: _CampaignObservation,
+    ) -> None:
+        """Stage only one validated Campaign's immutable Artifact set.
+
+        A changed control ref gets at most one wholly new observation.  The
+        target receipt/attempt/revision and Writer authority must remain
+        identical; unrelated Campaign evolution can therefore never populate
+        this cache from a mixed generation.
+        """
+
+        if type(observation) is not _CampaignObservation:
+            raise PlanControlError(
+                "DURABLE_STATE_CONCURRENT_CHANGE",
+                "Campaign Artifact hydration requires one exact observation",
+            )
+        if not self._uses_ref_cas:
+            self._hydrate_repo_artifacts(
+                self._read_repo(), artifacts, observation=observation
+            )
+            return
+        expected = observation
+        for attempt_number in range(2):
+            repo, ref_digest, _before, authority = self._read_ref_state()
+            current = self._observation_from_state(
+                repo,
+                ref_digest,
+                authority,
+                expected.handle,
+                expected.receipt.revision_digest,
+            )
+            if (
+                current.receipt != expected.receipt
+                or current.attempt != expected.attempt
+                or current.revision != expected.revision
+                or current.writer_authority != expected.writer_authority
+            ):
+                raise PlanControlError(
+                    "DURABLE_STATE_CONCURRENT_CHANGE",
+                    "Campaign or Writer identity changed before Artifact hydration",
+                )
+            staged = _StagedArtifactCache()
+            self._hydrate_repo_artifacts(repo, staged, observation=current)
+            _reread, reread_ref, _rendered, reread_authority = self._read_ref_state()
+            if reread_ref == ref_digest:
+                try:
+                    staged.commit(artifacts)
+                except Exception as error:
+                    raise PlanControlError(
+                        "DURABLE_STATE_INVALID",
+                        "GitHub governed Artifacts could not commit their coherent staged cache",
+                    ) from error
+                return
+            # A retry must start from one new coherent observation; never
+            # combine its target facts with the first read.
+            if attempt_number == 1:
+                raise PlanControlError(
+                    "DURABLE_STATE_CONCURRENT_CHANGE",
+                    "GitHub control ref did not remain coherent during target hydration",
+                )
+            if tuple(sorted(reread_authority.items())) != expected.writer_authority:
+                raise PlanControlError(
+                    "DURABLE_STATE_CONCURRENT_CHANGE",
+                    "Writer authority changed during target Artifact hydration",
+                )
+        raise PlanControlError(
+            "DURABLE_STATE_CONCURRENT_CHANGE",
+            "Campaign Artifact hydration exceeded its bounded retry",
+        )
+
     def hydrate_active_artifacts(
         self,
         artifacts: Any,
@@ -2032,38 +2587,23 @@ class GitHubPlanRepository:
         active identity remains byte-for-byte the same.
         """
 
-        if not self._uses_ref_cas:
-            self._hydrate_artifacts(artifacts)
-            return
-        expected_identity: tuple[ActivationReceipt, _PlanningAttempt, PlanRevision] | None = None
-        for attempt_number in range(2):
-            repo, ref_digest, _before, _authority = self._read_ref_state()
-            identity = self._active_identity(repo, handle)
-            if identity is None or identity[0] != receipt:
+        if self._uses_ref_cas:
+            repo, ref_digest, _before, authority = self._read_ref_state()
+            observation = self._observation_from_state(
+                repo,
+                ref_digest,
+                authority,
+                handle,
+                receipt.revision_digest,
+            )
+            if observation.receipt != receipt:
                 raise PlanControlError(
                     "DURABLE_STATE_CONCURRENT_CHANGE",
                     "GitHub active Campaign changed before governed Artifact hydration",
                 )
-            if expected_identity is not None and identity != expected_identity:
-                raise PlanControlError(
-                    "DURABLE_STATE_CONCURRENT_CHANGE",
-                    "GitHub active Campaign identity changed during Artifact hydration",
-                )
-            expected_identity = identity
-            self._hydrate_repo_artifacts(repo, artifacts)
-            reread, reread_ref, _rendered, _authority = self._read_ref_state()
-            reread_identity = self._active_identity(reread, handle)
-            if reread_ref == ref_digest and reread_identity == expected_identity:
-                return
-            if attempt_number == 1 or reread_identity != expected_identity:
-                raise PlanControlError(
-                    "DURABLE_STATE_CONCURRENT_CHANGE",
-                    "GitHub control ref changed to a different active Campaign identity",
-                )
-        raise PlanControlError(
-            "DURABLE_STATE_CONCURRENT_CHANGE",
-            "GitHub control ref did not remain coherent during Artifact hydration",
-        )
+            self.hydrate_campaign_artifacts(artifacts, observation)
+            return
+        self._hydrate_repo_artifacts(self._read_repo(), artifacts)
 
     def active_receipt(self, handle: CampaignHandle) -> ActivationReceipt | None:
         self._assert_repository(handle.repository)
@@ -2085,15 +2625,7 @@ class GitHubPlanRepository:
         return self._mutate(
             "save Planning attempt",
             lambda repo: repo.save_attempt(attempt),
-            classify=lambda repo: (
-                _WriterOperation.RECOVERY
-                if repo.read_attempt(
-                    attempt.handle,
-                    attempt.expected_previous_revision_digest,
-                )
-                is not None
-                else _WriterOperation.NEW_WORK
-            ),
+            classify=lambda repo: self._attempt_operation(repo, attempt),
         )
 
     def read_split_decision(
@@ -2116,36 +2648,13 @@ class GitHubPlanRepository:
             "save split-Campaign Decision",
             lambda repo: repo.save_split_decision(decision),
             classify=lambda repo: (
-                _WriterOperation.RECOVERY
+                _WriterOperation.RECOVER_ATTEMPT
                 if repo.read_split_decision(
                     decision.handle,
                     decision.expected_previous_revision_digest,
                 )
                 is not None
-                else _WriterOperation.NEW_WORK
-            ),
-        )
-
-    def read_runtime_assertion(
-        self,
-        handle: CampaignHandle,
-    ) -> Mapping[str, Any] | None:
-        self._assert_repository(handle.repository)
-        return self._read_repo().read_runtime_assertion(handle)
-
-    def save_runtime_assertion(
-        self,
-        handle: CampaignHandle,
-        assertion: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        self._assert_repository(handle.repository)
-        return self._mutate(
-            "bind Runtime assertion",
-            lambda repo: repo.save_runtime_assertion(handle, assertion),
-            classify=lambda repo: (
-                _WriterOperation.RECOVERY
-                if repo.read_runtime_assertion(handle) is not None
-                else _WriterOperation.NEW_WORK
+                else _WriterOperation.NEW_ATTEMPT
             ),
         )
 
@@ -2161,7 +2670,25 @@ class GitHubPlanRepository:
         self._mutate(
             "release Planning",
             lambda repo: repo.release_planning(reservation),
-            classify=lambda _repo: _WriterOperation.RECOVERY,
+            classify=lambda repo: (
+                _WriterOperation.RECOVER_RESERVATION
+                if repo.read_planning_reservation(
+                    CampaignHandle(reservation.repository, reservation.campaign_key),
+                    reservation.stable_action_id,
+                ) == reservation
+                else _WriterOperation.FIRST_ACTIVATION
+            ),
+        )
+
+    def read_planning_reservation(
+        self,
+        handle: CampaignHandle,
+        stable_action_id: str,
+    ) -> PlanningReservation | None:
+        self._assert_repository(handle.repository)
+        return self._read_repo().read_planning_reservation(
+            handle,
+            stable_action_id,
         )
 
     def reserve_claims(self, receipt: ActivationReceipt) -> None:
@@ -2169,7 +2696,7 @@ class GitHubPlanRepository:
         self._mutate(
             "reserve activation claims",
             lambda repo: repo.reserve_claims(receipt),
-            classify=lambda repo: self._rollforward_operation(repo, receipt),
+            classify=lambda repo: self._claim_operation(repo, receipt),
         )
 
     def publish_revision(self, revision: PlanRevision) -> None:
@@ -2201,7 +2728,7 @@ class GitHubPlanRepository:
         conflict = self._mutate(
             "activate Plan Revision",
             transition,
-            classify=lambda repo: self._rollforward_operation(repo, receipt),
+            classify=lambda repo: self._activation_operation(repo, receipt),
         )
         if conflict is not None:
             raise conflict
@@ -2211,7 +2738,7 @@ class GitHubPlanRepository:
         self._mutate(
             "finalize Ticket claims",
             lambda repo: repo.finalize_claims(receipt),
-            classify=lambda _repo: _WriterOperation.RECOVERY,
+            classify=lambda repo: self._finalize_operation(repo, receipt),
         )
 
     def read_activation(
@@ -2235,3 +2762,10 @@ class GitHubPlanRepository:
     ) -> tuple[TicketClaimProof, ...]:
         self._assert_repository(handle.repository)
         return self._read_repo().read_claim_proofs(handle, revision_digest)
+
+    def read_campaign_claim_proofs(
+        self,
+        handle: CampaignHandle,
+    ) -> tuple[TicketClaimProof, ...]:
+        self._assert_repository(handle.repository)
+        return self._read_repo().read_campaign_claim_proofs(handle)
