@@ -9,10 +9,11 @@ non-executable reservations, not only activated Plans.
 from __future__ import annotations
 
 import base64
+import json
 from dataclasses import asdict
 from typing import Any, Callable, Mapping, Protocol, TypeVar
 
-from ._canonical import canonical_bytes, load_canonical_json
+from ._canonical import canonical_bytes, digest_bytes, load_canonical_json
 from .activation import GitHubContentClient
 from .plan_control import (
     ActivationReceipt,
@@ -28,10 +29,31 @@ from .plan_control import (
 from .runtime_gateway import CampaignPlanningSubject
 
 
-_STATE_SCHEMA = "gwo.plan.github-state.v1"
+_STATE_SCHEMA = "gwo.plan.github-state.v2"
+_INDEX_SCHEMA = "gwo.plan.github-index.v3"
+_OBJECT_SCHEMA = "gwo.plan.github-object.v1"
+_OBJECT_MANIFEST_SCHEMA = "gwo.plan.github-object-manifest.v1"
 _DEFAULT_PATH = ".gwo-v8/plan-control-v3.json"
-_MAXIMUM_STATE_BYTES = 16_777_216
+# The mutable head is deliberately tiny.  Complete snapshots, PlanSpecs,
+# receipts, and in-flight records are immutable digest-addressed objects; a
+# large successor therefore cannot brick every later CAS by growing one JSON
+# document beyond GitHub Contents' practical limit.
+_MAXIMUM_STATE_BYTES = 262_144
+_OBJECT_PREFIX = ".gwo-v8/plan-control-v3/objects"
+_MAXIMUM_OBJECT_PART_BYTES = 196_608
 _T = TypeVar("_T")
+
+_CATEGORY_NAMES = (
+    "attempts",
+    "split_decisions",
+    "runtime_assertions",
+    "planning_reservations",
+    "pending_reservations",
+    "claims",
+    "revisions",
+    "activations",
+    "activation_receipts",
+)
 
 
 class WriterGenerationReadback(Protocol):
@@ -193,6 +215,11 @@ def _attempt_value(attempt: _PlanningAttempt) -> dict[str, Any]:
         "revision": (
             None if attempt.revision is None else _revision_value(attempt.revision)
         ),
+        "compilation_record_bytes_base64": (
+            None
+            if attempt.compilation_record_bytes is None
+            else _encoded(attempt.compilation_record_bytes)
+        ),
     }
 
 
@@ -211,6 +238,7 @@ def _attempt_from(value: object) -> _PlanningAttempt:
             "subject",
             "compilation_record_artifact_digest",
             "revision",
+            "compilation_record_bytes_base64",
         },
         "Planning attempt",
     )
@@ -278,6 +306,14 @@ def _attempt_from(value: object) -> _PlanningAttempt:
         ],
         revision=(
             None if revision_value is None else _revision_from(revision_value)
+        ),
+        compilation_record_bytes=(
+            None
+            if item["compilation_record_bytes_base64"] is None
+            else _bytes(
+                item["compilation_record_bytes_base64"],
+                "Planning compilation record bytes",
+            )
         ),
     )
 
@@ -348,6 +384,7 @@ def _empty_state(repository: str, writer_generation: str) -> dict[str, Any]:
         "claims": [],
         "revisions": [],
         "activations": [],
+        "activation_receipts": [],
     }
 
 
@@ -427,6 +464,17 @@ def _repo_value(
             (_activation_value(item) for item in repo.activations.values()),
             key=lambda item: item["campaign_key"],
         ),
+        "activation_receipts": sorted(
+            (
+                _activation_value(item)
+                for item in repo.activation_receipts.values()
+            ),
+            key=lambda item: (
+                item["campaign_key"],
+                item["revision_digest"],
+                item["planning_stable_action_id"],
+            ),
+        ),
     }
 
 
@@ -471,6 +519,7 @@ def _repo_from_state(
         "claims",
         "revisions",
         "activations",
+        "activation_receipts",
     }
     if any(type(state[field]) is not list for field in list_fields):
         raise PlanControlError(
@@ -583,6 +632,20 @@ def _repo_from_state(
                     "Durable activations repeat or cross repositories",
                 )
             repo.activations[key] = receipt
+        for raw in state["activation_receipts"]:
+            receipt = _activation_from(raw)
+            key = (
+                receipt.repository,
+                receipt.campaign_key,
+                receipt.revision_digest,
+                receipt.planning_stable_action_id,
+            )
+            if receipt.repository != repository or key in repo.activation_receipts:
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "Durable activation receipts repeat or cross repositories",
+                )
+            repo.activation_receipts[key] = receipt
     except PlanControlError:
         raise
     except Exception as error:
@@ -590,6 +653,21 @@ def _repo_from_state(
             "DURABLE_STATE_INVALID",
             "Durable PlanControl state cannot be reconstructed",
         ) from error
+    # A current pointer is valid only when it names exactly one immutable
+    # receipt in the append-only ledger.  This rejects a forged replacement or
+    # a rollback that silently erases a prior receipt.
+    for receipt in repo.activations.values():
+        key = (
+            receipt.repository,
+            receipt.campaign_key,
+            receipt.revision_digest,
+            receipt.planning_stable_action_id,
+        )
+        if repo.activation_receipts.get(key) != receipt:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "Current activation has no exact immutable receipt",
+            )
     if _repo_value(repository, writer_generation, repo) != state:
         raise PlanControlError(
             "DURABLE_STATE_INVALID",
@@ -598,8 +676,105 @@ def _repo_from_state(
     return repo
 
 
+def _category_values_for(
+    repository: str,
+    writer_generation: str,
+    repo: InMemoryPlanRepository,
+) -> dict[str, list[Any]]:
+    state = _repo_value(repository, writer_generation, repo)
+    return {name: state[name] for name in _CATEGORY_NAMES}
+
+
+def _repo_from_categories(
+    repository: str,
+    writer_generation: str,
+    categories: Mapping[str, Any],
+) -> InMemoryPlanRepository:
+    if type(categories) is not dict or set(categories) != set(_CATEGORY_NAMES):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable PlanControl category index is incomplete",
+        )
+    state = _empty_state(repository, writer_generation)
+    state.update(categories)
+    return _repo_from_state(state, repository, writer_generation)
+
+
+def _object_manifest_path(prefix: str, digest: str) -> str:
+    return f"{prefix}/{digest}/manifest.json"
+
+
+def _object_part_path(prefix: str, digest: str, index: int) -> str:
+    return f"{prefix}/{digest}/parts/{index:06d}"
+
+
+def _object_changes(
+    prefix: str,
+    payload: bytes,
+) -> tuple[str, dict[str, bytes]]:
+    """Return the immutable, chunked Git objects for one exact payload."""
+
+    digest = digest_bytes(payload)
+    parts = [
+        payload[offset : offset + _MAXIMUM_OBJECT_PART_BYTES]
+        for offset in range(0, len(payload), _MAXIMUM_OBJECT_PART_BYTES)
+    ] or [b""]
+    part_values = []
+    changes: dict[str, bytes] = {}
+    for index, part in enumerate(parts):
+        path = _object_part_path(prefix, digest, index)
+        changes[path] = part
+        part_values.append(
+            {
+                "path": path,
+                "digest": digest_bytes(part),
+                "byte_length": len(part),
+            }
+        )
+    manifest = canonical_bytes(
+        {
+            "schema_version": _OBJECT_MANIFEST_SCHEMA,
+            "digest": digest,
+            "byte_length": len(payload),
+            "parts": part_values,
+        }
+    )
+    changes[_object_manifest_path(prefix, digest)] = manifest
+    return digest, changes
+
+
+def _index_value(
+    repository: str,
+    writer_generation: str,
+    writer_record_id: str,
+    category_digests: Mapping[str, str],
+) -> dict[str, Any]:
+    if set(category_digests) != set(_CATEGORY_NAMES):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "PlanControl category index has an unknown schema",
+        )
+    return {
+        "schema_version": _INDEX_SCHEMA,
+        "repository": repository,
+        "writer_authority": {
+            "repository": repository,
+            "writer_generation": writer_generation,
+            "record_id": writer_record_id,
+        },
+        "categories": {
+            name: category_digests[name] for name in _CATEGORY_NAMES
+        },
+    }
+
+
 class GitHubPlanRepository:
-    """Complete PlanControlRepository backed by one GitHub CAS document."""
+    """Durable PlanControl facts rooted at one exact Git control-ref CAS.
+
+    Production keeps a tiny mutable root index and stores every collection as
+    immutable chunked objects.  The old one-file path remains only for injected
+    in-memory boundary doubles which cannot model a Git ref transaction.
+    """
 
     def __init__(
         self,
@@ -608,13 +783,22 @@ class GitHubPlanRepository:
         repository: str,
         branch: str,
         writer_generation: str,
-        writer_control: WriterGenerationReadback,
+        writer_control: WriterGenerationReadback | None = None,
         path: str = _DEFAULT_PATH,
         maximum_state_bytes: int = _MAXIMUM_STATE_BYTES,
+        object_prefix: str = _OBJECT_PREFIX,
+        writer_control_path: str = ".gwo-v8/writer-transition.json",
     ):
         if any(
             type(value) is not str or not value
-            for value in (repository, branch, writer_generation, path)
+            for value in (
+                repository,
+                branch,
+                writer_generation,
+                path,
+                object_prefix,
+                writer_control_path,
+            )
         ):
             raise PlanControlError(
                 "PLAN_CONTROL_COMPOSITION_INVALID",
@@ -632,6 +816,17 @@ class GitHubPlanRepository:
         self.writer_control = writer_control
         self.path = path.strip("/")
         self.maximum_state_bytes = maximum_state_bytes
+        self.object_prefix = object_prefix.strip("/")
+        self.writer_control_path = writer_control_path.strip("/")
+
+    @property
+    def _uses_ref_cas(self) -> bool:
+        return (
+            self.writer_control is None
+            and callable(getattr(self.client, "read_ref", None))
+            and callable(getattr(self.client, "read_at_ref", None))
+            and callable(getattr(self.client, "compare_and_swap_ref", None))
+        )
 
     def _assert_repository(self, repository: str) -> None:
         if repository != self.repository:
@@ -641,6 +836,11 @@ class GitHubPlanRepository:
             )
 
     def _assert_writer(self) -> None:
+        if self.writer_control is None:
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "Legacy PlanControl persistence requires an exact writer reader",
+            )
         try:
             current = self.writer_control.read_current(self.repository)
         except Exception as error:
@@ -660,7 +860,377 @@ class GitHubPlanRepository:
                 "Configured writer generation does not own the GitHub control state",
             )
 
+    def _writer_authority_at_ref(self, ref_digest: str) -> dict[str, str]:
+        """Read the Writer Record from the same tree that will be CASed."""
+
+        try:
+            content = self.client.read_at_ref(
+                self.repository,
+                ref_digest,
+                self.writer_control_path,
+            )
+        except Exception as error:
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "GitHub writer authority cannot be read at the control ref",
+            ) from error
+        if content is None or type(content.content) is not bytes:
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "GitHub control ref has no durable Writer Record",
+            )
+        try:
+            value = json.loads(content.content)
+            current = _exact(
+                value["current"],
+                {"repository", "writer_generation", "record_id"},
+                "Writer Record current pointer",
+            )
+            records = value["records"]
+        except (
+            KeyError,
+            TypeError,
+            json.JSONDecodeError,
+            PlanControlError,
+        ) as error:
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "GitHub Writer Record has an unknown schema",
+            ) from error
+        record_id = current["record_id"]
+        if (
+            type(value) is not dict
+            or value.get("schema_version") != 1
+            or type(records) is not list
+            or current["repository"] != self.repository
+            or current["writer_generation"] != self.writer_generation
+            or type(record_id) is not str
+            or not record_id
+            or record_id == "initial-writer"
+            or not any(
+                type(item) is dict and item.get("record_id") == record_id
+                for item in records
+            )
+        ):
+            raise PlanControlError(
+                "WRITER_FENCE_CONFLICT",
+                "GitHub control ref does not carry the configured Writer authority",
+            )
+        return {
+            "repository": self.repository,
+            "writer_generation": self.writer_generation,
+            "record_id": record_id,
+        }
+
+    def _read_object_at_ref(self, ref_digest: str, digest: str) -> bytes:
+        try:
+            manifest_blob = self.client.read_at_ref(
+                self.repository,
+                ref_digest,
+                _object_manifest_path(self.object_prefix, digest),
+            )
+        except Exception as error:
+            raise PlanControlError(
+                "DURABLE_STATE_UNAVAILABLE",
+                "GitHub governed object manifest cannot be read",
+            ) from error
+        if manifest_blob is None or type(manifest_blob.content) is not bytes:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "GitHub governed object manifest is missing",
+            )
+        try:
+            manifest = load_canonical_json(manifest_blob.content)
+            manifest = _exact(
+                manifest,
+                {"schema_version", "digest", "byte_length", "parts"},
+                "governed object manifest",
+            )
+        except Exception as error:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "GitHub governed object manifest is invalid",
+            ) from error
+        parts = manifest["parts"]
+        if (
+            manifest["schema_version"] != _OBJECT_MANIFEST_SCHEMA
+            or manifest["digest"] != digest
+            or type(manifest["byte_length"]) is not int
+            or manifest["byte_length"] < 0
+            or type(parts) is not list
+            or not parts
+        ):
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "GitHub governed object manifest changed its identity",
+            )
+        values: list[bytes] = []
+        for index, raw_part in enumerate(parts):
+            try:
+                part = _exact(
+                    raw_part,
+                    {"path", "digest", "byte_length"},
+                    "governed object part",
+                )
+            except PlanControlError as error:
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "GitHub governed object part is malformed",
+                ) from error
+            expected_path = _object_part_path(self.object_prefix, digest, index)
+            if (
+                part["path"] != expected_path
+                or type(part["digest"]) is not str
+                or type(part["byte_length"]) is not int
+                or not 0 <= part["byte_length"] <= _MAXIMUM_OBJECT_PART_BYTES
+            ):
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "GitHub governed object part changed its identity",
+                )
+            try:
+                blob = self.client.read_at_ref(
+                    self.repository,
+                    ref_digest,
+                    expected_path,
+                )
+            except Exception as error:
+                raise PlanControlError(
+                    "DURABLE_STATE_UNAVAILABLE",
+                    "GitHub governed object part cannot be read",
+                ) from error
+            if (
+                blob is None
+                or type(blob.content) is not bytes
+                or len(blob.content) != part["byte_length"]
+                or digest_bytes(blob.content) != part["digest"]
+            ):
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "GitHub governed object part did not read back exactly",
+                )
+            values.append(blob.content)
+        payload = b"".join(values)
+        if (
+            len(payload) != manifest["byte_length"]
+            or digest_bytes(payload) != digest
+        ):
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "GitHub governed object payload changed its digest",
+            )
+        return payload
+
+    def _read_ref_state(
+        self,
+    ) -> tuple[InMemoryPlanRepository, str, bytes | None, dict[str, str]]:
+        try:
+            ref_digest = self.client.read_ref(self.repository, self.branch)
+        except Exception as error:
+            raise PlanControlError(
+                "DURABLE_STATE_UNAVAILABLE",
+                "GitHub PlanControl control ref cannot be read",
+            ) from error
+        if type(ref_digest) is not str or not ref_digest:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "GitHub PlanControl control ref is malformed",
+            )
+        authority = self._writer_authority_at_ref(ref_digest)
+        try:
+            root = self.client.read_at_ref(
+                self.repository,
+                ref_digest,
+                self.path,
+            )
+        except Exception as error:
+            raise PlanControlError(
+                "DURABLE_STATE_UNAVAILABLE",
+                "GitHub PlanControl index cannot be read",
+            ) from error
+        if root is None:
+            return (
+                InMemoryPlanRepository(writer_generation=self.writer_generation),
+                ref_digest,
+                None,
+                authority,
+            )
+        if (
+            type(root.content) is not bytes
+            or type(root.blob_sha) is not str
+            or not root.blob_sha
+            or len(root.content) > self.maximum_state_bytes
+        ):
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "GitHub PlanControl index receipt is malformed or oversized",
+            )
+        try:
+            value = _exact(
+                load_canonical_json(root.content),
+                {"schema_version", "repository", "writer_authority", "categories"},
+                "PlanControl index",
+            )
+        except Exception as error:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "GitHub PlanControl index is not canonical JSON",
+            ) from error
+        if (
+            value["schema_version"] != _INDEX_SCHEMA
+            or value["repository"] != self.repository
+            or value["writer_authority"] != authority
+            or type(value["categories"]) is not dict
+            or set(value["categories"]) != set(_CATEGORY_NAMES)
+            or any(
+                type(digest) is not str
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                for digest in value["categories"].values()
+            )
+        ):
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "GitHub PlanControl index changed its authority or categories",
+            )
+        categories: dict[str, Any] = {}
+        for name in _CATEGORY_NAMES:
+            try:
+                object_value = load_canonical_json(
+                    self._read_object_at_ref(
+                        ref_digest,
+                        value["categories"][name],
+                    )
+                )
+                object_value = _exact(
+                    object_value,
+                    {
+                        "schema_version",
+                        "repository",
+                        "writer_generation",
+                        "category",
+                        "items",
+                    },
+                    "governed category",
+                )
+            except PlanControlError:
+                raise
+            except Exception as error:
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "GitHub governed category is invalid",
+                ) from error
+            if (
+                object_value["schema_version"] != _OBJECT_SCHEMA
+                or object_value["repository"] != self.repository
+                or object_value["writer_generation"] != self.writer_generation
+                or object_value["category"] != name
+                or type(object_value["items"]) is not list
+            ):
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "GitHub governed category changed its identity",
+                )
+            categories[name] = object_value["items"]
+        return (
+            _repo_from_categories(
+                self.repository,
+                self.writer_generation,
+                categories,
+            ),
+            ref_digest,
+            root.content,
+            authority,
+        )
+
+    def _render_ref_state(
+        self,
+        repo: InMemoryPlanRepository,
+        authority: Mapping[str, str],
+    ) -> tuple[bytes, dict[str, bytes]]:
+        category_digests: dict[str, str] = {}
+        changes: dict[str, bytes] = {}
+        for name, items in _category_values_for(
+            self.repository,
+            self.writer_generation,
+            repo,
+        ).items():
+            payload = canonical_bytes(
+                {
+                    "schema_version": _OBJECT_SCHEMA,
+                    "repository": self.repository,
+                    "writer_generation": self.writer_generation,
+                    "category": name,
+                    "items": items,
+                }
+            )
+            digest, object_changes = _object_changes(self.object_prefix, payload)
+            category_digests[name] = digest
+            changes.update(object_changes)
+        rendered = canonical_bytes(
+            _index_value(
+                self.repository,
+                self.writer_generation,
+                authority["record_id"],
+                category_digests,
+            )
+        )
+        if len(rendered) > self.maximum_state_bytes:
+            raise PlanControlError(
+                "DURABLE_STATE_TOO_LARGE",
+                "GitHub PlanControl mutable index exceeds its configured bound",
+            )
+        changes[self.path] = rendered
+        return rendered, changes
+
+    def _mutate_ref(
+        self,
+        operation: str,
+        callback: Callable[[InMemoryPlanRepository], _T],
+    ) -> _T:
+        repo, ref_digest, before, authority = self._read_ref_state()
+        result = callback(repo)
+        rendered, changes = self._render_ref_state(repo, authority)
+        if before == rendered:
+            return result
+        try:
+            committed = self.client.compare_and_swap_ref(
+                self.repository,
+                self.branch,
+                expected_ref_digest=ref_digest,
+                changes=changes,
+                message=f"GWO PlanControl {operation}",
+            )
+        except Exception as error:
+            # An acknowledgement loss may have committed the exact ref.  Only
+            # the full indexed state at a fresh ref can recover it.
+            try:
+                _recovered, _ref, recovered_bytes, _authority = self._read_ref_state()
+            except Exception:
+                recovered_bytes = None
+            if recovered_bytes != rendered:
+                raise PlanControlError(
+                    "DURABLE_CAS_CONFLICT",
+                    "GitHub control-ref CAS did not commit the exact transition",
+                ) from error
+            return result
+        if type(committed) is not str or not committed:
+            raise PlanControlError(
+                "DURABLE_STATE_READBACK_INVALID",
+                "GitHub control-ref CAS omitted its committed ref",
+            )
+        _readback, readback_ref, readback_bytes, _authority = self._read_ref_state()
+        if readback_ref != committed or readback_bytes != rendered:
+            raise PlanControlError(
+                "DURABLE_STATE_READBACK_INVALID",
+                "GitHub control-ref transition did not read back exactly",
+            )
+        return result
+
     def _read(self) -> tuple[InMemoryPlanRepository, str | None, bytes | None]:
+        if self._uses_ref_cas:
+            repo, ref_digest, rendered, _authority = self._read_ref_state()
+            return repo, ref_digest, rendered
         self._assert_writer()
         try:
             content = self.client.read(
@@ -712,6 +1282,8 @@ class GitHubPlanRepository:
         operation: str,
         callback: Callable[[InMemoryPlanRepository], _T],
     ) -> _T:
+        if self._uses_ref_cas:
+            return self._mutate_ref(operation, callback)
         repo, blob_sha, before = self._read()
         result = callback(repo)
         rendered = canonical_bytes(
@@ -774,6 +1346,104 @@ class GitHubPlanRepository:
 
     def _read_repo(self) -> InMemoryPlanRepository:
         return self._read()[0]
+
+    def _hydrate_artifacts(self, artifacts: Any) -> None:
+        """Rebuild the local Artifact cache solely from governed Git objects.
+
+        RuntimeGateway's ArtifactStore is an execution cache, not the source
+        of PlanControl durability.  A replacement host may therefore populate
+        an empty cache from the immutable attempt/revision objects before it
+        performs active readback.
+        """
+
+        repo = self._read_repo()
+
+        def restore(value: Any, digest: str, label: str) -> None:
+            try:
+                reference = artifacts.put_canonical(value)
+                if getattr(reference, "digest", None) != digest:
+                    raise ValueError("Artifact digest changed")
+            except Exception as error:
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    f"GitHub governed {label} cannot restore the exact Artifact",
+                ) from error
+
+        for attempt in repo.attempts.values():
+            try:
+                snapshot = load_canonical_json(attempt.snapshot_bytes)
+                if digest_bytes(attempt.snapshot_bytes) != attempt.snapshot_artifact_digest:
+                    raise ValueError("snapshot digest")
+                restore(snapshot, attempt.snapshot_artifact_digest, "snapshot")
+                policy = {
+                    key: value
+                    for key, value in snapshot["policy"].items()
+                    if key != "digest"
+                }
+                restore(policy, attempt.policy_witness_digest, "Policy Witness")
+                from .planning_protocol import planning_prompt
+
+                request = planning_prompt(
+                    subject_digest=attempt.subject.prompt_binding_digest,
+                    authority_digest=attempt.policy_witness_digest,
+                    snapshot_artifact_digest=attempt.snapshot_artifact_digest,
+                    policy_witness_artifact_digest=attempt.policy_witness_digest,
+                )
+                restore(
+                    request,
+                    attempt.planning_request_artifact_digest,
+                    "Planning request",
+                )
+                if attempt.compilation_record_artifact_digest is not None:
+                    if attempt.compilation_record_bytes is None:
+                        raise ValueError("completed attempt omitted record bytes")
+                    record = load_canonical_json(attempt.compilation_record_bytes)
+                    restore(
+                        record,
+                        attempt.compilation_record_artifact_digest,
+                        "compilation record",
+                    )
+                    output = record["planning_output"]
+                    restore(
+                        output,
+                        record["output_artifact_digest"],
+                        "Planning output",
+                    )
+            except PlanControlError:
+                raise
+            except Exception as error:
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "GitHub governed Planning attempt cannot hydrate a fresh host",
+                ) from error
+        for revision in repo.revisions.values():
+            try:
+                restore(
+                    load_canonical_json(revision.canonical_bytes),
+                    revision.digest,
+                    "Plan Revision",
+                )
+            except PlanControlError:
+                raise
+            except Exception as error:
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "GitHub governed Plan Revision cannot hydrate a fresh host",
+                ) from error
+        for decision in repo.split_decisions.values():
+            try:
+                restore(
+                    load_canonical_json(decision.canonical_bytes),
+                    decision.digest,
+                    "split-Campaign Decision",
+                )
+            except PlanControlError:
+                raise
+            except Exception as error:
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "GitHub governed split-Campaign Decision cannot hydrate a fresh host",
+                ) from error
 
     def active_receipt(self, handle: CampaignHandle) -> ActivationReceipt | None:
         self._assert_repository(handle.repository)
@@ -869,10 +1539,25 @@ class GitHubPlanRepository:
 
     def activate(self, receipt: ActivationReceipt) -> None:
         self._assert_repository(receipt.repository)
-        self._mutate(
+        # ``InMemoryPlanRepository.activate`` removes the losing pending
+        # reservation before it reports a CAS conflict.  Preserve that cleanup
+        # as a durable transition instead of letting an exception discard the
+        # reconstructed state in this adapter.
+        def transition(repo: InMemoryPlanRepository) -> PlanControlError | None:
+            try:
+                repo.activate(receipt)
+            except PlanControlError as error:
+                if error.code != "ACTIVATION_CAS_CONFLICT":
+                    raise
+                return error
+            return None
+
+        conflict = self._mutate(
             "activate Plan Revision",
-            lambda repo: repo.activate(receipt),
+            transition,
         )
+        if conflict is not None:
+            raise conflict
 
     def finalize_claims(self, receipt: ActivationReceipt) -> None:
         self._assert_repository(receipt.repository)

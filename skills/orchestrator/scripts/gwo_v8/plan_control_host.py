@@ -42,7 +42,6 @@ from .plan_control_github import (
     GitHubPlanRepository,
     WriterGenerationReadback,
 )
-from .transition import GitHubWriterTransitionControl
 
 
 _GatewayBuilder = Callable[..., Any]
@@ -57,21 +56,51 @@ class _RuntimeAssertionCommitGateway:
         gateway: Any,
         repository: PlanControlRepository,
         handle: CampaignHandle,
-        assertion: CampaignStartRuntimeOverrides,
+        assertion: CampaignStartRuntimeOverrides | None,
     ):
         self._gateway = gateway
         self._repository = repository
         self._handle = handle
-        self._assertion = assertion.canonical()
+        self._assertion = None if assertion is None else assertion.canonical()
 
     def planning_preflight(self, subject):
         receipt = self._gateway.planning_preflight(subject)
         _validate_preflight(receipt, subject)
+        recovered = getattr(self._gateway, "_campaign_start_assertion", None)
+        if callable(recovered):
+            try:
+                authoritative = recovered(
+                    self._handle.repository,
+                    self._handle.campaign_key,
+                    _handle_ref(self._handle),
+                )
+            except RuntimeGatewayError as error:
+                raise PlanControlError(
+                    "RUNTIME_PREFLIGHT_INVALID",
+                    "RuntimeGateway could not recover its durable Campaign assertion",
+                ) from error
+            if type(authoritative) is not CampaignStartRuntimeOverrides:
+                raise PlanControlError(
+                    "RUNTIME_PREFLIGHT_INVALID",
+                    "RuntimeGateway preflight omitted its durable Campaign assertion",
+                )
+            assertion = authoritative.canonical()
+        elif self._assertion is not None:
+            # Boundary doubles implement the narrow #111 caller surface only.
+            # Production RuntimeGateway always supplies the recovery seam.
+            assertion = self._assertion
+        else:
+            assertion = CampaignStartRuntimeOverrides().canonical()
+        if self._assertion is not None and assertion != self._assertion:
+            raise PlanControlError(
+                "START_OPTIONS_CONFLICT",
+                "RuntimeGateway durable assertion conflicts with Campaign start input",
+            )
         saved = self._repository.save_runtime_assertion(
             self._handle,
-            self._assertion,
+            assertion,
         )
-        if saved != self._assertion:
+        if saved != assertion:
             raise PlanControlError(
                 "START_OPTIONS_CONFLICT",
                 "PlanControl Runtime assertion mirror did not read back exactly",
@@ -236,6 +265,12 @@ class ProductionPlanControlStartHost:
             Path(artifact_root),
             maximum_bytes=maximum_artifact_bytes,
         )
+        hydrate = getattr(repository, "_hydrate_artifacts", None)
+        if callable(hydrate):
+            # Production GitHub PlanControl derives this cache from immutable
+            # governed objects.  A replacement host never trusts a prior
+            # machine's artifact directory as its durability source.
+            hydrate(self._artifacts)
         self._max_snapshot_bytes = max_snapshot_bytes
         self._gateway_builder = _gateway_builder or _production_gateway_builder
 
@@ -245,12 +280,18 @@ class ProductionPlanControlStartHost:
         ready_refs: Sequence[str],
         options: object = None,
     ) -> CampaignHandle:
-        refs = _ready_refs(ready_refs)
         if type(repository) is not str or not repository:
             raise PlanControlError(
                 "PLAN_CONTROL_INVALID",
                 "repository must be non-empty exact text",
             )
+        raw_refs = _ready_refs(ready_refs)
+        canonicalizer = getattr(self._source, "canonical_ready_refs", None)
+        refs = (
+            _ready_refs(canonicalizer(repository, raw_refs))
+            if callable(canonicalizer)
+            else raw_refs
+        )
         campaign_key = "campaign:" + digest_value(
             {"repository": repository, "ready_refs": list(refs)}
         )[:24]
@@ -273,18 +314,14 @@ class ProductionPlanControlStartHost:
             _handle_ref(handle),
         )
         configured = assertions.get(assertion_key)
-        selected_assertion = (
-            requested
-            or persisted
-            or configured
-            or CampaignStartRuntimeOverrides()
-        )
+        selected_assertion = requested or persisted or configured
         if configured is not None and configured != selected_assertion:
             raise PlanControlError(
                 "START_OPTIONS_CONFLICT",
                 "Campaign assertion conflicts with host Runtime configuration",
             )
-        assertions[assertion_key] = selected_assertion
+        if selected_assertion is not None:
+            assertions[assertion_key] = selected_assertion
         try:
             configuration = RuntimeConfiguration(
                 profiles=dict(self._configuration.profiles),
@@ -391,11 +428,19 @@ def install_github_plan_control_start(
         )
     content_client = _content_client or GitHubCliContentClient()
     issue_client = _issue_client or GitHubCliIssueReadClient()
-    writer_control = _writer_control or GitHubWriterTransitionControl(
-        content_client,
-        branch=control_branch,
-        initial_writer=writer_generation,
-    )
+    # A production writer must already be represented by an exact durable
+    # Writer Record on the control ref.  Do not manufacture ``initial-writer``
+    # from host configuration: that would make PlanControl authority a local
+    # guess and reopen a cross-path TOCTOU window.  The underscored reader is
+    # retained solely for in-memory boundary doubles which cannot model refs.
+    if _writer_control is None and not all(
+        callable(getattr(content_client, name, None))
+        for name in ("read_ref", "read_at_ref", "compare_and_swap_ref")
+    ):
+        raise PlanControlError(
+            "PLAN_CONTROL_COMPOSITION_INVALID",
+            "Production GitHub PlanControl requires exact control-ref CAS and a durable Writer Record",
+        )
     source = GitHubReadySnapshotSource(
         content_client=content_client,
         issue_client=issue_client,
@@ -408,7 +453,7 @@ def install_github_plan_control_start(
         repository=repository,
         branch=control_branch,
         writer_generation=writer_generation,
-        writer_control=writer_control,
+        writer_control=_writer_control,
         path=state_path,
         maximum_state_bytes=maximum_state_bytes,
     )

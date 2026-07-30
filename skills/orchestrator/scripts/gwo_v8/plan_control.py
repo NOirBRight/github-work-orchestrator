@@ -182,6 +182,10 @@ class _PlanningAttempt:
     subject: CampaignPlanningSubject
     compilation_record_artifact_digest: str | None = None
     revision: PlanRevision | None = None
+    # The governed production repository persists this immutable copy so a
+    # fresh host can reconstruct the Artifact-backed record before any active
+    # Plan readback.  It is absent only while Planning is still incomplete.
+    compilation_record_bytes: bytes | None = None
 
 
 class CampaignSnapshotSource(Protocol):
@@ -284,6 +288,12 @@ class InMemoryPlanRepository:
         self.runtime_assertions: dict[tuple[str, str], dict[str, Any]] = {}
         self.revisions: dict[str, PlanRevision] = {}
         self.activations: dict[tuple[str, str], ActivationReceipt] = {}
+        # ``activations`` is the mutable current pointer only.  Retain every
+        # published receipt separately so a successor cannot erase audit
+        # evidence for its predecessor.
+        self.activation_receipts: dict[
+            tuple[str, str, str, str], ActivationReceipt
+        ] = {}
 
     @staticmethod
     def _attempt_key(handle: CampaignHandle, previous: str | None) -> tuple[str, str, str | None]:
@@ -303,11 +313,13 @@ class InMemoryPlanRepository:
                 existing,
                 compilation_record_artifact_digest=None,
                 revision=None,
+                compilation_record_bytes=None,
             )
             immutable_attempt = replace(
                 attempt,
                 compilation_record_artifact_digest=None,
                 revision=None,
+                compilation_record_bytes=None,
             )
             if immutable_existing != immutable_attempt:
                 raise PlanControlError(
@@ -327,6 +339,15 @@ class InMemoryPlanRepository:
                 raise PlanControlError(
                     "PLAN_PUBLICATION_CONFLICT",
                     "Campaign attempt replaced its compiled Plan Revision",
+                )
+            if (
+                existing.compilation_record_bytes is not None
+                and existing.compilation_record_bytes
+                != attempt.compilation_record_bytes
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Campaign attempt replaced its durable compilation record",
                 )
         self.attempts[key] = attempt
         return attempt
@@ -633,6 +654,19 @@ class InMemoryPlanRepository:
                 return
             self.pending_reservations.pop(self._reservation_key(receipt), None)
             raise PlanControlError("ACTIVATION_CAS_CONFLICT", "Campaign active revision differs from the expected previous revision")
+        receipt_key = (
+            receipt.repository,
+            receipt.campaign_key,
+            receipt.revision_digest,
+            receipt.planning_stable_action_id,
+        )
+        published = self.activation_receipts.get(receipt_key)
+        if published is not None and published != receipt:
+            raise PlanControlError(
+                "ACTIVATION_RECEIPT_IMMUTABLE",
+                "Activation Receipt identity was already published with other bytes",
+            )
+        self.activation_receipts[receipt_key] = receipt
         self.activations[handle_key] = receipt
 
     def finalize_claims(self, receipt: ActivationReceipt) -> None:
@@ -959,7 +993,7 @@ class PlanControl:
                 "Activation Receipt does not exactly bind its Planning attempt",
             )
         self._verify_attempt_artifacts(attempt)
-        self._read_compilation_record(attempt)
+        intent_bytes = self._read_compilation_record(attempt)
         compilation = _read_artifact_json(
             self._artifacts,
             attempt.compilation_record_artifact_digest,
@@ -985,6 +1019,17 @@ class PlanControl:
                 "ACTIVE_PLAN_CROSS_BINDING_INVALID",
                 "Activated Plan Revision does not exactly bind the Activation Receipt",
             )
+        # The persisted revision is an audit fact, never compilation authority.
+        # Rebuild it from the frozen snapshot and validated one-pass intent on
+        # every active readback so a self-consistent repository substitution
+        # cannot redirect an already activated Campaign.
+        expected_revision = _compile_plan(
+            attempt.snapshot_bytes,
+            attempt.snapshot_artifact_digest,
+            intent_bytes,
+            handle,
+        )
+        _validate_revision_provenance(revision, expected_revision)
         _validate_plan_spec(revision.canonical_bytes)
         plan_spec = revision.plan_spec
         plan_ticket_keys = tuple(item["key"] for item in plan_spec["work"])
@@ -1196,6 +1241,11 @@ class PlanControl:
             return attempt
         output_digest = receipt.planning_output_artifact_digest
         assert output_digest is not None
+        output_value = _read_artifact_json(
+            self._artifacts,
+            output_digest,
+            code="RUNTIME_PLANNING_OUTPUT_INVALID",
+        )
         intent = _planning_payload(self._artifacts, output_digest, attempt.subject)
         normalized = _normalize_intent(intent, _snapshot_from_bytes(attempt.snapshot_bytes))
         record = {
@@ -1225,14 +1275,22 @@ class PlanControl:
                 ),
             },
             "output_artifact_digest": output_digest,
+            "planning_output": output_value,
             "normalized_intent": normalized,
             "normalized_intent_digest": digest_value(normalized),
         }
+        record_bytes = canonical_bytes(record)
         record_digest = _put_canonical(self._artifacts, record)
+        if record_digest != digest_bytes(record_bytes):
+            raise PlanControlError(
+                "COMPILATION_RECORD_INVALID",
+                "Compilation record Artifact changed its canonical bytes",
+            )
         return self._repository.save_attempt(
             replace(
                 attempt,
                 compilation_record_artifact_digest=record_digest,
+                compilation_record_bytes=record_bytes,
             )
         )
 
@@ -1249,6 +1307,16 @@ class PlanControl:
                 digest,
                 code="COMPILATION_RECORD_INVALID",
             )
+            if attempt.compilation_record_bytes is not None:
+                if (
+                    digest_bytes(attempt.compilation_record_bytes) != digest
+                    or load_canonical_json(attempt.compilation_record_bytes)
+                    != record
+                ):
+                    raise PlanControlError(
+                        "COMPILATION_RECORD_INVALID",
+                        "Durable compilation record bytes do not bind the Artifact",
+                    )
             expected = {
                 "schema_version",
                 "subject",
@@ -1260,6 +1328,7 @@ class PlanControl:
                 "preflight_receipt",
                 "planning_receipt",
                 "output_artifact_digest",
+                "planning_output",
                 "normalized_intent",
                 "normalized_intent_digest",
             }
@@ -1357,6 +1426,18 @@ class PlanControl:
                 raise PlanControlError(
                     "COMPILATION_RECORD_INVALID",
                     "Compilation record is not bound to one completed Planning receipt",
+                )
+            if (
+                _read_artifact_json(
+                    self._artifacts,
+                    record["output_artifact_digest"],
+                    code="RUNTIME_PLANNING_OUTPUT_INVALID",
+                )
+                != record["planning_output"]
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Compilation record output does not read back at its exact Artifact digest",
                 )
             raw_intent = _planning_payload(
                 self._artifacts,
@@ -1671,6 +1752,88 @@ def _capability(value: object, label: str) -> str:
     return value
 
 
+def _normalize_ticket_contract(
+    value: Any,
+    *,
+    ticket_key: str,
+) -> dict[str, Any]:
+    if type(value) is not dict or not {"title", "body"}.issubset(value):
+        raise PlanControlError(
+            "TICKET_CONTRACT_MISSING",
+            f"Ticket {ticket_key} lacks a complete frozen contract",
+        )
+    title = _text(value["title"], "Ticket title")
+    body = _text(value["body"], "Ticket body")
+    if set(value) == {"title", "body"}:
+        # Kept as an internal compatibility shape for semantic unit fixtures.
+        # The production GitHub source always emits the complete shape below.
+        return {"title": title, "body": body}
+    expected = {
+        "title",
+        "body",
+        "state",
+        "state_reason",
+        "type",
+        "repository",
+        "labels",
+        "comments",
+    }
+    if set(value) != expected or value["state"] != "open":
+        raise PlanControlError(
+            "TICKET_CONTRACT_MISSING",
+            f"Ticket {ticket_key} lacks its complete open GitHub contract",
+        )
+    state_reason = value["state_reason"]
+    issue_type = value["type"]
+    repository = value["repository"]
+    labels = value["labels"]
+    comments = value["comments"]
+    if (
+        (state_reason is not None and type(state_reason) is not str)
+        or (issue_type is not None and type(issue_type) is not dict)
+        or type(repository) is not dict
+        or set(repository) != {"full_name", "url"}
+        or type(labels) is not list
+        or any(type(label) is not dict for label in labels)
+        or type(comments) is not list
+        or any(type(comment) is not dict for comment in comments)
+    ):
+        raise PlanControlError(
+            "TICKET_CONTRACT_MISSING",
+            f"Ticket {ticket_key} has malformed frozen GitHub facts",
+        )
+    label_names = [label.get("name") for label in labels]
+    comment_ids = [comment.get("id") for comment in comments]
+    if (
+        any(type(name) is not str or not name for name in label_names)
+        or len(set(label_names)) != len(label_names)
+        or label_names != sorted(label_names)
+        or any(type(comment_id) is not int or comment_id < 1 for comment_id in comment_ids)
+        or len(set(comment_ids)) != len(comment_ids)
+        or comment_ids != sorted(comment_ids)
+    ):
+        raise PlanControlError(
+            "TICKET_CONTRACT_MISSING",
+            f"Ticket {ticket_key} has non-canonical labels or comments",
+        )
+    return {
+        "title": title,
+        "body": body,
+        "state": "open",
+        "state_reason": state_reason,
+        "type": None if issue_type is None else dict(issue_type),
+        "repository": {
+            "full_name": _text(
+                repository["full_name"],
+                "Ticket repository full_name",
+            ),
+            "url": _text(repository["url"], "Ticket repository URL"),
+        },
+        "labels": [dict(label) for label in labels],
+        "comments": [dict(comment) for comment in comments],
+    }
+
+
 def _normalize_ticket(value: Any) -> dict[str, Any]:
     expected = {"key", "labels", "source", "contract", "native_blockers"}
     if type(value) is not dict or set(value) != expected:
@@ -1681,27 +1844,63 @@ def _normalize_ticket(value: Any) -> dict[str, Any]:
         raise PlanControlError("TICKET_LABEL_INVALID", f"Ticket {key} labels are invalid")
     if "ready-for-agent" not in labels or set(labels).intersection(_TRIAGE - {"ready-for-agent"}):
         raise PlanControlError("TICKET_LABEL_INVALID", f"Ticket {key} is not ready-for-agent")
-    contract = value["contract"]
-    if type(contract) is not dict or set(contract) != {"title", "body"}:
-        raise PlanControlError("TICKET_CONTRACT_MISSING", f"Ticket {key} lacks a complete frozen contract")
+    contract = _normalize_ticket_contract(
+        value["contract"],
+        ticket_key=key,
+    )
     blockers = value["native_blockers"]
     if type(blockers) is not list:
         raise PlanControlError("SNAPSHOT_INVALID", "native_blockers must be a list")
     canonical_blockers = []
     for blocker in blockers:
-        if type(blocker) is not dict or set(blocker) != {"key", "state"}:
+        if type(blocker) is not dict or set(blocker) not in (
+            {"key", "state"},
+            {"key", "state", "repository", "source"},
+        ):
             raise PlanControlError("SNAPSHOT_INVALID", "native blocker schema is invalid")
         state = _text(blocker["state"], "native blocker state").lower()
         if state not in {"open", "closed"}:
             raise PlanControlError("SNAPSHOT_INVALID", "native blocker state is invalid")
-        canonical_blockers.append({"key": _text(blocker["key"], "native blocker key"), "state": state})
+        normalized_blocker = {
+            "key": _text(blocker["key"], "native blocker key"),
+            "state": state,
+        }
+        if "repository" in blocker:
+            blocker_repository = blocker["repository"]
+            if (
+                type(blocker_repository) is not dict
+                or set(blocker_repository) != {"full_name", "url"}
+            ):
+                raise PlanControlError(
+                    "SNAPSHOT_INVALID",
+                    "native blocker repository identity is invalid",
+                )
+            normalized_blocker.update(
+                {
+                    "repository": {
+                        "full_name": _text(
+                            blocker_repository["full_name"],
+                            "native blocker repository full_name",
+                        ),
+                        "url": _text(
+                            blocker_repository["url"],
+                            "native blocker repository URL",
+                        ),
+                    },
+                    "source": _frozen_ref(
+                        blocker["source"],
+                        "native blocker source",
+                    ),
+                }
+            )
+        canonical_blockers.append(normalized_blocker)
     if len({item["key"] for item in canonical_blockers}) != len(canonical_blockers):
         raise PlanControlError("SNAPSHOT_INVALID", "native blockers repeat a Ticket")
     return {
         "key": key,
         "labels": sorted(labels),
         "source": _frozen_ref(value["source"], "Ticket source"),
-        "contract": {"title": _text(contract["title"], "Ticket title"), "body": _text(contract["body"], "Ticket body")},
+        "contract": contract,
         "native_blockers": sorted(canonical_blockers, key=lambda item: item["key"]),
     }
 
@@ -1979,7 +2178,17 @@ def _validate_plan_spec(payload: bytes) -> None:
         if type(item) is not dict or set(item) != expected or _text(item["key"], "PlanSpec work key") != item["key"] or _frozen_ref(item["source"], "PlanSpec work source") != item["source"]:
             raise PlanControlError("PLANSPEC_V3_INVALID", "PlanSpec work manifest schema is invalid")
         contract = item["contract"]
-        if type(contract) is not dict or set(contract) != {"title", "body"} or any(type(contract[key]) is not str or not contract[key] for key in contract):
+        try:
+            normalized_contract = _normalize_ticket_contract(
+                contract,
+                ticket_key=item["key"],
+            )
+        except PlanControlError as error:
+            raise PlanControlError(
+                "PLANSPEC_V3_INVALID",
+                "PlanSpec work contract is invalid",
+            ) from error
+        if normalized_contract != contract:
             raise PlanControlError("PLANSPEC_V3_INVALID", "PlanSpec work contract is invalid")
         for field in ("depends_on", "exclusive_resources", "capabilities"):
             facts = item[field]

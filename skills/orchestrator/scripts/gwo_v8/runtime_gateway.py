@@ -7887,6 +7887,45 @@ class RuntimeGateway:
             receipt_digest=receipt_digest,
         )
 
+    def _campaign_start_assertion(
+        self,
+        repository: str,
+        campaign_key: str,
+        campaign_handle: str,
+    ) -> CampaignStartRuntimeOverrides | None:
+        """Host-only recovery of #111's authoritative Campaign binding.
+
+        This deliberately is not a RuntimeGateway caller operation.  The host
+        uses it only after preflight, to reconstruct a missing PlanControl
+        mirror from the already validated Gateway journal rather than inventing
+        a replacement assertion from local defaults.
+        """
+
+        if any(
+            type(value) is not str or not value
+            for value in (repository, campaign_key, campaign_handle)
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_CONFIGURATION_INVALID",
+                "Campaign assertion recovery identity is invalid",
+            )
+        self._refresh()
+        campaign = self._data["campaigns"].get(campaign_handle)
+        if campaign is None:
+            return None
+        if (
+            type(campaign) is not dict
+            or campaign.get("repository") != repository
+            or campaign.get("campaign_key") != campaign_key
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_CAMPAIGN_IDENTITY_MISMATCH",
+                "Campaign assertion recovery read another Campaign",
+            )
+        # ``_refresh`` has already proven the complete campaign/preflight
+        # cross-binding and canonical override digest before this projection.
+        return _campaign_overrides_from_value(campaign["overrides"])
+
     # Caller interface operation 2.  This owns the entire readback-first
     # prepare/observe/start-or-resume loop; callers cannot issue provider
     # commands or inspect a Runtime Binding.

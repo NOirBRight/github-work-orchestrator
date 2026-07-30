@@ -1683,8 +1683,29 @@ def test_production_github_installer_builds_real_source_and_durable_repository(
                 "title": "Contract",
                 "body": "Do the work",
                 "state": "open",
-                "labels": [{"name": "ready-for-agent"}],
+                "state_reason": None,
+                "type": None,
+                "repository_url": (
+                    "https://api.github.com/repos/owner/repository"
+                ),
+                "url": (
+                    "https://api.github.com/repos/owner/repository/"
+                    f"issues/{number}"
+                ),
+                "html_url": (
+                    "https://github.com/owner/repository/"
+                    f"issues/{number}"
+                ),
+                "labels": [
+                    {
+                        "id": 1,
+                        "name": "ready-for-agent",
+                    }
+                ],
             }
+
+        def read_comments(self, repository, number):
+            return ()
 
         def read_blockers(self, repository, number):
             return ()
@@ -1737,9 +1758,27 @@ def test_production_github_installer_builds_real_source_and_durable_repository(
         _gateway_builder=gateway_builder,
     )
 
-    handle = host.start("owner/repository", ["#109"])
+    options = {
+        "ticket_overrides": [
+            {
+                "ticket_key": "issue:109",
+                "role": "worker",
+                "mapping": {
+                    "primary_profile_digest": profile.digest,
+                    "availability_fallback_profile_digest": None,
+                },
+            }
+        ]
+    }
+    handle = host.start("owner/repository", ["#109"], options)
+    equivalent_handle = host.start(
+        "owner/repository",
+        ["https://github.com/owner/repository/issues/109"],
+        options,
+    )
 
     assert issue_client.issue_reads == [("owner/repository", 109)]
+    assert equivalent_handle == handle
     assert handle.repository == "owner/repository"
     assert any(
         path == ".gwo-v8/plan-control-v3.json"

@@ -419,6 +419,223 @@ class GitHubCliContentClient:
             )
         return readback
 
+    # The Contents API compares one path's blob, not the branch tip.  Control
+    # transitions which derive authority from another path must instead use
+    # one commit rooted at one observed branch tip.  These methods deliberately
+    # remain a private seam: the higher-level module still exposes only its
+    # typed durable operation, never Git commands to a workflow caller.
+    def read_ref(self, repository: str, branch: str) -> str:
+        result = self._run(
+            [
+                "api",
+                "--method",
+                "GET",
+                f"repos/{repository}/git/ref/heads/{branch}",
+            ]
+        )
+        if result.returncode != 0:
+            raise ActivationError(
+                "DURABLE_READ_FAILED",
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "GitHub control ref cannot be read",
+            )
+        try:
+            value = json.loads(result.stdout)
+            digest = value["object"]["sha"]
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ActivationError(
+                "DURABLE_READ_INVALID",
+                "GitHub control ref response is malformed",
+            ) from error
+        if type(digest) is not str or not digest:
+            raise ActivationError(
+                "DURABLE_READ_INVALID",
+                "GitHub control ref omitted its commit digest",
+            )
+        return digest
+
+    def read_at_ref(
+        self,
+        repository: str,
+        ref_digest: str,
+        path: str,
+    ) -> GitHubContent | None:
+        if type(ref_digest) is not str or not ref_digest:
+            raise ActivationError(
+                "DURABLE_READ_INVALID",
+                "GitHub control ref digest is invalid",
+            )
+        return self.read(repository, ref_digest, path)
+
+    def _git_json(
+        self,
+        repository: str,
+        method: str,
+        endpoint: str,
+        value: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        args = ["api", "--method", method, f"repos/{repository}/{endpoint}"]
+        result = self._run(
+            args if value is None else [*args, "--input", "-"],
+            input_text=None if value is None else json.dumps(value),
+        )
+        if result.returncode != 0:
+            raise ActivationError(
+                "DURABLE_STATE_AMBIGUOUS",
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "GitHub control ref transition was not acknowledged",
+            )
+        try:
+            parsed = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ActivationError(
+                "DURABLE_STATE_AMBIGUOUS",
+                "GitHub control ref transition returned malformed JSON",
+            ) from error
+        if type(parsed) is not dict:
+            raise ActivationError(
+                "DURABLE_STATE_AMBIGUOUS",
+                "GitHub control ref transition returned a non-object",
+            )
+        return parsed
+
+    def compare_and_swap_ref(
+        self,
+        repository: str,
+        branch: str,
+        *,
+        expected_ref_digest: str,
+        changes: dict[str, bytes],
+        message: str,
+    ) -> str:
+        """Commit all control paths from one exact branch-tip observation.
+
+        A non-forced ref update accepts only a child of ``expected_ref_digest``.
+        Thus a Writer Record change and a PlanControl transition cannot pass one
+        another through independent Contents-path CAS operations.
+        """
+
+        if (
+            type(expected_ref_digest) is not str
+            or not expected_ref_digest
+            or type(message) is not str
+            or not message
+            or type(changes) is not dict
+            or not changes
+            or any(
+                type(path) is not str
+                or not path
+                or type(content) is not bytes
+                for path, content in changes.items()
+            )
+        ):
+            raise ActivationError(
+                "DURABLE_STATE_AMBIGUOUS",
+                "GitHub control ref transition has an invalid exact change set",
+            )
+        current = self.read_ref(repository, branch)
+        if current != expected_ref_digest:
+            raise ActivationError(
+                "DURABLE_STATE_AMBIGUOUS",
+                "GitHub control branch advanced before the exact CAS transition",
+            )
+        commit = self._git_json(
+            repository,
+            "GET",
+            f"git/commits/{expected_ref_digest}",
+        )
+        try:
+            base_tree = commit["tree"]["sha"]
+        except (KeyError, TypeError) as error:
+            raise ActivationError(
+                "DURABLE_READ_INVALID",
+                "GitHub control commit omitted its base tree",
+            ) from error
+        if type(base_tree) is not str or not base_tree:
+            raise ActivationError(
+                "DURABLE_READ_INVALID",
+                "GitHub control commit base tree is invalid",
+            )
+        tree_entries = []
+        for path, content in sorted(changes.items()):
+            blob = self._git_json(
+                repository,
+                "POST",
+                "git/blobs",
+                {
+                    "content": base64.b64encode(content).decode("ascii"),
+                    "encoding": "base64",
+                },
+            )
+            digest = blob.get("sha")
+            if type(digest) is not str or not digest:
+                raise ActivationError(
+                    "DURABLE_STATE_AMBIGUOUS",
+                    "GitHub control blob write omitted its digest",
+                )
+            tree_entries.append(
+                {
+                    "path": path,
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": digest,
+                }
+            )
+        tree = self._git_json(
+            repository,
+            "POST",
+            "git/trees",
+            {"base_tree": base_tree, "tree": tree_entries},
+        )
+        tree_digest = tree.get("sha")
+        if type(tree_digest) is not str or not tree_digest:
+            raise ActivationError(
+                "DURABLE_STATE_AMBIGUOUS",
+                "GitHub control tree write omitted its digest",
+            )
+        committed = self._git_json(
+            repository,
+            "POST",
+            "git/commits",
+            {
+                "message": message,
+                "tree": tree_digest,
+                "parents": [expected_ref_digest],
+            },
+        )
+        commit_digest = committed.get("sha")
+        if type(commit_digest) is not str or not commit_digest:
+            raise ActivationError(
+                "DURABLE_STATE_AMBIGUOUS",
+                "GitHub control commit write omitted its digest",
+            )
+        updated = self._git_json(
+            repository,
+            "PATCH",
+            f"git/refs/heads/{branch}",
+            {"sha": commit_digest, "force": False},
+        )
+        if updated.get("object", {}).get("sha") != commit_digest:
+            raise ActivationError(
+                "DURABLE_STATE_AMBIGUOUS",
+                "GitHub control ref CAS did not return its exact commit",
+            )
+        if self.read_ref(repository, branch) != commit_digest:
+            raise ActivationError(
+                "DURABLE_STATE_AMBIGUOUS",
+                "GitHub control ref CAS did not read back its exact commit",
+            )
+        for path, content in changes.items():
+            readback = self.read_at_ref(repository, commit_digest, path)
+            if readback is None or readback.content != content:
+                raise ActivationError(
+                    "DURABLE_STATE_AMBIGUOUS",
+                    "GitHub control ref CAS did not read back exact changed bytes",
+                )
+        return commit_digest
+
 
 class GitHubDurablePlanControl:
     """Immutable Plan records plus one CAS-updated durable activation log."""
