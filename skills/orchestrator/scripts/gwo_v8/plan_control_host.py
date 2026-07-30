@@ -183,6 +183,8 @@ def _production_gateway_builder(
     repository_contexts: Mapping[str, RuntimeRepositoryContext],
     artifacts: ArtifactStore,
     planning_progress_policy: Callable[[CampaignPlanningSubject], str] | None = None,
+    planning_effect_authorizer: Callable[[CampaignPlanningSubject, str], bool]
+    | None = None,
 ) -> Any:
     return build_runtime_gateway(
         store_path=gateway_store_path,
@@ -190,6 +192,7 @@ def _production_gateway_builder(
         repository_contexts=repository_contexts,
         _shared_artifacts=artifacts,
         _planning_progress_policy=planning_progress_policy,
+        _planning_effect_authorizer=planning_effect_authorizer,
     )
 
 
@@ -239,6 +242,11 @@ class ProductionPlanControlStartHost:
                 "planning_progress_mode",
                 None,
             )
+            effect_authorizer = getattr(
+                self._repository,
+                "planning_effect_authorization",
+                None,
+            )
             gateway = self._gateway_builder(
                 gateway_store_path=self._gateway_store_path,
                 configuration=configuration,
@@ -246,6 +254,9 @@ class ProductionPlanControlStartHost:
                 artifacts=self._artifacts,
                 planning_progress_policy=(
                     progress_policy if callable(progress_policy) else None
+                ),
+                planning_effect_authorizer=(
+                    effect_authorizer if callable(effect_authorizer) else None
                 ),
             )
         except PlanControlError:

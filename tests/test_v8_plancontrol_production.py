@@ -619,6 +619,7 @@ class _RefContentClient:
         self.head = "commit:1"
         self.writes = []
         self.before_ref_cas = None
+        self.after_ref_cas = None
         self.activation_barrier = None
 
     def read_ref(self, repository, branch):
@@ -663,6 +664,10 @@ class _RefContentClient:
         self.writes.append((expected_ref_digest, dict(changes)))
         self.head = f"commit:{len(self._commits) + 1}"
         self._commits[self.head] = tree
+        if self.after_ref_cas is not None:
+            callback = self.after_ref_cas
+            self.after_ref_cas = None
+            callback()
         return self.head
 
     def advance_writer(self, writer_generation, *, status="cut_over"):
@@ -2505,3 +2510,214 @@ def test_r7c1_github_writer_policy_exposes_only_closed_progress_modes(status):
     )
 
     assert repository.planning_progress_mode(subject) == status
+
+
+def test_r8_github_effect_claim_loses_when_writer_drains_before_ref_cas():
+    """The provider gate cannot win after the Writer's durable drain."""
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import CampaignPlanningSubject
+
+    client = _RefContentClient()
+    client.before_ref_cas = lambda: client.advance_writer(
+        "writer:one", status="draining"
+    )
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    subject = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r8-cas",
+        campaign_handle="campaign-handle:r8-cas",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest="a" * 64,
+        policy_witness_digest="b" * 64,
+        planning_request_artifact_digest="c" * 64,
+        stable_action_id="planning:r8-cas",
+    )
+
+    assert repository.planning_effect_authorization(subject, "prepare") is False
+    assert repository.planning_progress_mode(subject) == "draining"
+    assert ".gwo-v8/planning-effect-authorizations.json" not in client._commits[
+        client.head
+    ]
+
+
+@pytest.mark.parametrize("boundary", ("prepare", "start"))
+def test_r8_github_effect_claim_survives_only_as_post_drain_recovery_evidence(
+    boundary,
+):
+    """A claim that wins before drain cannot dispatch after the drain commits."""
+
+    from dataclasses import replace
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import CampaignPlanningSubject
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    subject = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r8-replay",
+        campaign_handle="campaign-handle:r8-replay",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest="a" * 64,
+        policy_witness_digest="b" * 64,
+        planning_request_artifact_digest="c" * 64,
+        stable_action_id="planning:r8-replay",
+    )
+
+    assert repository.planning_effect_authorization(subject, boundary) is True
+    writes_after_claim = len(client.writes)
+    assert ".gwo-v8/planning-effect-authorizations.json" in client._commits[
+        client.head
+    ]
+    client.advance_writer("writer:one", status="draining")
+    restarted = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+
+    assert restarted.planning_effect_authorization(subject, boundary) is False
+    assert len(client.writes) == writes_after_claim
+    assert restarted.planning_effect_authorization(
+        subject, "start" if boundary == "prepare" else "prepare"
+    ) is False
+    assert restarted.planning_effect_authorization(
+        replace(subject, campaign_key="campaign:r8-other"), boundary
+    ) is False
+
+
+def _r8_authorized_runtime_gateway(tmp_path, repository, initial_state):
+    """Build one real Gateway plus the Git-backed Writer effect gate."""
+
+    from dataclasses import replace
+
+    from gwo_v8.planning_protocol import planning_prompt
+    from gwo_v8.runtime_gateway import (
+        ArtifactStore,
+        CampaignPlanningSubject,
+        ProfileMapping,
+        RuntimeConfiguration,
+        RuntimeGateway,
+        _InMemoryRuntimeProviderAdapter,
+        _RuntimeActionSpec,
+        _RuntimeFailure,
+    )
+    from gwo_v8.runtime_profile import RuntimeProfile
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    snapshot = store.put_canonical({"tickets": [{"key": "issue:109"}]})
+    policy = store.put_canonical({"policy": "frozen"})
+    unsigned = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r8-dispatch",
+        campaign_handle="campaign-handle:r8-dispatch",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest=snapshot.digest,
+        policy_witness_digest=policy.digest,
+        planning_request_artifact_digest="0" * 64,
+        stable_action_id="planning:r8-dispatch",
+    )
+    prompt = store.put_canonical(
+        planning_prompt(
+            subject_digest=unsigned.prompt_binding_digest,
+            authority_digest=unsigned.authority_digest,
+            snapshot_artifact_digest=snapshot.digest,
+            policy_witness_artifact_digest=policy.digest,
+        )
+    )
+    subject = replace(unsigned, planning_request_artifact_digest=prompt.digest)
+    profile = RuntimeProfile(
+        name="coordinator",
+        provider="test",
+        model="test-model",
+        thinking="high",
+        mode="safe",
+        features={},
+    )
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.json",
+        _adapter=adapter,
+        configuration=RuntimeConfiguration(
+            profiles={profile.digest: profile},
+            host_mappings={"coordinator": ProfileMapping(profile.digest)},
+        ),
+        _artifacts=store,
+        _planning_progress_policy=repository.planning_progress_mode,
+        _planning_effect_authorizer=repository.planning_effect_authorization,
+    )
+    preflight = gateway.planning_preflight(subject)
+    if initial_state == "prepared":
+        record = gateway._assignment_for_progress(
+            subject, gateway._data["preflights"][subject.stable_action_id]
+        )
+        prompt_artifact, input_artifacts = gateway._resolve_input_artifacts(subject)
+        prepared = adapter.prepare(
+            _RuntimeActionSpec(
+                subject.stable_action_id,
+                subject,
+                gateway._profile(record["profile_digest"]),
+                prompt_artifact,
+                input_artifacts,
+            )
+        )
+        assert not isinstance(prepared, _RuntimeFailure)
+    return gateway, subject, preflight, adapter
+
+
+@pytest.mark.parametrize("initial_state", ("absent", "prepared"))
+def test_r8_claim_then_drain_before_dispatch_has_zero_post_drain_effects(
+    initial_state,
+    tmp_path,
+):
+    """A post-claim drain blocks `prepare` and `start` before provider I/O."""
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import RuntimeGatewayError
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    gateway, subject, preflight, adapter = _r8_authorized_runtime_gateway(
+        tmp_path,
+        repository,
+        initial_state,
+    )
+    client.after_ref_cas = lambda: client.advance_writer(
+        "writer:one", status="draining"
+    )
+    before = (
+        len(adapter.prepare_calls),
+        adapter.created_agent_count,
+        len(adapter.command_calls),
+    )
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        gateway.progress(subject, preflight)
+
+    assert rejected.value.code == "RUNTIME_RECOVERY_ONLY"
+    assert repository.planning_progress_mode(subject) == "draining"
+    assert ".gwo-v8/planning-effect-authorizations.json" in client._commits[
+        client.head
+    ]
+    assert (
+        len(adapter.prepare_calls),
+        adapter.created_agent_count,
+        len(adapter.command_calls),
+    ) == before

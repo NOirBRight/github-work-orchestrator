@@ -13950,3 +13950,155 @@ def test_r7c1_progress_recovery_state_matrix(mode, action_state, expected, tmp_p
     )
     if mode == "draining":
         assert after == before
+
+
+@pytest.mark.parametrize("initial_state", ("absent", "prepared"))
+def test_r8_writer_effect_claim_cannot_dispatch_after_drain(
+    initial_state,
+    tmp_path,
+):
+    """A pre-drain claim is recovery evidence, never a draining dispatch lease."""
+
+    from gwo_v8.planning_protocol import planning_prompt
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    snapshot = store.put_canonical({"tickets": [{"key": "issue:111"}]})
+    policy = store.put_canonical({"policy": "frozen"})
+    unsigned = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r8-race",
+        campaign_handle="handle:r8-race",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest=snapshot.digest,
+        policy_witness_digest=policy.digest,
+        planning_request_artifact_digest="0" * 64,
+        stable_action_id="planning:r8-race",
+    )
+    prompt = store.put_canonical(
+        planning_prompt(
+            subject_digest=unsigned.prompt_binding_digest,
+            authority_digest=unsigned.authority_digest,
+            snapshot_artifact_digest=snapshot.digest,
+            policy_witness_artifact_digest=policy.digest,
+        )
+    )
+    subject = replace(unsigned, planning_request_artifact_digest=prompt.digest)
+    writer = {"mode": "cut_over", "samples": []}
+    effect_claims = []
+
+    def planning_mode(_subject):
+        writer["samples"].append(writer["mode"])
+        return writer["mode"]
+
+    def authorize_effect(authorized_subject, boundary):
+        assert authorized_subject == subject
+        effect_claims.append(boundary)
+        writer["mode"] = "draining"
+        return writer["mode"] == "cut_over"
+
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.json",
+        _adapter=adapter,
+        configuration=RuntimeConfiguration(
+            profiles={_profile().digest: _profile()},
+            host_mappings={"coordinator": ProfileMapping(_profile().digest)},
+        ),
+        _artifacts=store,
+        _planning_progress_policy=planning_mode,
+        _planning_effect_authorizer=authorize_effect,
+    )
+    preflight = gateway.planning_preflight(subject)
+    if initial_state == "prepared":
+        record = gateway._assignment_for_progress(
+            subject, gateway._data["preflights"][subject.stable_action_id]
+        )
+        prompt_artifact, input_artifacts = gateway._resolve_input_artifacts(subject)
+        prepared = adapter.prepare(
+            _RuntimeActionSpec(
+                subject.stable_action_id,
+                subject,
+                gateway._profile(record["profile_digest"]),
+                prompt_artifact,
+                input_artifacts,
+            )
+        )
+        assert not isinstance(prepared, _RuntimeFailure)
+    before = (
+        len(adapter.prepare_calls),
+        adapter.created_agent_count,
+        len(adapter.command_calls),
+    )
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        gateway.progress(subject, preflight)
+
+    assert rejected.value.code == "RUNTIME_RECOVERY_ONLY"
+    assert writer["samples"] == ["cut_over"]
+    assert effect_claims == [
+        "prepare" if initial_state == "absent" else "start"
+    ]
+    assert (
+        len(adapter.prepare_calls),
+        adapter.created_agent_count,
+        len(adapter.command_calls),
+    ) == before
+
+
+def test_r8_writer_effect_authorization_is_not_replayable_across_boundaries(
+    tmp_path,
+):
+    """One exact prepare claim cannot be replayed as a start claim."""
+
+    from gwo_v8.planning_protocol import planning_prompt
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    snapshot = store.put_canonical({"tickets": [{"key": "issue:111"}]})
+    policy = store.put_canonical({"policy": "frozen"})
+    unsigned = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r8-boundaries",
+        campaign_handle="handle:r8-boundaries",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest=snapshot.digest,
+        policy_witness_digest=policy.digest,
+        planning_request_artifact_digest="0" * 64,
+        stable_action_id="planning:r8-boundaries",
+    )
+    prompt = store.put_canonical(
+        planning_prompt(
+            subject_digest=unsigned.prompt_binding_digest,
+            authority_digest=unsigned.authority_digest,
+            snapshot_artifact_digest=snapshot.digest,
+            policy_witness_artifact_digest=policy.digest,
+        )
+    )
+    subject = replace(unsigned, planning_request_artifact_digest=prompt.digest)
+    authorizations = []
+
+    def authorize_effect(authorized_subject, boundary):
+        assert authorized_subject == subject
+        authorizations.append(boundary)
+        return boundary == "prepare"
+
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.json",
+        _adapter=adapter,
+        configuration=RuntimeConfiguration(
+            profiles={_profile().digest: _profile()},
+            host_mappings={"coordinator": ProfileMapping(_profile().digest)},
+        ),
+        _artifacts=store,
+        _planning_effect_authorizer=authorize_effect,
+    )
+    preflight = gateway.planning_preflight(subject)
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        gateway.progress(subject, preflight)
+
+    assert rejected.value.code == "RUNTIME_RECOVERY_ONLY"
+    assert authorizations == ["prepare", "start"]
+    assert adapter.prepare_calls == [subject.stable_action_id]
+    assert adapter.created_agent_count == 0
+    assert adapter.command_calls == []

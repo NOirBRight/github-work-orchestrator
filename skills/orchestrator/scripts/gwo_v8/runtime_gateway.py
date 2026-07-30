@@ -7682,6 +7682,8 @@ def build_runtime_gateway(
     maximum_artifact_bytes: int = 1_048_576,
     _shared_artifacts: ArtifactStore | None = None,
     _planning_progress_policy: Callable[[CampaignPlanningSubject], str] | None = None,
+    _planning_effect_authorizer: Callable[[CampaignPlanningSubject, str], bool]
+    | None = None,
 ) -> "RuntimeGateway":
     """Compose the V3 production Gateway without exposing provider machinery."""
 
@@ -7721,6 +7723,7 @@ def build_runtime_gateway(
         _artifacts=artifacts,
         _static_assignment_validator=_PaseoStaticAssignmentValidator(repository_contexts),
         _planning_progress_policy=_planning_progress_policy,
+        _planning_effect_authorizer=_planning_effect_authorizer,
     )
 
 
@@ -7763,6 +7766,8 @@ class RuntimeGateway:
         _static_assignment_validator: Callable[[RuntimeSubject, RuntimeProfile], None]
         | None = None,
         _planning_progress_policy: Callable[[CampaignPlanningSubject], str] | None = None,
+        _planning_effect_authorizer: Callable[[CampaignPlanningSubject, str], bool]
+        | None = None,
     ):
         self._store_path = Path(store_path)
         self._journal = _V3JsonJournal(self._store_path)
@@ -7780,6 +7785,7 @@ class RuntimeGateway:
         )
         self._static_assignment_validator = _static_assignment_validator
         self._planning_progress_policy = _planning_progress_policy
+        self._planning_effect_authorizer = _planning_effect_authorizer
         self._data = self._load()
 
     # Caller interface operation 1.  It neither calls an adapter nor reserves
@@ -8008,6 +8014,7 @@ class RuntimeGateway:
                 prompt_artifact=prompt_artifact,
                 input_artifacts=input_artifacts,
             )
+            self._authorize_planning_effect(subject, "prepare")
             prepared_verdict = self._prepare_verdict(spec)
             if prepared_verdict.kind == "recoverable_failure":
                 assert prepared_verdict.failure is not None
@@ -8062,6 +8069,7 @@ class RuntimeGateway:
                     "start requires an unfenced Prepared Runtime observation",
                 )
             self._record_observation(record, observation_verdict)
+            self._authorize_planning_effect(subject, "start")
             observation_verdict = self._command_with_readback(
                 subject.stable_action_id,
                 RuntimeCommand.START,
@@ -8148,6 +8156,43 @@ class RuntimeGateway:
                 "Planning progress policy is outside its closed state union",
             )
         return mode
+
+    def _authorize_planning_effect(
+        self,
+        subject: CampaignPlanningSubject,
+        boundary: str,
+    ) -> None:
+        """Require one exact, host-linearized Planning effect claim.
+
+        The host callback remains a private composition seam: callers still
+        have only preflight, progress, and transition.  A missing callback is
+        the deterministic in-memory/default composition where no external
+        Writer authority exists.  A composed callback must return the exact
+        boolean ``True`` after durably authorizing this subject and boundary.
+        """
+
+        if type(boundary) is not str or boundary not in {"prepare", "start"}:
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_ONLY",
+                "Planning provider-effect boundary is outside the closed authorization union",
+            )
+        authorizer = self._planning_effect_authorizer
+        if authorizer is None:
+            return
+        try:
+            authorized = authorizer(subject, boundary)
+        except RuntimeGatewayError:
+            raise
+        except Exception as error:
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_ONLY",
+                "Planning provider-effect authorization is unavailable",
+            ) from error
+        if type(authorized) is not bool or not authorized:
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_ONLY",
+                "Planning provider-effect authorization was denied or malformed",
+            )
 
     # Caller interface operation 3.  Binding refs remain private, including
     # for start/resume: they re-enter the same observe-gated progression path.
