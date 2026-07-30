@@ -112,6 +112,32 @@ relationships, Campaign source, target, and frozen repository policy. It
 rejects invalid labels, missing contracts, blocker cycles, conflicting Ticket
 claims, and oversized input before spending an LLM turn.
 
+After that immutable snapshot exists, and still before it acquires a Ticket
+claim or requests semantic action, PlanControl forms one pre-Plan
+`CampaignPlanningSubject`. The closed subject binds the repository, stable
+Campaign key and handle, expected previous Plan Revision digest (or `null`),
+snapshot Artifact digest, Policy Witness digest, immutable planning
+protocol/request Artifact digest, and stable action. It asks RuntimeGateway for
+the subject's mechanically read-only planning-configuration preflight receipt.
+The preflight resolves only the required `coordinator` configuration; it
+creates no Agent, session, workspace, provider action, claim, or capacity
+reservation. Missing or invalid configuration fails closed at this point.
+Its semantic signature is only `planning_preflight(subject)`. An optional
+Campaign-start assertion is host-composed configuration keyed by exact
+Campaign identity. Absence persists empty configuration on first use and
+reuses an existing durable binding; a present assertion must match that
+binding exactly.
+The opaque preflight receipt binds the complete Campaign-start overrides
+digest plus the resolved assignment digest.  The assignment digest covers the
+closed selector/source/Profile/fallback choice together with repository,
+Campaign, and exact subject provenance. Campaign, preflight, override, and
+assignment schemas are closed, and journal load recomputes each digest before
+any Adapter readback; unrelated Ticket overrides therefore still change the
+receipt.
+Each Campaign record also cross-binds the planning stable action to the exact
+subject and complete override digest. Journal load requires a one-to-one match
+between Campaign links and preflight records.
+
 Each initial or successor Plan Revision receives one bounded Campaign Planning
 Pass over that complete snapshot. Its output is private to PlanControl and may
 contain only:
@@ -127,7 +153,11 @@ a model or CLI, predict files, author lifecycle policy, or prescribe Worker
 steps. A semantic Coordinator Decision can never expand authority. PlanControl
 deterministically validates the private output and is the only PlanSpec
 compiler. Compilation, publication, and readback retry the same validated
-output and never repeat the Planning Pass.
+output and never repeat the Planning Pass. It requests that one pass only by
+giving RuntimeGateway the preflight receipt and `CampaignPlanningSubject`.
+RuntimeGateway returns an Artifact-backed planning receipt for the same stable
+action; PlanControl consumes that opaque receipt and never receives a provider,
+CLI, Runtime Profile, session, Runtime Binding, adapter, or command fact.
 
 A configured byte limit bounds the Planning input. Exceeding it returns a
 named split-Campaign Decision; V8 neither truncates contracts nor creates an
@@ -233,6 +263,13 @@ Runtime assignment uses exact selectors:
 - Ticket-scoped `review_strong`; and
 - Ticket-scoped `specialist:<policy-id>`.
 
+Those selectors are private configuration vocabulary. Work Run callers use
+the closed `WorkRunPurpose` values implementation, terminal-recovery
+implementation, Formal Review, invalid Review payload retry, and specialist
+review with a policy ID. RuntimeGateway performs the exact private
+mapping; raw selector strings and subclasses are rejected at the subject
+boundary.
+
 The `coordinator` selector resolves in this order:
 
 1. Campaign-start Coordinator override;
@@ -266,39 +303,334 @@ source.
 
 ## RuntimeGateway adapter contract
 
-RuntimeGateway owns one private provider-neutral adapter contract. Every
-production adapter and the deterministic in-memory adapter implements exactly:
+This successor PlanSpec v3 contract is supplied by #111 before #109 wires the
+new composition. The schema-version-2 Kernel and `runtime.py` adapters remain
+explicit predecessor compatibility until #118 Cutover Guard. They are not a
+RuntimeGateway bypass for any successor V3 module.
+
+RuntimeGateway accepts only two materialization subjects: the pre-Plan
+`CampaignPlanningSubject` above, and a Plan-Revision Work Run subject that
+binds the repository, Campaign, Plan Revision, Work Run, Ticket, semantic
+purpose, stable action, authority subtree, and Artifact-backed Prompt. The
+closed Work Run purposes are implementation, terminal-recovery
+implementation, Formal Review, invalid Review payload retry, and specialist
+review with one policy ID. RuntimeGateway privately maps those
+purposes to the configured selector vocabulary; callers never provide raw
+selector strings. It does
+not fabricate a Plan Revision for planning, and accepts no generic Agent or
+provider subject.
+
+Its caller interface has only three operations:
+`planning_preflight(subject)`,
+`progress(subject, preflight=None, wake_cursor=None)`, and
+`transition(stable_action_id, transition)`. Progress owns the complete
+observe-before-start and readback-first recovery loop; callers cannot prepare,
+observe, command, inspect a Runtime Binding, or treat an event as state.
+Campaign-start overrides are durable Campaign configuration, not PlanSpec;
+the gateway persists each stable action's selector, configuration source,
+resolved Profile digest, fallback choice, and closed assignment digest before
+any provider operation. A Planning action's seal must equal the independently
+persisted preflight and Campaign cross-binding; an action-local digest rewrite
+cannot select another otherwise valid Profile or source on restart.
+Planning preflights and materialized actions share one stable-action identity
+namespace in that same journal: the transaction that commits either record
+also reserves the subject kind and complete canonical-subject digest. Exact
+replay is valid, while any cross-kind or changed-subject reuse fails before
+Adapter readback, preparation, command, or provider effect. The current
+Gateway recovery journal is schema version 2 and requires every top-level,
+preflight, Campaign, and action field. A closed schema-version-1 journal may
+migrate only while the Journal lock is held: RuntimeGateway validates every
+preflight and action identity, rebuilds their shared reservation map, and
+rejects every conflict without rewriting the version-1 bytes. Only that
+complete validation may atomically publish schema version 2; every other
+earlier or malformed schema fails closed.
+Only the host configuration assembler reads immutable Runtime Profile
+provider/model facts and supplies the composed `RuntimeConfiguration`; that
+host-only composition data is not a PlanSpec or semantic-workflow input.
+`RuntimeProfile` is an immutable provider-neutral value in a neutral module
+shared with predecessor compatibility code; the successor gateway does not
+import the predecessor runtime implementation.
+Its nested JSON feature objects and arrays are recursively defensive-copied
+and immutable without changing canonical serialization or digest. They are
+composition-only views, not `dict`/`list` subclasses, and identity uses an
+explicit plain-JSON projection while `dict(profile.features)` remains V2
+compatible. `RuntimeConfiguration` reconstructs and freezes every Profile,
+selector, mapping, nested repository mapping, and Campaign assertion rather
+than retaining caller values. Every lookup and resolution rechecks exact value
+types and registry-key digests before Adapter or provider activity. The
+tuple-backed public values reject initializer re-entry and object-attribute
+mutation, while RuntimeGateway pins and rechecks the digest of the complete
+composed configuration. `RuntimeRepositoryContext` is likewise copied into a
+private sealed snapshot at production-adapter and static-validator entry; a
+caller cannot reinitialize or redirect a later prepare/restart to another
+repository or base ref.
+PlanControl, ExecutionKernel, CandidateGate, and other semantic workflow
+callers receive neither those facts nor a vendor command surface. Host
+composition uses provider-neutral `build_runtime_gateway` and
+`RuntimeRepositoryContext`; the factory accepts the composed configuration but
+has no direct provider, CLI, transport, raw-adapter, or binding parameter.
+
+RuntimeGateway owns one module-private provider-neutral adapter contract.
+Every production adapter and the deterministic in-memory adapter implements
+exactly:
 
 ```text
 prepare(RuntimeActionSpec) -> PrepareReceipt | RuntimeFailure
-observe(stable_action_id) -> RuntimeObservation | RuntimeFailure
-command(binding_ref, RuntimeCommand) -> CommandReceipt | RuntimeFailure
+observe(stable_action_id) -> PreparedObservation | BoundObservation | RuntimeFailure
+command(stable_action_id, RuntimeTransition) -> CommandReceipt | RuntimeFailure
 events(after_cursor) -> RuntimeEventPage
 ```
 
+`ObservationRead` is an adapter-private sealed reconciliation value, not an
+adapter-contract result. It binds the requested/selected action, complete
+semantic and prepared-spec identity, Workspace and optional binding identity,
+exact observation or closed failure, Artifact evidence, and a causal
+selected-record token at one readback linearization point. The adapter uses it
+to validate `observe`; RuntimeGateway validates the resulting public private-
+seam observation against its durable identity and independently proves every
+governed Artifact. One pure total validator owns the exact outer and nested
+schemas, causal-token consistency, and failure classification for Gateway
+progress, acknowledgement-loss recovery, commands, and event scans. Receipt
+and event unions are equally closed; subclasses, missing or extra fields,
+tuple subclasses, unknown failures, and cross-action evidence are protocol
+invalid.
+The validator returns exactly one of `prepared`, `bound`,
+`authoritative_absence`, `fairness_advance`, `failure`, or `invalid`.
+Transport, same-action binding-missing, and same-action
+materialization-pending classification is protocol-owned
+`fairness_advance`; event callers do not inspect raw failure codes. Gateway
+progression, transition, durable observation recording, command recovery, and
+Adapter command gates retain that verdict and branch only on its kind; only
+the external compatibility `observe` edge unwraps it. One exact field table
+covers the read, identity, token, Artifact evidence/read/output proofs, and
+Prepared/Bound observations. Every scalar and bounded proof length is
+validated before equality, hashing, membership, attribute use, or conversion,
+and arbitrary hostile objects are converted to typed invalid verdicts rather
+than escaping as Python exceptions.
+Any populated failure action ID must equal the selected action even when no
+materialized identity exists. Absence, binding-missing,
+materialization-pending, prepare/command acknowledgement-loss, and
+effect-ambiguity failures are action-bound and require that ID. Prepare
+follow-up readback recovery is restricted to same-action
+`RUNTIME_PREPARE_ACK_LOST` and `RUNTIME_EFFECT_AMBIGUOUS`; configuration,
+protocol, unknown, transport, and other permanent failures retain their
+original typed result.
+
 `prepare` is idempotent by stable action identity. It resolves or creates the
-Agent, session, and isolated workspace and stages the Artifact-backed Prompt,
-but it cannot begin semantic execution. `observe` authoritatively proves the
+action-owned isolated Workspace and stages every governed Artifact-backed
+input, including the Prompt, but it
+cannot create an Agent, session, or Runtime Binding or begin semantic
+execution. Only a typed authoritative absence permits prepare; transport,
+malformed result, and ambiguity fail closed. A Prepared observation proves
+the exact subject, Profile, authority, Workspace, Prompt, and boolean fence
+state while Agent/session/binding are explicitly absent. It also proves the
+fixed action result path is absent before prepare commit, every Prepared
+readback, and the `start` claim/effect; a planted valid result is invalid
+provenance. The complete Ticket contract,
+planning protocol/request, Review Subject, and Review Finding context travel
+through bounded Artifact references or files, never a short CLI argument; an
+adapter fails closed rather than exceeding an OS or Paseo command-length
+limit. A validated `ObservationRead` authoritatively proves the
 repository, Campaign, Plan Revision, Work Run, stable action, selected Profile,
 Agent, session, workspace, and Runtime Binding identities, plus Prompt
-acceptance, lifecycle, outstanding Permission Requests, and fencing state.
+acceptance, lifecycle, outstanding normalized Permission Requests, and strict
+boolean fencing state. That is a Bound observation.
 
-`RuntimeCommand` is a closed union:
+`RuntimeTransition` is the closed union of seven typed transitions. Its
+`RuntimeCommand` enum contains six values, while `PermissionResponse` is the
+seventh typed transition:
 
 ```text
-start | resume | park | interrupt | permission_response | fence | retire
+start | resume | park | interrupt | fence | retire
+PermissionResponse(request_id, allow|deny)
 ```
 
-RuntimeGateway may issue `start` or `resume` only after `observe` proves the
-complete binding and accepted-Prompt receipt for that stable action. No
-adapter has an implicit launch-on-prepare path. `events` provides cursor-based
-wake hints; it never replaces `observe`.
+Both permission fields are exact non-empty strings before any effect. `None`
+is the sole event-cursor origin. Every concrete cursor is canonical ASCII
+`[1-9][0-9]{0,18}` in `1..2^63-1`; zero and leading-zero aliases,
+booleans, integers, subclasses, Unicode digits, overflows, and coercible
+objects fail without changing the fair-scan cursor or event publication.
+Events are strictly newer than the requested cursor. A non-empty page returns
+exactly its last event cursor, while an empty page echoes the request.
+Persistent event history is a non-normalizing consecutive ring of at most 64
+events. Once cursor `2^63-1` has been emitted, any later state change that
+would need a new event returns `RUNTIME_EVENT_CURSOR_EXHAUSTED` before
+changing scan, wake, event, or terminal state.
 
-The deterministic in-memory adapter passes the same contract suite and
-failure cases as production adapters. It is not a looser fake or a second
-policy implementation. Runtime Profile resolution, permission policy, and
-fallback selection remain exclusively in RuntimeGateway. Retry bounds and
-semantic budgets remain ExecutionKernel policy.
+RuntimeGateway may issue `start` only after readback proves the exact
+Prepared state; Paseo then atomically creates and starts the Agent. It accepts
+the action only after stable-action label lookup and `inspect` prove the exact
+Bound state. `resume` requires an exact parked Bound observation and uses a
+Prompt file. No adapter has an implicit launch-on-prepare path. After an
+acknowledged-create loss, restart, or ambiguous materialization, it first
+observes the stable action and can neither create a second Agent/workspace/
+Prompt nor begin a second Planning Pass. `events` provides cursor-based wake
+hints; it never replaces authoritative readback. One event poll selects at
+most one fair-scan candidate without mutation and performs at most one action
+readback.
+It captures the scan cursor, ordered eligible-set digest, and selected action,
+validates the complete observation, and captures the reconciled selected
+action-record digest. One final CAS must still match all four identities before
+it publishes the scan cursor, wake digest, event, and terminal marker together.
+A concurrent scanner, selected-action update, or eligible-set change makes the
+CAS publish and advance nothing; a later poll re-reads. Malformed
+observations—including Bound plus `prepared`—and malformed absence evidence
+also publish nothing and do not update Bound Workspace history. Exact
+`authoritative_absence` and protocol-owned `fairness_advance` verdicts may
+consume one scan position as an isolated missed hint, so one stale action
+cannot starve other actions. The event-page protocol separately owns
+`page`, `transient_failure`, `failure`, and `invalid`; Gateway wake handling
+branches on that kind without reclassifying a raw code. A terminal action
+stores one pageable terminal wake and then leaves the scan set. A
+state-changing fence or retire claim atomically re-arms that action; proven
+non-dispatch restores the former terminal marker. Subject progress performs
+its authoritative observation validation before it polls these advisory
+hints.
+Every successful `observe` opens one adapter-private, ephemeral command gate
+from its sealed reconciliation read. `command` takes no caller-supplied token,
+consumes that gate exactly once, and rejects a fresh command, an event-only
+read, a stale gate, a previously consumed gate, or a gate from a restarted
+adapter before provider state changes. The Adapter compares the complete
+identity and selected-record digest against current state before dispatch; a
+concurrent rebind, reconciliation, or retire therefore rejects an old gate
+without changing provider state. Paseo performs the final selected-record,
+action, subject, and reconciled-identity check in the same durable transaction
+that grants the effect claim; it never validates one record and claims a later
+sample. The in-memory Adapter validates the complete current sealed read
+within the same re-entrant lock as its effect.
+
+Every accepted command receipt (including acknowledgement-loss recovery) is
+valid only after Bound readback proves its named effect: start/resume produce
+running or completed, park/interrupt parked, fence exactly true, retire
+retired, and `PermissionResponse` has an exact same-decision provider receipt
+and removes the exact request. Absence without that receipt is ambiguous, not
+acknowledgement-loss recovery. Paseo first verifies the native receipt name
+against the provider-namespaced operation, then retains the normalized
+operation ID in `name`; ingestion, restart, and readback all require
+`receipt.name == request.operation_id`. A fenced parked binding cannot resume. Production persists lifecycle, fence, and pending
+permission state changes as advisory cursor wake hints.
+
+All local files and provider arguments are validated before an effect claim.
+Only provider-process creation failure proves that a call was not dispatched
+and permits exact claim restoration. Timeout, output overflow, malformed
+protocol, native failure, and receipt mismatch retain their durable pending
+claim and require readback-first recovery.
+
+The Gateway-owned Artifact Store verifies bounded byte length and digest for
+every input and completed output. Canonical JSON Prompt and output Artifacts
+also prove their exact subject, stable action, authority, and payload binding;
+missing, truncated, oversized, or drifted Artifacts stop progression before a
+corresponding mutating provider effect or receipt. Read-only Agent or Workspace
+registry discovery may precede local validation when an unrecorded Workspace
+path is not yet known. Paseo uses a short bootstrap and `--output-schema`,
+but a completed receipt is authoritative only after the Agent atomically writes
+the action-owned Workspace result Artifact; logs are wake hints, never output.
+The host Store publishes an `ArtifactRef` only after a unique exclusive
+temporary create, complete write and flush, file `fsync`, atomic replacement,
+directory `fsync` where supported, and bounded final readback matching both
+digest and exact bytes. Existing targets are verified before adoption and
+concurrent same-digest writers are idempotent. Failure returns no reference
+and cleans only the temporary file owned by that attempt. This host durability
+contract is separate from the non-racing Runtime Workspace filesystem threat
+model below.
+Completed output uses one shared exact `gwo.runtime.output.v1` proof operation.
+RuntimeGateway performs its own proof at the authoritative observation edge;
+an Adapter's acceptance cannot substitute for that proof. The object admits only
+schema version, subject, stable action, authority, and payload fields; missing,
+corrupt, cross-action, or extra-field output fails before reconciliation,
+journal mutation, or receipt emission.
+The shared canonical layer accepts only exact JSON values: `null`, strings,
+booleans, integers, finite floats, arrays, and objects with exact string keys.
+It disables non-finite output and Python key coercion. GWO-owned Artifacts,
+journals, schemas, and authoritative completed outputs require exact canonical
+bytes. A native CLI stdout or stderr JSON envelope is instead bounded external
+transport: it is strict-UTF-8 decoded and strictly parsed into a fresh closed
+JSON value before it crosses the private provider seam or contributes to an
+identity. Its raw vendor bytes never become an Artifact, journal, schema, or
+identity input. This transport ingress still rejects duplicate names,
+`NaN`/infinities, invalid UTF-8, excessive depth and integer size, and values
+outside the closed domain, but it intentionally accepts ordinary pretty or
+unsorted JSON spelling. A non-empty whitespace-only success envelope is
+malformed. Exact empty stdout is accepted only for a command whose concrete
+semantics allow no body and whose effect is established by a subsequent
+authoritative readback; identity, list, create-receipt, and permission-receipt
+paths require their stated response shape. Strings and object keys contain
+Unicode scalar values only: lone high and low surrogate code points are
+rejected recursively, while supplementary characters and valid JSON surrogate
+pairs decoded into one scalar remain valid.
+Paseo label list readback establishes the stable action before `inspect`, whose
+Agent ID, provider, model, thinking, mode, current working directory, and
+status must exactly match the binding. Its working directory joins the exact
+recorded workspace ID/name/worktree record. Registry selection is target-
+scoped to the action-owned worktree slug and exact durable identity; unrelated
+rows are ignored, conflicting target rows fail closed, and untrusted durable
+network paths are never resolved. Bounded Git readback proves the
+same repository common directory; a Prepared Workspace also has the configured
+base commit as its `HEAD`. Pinned equality applies only to Prepared. Bound
+readback and exact prepare replay re-prove Agent/label identity, common
+directory, ownership marker, and staged Artifacts, then require a monotonic
+descendant chain from the pinned base and the last observed Bound head.
+Ordinary Worker commits remain valid; unrelated history or rewind is
+ambiguous.
+Agent and Workspace compatibility aliases use one exact decoder across
+inspect, Agent-list, Workspace-list, and Workspace-create receipt paths:
+missing stays missing, equal populated aliases remain compatible, and
+conflicting populated aliases fail as ambiguous identity rather than selecting
+one spelling.
+
+The pinned base must not contain any casefold-equivalent reserved `.gwo`
+top-level path, including `.GWO`. Before Workspace creation, the durable intent
+records a random ownership nonce and layout version. After exact registry and
+Git identity readback, prepare creates or
+recovers a nonce-bound marker and only fixed artifact, schema, result, and
+resume targets. Restart re-derives all recorded paths. Every governed file
+operation rejects links, Windows reparse points, non-directory parents,
+non-regular or multiply linked leaves, and resolved containment escapes before
+using an exclusive temporary file and verified atomic replacement. This is a
+non-racing link/reparse defense; it does not claim portable descriptor-grade
+protection against a local attacker racing between the checks and use.
+Marker creation uses one deterministic nonce-owned temporary path; recovery
+validates its containment, regular type, non-reparse state, and single link
+before removal and reconstruction.
+
+Because Paseo does not
+expose a provider session ID, `paseo-agent:<agent-id>` is an explicit
+adapter-derived session reference; non-empty Profile features fail closed.
+Before Workspace create, run, or resume, the production adapter persists the
+exact pending effect. Paseo's schema-version-5 recovery journal is a closed
+union: every action carries every pending claim (`pending_start` included),
+its idempotent-recovery state, an irreversible `binding_established` proof
+paired with its Agent ID, and exact built-in field types from its first write.
+Missing, widened, malformed, or invalid-transition state fails before Adapter
+readback or a second provider command. An acknowledgement-loss
+readback that is still absent returns materialization-pending and cannot
+repeat that side effect; duplicate
+Workspace registry rows are all safely decoded before target selection, but
+uniqueness is judged only among the action-target candidates for its durable
+worktree slug, Workspace ID, and path. Duplicate unrelated rows do not block
+the action; duplicate or conflicting action-target candidates fail closed.
+Proven non-dispatch of Workspace create restores `create_pending` to the
+complete `recorded` intent before any registry readback, so independent
+registry failure cannot strand a never-dispatched effect.
+Verified action-bound output dominates every non-retired provider lifecycle,
+including idle, running, and busy, and clears stale park/resume/stop flags
+atomically. Terminal bindings never send a new permission decision; only exact
+replay of a durable same-request, same-decision completed effect is idempotent.
+Its request and provider receipt digests must recompute, the action, subject,
+and binding must match, and the request must remain absent from outstanding
+permissions.
+The deterministic in-memory adapter passes the same
+contract suite and failure cases as production adapters. It is not a looser
+fake or a second policy implementation. Runtime Profile resolution, permission
+policy, and fallback selection remain exclusively in RuntimeGateway. Retry
+bounds and semantic budgets remain ExecutionKernel policy.
+In-memory `start` establishes binding plus `running` before output
+publication. If publication fails, later observation retries completion on the
+same Bound action without creating another Agent; final permission-response
+publication follows the same ordering.
+Bound observations admit only `running`, `parked`, `completed`, or `retired`;
+the `prepared` lifecycle is valid only for the separate unbound Prepared
+observation and is rejected before durable observation state changes.
 
 ## Worker Slots and Work Run bounds
 
@@ -335,11 +667,14 @@ rejected Candidate cannot obtain another Formal Review.
 
 ## Runtime permissions, waits, and recovery
 
-RuntimeGateway normalizes each Permission Request into the exact operation ID,
-resource ID, request identity, Runtime Binding, and authority-subtree digest.
-It auto-approves only when the exact request is covered by both the frozen
-Authority Grant and its Policy Witness. An unmatched, ambiguous, or
-higher-authority request returns `PermissionRequired`.
+Issue #111's RuntimeGateway only joins provider readback and emits an opaque,
+canonical descriptor identity: exact request identity, provider-namespaced
+operation/resource digests, Runtime Binding, and authority-subtree digest. It
+does not infer authority from provider names or natural-language descriptions,
+and it does not decide allow/deny. Issue #112 may auto-allow only when the
+exact canonical operation and resource identifiers are covered by both the
+frozen Authority Grant and its Policy Witness; otherwise it returns
+`PermissionRequired`.
 
 RuntimeGateway cannot expand authority. A Coordinator may propose only an
 alternative already covered by the same frozen authority subtree. Any new or

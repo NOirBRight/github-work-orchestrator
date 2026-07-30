@@ -22,6 +22,7 @@ from ._effects import (
     normalized_relative_path,
 )
 from .evidence import ResultClaim, TypedEvidence
+from .runtime_profile import RuntimeProfile
 
 
 class RuntimeAdapterError(RuntimeError):
@@ -36,29 +37,6 @@ class RuntimeAdapterError(RuntimeError):
         self.code = code
         self.detail = detail
         self.failure_class = failure_class
-
-
-@dataclass(frozen=True)
-class RuntimeProfile:
-    name: str
-    provider: str
-    model: str
-    thinking: str
-    mode: str
-    features: dict[str, Any]
-
-    @property
-    def digest(self) -> str:
-        return digest_value(
-            {
-                "name": self.name,
-                "provider": self.provider,
-                "model": self.model,
-                "thinking": self.thinking,
-                "mode": self.mode,
-                "features": self.features,
-            }
-        )
 
 
 @dataclass(frozen=True)
@@ -979,7 +957,7 @@ class InMemoryPaseoClient:
             profile_digest=request.profile.digest,
             thinking=request.profile.thinking,
             mode=request.profile.mode,
-            features=dict(request.profile.features),
+            features=request.profile.canonical()["features"],
             labels={
                 **request.labels,
                 "gwo.action_key": request.action_key,
@@ -1621,7 +1599,8 @@ class PaseoRuntimeAdapter:
             or binding.base_sha != admission.base_sha
             or binding.thinking != profile.thinking
             or binding.mode != profile.mode
-            or binding.features_digest != digest_value(profile.features)
+            or binding.features_digest
+            != digest_value(profile.canonical()["features"])
             or binding.prompt_digest != prompt.digest
         ):
             raise RuntimeAdapterError(
@@ -2261,7 +2240,8 @@ class PaseoRuntimeAdapter:
             or agent.model != profile.model
             or agent.thinking != profile.thinking
             or agent.mode != profile.mode
-            or digest_value(agent.features) != digest_value(profile.features)
+            or digest_value(agent.features)
+            != digest_value(profile.canonical()["features"])
         ):
             raise RuntimeAdapterError(
                 "REVIEW_AXIS_IDENTITY_MISMATCH",
@@ -2642,7 +2622,9 @@ class InMemoryRuntimeAdapter:
             features_digest=(
                 None
                 if admission.runtime_profile is None
-                else digest_value(admission.runtime_profile.features)
+                else digest_value(
+                    admission.runtime_profile.canonical()["features"]
+                )
             ),
             base_sha=admission.base_sha,
         )
