@@ -764,7 +764,7 @@ class _RecordingPaseoCli:
         # Internal fake state follows inspect's actionable full-id projection.
         self.permissions: list[dict[str, str]] = []
 
-    def _run(self, args):
+    def _run(self, args, *, allow_empty=False):
         self.commands.append(list(args))
         if self.fail_workspace:
             raise OSError("provider executable vanished")
@@ -3249,36 +3249,26 @@ def test_production_preflight_validates_fallback_and_repository_context_before_p
     assert gateway._data["preflights"] == {}
 
 
-def test_paseo_nonzero_json_error_taxonomy_never_treats_permanent_rejection_as_transport(monkeypatch):
+def test_paseo_nonzero_pretty_json_error_taxonomy_never_treats_permanent_rejection_as_transport():
     daemon = _PaseoCliTransport._nonzero_failure(
-        canonical_module.canonical_bytes(
-            {"error": {"code": "DAEMON_NOT_RUNNING", "message": "native detail"}}
-        ).decode("utf-8"),
+        json.dumps(
+            {"error": {"message": "native detail", "code": "DAEMON_NOT_RUNNING"}},
+            indent=2,
+        ),
         "",
     )
     assert daemon.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
 
     for code, expected in (("PERMISSION_NOT_FOUND", "RUNTIME_PERMISSION_REQUEST_UNKNOWN"), ("UNKNOWN_COMMAND", "RUNTIME_PROVIDER_COMMAND_FAILED")):
         permanent = _PaseoCliTransport._nonzero_failure(
-            canonical_module.canonical_bytes(
-                {"error": {"code": code, "message": "native detail"}}
-            ).decode("utf-8"),
+            json.dumps(
+                {"error": {"message": "native detail", "code": code}},
+                indent=2,
+            ),
             "",
         )
         assert permanent.code == expected
         assert "native detail" not in permanent.detail
-
-
-@pytest.mark.parametrize("stream", ("stdout", "stderr"))
-def test_paseo_nonzero_error_envelope_requires_canonical_json(stream):
-    noncanonical = '{"error":{"code":"DAEMON_NOT_RUNNING","message":"native detail"} }'
-    stdout, stderr = (noncanonical, "") if stream == "stdout" else ("", noncanonical)
-
-    rejected = _PaseoCliTransport._nonzero_failure(stdout, stderr)
-
-    assert rejected.code == "RUNTIME_PROVIDER_COMMAND_FAILED"
-    assert rejected.detail == "Paseo command was rejected"
-
 
 @pytest.mark.parametrize(
     "failure_kind, expected_code",
@@ -3470,15 +3460,19 @@ def test_production_preflight_accepts_safe_git_base_ref_that_is_not_paseo_argv(t
     assert gateway._data["campaigns"] != {}
 
 
-def test_paseo_nonzero_error_json_over_byte_limit_is_never_parsed(monkeypatch):
-    payload = json.dumps({"error": {"code": "DAEMON_NOT_RUNNING"}})
-    payload += "x" * (gateway_module._MAXIMUM_PASEO_ERROR_JSON_BYTES + 1)
-    monkeypatch.setattr(
-        gateway_module.json,
-        "loads",
-        lambda _payload: pytest.fail("oversized Paseo error JSON was parsed"),
+def test_paseo_nonzero_error_json_over_byte_limit_cannot_classify_transport():
+    payload = json.dumps(
+        {
+            "error": {
+                "code": "DAEMON_NOT_RUNNING",
+                "padding": "x" * gateway_module._MAXIMUM_PASEO_ERROR_JSON_BYTES,
+            }
+        }
     )
+    assert len(payload.encode("utf-8")) > gateway_module._MAXIMUM_PASEO_ERROR_JSON_BYTES
+
     error = _PaseoCliTransport._nonzero_failure(payload, "")
+
     assert error.code == "RUNTIME_PROVIDER_COMMAND_FAILED"
 
 
@@ -4434,9 +4428,23 @@ def _write_paseo_transport_helper(tmp_path: Path) -> Path:
                 "elif mode == 'invalid-utf8':",
                 "    sys.stdout.buffer.write(b'\\xff')",
                 "    sys.stdout.buffer.flush()",
-                "elif mode == 'noncanonical-json':",
-                "    sys.stdout.buffer.write(b'{\"response\":true }')",
-                "    sys.stdout.buffer.flush()",
+                "elif mode == 'pretty-workspace-list':",
+                "    sys.stdout.write(json.dumps({'workspaces': [], 'transport': 'native'}, indent=2))",
+                "    sys.stdout.flush()",
+                "elif mode == 'empty':",
+                "    pass",
+                "elif mode == 'whitespace-only':",
+                "    sys.stdout.write(' \\t\\r\\n')",
+                "    sys.stdout.flush()",
+                "elif mode == 'malformed-json':",
+                "    sys.stdout.write('{')",
+                "    sys.stdout.flush()",
+                "elif mode == 'duplicate-json':",
+                "    sys.stdout.write('{\"field\": 1, \"field\": 2}')",
+                "    sys.stdout.flush()",
+                "elif mode == 'nan-json':",
+                "    sys.stdout.write('{\"field\": NaN}')",
+                "    sys.stdout.flush()",
                 "elif mode == 'inherited-pipe':",
                 "    child = subprocess.Popen(",
                 "        [sys.executable, '-c', 'import time; time.sleep(1)'],",
@@ -4453,16 +4461,9 @@ def _write_paseo_transport_helper(tmp_path: Path) -> Path:
     return helper
 
 
-def test_paseo_transport_caps_oversized_valid_json_before_parse_and_block(
-    tmp_path, monkeypatch
-):
+def test_paseo_transport_caps_oversized_valid_json_before_parse_and_block(tmp_path):
     helper = _write_paseo_transport_helper(tmp_path)
     transport = _PaseoCliTransport(sys.executable, timeout_seconds=60)
-    monkeypatch.setattr(
-        gateway_module.json,
-        "loads",
-        lambda _payload: pytest.fail("oversized valid JSON must never be parsed"),
-    )
     started = time.monotonic()
 
     with pytest.raises(RuntimeGatewayError) as oversized:
@@ -4492,12 +4493,39 @@ def test_paseo_transport_timeout_and_strict_utf8_taxonomy(tmp_path):
         strict_transport._run([str(helper), "invalid-utf8"])
 
 
-def test_paseo_transport_success_response_requires_canonical_json(tmp_path):
+def test_paseo_transport_normalizes_pretty_vendor_envelope_before_identity(tmp_path):
+    helper = _write_paseo_transport_helper(tmp_path)
+    transport = _PaseoCliTransport(sys.executable, timeout_seconds=10)
+
+    value = transport._run([str(helper), "pretty-workspace-list"])
+
+    assert value == {"workspaces": [], "transport": "native"}
+    assert gateway_module.canonical_bytes(value) == (
+        b'{"transport":"native","workspaces":[]}'
+    )
+
+
+def test_paseo_transport_allows_exact_empty_only_when_the_command_allows_it(tmp_path):
+    helper = _write_paseo_transport_helper(tmp_path)
+    transport = _PaseoCliTransport(sys.executable, timeout_seconds=10)
+
+    with pytest.raises(ValueError, match="empty"):
+        transport._run([str(helper), "empty"])
+    assert (
+        transport._run([str(helper), "empty"], allow_empty=True)
+        is gateway_module._NO_PASEO_BODY_ACK
+    )
+
+
+@pytest.mark.parametrize(
+    "mode", ("whitespace-only", "malformed-json", "duplicate-json", "nan-json")
+)
+def test_paseo_transport_rejects_nonempty_invalid_vendor_envelopes(tmp_path, mode):
     helper = _write_paseo_transport_helper(tmp_path)
     transport = _PaseoCliTransport(sys.executable, timeout_seconds=10)
 
     with pytest.raises(ValueError, match="Paseo JSON response is invalid"):
-        transport._run([str(helper), "noncanonical-json"])
+        transport._run([str(helper), mode])
 
 
 def test_paseo_transport_parent_exit_with_inherited_pipe_is_bounded_and_reaped(

@@ -9,34 +9,36 @@ provider-shaped public interface:
 
 ```text
 prepare(RuntimeActionSpec) -> PrepareReceipt | RuntimeFailure
-read_observation(stable_action_id) -> ObservationRead
-command(stable_action_id, RuntimeTransition, ObservationReadToken) -> CommandReceipt | RuntimeFailure
+observe(stable_action_id) -> PreparedObservation | BoundObservation | RuntimeFailure
+command(stable_action_id, RuntimeTransition) -> CommandReceipt | RuntimeFailure
 events(after_cursor) -> RuntimeEventPage
 ```
 
-`ObservationRead` is a sealed, closed envelope. It binds the requested and
-selected stable action, complete subject/Profile/Prompt/input/spec identity,
-Workspace and optional Agent/session/binding identity, one exact
-Prepared/Bound observation or closed failure, Artifact read evidence, and a
-causal token. The Adapter mints that token from the selected action record at
-the readback/reconciliation linearization point; consumers never sample the
-action again to invent causality. One pure, total validator accepts this same
-envelope for progress, acknowledgement-loss recovery, command gating, and
-events. Exact classes, fields, tuples, nested permission/completion evidence,
-failure codes, receipts, event pages, and cross-action identity are closed;
-malformed values become typed protocol failure rather than exceptions.
-Its verdict kind is exactly `prepared`, `bound`, `authoritative_absence`,
-`fairness_advance`, `failure`, or `invalid`. The protocol alone classifies a
-valid transport, same-action binding-missing, or same-action
-materialization-pending failure as `fairness_advance`; event callers never
-reinterpret a raw failure code. Authoritative Gateway and Adapter paths retain
-that verdict and branch only on its kind; only the external compatibility
-`observe` projection may unwrap it at the final edge. Closed result scalars
-use one exact field table before comparison or set membership. It covers the
-read, identity, token, Artifact evidence and proofs, and Prepared/Bound
-lifecycles; proof lengths are exact bounded non-negative integers. Subclasses
-and objects with hostile equality, hashing, attribute access, or integer
-conversion therefore cannot escape the typed boundary.
+`ObservationRead` is a sealed, adapter-private reconciliation value, not a
+Protocol operation or caller-visible token. It binds the requested and selected
+stable action, complete subject/Profile/Prompt/input/spec identity, Workspace
+and optional Agent/session/binding identity, one exact Prepared/Bound
+observation or closed failure, Artifact read evidence, and a causal
+selected-record token at the readback/reconciliation linearization point. The
+Adapter uses it to validate its `observe` projection; RuntimeGateway validates
+that projection against durable identity and independently proves governed
+Artifacts. One pure, total validator owns the sealed-read and public
+observation schemas for progress, acknowledgement-loss recovery, private
+command gating, and events. Exact classes, fields, tuples, nested
+permission/completion evidence, failure codes, receipts, event pages, and
+cross-action identity are closed; malformed values become typed protocol
+failure rather than exceptions. Its verdict kind is exactly `prepared`,
+`bound`, `authoritative_absence`, `fairness_advance`, `failure`, or `invalid`.
+The protocol alone classifies a valid transport, same-action binding-missing,
+or same-action materialization-pending failure as `fairness_advance`; event
+callers never reinterpret a raw failure code. Gateway and Adapter paths retain
+that verdict and branch only on its kind; only `observe` unwraps it at the
+private seam. Closed result scalars use one exact field table before comparison
+or set membership. It covers the read, identity, internal causal token,
+Artifact evidence and proofs, and Prepared/Bound lifecycles; proof lengths are
+exact bounded non-negative integers. Subclasses and objects with hostile
+equality, hashing, attribute access, or integer conversion therefore cannot
+escape the typed boundary.
 Any failure that carries a stable action ID must name the selected action.
 Action-bound absence, binding-missing, materialization-pending,
 prepare/command acknowledgement-loss, and effect-ambiguity failures require
@@ -81,15 +83,18 @@ emit at most one stored terminal wake and leave the scan set. A state-changing
 `fence` or `retire` claim atomically re-arms that action, so the later
 fenced-completed or retired state emits its own wake. Proven non-dispatch
 restores the previous terminal marker with the rest of the claim.
-Every Gateway command carries the accepted read token. The Adapter compares it
-to the current selected-record and complete-identity digests before any
-provider effect, so a concurrent retire, rebind, or reconciliation makes the
-old command stale without dispatch.
-Production performs that comparison again inside the same durable transaction
-that grants the provider-effect claim; the claim cannot resample a newer
-record after validating an older read. The in-memory implementation validates
-the complete sealed read and token under the same re-entrant lock as its
-effect.
+Every successful `observe` opens one adapter-private, ephemeral, one-shot
+command gate from its sealed reconciliation read. `command` accepts no
+caller-supplied token and consumes that gate before it can dispatch. A command
+without a fresh observe, after an event-only read, after an earlier consumed
+gate, or after Adapter restart therefore has zero effect. The Adapter compares
+the complete identity and selected-record digest against current state before
+any provider effect, so a concurrent retire, rebind, or reconciliation makes
+the old gate stale without dispatch. Production performs that comparison again
+inside the same durable transaction that grants the provider-effect claim; the
+claim cannot resample a newer record after validating an older read. The
+in-memory implementation validates the complete sealed read under the same
+re-entrant lock as its effect.
 
 The production adapter persists an effect claim only after all local argument
 and file validation succeeds. It may restore that claim only when process

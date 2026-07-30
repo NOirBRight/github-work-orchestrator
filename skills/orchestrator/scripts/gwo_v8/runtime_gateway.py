@@ -9,12 +9,11 @@ or starting it.  Provider adapters are private implementation details.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from copy import deepcopy
 from enum import Enum
 import errno
 import hashlib
-import json
 import ntpath
 import os
 from pathlib import Path
@@ -34,6 +33,7 @@ from ._canonical import (
     canonical_bytes,
     digest_value,
     load_canonical_json,
+    strict_json_loads,
 )
 from .runtime_profile import (
     RuntimeProfile,
@@ -60,6 +60,7 @@ _MAXIMUM_PASEO_PERMISSION_TEXT = 4_096
 _MAXIMUM_PASEO_ERROR_JSON_BYTES = 4_096
 _MAXIMUM_PASEO_STREAM_BYTES = 1_048_576
 _MAXIMUM_PASEO_TOTAL_BYTES = 1_572_864
+_NO_PASEO_BODY_ACK = object()
 _PASEO_PIPE_CHUNK_BYTES = 65_536
 _PASEO_PIPE_POLL_SECONDS = 0.005
 _PASEO_POST_EXIT_DRAIN_SECONDS = 0.25
@@ -4144,7 +4145,23 @@ class _PaseoCliTransport:
                 "Paseo command exceeds the bounded command-line limit",
             )
 
-    def _run(self, args: list[str]) -> Any:
+    @staticmethod
+    def _decode_transport_envelope(payload: str) -> Any:
+        """Decode bounded native JSON without treating its spelling as identity.
+
+        Paseo's CLI stdout and stderr are external transport envelopes, not GWO
+        Artifacts.  Strict decoding produces one fresh exact-builtin JSON value;
+        the original vendor bytes do not leave this boundary.  A downstream
+        journal, Artifact, schema, or identity operation still creates and
+        verifies its own exact canonical bytes from that value.
+        """
+
+        try:
+            return strict_json_loads(payload)
+        except CanonicalJsonError as error:
+            raise ValueError("Paseo JSON response is invalid") from error
+
+    def _run(self, args: list[str], *, allow_empty: bool = False) -> Any:
         self.validate_arguments(args, executable=self._executable)
         started = time.monotonic()
         command_deadline = started + self._timeout_seconds
@@ -4294,12 +4311,11 @@ class _PaseoCliTransport:
             raise ValueError("Paseo output is not strict UTF-8") from error
         if returncode != 0:
             raise self._nonzero_failure(stdout, stderr)
-        if not stdout.strip():
-            return {}
-        try:
-            return load_canonical_json(stdout)
-        except CanonicalJsonError as error:
-            raise ValueError("Paseo JSON response is invalid") from error
+        if stdout == "":
+            if allow_empty:
+                return _NO_PASEO_BODY_ACK
+            raise ValueError("Paseo JSON response is empty")
+        return self._decode_transport_envelope(stdout)
 
     @staticmethod
     def _poll(process: Any) -> int | None:
@@ -4344,7 +4360,7 @@ class _PaseoCliTransport:
 
         error: Mapping[str, Any] | None = None
         for payload in (stdout, stderr):
-            if not isinstance(payload, str) or not payload.strip():
+            if not isinstance(payload, str) or payload == "":
                 continue
             # Error text is untrusted provider output.  Do not give JSON a
             # potentially unbounded document merely because the process
@@ -4352,7 +4368,7 @@ class _PaseoCliTransport:
             if len(payload.encode("utf-8")) > _MAXIMUM_PASEO_ERROR_JSON_BYTES:
                 continue
             try:
-                candidate = load_canonical_json(payload)
+                candidate = strict_json_loads(payload)
             except CanonicalJsonError:
                 continue
             if isinstance(candidate, dict) and isinstance(candidate.get("error"), dict):
@@ -4475,7 +4491,10 @@ class _PaseoCliTransport:
             _require_paseo_argument(key, "Paseo label key")
             _require_paseo_argument(value, "Paseo label value")
             args.extend(["--label", f"{key}={value}"])
-        self._run([*args, "--json"])
+        # Label mutation has no provider receipt shape.  The caller's
+        # authoritative inspect readback, not this optional empty envelope,
+        # establishes the effect.
+        self._run([*args, "--json"], allow_empty=True)
 
 
 class _PaseoRuntimeProviderAdapter:
@@ -4962,8 +4981,10 @@ class _PaseoRuntimeProviderAdapter:
             "Paseo status does not prove running, parked, completed, or retired",
         )
 
-    def _call(self, args: list[str]) -> Any:
+    def _call(self, args: list[str], *, allow_empty: bool = False) -> Any:
         _PaseoCliTransport.validate_arguments(args)
+        if allow_empty:
+            return self._client._run(args, allow_empty=True)  # type: ignore[attr-defined]
         return self._client._run(args)  # type: ignore[attr-defined]
 
     @staticmethod
@@ -7090,7 +7111,7 @@ class _PaseoRuntimeProviderAdapter:
                         "Paseo start already has one durable effect owner",
                         stable_action_id=stable_action_id,
                     )
-                self._call(start_args)
+                self._call(start_args, allow_empty=True)
             elif verdict.kind != "bound":
                 return _RuntimeFailure("RUNTIME_COMMAND_INVALID", "only start is allowed before Runtime binding exists")
             elif (
@@ -7219,7 +7240,7 @@ class _PaseoRuntimeProviderAdapter:
                         "Paseo resume already has one durable effect owner",
                         stable_action_id=stable_action_id,
                     )
-                self._call(resume_args)
+                self._call(resume_args, allow_empty=True)
             elif command in {RuntimeCommand.PARK, RuntimeCommand.INTERRUPT}:
                 if observation.lifecycle in {"completed", "retired"}:
                     return _RuntimeFailure(
@@ -7250,7 +7271,7 @@ class _PaseoRuntimeProviderAdapter:
                         "Paseo stop already has one durable effect owner",
                         stable_action_id=stable_action_id,
                     )
-                self._call(stop_args)
+                self._call(stop_args, allow_empty=True)
             elif command is RuntimeCommand.FENCE:
                 if record.get("pending_fence") is True:
                     return _RuntimeFailure(
@@ -7320,7 +7341,7 @@ class _PaseoRuntimeProviderAdapter:
                         "Paseo retirement already has one durable effect owner",
                         stable_action_id=stable_action_id,
                     )
-                self._call(retire_args)
+                self._call(retire_args, allow_empty=True)
             return _CommandReceipt(stable_action_id, command)
         except Exception as error:
             not_dispatched = (

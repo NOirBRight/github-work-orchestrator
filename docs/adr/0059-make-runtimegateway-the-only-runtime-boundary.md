@@ -273,17 +273,23 @@ Gateway journal update, or receipt emission.
 
 The shared canonical layer accepts only JSON `null`, exact strings and
 booleans, integers, finite floats, arrays, and objects with exact string keys.
-It disables non-finite encoding and Python key coercion. Strict Artifact,
-journal, and provider loaders reject duplicate object names,
-`NaN`/infinities, invalid UTF-8, and noncanonical byte representations; the
-Artifact Store, Runtime journal, and provider seam translate those failures
-into their own typed errors. Active-reference cycles, values beyond the fixed
-canonical nesting depth, and integers beyond the explicit decimal-digit bound
-are rejected by that same typed layer rather than leaking interpreter
-recursion or integer-conversion errors. Strings and object keys must contain
-Unicode scalar values: lone high or low surrogate code points fail at every
-shared ingress, while supplementary characters and valid JSON surrogate pairs
-decoded to one scalar remain accepted.
+It disables non-finite encoding and Python key coercion. GWO-owned Artifact,
+journal, schema, and authoritative-output loaders require exact canonical
+bytes. A native Paseo CLI stdout or stderr JSON envelope is bounded external
+transport rather than a GWO Artifact or authoritative identity: strict UTF-8
+and JSON decoding creates a fresh closed JSON value before the private provider
+seam, and the raw vendor bytes never cross it. That ingress still rejects
+duplicate names, `NaN`/infinities, invalid UTF-8, non-domain values, excess
+depth, and excessive integers, but accepts ordinary pretty or unsorted JSON.
+Any later journal, Artifact, schema, or identity operation creates and verifies
+its own canonical bytes from the parsed value. Non-empty whitespace-only
+success output is malformed. Exact empty stdout is allowed only for a concrete
+mutating command whose effect has a required authoritative readback; identity,
+list, create-receipt, and permission-receipt paths require their declared
+response shapes. Strings and object keys must contain Unicode scalar values:
+lone high or low surrogate code points fail at every shared ingress, while
+supplementary characters and valid JSON surrogate pairs decoded to one scalar
+remain accepted.
 
 Putting bytes into that host Artifact Store uses a unique exclusively-created
 temporary file, complete write plus flush and file `fsync`, atomic replacement,

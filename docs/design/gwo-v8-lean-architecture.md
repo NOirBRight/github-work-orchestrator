@@ -541,12 +541,20 @@ corrupt, cross-action, or extra-field output fails before reconciliation,
 journal mutation, or receipt emission.
 The shared canonical layer accepts only exact JSON values: `null`, strings,
 booleans, integers, finite floats, arrays, and objects with exact string keys.
-It disables non-finite output and Python key coercion. Artifact, journal, and
-provider ingress reject duplicate names, `NaN`/infinities, invalid UTF-8, and
-noncanonical bytes and translate them into boundary-owned typed failures.
-It also rejects active-reference cycles, values beyond a fixed nesting depth,
-and integers beyond an explicit digit bound without leaking interpreter
-recursion or integer-conversion failures. Strings and object keys contain
+It disables non-finite output and Python key coercion. GWO-owned Artifacts,
+journals, schemas, and authoritative completed outputs require exact canonical
+bytes. A native CLI stdout or stderr JSON envelope is instead bounded external
+transport: it is strict-UTF-8 decoded and strictly parsed into a fresh closed
+JSON value before it crosses the private provider seam or contributes to an
+identity. Its raw vendor bytes never become an Artifact, journal, schema, or
+identity input. This transport ingress still rejects duplicate names,
+`NaN`/infinities, invalid UTF-8, excessive depth and integer size, and values
+outside the closed domain, but it intentionally accepts ordinary pretty or
+unsorted JSON spelling. A non-empty whitespace-only success envelope is
+malformed. Exact empty stdout is accepted only for a command whose concrete
+semantics allow no body and whose effect is established by a subsequent
+authoritative readback; identity, list, create-receipt, and permission-receipt
+paths require their stated response shape. Strings and object keys contain
 Unicode scalar values only: lone high and low surrogate code points are
 rejected recursively, while supplementary characters and valid JSON surrogate
 pairs decoded into one scalar remain valid.

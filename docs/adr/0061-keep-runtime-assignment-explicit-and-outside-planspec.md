@@ -117,12 +117,19 @@ completion receipt that names the failed target.
 All Runtime JSON identities share one closed canonical domain: JSON `null`,
 exact strings and booleans, integers, finite floats, arrays, and objects whose
 keys are exact strings. Encoding disables non-finite numbers and Python key
-coercion. Artifact, journal, and provider ingress reject duplicate object
-names, `NaN`/infinities, invalid UTF-8, and byte representations that are not
-canonical, translating failure at the owning boundary rather than leaking a
-raw JSON exception. The same validator rejects active-reference cycles, values
-beyond its fixed nesting depth, and integers beyond its explicit digit bound,
-normalizing recursion and interpreter integer-limit failures.
+coercion. GWO-owned Artifact, journal, schema, and authoritative-output bytes
+must be exact canonical representations. Native CLI stdout and stderr JSON are
+bounded external transport rather than identity bytes: strict decoding rejects
+duplicate names, `NaN`/infinities, invalid UTF-8, non-domain values, excessive
+depth, and excessive integers, then passes only the parsed fresh JSON value
+across the private provider seam. Pretty or unsorted vendor spelling is
+therefore accepted, while the raw bytes never become a Runtime identity. A
+non-empty whitespace-only success envelope is malformed; exact empty stdout is
+allowed only for a concrete mutating command whose effect is authoritatively
+read back, never for identity, list, create-receipt, or permission-receipt
+paths. The same validator rejects active-reference cycles, values beyond its
+fixed nesting depth, and integers beyond its explicit digit bound, normalizing
+recursion and interpreter integer-limit failures.
 
 A durably selected fallback remains selected even if the primary later
 recovers. Cached availability is advisory; live provider, configuration, and
