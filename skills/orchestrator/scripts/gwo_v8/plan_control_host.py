@@ -9,6 +9,7 @@ these assignment facts.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any, Callable, Mapping, Sequence
 
 from .plan_control import (
@@ -41,6 +42,7 @@ from .github_snapshot import (
 from .plan_control_github import (
     GitHubPlanRepository,
     WriterGenerationReadback,
+    validate_github_plan_control_paths,
 )
 
 
@@ -274,12 +276,77 @@ class ProductionPlanControlStartHost:
         self._max_snapshot_bytes = max_snapshot_bytes
         self._gateway_builder = _gateway_builder or _production_gateway_builder
 
+    def _hydrate_governed_artifacts(self) -> None:
+        """Refresh the local cache before consuming remotely discovered facts."""
+
+        hydrate = getattr(self._repository, "_hydrate_artifacts", None)
+        if callable(hydrate):
+            hydrate(self._artifacts)
+
+    def _control_for(
+        self,
+        *,
+        handle: CampaignHandle,
+        assertion: CampaignStartRuntimeOverrides | None,
+        configuration: RuntimeConfiguration,
+    ) -> PlanControl:
+        try:
+            gateway = self._gateway_builder(
+                gateway_store_path=self._gateway_store_path,
+                configuration=configuration,
+                repository_contexts=self._repository_contexts,
+                artifacts=self._artifacts,
+            )
+        except PlanControlError:
+            raise
+        except (TypeError, RuntimeGatewayError, ValueError) as error:
+            raise PlanControlError(
+                "PLAN_CONTROL_COMPOSITION_INVALID",
+                "RuntimeGateway host composition rejected the Campaign assertion",
+            ) from error
+        return PlanControl(
+            source=self._source,
+            artifacts=self._artifacts,
+            gateway=_RuntimeAssertionCommitGateway(
+                gateway=gateway,
+                repository=self._repository,
+                handle=handle,
+                assertion=assertion,
+            ),
+            repository=self._repository,
+            max_snapshot_bytes=self._max_snapshot_bytes,
+        )
+
+    def _runtime_configuration_for(
+        self,
+        handle: CampaignHandle,
+        assertion: CampaignStartRuntimeOverrides | None,
+    ) -> RuntimeConfiguration:
+        assertions = dict(self._configuration.campaign_assertions)
+        assertion_key = (
+            handle.repository,
+            handle.campaign_key,
+            _handle_ref(handle),
+        )
+        if assertion is not None:
+            assertions[assertion_key] = assertion
+        return RuntimeConfiguration(
+            profiles=dict(self._configuration.profiles),
+            host_mappings=dict(self._configuration.host_mappings),
+            repository_mappings={
+                name: dict(mappings)
+                for name, mappings in self._configuration.repository_mappings.items()
+            },
+            campaign_assertions=assertions,
+        )
+
     def start(
         self,
         repository: str,
         ready_refs: Sequence[str],
         options: object = None,
     ) -> CampaignHandle:
+        self._hydrate_governed_artifacts()
         if type(repository) is not str or not repository:
             raise PlanControlError(
                 "PLAN_CONTROL_INVALID",
@@ -307,60 +374,95 @@ class ProductionPlanControlStartHost:
             requested = _runtime_overrides(options, refs)
             _assert_profiles_are_composed(requested, self._configuration)
 
-        assertions = dict(self._configuration.campaign_assertions)
         assertion_key = (
             handle.repository,
             handle.campaign_key,
             _handle_ref(handle),
         )
-        configured = assertions.get(assertion_key)
+        configured = self._configuration.campaign_assertions.get(assertion_key)
         selected_assertion = requested or persisted or configured
         if configured is not None and configured != selected_assertion:
             raise PlanControlError(
                 "START_OPTIONS_CONFLICT",
                 "Campaign assertion conflicts with host Runtime configuration",
             )
-        if selected_assertion is not None:
-            assertions[assertion_key] = selected_assertion
-        try:
-            configuration = RuntimeConfiguration(
-                profiles=dict(self._configuration.profiles),
-                host_mappings=dict(self._configuration.host_mappings),
-                repository_mappings={
-                    name: dict(mappings)
-                    for name, mappings in self._configuration.repository_mappings.items()
-                },
-                campaign_assertions=assertions,
-            )
-            gateway = self._gateway_builder(
-                gateway_store_path=self._gateway_store_path,
-                configuration=configuration,
-                repository_contexts=self._repository_contexts,
-                artifacts=self._artifacts,
-            )
-        except PlanControlError:
-            raise
-        except (TypeError, RuntimeGatewayError, ValueError) as error:
-            raise PlanControlError(
-                "PLAN_CONTROL_COMPOSITION_INVALID",
-                "RuntimeGateway host composition rejected the Campaign assertion",
-            ) from error
-
-        return PlanControl(
-            source=self._source,
-            artifacts=self._artifacts,
-            gateway=_RuntimeAssertionCommitGateway(
-                gateway=gateway,
-                repository=self._repository,
-                handle=handle,
-                assertion=selected_assertion,
+        return self._control_for(
+            handle=handle,
+            assertion=selected_assertion,
+            configuration=self._runtime_configuration_for(
+                handle,
+                selected_assertion,
             ),
-            repository=self._repository,
-            max_snapshot_bytes=self._max_snapshot_bytes,
         ).start(
             repository,
             refs,
             campaign_key=campaign_key,
+        )
+
+    def start_successor(
+        self,
+        handle: CampaignHandle,
+        ready_refs: Sequence[str],
+        *,
+        expected_previous_revision_digest: str,
+    ) -> CampaignHandle:
+        """Publish one successor Revision through the installed host boundary.
+
+        Runtime overrides are intentionally absent: the existing Campaign's
+        durable #111 assertion is recovered rather than replaced.
+        """
+
+        self._hydrate_governed_artifacts()
+        if type(handle) is not CampaignHandle:
+            raise PlanControlError(
+                "START_SUCCESSOR_INVALID",
+                "successor start requires the exact existing CampaignHandle",
+            )
+        if (
+            type(expected_previous_revision_digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_previous_revision_digest)
+            is None
+        ):
+            raise PlanControlError(
+                "START_SUCCESSOR_INVALID",
+                "successor start requires the exact previous Plan Revision digest",
+            )
+        raw_refs = _ready_refs(ready_refs)
+        canonicalizer = getattr(self._source, "canonical_ready_refs", None)
+        refs = (
+            _ready_refs(canonicalizer(handle.repository, raw_refs))
+            if callable(canonicalizer)
+            else raw_refs
+        )
+        persisted_value = self._repository.read_runtime_assertion(handle)
+        persisted = (
+            None
+            if persisted_value is None
+            else _runtime_overrides(persisted_value, refs)
+        )
+        if persisted is not None:
+            _assert_profiles_are_composed(persisted, self._configuration)
+        assertion_key = (
+            handle.repository,
+            handle.campaign_key,
+            _handle_ref(handle),
+        )
+        configured = self._configuration.campaign_assertions.get(assertion_key)
+        if configured is not None and persisted is not None and configured != persisted:
+            raise PlanControlError(
+                "START_OPTIONS_CONFLICT",
+                "Campaign successor assertion conflicts with its durable binding",
+            )
+        assertion = persisted or configured
+        return self._control_for(
+            handle=handle,
+            assertion=assertion,
+            configuration=self._runtime_configuration_for(handle, assertion),
+        ).start(
+            handle.repository,
+            refs,
+            campaign_key=handle.campaign_key,
+            expected_previous_revision_digest=expected_previous_revision_digest,
         )
 
 
@@ -426,6 +528,12 @@ def install_github_plan_control_start(
             "PLAN_CONTROL_COMPOSITION_INVALID",
             "Production GitHub repository must be exact non-empty text",
         )
+    validate_github_plan_control_paths(
+        policy_path=policy_path,
+        state_path=state_path,
+        object_prefix=".gwo-v8/plan-control-v3/objects",
+        writer_control_path=".gwo-v8/writer-transition.json",
+    )
     content_client = _content_client or GitHubCliContentClient()
     issue_client = _issue_client or GitHubCliIssueReadClient()
     # A production writer must already be represented by an exact durable

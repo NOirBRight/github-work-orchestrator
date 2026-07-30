@@ -27,6 +27,7 @@ from .plan_control import (
     _SplitCampaignDecisionRecord,
 )
 from .runtime_gateway import CampaignPlanningSubject
+from .transition import WriterTransitionRecord
 
 
 _STATE_SCHEMA = "gwo.plan.github-state.v2"
@@ -58,6 +59,59 @@ _CATEGORY_NAMES = (
 
 class WriterGenerationReadback(Protocol):
     def read_current(self, repository: str) -> object: ...
+
+
+def _governed_path(value: object, label: str) -> str:
+    """Accept only one normalized repository-relative GWO control path."""
+
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip("/")
+        or "\\" in value
+        or not value.startswith(".gwo-v8/")
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise PlanControlError(
+            "PLAN_CONTROL_COMPOSITION_INVALID",
+            f"{label} must be a normalized repository-contained .gwo-v8 path",
+        )
+    return value
+
+
+def _paths_overlap(left: str, right: str) -> bool:
+    return (
+        left == right
+        or left.startswith(right + "/")
+        or right.startswith(left + "/")
+    )
+
+
+def validate_github_plan_control_paths(
+    *,
+    policy_path: str,
+    state_path: str,
+    object_prefix: str,
+    writer_control_path: str,
+) -> tuple[str, str, str, str]:
+    """Fence all production control paths before any GitHub read or write."""
+
+    normalized = (
+        _governed_path(policy_path, "Policy Witness path"),
+        _governed_path(state_path, "PlanControl index path"),
+        _governed_path(object_prefix, "PlanControl object prefix"),
+        _governed_path(writer_control_path, "Writer Record path"),
+    )
+    if any(
+        _paths_overlap(left, right)
+        for index, left in enumerate(normalized)
+        for right in normalized[index + 1 :]
+    ):
+        raise PlanControlError(
+            "PLAN_CONTROL_COMPOSITION_INVALID",
+            "Policy, Writer Record, PlanControl index, and governed object paths must be disjoint",
+        )
+    return normalized
 
 
 def _exact(value: object, keys: set[str], label: str) -> dict[str, Any]:
@@ -653,27 +707,96 @@ def _repo_from_state(
             "DURABLE_STATE_INVALID",
             "Durable PlanControl state cannot be reconstructed",
         ) from error
-    # A current pointer is valid only when it names exactly one immutable
-    # receipt in the append-only ledger.  This rejects a forged replacement or
-    # a rollback that silently erases a prior receipt.
-    for receipt in repo.activations.values():
-        key = (
-            receipt.repository,
-            receipt.campaign_key,
-            receipt.revision_digest,
-            receipt.planning_stable_action_id,
-        )
-        if repo.activation_receipts.get(key) != receipt:
-            raise PlanControlError(
-                "DURABLE_STATE_INVALID",
-                "Current activation has no exact immutable receipt",
-            )
+    _validate_activation_receipt_chains(repo)
     if _repo_value(repository, writer_generation, repo) != state:
         raise PlanControlError(
             "DURABLE_STATE_INVALID",
             "Durable PlanControl state is not in exact canonical order",
         )
     return repo
+
+
+def _validate_activation_receipt_chains(repo: InMemoryPlanRepository) -> None:
+    """Require one complete linear immutable receipt ledger per Campaign."""
+
+    by_campaign: dict[tuple[str, str], list[ActivationReceipt]] = {}
+    for receipt in repo.activation_receipts.values():
+        by_campaign.setdefault(
+            (receipt.repository, receipt.campaign_key),
+            [],
+        ).append(receipt)
+    if set(by_campaign) != set(repo.activations):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Activation Receipt ledger and current Campaign pointers disagree",
+        )
+    for campaign, receipts in by_campaign.items():
+        current = repo.activations[campaign]
+        by_revision: dict[str, ActivationReceipt] = {}
+        successors: dict[str, str] = {}
+        roots: list[ActivationReceipt] = []
+        for receipt in receipts:
+            prior = by_revision.get(receipt.revision_digest)
+            if prior is not None:
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "Activation Receipt ledger repeats a revision identity",
+                )
+            by_revision[receipt.revision_digest] = receipt
+            predecessor = receipt.expected_previous_revision_digest
+            if predecessor is None:
+                roots.append(receipt)
+                continue
+            existing_successor = successors.setdefault(
+                predecessor,
+                receipt.revision_digest,
+            )
+            if existing_successor != receipt.revision_digest:
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "Activation Receipt ledger forks a predecessor revision",
+                )
+        if len(roots) != 1:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "Activation Receipt ledger must have exactly one initial receipt",
+            )
+        if any(
+            receipt.expected_previous_revision_digest is not None
+            and receipt.expected_previous_revision_digest not in by_revision
+            for receipt in receipts
+        ):
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "Activation Receipt ledger has a missing predecessor",
+            )
+        current_key = (
+            current.repository,
+            current.campaign_key,
+            current.revision_digest,
+            current.planning_stable_action_id,
+        )
+        if repo.activation_receipts.get(current_key) != current:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "Current activation has no exact immutable receipt",
+            )
+        seen: set[str] = set()
+        cursor: ActivationReceipt | None = current
+        while cursor is not None:
+            if cursor.revision_digest in seen:
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "Activation Receipt predecessor chain is cyclic",
+                )
+            seen.add(cursor.revision_digest)
+            predecessor = cursor.expected_previous_revision_digest
+            cursor = None if predecessor is None else by_revision[predecessor]
+        if seen != set(by_revision) or roots[0].revision_digest not in seen:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "Activation Receipt ledger has orphan or truncated receipts",
+            )
 
 
 def _category_values_for(
@@ -791,14 +914,7 @@ class GitHubPlanRepository:
     ):
         if any(
             type(value) is not str or not value
-            for value in (
-                repository,
-                branch,
-                writer_generation,
-                path,
-                object_prefix,
-                writer_control_path,
-            )
+            for value in (repository, branch, writer_generation)
         ):
             raise PlanControlError(
                 "PLAN_CONTROL_COMPOSITION_INVALID",
@@ -809,15 +925,29 @@ class GitHubPlanRepository:
                 "PLAN_CONTROL_COMPOSITION_INVALID",
                 "GitHub PlanControl state bound must be positive",
             )
+        normalized_paths = (
+            _governed_path(path, "PlanControl index path"),
+            _governed_path(object_prefix, "PlanControl object prefix"),
+            _governed_path(writer_control_path, "Writer Record path"),
+        )
+        if any(
+            _paths_overlap(left, right)
+            for index, left in enumerate(normalized_paths)
+            for right in normalized_paths[index + 1 :]
+        ):
+            raise PlanControlError(
+                "PLAN_CONTROL_COMPOSITION_INVALID",
+                "PlanControl index, governed objects, and Writer Record paths must be disjoint",
+            )
         self.client = client
         self.repository = repository
         self.branch = branch
         self.writer_generation = writer_generation
         self.writer_control = writer_control
-        self.path = path.strip("/")
+        self.path = normalized_paths[0]
         self.maximum_state_bytes = maximum_state_bytes
-        self.object_prefix = object_prefix.strip("/")
-        self.writer_control_path = writer_control_path.strip("/")
+        self.object_prefix = normalized_paths[1]
+        self.writer_control_path = normalized_paths[2]
 
     @property
     def _uses_ref_cas(self) -> bool:
@@ -860,8 +990,18 @@ class GitHubPlanRepository:
                 "Configured writer generation does not own the GitHub control state",
             )
 
-    def _writer_authority_at_ref(self, ref_digest: str) -> dict[str, str]:
-        """Read the Writer Record from the same tree that will be CASed."""
+    def _writer_authority_at_ref(
+        self,
+        ref_digest: str,
+        *,
+        allows_new_work: bool,
+    ) -> dict[str, str]:
+        """Decode one full WriterTransitionRecord from the exact control tree.
+
+        Read/recovery may continue while a valid cutover writer is draining;
+        only an exact ``cut_over`` record with its published activation binding
+        authorizes new Planning, claim, or Campaign activation mutations.
+        """
 
         try:
             content = self.client.read_at_ref(
@@ -880,7 +1020,11 @@ class GitHubPlanRepository:
                 "GitHub control ref has no durable Writer Record",
             )
         try:
-            value = json.loads(content.content)
+            value = _exact(
+                json.loads(content.content),
+                {"schema_version", "current", "records"},
+                "Writer Record",
+            )
             current = _exact(
                 value["current"],
                 {"repository", "writer_generation", "record_id"},
@@ -899,22 +1043,92 @@ class GitHubPlanRepository:
             ) from error
         record_id = current["record_id"]
         if (
-            type(value) is not dict
-            or value.get("schema_version") != 1
+            value["schema_version"] != 1
             or type(records) is not list
             or current["repository"] != self.repository
             or current["writer_generation"] != self.writer_generation
             or type(record_id) is not str
             or not record_id
             or record_id == "initial-writer"
-            or not any(
-                type(item) is dict and item.get("record_id") == record_id
-                for item in records
-            )
         ):
             raise PlanControlError(
                 "WRITER_FENCE_CONFLICT",
                 "GitHub control ref does not carry the configured Writer authority",
+            )
+        decoded: list[WriterTransitionRecord] = []
+        expected_record_fields = {
+            "record_id",
+            "repository",
+            "kind",
+            "status",
+            "previous_writer_generation",
+            "writer_generation",
+            "activation_id",
+            "plan_digest",
+            "canary_evidence_digest",
+            "canary_evidence_refs",
+            "canary_manifest_ref",
+            "worker_capacity",
+            "coordinator_capacity",
+            "reason",
+            "created_at",
+        }
+        try:
+            for item in records:
+                raw = _exact(item, expected_record_fields, "Writer Transition Record")
+                refs = raw["canary_evidence_refs"]
+                if type(refs) is not list:
+                    raise TypeError("Writer Transition Record references")
+                decoded.append(
+                    WriterTransitionRecord(
+                        **{
+                            **raw,
+                            "canary_evidence_refs": tuple(refs),
+                        }
+                    )
+                )
+        except (TypeError, PlanControlError) as error:
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "GitHub Writer Record has a malformed transition record",
+            ) from error
+        matching = [record for record in decoded if record.record_id == record_id]
+        if len(matching) != 1:
+            raise PlanControlError(
+                "WRITER_FENCE_CONFLICT",
+                "GitHub Writer Record current pointer does not identify one transition",
+            )
+        record = matching[0]
+        allowed_statuses = {"cut_over"} if allows_new_work else {"cut_over", "draining"}
+        if (
+            record.repository != self.repository
+            or record.writer_generation != self.writer_generation
+            or record.kind != "cutover"
+            or record.status not in allowed_statuses
+            or type(record.previous_writer_generation) is not str
+            or not record.previous_writer_generation
+            or type(record.activation_id) is not str
+            or not record.activation_id
+            or type(record.plan_digest) is not str
+            or len(record.plan_digest) != 64
+            or any(character not in "0123456789abcdef" for character in record.plan_digest)
+            or type(record.canary_evidence_digest) is not str
+            or len(record.canary_evidence_digest) != 64
+            or any(character not in "0123456789abcdef" for character in record.canary_evidence_digest)
+            or not record.canary_evidence_refs
+            or any(type(reference) is not str or not reference for reference in record.canary_evidence_refs)
+            or type(record.canary_manifest_ref) is not str
+            or not record.canary_manifest_ref
+            or record.worker_capacity != 8
+            or record.coordinator_capacity != 1
+            or record.reason is not None
+            or type(record.created_at) is not str
+            or not record.created_at
+        ):
+            code = "WRITER_FENCE_CONFLICT" if allows_new_work else "WRITER_FENCE_READBACK_INVALID"
+            raise PlanControlError(
+                code,
+                "GitHub Writer Transition Record does not authorize this PlanControl operation",
             )
         return {
             "repository": self.repository,
@@ -1023,6 +1237,8 @@ class GitHubPlanRepository:
 
     def _read_ref_state(
         self,
+        *,
+        allows_new_work: bool = False,
     ) -> tuple[InMemoryPlanRepository, str, bytes | None, dict[str, str]]:
         try:
             ref_digest = self.client.read_ref(self.repository, self.branch)
@@ -1036,7 +1252,10 @@ class GitHubPlanRepository:
                 "DURABLE_STATE_INVALID",
                 "GitHub PlanControl control ref is malformed",
             )
-        authority = self._writer_authority_at_ref(ref_digest)
+        authority = self._writer_authority_at_ref(
+            ref_digest,
+            allows_new_work=allows_new_work,
+        )
         try:
             root = self.client.read_at_ref(
                 self.repository,
@@ -1187,8 +1406,12 @@ class GitHubPlanRepository:
         self,
         operation: str,
         callback: Callable[[InMemoryPlanRepository], _T],
+        *,
+        allows_new_work: bool,
     ) -> _T:
-        repo, ref_digest, before, authority = self._read_ref_state()
+        repo, ref_digest, before, authority = self._read_ref_state(
+            allows_new_work=allows_new_work,
+        )
         result = callback(repo)
         rendered, changes = self._render_ref_state(repo, authority)
         if before == rendered:
@@ -1205,7 +1428,9 @@ class GitHubPlanRepository:
             # An acknowledgement loss may have committed the exact ref.  Only
             # the full indexed state at a fresh ref can recover it.
             try:
-                _recovered, _ref, recovered_bytes, _authority = self._read_ref_state()
+                _recovered, _ref, recovered_bytes, _authority = self._read_ref_state(
+                    allows_new_work=allows_new_work,
+                )
             except Exception:
                 recovered_bytes = None
             if recovered_bytes != rendered:
@@ -1219,7 +1444,9 @@ class GitHubPlanRepository:
                 "DURABLE_STATE_READBACK_INVALID",
                 "GitHub control-ref CAS omitted its committed ref",
             )
-        _readback, readback_ref, readback_bytes, _authority = self._read_ref_state()
+        _readback, readback_ref, readback_bytes, _authority = self._read_ref_state(
+            allows_new_work=allows_new_work,
+        )
         if readback_ref != committed or readback_bytes != rendered:
             raise PlanControlError(
                 "DURABLE_STATE_READBACK_INVALID",
@@ -1281,9 +1508,15 @@ class GitHubPlanRepository:
         self,
         operation: str,
         callback: Callable[[InMemoryPlanRepository], _T],
+        *,
+        allows_new_work: bool = True,
     ) -> _T:
         if self._uses_ref_cas:
-            return self._mutate_ref(operation, callback)
+            return self._mutate_ref(
+                operation,
+                callback,
+                allows_new_work=allows_new_work,
+            )
         repo, blob_sha, before = self._read()
         result = callback(repo)
         rendered = canonical_bytes(
@@ -1518,6 +1751,7 @@ class GitHubPlanRepository:
         self._mutate(
             "release Planning",
             lambda repo: repo.release_planning(reservation),
+            allows_new_work=False,
         )
 
     def reserve_claims(self, receipt: ActivationReceipt) -> None:

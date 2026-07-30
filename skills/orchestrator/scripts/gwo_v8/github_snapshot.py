@@ -21,6 +21,10 @@ _BLOCKED_BY_HEADING = re.compile(
 )
 _NEXT_LEVEL_TWO_HEADING = re.compile(r"(?m)^[ \t]*##(?:[ \t]+|$)")
 _BLOCKER_BULLET = re.compile(r"^[ \t]*[-*+][ \t]+(.+?)[ \t]*$")
+_OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_DEPENDENCY_UNSUPPORTED = re.compile(
+    r"(?is)\bHTTP (?:404|410|422)\b.*\bissue dependencies\b.*\b(?:not supported|unavailable|disabled)\b"
+)
 
 
 class GitHubIssueReadClient(Protocol):
@@ -38,7 +42,11 @@ class GitHubIssueReadClient(Protocol):
         number: int,
     ) -> tuple[Mapping[str, Any], ...] | None: ...
 
-    def read_branch_oid(self, repository: str, branch: str) -> str: ...
+    def read_branch_source(
+        self,
+        repository: str,
+        branch: str,
+    ) -> Mapping[str, str]: ...
 
 
 class GitHubCliIssueReadClient:
@@ -132,10 +140,20 @@ class GitHubCliIssueReadClient:
         self,
         repository: str,
         number: int,
-    ) -> tuple[Mapping[str, Any], ...]:
-        return self._read_pages(
+    ) -> tuple[Mapping[str, Any], ...] | None:
+        endpoint = (
             f"repos/{repository}/issues/{number}/dependencies/blocked_by"
         )
+        result = self._run(["api", "--paginate", "--slurp", endpoint])
+        if result.returncode != 0:
+            detail = "\n".join((result.stderr, result.stdout))
+            if _DEPENDENCY_UNSUPPORTED.search(detail):
+                return None
+            raise PlanControlError(
+                "GITHUB_SNAPSHOT_UNAVAILABLE",
+                "GitHub native dependency API read failed",
+            )
+        return self._decode_pages(result.stdout)
 
     def read_comments(
         self,
@@ -146,7 +164,30 @@ class GitHubCliIssueReadClient:
             f"repos/{repository}/issues/{number}/comments?per_page=100"
         )
 
-    def read_branch_oid(self, repository: str, branch: str) -> str:
+    def _decode_pages(self, payload: str) -> tuple[Mapping[str, Any], ...]:
+        try:
+            pages = json.loads(payload)
+        except json.JSONDecodeError as error:
+            raise PlanControlError(
+                "GITHUB_SNAPSHOT_INVALID",
+                "GitHub paginated snapshot API returned malformed JSON",
+            ) from error
+        if (
+            type(pages) is not list
+            or any(type(page) is not list for page in pages)
+            or any(type(item) is not dict for page in pages for item in page)
+        ):
+            raise PlanControlError(
+                "GITHUB_SNAPSHOT_INVALID",
+                "GitHub paginated snapshot readback is not a list of pages",
+            )
+        return tuple(item for page in pages for item in page)
+
+    def read_branch_source(
+        self,
+        repository: str,
+        branch: str,
+    ) -> Mapping[str, str]:
         value = self._read_json(f"repos/{repository}/git/ref/heads/{branch}")
         if (
             type(value) is not dict
@@ -158,7 +199,31 @@ class GitHubCliIssueReadClient:
                 "GITHUB_SNAPSHOT_INVALID",
                 "GitHub target branch readback omitted its commit",
             )
-        return value["object"]["sha"]
+        commit_oid = value["object"]["sha"]
+        commit = self._read_json(
+            f"repos/{repository}/git/commits/{commit_oid}"
+        )
+        if (
+            type(commit) is not dict
+            or type(commit.get("tree")) is not dict
+            or type(commit["tree"].get("sha")) is not str
+            or _OID.fullmatch(commit_oid) is None
+            or _OID.fullmatch(commit["tree"]["sha"]) is None
+        ):
+            raise PlanControlError(
+                "GITHUB_SNAPSHOT_INVALID",
+                "GitHub target branch source omitted its immutable tree identity",
+            )
+        return {
+            "input_ref": f"refs/heads/{branch}",
+            "resolved_commit_oid": commit_oid,
+            "tree_oid": commit["tree"]["sha"],
+        }
+
+    def read_branch_oid(self, repository: str, branch: str) -> str:
+        """Compatibility read for unrelated callers; snapshots use full source."""
+
+        return self.read_branch_source(repository, branch)["resolved_commit_oid"]
 
 
 def _issue_number(repository: str, ready_ref: str) -> int:
@@ -223,6 +288,10 @@ def _canonical_issue(
     )
     if (
         type(issue) is not dict
+        or type(issue.get("id")) is not int
+        or issue["id"] < 1
+        or type(issue.get("node_id")) is not str
+        or not issue["node_id"]
         or issue.get("number") != number
         or issue.get("repository_url") != repository_url
         or issue.get("url") != issue_url
@@ -234,6 +303,8 @@ def _canonical_issue(
         or not issue["body"]
         or type(issue.get("state")) is not str
         or issue["state"].lower() not in {"open", "closed"}
+        or type(issue.get("updated_at")) is not str
+        or not issue["updated_at"]
     ):
         raise PlanControlError(
             "GITHUB_SNAPSHOT_INVALID",
@@ -280,10 +351,23 @@ def _canonical_issue(
     return (
         labels,
         sorted(
-            (dict(label) for label in labels_value),
-            key=lambda label: label["name"],
+            (
+                {
+                    "id": label.get("id"),
+                    "node_id": label.get("node_id"),
+                    "url": label.get("url"),
+                    "name": label.get("name"),
+                    "color": label.get("color"),
+                    "default": label.get("default"),
+                    "description": label.get("description"),
+                }
+                for label in labels_value
+            ),
+            key=lambda label: str(label["name"]),
         ),
         {
+            "id": issue["id"],
+            "node_id": issue["node_id"],
             "number": number,
             "title": issue["title"],
             "body": issue["body"],
@@ -296,6 +380,7 @@ def _canonical_issue(
             },
             "url": issue_url,
             "html_url": html_url,
+            "updated_at": issue["updated_at"],
         },
     )
 
@@ -369,13 +454,36 @@ def _canonical_comments(
             or comment.get("url") != f"{api_prefix}{comment_id}"
             or comment.get("html_url") != f"{html_prefix}{comment_id}"
             or type(comment.get("body")) is not str
+            or type(comment.get("node_id")) is not str
+            or not comment["node_id"]
+            or type(comment.get("user")) is not dict
+            or type(comment["user"].get("login")) is not str
+            or not comment["user"]["login"]
+            or type(comment.get("created_at")) is not str
+            or not comment["created_at"]
+            or type(comment.get("updated_at")) is not str
+            or not comment["updated_at"]
+            or type(comment.get("author_association")) is not str
+            or not comment["author_association"]
         ):
             raise PlanControlError(
                 "GITHUB_SNAPSHOT_INVALID",
                 "GitHub issue comment identity or contract is incomplete",
             )
         seen.add(comment_id)
-        frozen.append(dict(comment))
+        frozen.append(
+            {
+                "id": comment_id,
+                "node_id": comment.get("node_id"),
+                "url": comment["url"],
+                "html_url": comment["html_url"],
+                "body": comment["body"],
+                "user": {"login": (comment.get("user") or {}).get("login")},
+                "created_at": comment.get("created_at"),
+                "updated_at": comment.get("updated_at"),
+                "author_association": comment.get("author_association"),
+            }
+        )
     return sorted(frozen, key=lambda comment: comment["id"])
 
 
@@ -396,6 +504,13 @@ def _canonical_blocker(
     )
     state = blocker.get("state")
     if (
+        type(blocker.get("id")) is not int
+        or blocker["id"] < 1
+        or type(blocker.get("node_id")) is not str
+        or not blocker["node_id"]
+        or type(blocker.get("updated_at")) is not str
+        or not blocker["updated_at"]
+        or
         blocker.get("repository_url") != repository_url
         or blocker.get("url") != issue_url
         or blocker.get("html_url") != html_url
@@ -410,9 +525,12 @@ def _canonical_blocker(
     frozen_source = {
         "repository": repository,
         "number": number,
+        "id": blocker["id"],
+        "node_id": blocker["node_id"],
         "url": issue_url,
         "html_url": html_url,
         "state": state.lower(),
+        "updated_at": blocker["updated_at"],
     }
     return {
         "key": f"issue:{number}",
@@ -446,7 +564,11 @@ class GitHubReadySnapshotSource:
             or type(target_branch) is not str
             or _BRANCH.fullmatch(target_branch) is None
             or type(policy_path) is not str
-            or not policy_path.strip("/")
+            or not policy_path
+            or policy_path != policy_path.strip("/")
+            or "\\" in policy_path
+            or not policy_path.startswith(".gwo-v8/")
+            or any(part in {"", ".", ".."} for part in policy_path.split("/"))
         ):
             raise PlanControlError(
                 "PLAN_CONTROL_COMPOSITION_INVALID",
@@ -456,7 +578,7 @@ class GitHubReadySnapshotSource:
         self.issue_client = issue_client
         self.control_branch = control_branch
         self.target_branch = target_branch
-        self.policy_path = policy_path.strip("/")
+        self.policy_path = policy_path
 
     def canonical_ready_refs(
         self,
@@ -488,6 +610,155 @@ class GitHubReadySnapshotSource:
             )
         return canonical
 
+    def _policy(self, repository: str) -> tuple[dict[str, Any], bytes]:
+        try:
+            content = self.content_client.read(
+                repository,
+                self.control_branch,
+                self.policy_path,
+            )
+        except Exception as error:
+            raise PlanControlError(
+                "GITHUB_SNAPSHOT_UNAVAILABLE",
+                "GitHub Policy Witness cannot be read",
+            ) from error
+        if content is None or type(content.content) is not bytes:
+            raise PlanControlError(
+                "POLICY_WITNESS_INVALID",
+                "GitHub Policy Witness is missing",
+            )
+        try:
+            policy = strict_json_loads(content.content)
+        except CanonicalJsonError as error:
+            raise PlanControlError(
+                "POLICY_WITNESS_INVALID",
+                "GitHub Policy Witness is not strict JSON",
+            ) from error
+        if type(policy) is not dict:
+            raise PlanControlError(
+                "POLICY_WITNESS_INVALID",
+                "GitHub Policy Witness is not an object",
+            )
+        return policy, content.content
+
+    def _campaign_source(self, repository: str) -> dict[str, str]:
+        raw = self.issue_client.read_branch_source(
+            repository,
+            self.target_branch,
+        )
+        if (
+            type(raw) is not dict
+            or set(raw) != {"input_ref", "resolved_commit_oid", "tree_oid"}
+            or raw["input_ref"] != f"refs/heads/{self.target_branch}"
+            or any(
+                type(raw[name]) is not str
+                or _OID.fullmatch(raw[name]) is None
+                for name in ("resolved_commit_oid", "tree_oid")
+            )
+        ):
+            raise PlanControlError(
+                "GITHUB_SNAPSHOT_INVALID",
+                "GitHub Campaign source did not read back one immutable commit and tree",
+            )
+        source = {
+            "repository": repository,
+            **raw,
+        }
+        return {**source, "digest": digest_value(source)}
+
+    def _ticket(self, repository: str, ready_ref: str) -> dict[str, Any]:
+        number = _issue_number(repository, ready_ref)
+        issue = self.issue_client.read_issue(repository, number)
+        labels, label_records, issue_contract = _canonical_issue(
+            issue,
+            repository=repository,
+            number=number,
+            require_ready=True,
+        )
+        comments = _canonical_comments(
+            self.issue_client.read_comments(repository, number),
+            repository=repository,
+            issue_number=number,
+        )
+        body_numbers = _body_blocker_numbers(issue_contract["body"], repository)
+        native_values = self.issue_client.read_blockers(repository, number)
+        blockers: list[dict[str, Any]] = []
+        if native_values is None:
+            if body_numbers is None:
+                raise PlanControlError(
+                    "GITHUB_BLOCKERS_OMITTED",
+                    "Native dependencies are unavailable and the Ticket omits its Blocked-by fallback section",
+                )
+            for blocker_number in body_numbers:
+                blocker_issue = self.issue_client.read_issue(repository, blocker_number)
+                _canonical_issue(
+                    blocker_issue,
+                    repository=repository,
+                    number=blocker_number,
+                    require_ready=False,
+                )
+                blockers.append(_canonical_blocker(blocker_issue, repository=repository))
+        else:
+            if type(native_values) not in {tuple, list}:
+                raise PlanControlError(
+                    "GITHUB_SNAPSHOT_INVALID",
+                    "GitHub native blocker readback is not a complete page set",
+                )
+            blockers = [
+                _canonical_blocker(blocker, repository=repository)
+                for blocker in native_values
+            ]
+            native_numbers = tuple(
+                int(blocker["key"].removeprefix("issue:"))
+                for blocker in blockers
+            )
+            if len(set(native_numbers)) != len(native_numbers):
+                raise PlanControlError(
+                    "GITHUB_SNAPSHOT_INVALID",
+                    "GitHub native blockers repeat an Issue",
+                )
+            if body_numbers is None and native_numbers:
+                raise PlanControlError(
+                    "GITHUB_BLOCKERS_OMITTED",
+                    "Ticket body omits native dependency references",
+                )
+            if body_numbers is not None and set(body_numbers) != set(native_numbers):
+                raise PlanControlError(
+                    "GITHUB_BLOCKERS_CONFLICT",
+                    "Ticket body and native dependencies disagree",
+                )
+        complete_contract = {
+            "id": issue_contract["id"],
+            "node_id": issue_contract["node_id"],
+            "title": issue_contract["title"],
+            "body": issue_contract["body"],
+            "state": issue_contract["state"],
+            "state_reason": issue_contract["state_reason"],
+            "type": issue_contract["type"],
+            "repository": issue_contract["repository"],
+            "labels": label_records,
+            "comments": comments,
+            "updated_at": issue_contract["updated_at"],
+        }
+        canonical_blockers = sorted(blockers, key=lambda item: item["key"])
+        frozen_contract = {
+            "number": number,
+            "contract": complete_contract,
+            "labels": labels,
+            "source_ref": ready_ref,
+            "native_blockers": canonical_blockers,
+        }
+        return {
+            "key": f"issue:{number}",
+            "labels": labels,
+            "source": {
+                "ref": ready_ref,
+                "digest": digest_value(frozen_contract),
+            },
+            "contract": complete_contract,
+            "native_blockers": canonical_blockers,
+        }
+
     def snapshot(
         self,
         repository: str,
@@ -499,179 +770,30 @@ class GitHubReadySnapshotSource:
             or type(ready_refs) is not tuple
             or not ready_refs
         ):
-            raise PlanControlError(
-                "GITHUB_SNAPSHOT_INVALID",
-                "GitHub snapshot identity is invalid",
-            )
-        # Source readback is also callable through deterministic tests and
-        # host-independent PlanControl seams.  Normalize here as well as at
-        # the public host boundary, so a transport spelling can never leak
-        # into a frozen source reference or Campaign identity.
+            raise PlanControlError("GITHUB_SNAPSHOT_INVALID", "GitHub snapshot identity is invalid")
         ready_refs = self.canonical_ready_refs(repository, ready_refs)
-        try:
-            policy_content = self.content_client.read(
-                repository,
-                self.control_branch,
-                self.policy_path,
-            )
-        except Exception as error:
+        policy, policy_bytes = self._policy(repository)
+        source = self._campaign_source(repository)
+        tickets = [self._ticket(repository, ready_ref) for ready_ref in ready_refs]
+        if len({ticket["key"] for ticket in tickets}) != len(tickets):
+            raise PlanControlError("READY_REFS_INVALID", "Ready references resolve to the same GitHub issue")
+        # GitHub serves these facts through independent endpoints.  Re-read the
+        # complete selected frontier at a bounded final barrier; publishing a
+        # mixed issue/comment/blocker/ref view is forbidden.
+        if (
+            self._campaign_source(repository) != source
+            or self._policy(repository)[1] != policy_bytes
+            or [self._ticket(repository, ready_ref) for ready_ref in ready_refs]
+            != tickets
+        ):
             raise PlanControlError(
-                "GITHUB_SNAPSHOT_UNAVAILABLE",
-                "GitHub Policy Witness cannot be read",
-            ) from error
-        if policy_content is None:
-            raise PlanControlError(
-                "POLICY_WITNESS_INVALID",
-                "GitHub Policy Witness is missing",
+                "GITHUB_SNAPSHOT_CONCURRENT_CHANGE",
+                "GitHub selected Ticket frontier changed during snapshot capture",
             )
-        try:
-            policy = strict_json_loads(policy_content.content)
-        except CanonicalJsonError as error:
-            raise PlanControlError(
-                "POLICY_WITNESS_INVALID",
-                "GitHub Policy Witness is not strict JSON",
-            ) from error
-        if type(policy) is not dict:
-            raise PlanControlError(
-                "POLICY_WITNESS_INVALID",
-                "GitHub Policy Witness is not an object",
-            )
-        target_oid = self.issue_client.read_branch_oid(
-            repository,
-            self.target_branch,
-        )
-        tickets = []
-        seen_numbers: set[int] = set()
-        for ready_ref in ready_refs:
-            number = _issue_number(repository, ready_ref)
-            if number in seen_numbers:
-                raise PlanControlError(
-                    "READY_REFS_INVALID",
-                    "Ready references resolve to the same GitHub issue",
-                )
-            seen_numbers.add(number)
-            issue = self.issue_client.read_issue(repository, number)
-            labels, label_records, issue_contract = _canonical_issue(
-                issue,
-                repository=repository,
-                number=number,
-                require_ready=True,
-            )
-            comments = _canonical_comments(
-                self.issue_client.read_comments(repository, number),
-                repository=repository,
-                issue_number=number,
-            )
-            body_numbers = _body_blocker_numbers(
-                issue_contract["body"],
-                repository,
-            )
-            native_values = self.issue_client.read_blockers(
-                repository,
-                number,
-            )
-            blockers: list[dict[str, Any]] = []
-            if native_values is None:
-                if body_numbers is None:
-                    raise PlanControlError(
-                        "GITHUB_BLOCKERS_OMITTED",
-                        "Native dependencies are unavailable and the Ticket "
-                        "omits its Blocked-by fallback section",
-                    )
-                for blocker_number in body_numbers:
-                    blocker_issue = self.issue_client.read_issue(
-                        repository,
-                        blocker_number,
-                    )
-                    _canonical_issue(
-                        blocker_issue,
-                        repository=repository,
-                        number=blocker_number,
-                        require_ready=False,
-                    )
-                    blockers.append(
-                        _canonical_blocker(
-                            blocker_issue,
-                            repository=repository,
-                        )
-                    )
-            else:
-                if type(native_values) not in {tuple, list}:
-                    raise PlanControlError(
-                        "GITHUB_SNAPSHOT_INVALID",
-                        "GitHub native blocker readback is not a complete page set",
-                    )
-                blockers = [
-                    _canonical_blocker(blocker, repository=repository)
-                    for blocker in native_values
-                ]
-                native_numbers = tuple(
-                    int(blocker["key"].removeprefix("issue:"))
-                    for blocker in blockers
-                )
-                if len(set(native_numbers)) != len(native_numbers):
-                    raise PlanControlError(
-                        "GITHUB_SNAPSHOT_INVALID",
-                        "GitHub native blockers repeat an Issue",
-                    )
-                if body_numbers is None:
-                    if native_numbers:
-                        raise PlanControlError(
-                            "GITHUB_BLOCKERS_OMITTED",
-                            "Ticket body omits native dependency references",
-                        )
-                elif set(body_numbers) != set(native_numbers):
-                    raise PlanControlError(
-                        "GITHUB_BLOCKERS_CONFLICT",
-                        "Ticket body and native dependencies disagree",
-                    )
-            complete_contract = {
-                "title": issue_contract["title"],
-                "body": issue_contract["body"],
-                "state": issue_contract["state"],
-                "state_reason": issue_contract["state_reason"],
-                "type": issue_contract["type"],
-                "repository": issue_contract["repository"],
-                "labels": label_records,
-                "comments": comments,
-            }
-            canonical_blockers = sorted(
-                blockers,
-                key=lambda item: item["key"],
-            )
-            frozen_contract = {
-                "number": number,
-                "contract": complete_contract,
-                "labels": labels,
-                "source_ref": ready_ref,
-                "native_blockers": canonical_blockers,
-            }
-            tickets.append(
-                {
-                    "key": f"issue:{number}",
-                    "labels": labels,
-                    "source": {
-                        "ref": ready_ref,
-                        "digest": digest_value(frozen_contract),
-                    },
-                    "contract": complete_contract,
-                    "native_blockers": canonical_blockers,
-                }
-            )
-        branch_ref = f"refs/heads/{self.target_branch}"
         return {
             "repository": repository,
             "target_branch": self.target_branch,
-            "campaign_source": {
-                "ref": branch_ref,
-                "digest": digest_value(
-                    {
-                        "repository": repository,
-                        "ref": branch_ref,
-                        "commit_oid": target_oid,
-                    }
-                ),
-            },
+            "campaign_source": source,
             "policy": policy,
             "tickets": tickets,
         }

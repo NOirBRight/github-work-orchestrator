@@ -110,17 +110,57 @@ def _snapshot():
     policy["digest"] = hashlib.sha256(
         json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    campaign_source = {
+        "repository": "owner/repository",
+        "input_ref": "refs/heads/main",
+        "resolved_commit_oid": "a" * 40,
+        "tree_oid": "b" * 40,
+    }
     return {
         "repository": "owner/repository",
         "target_branch": "main",
-        "campaign_source": {"ref": "refs/heads/main", "digest": "1" * 64},
+        "campaign_source": {
+            **campaign_source,
+            "digest": hashlib.sha256(
+                json.dumps(
+                    campaign_source,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest(),
+        },
         "policy": policy,
         "tickets": [
             {
                 "key": "issue:109",
                 "labels": ["ready-for-agent"],
                 "source": {"ref": "issue:109", "digest": "2" * 64},
-                "contract": {"title": "Contract", "body": "Do the work"},
+                "contract": {
+                    "id": 109,
+                    "node_id": "ISSUE_109",
+                    "title": "Contract",
+                    "body": "Do the work",
+                    "state": "open",
+                    "state_reason": None,
+                    "type": None,
+                    "repository": {
+                        "full_name": "owner/repository",
+                        "url": "https://api.github.com/repos/owner/repository",
+                    },
+                    "labels": [
+                        {
+                            "id": 1,
+                            "node_id": "LABEL_1",
+                            "url": "https://api.github.com/repos/owner/repository/labels/ready-for-agent",
+                            "name": "ready-for-agent",
+                            "color": "0052cc",
+                            "default": False,
+                            "description": "ready",
+                        }
+                    ],
+                    "comments": [],
+                    "updated_at": "2026-07-30T00:00:00Z",
+                },
                 "native_blockers": [],
             }
         ],
@@ -784,6 +824,29 @@ def test_claim_identity_is_repository_scoped_and_active_readback_is_campaign_sco
             assert name == self.name
             value = _snapshot()
             value["repository"] = name
+            source = {
+                key: value["campaign_source"][key]
+                for key in (
+                    "repository",
+                    "input_ref",
+                    "resolved_commit_oid",
+                    "tree_oid",
+                )
+            }
+            source["repository"] = name
+            import hashlib
+            import json
+
+            value["campaign_source"] = {
+                **source,
+                "digest": hashlib.sha256(
+                    json.dumps(
+                        source,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+            }
             value["tickets"][0]["key"] = self.ticket_key
             value["tickets"][0]["source"]["ref"] = self.ticket_key
             return value
@@ -1679,12 +1742,15 @@ def test_production_github_installer_builds_real_source_and_durable_repository(
         def read_issue(self, repository, number):
             self.issue_reads.append((repository, number))
             return {
+                "id": number,
+                "node_id": f"ISSUE_{number}",
                 "number": number,
                 "title": "Contract",
                 "body": "Do the work",
                 "state": "open",
                 "state_reason": None,
                 "type": None,
+                "updated_at": "2026-07-30T00:00:00Z",
                 "repository_url": (
                     "https://api.github.com/repos/owner/repository"
                 ),
@@ -1699,7 +1765,12 @@ def test_production_github_installer_builds_real_source_and_durable_repository(
                 "labels": [
                     {
                         "id": 1,
+                        "node_id": "LABEL_1",
+                        "url": "https://api.github.com/repos/owner/repository/labels/ready-for-agent",
                         "name": "ready-for-agent",
+                        "color": "0052cc",
+                        "default": False,
+                        "description": "ready",
                     }
                 ],
             }
@@ -1710,8 +1781,12 @@ def test_production_github_installer_builds_real_source_and_durable_repository(
         def read_blockers(self, repository, number):
             return ()
 
-        def read_branch_oid(self, repository, branch):
-            return "a" * 40
+        def read_branch_source(self, repository, branch):
+            return {
+                "input_ref": "refs/heads/main",
+                "resolved_commit_oid": "a" * 40,
+                "tree_oid": "b" * 40,
+            }
 
     client = _GitHubPlanStateClient()
     client.contents[
@@ -1777,7 +1852,10 @@ def test_production_github_installer_builds_real_source_and_durable_repository(
         options,
     )
 
-    assert issue_client.issue_reads == [("owner/repository", 109)]
+    assert issue_client.issue_reads == [
+        ("owner/repository", 109),
+        ("owner/repository", 109),
+    ]
     assert equivalent_handle == handle
     assert handle.repository == "owner/repository"
     assert any(

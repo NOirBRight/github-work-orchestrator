@@ -10,6 +10,7 @@ session, Workspace, or command seam.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import wraps
 import re
 import threading
 from typing import Any, Mapping, Protocol, Sequence
@@ -33,6 +34,8 @@ _ROLE_AUTHORITY_GRANTS = {
 }
 _OPERATION_ROOTS = frozenset({"artifact", "ci", "git", "github", "repository", "workspace"})
 _RESOURCE_ROOTS = frozenset({"artifact", "campaign", "candidate", "repository", "review", "target", "work-run"})
+_MAX_DEPENDENCY_NODES = 8_192
+_MAX_DEPENDENCY_EDGES = 65_536
 
 
 class PlanControlError(RuntimeError):
@@ -42,6 +45,17 @@ class PlanControlError(RuntimeError):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+
+
+def _repository_locked(method):
+    """Serialize the in-memory durable-double's complete CAS surface."""
+
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return guarded
 
 
 @dataclass(frozen=True)
@@ -299,12 +313,15 @@ class InMemoryPlanRepository:
     def _attempt_key(handle: CampaignHandle, previous: str | None) -> tuple[str, str, str | None]:
         return (handle.repository, handle.campaign_key, previous)
 
+    @_repository_locked
     def active_receipt(self, handle: CampaignHandle) -> ActivationReceipt | None:
         return self.activations.get((handle.repository, handle.campaign_key))
 
+    @_repository_locked
     def read_attempt(self, handle: CampaignHandle, expected_previous_revision_digest: str | None) -> _PlanningAttempt | None:
         return self.attempts.get(self._attempt_key(handle, expected_previous_revision_digest))
 
+    @_repository_locked
     def save_attempt(self, attempt: _PlanningAttempt) -> _PlanningAttempt:
         key = self._attempt_key(attempt.handle, attempt.expected_previous_revision_digest)
         existing = self.attempts.get(key)
@@ -352,6 +369,7 @@ class InMemoryPlanRepository:
         self.attempts[key] = attempt
         return attempt
 
+    @_repository_locked
     def read_split_decision(
         self,
         handle: CampaignHandle,
@@ -361,6 +379,7 @@ class InMemoryPlanRepository:
             self._attempt_key(handle, expected_previous_revision_digest)
         )
 
+    @_repository_locked
     def save_split_decision(
         self,
         decision: _SplitCampaignDecisionRecord,
@@ -378,6 +397,7 @@ class InMemoryPlanRepository:
         self.split_decisions[key] = decision
         return decision
 
+    @_repository_locked
     def read_runtime_assertion(
         self,
         handle: CampaignHandle,
@@ -388,6 +408,7 @@ class InMemoryPlanRepository:
             )
             return None if value is None else _canonical(value)
 
+    @_repository_locked
     def save_runtime_assertion(
         self,
         handle: CampaignHandle,
@@ -428,6 +449,7 @@ class InMemoryPlanRepository:
             reservation.stable_action_id,
         )
 
+    @_repository_locked
     def reserve_planning(self, reservation: PlanningReservation) -> None:
         if (
             type(reservation) is not PlanningReservation
@@ -504,6 +526,7 @@ class InMemoryPlanRepository:
                 )
             self.planning_reservations[key] = reservation
 
+    @_repository_locked
     def release_planning(self, reservation: PlanningReservation) -> None:
         if type(reservation) is not PlanningReservation:
             raise PlanControlError(
@@ -522,6 +545,7 @@ class InMemoryPlanRepository:
                 )
             self.planning_reservations.pop(key)
 
+    @_repository_locked
     def reserve_claims(self, receipt: ActivationReceipt) -> None:
         if (
             type(receipt) is not ActivationReceipt
@@ -636,15 +660,18 @@ class InMemoryPlanRepository:
             self.pending_reservations[reservation_key] = receipt
             self.planning_reservations.pop(planning_key)
 
+    @_repository_locked
     def publish_revision(self, revision: PlanRevision) -> None:
         existing = self.revisions.get(revision.digest)
         if existing is not None and existing != revision:
             raise PlanControlError("PLAN_PUBLICATION_CONFLICT", "Plan revision digest resolves to different bytes")
         self.revisions[revision.digest] = revision
 
+    @_repository_locked
     def read_revision(self, digest: str) -> PlanRevision | None:
         return self.revisions.get(digest)
 
+    @_repository_locked
     def activate(self, receipt: ActivationReceipt) -> None:
         handle_key = (receipt.repository, receipt.campaign_key)
         current = self.activations.get(handle_key)
@@ -669,6 +696,7 @@ class InMemoryPlanRepository:
         self.activation_receipts[receipt_key] = receipt
         self.activations[handle_key] = receipt
 
+    @_repository_locked
     def finalize_claims(self, receipt: ActivationReceipt) -> None:
         handle = CampaignHandle(receipt.repository, receipt.campaign_key)
         if self.read_activation(handle) != receipt:
@@ -742,9 +770,11 @@ class InMemoryPlanRepository:
             ):
                 self.pending_reservations.pop(key, None)
 
+    @_repository_locked
     def read_activation(self, handle: CampaignHandle) -> ActivationReceipt | None:
         return self.active_receipt(handle)
 
+    @_repository_locked
     def read_claim_proofs(
         self,
         handle: CampaignHandle,
@@ -837,6 +867,15 @@ class PlanControl:
             expected = None if active is None else active.revision_digest
         else:
             expected = _optional_digest(expected_previous_revision_digest, "expected_previous_revision_digest")
+            if (
+                active is not None
+                and active.revision_digest != expected
+                and self._repository.read_attempt(handle, expected) is None
+            ):
+                raise PlanControlError(
+                    "ACTIVATION_CAS_CONFLICT",
+                    "Successor request names a stale previous Plan Revision digest",
+                )
 
         split_decision = self._repository.read_split_decision(handle, expected)
         if split_decision is not None:
@@ -920,6 +959,15 @@ class PlanControl:
                 planning_reservation.preflight_receipt_digest
             ),
         )
+
+        # An explicitly replayed successor request is idempotent only when it
+        # reconstructs the exact already-active receipt for the same required
+        # predecessor.  Do not ask it to recreate a consumed reservation.
+        current = self._repository.active_receipt(handle)
+        if current == receipt:
+            self._repository.finalize_claims(current)
+            self.read_active(handle)
+            return handle
 
         # Reservation is durable but cannot replace an active claim.  The
         # revision is published before activation; claims move only after the
@@ -1677,6 +1725,53 @@ def _frozen_ref(value: Any, label: str) -> dict[str, str]:
     return {"ref": _text(value["ref"], f"{label} ref"), "digest": _digest(value["digest"], f"{label} digest")}
 
 
+def _campaign_source(value: Any, repository: str) -> dict[str, str]:
+    """Validate the immutable Git identity selected for one Campaign.
+
+    A branch name is only the input selector.  The resolved commit and tree
+    are the durable authority used by PlanSpec and restart readback.
+    """
+
+    expected = {
+        "repository",
+        "input_ref",
+        "resolved_commit_oid",
+        "tree_oid",
+        "digest",
+    }
+    if type(value) is not dict or set(value) != expected:
+        raise PlanControlError(
+            "SNAPSHOT_INVALID",
+            "Campaign source must carry its complete immutable Git identity",
+        )
+    source_repository = _text(value["repository"], "Campaign source repository")
+    input_ref = _text(value["input_ref"], "Campaign source input ref")
+    commit_oid = _text(value["resolved_commit_oid"], "Campaign source commit")
+    tree_oid = _text(value["tree_oid"], "Campaign source tree")
+    if (
+        source_repository != repository
+        or not input_ref.startswith("refs/heads/")
+        or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_oid) is None
+        or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tree_oid) is None
+    ):
+        raise PlanControlError(
+            "SNAPSHOT_INVALID",
+            "Campaign source identity is malformed or belongs to another repository",
+        )
+    source = {
+        "repository": source_repository,
+        "input_ref": input_ref,
+        "resolved_commit_oid": commit_oid,
+        "tree_oid": tree_oid,
+    }
+    if _digest(value["digest"], "Campaign source digest") != digest_value(source):
+        raise PlanControlError(
+            "SNAPSHOT_INVALID",
+            "Campaign source digest does not bind its exact Git identity",
+        )
+    return {**source, "digest": value["digest"]}
+
+
 def _versioned(value: object, *, roots: frozenset[str], label: str) -> str:
     value = _text(value, label)
     if _VERSIONED_IDENTIFIER.fullmatch(value) is None or value.split(".", 1)[0] not in roots:
@@ -1757,18 +1852,14 @@ def _normalize_ticket_contract(
     *,
     ticket_key: str,
 ) -> dict[str, Any]:
-    if type(value) is not dict or not {"title", "body"}.issubset(value):
+    if type(value) is not dict:
         raise PlanControlError(
             "TICKET_CONTRACT_MISSING",
             f"Ticket {ticket_key} lacks a complete frozen contract",
         )
-    title = _text(value["title"], "Ticket title")
-    body = _text(value["body"], "Ticket body")
-    if set(value) == {"title", "body"}:
-        # Kept as an internal compatibility shape for semantic unit fixtures.
-        # The production GitHub source always emits the complete shape below.
-        return {"title": title, "body": body}
     expected = {
+        "id",
+        "node_id",
         "title",
         "body",
         "state",
@@ -1777,18 +1868,30 @@ def _normalize_ticket_contract(
         "repository",
         "labels",
         "comments",
+        "updated_at",
     }
     if set(value) != expected or value["state"] != "open":
         raise PlanControlError(
             "TICKET_CONTRACT_MISSING",
             f"Ticket {ticket_key} lacks its complete open GitHub contract",
         )
+    ticket_id = value["id"]
+    node_id = value["node_id"]
+    title = _text(value["title"], "Ticket title")
+    body = _text(value["body"], "Ticket body")
     state_reason = value["state_reason"]
     issue_type = value["type"]
     repository = value["repository"]
     labels = value["labels"]
     comments = value["comments"]
     if (
+        type(ticket_id) is not int
+        or ticket_id < 1
+        or type(node_id) is not str
+        or not node_id
+        or type(value["updated_at"]) is not str
+        or not value["updated_at"]
+        or
         (state_reason is not None and type(state_reason) is not str)
         or (issue_type is not None and type(issue_type) is not dict)
         or type(repository) is not dict
@@ -1805,18 +1908,67 @@ def _normalize_ticket_contract(
     label_names = [label.get("name") for label in labels]
     comment_ids = [comment.get("id") for comment in comments]
     if (
+        any(
+            type(label.get("id")) is not int
+            or label["id"] < 1
+            or type(label.get("node_id")) is not str
+            or not label["node_id"]
+            or type(label.get("url")) is not str
+            or not label["url"]
+            or type(label.get("color")) is not str
+            or type(label.get("default")) is not bool
+            or label.get("description") is not None
+            and type(label.get("description")) is not str
+            or set(label)
+            != {"id", "node_id", "url", "name", "color", "default", "description"}
+            for label in labels
+        )
+        or
         any(type(name) is not str or not name for name in label_names)
         or len(set(label_names)) != len(label_names)
         or label_names != sorted(label_names)
         or any(type(comment_id) is not int or comment_id < 1 for comment_id in comment_ids)
         or len(set(comment_ids)) != len(comment_ids)
         or comment_ids != sorted(comment_ids)
+        or any(
+            type(comment.get("node_id")) is not str
+            or not comment["node_id"]
+            or type(comment.get("url")) is not str
+            or not comment["url"]
+            or type(comment.get("html_url")) is not str
+            or not comment["html_url"]
+            or type(comment.get("body")) is not str
+            or type(comment.get("user")) is not dict
+            or type(comment["user"].get("login")) is not str
+            or not comment["user"]["login"]
+            or type(comment.get("created_at")) is not str
+            or not comment["created_at"]
+            or type(comment.get("updated_at")) is not str
+            or not comment["updated_at"]
+            or type(comment.get("author_association")) is not str
+            or not comment["author_association"]
+            or set(comment)
+            != {
+                "id",
+                "node_id",
+                "url",
+                "html_url",
+                "body",
+                "user",
+                "created_at",
+                "updated_at",
+                "author_association",
+            }
+            for comment in comments
+        )
     ):
         raise PlanControlError(
             "TICKET_CONTRACT_MISSING",
             f"Ticket {ticket_key} has non-canonical labels or comments",
         )
     return {
+        "id": ticket_id,
+        "node_id": node_id,
         "title": title,
         "body": body,
         "state": "open",
@@ -1831,6 +1983,7 @@ def _normalize_ticket_contract(
         },
         "labels": [dict(label) for label in labels],
         "comments": [dict(comment) for comment in comments],
+        "updated_at": value["updated_at"],
     }
 
 
@@ -1933,41 +2086,84 @@ def _normalize_snapshot(value: Any, repository: str, refs: tuple[str, ...]) -> d
         "schema_version": 1,
         "repository": repository,
         "target_branch": _text(value["target_branch"], "target_branch"),
-        "campaign_source": _frozen_ref(value["campaign_source"], "Campaign source"),
+        "campaign_source": _campaign_source(
+            value["campaign_source"],
+            repository,
+        ),
         "policy": _normalize_policy(value["policy"]),
         "tickets": tickets,
     }
 
 
 def _assert_acyclic(dependencies: Mapping[str, set[str]]) -> None:
-    visited: set[str] = set()
-    visiting: set[str] = set()
+    """Iteratively validate one bounded closed Ticket dependency graph."""
 
-    def visit(key: str) -> None:
-        if key in visiting:
-            raise PlanControlError("DEPENDENCY_CYCLE", "Ticket dependencies contain a cycle")
-        if key in visited:
-            return
-        visiting.add(key)
-        for dependency in sorted(dependencies[key]):
-            visit(dependency)
-        visiting.remove(key)
-        visited.add(key)
-
-    for key in sorted(dependencies):
-        visit(key)
+    if (
+        len(dependencies) > _MAX_DEPENDENCY_NODES
+        or any(type(key) is not str or not key for key in dependencies)
+        or any(
+            type(values) is not set
+            or any(type(item) is not str or not item for item in values)
+            for values in dependencies.values()
+        )
+    ):
+        raise PlanControlError(
+            "DEPENDENCY_STRUCTURE_LIMIT",
+            "Ticket dependency graph exceeds its bounded structural contract",
+        )
+    edge_count = sum(len(values) for values in dependencies.values())
+    if edge_count > _MAX_DEPENDENCY_EDGES:
+        raise PlanControlError(
+            "DEPENDENCY_STRUCTURE_LIMIT",
+            "Ticket dependency graph has too many edges",
+        )
+    keys = set(dependencies)
+    if any(not values.issubset(keys) for values in dependencies.values()):
+        raise PlanControlError(
+            "DEPENDENCY_INVALID",
+            "Ticket dependency graph names unselected work",
+        )
+    state: dict[str, int] = {}
+    for root in sorted(keys):
+        if state.get(root, 0) == 2:
+            continue
+        state[root] = 1
+        stack: list[tuple[str, Any]] = [
+            (root, iter(sorted(dependencies[root])))
+        ]
+        while stack:
+            key, iterator = stack[-1]
+            try:
+                dependency = next(iterator)
+            except StopIteration:
+                state[key] = 2
+                stack.pop()
+                continue
+            dependency_state = state.get(dependency, 0)
+            if dependency_state == 1:
+                raise PlanControlError(
+                    "DEPENDENCY_CYCLE",
+                    "Ticket dependencies contain a cycle",
+                )
+            if dependency_state == 2:
+                continue
+            state[dependency] = 1
+            stack.append((dependency, iter(sorted(dependencies[dependency]))))
 
 
 def _facts_by_ticket(value: Any, selected: set[str], label: str) -> dict[str, list[str]]:
     if (
         type(value) is not dict
         or any(type(key) is not str or not key for key in value)
-        or not set(value).issubset(selected)
+        or set(value) != selected
     ):
-        raise PlanControlError("PLAN_INTENT_INVALID", f"{label} names unselected work")
+        raise PlanControlError(
+            "PLAN_INTENT_OMISSION",
+            f"{label} must account for every selected Ticket exactly once",
+        )
     result = {}
     for key in selected:
-        facts = value.get(key, [])
+        facts = value[key]
         if type(facts) is not list or any(type(item) is not str or not item for item in facts) or len(set(facts)) != len(facts):
             raise PlanControlError("PLAN_INTENT_INVALID", f"{label} facts are invalid")
         result[key] = sorted(facts)
@@ -2157,7 +2353,8 @@ def _validate_plan_spec(payload: bytes) -> None:
     if (
         type(campaign) is not dict
         or set(campaign) != {"key", "source", "authority"}
-        or _frozen_ref(campaign["source"], "PlanSpec campaign source") != campaign["source"]
+        or _campaign_source(campaign["source"], plan["repository"])
+        != campaign["source"]
         or type(policy) is not dict
         or set(policy) != {"ref", "digest"}
         or _text(policy["ref"], "PlanSpec policy ref") != policy["ref"]
