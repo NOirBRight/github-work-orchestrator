@@ -18,22 +18,62 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: Verify runner Python
+      - name: Resolve runner Python
         shell: pwsh
         run: |
-          $fullVersion = & python --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Host "Runner Python: $fullVersion"
-          $version = & python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-          if ($LASTEXITCODE -ne 0 -or $version.Trim() -ne "3.13") {
-            Write-Error "Dedicated runner must provide Python 3.13; got '$version'."
+          $candidates = @()
+          $python313 = @(Get-Command python3.13 -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+          foreach ($command in $python313) {
+            $candidates += $command.Path
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            $candidates += (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe")
+          }
+          $pythonFallback = @(Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+          foreach ($command in $pythonFallback) {
+            $candidates += $command.Path
+          }
+
+          $runnerPython = $null
+          $runnerFullVersion = $null
+          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          foreach ($candidate in $candidates) {
+            if ([string]::IsNullOrWhiteSpace($candidate) -or -not $seen.Add($candidate)) {
+              continue
+            }
+            if (-not [System.IO.Path]::IsPathFullyQualified($candidate) -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+              Write-Host "Skipping unavailable Python candidate: $candidate"
+              continue
+            }
+            try {
+              $fullVersion = & $candidate --version 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "Skipping unusable Python candidate: $candidate"
+                continue
+              }
+              $version = & $candidate -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>&1
+              if ($LASTEXITCODE -ne 0 -or ($version | Out-String).Trim() -ne "3.13") {
+                Write-Host "Skipping non-3.13 Python candidate: $candidate"
+                continue
+              }
+              $runnerPython = (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).Path
+              $runnerFullVersion = ($fullVersion | Out-String).Trim()
+              break
+            } catch {
+              Write-Host "Skipping failed Python candidate '$candidate': $($_.Exception.Message)"
+            }
+          }
+          if ($null -eq $runnerPython) {
+            Write-Error "Dedicated runner must provide a usable Python 3.13 executable."
             exit 1
           }
+          Write-Host "Runner Python: $runnerFullVersion ($runnerPython)"
+          "GWO_RUNNER_PYTHON=$runnerPython" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Create isolated test environment
         shell: pwsh
         run: |
           $venvPath = Join-Path $env:RUNNER_TEMP ("gwo-ci-venv-{0}-{1}" -f $env:GITHUB_RUN_ID, $env:GITHUB_RUN_ATTEMPT)
-          & python -m venv $venvPath
+          & $env:GWO_RUNNER_PYTHON -m venv $venvPath
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $venvPython = Join-Path $venvPath "Scripts\python.exe"
           & $venvPython -m pip --version

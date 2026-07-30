@@ -151,6 +151,26 @@ def test_openai_metadata_is_explicit_and_invocable():
     assert "allow_implicit_invocation: false" in alias
 
 
+def test_ci_resolves_a_validated_python313_before_creating_its_venv():
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    for required in (
+        "Get-Command python3.13 -CommandType Application",
+        "$env:LOCALAPPDATA",
+        "Programs\\Python\\Python313\\python.exe",
+        "[System.IO.Path]::IsPathFullyQualified($candidate)",
+        "[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)",
+        "-not $seen.Add($candidate)",
+        '($version | Out-String).Trim() -ne "3.13"',
+        '"GWO_RUNNER_PYTHON=$runnerPython"',
+        "& $env:GWO_RUNNER_PYTHON -m venv $venvPath",
+    ):
+        assert required in workflow
+    assert "& python -m venv" not in workflow
+
+
 def test_v61_parallel_frontier_remains_documented_during_compatibility_release():
     design = (ROOT / "docs" / "orchestrator-v6-living-design.md").read_text(
         encoding="utf-8"
