@@ -19,7 +19,8 @@ from .activation import (
 from .compiler import CompiledPlan, CompileError, PlanCompiler
 from .plan_control import (
     CampaignHandle,
-    CampaignStartOptions,
+    InMemoryPlanRepository,
+    PlanControl,
     PlanControlDecision,
     PlanControlError,
     start,
@@ -286,7 +287,8 @@ __all__ = [
     "VerificationDecision",
     "VerifiedResult",
     "CampaignHandle",
-    "CampaignStartOptions",
+    "InMemoryPlanRepository",
+    "PlanControl",
     "PlanControlDecision",
     "PlanControlError",
     "start",
