@@ -7610,16 +7610,30 @@ def build_runtime_gateway(
     repository_contexts: Mapping[str, RuntimeRepositoryContext],
     artifact_root: Path | None = None,
     maximum_artifact_bytes: int = 1_048_576,
+    _shared_artifacts: ArtifactStore | None = None,
 ) -> "RuntimeGateway":
     """Compose the V3 production Gateway without exposing provider machinery."""
 
     gateway_store = Path(store_path)
-    artifacts = ArtifactStore(
-        Path(artifact_root)
-        if artifact_root is not None
-        else gateway_store.parent / "runtime-artifacts",
-        maximum_bytes=maximum_artifact_bytes,
-    )
+    if _shared_artifacts is not None:
+        if type(_shared_artifacts) is not ArtifactStore:
+            raise RuntimeGatewayError(
+                "RUNTIME_CONFIGURATION_INVALID",
+                "shared Artifact Store must be one exact Gateway-owned store",
+            )
+        if artifact_root is not None:
+            raise RuntimeGatewayError(
+                "RUNTIME_CONFIGURATION_INVALID",
+                "shared Artifact Store and artifact_root are mutually exclusive",
+            )
+        artifacts = _shared_artifacts
+    else:
+        artifacts = ArtifactStore(
+            Path(artifact_root)
+            if artifact_root is not None
+            else gateway_store.parent / "runtime-artifacts",
+            maximum_bytes=maximum_artifact_bytes,
+        )
     return RuntimeGateway(
         store_path=gateway_store,
         _adapter=_PaseoRuntimeProviderAdapter(

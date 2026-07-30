@@ -66,6 +66,29 @@ class PlanControlDecision(PlanControlError):
         )
 
 
+class SplitCampaignDecision(PlanControlError):
+    """A durable named Decision to split an input that cannot be planned safely."""
+
+    def __init__(
+        self,
+        *,
+        handle: CampaignHandle,
+        snapshot_digest: str,
+        snapshot_byte_length: int,
+        maximum_snapshot_bytes: int,
+        decision_digest: str,
+    ):
+        super().__init__(
+            "SPLIT_CAMPAIGN_REQUIRED",
+            "Campaign snapshot exceeds the configured Planning input bound",
+        )
+        self.handle = handle
+        self.snapshot_digest = snapshot_digest
+        self.snapshot_byte_length = snapshot_byte_length
+        self.maximum_snapshot_bytes = maximum_snapshot_bytes
+        self.decision_digest = decision_digest
+
+
 @dataclass(frozen=True)
 class PlanRevision:
     repository: str
@@ -113,6 +136,15 @@ class ActivePlanReadback:
 
 
 @dataclass(frozen=True)
+class _SplitCampaignDecisionRecord:
+    handle: CampaignHandle
+    ticket_keys: tuple[str, ...]
+    expected_previous_revision_digest: str | None
+    canonical_bytes: bytes
+    digest: str
+
+
+@dataclass(frozen=True)
 class _PlanningAttempt:
     handle: CampaignHandle
     ticket_keys: tuple[str, ...]
@@ -122,9 +154,7 @@ class _PlanningAttempt:
     policy_witness_digest: str
     planning_request_artifact_digest: str
     subject: CampaignPlanningSubject
-    planning_receipt_digest: str | None = None
-    planning_output_artifact_digest: str | None = None
-    intent_bytes: bytes | None = None
+    compilation_record_artifact_digest: str | None = None
     revision: PlanRevision | None = None
 
 
@@ -140,6 +170,8 @@ class PlanningArtifacts(Protocol):
     def put_canonical(self, value: Any) -> Any: ...
 
     def get(self, digest: str) -> Any: ...
+
+    def read_json(self, digest: str) -> Any: ...
 
 
 class CampaignPlanningGateway(Protocol):
@@ -159,7 +191,29 @@ class PlanControlRepository(Protocol):
 
     def save_attempt(self, attempt: _PlanningAttempt) -> _PlanningAttempt: ...
 
-    def reserve_claims(self, handle: CampaignHandle, ticket_keys: tuple[str, ...], revision_digest: str) -> None: ...
+    def read_split_decision(
+        self,
+        handle: CampaignHandle,
+        expected_previous_revision_digest: str | None,
+    ) -> _SplitCampaignDecisionRecord | None: ...
+
+    def save_split_decision(
+        self,
+        decision: _SplitCampaignDecisionRecord,
+    ) -> _SplitCampaignDecisionRecord: ...
+
+    def read_runtime_assertion(
+        self,
+        handle: CampaignHandle,
+    ) -> Mapping[str, Any] | None: ...
+
+    def save_runtime_assertion(
+        self,
+        handle: CampaignHandle,
+        assertion: Mapping[str, Any],
+    ) -> Mapping[str, Any]: ...
+
+    def reserve_claims(self, receipt: ActivationReceipt) -> None: ...
 
     def publish_revision(self, revision: PlanRevision) -> None: ...
 
@@ -167,9 +221,15 @@ class PlanControlRepository(Protocol):
 
     def activate(self, receipt: ActivationReceipt) -> None: ...
 
+    def finalize_claims(self, receipt: ActivationReceipt) -> None: ...
+
     def read_activation(self, handle: CampaignHandle) -> ActivationReceipt | None: ...
 
-    def read_claim_proofs(self) -> tuple[TicketClaimProof, ...]: ...
+    def read_claim_proofs(
+        self,
+        handle: CampaignHandle,
+        revision_digest: str,
+    ) -> tuple[TicketClaimProof, ...]: ...
 
 
 class InMemoryPlanRepository:
@@ -179,8 +239,15 @@ class InMemoryPlanRepository:
         _text(writer_generation, "writer_generation")
         self.writer_generation = writer_generation
         self.attempts: dict[tuple[str, str, str | None], _PlanningAttempt] = {}
-        self.claims: dict[str, str] = {}
-        self._claim_campaigns: dict[str, tuple[str, str]] = {}
+        self.claims: dict[tuple[str, str], str] = {}
+        self._claim_campaigns: dict[tuple[str, str], str] = {}
+        self.pending_reservations: dict[
+            tuple[str, str, str], ActivationReceipt
+        ] = {}
+        self.split_decisions: dict[
+            tuple[str, str, str | None], _SplitCampaignDecisionRecord
+        ] = {}
+        self.runtime_assertions: dict[tuple[str, str], dict[str, Any]] = {}
         self.revisions: dict[str, PlanRevision] = {}
         self.activations: dict[tuple[str, str], ActivationReceipt] = {}
 
@@ -197,23 +264,137 @@ class InMemoryPlanRepository:
     def save_attempt(self, attempt: _PlanningAttempt) -> _PlanningAttempt:
         key = self._attempt_key(attempt.handle, attempt.expected_previous_revision_digest)
         existing = self.attempts.get(key)
-        if existing is not None and existing.snapshot_bytes != attempt.snapshot_bytes:
-            raise PlanControlError("PLANNING_ATTEMPT_IDENTITY_CONFLICT", "Campaign attempt changed its immutable snapshot")
+        if existing is not None:
+            immutable_existing = replace(
+                existing,
+                compilation_record_artifact_digest=None,
+                revision=None,
+            )
+            immutable_attempt = replace(
+                attempt,
+                compilation_record_artifact_digest=None,
+                revision=None,
+            )
+            if immutable_existing != immutable_attempt:
+                raise PlanControlError(
+                    "PLANNING_ATTEMPT_IDENTITY_CONFLICT",
+                    "Campaign attempt changed its immutable subject or snapshot",
+                )
+            if (
+                existing.compilation_record_artifact_digest is not None
+                and existing.compilation_record_artifact_digest
+                != attempt.compilation_record_artifact_digest
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Campaign attempt replaced its bound compilation record",
+                )
+            if existing.revision is not None and existing.revision != attempt.revision:
+                raise PlanControlError(
+                    "PLAN_PUBLICATION_CONFLICT",
+                    "Campaign attempt replaced its compiled Plan Revision",
+                )
         self.attempts[key] = attempt
         return attempt
 
-    def reserve_claims(self, handle: CampaignHandle, ticket_keys: tuple[str, ...], revision_digest: str) -> None:
-        owner = (handle.repository, handle.campaign_key)
-        conflicts = sorted(
-            key
-            for key in ticket_keys
-            if key in self._claim_campaigns and self._claim_campaigns[key] != owner
+    def read_split_decision(
+        self,
+        handle: CampaignHandle,
+        expected_previous_revision_digest: str | None,
+    ) -> _SplitCampaignDecisionRecord | None:
+        return self.split_decisions.get(
+            self._attempt_key(handle, expected_previous_revision_digest)
         )
+
+    def save_split_decision(
+        self,
+        decision: _SplitCampaignDecisionRecord,
+    ) -> _SplitCampaignDecisionRecord:
+        key = self._attempt_key(
+            decision.handle,
+            decision.expected_previous_revision_digest,
+        )
+        existing = self.split_decisions.get(key)
+        if existing is not None and existing != decision:
+            raise PlanControlError(
+                "SPLIT_CAMPAIGN_DECISION_CONFLICT",
+                "Split-Campaign Decision changed its immutable identity",
+            )
+        self.split_decisions[key] = decision
+        return decision
+
+    def read_runtime_assertion(
+        self,
+        handle: CampaignHandle,
+    ) -> Mapping[str, Any] | None:
+        value = self.runtime_assertions.get(
+            (handle.repository, handle.campaign_key)
+        )
+        return None if value is None else _canonical(value)
+
+    def save_runtime_assertion(
+        self,
+        handle: CampaignHandle,
+        assertion: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        value = _canonical(assertion)
+        if type(value) is not dict:
+            raise PlanControlError(
+                "START_OPTIONS_INVALID",
+                "Campaign Runtime assertion must be a canonical object",
+            )
+        key = (handle.repository, handle.campaign_key)
+        existing = self.runtime_assertions.get(key)
+        if existing is not None and existing != value:
+            raise PlanControlError(
+                "START_OPTIONS_CONFLICT",
+                "Campaign Runtime assertion differs from its durable identity",
+            )
+        self.runtime_assertions[key] = value
+        return _canonical(value)
+
+    @staticmethod
+    def _reservation_key(receipt: ActivationReceipt) -> tuple[str, str, str]:
+        return (
+            receipt.repository,
+            receipt.campaign_key,
+            receipt.revision_digest,
+        )
+
+    def reserve_claims(self, receipt: ActivationReceipt) -> None:
+        reservation_key = self._reservation_key(receipt)
+        existing = self.pending_reservations.get(reservation_key)
+        if existing is not None:
+            if existing != receipt:
+                raise PlanControlError(
+                    "TICKET_RESERVATION_CONFLICT",
+                    "Pending Ticket reservation changed its immutable identity",
+                )
+            return
+        owner = receipt.campaign_key
+        conflicts = sorted(
+            ticket_key
+            for ticket_key in receipt.ticket_keys
+            if (
+                (receipt.repository, ticket_key) in self._claim_campaigns
+                and self._claim_campaigns[(receipt.repository, ticket_key)]
+                != owner
+            )
+        )
+        for pending in self.pending_reservations.values():
+            if (
+                pending.repository == receipt.repository
+                and pending.campaign_key != receipt.campaign_key
+            ):
+                conflicts.extend(
+                    sorted(set(pending.ticket_keys).intersection(receipt.ticket_keys))
+                )
         if conflicts:
-            raise PlanControlError("TICKET_CLAIM_CONFLICT", "Ticket claims overlap: " + ", ".join(conflicts))
-        for key in ticket_keys:
-            self.claims[key] = revision_digest
-            self._claim_campaigns[key] = owner
+            raise PlanControlError(
+                "TICKET_CLAIM_CONFLICT",
+                "Ticket claims overlap: " + ", ".join(sorted(set(conflicts))),
+            )
+        self.pending_reservations[reservation_key] = receipt
 
     def publish_revision(self, revision: PlanRevision) -> None:
         existing = self.revisions.get(revision.digest)
@@ -231,22 +412,106 @@ class InMemoryPlanRepository:
         if current_digest != receipt.expected_previous_revision_digest:
             if current == receipt:
                 return
+            self.pending_reservations.pop(self._reservation_key(receipt), None)
             raise PlanControlError("ACTIVATION_CAS_CONFLICT", "Campaign active revision differs from the expected previous revision")
         self.activations[handle_key] = receipt
+
+    def finalize_claims(self, receipt: ActivationReceipt) -> None:
+        handle = CampaignHandle(receipt.repository, receipt.campaign_key)
+        if self.read_activation(handle) != receipt:
+            raise PlanControlError(
+                "ACTIVATION_READBACK_INVALID",
+                "Ticket claims cannot finalize before the winning Activation Receipt reads back",
+            )
+        reservation_key = self._reservation_key(receipt)
+        reservation = self.pending_reservations.get(reservation_key)
+        active_keys = {
+            key
+            for key, campaign_key in self._claim_campaigns.items()
+            if key[0] == receipt.repository
+            and campaign_key == receipt.campaign_key
+        }
+        expected_keys = {
+            (receipt.repository, ticket_key) for ticket_key in receipt.ticket_keys
+        }
+        if reservation is None:
+            if (
+                active_keys == expected_keys
+                and all(
+                    self.claims[key] == receipt.revision_digest
+                    for key in expected_keys
+                )
+            ):
+                return
+            raise PlanControlError(
+                "TICKET_RESERVATION_MISSING",
+                "Winning Activation Receipt has no exact pending Ticket reservation",
+            )
+        if reservation != receipt:
+            raise PlanControlError(
+                "TICKET_RESERVATION_CONFLICT",
+                "Pending Ticket reservation does not bind the winning revision",
+            )
+        for key in expected_keys:
+            owner = self._claim_campaigns.get(key)
+            if owner is not None and owner != receipt.campaign_key:
+                raise PlanControlError(
+                    "TICKET_CLAIM_CONFLICT",
+                    "Winning activation overlaps an independently active Campaign",
+                )
+            claimed_revision = self.claims.get(key)
+            if (
+                owner == receipt.campaign_key
+                and claimed_revision
+                not in {
+                    receipt.expected_previous_revision_digest,
+                    receipt.revision_digest,
+                }
+            ):
+                raise PlanControlError(
+                    "TICKET_CLAIM_READBACK_INVALID",
+                    "Existing Campaign claim is not guarded by the expected revision",
+                )
+
+        # This in-memory transaction models the durable repository's atomic
+        # post-CAS reconcile: only the read-backed winning receipt can replace
+        # the old Campaign claims.
+        for key in active_keys - expected_keys:
+            self.claims.pop(key, None)
+            self._claim_campaigns.pop(key, None)
+        for key in expected_keys:
+            self.claims[key] = receipt.revision_digest
+            self._claim_campaigns[key] = receipt.campaign_key
+        for key, pending in tuple(self.pending_reservations.items()):
+            if (
+                pending.repository == receipt.repository
+                and pending.campaign_key == receipt.campaign_key
+            ):
+                self.pending_reservations.pop(key, None)
 
     def read_activation(self, handle: CampaignHandle) -> ActivationReceipt | None:
         return self.active_receipt(handle)
 
-    def read_claim_proofs(self) -> tuple[TicketClaimProof, ...]:
+    def read_claim_proofs(
+        self,
+        handle: CampaignHandle,
+        revision_digest: str,
+    ) -> tuple[TicketClaimProof, ...]:
         proofs = []
-        for ticket_key, revision_digest in self.claims.items():
-            repository, campaign_key = self._claim_campaigns[ticket_key]
+        for (repository, ticket_key), claimed_revision in self.claims.items():
+            campaign_key = self._claim_campaigns[(repository, ticket_key)]
+            if (
+                repository != handle.repository
+                or campaign_key != handle.campaign_key
+                or claimed_revision != revision_digest
+            ):
+                continue
             proofs.append(
                 TicketClaimProof(
                     ticket_key=ticket_key,
                     repository=repository,
                     campaign_key=campaign_key,
-                    plan_revision_digest=revision_digest,
+                    plan_revision_digest=claimed_revision,
                 )
             )
         return tuple(sorted(proofs, key=lambda proof: proof.ticket_key))
@@ -278,6 +543,8 @@ class PlanControl:
         key = campaign_key or "campaign:" + digest_value({"repository": repository, "ready_refs": list(refs)})[:24]
         handle = CampaignHandle(repository, _text(key, "campaign_key"))
         active = self._repository.active_receipt(handle)
+        if active is not None:
+            self._repository.finalize_claims(active)
         if expected_previous_revision_digest is _AUTO_PREVIOUS:
             if active is not None and active.ticket_keys == refs:
                 self.read_active(handle)
@@ -285,6 +552,10 @@ class PlanControl:
             expected = None if active is None else active.revision_digest
         else:
             expected = _optional_digest(expected_previous_revision_digest, "expected_previous_revision_digest")
+
+        split_decision = self._repository.read_split_decision(handle, expected)
+        if split_decision is not None:
+            self._raise_split_decision(split_decision, handle, refs, expected)
 
         attempt = self._repository.read_attempt(handle, expected)
         if attempt is None:
@@ -295,19 +566,25 @@ class PlanControl:
 
         self._verify_attempt_artifacts(attempt)
 
-        if attempt.intent_bytes is None:
+        if attempt.compilation_record_artifact_digest is None:
             attempt = self._obtain_one_planning_intent(attempt)
             # A live semantic turn remains pending; its stable handle gives
             # #110 a durable continuation point without inventing a revision.
-            if attempt.intent_bytes is None:
+            if attempt.compilation_record_artifact_digest is None:
                 return handle
 
-        intent = _intent_from_bytes(attempt.intent_bytes, attempt.snapshot_bytes)
+        intent_bytes = self._read_compilation_record(attempt)
+        intent = _intent_from_bytes(intent_bytes, attempt.snapshot_bytes)
         findings = tuple(DecisionFinding(**item) for item in intent["decision_requirements"])
         if findings:
             raise PlanControlDecision(attempt.snapshot_artifact_digest, findings)
 
-        revision = attempt.revision or _compile_plan(attempt.snapshot_bytes, attempt.snapshot_artifact_digest, attempt.intent_bytes, handle)
+        revision = attempt.revision or _compile_plan(
+            attempt.snapshot_bytes,
+            attempt.snapshot_artifact_digest,
+            intent_bytes,
+            handle,
+        )
         if attempt.revision is None:
             attempt = self._repository.save_attempt(replace(attempt, revision=revision))
 
@@ -316,15 +593,16 @@ class PlanControl:
         # can reconstruct authority from these exact bytes without accepting a
         # mutable PlanControl projection.
         plan_artifact_digest = _put_canonical(self._artifacts, revision.plan_spec)
-        if plan_artifact_digest != revision.digest or _canonical(self._artifacts.get(plan_artifact_digest)) != revision.plan_spec:
+        if (
+            plan_artifact_digest != revision.digest
+            or _read_artifact_json(
+                self._artifacts,
+                plan_artifact_digest,
+                code="PLAN_READBACK_INVALID",
+            )
+            != revision.plan_spec
+        ):
             raise PlanControlError("PLAN_READBACK_INVALID", "PlanSpec Artifact does not read back at its revision digest")
-
-        # Claims happen only after preflight and the sole semantic Planning
-        # Pass, but before immutable Plan publication as required by #109.
-        self._repository.reserve_claims(handle, refs, revision.digest)
-        self._repository.publish_revision(revision)
-        if self._repository.read_revision(revision.digest) != revision:
-            raise PlanControlError("PLAN_READBACK_INVALID", "Published Plan Revision does not read back exactly")
 
         receipt = ActivationReceipt(
             repository=handle.repository,
@@ -334,9 +612,18 @@ class PlanControl:
             writer_generation=self._writer_generation(),
             ticket_keys=refs,
         )
+
+        # Reservation is durable but cannot replace an active claim.  The
+        # revision is published before activation; claims move only after the
+        # winning CAS receipt has read back exactly.
+        self._repository.reserve_claims(receipt)
+        self._repository.publish_revision(revision)
+        if self._repository.read_revision(revision.digest) != revision:
+            raise PlanControlError("PLAN_READBACK_INVALID", "Published Plan Revision does not read back exactly")
         self._repository.activate(receipt)
         if self._repository.read_activation(handle) != receipt:
             raise PlanControlError("ACTIVATION_READBACK_INVALID", "Activation Receipt does not read back exactly")
+        self._repository.finalize_claims(receipt)
         return handle
 
     def read_active(self, handle: CampaignHandle) -> ActivePlanReadback:
@@ -357,21 +644,32 @@ class PlanControl:
         if revision is None or revision.repository != handle.repository or revision.campaign_key != handle.campaign_key or digest_bytes(revision.canonical_bytes) != receipt.revision_digest:
             raise PlanControlError("PLAN_READBACK_INVALID", "Activated Plan Revision does not read back exactly")
         _validate_plan_spec(revision.canonical_bytes)
-        if _canonical(self._artifacts.get(receipt.revision_digest)) != revision.plan_spec:
+        if (
+            _read_artifact_json(
+                self._artifacts,
+                receipt.revision_digest,
+                code="PLAN_READBACK_INVALID",
+            )
+            != revision.plan_spec
+        ):
             raise PlanControlError("PLAN_READBACK_INVALID", "PlanSpec Artifact does not read back exactly")
         self._verify_policy_witness(revision.plan_spec)
-        proofs = self._repository.read_claim_proofs()
-        active_proofs = tuple(
-            proof
-            for proof in proofs
-            if proof.repository == handle.repository and proof.campaign_key == handle.campaign_key
+        active_proofs = self._repository.read_claim_proofs(
+            handle,
+            receipt.revision_digest,
         )
         if (
             tuple(proof.ticket_key for proof in active_proofs) != receipt.ticket_keys
             or any(proof.plan_revision_digest != receipt.revision_digest for proof in active_proofs)
         ):
             raise PlanControlError("TICKET_CLAIM_READBACK_INVALID", "Activated Ticket claims do not read back for the exact Plan Revision")
-        return ActivePlanReadback(handle, receipt.revision_digest, revision.canonical_bytes, receipt, proofs)
+        return ActivePlanReadback(
+            handle,
+            receipt.revision_digest,
+            revision.canonical_bytes,
+            receipt,
+            active_proofs,
+        )
 
     def _new_attempt(self, handle: CampaignHandle, refs: tuple[str, ...], expected: str | None) -> _PlanningAttempt:
         snapshot = _normalize_snapshot(self._source.snapshot(handle.repository, refs), handle.repository, refs)
@@ -381,7 +679,29 @@ class PlanControl:
             raise PlanControlError("POLICY_WITNESS_INVALID", "Policy Witness Artifact digest differs from its frozen witness digest")
         snapshot_bytes = canonical_bytes(snapshot)
         if len(snapshot_bytes) > self._max_snapshot_bytes:
-            raise PlanControlError("SPLIT_CAMPAIGN_REQUIRED", "Campaign snapshot exceeds the configured Planning input bound")
+            decision_value = {
+                "schema_version": "gwo.plan.split-campaign-decision.v1",
+                "campaign": {
+                    "repository": handle.repository,
+                    "campaign_key": handle.campaign_key,
+                },
+                "ticket_keys": list(refs),
+                "expected_previous_revision_digest": expected,
+                "snapshot_digest": digest_bytes(snapshot_bytes),
+                "snapshot_byte_length": len(snapshot_bytes),
+                "maximum_snapshot_bytes": self._max_snapshot_bytes,
+            }
+            decision_digest = _put_canonical(self._artifacts, decision_value)
+            decision = self._repository.save_split_decision(
+                _SplitCampaignDecisionRecord(
+                    handle=handle,
+                    ticket_keys=refs,
+                    expected_previous_revision_digest=expected,
+                    canonical_bytes=canonical_bytes(decision_value),
+                    digest=decision_digest,
+                )
+            )
+            self._raise_split_decision(decision, handle, refs, expected)
         snapshot_ref = _put_canonical(self._artifacts, snapshot)
         if snapshot_ref != digest_bytes(snapshot_bytes):
             raise PlanControlError("SNAPSHOT_ARTIFACT_MISMATCH", "Snapshot Artifact digest differs from canonical snapshot bytes")
@@ -413,6 +733,72 @@ class PlanControl:
         subject = replace(provisional, planning_request_artifact_digest=request_ref)
         return _PlanningAttempt(handle, refs, expected, snapshot_bytes, snapshot_ref, policy_digest, request_ref, subject)
 
+    def _raise_split_decision(
+        self,
+        record: _SplitCampaignDecisionRecord,
+        handle: CampaignHandle,
+        refs: tuple[str, ...],
+        expected: str | None,
+    ) -> None:
+        try:
+            value = load_canonical_json(record.canonical_bytes)
+        except CanonicalJsonError as error:
+            raise PlanControlError(
+                "SPLIT_CAMPAIGN_DECISION_INVALID",
+                "Split-Campaign Decision is not canonical",
+            ) from error
+        expected_keys = {
+            "schema_version",
+            "campaign",
+            "ticket_keys",
+            "expected_previous_revision_digest",
+            "snapshot_digest",
+            "snapshot_byte_length",
+            "maximum_snapshot_bytes",
+        }
+        if (
+            type(value) is not dict
+            or set(value) != expected_keys
+            or value["schema_version"]
+            != "gwo.plan.split-campaign-decision.v1"
+            or value["campaign"]
+            != {
+                "repository": handle.repository,
+                "campaign_key": handle.campaign_key,
+            }
+            or value["ticket_keys"] != list(refs)
+            or value["expected_previous_revision_digest"] != expected
+            or record.handle != handle
+            or record.ticket_keys != refs
+            or record.expected_previous_revision_digest != expected
+            or digest_bytes(record.canonical_bytes) != record.digest
+            or _read_artifact_json(
+                self._artifacts,
+                record.digest,
+                code="SPLIT_CAMPAIGN_DECISION_INVALID",
+            )
+            != value
+            or type(value["snapshot_byte_length"]) is not int
+            or type(value["maximum_snapshot_bytes"]) is not int
+            or value["snapshot_byte_length"]
+            <= value["maximum_snapshot_bytes"]
+        ):
+            raise PlanControlError(
+                "SPLIT_CAMPAIGN_DECISION_INVALID",
+                "Split-Campaign Decision does not bind the exact Campaign snapshot",
+            )
+        snapshot_digest = _digest(
+            value["snapshot_digest"],
+            "Split-Campaign snapshot digest",
+        )
+        raise SplitCampaignDecision(
+            handle=handle,
+            snapshot_digest=snapshot_digest,
+            snapshot_byte_length=value["snapshot_byte_length"],
+            maximum_snapshot_bytes=value["maximum_snapshot_bytes"],
+            decision_digest=record.digest,
+        )
+
     def _obtain_one_planning_intent(self, attempt: _PlanningAttempt) -> _PlanningAttempt:
         # The preflight is intentionally before both claim reservation and
         # semantic progress.  Its receipt is opaque, but exact subject/action
@@ -427,14 +813,172 @@ class PlanControl:
         assert output_digest is not None
         intent = _planning_payload(self._artifacts, output_digest, attempt.subject)
         normalized = _normalize_intent(intent, _snapshot_from_bytes(attempt.snapshot_bytes))
+        record = {
+            "schema_version": "gwo.plan.compilation.v1",
+            "subject": attempt.subject.canonical(),
+            "subject_digest": attempt.subject.digest,
+            "snapshot_artifact_digest": attempt.snapshot_artifact_digest,
+            "policy_witness_digest": attempt.policy_witness_digest,
+            "planning_request_artifact_digest": attempt.planning_request_artifact_digest,
+            "stable_action_id": attempt.subject.stable_action_id,
+            "preflight_receipt": {
+                "subject_digest": preflight.subject_digest,
+                "stable_action_id": preflight.stable_action_id,
+                "receipt_digest": preflight.receipt_digest,
+            },
+            "planning_receipt": {
+                "subject_digest": receipt.subject_digest,
+                "stable_action_id": receipt.stable_action_id,
+                "status": receipt.status,
+                "receipt_digest": receipt.receipt_digest,
+                "planning_output_artifact_digest": output_digest,
+            },
+            "output_artifact_digest": output_digest,
+            "normalized_intent": normalized,
+            "normalized_intent_digest": digest_value(normalized),
+        }
+        record_digest = _put_canonical(self._artifacts, record)
         return self._repository.save_attempt(
             replace(
                 attempt,
-                planning_receipt_digest=receipt.receipt_digest,
-                planning_output_artifact_digest=output_digest,
-                intent_bytes=canonical_bytes(normalized),
+                compilation_record_artifact_digest=record_digest,
             )
         )
+
+    def _read_compilation_record(self, attempt: _PlanningAttempt) -> bytes:
+        digest = attempt.compilation_record_artifact_digest
+        if digest is None:
+            raise PlanControlError(
+                "COMPILATION_RECORD_INVALID",
+                "Campaign attempt has no completed compilation record",
+            )
+        try:
+            record = _read_artifact_json(
+                self._artifacts,
+                digest,
+                code="COMPILATION_RECORD_INVALID",
+            )
+            expected = {
+                "schema_version",
+                "subject",
+                "subject_digest",
+                "snapshot_artifact_digest",
+                "policy_witness_digest",
+                "planning_request_artifact_digest",
+                "stable_action_id",
+                "preflight_receipt",
+                "planning_receipt",
+                "output_artifact_digest",
+                "normalized_intent",
+                "normalized_intent_digest",
+            }
+            if (
+                type(record) is not dict
+                or set(record) != expected
+                or record["schema_version"] != "gwo.plan.compilation.v1"
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Compilation record has an unknown schema",
+                )
+            raw_subject = record["subject"]
+            if type(raw_subject) is not dict or set(raw_subject) != {
+                "kind",
+                "repository",
+                "campaign_key",
+                "campaign_handle",
+                "expected_previous_plan_revision_digest",
+                "snapshot_artifact_digest",
+                "policy_witness_digest",
+                "planning_request_artifact_digest",
+                "stable_action_id",
+            } or raw_subject.get("kind") != "campaign_planning":
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Compilation record Planning subject is malformed",
+                )
+            subject = CampaignPlanningSubject(
+                **{key: value for key, value in raw_subject.items() if key != "kind"}
+            )
+            if (
+                subject != attempt.subject
+                or record["subject_digest"] != subject.digest
+                or record["snapshot_artifact_digest"]
+                != attempt.snapshot_artifact_digest
+                or record["policy_witness_digest"] != attempt.policy_witness_digest
+                or record["planning_request_artifact_digest"]
+                != attempt.planning_request_artifact_digest
+                or record["stable_action_id"] != subject.stable_action_id
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Compilation record changed its snapshot, policy, request, or action identity",
+                )
+            preflight_value = record["preflight_receipt"]
+            if type(preflight_value) is not dict or set(preflight_value) != {
+                "subject_digest",
+                "stable_action_id",
+                "receipt_digest",
+            }:
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Compilation preflight receipt is malformed",
+                )
+            preflight = PlanningPreflightReceipt(**preflight_value)
+            _validate_preflight(preflight, subject)
+            planning_value = record["planning_receipt"]
+            if type(planning_value) is not dict or set(planning_value) != {
+                "subject_digest",
+                "stable_action_id",
+                "status",
+                "receipt_digest",
+                "planning_output_artifact_digest",
+            }:
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Compilation planning receipt is malformed",
+                )
+            planning = PlanningReceipt(**planning_value)
+            _validate_planning_receipt(planning, subject)
+            if (
+                planning.status != "completed"
+                or planning.planning_output_artifact_digest
+                != record["output_artifact_digest"]
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Compilation record is not bound to one completed Planning receipt",
+                )
+            raw_intent = _planning_payload(
+                self._artifacts,
+                record["output_artifact_digest"],
+                subject,
+            )
+            normalized = _normalize_intent(
+                raw_intent,
+                _snapshot_from_bytes(attempt.snapshot_bytes),
+            )
+            if (
+                record["normalized_intent"] != normalized
+                or record["normalized_intent_digest"] != digest_value(normalized)
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Compilation record normalized intent changed identity",
+                )
+            return canonical_bytes(normalized)
+        except PlanControlError as error:
+            if error.code == "COMPILATION_RECORD_INVALID":
+                raise
+            raise PlanControlError(
+                "COMPILATION_RECORD_INVALID",
+                "Compilation record failed closed identity validation",
+            ) from error
+        except Exception as error:
+            raise PlanControlError(
+                "COMPILATION_RECORD_INVALID",
+                "Compilation record is missing or malformed",
+            ) from error
 
     def _verify_attempt_artifacts(self, attempt: _PlanningAttempt) -> None:
         """Read back the immutable snapshot and Policy Witness before use."""
@@ -442,18 +986,82 @@ class PlanControl:
         snapshot = _snapshot_from_bytes(attempt.snapshot_bytes)
         if digest_bytes(attempt.snapshot_bytes) != attempt.snapshot_artifact_digest:
             raise PlanControlError("SNAPSHOT_DIGEST_MISMATCH", "Attempt snapshot digest changed")
-        if _canonical(self._artifacts.get(attempt.snapshot_artifact_digest)) != snapshot:
+        if (
+            _read_artifact_json(
+                self._artifacts,
+                attempt.snapshot_artifact_digest,
+                code="SNAPSHOT_READBACK_INVALID",
+            )
+            != snapshot
+        ):
             raise PlanControlError("SNAPSHOT_READBACK_INVALID", "Snapshot Artifact does not read back exactly")
         witness = {key: value for key, value in snapshot["policy"].items() if key != "digest"}
-        if digest_value(witness) != attempt.policy_witness_digest or _canonical(self._artifacts.get(attempt.policy_witness_digest)) != witness:
+        if (
+            digest_value(witness) != attempt.policy_witness_digest
+            or _read_artifact_json(
+                self._artifacts,
+                attempt.policy_witness_digest,
+                code="POLICY_WITNESS_INVALID",
+            )
+            != witness
+        ):
             raise PlanControlError("POLICY_WITNESS_INVALID", "Policy Witness Artifact does not read back exactly")
+        expected_action = "planning:" + digest_value(
+            {
+                "handle": attempt.handle.__dict__,
+                "snapshot_digest": attempt.snapshot_artifact_digest,
+                "policy_witness_digest": attempt.policy_witness_digest,
+                "expected_previous_revision_digest": attempt.expected_previous_revision_digest,
+            }
+        )
+        subject = attempt.subject
+        if (
+            subject.repository != attempt.handle.repository
+            or subject.campaign_key != attempt.handle.campaign_key
+            or subject.campaign_handle != _handle_ref(attempt.handle)
+            or subject.expected_previous_plan_revision_digest
+            != attempt.expected_previous_revision_digest
+            or subject.snapshot_artifact_digest
+            != attempt.snapshot_artifact_digest
+            or subject.policy_witness_digest != attempt.policy_witness_digest
+            or subject.planning_request_artifact_digest
+            != attempt.planning_request_artifact_digest
+            or subject.stable_action_id != expected_action
+        ):
+            raise PlanControlError(
+                "PLANNING_ATTEMPT_IDENTITY_CONFLICT",
+                "Planning attempt subject changed its immutable identity",
+            )
+        request = _read_artifact_json(
+            self._artifacts,
+            attempt.planning_request_artifact_digest,
+            code="PLANNING_REQUEST_INVALID",
+        )
+        if request != {
+            "schema_version": "gwo.runtime.prompt.v1",
+            "subject_digest": subject.prompt_binding_digest,
+            "authority_digest": attempt.policy_witness_digest,
+            "payload": {
+                "schema_version": 1,
+                "snapshot_artifact_digest": attempt.snapshot_artifact_digest,
+                "policy_witness_digest": attempt.policy_witness_digest,
+            },
+        }:
+            raise PlanControlError(
+                "PLANNING_REQUEST_INVALID",
+                "Planning request Artifact changed its subject or authority binding",
+            )
 
     def _verify_policy_witness(self, plan_spec: Mapping[str, Any]) -> None:
         policy = plan_spec.get("policy")
         if type(policy) is not dict:
             raise PlanControlError("POLICY_WITNESS_INVALID", "PlanSpec policy projection is invalid")
         digest = _digest(policy.get("digest"), "PlanSpec Policy Witness digest")
-        witness = _canonical(self._artifacts.get(digest))
+        witness = _read_artifact_json(
+            self._artifacts,
+            digest,
+            code="POLICY_WITNESS_INVALID",
+        )
         if type(witness) is not dict or _normalize_policy({**witness, "digest": digest}) != {**witness, "digest": digest}:
             raise PlanControlError("POLICY_WITNESS_INVALID", "PlanSpec Policy Witness Artifact is invalid")
 
@@ -499,6 +1107,28 @@ def _put_canonical(artifacts: PlanningArtifacts, value: Any) -> str:
     reference = artifacts.put_canonical(_canonical(value))
     digest = getattr(reference, "digest", None)
     return _digest(digest, "Artifact digest")
+
+
+def _read_artifact_json(
+    artifacts: PlanningArtifacts,
+    digest: str,
+    *,
+    code: str,
+) -> Any:
+    """Verify the #111 ArtifactRef, then decode through its canonical reader."""
+
+    try:
+        reference = artifacts.get(digest)
+        if getattr(reference, "digest", None) != digest:
+            raise PlanControlError(code, "Artifact reference does not bind its requested digest")
+        value = _canonical(artifacts.read_json(digest), code=code)
+        if digest_value(value) != digest:
+            raise PlanControlError(code, "Artifact value does not bind its content digest")
+        return value
+    except PlanControlError:
+        raise
+    except Exception as error:
+        raise PlanControlError(code, "Artifact is missing or cannot be read as canonical JSON") from error
 
 
 def _handle_ref(handle: CampaignHandle) -> str:
@@ -851,31 +1481,53 @@ def _validate_planning_receipt(receipt: object, subject: CampaignPlanningSubject
 
 
 def _planning_payload(artifacts: PlanningArtifacts, output_digest: str, subject: CampaignPlanningSubject) -> Any:
-    try:
-        output = _canonical(artifacts.get(output_digest), code="RUNTIME_PLANNING_OUTPUT_INVALID")
-    except KeyError as error:
-        raise PlanControlError("RUNTIME_PLANNING_OUTPUT_INVALID", "Planning output Artifact is missing") from error
+    output = _read_artifact_json(
+        artifacts,
+        output_digest,
+        code="RUNTIME_PLANNING_OUTPUT_INVALID",
+    )
     expected = {"schema_version", "subject_digest", "stable_action_id", "authority_digest", "payload"}
     if type(output) is not dict or set(output) != expected or output["schema_version"] != "gwo.runtime.output.v1" or output["subject_digest"] != subject.digest or output["stable_action_id"] != subject.stable_action_id or output["authority_digest"] != subject.authority_digest:
         raise PlanControlError("RUNTIME_PLANNING_OUTPUT_INVALID", "Planning output Artifact does not bind its exact subject and authority")
     return output["payload"]
 
 
-_default_control: PlanControl | None = None
+class _DirectControlStartHost:
+    def __init__(self, control: PlanControl):
+        self._control = control
+
+    def start(
+        self,
+        repository: str,
+        ready_refs: Sequence[str],
+        options: object = None,
+    ) -> CampaignHandle:
+        return self._control.start(repository, ready_refs, options)
+
+
+_default_start_host: Any | None = None
+
+
+def _install_start_host(host: object) -> None:
+    """Install one host-owned public Campaign start composition."""
+
+    if not callable(getattr(host, "start", None)):
+        raise TypeError("host must expose a callable start boundary")
+    global _default_start_host
+    _default_start_host = host
 
 
 def _install_start_control(control: PlanControl) -> None:
-    """Host composition hook; intentionally not a semantic workflow operation."""
+    """Compatibility test hook for a directly composed PlanControl."""
 
     if type(control) is not PlanControl:
         raise TypeError("control must be an exact PlanControl")
-    global _default_control
-    _default_control = control
+    _install_start_host(_DirectControlStartHost(control))
 
 
 def start(repository: str, ready_refs: Sequence[str], options: object = None) -> CampaignHandle:
     """Start one Campaign through the host-composed PlanControl boundary."""
 
-    if _default_control is None:
+    if _default_start_host is None:
         raise PlanControlError("PLAN_CONTROL_NOT_CONFIGURED", "Host composition has not installed PlanControl")
-    return _default_control.start(repository, ready_refs, options)
+    return _default_start_host.start(repository, ready_refs, options)

@@ -22,23 +22,7 @@ def test_plan_control_preflights_before_claiming_or_planning():
             assert refs == ("issue:109",)
             return _snapshot()
 
-    class Artifacts:
-        def __init__(self):
-            self.values = {}
-
-        def put_canonical(self, value):
-            import hashlib
-            import json
-
-            raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-            digest = hashlib.sha256(raw).hexdigest()
-            self.values[digest] = value
-            return type("Ref", (), {"digest": digest})()
-
-        def get(self, digest):
-            return self.values[digest]
-
-    artifacts = Artifacts()
+    artifacts = _Artifacts()
 
     class Gateway:
         def planning_preflight(self, subject):
@@ -85,7 +69,9 @@ def test_plan_control_preflights_before_claiming_or_planning():
 
     assert calls == ["preflight", "planning"]
     assert handle.repository == "owner/repository"
-    assert repository.active_receipt(handle).revision_digest == repository.claims["issue:109"]
+    assert repository.active_receipt(handle).revision_digest == repository.claims[
+        ("owner/repository", "issue:109")
+    ]
 
 
 def _snapshot():
@@ -127,12 +113,12 @@ def _snapshot():
     }
 
 
-def _intent():
+def _intent(ticket_key="issue:109"):
     return {
-        "admitted_work": ["issue:109"],
+        "admitted_work": [ticket_key],
         "dependency_additions": [],
-        "exclusive_resources": {"issue:109": []},
-        "capability_requirements": {"issue:109": ["git", "local_check"]},
+        "exclusive_resources": {ticket_key: []},
+        "capability_requirements": {ticket_key: ["git", "local_check"]},
         "decision_requirements": [],
     }
 
@@ -151,7 +137,26 @@ class _Artifacts:
         return type("Ref", (), {"digest": digest})()
 
     def get(self, digest):
-        return self.values[digest]
+        value = self.values[digest]
+        import json
+
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        return type(
+            "Ref",
+            (),
+            {"digest": digest, "byte_length": len(raw), "path": f"memory:{digest}"},
+        )()
+
+    def read_json(self, digest):
+        import json
+
+        return json.loads(
+            json.dumps(
+                self.values[digest],
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
 
 
 class _Gateway:
@@ -162,6 +167,7 @@ class _Gateway:
         self.pending = pending
         self.preflights = []
         self.progresses = []
+        self.output_digests = []
 
     def planning_preflight(self, subject):
         self.preflights.append(subject)
@@ -198,6 +204,7 @@ class _Gateway:
                 "payload": self.intent,
             }
         )
+        self.output_digests.append(output.digest)
         return type(
             "Receipt",
             (),
@@ -241,17 +248,46 @@ def _control(*, source=None, artifacts=None, gateway=None, repository=None):
     )
 
 
+def test_real_artifact_store_contract_is_used_for_plancontrol_reads(tmp_path):
+    from gwo_v8.plan_control import PlanControl
+    from gwo_v8.runtime_gateway import ArtifactStore
+
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    gateway = _Gateway(artifacts)
+    repository = __import__(
+        "gwo_v8.plan_control", fromlist=["InMemoryPlanRepository"]
+    ).InMemoryPlanRepository(writer_generation="writer:one")
+
+    handle = PlanControl(
+        source=_Source(),
+        artifacts=artifacts,
+        gateway=gateway,
+        repository=repository,
+    ).start("owner/repository", ["issue:109"])
+
+    active = PlanControl(
+        source=_Source(),
+        artifacts=artifacts,
+        gateway=gateway,
+        repository=repository,
+    ).read_active(handle)
+    assert artifacts.get(active.current_revision_digest).digest == (
+        active.current_revision_digest
+    )
+    assert artifacts.read_json(active.current_revision_digest)["schema_version"] == 3
+
+
 def test_full_policy_and_planspec_artifacts_read_back_at_authority_digests():
     control, artifacts, _gateway, repository = _control()
 
     handle = control.start("owner/repository", ["issue:109"])
     receipt = repository.active_receipt(handle)
     revision = repository.read_revision(receipt.revision_digest)
-    plan = artifacts.get(revision.digest)
+    plan = artifacts.read_json(revision.digest)
     policy_digest = plan["policy"]["digest"]
 
     assert plan == revision.plan_spec
-    assert artifacts.get(policy_digest) == {
+    assert artifacts.read_json(policy_digest) == {
         key: value for key, value in _snapshot()["policy"].items() if key != "digest"
     }
     authority = plan["work"][0]["authority"]
@@ -274,7 +310,7 @@ def test_active_readback_is_immutable_and_fails_closed_for_pending_plan_or_claim
     assert active.plan_spec_bytes == repository.read_revision(active.current_revision_digest).canonical_bytes
     assert [proof.ticket_key for proof in active.claim_proofs] == ["issue:109"]
 
-    repository.claims["issue:109"] = "0" * 64
+    repository.claims[("owner/repository", "issue:109")] = "0" * 64
     try:
         control.read_active(handle)
     except PlanControlError as error:
@@ -344,6 +380,59 @@ def test_restart_across_activation_boundaries_reuses_one_planning_receipt_and_in
     assert repository.active_receipt(handle) is not None
 
 
+def test_restart_revalidates_the_bound_gateway_output_before_reusing_compilation():
+    from gwo_v8.plan_control import InMemoryPlanRepository, PlanControlError
+
+    class CrashAfterReservation:
+        def __init__(self):
+            self.inner = InMemoryPlanRepository(writer_generation="writer:one")
+            self.writer_generation = self.inner.writer_generation
+            self.crashed = False
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def reserve_claims(self, receipt):
+            self.inner.reserve_claims(receipt)
+            if not self.crashed:
+                self.crashed = True
+                raise PlanControlError(
+                    "DURABLE_STATE_AMBIGUOUS",
+                    "synthetic reservation crash",
+                )
+
+    artifacts = _Artifacts()
+    gateway = _Gateway(artifacts)
+    repository = CrashAfterReservation()
+    control, _, _, _ = _control(
+        artifacts=artifacts,
+        gateway=gateway,
+        repository=repository,
+    )
+
+    with pytest.raises(PlanControlError) as crashed:
+        control.start("owner/repository", ["issue:109"])
+    assert crashed.value.code == "DURABLE_STATE_AMBIGUOUS"
+    assert len(gateway.output_digests) == 1
+
+    artifacts.values[gateway.output_digests[0]]["payload"]["admitted_work"] = [
+        "issue:replacement"
+    ]
+    with pytest.raises(PlanControlError) as changed:
+        control.start("owner/repository", ["issue:109"])
+    assert changed.value.code == "COMPILATION_RECORD_INVALID"
+    assert len(gateway.progresses) == 1
+    assert repository.active_receipt(
+        __import__(
+            "gwo_v8.plan_control",
+            fromlist=["CampaignHandle"],
+        ).CampaignHandle(
+            "owner/repository",
+            "campaign:2cc514aa7aef8939eb3e8c86",
+        )
+    ) is None
+
+
 def test_successor_revision_keeps_handle_and_uses_exact_previous_digest():
     control, _artifacts, gateway, repository = _control()
     first = control.start("owner/repository", ["issue:109"])
@@ -369,6 +458,107 @@ def test_successor_revision_keeps_handle_and_uses_exact_previous_digest():
     assert receipt.expected_previous_revision_digest == previous
     assert receipt.revision_digest != previous
     assert len(gateway.progresses) == 2
+
+
+def test_interleaved_successors_keep_old_claims_until_winning_activation_readback():
+    from gwo_v8.plan_control import (
+        ActivationReceipt,
+        InMemoryPlanRepository,
+        PlanControlError,
+    )
+
+    artifacts = _Artifacts()
+    repository = InMemoryPlanRepository(writer_generation="writer:one")
+    first_gateway = _Gateway(artifacts)
+    first, _, _, _ = _control(
+        artifacts=artifacts,
+        gateway=first_gateway,
+        repository=repository,
+    )
+    handle = first.start("owner/repository", ["issue:109"])
+    previous = repository.active_receipt(handle).revision_digest
+    losing = ActivationReceipt(
+        repository=handle.repository,
+        campaign_key=handle.campaign_key,
+        revision_digest="a" * 64,
+        expected_previous_revision_digest=previous,
+        writer_generation=repository.writer_generation,
+        ticket_keys=("issue:109",),
+    )
+    winning = ActivationReceipt(
+        repository=handle.repository,
+        campaign_key=handle.campaign_key,
+        revision_digest="b" * 64,
+        expected_previous_revision_digest=previous,
+        writer_generation=repository.writer_generation,
+        ticket_keys=("issue:109",),
+    )
+
+    repository.reserve_claims(losing)
+    repository.reserve_claims(winning)
+    assert repository.claims[("owner/repository", "issue:109")] == previous
+
+    repository.activate(winning)
+    assert repository.read_activation(handle) == winning
+    assert repository.claims[("owner/repository", "issue:109")] == previous
+    repository.finalize_claims(winning)
+
+    with pytest.raises(PlanControlError) as conflict:
+        repository.activate(losing)
+    assert conflict.value.code == "ACTIVATION_CAS_CONFLICT"
+    assert repository.active_receipt(handle) == winning
+    assert repository.claims[("owner/repository", "issue:109")] == winning.revision_digest
+
+
+def test_claim_identity_is_repository_scoped_and_active_readback_is_campaign_scoped():
+    from gwo_v8.plan_control import InMemoryPlanRepository, PlanControl
+
+    artifacts = _Artifacts()
+    repository = InMemoryPlanRepository(writer_generation="writer:one")
+
+    class Source:
+        def __init__(self, name, ticket_key):
+            self.name = name
+            self.ticket_key = ticket_key
+
+        def snapshot(self, name, refs):
+            assert name == self.name
+            value = _snapshot()
+            value["repository"] = name
+            value["tickets"][0]["key"] = self.ticket_key
+            value["tickets"][0]["source"]["ref"] = self.ticket_key
+            return value
+
+    def start(name, ticket_key, campaign_key):
+        gateway = _Gateway(artifacts, intent=_intent(ticket_key))
+        control = PlanControl(
+            source=Source(name, ticket_key),
+            artifacts=artifacts,
+            gateway=gateway,
+            repository=repository,
+        )
+        handle = control.start(name, [ticket_key], campaign_key=campaign_key)
+        return control, handle
+
+    first, first_handle = start(
+        "owner/repository-a", "issue:109", "campaign:first"
+    )
+    _second, _second_handle = start(
+        "owner/repository-b", "issue:109", "campaign:second"
+    )
+    _third, _third_handle = start(
+        "owner/repository-a", "issue:110", "campaign:third"
+    )
+
+    active = first.read_active(first_handle)
+    assert [(proof.repository, proof.ticket_key, proof.campaign_key) for proof in active.claim_proofs] == [
+        ("owner/repository-a", "issue:109", "campaign:first")
+    ]
+    assert set(repository.claims) == {
+        ("owner/repository-a", "issue:109"),
+        ("owner/repository-b", "issue:109"),
+        ("owner/repository-a", "issue:110"),
+    }
 
 
 def test_overlap_fails_closed_after_planning_and_before_publication():
@@ -438,6 +628,147 @@ def test_open_external_blocker_and_pending_planning_do_not_activate():
     assert repository.active_receipt(handle) is None
     assert repository.claims == {}
     assert len(gateway.progresses) == 1
+
+
+def test_oversized_snapshot_persists_one_typed_split_campaign_decision():
+    from gwo_v8.plan_control import (
+        InMemoryPlanRepository,
+        PlanControl,
+        SplitCampaignDecision,
+    )
+
+    source = _Source()
+    artifacts = _Artifacts()
+    gateway = _Gateway(artifacts)
+    repository = InMemoryPlanRepository(writer_generation="writer:one")
+    control = PlanControl(
+        source=source,
+        artifacts=artifacts,
+        gateway=gateway,
+        repository=repository,
+        max_snapshot_bytes=128,
+    )
+
+    with pytest.raises(SplitCampaignDecision) as first:
+        control.start("owner/repository", ["issue:109"])
+    with pytest.raises(SplitCampaignDecision) as restarted:
+        control.start("owner/repository", ["issue:109"])
+
+    assert restarted.value.decision_digest == first.value.decision_digest
+    assert restarted.value.snapshot_digest == first.value.snapshot_digest
+    assert restarted.value.handle == first.value.handle
+    assert restarted.value.snapshot_byte_length > restarted.value.maximum_snapshot_bytes
+    assert source.calls == 1
+    assert gateway.preflights == []
+    assert gateway.progresses == []
+    assert repository.claims == {}
+
+
+def test_installed_public_start_persists_exact_runtime_overrides_outside_planspec(
+    tmp_path,
+    monkeypatch,
+):
+    import gwo_v8.plan_control as plan_module
+    from gwo_v8.plan_control import InMemoryPlanRepository, PlanControlError
+    from gwo_v8.plan_control_host import install_plan_control_start
+    from gwo_v8.runtime_profile import RuntimeProfile
+    from gwo_v8.runtime_gateway import (
+        ArtifactStore,
+        CampaignStartRuntimeOverrides,
+        ProfileMapping,
+        RuntimeConfiguration,
+    )
+
+    monkeypatch.setattr(plan_module, "_default_start_host", None)
+    profile = RuntimeProfile(
+        name="host",
+        provider="test-provider",
+        model="model:host",
+        thinking="high",
+        mode="safe",
+        features={},
+    )
+    alternate = RuntimeProfile(
+        name="alternate",
+        provider="test-provider",
+        model="model:alternate",
+        thinking="high",
+        mode="safe",
+        features={},
+    )
+    configuration = RuntimeConfiguration(
+        profiles={profile.digest: profile, alternate.digest: alternate},
+        host_mappings={"coordinator": ProfileMapping(profile.digest)},
+    )
+    repository = InMemoryPlanRepository(writer_generation="writer:one")
+    composed = []
+
+    def gateway_builder(*, configuration, artifacts, **_kwargs):
+        assert type(artifacts) is ArtifactStore
+        composed.append((configuration, artifacts))
+        return _Gateway(artifacts)
+
+    install_plan_control_start(
+        source=_Source(),
+        repository=repository,
+        runtime_configuration=configuration,
+        repository_contexts={},
+        gateway_store_path=tmp_path / "gateway.json",
+        artifact_root=tmp_path / "artifacts",
+        _gateway_builder=gateway_builder,
+    )
+    options = {
+        "coordinator": {
+            "primary_profile_digest": alternate.digest,
+            "availability_fallback_profile_digest": profile.digest,
+        },
+        "ticket_overrides": [
+            {
+                "ticket_key": "issue:109",
+                "role": "worker",
+                "mapping": {
+                    "primary_profile_digest": alternate.digest,
+                    "availability_fallback_profile_digest": None,
+                },
+            }
+        ],
+    }
+
+    handle = plan_module.start(
+        "owner/repository",
+        ["issue:109"],
+        options,
+    )
+    assertion = CampaignStartRuntimeOverrides(
+        coordinator=ProfileMapping(alternate.digest, profile.digest),
+        ticket_overrides={
+            ("issue:109", "worker"): ProfileMapping(alternate.digest)
+        },
+    )
+    assert repository.read_runtime_assertion(handle) == assertion.canonical()
+    key = (
+        handle.repository,
+        handle.campaign_key,
+        "campaign-handle:"
+        + __import__("gwo_v8._canonical", fromlist=["digest_value"]).digest_value(
+            handle.__dict__
+        ),
+    )
+    assert composed[-1][0].campaign_assertions[key] == assertion
+
+    active = repository.active_receipt(handle)
+    plan = repository.read_revision(active.revision_digest).plan_spec
+    assert alternate.digest not in repr(plan)
+    assert profile.digest not in repr(plan)
+    assert plan_module.start("owner/repository", ["issue:109"]) == handle
+
+    with pytest.raises(PlanControlError) as invalid:
+        plan_module.start(
+            "owner/repository",
+            ["issue:109"],
+            {"coordinator": None, "ticket_overrides": [], "unknown": True},
+        )
+    assert invalid.value.code == "START_OPTIONS_INVALID"
 
 
 def test_rebuild_has_no_predecessor_v3_runtime_or_profile_path():

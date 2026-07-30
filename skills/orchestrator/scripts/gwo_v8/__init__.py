@@ -23,8 +23,10 @@ from .plan_control import (
     PlanControl,
     PlanControlDecision,
     PlanControlError,
+    SplitCampaignDecision,
     start,
 )
+from .plan_control_host import install_plan_control_start
 from .entry import (
     ImplementGwoDecision,
     ImplementGwoEntry,
@@ -291,5 +293,7 @@ __all__ = [
     "PlanControl",
     "PlanControlDecision",
     "PlanControlError",
+    "SplitCampaignDecision",
+    "install_plan_control_start",
     "start",
 ]
