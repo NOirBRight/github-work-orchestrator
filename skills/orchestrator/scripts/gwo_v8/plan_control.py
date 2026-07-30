@@ -250,12 +250,6 @@ class CampaignPlanningGateway(Protocol):
 
     def progress(self, subject: CampaignPlanningSubject, preflight: PlanningPreflightReceipt) -> PlanningReceipt: ...
 
-    def planning_readback(
-        self,
-        subject: CampaignPlanningSubject,
-        preflight: PlanningPreflightReceipt,
-    ) -> PlanningReceipt: ...
-
 
 class PlanControlRepository(Protocol):
     """Durable facts required by PlanControl's claim and activation boundary."""
@@ -1516,9 +1510,10 @@ class PlanControl:
         )
 
     def _obtain_one_planning_intent(self, attempt: _PlanningAttempt) -> _PlanningAttempt:
-        # A pre-existing reservation is an identity-proven crash boundary.
-        # Recover it only through RuntimeGateway's non-command readback seam;
-        # do not turn a draining Writer into a second semantic progress call.
+        # A pre-existing reservation proves only this stable action's immutable
+        # identity.  RuntimeGateway.progress owns its readback-first recovery:
+        # an action may be absent when PlanControl crashed between this durable
+        # reservation and Runtime materialization.
         existing = self._repository.read_planning_reservation(
             attempt.handle,
             attempt.subject.stable_action_id,
@@ -1542,13 +1537,7 @@ class PlanControl:
                 stable_action_id=existing.stable_action_id,
                 receipt_digest=existing.preflight_receipt_digest,
             )
-            readback = getattr(self._gateway, "planning_readback", None)
-            if not callable(readback):
-                raise PlanControlError(
-                    "RUNTIME_PREFLIGHT_INVALID",
-                    "Existing Planning reservation requires RuntimeGateway recovery readback",
-                )
-            receipt = readback(attempt.subject, preflight)
+            receipt = self._gateway.progress(attempt.subject, preflight)
             _validate_planning_receipt(receipt, attempt.subject)
             return self._save_completed_planning_intent(attempt, preflight, receipt)
 

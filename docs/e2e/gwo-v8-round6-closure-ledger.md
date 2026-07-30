@@ -13,3 +13,12 @@ The matrix is intentionally adversarial and table driven where each closed
 state family has adjacent-state or adjacent-field coverage.  All rejection
 rows assert that Planning does not begin or that durable claim state is left
 unchanged, as appropriate to the boundary being exercised.
+
+## Round 7 closure ledger
+
+| Raw Round 7 finding | Owning invariant / narrow API | Focused evidence |
+| --- | --- | --- |
+| A durable Planning reservation could strand an absent Runtime action after a crash | `RuntimeGateway.progress()` is the single readback-first materialization/recovery operation; reservations bind identity only | `test_r7c1_reservation_crash_retries_the_same_progress_operation` |
+| A fourth `planning_readback` operation widened the exact Gateway surface and could not cover action state | Closed `progress` recovery-policy matrix; caller-visible Gateway operations remain preflight/progress/transition only | `test_r7c1_progress_recovery_state_matrix`; `test_public_package_hides_raw_provider_seam_and_gateway_has_only_three_operations` |
+| Production inferred Planning output schema from prompt shape while the in-memory adapter required a Planning subject | Shared `_resolve_runtime_subject_protocol` binds exact subject, canonical prompt, frozen inputs, and output schema in both adapters | `test_r7c2_subject_prompt_schema_matrix_is_shared_by_both_adapters` |
+| Host readback adapter retained an unused assertion projection | The Host adapter no longer stores assertion state or owns a readback operation | `test_public_package_hides_raw_provider_seam_and_gateway_has_only_three_operations` and source-level Host construction coverage |

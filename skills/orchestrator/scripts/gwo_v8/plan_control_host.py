@@ -49,61 +49,23 @@ from .plan_control_github import (
 _GatewayBuilder = Callable[..., Any]
 
 
-class _RuntimeAssertionCommitGateway:
-    """Keep #111 assertion ownership entirely inside RuntimeGateway."""
+class _PlanControlGateway:
+    """Forward the exact three-operation #111 caller surface to RuntimeGateway."""
 
     def __init__(
         self,
         *,
         gateway: Any,
-        handle: CampaignHandle,
-        assertion: CampaignStartRuntimeOverrides | None,
     ):
         self._gateway = gateway
-        self._handle = handle
-        self._assertion = None if assertion is None else assertion.canonical()
 
     def planning_preflight(self, subject):
         receipt = self._gateway.planning_preflight(subject)
         _validate_preflight(receipt, subject)
-        recovered = getattr(
-            self._gateway,
-            "_campaign_start_assertion_identity",
-            None,
-        )
-        if callable(recovered):
-            try:
-                authoritative = recovered(
-                    self._handle.repository,
-                    self._handle.campaign_key,
-                    _handle_ref(self._handle),
-                )
-            except RuntimeGatewayError as error:
-                raise PlanControlError(
-                    "RUNTIME_PREFLIGHT_INVALID",
-                    "RuntimeGateway could not recover its durable Campaign assertion",
-                ) from error
-            if type(authoritative) is not str or not authoritative:
-                raise PlanControlError(
-                    "RUNTIME_PREFLIGHT_INVALID",
-                    "RuntimeGateway preflight omitted its durable Campaign assertion identity",
-                )
-        # The preflight has committed/read back the Gateway-owned assertion.
-        # PlanControl sees no Profile, fallback, or override projection.
         return receipt
 
     def progress(self, subject, preflight):
         return self._gateway.progress(subject, preflight)
-
-    def planning_readback(self, subject, preflight):
-        readback = getattr(self._gateway, "_planning_readback", None)
-        if not callable(readback):
-            raise PlanControlError(
-                "RUNTIME_PREFLIGHT_INVALID",
-                "RuntimeGateway omits the recovery-only Planning readback seam",
-            )
-        return readback(subject, preflight)
-
 
 def _mapping(value: Any, label: str) -> ProfileMapping:
     if type(value) is not dict or set(value) != {
@@ -220,12 +182,14 @@ def _production_gateway_builder(
     configuration: RuntimeConfiguration,
     repository_contexts: Mapping[str, RuntimeRepositoryContext],
     artifacts: ArtifactStore,
+    planning_progress_policy: Callable[[CampaignPlanningSubject], str] | None = None,
 ) -> Any:
     return build_runtime_gateway(
         store_path=gateway_store_path,
         configuration=configuration,
         repository_contexts=repository_contexts,
         _shared_artifacts=artifacts,
+        _planning_progress_policy=planning_progress_policy,
     )
 
 
@@ -270,11 +234,19 @@ class ProductionPlanControlStartHost:
         configuration: RuntimeConfiguration,
     ) -> PlanControl:
         try:
+            progress_policy = getattr(
+                self._repository,
+                "planning_progress_mode",
+                None,
+            )
             gateway = self._gateway_builder(
                 gateway_store_path=self._gateway_store_path,
                 configuration=configuration,
                 repository_contexts=self._repository_contexts,
                 artifacts=self._artifacts,
+                planning_progress_policy=(
+                    progress_policy if callable(progress_policy) else None
+                ),
             )
         except PlanControlError:
             raise
@@ -286,10 +258,8 @@ class ProductionPlanControlStartHost:
         return PlanControl(
             source=self._source,
             artifacts=self._artifacts,
-            gateway=_RuntimeAssertionCommitGateway(
+            gateway=_PlanControlGateway(
                 gateway=gateway,
-                handle=handle,
-                assertion=assertion,
             ),
             repository=self._repository,
             max_snapshot_bytes=self._max_snapshot_bytes,

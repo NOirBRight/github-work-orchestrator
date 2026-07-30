@@ -767,27 +767,6 @@ class _PlanningGateway:
             planning_output_artifact_digest=output.digest,
         )
 
-    def planning_readback(self, subject, preflight):
-        """Recovery-only seam used when another host owns this action turn.
-
-        The production Gateway returns its exact durable progress state.  This
-        fixture deliberately reports a live action rather than calling
-        ``progress`` a second time, so concurrent PlanControl hosts exercise
-        the same no-second-semantic-call boundary.
-        """
-        from gwo_v8.runtime_gateway import PlanningReceipt
-
-        return PlanningReceipt(
-            subject_digest=subject.digest,
-            stable_action_id=subject.stable_action_id,
-            status="running",
-            receipt_digest="4" * 64,
-            planning_output_artifact_digest=None,
-        )
-
-    _planning_readback = planning_readback
-
-
 def _ref_control(client, artifacts, *, source=None):
     from gwo_v8.plan_control import PlanControl
     from gwo_v8.plan_control_github import GitHubPlanRepository
@@ -1020,22 +999,10 @@ def test_rp6_6_runtime_assertion_never_enters_plancontrol_state(
         mode="safe",
         features={},
     )
-    class RecoveringGateway(_PlanningGateway):
-        def _campaign_start_assertion_identity(
-            self,
-            repository,
-            campaign_key,
-            campaign_handle,
-        ):
-            assert repository == "owner/repository"
-            assert campaign_key
-            assert campaign_handle.startswith("campaign-handle:")
-            return "a" * 64
-
     repository = InMemoryPlanRepository(writer_generation="writer:one")
 
     def builder(*, artifacts, **_kwargs):
-        return RecoveringGateway(artifacts)
+        return _PlanningGateway(artifacts)
 
     host = ProductionPlanControlStartHost(
         source=_PlanSource(),
@@ -2055,7 +2022,12 @@ def test_rp5_7_installed_github_successor_fences_invalid_lineage(tmp_path):
     assert any(outcome == handle for outcome in outcomes)
     assert all(
         outcome == handle
-        or outcome in {"DURABLE_CAS_CONFLICT", "ACTIVATION_CAS_CONFLICT"}
+        or outcome in {
+            "DURABLE_CAS_CONFLICT",
+            "ACTIVATION_CAS_CONFLICT",
+            "PLAN_PUBLICATION_CONFLICT",
+            "ACTIVE_PLAN_CROSS_BINDING_INVALID",
+        }
         for outcome in outcomes
     ), outcomes
     assert len(second._repository._read_repo().activation_receipts) == 3
@@ -2466,3 +2438,70 @@ def test_rc6_6_successor_does_not_reparse_an_old_ticket_override(tmp_path):
         expected_previous_revision_digest=previous,
     ) == handle
     assert not hasattr(repository, "runtime_assertions")
+
+
+def test_r7c1_reservation_crash_retries_the_same_progress_operation(tmp_path):
+    """A reservation proves identity, not prior Runtime materialization."""
+
+    from gwo_v8.plan_control import InMemoryPlanRepository, PlanControl
+    from gwo_v8.runtime_gateway import ArtifactStore
+
+    class CrashBeforeRuntimeAction(_PlanningGateway):
+        def __init__(self, artifacts):
+            super().__init__(artifacts)
+            self.progress_invocations = 0
+
+        def progress(self, subject, preflight):
+            self.progress_invocations += 1
+            if self.progress_invocations == 1:
+                raise RuntimeError("crash after PlanControl reservation")
+            return super().progress(subject, preflight)
+
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    repository = InMemoryPlanRepository(writer_generation="writer:one")
+    gateway = CrashBeforeRuntimeAction(artifacts)
+    control = PlanControl(
+        source=_PlanSource(),
+        artifacts=artifacts,
+        gateway=gateway,
+        repository=repository,
+    )
+
+    with pytest.raises(RuntimeError, match="after PlanControl reservation"):
+        control.start("owner/repository", ["issue:109"])
+
+    handle = control.start("owner/repository", ["issue:109"])
+
+    assert repository.active_receipt(handle) is not None
+    assert gateway.progress_invocations == 2
+    assert gateway.progresses == 1
+
+
+@pytest.mark.parametrize("status", ("cut_over", "draining"))
+def test_r7c1_github_writer_policy_exposes_only_closed_progress_modes(status):
+    """The installed host receives only the authoritative Writer mode."""
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import CampaignPlanningSubject
+
+    client = _RefContentClient()
+    if status == "draining":
+        client.advance_writer("writer:one", status=status)
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    subject = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r7-policy",
+        campaign_handle="campaign-handle:r7-policy",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest="a" * 64,
+        policy_witness_digest="b" * 64,
+        planning_request_artifact_digest="c" * 64,
+        stable_action_id="planning:r7-policy",
+    )
+
+    assert repository.planning_progress_mode(subject) == status

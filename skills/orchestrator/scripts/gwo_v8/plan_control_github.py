@@ -2691,6 +2691,32 @@ class GitHubPlanRepository:
             stable_action_id,
         )
 
+    def planning_progress_mode(self, subject: CampaignPlanningSubject) -> str:
+        """Return the exact Writer state consumed inside Gateway.progress.
+
+        This is a host-composition policy callback, never a caller-visible
+        RuntimeGateway operation.  It reads one validated Writer authority and
+        exposes only the closed progress mode for this repository.
+        """
+
+        if (
+            type(subject) is not CampaignPlanningSubject
+            or subject.repository != self.repository
+        ):
+            raise PlanControlError(
+                "WRITER_FENCE_CONFLICT",
+                "Planning progress policy was requested for another repository",
+            )
+        _repo, _ref, _before, authority = self._read_ref_state()
+        self._assert_writer_operation(authority, _WriterOperation.READ)
+        status = authority.get("status")
+        if type(status) is not str or status not in {"cut_over", "draining"}:
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "Writer authority cannot select a Planning progress mode",
+            )
+        return status
+
     def reserve_claims(self, receipt: ActivationReceipt) -> None:
         self._assert_repository(receipt.repository)
         self._mutate(

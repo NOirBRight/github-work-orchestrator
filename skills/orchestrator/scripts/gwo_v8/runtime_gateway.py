@@ -1956,6 +1956,68 @@ class WorkRunSubject:
 RuntimeSubject = CampaignPlanningSubject | WorkRunSubject
 
 
+def _resolve_runtime_subject_protocol(
+    subject: object,
+    prompt: object,
+) -> Mapping[str, Any] | None:
+    """Bind one exact Runtime subject kind to its only permitted protocol.
+
+    This is deliberately shared by both provider adapters.  A Planning-shaped
+    Prompt is not authority by itself: only the exact pre-Plan subject may use
+    it, and its input Artifact identities must equal that subject's frozen
+    snapshot and Policy Witness.
+    """
+
+    if type(subject) not in {CampaignPlanningSubject, WorkRunSubject}:
+        raise RuntimeGatewayError(
+            "RUNTIME_SUBJECT_INVALID",
+            "Runtime protocol resolution accepts exact closed subject types only",
+        )
+    if (
+        type(prompt) is not dict
+        or set(prompt) != {
+            "schema_version",
+            "subject_digest",
+            "authority_digest",
+            "payload",
+        }
+        or type(prompt["schema_version"]) is not str
+        or prompt["schema_version"] != "gwo.runtime.prompt.v1"
+        or type(prompt["subject_digest"]) is not str
+        or prompt["subject_digest"] != subject.prompt_binding_digest
+        or type(prompt["authority_digest"]) is not str
+        or prompt["authority_digest"] != subject.authority_digest
+    ):
+        raise RuntimeGatewayError(
+            "RUNTIME_PROMPT_ARTIFACT_INVALID",
+            "Prompt Artifact does not bind its exact Runtime subject and authority",
+        )
+    planning_schema = planning_output_schema_from_prompt(prompt)
+    if type(subject) is CampaignPlanningSubject:
+        if planning_schema is None:
+            raise RuntimeGatewayError(
+                "RUNTIME_PROMPT_ARTIFACT_INVALID",
+                "Campaign Planning requires one exact canonical Planning prompt",
+            )
+        inputs = prompt["payload"]["input_artifacts"]
+        if (
+            inputs["snapshot_artifact_digest"] != subject.snapshot_artifact_digest
+            or inputs["policy_witness_artifact_digest"]
+            != subject.policy_witness_digest
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_PROMPT_ARTIFACT_INVALID",
+                "Campaign Planning prompt changed its frozen input Artifact identities",
+            )
+        return planning_schema
+    if planning_schema is not None:
+        raise RuntimeGatewayError(
+            "RUNTIME_PROMPT_ARTIFACT_INVALID",
+            "Plan-Revision Work Run cannot use the exclusive Planning protocol",
+        )
+    return None
+
+
 class RuntimeCommand(str, Enum):
     START = "start"
     RESUME = "resume"
@@ -6616,12 +6678,15 @@ class _PaseoRuntimeProviderAdapter:
                 stable_action_id=spec.stable_action_id,
                 authority_digest=spec.subject.authority_digest,
             ),
-            planning_output_schema_from_prompt(prompt),
+            _resolve_runtime_subject_protocol(spec.subject, prompt),
         )
 
     def prepare(self, spec: _RuntimeActionSpec) -> _PrepareReceipt | _RuntimeFailure:
         try:
             self._refresh()
+            # Resolve the complete subject/protocol/schema relation before any
+            # workspace, durable intent, or provider operation is attempted.
+            output_schema = self._output_schema_payload(spec)
             existing = self._actions.get(spec.stable_action_id)
             if existing is not None:
                 return self._prepared_receipt_from_action(spec, existing)
@@ -6683,7 +6748,7 @@ class _PaseoRuntimeProviderAdapter:
             }
             target = staged[prompt.digest]
             schema_digest = files.write_schema(
-                self._output_schema_payload(spec)
+                output_schema
             )
             files.require_result_absent()
             action_record = {
@@ -7616,6 +7681,7 @@ def build_runtime_gateway(
     artifact_root: Path | None = None,
     maximum_artifact_bytes: int = 1_048_576,
     _shared_artifacts: ArtifactStore | None = None,
+    _planning_progress_policy: Callable[[CampaignPlanningSubject], str] | None = None,
 ) -> "RuntimeGateway":
     """Compose the V3 production Gateway without exposing provider machinery."""
 
@@ -7654,6 +7720,7 @@ def build_runtime_gateway(
         configuration=configuration,
         _artifacts=artifacts,
         _static_assignment_validator=_PaseoStaticAssignmentValidator(repository_contexts),
+        _planning_progress_policy=_planning_progress_policy,
     )
 
 
@@ -7695,6 +7762,7 @@ class RuntimeGateway:
         _artifacts: ArtifactStore | None = None,
         _static_assignment_validator: Callable[[RuntimeSubject, RuntimeProfile], None]
         | None = None,
+        _planning_progress_policy: Callable[[CampaignPlanningSubject], str] | None = None,
     ):
         self._store_path = Path(store_path)
         self._journal = _V3JsonJournal(self._store_path)
@@ -7711,6 +7779,7 @@ class RuntimeGateway:
             self._store_path.parent / "runtime-artifacts"
         )
         self._static_assignment_validator = _static_assignment_validator
+        self._planning_progress_policy = _planning_progress_policy
         self._data = self._load()
 
     # Caller interface operation 1.  It neither calls an adapter nor reserves
@@ -7887,128 +7956,6 @@ class RuntimeGateway:
             receipt_digest=receipt_digest,
         )
 
-    def _campaign_start_assertion_identity(
-        self,
-        repository: str,
-        campaign_key: str,
-        campaign_handle: str,
-    ) -> str | None:
-        """Host-only opaque proof of #111's authoritative Campaign binding.
-
-        This deliberately exposes neither Runtime Profile nor fallback or
-        Ticket override material.  The host may prove/reuse a Campaign-start
-        assertion by its opaque identity, while RuntimeGateway remains its
-        sole durable owner.
-        """
-
-        if any(
-            type(value) is not str or not value
-            for value in (repository, campaign_key, campaign_handle)
-        ):
-            raise RuntimeGatewayError(
-                "RUNTIME_CONFIGURATION_INVALID",
-                "Campaign assertion recovery identity is invalid",
-            )
-        self._refresh()
-        campaign = self._data["campaigns"].get(campaign_handle)
-        if campaign is None:
-            return None
-        if (
-            type(campaign) is not dict
-            or campaign.get("repository") != repository
-            or campaign.get("campaign_key") != campaign_key
-        ):
-            raise RuntimeGatewayError(
-                "RUNTIME_CAMPAIGN_IDENTITY_MISMATCH",
-                "Campaign assertion recovery read another Campaign",
-            )
-        # ``_refresh`` has already proven the complete campaign/preflight
-        # cross-binding and canonical override digest before this projection.
-        overrides_digest = campaign.get("overrides_digest")
-        if (
-            type(overrides_digest) is not str
-            or _DIGEST_RE.fullmatch(overrides_digest) is None
-            or overrides_digest != digest_value(campaign.get("overrides"))
-        ):
-            raise RuntimeGatewayError(
-                "RUNTIME_STORE_INVALID",
-                "Campaign assertion opaque identity is invalid",
-            )
-        return digest_value(
-            {
-                "repository": repository,
-                "campaign_key": campaign_key,
-                "campaign_handle": campaign_handle,
-                "overrides_digest": overrides_digest,
-            }
-        )
-
-    def _planning_readback(
-        self,
-        subject: CampaignPlanningSubject,
-        preflight: PlanningPreflightReceipt,
-    ) -> PlanningReceipt:
-        """Recover one already-materialized Planning action without effects.
-
-        Unlike ``progress``, this seam never prepares, starts, resumes, or
-        sends a command.  It is intentionally private host recovery plumbing
-        for a draining Writer that may only read the exact durable #111 action
-        that was reserved before drain.
-        """
-
-        if type(subject) is not CampaignPlanningSubject:
-            raise RuntimeGatewayError(
-                "RUNTIME_PREFLIGHT_SUBJECT_INVALID",
-                "planning readback accepts CampaignPlanningSubject only",
-            )
-        self._assert_configuration_identity()
-        self._refresh()
-        persisted_preflight = self._require_preflight(subject, preflight)
-        record = self._data["actions"].get(subject.stable_action_id)
-        if type(record) is not dict:
-            raise RuntimeGatewayError(
-                "RUNTIME_ACTION_UNKNOWN",
-                "planning readback has no previously reserved Runtime action",
-            )
-        try:
-            persisted_subject = _subject_from_canonical(record.get("subject"))
-        except RuntimeGatewayError as error:
-            raise RuntimeGatewayError(
-                "RUNTIME_STORE_INVALID",
-                "planning readback action subject is invalid",
-            ) from error
-        if persisted_subject != subject:
-            raise RuntimeGatewayError(
-                "RUNTIME_PREFLIGHT_IDENTITY_MISMATCH",
-                "planning readback action belongs to another Campaign subject",
-            )
-        self._assignment_for_progress(subject, persisted_preflight)
-        verdict = self._observe_verdict(subject.stable_action_id)
-        if verdict.kind in _RUNTIME_OBSERVATION_FAILURE_VERDICT_KINDS:
-            assert verdict.failure is not None
-            self._raise_failure(verdict.failure)
-        if verdict.kind != "bound":
-            raise RuntimeGatewayError(
-                "RUNTIME_BINDING_MISSING",
-                "planning readback has no existing bound Runtime action",
-            )
-        observation = verdict.observation
-        assert observation is not None
-        self._validate_bound_observation(subject, record, observation)
-        # A provider observation is read-only; no journal write or Runtime
-        # command occurs on this path.
-        receipt = self._progress_receipt(
-            subject,
-            verdict,
-            command=None,
-        )
-        if type(receipt) is not PlanningReceipt:
-            raise RuntimeGatewayError(
-                "RUNTIME_STORE_INVALID",
-                "planning readback did not reconstruct a Planning receipt",
-            )
-        return receipt
-
     # Caller interface operation 2.  This owns the entire readback-first
     # prepare/observe/start-or-resume loop; callers cannot issue provider
     # commands or inspect a Runtime Binding.
@@ -8025,8 +7972,10 @@ class RuntimeGateway:
             )
         self._assert_configuration_identity()
         self._refresh()
-        if isinstance(subject, CampaignPlanningSubject):
+        planning_mode: str | None = None
+        if type(subject) is CampaignPlanningSubject:
             persisted_preflight = self._require_preflight(subject, preflight)
+            planning_mode = self._planning_progress_mode(subject)
         elif preflight is not None:
             raise RuntimeGatewayError(
                 "RUNTIME_PREFLIGHT_INVALID",
@@ -8041,6 +7990,11 @@ class RuntimeGateway:
             subject.stable_action_id
         )
         if observation_verdict.kind == "authoritative_absence":
+            if planning_mode == "draining":
+                raise RuntimeGatewayError(
+                    "RUNTIME_RECOVERY_ONLY",
+                    "Draining Planning recovery cannot materialize an absent Runtime action",
+                )
             if self._record_has_materialization_history(record):
                 raise RuntimeGatewayError(
                     "RUNTIME_BINDING_MISSING",
@@ -8097,6 +8051,11 @@ class RuntimeGateway:
             observation = observation_verdict.observation
             assert observation is not None
             self._validate_prepared_observation(subject, record, observation)
+            if planning_mode == "draining":
+                raise RuntimeGatewayError(
+                    "RUNTIME_RECOVERY_ONLY",
+                    "Draining Planning recovery cannot start a Prepared Runtime action",
+                )
             if observation.fenced is not False:
                 raise RuntimeGatewayError(
                     "RUNTIME_COMMAND_INVALID",
@@ -8115,6 +8074,11 @@ class RuntimeGateway:
             observation = observation_verdict.observation
             assert observation is not None
             self._validate_bound_observation(subject, record, observation)
+            if planning_mode == "draining" and observation.lifecycle != "completed":
+                raise RuntimeGatewayError(
+                    "RUNTIME_RECOVERY_ONLY",
+                    "Draining Planning recovery requires one exact completed Runtime action",
+                )
             if (
                 observation.lifecycle in {"running", "completed"}
                 and record["lifecycle"] is None
@@ -8148,6 +8112,12 @@ class RuntimeGateway:
                 "RUNTIME_OBSERVATION_INVALID",
                 f"cannot progress Runtime lifecycle {observation.lifecycle}",
             )
+        if planning_mode == "draining":
+            return self._progress_receipt(
+                subject,
+                observation_verdict,
+                command=None,
+            )
         wake_hints, next_cursor = self._wake_hints(wake_cursor, subject)
         return self._progress_receipt(
             subject,
@@ -8156,6 +8126,28 @@ class RuntimeGateway:
             wake_cursor=next_cursor,
             wake_hints=wake_hints,
         )
+
+    def _planning_progress_mode(self, subject: CampaignPlanningSubject) -> str:
+        """Resolve the closed dynamic policy inside the sole progress operation."""
+
+        policy = self._planning_progress_policy
+        if policy is None:
+            return "cut_over"
+        try:
+            mode = policy(subject)
+        except RuntimeGatewayError:
+            raise
+        except Exception as error:
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_POLICY_INVALID",
+                "Planning progress policy is unavailable",
+            ) from error
+        if type(mode) is not str or mode not in {"cut_over", "draining"}:
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_POLICY_INVALID",
+                "Planning progress policy is outside its closed state union",
+            )
+        return mode
 
     # Caller interface operation 3.  Binding refs remain private, including
     # for start/resume: they re-enter the same observe-gated progression path.
@@ -8590,23 +8582,13 @@ class RuntimeGateway:
     ) -> tuple[ArtifactRef, tuple[ArtifactRef, ...]]:
         prompt_digest = (
             subject.planning_request_artifact_digest
-            if isinstance(subject, CampaignPlanningSubject)
+            if type(subject) is CampaignPlanningSubject
             else subject.prompt_artifact_digest
         )
         prompt = self._artifacts.get(prompt_digest)
         payload = self._artifacts.read_json(prompt.digest)
-        if (
-            not isinstance(payload, dict)
-            or payload.get("schema_version") != "gwo.runtime.prompt.v1"
-            or payload.get("subject_digest") != subject.prompt_binding_digest
-            or payload.get("authority_digest") != subject.authority_digest
-            or "payload" not in payload
-        ):
-            raise RuntimeGatewayError(
-                "RUNTIME_PROMPT_ARTIFACT_INVALID",
-                "Prompt Artifact does not bind its exact subject, payload, and authority",
-            )
-        if isinstance(subject, CampaignPlanningSubject):
+        _resolve_runtime_subject_protocol(subject, payload)
+        if type(subject) is CampaignPlanningSubject:
             # The planning subject binds these governed inputs by digest.  They
             # remain protocol Artifacts, so existence alone is insufficient.
             self._artifacts.read_json(subject.snapshot_artifact_digest)
@@ -10733,11 +10715,12 @@ class _InMemoryRuntimeProviderAdapter:
             authority_digest=action.spec.subject.authority_digest,
         )
         prompt = self._artifacts.read_json(action.spec.prompt_artifact.digest)
+        planning_schema = _resolve_runtime_subject_protocol(
+            action.spec.subject,
+            prompt,
+        )
         payload: dict[str, Any]
-        if (
-            type(action.spec.subject) is CampaignPlanningSubject
-            and planning_output_schema_from_prompt(prompt) is not None
-        ):
+        if planning_schema is not None:
             snapshot = self._artifacts.read_json(
                 action.spec.subject.snapshot_artifact_digest
             )
@@ -10794,6 +10777,11 @@ class _InMemoryRuntimeProviderAdapter:
     def _prepare_locked(
         self, spec: _RuntimeActionSpec
     ) -> _PrepareReceipt | _RuntimeFailure:
+        try:
+            prompt = self._artifacts.read_json(spec.prompt_artifact.digest)
+            _resolve_runtime_subject_protocol(spec.subject, prompt)
+        except RuntimeGatewayError as error:
+            return _RuntimeFailure(error.code, "Runtime subject/prompt protocol is invalid")
         existing = self._actions.get(spec.stable_action_id)
         if existing is not None:
             if (

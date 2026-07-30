@@ -19,6 +19,7 @@ from gwo_v8 import (  # noqa: E402
     WorkRunSubject,
 )
 from gwo_v8.runtime import RuntimeProfile  # noqa: E402
+from gwo_v8.planning_protocol import planning_prompt  # noqa: E402
 from gwo_v8.runtime_gateway import (  # noqa: E402
     ArtifactStore,
     CampaignStartRuntimeOverrides,
@@ -39,7 +40,7 @@ def _profile(name: str) -> RuntimeProfile:
 
 
 def _planning(store: ArtifactStore, *, action: str = "planning:one"):
-    snapshot = store.put_canonical({"tickets": ["issue:111"]})
+    snapshot = store.put_canonical({"tickets": [{"key": "issue:111"}]})
     policy = store.put_canonical({"policy": "frozen"})
     provisional = CampaignPlanningSubject(
         repository="owner/repository",
@@ -52,12 +53,12 @@ def _planning(store: ArtifactStore, *, action: str = "planning:one"):
         stable_action_id=action,
     )
     prompt = store.put_canonical(
-        {
-            "schema_version": "gwo.runtime.prompt.v1",
-            "subject_digest": provisional.prompt_binding_digest,
-            "authority_digest": policy.digest,
-            "payload": {"complete_ticket_contracts": ["x" * 100_000]},
-        }
+        planning_prompt(
+            subject_digest=provisional.prompt_binding_digest,
+            authority_digest=provisional.authority_digest,
+            snapshot_artifact_digest=snapshot.digest,
+            policy_witness_artifact_digest=policy.digest,
+        )
     )
     return CampaignPlanningSubject(
         **{
