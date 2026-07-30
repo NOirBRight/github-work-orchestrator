@@ -72,6 +72,7 @@ _MAXIMUM_RUNTIME_JOURNAL_BYTES = 16_777_216
 _MAXIMUM_RUNTIME_EVENTS = 64
 _MAXIMUM_RUNTIME_EVENT_PAGE = 16
 _MAXIMUM_RUNTIME_EVENT_READBACKS = 1
+_RUNTIME_RECOVERY_RETRY_SECONDS = 60
 _MAXIMUM_RUNTIME_SCALAR_INTEGER = (1 << 63) - 1
 _MAXIMUM_RUNTIME_EVENT_CURSOR = _MAXIMUM_RUNTIME_SCALAR_INTEGER
 _MAXIMUM_RUNTIME_EVENT_CURSOR_TEXT = str(_MAXIMUM_RUNTIME_EVENT_CURSOR)
@@ -279,6 +280,7 @@ class _RuntimeFailure:
     detail: str
     stable_action_id: str | None = None
     authoritative_absence: bool = False
+    observation_id: str | None = None
 
     @classmethod
     def absent(cls, stable_action_id: str) -> "_RuntimeFailure":
@@ -303,6 +305,29 @@ class _RuntimeFailure:
             "Runtime identity readback is ambiguous",
             stable_action_id=stable_action_id,
         )
+
+    @classmethod
+    def provider_unavailable(
+        cls,
+        observation_id: str,
+        *,
+        stable_action_id: str | None = None,
+    ) -> "_RuntimeFailure":
+        _require_text(observation_id, "provider unavailable observation_id")
+        return cls(
+            "RUNTIME_PROVIDER_UNAVAILABLE",
+            "Runtime provider is unavailable",
+            stable_action_id=stable_action_id,
+            observation_id=observation_id,
+        )
+
+
+class _RuntimeRecoverySignal(Exception):
+    """Private transport of a classified command failure to Gateway policy."""
+
+    def __init__(self, failure: _RuntimeFailure):
+        self.failure = failure
+        super().__init__(failure.code)
 
 
 @dataclass(frozen=True)
@@ -2046,6 +2071,88 @@ class PermissionResponse:
             )
 
 
+@dataclass(frozen=True)
+class PermissionRequired:
+    """Opaque, exact descriptor for one Runtime permission needing attention."""
+
+    stable_action_id: str
+    request_id: str
+    descriptor_digest: str
+
+    def __post_init__(self) -> None:
+        _require_text(self.stable_action_id, "permission stable_action_id")
+        _require_text(self.request_id, "permission request_id")
+        _require_digest(self.descriptor_digest, "permission descriptor_digest")
+
+
+@dataclass(frozen=True)
+class RuntimeRecoveryOutcome:
+    """Closed non-scheduling recovery result for one persisted observation."""
+
+    kind: str
+    reason: str
+    next_check_at: int | None
+    observation_digest: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"wait", "blocked", "decision"}:
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_INVALID", "Runtime recovery kind is invalid"
+            )
+        if self.reason not in {
+            "RuntimeProviderUnavailable",
+            "RuntimeTransportUnavailable",
+            "RuntimeConfigurationInvalid",
+            "RuntimeConfigurationRepairRequired",
+            "RuntimeObservationUnavailable",
+            "RuntimeProviderRecoveryRequired",
+        }:
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_INVALID", "Runtime recovery reason is invalid"
+            )
+        allowed_kinds = {
+            "RuntimeProviderUnavailable": {"wait", "blocked"},
+            "RuntimeTransportUnavailable": {"wait", "blocked"},
+            "RuntimeConfigurationInvalid": {"blocked"},
+            "RuntimeConfigurationRepairRequired": {"decision"},
+            "RuntimeObservationUnavailable": {"decision"},
+            "RuntimeProviderRecoveryRequired": {"decision"},
+        }
+        if self.kind not in allowed_kinds[self.reason]:
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_INVALID",
+                "Runtime recovery kind does not match its classified reason",
+            )
+        if self.kind == "wait":
+            if (
+                type(self.next_check_at) is not int
+                or isinstance(self.next_check_at, bool)
+                or self.next_check_at < 0
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_RECOVERY_INVALID",
+                    "Runtime recovery wait requires a due time",
+                )
+        elif self.next_check_at is not None:
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_INVALID",
+                "terminal Runtime recovery outcome cannot carry a due time",
+            )
+        _require_digest(self.observation_digest, "recovery observation_digest")
+
+
+@dataclass(frozen=True)
+class TerminalBindingEvidence:
+    """Opaque proof required before a caller can select a replacement binding."""
+
+    stable_action_id: str
+    evidence_digest: str
+
+    def __post_init__(self) -> None:
+        _require_text(self.stable_action_id, "terminal evidence stable_action_id")
+        _require_digest(self.evidence_digest, "terminal evidence digest")
+
+
 RuntimeTransition = RuntimeCommand | PermissionResponse
 
 
@@ -2170,6 +2277,209 @@ def _permission_request_from_value(value: object) -> _PermissionRequest:
             "RUNTIME_OBSERVATION_INVALID",
             "completed permission request proof is invalid",
         ) from error
+
+
+@dataclass(frozen=True)
+class _FrozenPermissionAuthorityV1:
+    """One read-backed, provider-neutral authority view for a Work Run."""
+
+    plan_revision_digest: str
+    ticket_key: str
+    purpose: WorkRunPurpose
+    authority_subtree_digest: str
+    policy_witness_digest: str
+    grant_pairs: frozenset[tuple[str, str]]
+    witness_pairs: frozenset[tuple[str, str]]
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "plan_revision_digest",
+            "authority_subtree_digest",
+            "policy_witness_digest",
+        ):
+            _require_digest(getattr(self, field_name), field_name)
+        _require_text(self.ticket_key, "ticket_key")
+        if type(self.purpose) is not WorkRunPurpose:
+            raise RuntimeGatewayError(
+                "RUNTIME_AUTHORITY_INVALID",
+                "frozen permission authority purpose is invalid",
+            )
+        for field_name in ("grant_pairs", "witness_pairs"):
+            pairs = getattr(self, field_name)
+            if type(pairs) is not frozenset or not all(
+                type(pair) is tuple
+                and len(pair) == 2
+                and type(pair[0]) is str
+                and bool(pair[0])
+                and type(pair[1]) is str
+                and bool(pair[1])
+                for pair in pairs
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_AUTHORITY_INVALID",
+                    "frozen permission authority pairs are invalid",
+                )
+
+
+class _AuthorityReadback(Protocol):
+    """Private bridge to the published PlanSpec v3 authority projection."""
+
+    def read(
+        self, subject: WorkRunSubject
+    ) -> _FrozenPermissionAuthorityV1 | None: ...
+
+
+class _ArtifactAuthorityReadback:
+    """Read one Work Run's frozen authority from published V3 Artifacts.
+
+    This is deliberately not a PlanControl import.  RuntimeGateway needs only
+    the immutable readback contract: the Plan Revision Artifact identifies the
+    authority subtree, and its Policy Witness Artifact independently carries
+    the policy-side grants.  Missing, malformed, or cross-bound records are a
+    closed no-auto-approval result, not a reason to infer authority.
+    """
+
+    def __init__(self, artifacts: ArtifactStore):
+        self._artifacts = artifacts
+
+    def read(
+        self, subject: WorkRunSubject
+    ) -> _FrozenPermissionAuthorityV1 | None:
+        try:
+            plan = self._artifacts.read_json(subject.plan_revision_digest)
+        except RuntimeGatewayError:
+            return None
+        if (
+            type(plan) is not dict
+            or plan.get("schema_version") != 3
+            or plan.get("repository") != subject.repository
+            or type(plan.get("campaign")) is not dict
+            or plan["campaign"].get("key") != subject.campaign_key
+            or type(plan.get("policy")) is not dict
+            or type(plan["policy"].get("digest")) is not str
+            or _DIGEST_RE.fullmatch(plan["policy"]["digest"]) is None
+            or type(plan.get("work")) is not list
+        ):
+            return None
+        matching_work = [
+            item
+            for item in plan["work"]
+            if type(item) is dict and item.get("key") == subject.ticket_key
+        ]
+        if len(matching_work) != 1:
+            return None
+        authority = matching_work[0].get("authority")
+        if (
+            type(authority) is not dict
+            or authority.get("policy_witness_digest") != plan["policy"]["digest"]
+        ):
+            return None
+        role = _authority_role_for_purpose(subject.purpose)
+        subtree = authority.get(role)
+        if type(subtree) is not dict or set(subtree) != {
+            "policy_witness_digest",
+            "grants",
+            "subtree_digest",
+        }:
+            return None
+        policy_witness_digest = subtree.get("policy_witness_digest")
+        subtree_digest = subtree.get("subtree_digest")
+        if (
+            type(policy_witness_digest) is not str
+            or policy_witness_digest != plan["policy"]["digest"]
+            or type(subtree_digest) is not str
+            or subtree_digest != subject.authority_digest
+            or _DIGEST_RE.fullmatch(subtree_digest) is None
+        ):
+            return None
+        grants = _authority_pairs(subtree.get("grants"))
+        if grants is None:
+            return None
+        if digest_value(
+            {
+                "policy_witness_digest": policy_witness_digest,
+                "grants": [
+                    {"operation_id": operation, "resource_id": resource}
+                    for operation, resource in sorted(grants)
+                ],
+            }
+        ) != subtree_digest:
+            return None
+        try:
+            witness = self._artifacts.read_json(policy_witness_digest)
+        except RuntimeGatewayError:
+            return None
+        witness_pairs = _policy_witness_pairs(witness, role, policy_witness_digest)
+        if witness_pairs is None:
+            return None
+        return _FrozenPermissionAuthorityV1(
+            plan_revision_digest=subject.plan_revision_digest,
+            ticket_key=subject.ticket_key,
+            purpose=subject.purpose,
+            authority_subtree_digest=subtree_digest,
+            policy_witness_digest=policy_witness_digest,
+            grant_pairs=grants,
+            witness_pairs=witness_pairs,
+        )
+
+
+def _authority_role_for_purpose(purpose: WorkRunPurpose) -> str:
+    if purpose.kind == "implementation":
+        return "worker"
+    if purpose.kind == "terminal_recovery_implementation":
+        return "recovery_worker"
+    return "review"
+
+
+def _authority_pairs(value: object) -> frozenset[tuple[str, str]] | None:
+    if type(value) is not list:
+        return None
+    pairs: list[tuple[str, str]] = []
+    for grant in value:
+        if (
+            type(grant) is not dict
+            or set(grant) != {"operation_id", "resource_id"}
+            or type(grant["operation_id"]) is not str
+            or not grant["operation_id"]
+            or type(grant["resource_id"]) is not str
+            or not grant["resource_id"]
+        ):
+            return None
+        pairs.append((grant["operation_id"], grant["resource_id"]))
+    frozen = frozenset(pairs)
+    return None if len(frozen) != len(pairs) else frozen
+
+
+def _policy_witness_pairs(
+    value: object,
+    role: str,
+    expected_digest: str,
+) -> frozenset[tuple[str, str]] | None:
+    """Validate the digest-addressed Policy Witness side independently."""
+
+    if (
+        type(value) is not dict
+        or set(value) != {
+            "schema_version",
+            "ref",
+            "authority_grants",
+            "allowed_capabilities",
+            "exclusive_resources",
+        }
+        or value.get("schema_version") != 1
+        or type(value.get("ref")) is not str
+        or not value["ref"]
+        or type(value.get("authority_grants")) is not dict
+        or set(value["authority_grants"]) != {
+            "campaign",
+            "worker",
+            "recovery_worker",
+            "review",
+        }
+        or digest_value(value) != expected_digest
+    ):
+        return None
+    return _authority_pairs(value["authority_grants"].get(role))
 
 
 @dataclass(frozen=True)
@@ -3318,6 +3628,7 @@ _RUNTIME_PROVIDER_FAILURE_CODES = frozenset(
         "RUNTIME_PREPARE_ACK_LOST",
         "RUNTIME_PROMPT_ARTIFACT_INVALID",
         "RUNTIME_PROVIDER_COMMAND_FAILED",
+        "RUNTIME_PROVIDER_UNAVAILABLE",
         "RUNTIME_PROVIDER_PROTOCOL_INVALID",
         "RUNTIME_RESULT_PROVENANCE_INVALID",
         "RUNTIME_SELECTOR_INVALID",
@@ -3361,6 +3672,7 @@ def _runtime_failure_is_structurally_valid(value: object) -> bool:
                 "detail",
                 "stable_action_id",
                 "authoritative_absence",
+                "observation_id",
             }
             or type(value.code) is not str
             or value.code not in _RUNTIME_PROVIDER_FAILURE_CODES
@@ -3375,6 +3687,13 @@ def _runtime_failure_is_structurally_valid(value: object) -> bool:
             )
             or type(value.authoritative_absence) is not bool
             or (
+                value.observation_id is not None
+                and (
+                    type(value.observation_id) is not str
+                    or not value.observation_id
+                )
+            )
+            or (
                 value.code in _RUNTIME_ACTION_BOUND_FAILURE_CODES
                 and value.stable_action_id is None
             )
@@ -3386,7 +3705,13 @@ def _runtime_failure_is_structurally_valid(value: object) -> bool:
                 and value.stable_action_id is not None
                 and value.authoritative_absence is True
             )
-        return value.authoritative_absence is False
+        return (
+            value.authoritative_absence is False
+            and (
+                value.code != "RUNTIME_PROVIDER_UNAVAILABLE"
+                or value.observation_id is not None
+            )
+        )
     except Exception:
         return False
 
@@ -7784,6 +8109,9 @@ class RuntimeProgressReceipt:
     wake_cursor: str | None = None
     wake_hints: tuple[str, ...] = ()
     output_artifact_digest: str | None = None
+    permission_required: PermissionRequired | None = None
+    recovery_outcome: RuntimeRecoveryOutcome | None = None
+    terminal_binding_evidence: TerminalBindingEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -7804,6 +8132,7 @@ class RuntimeGateway:
         _static_assignment_validator: Callable[[RuntimeSubject, RuntimeProfile], None]
         | None = None,
         _planning_effect_dispatch: _PlanningEffectDispatch | None = None,
+        _authority_readback: _AuthorityReadback | None = None,
     ):
         self._store_path = Path(store_path)
         self._journal = _V3JsonJournal(self._store_path)
@@ -7821,6 +8150,11 @@ class RuntimeGateway:
         )
         self._static_assignment_validator = _static_assignment_validator
         self._planning_effect_dispatch = _planning_effect_dispatch
+        self._authority_readback = (
+            _authority_readback
+            if _authority_readback is not None
+            else _ArtifactAuthorityReadback(self._artifacts)
+        )
         self._data = self._load()
 
     # Caller interface operation 1.  It neither calls an adapter nor reserves
@@ -8055,6 +8389,14 @@ class RuntimeGateway:
                 "prepare",
             )
             prepared_verdict = self._prepare_verdict(spec)
+            if prepared_verdict.failure is not None:
+                retry_with_fallback, recovery = self._recovery_for_failure(
+                    subject, record, prepared_verdict.failure
+                )
+                if retry_with_fallback:
+                    return self.progress(subject, preflight, wake_cursor)
+                if recovery is not None:
+                    return self._recovery_receipt(subject, recovery)
             if prepared_verdict.kind == "recoverable_failure":
                 assert prepared_verdict.failure is not None
                 prepare_failure = prepared_verdict.failure
@@ -8092,6 +8434,13 @@ class RuntimeGateway:
             "invalid",
         }:
             assert observation_verdict.failure is not None
+            retry_with_fallback, recovery = self._recovery_for_failure(
+                subject, record, observation_verdict.failure
+            )
+            if retry_with_fallback:
+                return self.progress(subject, preflight, wake_cursor)
+            if recovery is not None:
+                return self._recovery_receipt(subject, recovery)
             self._raise_failure(observation_verdict.failure)
         if observation_verdict.kind == "prepared":
             observation = observation_verdict.observation
@@ -8163,21 +8512,22 @@ class RuntimeGateway:
                 "Runtime observation verdict is outside the closed union",
             )
         if observation.lifecycle == "parked":
-            if observation.fenced is not False:
-                raise RuntimeGatewayError(
-                    "RUNTIME_COMMAND_INVALID",
-                    "progress cannot resume a fenced Runtime binding",
+            if type(subject) is CampaignPlanningSubject:
+                if observation.fenced is not False:
+                    raise RuntimeGatewayError(
+                        "RUNTIME_COMMAND_INVALID",
+                        "progress cannot resume a fenced Runtime binding",
+                    )
+                observation_verdict = self._planning_command_with_readback(
+                    subject,
+                    RuntimeCommand.RESUME,
+                    planning_mode=planning_mode,
                 )
-            observation_verdict = self._planning_command_with_readback(
-                subject,
-                RuntimeCommand.RESUME,
-                planning_mode=planning_mode,
-            )
-            assert observation_verdict.observation is not None
-            observation = observation_verdict.observation
-            self._validate_bound_observation(subject, record, observation)
-            self._record_observation(record, observation_verdict)
-        elif observation.lifecycle not in {"running", "completed"}:
+                assert observation_verdict.observation is not None
+                observation = observation_verdict.observation
+                self._validate_bound_observation(subject, record, observation)
+                self._record_observation(record, observation_verdict)
+        elif observation.lifecycle not in {"running", "parked", "completed"}:
             raise RuntimeGatewayError(
                 "RUNTIME_OBSERVATION_INVALID",
                 f"cannot progress Runtime lifecycle {observation.lifecycle}",
@@ -8188,6 +8538,35 @@ class RuntimeGateway:
                 observation_verdict,
                 command=None,
             )
+        if type(subject) is WorkRunSubject:
+            permission = self._auto_allowed_permission(subject, observation)
+            if permission is not None:
+                try:
+                    observation_verdict = self._command_with_readback(
+                        subject.stable_action_id,
+                        permission,
+                    )
+                except _RuntimeRecoverySignal as signal:
+                    return self._command_recovery_receipt(
+                        subject,
+                        record,
+                        signal.failure,
+                    )
+                assert observation_verdict.observation is not None
+                observation = observation_verdict.observation
+                self._validate_bound_observation(subject, record, observation)
+                self._record_observation(record, observation_verdict)
+                wake_hints, next_cursor = self._wake_hints(wake_cursor, subject)
+                return self._progress_receipt(
+                    subject,
+                    observation_verdict,
+                    command=permission,
+                    wake_cursor=next_cursor,
+                    wake_hints=wake_hints,
+                )
+            permission_required = self._permission_required(subject, observation)
+        else:
+            permission_required = None
         wake_hints, next_cursor = self._wake_hints(wake_cursor, subject)
         return self._progress_receipt(
             subject,
@@ -8195,6 +8574,7 @@ class RuntimeGateway:
             command=None,
             wake_cursor=next_cursor,
             wake_hints=wake_hints,
+            permission_required=permission_required,
         )
 
     def _planning_progress_mode(self, subject: CampaignPlanningSubject) -> str:
@@ -8439,7 +8819,11 @@ class RuntimeGateway:
                 in _RUNTIME_OBSERVATION_FAILURE_VERDICT_KINDS
             ):
                 assert observation_verdict.failure is not None
-                self._raise_failure(observation_verdict.failure)
+                return self._command_recovery_receipt(
+                    subject,
+                    record,
+                    observation_verdict.failure,
+                )
             if (
                 command is RuntimeCommand.START
                 and observation_verdict.kind != "prepared"
@@ -8478,11 +8862,18 @@ class RuntimeGateway:
                     observation_verdict,
                 )
             self._record_observation(record, observation_verdict)
-            progressed_verdict = self._planning_command_with_readback(
-                subject,
-                command,
-                planning_mode="cut_over" if planning_boundary is not None else None,
-            )
+            try:
+                progressed_verdict = self._planning_command_with_readback(
+                    subject,
+                    command,
+                    planning_mode="cut_over" if planning_boundary is not None else None,
+                )
+            except _RuntimeRecoverySignal as signal:
+                return self._command_recovery_receipt(
+                    subject,
+                    record,
+                    signal.failure,
+                )
             assert progressed_verdict.observation is not None
             progressed = progressed_verdict.observation
             self._validate_bound_observation(subject, record, progressed)
@@ -8498,7 +8889,11 @@ class RuntimeGateway:
             in _RUNTIME_OBSERVATION_FAILURE_VERDICT_KINDS
         ):
             assert observation_verdict.failure is not None
-            self._raise_failure(observation_verdict.failure)
+            return self._command_recovery_receipt(
+                subject,
+                record,
+                observation_verdict.failure,
+            )
         if observation_verdict.kind != "bound":
             raise RuntimeGatewayError(
                 "RUNTIME_COMMAND_INVALID",
@@ -8537,11 +8932,18 @@ class RuntimeGateway:
                     "RUNTIME_PERMISSION_REQUEST_UNKNOWN",
                     "permission response does not bind one exact pending request",
                 )
-        observation_verdict = self._planning_command_with_readback(
-            subject,
-            command,
-            planning_mode="cut_over" if planning_boundary is not None else None,
-        )
+        try:
+            observation_verdict = self._planning_command_with_readback(
+                subject,
+                command,
+                planning_mode="cut_over" if planning_boundary is not None else None,
+            )
+        except _RuntimeRecoverySignal as signal:
+            return self._command_recovery_receipt(
+                subject,
+                record,
+                signal.failure,
+            )
         assert observation_verdict.observation is not None
         observation = observation_verdict.observation
         self._validate_bound_observation(subject, record, observation)
@@ -8573,12 +8975,10 @@ class RuntimeGateway:
                 persisted = self._data["preflights"].get(subject.stable_action_id)
                 if (
                     type(persisted) is not dict
-                    or existing["assignment_digest"]
-                    != persisted.get("assignment_digest")
                 ):
                     raise RuntimeGatewayError(
                         "RUNTIME_STORE_INVALID",
-                        "planning action assignment is not cross-bound to preflight",
+                        "planning action lacks its exact frozen preflight",
                     )
             return existing
         if isinstance(subject, CampaignPlanningSubject):
@@ -8660,6 +9060,7 @@ class RuntimeGateway:
             "materialization_observed": False,
             "ever_bound": False,
             "last_observation": None,
+            "recovery": _initial_recovery_state(),
         }
         identity_fields = (
             "subject",
@@ -9171,6 +9572,406 @@ class RuntimeGateway:
                 "authoritative observation does not prove the complete Runtime binding",
             )
 
+    def _auto_allowed_permission(
+        self,
+        subject: WorkRunSubject,
+        observation: _BoundRuntimeObservation,
+    ) -> PermissionResponse | None:
+        """Return one exact auto-allow transition, or retain human attention.
+
+        #112 deliberately keeps this policy beside the provider boundary.  The
+        adapter normalizes a request, but it cannot infer semantic authority
+        from a vendor operation name.  The existing authority-subtree digest
+        names an immutable Authority Grant Artifact which, in turn, binds one
+        immutable Policy Witness Artifact.  Both must enumerate the same
+        exact operation/resource pair before the Gateway sends a response.
+        """
+
+        if observation.authority_subtree_digest != subject.authority_digest:
+            raise RuntimeGatewayError(
+                "RUNTIME_OBSERVATION_INVALID",
+                "permission observation changed its frozen authority subtree",
+            )
+        if not observation.permission_requests:
+            return None
+        authority = self._authority_readback.read(subject)
+        if authority is None:
+            return None
+        if type(authority) is not _FrozenPermissionAuthorityV1:
+            raise RuntimeGatewayError(
+                "RUNTIME_AUTHORITY_INVALID",
+                "authority readback returned an invalid frozen authority",
+            )
+        if (
+            authority.plan_revision_digest != subject.plan_revision_digest
+            or authority.ticket_key != subject.ticket_key
+            or authority.purpose != subject.purpose
+            or authority.authority_subtree_digest != subject.authority_digest
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_AUTHORITY_INVALID",
+                "authority readback does not bind the exact Work Run subject",
+            )
+        for request in observation.permission_requests:
+            if (
+                request.stable_action_id == subject.stable_action_id
+                and request.subject_digest == subject.digest
+                and request.binding_ref == observation.binding_ref
+                and request.authority_subtree_digest == subject.authority_digest
+                and (request.operation_id, request.resource_id) in authority.grant_pairs
+                and (request.operation_id, request.resource_id) in authority.witness_pairs
+            ):
+                return PermissionResponse(request.request_id, "allow")
+        return None
+
+    @staticmethod
+    def _permission_required(
+        subject: RuntimeSubject,
+        observation: _BoundRuntimeObservation,
+    ) -> PermissionRequired | None:
+        """Project one outstanding exact request without exposing a binding."""
+
+        if not observation.permission_requests:
+            return None
+        request = observation.permission_requests[0]
+        if (
+            request.stable_action_id != subject.stable_action_id
+            or request.subject_digest != subject.digest
+            or request.binding_ref != observation.binding_ref
+            or request.authority_subtree_digest != subject.authority_digest
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_OBSERVATION_INVALID",
+                "permission request does not bind the authoritative Runtime observation",
+            )
+        return PermissionRequired(
+            stable_action_id=request.stable_action_id,
+            request_id=request.request_id,
+            descriptor_digest=digest_value(asdict(request)),
+        )
+
+    def _recovery_for_failure(
+        self,
+        subject: RuntimeSubject,
+        record: dict[str, Any],
+        failure: _RuntimeFailure,
+    ) -> tuple[bool, RuntimeRecoveryOutcome | None]:
+        """Persist one classified Runtime failure without scheduling recovery.
+
+        The returned boolean means that a single pre-identity availability
+        fallback was durably selected.  ``progress`` then re-enters its normal
+        readback-first loop under that assignment; it never starts another
+        binding or changes an already materialized action.
+        """
+
+        if failure.code not in {
+            "RUNTIME_PROVIDER_UNAVAILABLE",
+            "RUNTIME_TRANSPORT_UNAVAILABLE",
+            "RUNTIME_CONFIGURATION_INVALID",
+        }:
+            return False, None
+        pre_identity = record.get("ever_bound") is False
+        if failure.code == "RUNTIME_CONFIGURATION_INVALID":
+            outcome = RuntimeRecoveryOutcome(
+                kind="blocked" if pre_identity else "decision",
+                reason=(
+                    "RuntimeConfigurationInvalid"
+                    if pre_identity
+                    else "RuntimeConfigurationRepairRequired"
+                ),
+                next_check_at=None,
+                observation_digest=self._recovery_observation_digest(record, failure),
+            )
+            self._persist_recovery_outcome(record, outcome, None)
+            return False, outcome
+        channel = (
+            "provider_unavailable"
+            if failure.code == "RUNTIME_PROVIDER_UNAVAILABLE"
+            else "transport_unavailable"
+        )
+        observation_digest = self._recovery_observation_digest(record, failure)
+        binding_ref = record.get("binding_ref") if not pre_identity else None
+        if binding_ref is not None and (type(binding_ref) is not str or not binding_ref):
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID",
+                "Runtime recovery record has an invalid binding reference",
+            )
+        count, duplicate = self._persist_recovery_observation(
+            record,
+            channel=channel,
+            observation_digest=observation_digest,
+            binding_ref=binding_ref,
+        )
+        if (
+            failure.code == "RUNTIME_PROVIDER_UNAVAILABLE"
+            and pre_identity
+            and not self._record_has_materialization_history(record)
+            and record.get("fallback_selected") is False
+            and record.get("availability_fallback_profile_digest") is not None
+        ):
+            self._select_pre_identity_fallback(record)
+            return True, None
+        if failure.code == "RUNTIME_PROVIDER_UNAVAILABLE":
+            if pre_identity:
+                outcome = RuntimeRecoveryOutcome(
+                    kind="wait" if count < 3 else "blocked",
+                    reason="RuntimeProviderUnavailable",
+                    next_check_at=(
+                        int(time.time()) + _RUNTIME_RECOVERY_RETRY_SECONDS
+                        if count < 3
+                        else None
+                    ),
+                    observation_digest=observation_digest,
+                )
+            else:
+                outcome = RuntimeRecoveryOutcome(
+                    kind="wait" if count < 3 else "decision",
+                    reason=(
+                        "RuntimeProviderUnavailable"
+                        if count < 3
+                        else "RuntimeProviderRecoveryRequired"
+                    ),
+                    next_check_at=(
+                        int(time.time()) + _RUNTIME_RECOVERY_RETRY_SECONDS
+                        if count < 3
+                        else None
+                    ),
+                    observation_digest=observation_digest,
+                )
+        else:
+            outcome = RuntimeRecoveryOutcome(
+                kind="wait" if count < 3 else ("blocked" if pre_identity else "decision"),
+                reason=(
+                    "RuntimeTransportUnavailable"
+                    if count < 3 or pre_identity
+                    else "RuntimeObservationUnavailable"
+                ),
+                next_check_at=(
+                    int(time.time()) + _RUNTIME_RECOVERY_RETRY_SECONDS
+                    if count < 3
+                    else None
+                ),
+                observation_digest=observation_digest,
+            )
+        if duplicate:
+            persisted = record["recovery"].get("last_outcome")
+            if type(persisted) is dict:
+                outcome = RuntimeRecoveryOutcome(**persisted)
+        self._persist_recovery_outcome(record, outcome, None)
+        return False, outcome
+
+    def _recovery_receipt(
+        self,
+        subject: RuntimeSubject,
+        outcome: RuntimeRecoveryOutcome,
+    ) -> RuntimeProgressReceipt:
+        """Return the persisted recovery fact without inventing provider state.
+
+        A caller receives only a typed next action and opaque observation
+        proof.  In particular, this operation neither reacquires a slot nor
+        selects a replacement binding; those decisions remain with #110.
+        """
+
+        self._refresh()
+        record = self._data["actions"].get(subject.stable_action_id)
+        if type(record) is not dict or record.get("subject_digest") != subject.digest:
+            raise RuntimeGatewayError(
+                "RUNTIME_ACTION_IDENTITY_MISMATCH",
+                "Runtime recovery receipt no longer binds the submitted subject",
+            )
+        persisted = record.get("recovery", {}).get("last_outcome")
+        if type(persisted) is not dict:
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID",
+                "Runtime recovery outcome was not durably persisted",
+            )
+        try:
+            durable_outcome = RuntimeRecoveryOutcome(**persisted)
+        except (TypeError, RuntimeGatewayError) as error:
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID",
+                "Runtime recovery outcome is malformed",
+            ) from error
+        if durable_outcome != outcome:
+            raise RuntimeGatewayError(
+                "RUNTIME_ACTION_STATE_CHANGED",
+                "Runtime recovery outcome changed before receipt emission",
+            )
+        payload = {
+            "kind": (
+                "runtime_planning_recovery_receipt.v1"
+                if type(subject) is CampaignPlanningSubject
+                else "runtime_work_run_recovery_receipt.v1"
+            ),
+            "subject_digest": subject.digest,
+            "stable_action_id": subject.stable_action_id,
+            "recovery_outcome": asdict(durable_outcome),
+        }
+        common = {
+            "subject_digest": subject.digest,
+            "stable_action_id": subject.stable_action_id,
+            "status": durable_outcome.kind,
+            "receipt_digest": digest_value(payload),
+            "recovery_outcome": durable_outcome,
+        }
+        if type(subject) is CampaignPlanningSubject:
+            return PlanningReceipt(
+                **common,
+                planning_output_artifact_digest=None,
+            )
+        return RuntimeProgressReceipt(**common)
+
+    def _command_recovery_receipt(
+        self,
+        subject: RuntimeSubject,
+        record: dict[str, Any],
+        failure: _RuntimeFailure,
+    ) -> RuntimeProgressReceipt:
+        """Classify a command-path failure without retrying or replacing it."""
+
+        retry_with_fallback, outcome = self._recovery_for_failure(
+            subject,
+            record,
+            failure,
+        )
+        if retry_with_fallback:
+            raise RuntimeGatewayError(
+                "RUNTIME_OBSERVATION_INVALID",
+                "a commanded Runtime binding cannot take a pre-identity fallback",
+            )
+        if outcome is not None:
+            return self._recovery_receipt(subject, outcome)
+        self._raise_failure(failure)
+        raise AssertionError("_raise_failure must not return")
+
+    @staticmethod
+    def _recovery_observation_digest(
+        record: Mapping[str, Any], failure: _RuntimeFailure
+    ) -> str:
+        return digest_value(
+            {
+                "failure_code": failure.code,
+                "stable_action_id": record.get("subject", {}).get("stable_action_id"),
+                "provider_observation_id": failure.observation_id,
+                "last_observation_digest": record.get("observation_digest"),
+            }
+        )
+
+    def _persist_recovery_observation(
+        self,
+        record: dict[str, Any],
+        *,
+        channel: str,
+        observation_digest: str,
+        binding_ref: str | None,
+    ) -> tuple[int, bool]:
+        stable_action_id = record["subject"]["stable_action_id"]
+        expected_subject = record["subject_digest"]
+        expected_recovery = deepcopy(record["recovery"])
+
+        def commit(data: dict[str, Any]) -> tuple[dict[str, Any], int, bool]:
+            current = data["actions"].get(stable_action_id)
+            if (
+                type(current) is not dict
+                or current.get("subject_digest") != expected_subject
+                or current.get("recovery") != expected_recovery
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_ACTION_STATE_CHANGED",
+                    "Runtime recovery state changed during observation persistence",
+                )
+            recovery = current["recovery"]
+            entries = recovery[channel]
+            duplicate = any(
+                entry["observation_digest"] == observation_digest for entry in entries
+            )
+            if not duplicate:
+                entries.append(
+                    {
+                        "observation_digest": observation_digest,
+                        "binding_ref": binding_ref,
+                    }
+                )
+            count = sum(
+                entry["binding_ref"] == binding_ref for entry in entries
+            )
+            return deepcopy(current), count, duplicate
+
+        updated, count, duplicate = self._transact(commit)
+        record.clear()
+        record.update(updated)
+        return count, duplicate
+
+    def _persist_recovery_outcome(
+        self,
+        record: dict[str, Any],
+        outcome: RuntimeRecoveryOutcome,
+        _unused: None,
+    ) -> None:
+        stable_action_id = record["subject"]["stable_action_id"]
+        expected_subject = record["subject_digest"]
+        expected_recovery = deepcopy(record["recovery"])
+
+        def commit(data: dict[str, Any]) -> dict[str, Any]:
+            current = data["actions"].get(stable_action_id)
+            if (
+                type(current) is not dict
+                or current.get("subject_digest") != expected_subject
+                or current.get("recovery") != expected_recovery
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_ACTION_STATE_CHANGED",
+                    "Runtime recovery outcome changed before persistence",
+                )
+            current["recovery"]["last_outcome"] = asdict(outcome)
+            return deepcopy(current)
+
+        updated = self._transact(commit)
+        record.clear()
+        record.update(updated)
+
+    def _select_pre_identity_fallback(self, record: dict[str, Any]) -> None:
+        fallback = record.get("availability_fallback_profile_digest")
+        if type(fallback) is not str or _DIGEST_RE.fullmatch(fallback) is None:
+            raise RuntimeGatewayError(
+                "RUNTIME_CONFIGURATION_INVALID",
+                "Runtime availability fallback is invalid",
+            )
+        stable_action_id = record["subject"]["stable_action_id"]
+        expected_subject = record["subject_digest"]
+        expected_profile = record["profile_digest"]
+        expected_recovery = deepcopy(record["recovery"])
+
+        def commit(data: dict[str, Any]) -> dict[str, Any]:
+            current = data["actions"].get(stable_action_id)
+            if (
+                type(current) is not dict
+                or current.get("subject_digest") != expected_subject
+                or current.get("profile_digest") != expected_profile
+                or current.get("recovery") != expected_recovery
+                or current.get("fallback_selected") is not False
+                or self._record_has_materialization_history(current)
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_ACTION_STATE_CHANGED",
+                    "Runtime availability fallback no longer binds an unmaterialized action",
+                )
+            current["profile_digest"] = fallback
+            current["fallback_selected"] = True
+            subject = _subject_from_canonical(current["subject"])
+            current["assignment_digest"] = _assignment_digest(
+                subject,
+                {
+                    key: current[key]
+                    for key in _ASSIGNMENT_RECORD_KEYS
+                },
+            )
+            return deepcopy(current)
+
+        updated = self._transact(commit)
+        record.clear()
+        record.update(updated)
+
     def _record_observation(
         self,
         record: dict[str, Any],
@@ -9259,7 +10060,7 @@ class RuntimeGateway:
             in _RUNTIME_OBSERVATION_FAILURE_VERDICT_KINDS
         ):
             assert verdict.failure is not None
-            self._raise_failure(verdict.failure)
+            self._raise_command_failure_or_signal(verdict.failure)
         if verdict.kind != "bound":
             raise RuntimeGatewayError(
                 "RUNTIME_OBSERVATION_INVALID",
@@ -9293,10 +10094,10 @@ class RuntimeGateway:
         )
         if verdict.kind == "invalid":
             assert verdict.failure is not None
-            self._raise_failure(verdict.failure)
+            self._raise_command_failure_or_signal(verdict.failure)
         if verdict.kind == "failure":
             assert verdict.failure is not None
-            self._raise_failure(verdict.failure)
+            self._raise_command_failure_or_signal(verdict.failure)
         if verdict.kind == "recoverable_failure":
             # A transport/ack ambiguity may follow a successful command.
             # Readback is authoritative; semantic/unknown failures never get
@@ -9307,7 +10108,7 @@ class RuntimeGateway:
                 in _RUNTIME_OBSERVATION_FAILURE_VERDICT_KINDS
             ):
                 assert observation_verdict.failure is not None
-                self._raise_failure(observation_verdict.failure)
+                self._raise_command_failure_or_signal(observation_verdict.failure)
             if observation_verdict.kind != "bound":
                 raise RuntimeGatewayError(
                     "RUNTIME_OBSERVATION_INVALID",
@@ -9326,6 +10127,16 @@ class RuntimeGateway:
         if _after_dispatch is not None:
             _after_dispatch()
         return observation_verdict
+
+    @staticmethod
+    def _raise_command_failure_or_signal(failure: _RuntimeFailure) -> None:
+        if failure.code in {
+            "RUNTIME_PROVIDER_UNAVAILABLE",
+            "RUNTIME_TRANSPORT_UNAVAILABLE",
+            "RUNTIME_CONFIGURATION_INVALID",
+        }:
+            raise _RuntimeRecoverySignal(failure)
+        RuntimeGateway._raise_failure(failure)
 
     def _validate_command_effect(
         self,
@@ -9373,6 +10184,7 @@ class RuntimeGateway:
         command: RuntimeTransition | None = None,
         wake_cursor: str | None = None,
         wake_hints: tuple[str, ...] = (),
+        permission_required: PermissionRequired | None = None,
     ) -> RuntimeProgressReceipt:
         # Receipt emission is an authoritative Gateway boundary.  Re-read the
         # complete durable state under the Journal lock so an earlier completed
@@ -9386,6 +10198,13 @@ class RuntimeGateway:
         observation = verdict.observation
         assert observation is not None
         kind = "planning" if isinstance(subject, CampaignPlanningSubject) else "work_run"
+        observation_snapshot = _json_projection(asdict(observation))
+        observation_digest = digest_value(observation_snapshot)
+        terminal_binding_evidence = self._terminal_binding_evidence(
+            subject,
+            observation,
+            observation_digest,
+        )
         payload = {
             "kind": f"runtime_{kind}_receipt.v1",
             "subject_digest": subject.digest,
@@ -9393,9 +10212,17 @@ class RuntimeGateway:
             "lifecycle": observation.lifecycle,
             "output_artifact_digest": observation.output_artifact_digest,
             "command": _transition_canonical(command),
-            "observation_digest": digest_value(
-                _json_projection(asdict(observation))
+            "permission_required": (
+                None
+                if permission_required is None
+                else asdict(permission_required)
             ),
+            "terminal_binding_evidence": (
+                None
+                if terminal_binding_evidence is None
+                else asdict(terminal_binding_evidence)
+            ),
+            "observation_digest": observation_digest,
         }
         if observation.lifecycle == "completed":
             output_digest = observation.output_artifact_digest
@@ -9420,6 +10247,8 @@ class RuntimeGateway:
                 wake_cursor=wake_cursor,
                 wake_hints=wake_hints,
                 output_artifact_digest=observation.output_artifact_digest,
+                permission_required=permission_required,
+                terminal_binding_evidence=terminal_binding_evidence,
                 planning_output_artifact_digest=observation.output_artifact_digest,
             )
         return RuntimeProgressReceipt(
@@ -9431,6 +10260,50 @@ class RuntimeGateway:
             wake_cursor=wake_cursor,
             wake_hints=wake_hints,
             output_artifact_digest=observation.output_artifact_digest,
+            permission_required=permission_required,
+            terminal_binding_evidence=terminal_binding_evidence,
+        )
+
+    @staticmethod
+    def _terminal_binding_evidence(
+        subject: RuntimeSubject,
+        observation: _BoundRuntimeObservation,
+        observation_digest: str,
+    ) -> TerminalBindingEvidence | None:
+        """Derive replacement precondition evidence from a terminal readback.
+
+        The Provider observation has already passed the exact subject, prompt,
+        authority, workspace, Agent/session, and binding validation on every
+        call path that can emit a receipt.  The returned digest freezes that
+        readback as the durable workspace checkpoint; no replacement is
+        selected or created here.
+        """
+
+        if (
+            type(subject) is not WorkRunSubject
+            or observation.lifecycle != "retired"
+            or observation.fenced is not True
+        ):
+            return None
+        evidence = {
+            "kind": "runtime_terminal_binding_evidence.v1",
+            "stable_action_id": subject.stable_action_id,
+            "subject_digest": subject.digest,
+            "plan_revision_digest": subject.plan_revision_digest,
+            "work_run_key": subject.work_run_key,
+            "authority_subtree_digest": subject.authority_digest,
+            "prompt_artifact_digest": observation.prompt_artifact_digest,
+            "binding_ref": observation.binding_ref,
+            "agent_id": observation.agent_id,
+            "session_id": observation.session_id,
+            "workspace_id": observation.workspace_id,
+            "fenced": observation.fenced,
+            "lifecycle": observation.lifecycle,
+            "workspace_checkpoint_digest": observation_digest,
+        }
+        return TerminalBindingEvidence(
+            stable_action_id=subject.stable_action_id,
+            evidence_digest=digest_value(evidence),
         )
 
     def _load(self) -> dict[str, Any]:
@@ -9443,13 +10316,13 @@ class RuntimeGateway:
         value = self._journal.read_unlocked()
         if value is None:
             return {
-                "schema_version": 2,
+                "schema_version": 3,
                 "campaigns": {},
                 "actions": {},
                 "preflights": {},
                 "action_identities": {},
             }
-        schema_v2_keys = frozenset(
+        schema_v3_keys = frozenset(
             {
                 "schema_version",
                 "campaigns",
@@ -9458,7 +10331,7 @@ class RuntimeGateway:
                 "action_identities",
             }
         )
-        schema_v1_keys = schema_v2_keys - {"action_identities"}
+        schema_v1_keys = schema_v3_keys - {"action_identities"}
         migrate_v1 = (
             type(value) is dict
             and frozenset(value) == schema_v1_keys
@@ -9468,16 +10341,25 @@ class RuntimeGateway:
                 for key in ("campaigns", "actions", "preflights")
             )
         )
-        valid_v2_shape = (
+        migrate_v2 = (
             type(value) is dict
-            and frozenset(value) == schema_v2_keys
+            and frozenset(value) == schema_v3_keys
             and value.get("schema_version") == 2
             and all(
                 type(value.get(key)) is dict
                 for key in ("campaigns", "actions", "preflights", "action_identities")
             )
         )
-        if not migrate_v1 and not valid_v2_shape:
+        valid_v3_shape = (
+            type(value) is dict
+            and frozenset(value) == schema_v3_keys
+            and value.get("schema_version") == 3
+            and all(
+                type(value.get(key)) is dict
+                for key in ("campaigns", "actions", "preflights", "action_identities")
+            )
+        )
+        if not migrate_v1 and not migrate_v2 and not valid_v3_shape:
             raise RuntimeGatewayError(
                 "RUNTIME_STORE_INVALID", "RuntimeGateway durable record has an unknown schema"
             )
@@ -9485,6 +10367,11 @@ class RuntimeGateway:
         if migrate_v1:
             normalized["schema_version"] = 2
             normalized["action_identities"] = {}
+        if migrate_v1 or migrate_v2:
+            for record in normalized["actions"].values():
+                if type(record) is dict and "recovery" not in record:
+                    record["recovery"] = _initial_recovery_state()
+            normalized["schema_version"] = 3
         rebuilt_identities: dict[str, dict[str, str]] = {}
 
         def rebuild_identity(
@@ -9776,15 +10663,26 @@ class RuntimeGateway:
                 else subject.ticket_key
             )
             try:
+                resolved_assignment = self._resolve_assignment(
+                    subject.repository,
+                    selector,
+                    ticket_key,
+                    campaign["overrides"],
+                )
                 expected_assignment = {
-                    **self._resolve_assignment(
-                        subject.repository,
-                        selector,
-                        ticket_key,
-                        campaign["overrides"],
-                    ),
-                    "fallback_selected": False,
+                    **resolved_assignment,
+                    "fallback_selected": assignment["fallback_selected"],
                 }
+                if assignment["fallback_selected"] is True:
+                    fallback = resolved_assignment[
+                        "availability_fallback_profile_digest"
+                    ]
+                    if fallback is None:
+                        raise RuntimeGatewayError(
+                            "RUNTIME_STORE_INVALID",
+                            "Runtime assignment selected an unavailable fallback",
+                        )
+                    expected_assignment["profile_digest"] = fallback
             except RuntimeGatewayError as error:
                 raise RuntimeGatewayError(
                     "RUNTIME_STORE_INVALID",
@@ -9803,8 +10701,6 @@ class RuntimeGateway:
                     owning_preflight_subject is None
                     or owning_preflight_subject.canonical()
                     != record["subject"]
-                    or normalized["preflights"][stable_action_id]["assignment_digest"]
-                    != record["assignment_digest"]
                 ):
                     raise RuntimeGatewayError(
                         "RUNTIME_STORE_INVALID",
@@ -9818,6 +10714,7 @@ class RuntimeGateway:
         persisted_identities = normalized.get("action_identities")
         if (
             not migrate_v1
+            and not migrate_v2
             and persisted_identities != rebuilt_identities
         ):
             raise RuntimeGatewayError(
@@ -9825,7 +10722,7 @@ class RuntimeGateway:
                 "RuntimeGateway stable-action identity registry does not match durable subjects",
             )
         normalized["action_identities"] = rebuilt_identities
-        if migrate_v1:
+        if migrate_v1 or migrate_v2:
             # The caller holds the journal lock.  Publish only after every
             # legacy Campaign, preflight, action, and rebuilt identity has
             # passed the v2 validator; conflicts leave the v1 bytes intact.
@@ -9974,8 +10871,75 @@ _GATEWAY_ACTION_KEYS = frozenset(
         "materialization_observed",
         "ever_bound",
         "last_observation",
+        "recovery",
     }
 )
+
+
+def _initial_recovery_state() -> dict[str, Any]:
+    return {
+        "provider_unavailable": [],
+        "transport_unavailable": [],
+        "last_outcome": None,
+    }
+
+
+def _recovery_state_is_valid(value: object) -> bool:
+    if type(value) is not dict or set(value) != {
+        "provider_unavailable",
+        "transport_unavailable",
+        "last_outcome",
+    }:
+        return False
+    seen: set[str] = set()
+    for field_name in ("provider_unavailable", "transport_unavailable"):
+        entries = value[field_name]
+        if type(entries) is not list:
+            return False
+        for entry in entries:
+            if (
+                type(entry) is not dict
+                or set(entry) != {"observation_digest", "binding_ref"}
+                or type(entry["observation_digest"]) is not str
+                or _DIGEST_RE.fullmatch(entry["observation_digest"]) is None
+                or (
+                    entry["binding_ref"] is not None
+                    and (
+                        type(entry["binding_ref"]) is not str
+                        or not entry["binding_ref"]
+                    )
+                )
+                or entry["observation_digest"] in seen
+            ):
+                return False
+            seen.add(entry["observation_digest"])
+    outcome = value["last_outcome"]
+    if outcome is None:
+        return True
+    if type(outcome) is not dict or set(outcome) != {
+        "kind",
+        "reason",
+        "next_check_at",
+        "observation_digest",
+    }:
+        return False
+    try:
+        typed_outcome = RuntimeRecoveryOutcome(**outcome)
+    except (TypeError, RuntimeGatewayError):
+        return False
+    channel_by_reason = {
+        "RuntimeProviderUnavailable": "provider_unavailable",
+        "RuntimeProviderRecoveryRequired": "provider_unavailable",
+        "RuntimeTransportUnavailable": "transport_unavailable",
+        "RuntimeObservationUnavailable": "transport_unavailable",
+    }
+    channel = channel_by_reason.get(typed_outcome.reason)
+    if channel is not None and not any(
+        entry["observation_digest"] == typed_outcome.observation_digest
+        for entry in value[channel]
+    ):
+        return False
+    return True
 
 
 def _gateway_action_recovery_state_is_valid(
@@ -9997,7 +10961,14 @@ def _gateway_action_recovery_state_is_valid(
             or prompt_digest != expected_prompt_digest
             or type(record.get("materialization_observed")) is not bool
             or type(record.get("ever_bound")) is not bool
-            or record.get("fallback_selected") is not False
+            or type(record.get("fallback_selected")) is not bool
+            or not _recovery_state_is_valid(record.get("recovery"))
+        ):
+            return False
+        if record["fallback_selected"] is True and (
+            record.get("availability_fallback_profile_digest") is None
+            or record.get("profile_digest")
+            != record.get("availability_fallback_profile_digest")
         ):
             return False
 
