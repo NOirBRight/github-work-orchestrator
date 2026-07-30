@@ -202,9 +202,9 @@ before historical tracker cleanup:
 | Ticket | Published contract | Blocked by |
 | --- | --- | --- |
 | #108 | Land the accepted execution contract | none |
-| #109 | Start one immutable PlanSpec v3 Campaign | #108 |
+| #109 | Start one immutable PlanSpec v3 Campaign | #111 |
 | #110 | Advance four Work Runs without Coordinator continuation | #109 |
-| #111 | Route semantic roles through one RuntimeGateway | #109 |
+| #111 | Route semantic roles through one RuntimeGateway | #108 |
 | #112 | Bound permission waits and terminal Runtime recovery | #111 |
 | #113 | Resume Campaigns without LLM polling | #110, #112 |
 | #114 | Accept standard Candidates through one CandidateGate | #110, #111 |

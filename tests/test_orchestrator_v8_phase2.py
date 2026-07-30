@@ -1711,6 +1711,36 @@ def test_goal_driver_production_paseo_coordinator_reads_back_auto_profile(
     assert agents[0].model == "kimi-code/k3"
 
 
+def test_goal_driver_accepts_equal_plain_dict_feature_readback(tmp_path):
+    repository = _temporary_repository(tmp_path)
+    profile = replace(
+        _coordinator_profile(),
+        features={
+            "plan_mode": False,
+            "nested": {"levels": [1, 2]},
+        },
+    )
+    client = InMemoryPaseoClient()
+    driver = GoalDriver(
+        store_path=tmp_path / "driver.sqlite3",
+        reconciler=_SequenceReconciler([_reconcile_outcome()]),
+        coordinators=PaseoCoordinatorRuntime(
+            client,
+            repository_path=repository,
+            base_sha=_git(repository, "rev-parse", "HEAD"),
+        ),
+        auto_profile=profile,
+        durable=InMemoryDurableGoalControl(),
+    )
+
+    directive = driver.run_once(_goal_snapshot())
+
+    assert directive.kind == "continue_coordinator"
+    assert client.find_by_labels({"gwo.goal": "goal:phase-two"})[
+        0
+    ].features == profile.canonical()["features"]
+
+
 def test_goal_driver_recovers_paseo_outcome_by_deterministic_readback(tmp_path):
     repository = _temporary_repository(tmp_path)
     client = InMemoryPaseoClient()

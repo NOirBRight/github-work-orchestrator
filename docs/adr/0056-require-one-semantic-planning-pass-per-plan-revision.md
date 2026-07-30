@@ -6,7 +6,7 @@ amends: ADR-0029, ADR-0045, ADR-0050, ADR-0055
 
 # Require one semantic planning pass per Plan Revision
 
-PlanControl uses a hybrid boundary. It automates source readback, structural
+Successor PlanSpec v3 PlanControl uses a hybrid boundary. It automates source readback, structural
 validation, deterministic compilation, publication, activation, and durable
 readback, but it does not compile a selected Ticket set without semantic
 inspection.
@@ -18,6 +18,17 @@ blockers, Campaign source, and repository policy. It rejects mechanically
 invalid input before spending an LLM turn. The Coordinator then inspects the
 whole snapshot in one pass, not one Ticket at a time, using the Campaign's
 fixed Coordinator semantic-control capacity.
+
+Before requesting that pass, PlanControl forms the closed pre-Plan
+`CampaignPlanningSubject`: repository, Campaign key and handle, expected prior
+Plan Revision digest or `null`, immutable snapshot Artifact digest, Policy
+Witness digest, planning protocol/request Artifact digest, and stable action.
+It consumes RuntimeGateway's mechanically read-only configuration-preflight
+receipt for that exact subject before acquiring a Ticket claim or requesting
+semantic action. This preflight creates no Agent, session, workspace, provider
+action, claim, or capacity reservation. A missing or invalid Coordinator
+mapping therefore fails before planning rather than being repaired after an
+identity may exist.
 
 The Planning Pass emits one typed, non-authoritative output private to
 PlanControl containing
@@ -47,6 +58,31 @@ Review, bounded repair, Batch formation, local checks, hosted CI, integration,
 and cleanup are deterministic Kernel lifecycle. The Coordinator is invoked
 again only for an explicit semantic exception or to produce the one Planning
 Pass for a replacement Plan Revision. It does not supervise normal progress.
+
+RuntimeGateway executes and recovers that single pass from the immutable
+Artifact-backed planning protocol/request. Its planning receipt remains bound
+to the exact `CampaignPlanningSubject` and stable action. Post-identity
+ambiguity reads back that same action and output; it cannot authorize a second
+Planning Pass. PlanControl sees only the opaque preflight and planning
+receipts, never a provider, CLI, Profile, session, or Runtime Binding.
+
+The preflight is exclusive to `CampaignPlanningSubject`. It is a durable
+compare-and-set binding of that exact subject, Campaign-start overrides, and
+resolved Coordinator configuration; retrying it with changed input, options,
+or configuration under the same stable action fails closed. A Work Run cannot
+enter this pre-Plan operation. Progress reads the complete planning
+protocol/request from the bounded Gateway Artifact Store and validates the
+completed output's exact subject, stable action, authority, and payload
+binding before it returns the opaque receipt.
+
+The semantic method is exactly `planning_preflight(subject)`. Host composition
+supplies an optional Campaign-start assertion in `RuntimeConfiguration`, keyed
+by the exact `(repository, campaign_key, campaign_handle)`; that assertion is
+not a semantic call argument or package-level workflow type. On first use,
+absence means persist the canonical empty override set. For an already bound
+Campaign, absence means reuse the durable binding, while a present assertion
+must equal it exactly. Concurrent first callers are resolved by one durable
+compare-and-set; a loser with different asserted configuration fails closed.
 
 This replaces the earlier zero-Coordinator initial path with a bounded cost:
 one semantic planning turn for the complete Campaign revision, independent of
