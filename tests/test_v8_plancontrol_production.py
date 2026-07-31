@@ -3642,12 +3642,20 @@ def test_r9_restart_after_provider_dispatch_before_resolution_recovers_once(
     assert adapter.prepare_calls == [subject.stable_action_id]
 
 
-@pytest.mark.parametrize("writer_status", ("cut_over", "draining"))
-def test_r10_planning_transition_start_is_rejected_before_adapter_effect(
+@pytest.mark.parametrize(
+    ("writer_status", "expected_status", "expected_error"),
+    (
+        ("cut_over", "completed", None),
+        ("draining", None, "RUNTIME_RECOVERY_ONLY"),
+    ),
+)
+def test_r12_planning_transition_start_obeys_the_writer_fence(
     writer_status,
+    expected_status,
+    expected_error,
     tmp_path,
 ):
-    """Planning START belongs exclusively to progress(), in either Writer mode."""
+    """Planning START keeps #111 behavior only while Writer is cut over."""
 
     from gwo_v8.plan_control_github import GitHubPlanRepository
     from gwo_v8.runtime_gateway import RuntimeCommand, RuntimeGatewayError
@@ -3666,38 +3674,38 @@ def test_r10_planning_transition_start_is_rejected_before_adapter_effect(
     )
     if writer_status == "draining":
         client.advance_writer("writer:one", status="draining")
-    before = (
-        adapter.created_agent_count,
-        tuple(adapter.command_calls),
-    )
+    before = (adapter.created_agent_count, tuple(adapter.command_calls))
 
-    with pytest.raises(RuntimeGatewayError) as rejected:
-        gateway.transition(subject.stable_action_id, RuntimeCommand.START)
+    if expected_error is None:
+        assert gateway.transition(subject.stable_action_id, RuntimeCommand.START).status == expected_status
+        assert adapter.created_agent_count == before[0] + 1
+    else:
+        with pytest.raises(RuntimeGatewayError) as rejected:
+            gateway.transition(subject.stable_action_id, RuntimeCommand.START)
+        assert rejected.value.code == expected_error
+        assert (adapter.created_agent_count, tuple(adapter.command_calls)) == before
 
-    assert rejected.value.code == "RUNTIME_PLANNING_TRANSITION_FORBIDDEN"
-    assert (adapter.created_agent_count, tuple(adapter.command_calls)) == before
 
-
-@pytest.mark.parametrize("writer_status", ("cut_over", "draining"))
 @pytest.mark.parametrize(
-    ("state", "command"),
+    ("boundary", "initial_state", "command", "expected_status"),
     (
-        ("prepared", "START"),
-        ("running", "PARK"),
-        ("parked", "RESUME"),
-        ("completed", "PARK"),
+        ("start", "prepared", "start", "completed"),
+        ("resume", "parked", "resume", "running"),
+        ("permission_allow", "running", "permission_allow", "running"),
     ),
 )
-def test_r10_planning_transition_matrix_never_dispatches(
-    writer_status,
-    state,
+def test_r12_cut_over_transition_effects_block_writer_drain_until_dispatch(
+    boundary,
+    initial_state,
     command,
+    expected_status,
     tmp_path,
 ):
-    """Every observed Planning state rejects the caller command surface."""
+    """Every legal Planning transition effect shares the real Writer CAS fence."""
 
     from gwo_v8.plan_control_github import GitHubPlanRepository
-    from gwo_v8.runtime_gateway import RuntimeCommand, RuntimeGatewayError
+    from gwo_v8.runtime_gateway import PermissionResponse, RuntimeCommand
+    from gwo_v8.transition import GitHubWriterTransitionControl, WriterTransitionBlocked
 
     client = _RefContentClient()
     repository = GitHubPlanRepository(
@@ -3711,26 +3719,48 @@ def test_r10_planning_transition_matrix_never_dispatches(
         repository,
         "prepared",
     )
-    if state in {"running", "parked"}:
+    if initial_state == "parked":
         adapter._complete_action = lambda _action: None  # type: ignore[method-assign]
         assert gateway.progress(subject, preflight).status == "running"
-        if state == "parked":
-            adapter.observe(subject.stable_action_id)
-            adapter.command(subject.stable_action_id, RuntimeCommand.PARK)
-    elif state == "completed":
-        assert gateway.progress(subject, preflight).status == "completed"
-    if writer_status == "draining":
-        client.advance_writer("writer:one", status="draining")
-    before = (
-        adapter.created_agent_count,
-        tuple(adapter.command_calls),
+        assert gateway.transition(subject.stable_action_id, RuntimeCommand.PARK).status == "parked"
+    elif initial_state == "running":
+        adapter._complete_action = lambda _action: None  # type: ignore[method-assign]
+        adapter._actions[subject.stable_action_id].pending_permissions = [
+            ("request:r12", "write", "repository")
+        ]
+        assert gateway.progress(subject, preflight).status == "running"
+
+    transition = (
+        getattr(RuntimeCommand, command.upper())
+        if command != "permission_allow"
+        else PermissionResponse("request:r12", "allow")
     )
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    drain_blockers = []
 
-    with pytest.raises(RuntimeGatewayError) as rejected:
-        gateway.transition(subject.stable_action_id, getattr(RuntimeCommand, command))
+    def attempt_drain():
+        with pytest.raises(WriterTransitionBlocked) as blocked:
+            transitions.publish(_r10_drain_record(f"r12 {boundary} race"))
+        drain_blockers.append(blocked.value.code)
 
-    assert rejected.value.code == "RUNTIME_PLANNING_TRANSITION_FORBIDDEN"
-    assert (adapter.created_agent_count, tuple(adapter.command_calls)) == before
+    native_command = adapter.command
+
+    def command_after_active(stable_action_id, observed_transition):
+        if observed_transition == transition:
+            attempt_drain()
+        return native_command(stable_action_id, observed_transition)
+
+    adapter.command = command_after_active  # type: ignore[method-assign]
+    receipt = gateway.transition(subject.stable_action_id, transition)
+
+    assert receipt.status == expected_status
+    assert drain_blockers == ["WRITER_DRAIN_DISPATCH_ACTIVE"]
+    transitions.publish(_r10_drain_record(f"r12 {boundary} drain"))
+    assert repository.planning_progress_mode(subject) == "draining"
 
 
 @pytest.mark.parametrize(

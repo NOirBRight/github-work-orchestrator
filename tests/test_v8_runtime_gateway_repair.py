@@ -738,6 +738,160 @@ def test_in_memory_conforms_for_permission_and_each_closed_transition(tmp_path):
     assert gateway.transition(subject.stable_action_id, RuntimeCommand.RETIRE).status == "retired"
 
 
+@pytest.mark.parametrize(
+    (
+        "subject_kind",
+        "writer_mode",
+        "lifecycle",
+        "command",
+        "expected_status",
+        "expected_error",
+        "expected_dispatch_boundary",
+    ),
+    (
+        # Planning cut-over admits the #111 transition contract.  Only actions
+        # that can begin or resume semantic Planning work enter the Writer
+        # dispatch protocol; quiescing controls do not.
+        ("planning", "cut_over", "prepared", RuntimeCommand.START, "completed", None, "start"),
+        ("planning", "cut_over", "parked", RuntimeCommand.RESUME, "running", None, "resume"),
+        ("planning", "cut_over", "running", RuntimeCommand.PARK, "parked", None, None),
+        ("planning", "cut_over", "running", RuntimeCommand.INTERRUPT, "parked", None, None),
+        ("planning", "cut_over", "running", RuntimeCommand.FENCE, "running", None, None),
+        ("planning", "cut_over", "running", RuntimeCommand.RETIRE, "retired", None, None),
+        ("planning", "cut_over", "running", PermissionResponse("request:matrix", "allow"), "running", None, "permission_allow"),
+        ("planning", "cut_over", "running", PermissionResponse("request:matrix", "deny"), "running", None, None),
+        # Draining rejects only transitions that can authorize new Planning
+        # work.  It retains the closed quiescing and deny-control contract.
+        ("planning", "draining", "prepared", RuntimeCommand.START, None, "RUNTIME_RECOVERY_ONLY", None),
+        ("planning", "draining", "parked", RuntimeCommand.RESUME, None, "RUNTIME_RECOVERY_ONLY", None),
+        ("planning", "draining", "running", RuntimeCommand.PARK, "parked", None, None),
+        ("planning", "draining", "running", RuntimeCommand.INTERRUPT, "parked", None, None),
+        ("planning", "draining", "running", RuntimeCommand.FENCE, "running", None, None),
+        ("planning", "draining", "running", RuntimeCommand.RETIRE, "retired", None, None),
+        ("planning", "draining", "running", PermissionResponse("request:matrix", "allow"), None, "RUNTIME_RECOVERY_ONLY", None),
+        ("planning", "draining", "running", PermissionResponse("request:matrix", "deny"), "running", None, None),
+        # Writer mode is not a Work Run concern; every closed transition keeps
+        # its established #111 behavior through the same Gateway surface.
+        ("work", None, "prepared", RuntimeCommand.START, "completed", None, None),
+        ("work", None, "parked", RuntimeCommand.RESUME, "running", None, None),
+        ("work", None, "running", RuntimeCommand.PARK, "parked", None, None),
+        ("work", None, "running", RuntimeCommand.INTERRUPT, "parked", None, None),
+        ("work", None, "running", RuntimeCommand.FENCE, "running", None, None),
+        ("work", None, "running", RuntimeCommand.RETIRE, "retired", None, None),
+        ("work", None, "running", PermissionResponse("request:matrix", "allow"), "running", None, None),
+        ("work", None, "running", PermissionResponse("request:matrix", "deny"), "running", None, None),
+    ),
+)
+def test_r12_transition_contract_matrix_preserves_controls_and_writer_fences(
+    tmp_path,
+    subject_kind,
+    writer_mode,
+    lifecycle,
+    command,
+    expected_status,
+    expected_error,
+    expected_dispatch_boundary,
+):
+    """The two subject kinds share #111 transitions without Planning bypasses."""
+
+    class PlanningDispatch:
+        def __init__(self, mode):
+            self.mode_value = mode
+            self.boundaries = []
+
+        def mode(self, _subject):
+            return self.mode_value
+
+        def enter(self, _subject, boundary):
+            self.boundaries.append(boundary)
+            return f"matrix:{boundary}"
+
+        def resolve(self, _subject, _boundary, _ticket):
+            return None
+
+        def reconcile(self, _subject, _observation_kind):
+            return None
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    profile = _profile()
+    dispatch = PlanningDispatch("cut_over") if subject_kind == "planning" else None
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=(adapter := _InMemoryRuntimeProviderAdapter(store)),
+        configuration=RuntimeConfiguration(
+            profiles={profile.digest: profile},
+            host_mappings={
+                "coordinator": ProfileMapping(profile.digest),
+                "worker": ProfileMapping(profile.digest),
+            },
+        ),
+        _artifacts=store,
+        _planning_effect_dispatch=dispatch,
+    )
+    planning_subject = _put_subject_artifacts(store, _subject())
+    subject = (
+        planning_subject
+        if subject_kind == "planning"
+        else _put_work_subject_artifacts(
+            store,
+            planning_subject,
+            stable_action_id="work:transition-matrix",
+        )
+    )
+    planning_preflight = gateway.planning_preflight(planning_subject)
+    preflight = planning_preflight if subject_kind == "planning" else None
+    if lifecycle == "prepared":
+        record = gateway._assignment_for_progress(
+            subject,
+            (
+                gateway._data["preflights"][subject.stable_action_id]
+                if subject_kind == "planning"
+                else None
+            ),
+        )
+        prompt, inputs = gateway._resolve_input_artifacts(subject)
+        prepared = adapter.prepare(
+            _RuntimeActionSpec(
+                subject.stable_action_id,
+                subject,
+                gateway._profile(record["profile_digest"]),
+                prompt,
+                inputs,
+            )
+        )
+        assert not isinstance(prepared, _RuntimeFailure)
+    else:
+        if lifecycle != "completed":
+            adapter._complete_action = lambda _action: None  # type: ignore[method-assign]
+        if type(command) is PermissionResponse:
+            adapter._pending_permissions[subject.stable_action_id] = [
+                (command.request_id, "write", "repository")
+            ]
+        assert gateway.progress(subject, preflight).status == (
+            "completed" if lifecycle == "completed" else "running"
+        )
+        if lifecycle == "parked":
+            gateway.transition(subject.stable_action_id, RuntimeCommand.PARK)
+
+    if dispatch is not None:
+        dispatch.mode_value = writer_mode
+        dispatch.boundaries.clear()
+    before = tuple(adapter.command_calls)
+    if expected_error is None:
+        receipt = gateway.transition(subject.stable_action_id, command)
+        assert receipt.status == expected_status
+        assert receipt.command == command
+    else:
+        with pytest.raises(RuntimeGatewayError) as rejected:
+            gateway.transition(subject.stable_action_id, command)
+        assert rejected.value.code == expected_error
+        assert tuple(adapter.command_calls) == before
+    if dispatch is not None:
+        assert dispatch.boundaries == (
+            [] if expected_dispatch_boundary is None else [expected_dispatch_boundary]
+        )
+
+
 class _RecordingPaseoCli:
     def __init__(
         self,

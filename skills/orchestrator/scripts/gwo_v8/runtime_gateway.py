@@ -2049,6 +2049,20 @@ class PermissionResponse:
 RuntimeTransition = RuntimeCommand | PermissionResponse
 
 
+def _planning_transition_effect_boundary(
+    command: RuntimeTransition,
+) -> str | None:
+    """Name only Planning transitions that can authorize semantic work."""
+
+    if command is RuntimeCommand.START:
+        return "start"
+    if command is RuntimeCommand.RESUME:
+        return "resume"
+    if type(command) is PermissionResponse and command.decision == "allow":
+        return "permission_allow"
+    return None
+
+
 def _runtime_transition_is_structurally_valid(value: object) -> bool:
     """Validate one exact closed transition without invoking foreign code."""
 
@@ -8101,18 +8115,10 @@ class RuntimeGateway:
                     "start requires an unfenced Prepared Runtime observation",
             )
             self._record_observation(record, observation_verdict)
-            dispatch_ticket = self._enter_planning_effect_dispatch(
+            observation_verdict = self._planning_command_with_readback(
                 subject,
-                "start",
-            )
-            observation_verdict = self._command_with_readback(
-                subject.stable_action_id,
                 RuntimeCommand.START,
-                _after_dispatch=lambda: self._resolve_planning_effect_dispatch(
-                    subject,
-                    "start",
-                    dispatch_ticket
-                ),
+                planning_mode=planning_mode,
             )
             assert observation_verdict.observation is not None
             observation = observation_verdict.observation
@@ -8147,9 +8153,10 @@ class RuntimeGateway:
                     "RUNTIME_COMMAND_INVALID",
                     "progress cannot resume a fenced Runtime binding",
                 )
-            observation_verdict = self._command_with_readback(
-                subject.stable_action_id,
+            observation_verdict = self._planning_command_with_readback(
+                subject,
                 RuntimeCommand.RESUME,
+                planning_mode=planning_mode,
             )
             assert observation_verdict.observation is not None
             observation = observation_verdict.observation
@@ -8204,7 +8211,12 @@ class RuntimeGateway:
     ) -> str | None:
         """Enter a Writer-blocking durable state immediately before I/O."""
 
-        if type(boundary) is not str or boundary not in {"prepare", "start"}:
+        if type(boundary) is not str or boundary not in {
+            "prepare",
+            "start",
+            "resume",
+            "permission_allow",
+        }:
             raise RuntimeGatewayError(
                 "RUNTIME_RECOVERY_ONLY",
                 "Planning provider-effect boundary is outside the closed dispatch union",
@@ -8280,6 +8292,41 @@ class RuntimeGateway:
                 "Planning provider-effect dispatch could not reconcile its durable state",
             ) from error
 
+    def _planning_command_with_readback(
+        self,
+        subject: RuntimeSubject,
+        command: RuntimeTransition,
+        *,
+        planning_mode: str | None = None,
+    ) -> _RuntimeObservationVerdict:
+        """Fence only Planning transitions that can begin semantic work."""
+
+        if type(subject) is not CampaignPlanningSubject:
+            return self._command_with_readback(subject.stable_action_id, command)
+        boundary = _planning_transition_effect_boundary(command)
+        if boundary is None:
+            return self._command_with_readback(subject.stable_action_id, command)
+        mode = (
+            self._planning_progress_mode(subject)
+            if planning_mode is None
+            else planning_mode
+        )
+        if mode != "cut_over":
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_ONLY",
+                "Draining Writer authority cannot authorize new Planning semantic work",
+            )
+        ticket = self._enter_planning_effect_dispatch(subject, boundary)
+        return self._command_with_readback(
+            subject.stable_action_id,
+            command,
+            _after_dispatch=lambda: self._resolve_planning_effect_dispatch(
+                subject,
+                boundary,
+                ticket,
+            ),
+        )
+
     # Caller interface operation 3.  Binding refs remain private, including
     # for start/resume: they re-enter the same observe-gated progression path.
     def transition(
@@ -8299,10 +8346,18 @@ class RuntimeGateway:
         if not isinstance(record, dict):
             raise RuntimeGatewayError("RUNTIME_ACTION_UNKNOWN", "stable action is unknown")
         subject = _subject_from_canonical(record.get("subject"))
-        if type(subject) is CampaignPlanningSubject:
+        planning_boundary = (
+            _planning_transition_effect_boundary(command)
+            if type(subject) is CampaignPlanningSubject
+            else None
+        )
+        if (
+            planning_boundary is not None
+            and self._planning_progress_mode(subject) != "cut_over"
+        ):
             raise RuntimeGatewayError(
-                "RUNTIME_PLANNING_TRANSITION_FORBIDDEN",
-                "Campaign Planning semantic choreography belongs exclusively to progress",
+                "RUNTIME_RECOVERY_ONLY",
+                "Draining Writer authority cannot authorize new Planning semantic work",
             )
         self._validate_static_assignment(subject, record)
         if command in {RuntimeCommand.START, RuntimeCommand.RESUME}:
@@ -8313,6 +8368,11 @@ class RuntimeGateway:
             ):
                 assert observation_verdict.failure is not None
                 self._raise_failure(observation_verdict.failure)
+            if type(subject) is CampaignPlanningSubject:
+                self._reconcile_planning_effect_dispatch(
+                    subject,
+                    observation_verdict.kind,
+                )
             if (
                 command is RuntimeCommand.START
                 and observation_verdict.kind != "prepared"
@@ -8346,9 +8406,10 @@ class RuntimeGateway:
             else:
                 self._validate_bound_observation(subject, record, observed)
             self._record_observation(record, observation_verdict)
-            progressed_verdict = self._command_with_readback(
-                stable_action_id,
+            progressed_verdict = self._planning_command_with_readback(
+                subject,
                 command,
+                planning_mode="cut_over" if planning_boundary is not None else None,
             )
             assert progressed_verdict.observation is not None
             progressed = progressed_verdict.observation
@@ -8374,6 +8435,8 @@ class RuntimeGateway:
         observation = observation_verdict.observation
         assert observation is not None
         self._validate_bound_observation(subject, record, observation)
+        if type(subject) is CampaignPlanningSubject:
+            self._reconcile_planning_effect_dispatch(subject, observation_verdict.kind)
         if type(command) is PermissionResponse:
             if observation.lifecycle in {"completed", "retired"}:
                 if _completed_permission_effect_matches(command, observation):
@@ -8402,9 +8465,10 @@ class RuntimeGateway:
                     "RUNTIME_PERMISSION_REQUEST_UNKNOWN",
                     "permission response does not bind one exact pending request",
                 )
-        observation_verdict = self._command_with_readback(
-            stable_action_id,
+        observation_verdict = self._planning_command_with_readback(
+            subject,
             command,
+            planning_mode="cut_over" if planning_boundary is not None else None,
         )
         assert observation_verdict.observation is not None
         observation = observation_verdict.observation

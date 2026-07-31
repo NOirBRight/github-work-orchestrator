@@ -61,6 +61,9 @@ _PLANNING_EFFECT_DISPATCH_MAX_ENTRIES = 16
 _PLANNING_EFFECT_DISPATCH_MAX_ACTIVE_ENTRIES = 8
 _PLANNING_EFFECT_DISPATCH_MAX_TEXT_BYTES = 256
 _PLANNING_EFFECT_DISPATCH_MAX_ATTEMPT = 16
+_PLANNING_EFFECT_DISPATCH_BOUNDARIES = frozenset(
+    {"prepare", "start", "resume", "permission_allow"}
+)
 _PLANNING_EFFECT_DISPATCH_TICKET_FIELDS = tuple(
     sorted(_PLANNING_EFFECT_DISPATCH_FIELDS - {"ticket", "state"})
 )
@@ -889,7 +892,7 @@ def _validate_planning_effect_dispatch_entries(
                 for character in raw["subject_digest"]
             )
             or type(raw["effect_boundary"]) is not str
-            or raw["effect_boundary"] not in {"prepare", "start"}
+            or raw["effect_boundary"] not in _PLANNING_EFFECT_DISPATCH_BOUNDARIES
             or type(raw["state"]) is not str
             or raw["state"] not in {"active", "recovery"}
             or type(raw["attempt"]) is not int

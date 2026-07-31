@@ -30,6 +30,7 @@ from .plan_control import (
 from .runtime_gateway import CampaignPlanningSubject
 from .transition import (
     WriterTransitionRecord,
+    _PLANNING_EFFECT_DISPATCH_BOUNDARIES,
     _PLANNING_EFFECT_DISPATCH_FIELDS,
     _PLANNING_EFFECT_DISPATCH_MAX_ACTIVE_ENTRIES,
     _PLANNING_EFFECT_DISPATCH_PATH,
@@ -2925,7 +2926,7 @@ class GitHubPlanRepository:
             type(subject) is not CampaignPlanningSubject
             or subject.repository != self.repository
             or type(boundary) is not str
-            or boundary not in {"prepare", "start"}
+            or boundary not in _PLANNING_EFFECT_DISPATCH_BOUNDARIES
             or not self._uses_ref_cas
         ):
             return None
@@ -3061,7 +3062,7 @@ class GitHubPlanRepository:
             type(subject) is not CampaignPlanningSubject
             or subject.repository != self.repository
             or type(boundary) is not str
-            or boundary not in {"prepare", "start"}
+            or boundary not in _PLANNING_EFFECT_DISPATCH_BOUNDARIES
             or type(ticket) is not str
             or not ticket
             or not self._uses_ref_cas
@@ -3172,7 +3173,9 @@ class GitHubPlanRepository:
             entry["effect_boundary"] == "prepare"
             and observation_kind in {"prepared", "bound"}
         ) or (
-            entry["effect_boundary"] == "start" and observation_kind == "bound"
+            entry["effect_boundary"]
+            in _PLANNING_EFFECT_DISPATCH_BOUNDARIES - {"prepare"}
+            and observation_kind == "bound"
         )
         if proven:
             self._resolve_planning_effect_dispatch(
