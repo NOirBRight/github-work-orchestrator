@@ -7673,6 +7673,22 @@ class _PaseoStaticAssignmentValidator:
             ) from error
 
 
+class _PlanningEffectDispatch(Protocol):
+    """Host-private Writer-fenced capability for Planning provider effects."""
+
+    def mode(self, subject: CampaignPlanningSubject) -> str: ...
+
+    def enter(self, subject: CampaignPlanningSubject, boundary: str) -> str | None: ...
+
+    def resolve(self, ticket: str) -> None: ...
+
+    def reconcile(
+        self,
+        subject: CampaignPlanningSubject,
+        observation_kind: str,
+    ) -> None: ...
+
+
 def build_runtime_gateway(
     *,
     store_path: Path,
@@ -7681,9 +7697,7 @@ def build_runtime_gateway(
     artifact_root: Path | None = None,
     maximum_artifact_bytes: int = 1_048_576,
     _shared_artifacts: ArtifactStore | None = None,
-    _planning_progress_policy: Callable[[CampaignPlanningSubject], str] | None = None,
-    _planning_effect_authorizer: Callable[[CampaignPlanningSubject, str], bool]
-    | None = None,
+    _planning_effect_dispatch: _PlanningEffectDispatch | None = None,
 ) -> "RuntimeGateway":
     """Compose the V3 production Gateway without exposing provider machinery."""
 
@@ -7722,8 +7736,7 @@ def build_runtime_gateway(
         configuration=configuration,
         _artifacts=artifacts,
         _static_assignment_validator=_PaseoStaticAssignmentValidator(repository_contexts),
-        _planning_progress_policy=_planning_progress_policy,
-        _planning_effect_authorizer=_planning_effect_authorizer,
+        _planning_effect_dispatch=_planning_effect_dispatch,
     )
 
 
@@ -7765,9 +7778,7 @@ class RuntimeGateway:
         _artifacts: ArtifactStore | None = None,
         _static_assignment_validator: Callable[[RuntimeSubject, RuntimeProfile], None]
         | None = None,
-        _planning_progress_policy: Callable[[CampaignPlanningSubject], str] | None = None,
-        _planning_effect_authorizer: Callable[[CampaignPlanningSubject, str], bool]
-        | None = None,
+        _planning_effect_dispatch: _PlanningEffectDispatch | None = None,
     ):
         self._store_path = Path(store_path)
         self._journal = _V3JsonJournal(self._store_path)
@@ -7784,8 +7795,7 @@ class RuntimeGateway:
             self._store_path.parent / "runtime-artifacts"
         )
         self._static_assignment_validator = _static_assignment_validator
-        self._planning_progress_policy = _planning_progress_policy
-        self._planning_effect_authorizer = _planning_effect_authorizer
+        self._planning_effect_dispatch = _planning_effect_dispatch
         self._data = self._load()
 
     # Caller interface operation 1.  It neither calls an adapter nor reserves
@@ -7995,6 +8005,15 @@ class RuntimeGateway:
         observation_verdict = self._observe_verdict(
             subject.stable_action_id
         )
+        if (
+            type(subject) is CampaignPlanningSubject
+            and observation_verdict.kind
+            in {"authoritative_absence", "prepared", "bound"}
+        ):
+            self._reconcile_planning_effect_dispatch(
+                subject,
+                observation_verdict.kind,
+            )
         if observation_verdict.kind == "authoritative_absence":
             if planning_mode == "draining":
                 raise RuntimeGatewayError(
@@ -8014,8 +8033,12 @@ class RuntimeGateway:
                 prompt_artifact=prompt_artifact,
                 input_artifacts=input_artifacts,
             )
-            self._authorize_planning_effect(subject, "prepare")
+            dispatch_ticket = self._enter_planning_effect_dispatch(
+                subject,
+                "prepare",
+            )
             prepared_verdict = self._prepare_verdict(spec)
+            self._resolve_planning_effect_dispatch(dispatch_ticket)
             if prepared_verdict.kind == "recoverable_failure":
                 assert prepared_verdict.failure is not None
                 prepare_failure = prepared_verdict.failure
@@ -8067,12 +8090,18 @@ class RuntimeGateway:
                 raise RuntimeGatewayError(
                     "RUNTIME_COMMAND_INVALID",
                     "start requires an unfenced Prepared Runtime observation",
-                )
+            )
             self._record_observation(record, observation_verdict)
-            self._authorize_planning_effect(subject, "start")
+            dispatch_ticket = self._enter_planning_effect_dispatch(
+                subject,
+                "start",
+            )
             observation_verdict = self._command_with_readback(
                 subject.stable_action_id,
                 RuntimeCommand.START,
+                _after_dispatch=lambda: self._resolve_planning_effect_dispatch(
+                    dispatch_ticket
+                ),
             )
             assert observation_verdict.observation is not None
             observation = observation_verdict.observation
@@ -8138,11 +8167,11 @@ class RuntimeGateway:
     def _planning_progress_mode(self, subject: CampaignPlanningSubject) -> str:
         """Resolve the closed dynamic policy inside the sole progress operation."""
 
-        policy = self._planning_progress_policy
-        if policy is None:
+        dispatch = self._planning_effect_dispatch
+        if dispatch is None:
             return "cut_over"
         try:
-            mode = policy(subject)
+            mode = dispatch.mode(subject)
         except RuntimeGatewayError:
             raise
         except Exception as error:
@@ -8157,42 +8186,78 @@ class RuntimeGateway:
             )
         return mode
 
-    def _authorize_planning_effect(
+    def _enter_planning_effect_dispatch(
         self,
         subject: CampaignPlanningSubject,
         boundary: str,
-    ) -> None:
-        """Require one exact, host-linearized Planning effect claim.
-
-        The host callback remains a private composition seam: callers still
-        have only preflight, progress, and transition.  A missing callback is
-        the deterministic in-memory/default composition where no external
-        Writer authority exists.  A composed callback must return the exact
-        boolean ``True`` after durably authorizing this subject and boundary.
-        """
+    ) -> str | None:
+        """Enter a Writer-blocking durable state immediately before I/O."""
 
         if type(boundary) is not str or boundary not in {"prepare", "start"}:
             raise RuntimeGatewayError(
                 "RUNTIME_RECOVERY_ONLY",
-                "Planning provider-effect boundary is outside the closed authorization union",
+                "Planning provider-effect boundary is outside the closed dispatch union",
             )
-        authorizer = self._planning_effect_authorizer
-        if authorizer is None:
-            return
+        dispatch = self._planning_effect_dispatch
+        if dispatch is None:
+            return None
         try:
-            authorized = authorizer(subject, boundary)
+            ticket = dispatch.enter(subject, boundary)
         except RuntimeGatewayError:
             raise
         except Exception as error:
             raise RuntimeGatewayError(
                 "RUNTIME_RECOVERY_ONLY",
-                "Planning provider-effect authorization is unavailable",
+                "Planning provider-effect dispatch admission is unavailable",
             ) from error
-        if type(authorized) is not bool or not authorized:
+        if type(ticket) is not str or not ticket:
             raise RuntimeGatewayError(
                 "RUNTIME_RECOVERY_ONLY",
-                "Planning provider-effect authorization was denied or malformed",
+                "Planning provider-effect dispatch admission was denied or malformed",
             )
+        return ticket
+
+    def _resolve_planning_effect_dispatch(self, ticket: str | None) -> None:
+        dispatch = self._planning_effect_dispatch
+        if dispatch is None:
+            if ticket is not None:
+                raise RuntimeGatewayError(
+                    "RUNTIME_RECOVERY_ONLY",
+                    "Planning dispatch ticket appeared without a host capability",
+                )
+            return
+        if type(ticket) is not str or not ticket:
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_ONLY",
+                "Planning provider-effect dispatch ticket is missing or malformed",
+            )
+        try:
+            dispatch.resolve(ticket)
+        except RuntimeGatewayError:
+            raise
+        except Exception as error:
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_ONLY",
+                "Planning provider-effect dispatch could not resolve its durable state",
+            ) from error
+
+    def _reconcile_planning_effect_dispatch(
+        self,
+        subject: CampaignPlanningSubject,
+        observation_kind: str,
+    ) -> None:
+        dispatch = self._planning_effect_dispatch
+        if dispatch is None:
+            return
+        try:
+            dispatch.reconcile(subject, observation_kind)
+        except RuntimeGatewayError:
+            raise
+        except Exception as error:
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_ONLY",
+                "Planning provider-effect dispatch could not reconcile its durable state",
+            ) from error
 
     # Caller interface operation 3.  Binding refs remain private, including
     # for start/resume: they re-enter the same observe-gated progression path.
@@ -9044,6 +9109,8 @@ class RuntimeGateway:
         self,
         stable_action_id: str,
         command: RuntimeTransition,
+        *,
+        _after_dispatch: Callable[[], None] | None = None,
     ) -> _RuntimeObservationVerdict:
         self._refresh_before_adapter_io()
         try:
@@ -9057,6 +9124,8 @@ class RuntimeGateway:
             result = _RuntimeFailure(
                 "RUNTIME_PROVIDER_PROTOCOL_INVALID", "Runtime provider command failed"
             )
+        if _after_dispatch is not None:
+            _after_dispatch()
         verdict = _RuntimeCommandResultProtocol.validate(
             result,
             stable_action_id,

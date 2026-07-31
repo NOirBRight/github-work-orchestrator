@@ -28,7 +28,13 @@ from .plan_control import (
     _SplitCampaignDecisionRecord,
 )
 from .runtime_gateway import CampaignPlanningSubject
-from .transition import WriterTransitionRecord
+from .transition import (
+    WriterTransitionRecord,
+    _PLANNING_EFFECT_DISPATCH_FIELDS,
+    _PLANNING_EFFECT_DISPATCH_PATH,
+    _PLANNING_EFFECT_DISPATCH_SCHEMA,
+    _planning_effect_dispatch_entries_at_ref,
+)
 
 
 _STATE_SCHEMA = "gwo.plan.github-state.v3"
@@ -45,8 +51,6 @@ _OBJECT_PREFIX = ".gwo-v8/plan-control-v3/objects"
 _POLICY_PATH = ".gwo-v8/policy-witness.json"
 _WRITER_PATH = ".gwo-v8/writer-transition.json"
 _WRITER_ACTIVATION_PATH = ".gwo/v8/active-plan.json"
-_PLANNING_EFFECT_AUTHORIZATIONS_PATH = ".gwo-v8/planning-effect-authorizations.json"
-_PLANNING_EFFECT_AUTHORIZATIONS_SCHEMA = "gwo.planning-effect-authorizations.v1"
 _MAXIMUM_OBJECT_PART_BYTES = 196_608
 _T = TypeVar("_T")
 
@@ -290,6 +294,32 @@ class _StagedArtifactCache:
                 raise ValueError("staged Artifact digest changed")
 
 
+class _GitHubPlanningEffectDispatch:
+    """One host-private capability for Writer-fenced Planning dispatch."""
+
+    def __init__(self, repository: "GitHubPlanRepository") -> None:
+        self._repository = repository
+
+    def mode(self, subject: CampaignPlanningSubject) -> str:
+        return self._repository.planning_progress_mode(subject)
+
+    def enter(self, subject: CampaignPlanningSubject, boundary: str) -> str | None:
+        return self._repository._enter_planning_effect_dispatch(subject, boundary)
+
+    def resolve(self, ticket: str) -> None:
+        self._repository._resolve_planning_effect_dispatch(ticket)
+
+    def reconcile(
+        self,
+        subject: CampaignPlanningSubject,
+        observation_kind: str,
+    ) -> None:
+        self._repository._reconcile_planning_effect_dispatch(
+            subject,
+            observation_kind,
+        )
+
+
 def _governed_path(value: object, label: str) -> str:
     """Accept only one normalized repository-relative GWO control path."""
 
@@ -395,20 +425,6 @@ def _is_digest(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
-
-
-_PLANNING_EFFECT_AUTHORIZATION_FIELDS = {
-    "repository",
-    "campaign_key",
-    "campaign_handle",
-    "subject_digest",
-    "writer_generation",
-    "writer_record_id",
-    "writer_cut_over_record_id",
-    "writer_observation_ref",
-    "stable_action_id",
-    "effect_boundary",
-}
 
 
 def _bytes(value: object, label: str) -> bytes:
@@ -2756,210 +2772,165 @@ class GitHubPlanRepository:
             )
         return status
 
-    def _planning_effect_claim(
-        self,
-        subject: CampaignPlanningSubject,
-        boundary: str,
-        *,
-        authority: Mapping[str, str],
-        observed_ref: str,
-    ) -> dict[str, str]:
-        if (
-            type(subject) is not CampaignPlanningSubject
-            or subject.repository != self.repository
-            or type(boundary) is not str
-            or boundary not in {"prepare", "start"}
-            or not _nonempty_text(observed_ref)
-        ):
-            raise PlanControlError(
-                "WRITER_FENCE_CONFLICT",
-                "Planning effect authorization has an invalid repository, subject, or boundary",
-            )
-        required_authority = {
-            "repository",
-            "writer_generation",
-            "record_id",
-            "cut_over_record_id",
-            "status",
-        }
-        if (
-            not required_authority.issubset(authority)
-            or authority.get("repository") != self.repository
-            or any(
-                not _nonempty_text(authority.get(name))
-                for name in required_authority - {"repository", "status"}
-            )
-            or authority.get("status") != "cut_over"
-            or authority.get("record_id") != authority.get("cut_over_record_id")
-        ):
-            raise PlanControlError(
-                "WRITER_FENCE_CONFLICT",
-                "Planning effect authorization requires the exact cut-over Writer authority",
-            )
-        return {
-            "repository": self.repository,
-            "campaign_key": subject.campaign_key,
-            "campaign_handle": subject.campaign_handle,
-            "subject_digest": subject.digest,
-            "writer_generation": str(authority["writer_generation"]),
-            "writer_record_id": str(authority["record_id"]),
-            "writer_cut_over_record_id": str(authority["cut_over_record_id"]),
-            "writer_observation_ref": observed_ref,
-            "stable_action_id": subject.stable_action_id,
-            "effect_boundary": boundary,
-        }
+    def planning_effect_dispatch(self) -> object:
+        """Return the one private host capability for Planning provider I/O."""
 
-    def _read_planning_effect_claims_at_ref(
+        return _GitHubPlanningEffectDispatch(self)
+
+    def _planning_effect_dispatch_entries(
         self,
         ref_digest: str,
-    ) -> tuple[dict[str, str], ...]:
+    ) -> tuple[dict[str, Any], ...]:
         try:
-            content = self.client.read_at_ref(
+            return _planning_effect_dispatch_entries_at_ref(
+                self.client,
                 self.repository,
                 ref_digest,
-                _PLANNING_EFFECT_AUTHORIZATIONS_PATH,
             )
         except Exception as error:
             raise PlanControlError(
                 "WRITER_FENCE_READBACK_INVALID",
-                "Planning effect authorization ledger cannot be read at the control ref",
+                "Planning effect dispatch ledger is unavailable or malformed",
             ) from error
-        if content is None:
-            return ()
-        if type(content.content) is not bytes:
-            raise PlanControlError(
-                "WRITER_FENCE_READBACK_INVALID",
-                "Planning effect authorization ledger has malformed bytes",
-            )
-        try:
-            ledger = _exact(
-                load_canonical_json(content.content),
-                {"schema_version", "repository", "claims"},
-                "Planning effect authorization ledger",
-            )
-            claims = ledger["claims"]
-            if (
-                ledger["schema_version"] != _PLANNING_EFFECT_AUTHORIZATIONS_SCHEMA
-                or ledger["repository"] != self.repository
-                or type(claims) is not list
-            ):
-                raise ValueError("authorization ledger identity")
-            decoded: list[dict[str, str]] = []
-            lineage_keys: set[tuple[str, str, str, str]] = set()
-            for raw in claims:
-                claim = _exact(
-                    raw,
-                    _PLANNING_EFFECT_AUTHORIZATION_FIELDS,
-                    "Planning effect authorization",
-                )
-                if (
-                    claim["repository"] != self.repository
-                    or not _is_digest(claim["subject_digest"])
-                    or claim["effect_boundary"] not in {"prepare", "start"}
-                    or any(
-                        not _nonempty_text(claim[name])
-                        for name in _PLANNING_EFFECT_AUTHORIZATION_FIELDS
-                        - {"repository", "subject_digest", "effect_boundary"}
-                    )
-                ):
-                    raise ValueError("authorization claim fields")
-                key = (
-                    claim["writer_generation"],
-                    claim["writer_cut_over_record_id"],
-                    claim["stable_action_id"],
-                    claim["effect_boundary"],
-                )
-                if key in lineage_keys:
-                    raise ValueError("duplicate authorization lineage")
-                lineage_keys.add(key)
-                decoded.append({name: claim[name] for name in sorted(claim)})
-        except (PlanControlError, TypeError, ValueError) as error:
-            raise PlanControlError(
-                "WRITER_FENCE_READBACK_INVALID",
-                "Planning effect authorization ledger has an invalid closed schema",
-            ) from error
-        return tuple(decoded)
 
     @staticmethod
-    def _planning_effect_claim_matches(
-        claim: Mapping[str, str],
+    def _dispatch_entry_matches_subject(
+        entry: Mapping[str, Any],
         subject: CampaignPlanningSubject,
         boundary: str,
         authority: Mapping[str, str],
     ) -> bool:
         return (
-            claim.get("repository") == subject.repository
-            and claim.get("campaign_key") == subject.campaign_key
-            and claim.get("campaign_handle") == subject.campaign_handle
-            and claim.get("subject_digest") == subject.digest
-            and claim.get("writer_generation") == authority.get("writer_generation")
-            and claim.get("writer_record_id")
+            entry.get("repository") == subject.repository
+            and entry.get("campaign_key") == subject.campaign_key
+            and entry.get("campaign_handle") == subject.campaign_handle
+            and entry.get("subject_digest") == subject.digest
+            and entry.get("stable_action_id") == subject.stable_action_id
+            and entry.get("effect_boundary") == boundary
+            and entry.get("writer_generation") == authority.get("writer_generation")
+            and entry.get("writer_cut_over_record_id")
             == authority.get("cut_over_record_id")
-            and claim.get("writer_cut_over_record_id")
-            == authority.get("cut_over_record_id")
-            and claim.get("stable_action_id") == subject.stable_action_id
-            and claim.get("effect_boundary") == boundary
-            and authority.get("status") == "cut_over"
         )
 
-    def planning_effect_authorization(
+    @staticmethod
+    def _dispatch_entry_for_action(
+        entry: Mapping[str, Any],
+        subject: CampaignPlanningSubject,
+        authority: Mapping[str, str],
+    ) -> bool:
+        return (
+            entry.get("repository") == subject.repository
+            and entry.get("stable_action_id") == subject.stable_action_id
+            and entry.get("writer_generation") == authority.get("writer_generation")
+            and entry.get("writer_cut_over_record_id")
+            == authority.get("cut_over_record_id")
+        )
+
+    @staticmethod
+    def _dispatch_entry_for_boundary(
+        entry: Mapping[str, Any],
+        subject: CampaignPlanningSubject,
+        boundary: str,
+        authority: Mapping[str, str],
+    ) -> bool:
+        return (
+            GitHubPlanRepository._dispatch_entry_for_action(
+                entry,
+                subject,
+                authority,
+            )
+            and entry.get("effect_boundary") == boundary
+        )
+
+    def _enter_planning_effect_dispatch(
         self,
         subject: CampaignPlanningSubject,
         boundary: str,
-    ) -> bool:
-        """Durably order one Planning provider effect with Writer draining.
+    ) -> str | None:
+        """Publish one active dispatch fence before the adapter may be called."""
 
-        The claim is a host-private control-ref fact, not PlanControl or
-        Runtime state.  A ref CAS from an exact cut-over observation is the
-        sole authorization linearization point.  The durable claim remains
-        recovery evidence after draining, but every dispatch still requires
-        the current Writer ref to remain exactly cut-over.
-        """
-
-        if not self._uses_ref_cas:
-            return False
-        repo, ref_digest, _before, authority = self._read_ref_state()
-        del repo
-        claims = self._read_planning_effect_claims_at_ref(ref_digest)
-        if any(
-            self._planning_effect_claim_matches(
-                claim,
+        if (
+            type(subject) is not CampaignPlanningSubject
+            or subject.repository != self.repository
+            or type(boundary) is not str
+            or boundary not in {"prepare", "start"}
+            or not self._uses_ref_cas
+        ):
+            return None
+        _repo, ref_digest, _before, authority = self._read_ref_state()
+        entries = self._planning_effect_dispatch_entries(ref_digest)
+        boundary_entries = [
+            entry
+            for entry in entries
+            if self._dispatch_entry_for_boundary(
+                entry,
                 subject,
                 boundary,
                 authority,
             )
-            for claim in claims
-        ):
-            return True
-        if authority.get("status") != "cut_over":
-            return False
-        claim = self._planning_effect_claim(
-            subject,
-            boundary,
-            authority=authority,
-            observed_ref=ref_digest,
-        )
-        conflicting = [
-            existing
-            for existing in claims
-            if (
-                existing["writer_generation"] == claim["writer_generation"]
-                and existing["writer_cut_over_record_id"]
-                == claim["writer_cut_over_record_id"]
-                and existing["stable_action_id"] == claim["stable_action_id"]
-                and existing["effect_boundary"] == claim["effect_boundary"]
-            )
         ]
-        if conflicting:
+        if len(boundary_entries) > 1:
             raise PlanControlError(
                 "WRITER_FENCE_READBACK_INVALID",
-                "Planning effect authorization reuses a Writer/action/boundary lineage",
+                "Planning effect dispatch has duplicate boundary identities",
             )
+        previous = None if not boundary_entries else boundary_entries[0]
+        if previous is not None and not self._dispatch_entry_matches_subject(
+            previous,
+            subject,
+            boundary,
+            authority,
+        ):
+            # The stable Planning action/boundary has already produced
+            # recovery evidence for another exact Campaign subject.  Never
+            # overwrite it or turn it into a new provider-effect authority.
+            return None
+        if previous is not None and previous["state"] == "active":
+            return str(previous["ticket"])
+        if any(
+            entry["state"] == "active"
+            and self._dispatch_entry_for_action(entry, subject, authority)
+            for entry in entries
+        ):
+            return None
+        if authority.get("status") != "cut_over" or (
+            authority.get("record_id") != authority.get("cut_over_record_id")
+        ):
+            return None
+        attempt = 1 if previous is None else int(previous["attempt"]) + 1
+        identity = {
+            "repository": self.repository,
+            "campaign_key": subject.campaign_key,
+            "campaign_handle": subject.campaign_handle,
+            "subject_digest": subject.digest,
+            "stable_action_id": subject.stable_action_id,
+            "effect_boundary": boundary,
+            "writer_generation": authority["writer_generation"],
+            "writer_cut_over_record_id": authority["cut_over_record_id"],
+            "writer_observation_ref": ref_digest,
+            "attempt": attempt,
+        }
+        ticket = "planning-dispatch:" + digest_value(identity)[:32]
+        entry = {
+            **identity,
+            "ticket": ticket,
+            "state": "active",
+        }
+        if set(entry) != _PLANNING_EFFECT_DISPATCH_FIELDS:
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "Planning effect dispatch entry has an invalid closed schema",
+            )
+        updated = list(entries)
+        if previous is None:
+            updated.append(entry)
+        else:
+            updated[updated.index(previous)] = entry
         rendered = canonical_bytes(
             {
-                "schema_version": _PLANNING_EFFECT_AUTHORIZATIONS_SCHEMA,
+                "schema_version": _PLANNING_EFFECT_DISPATCH_SCHEMA,
                 "repository": self.repository,
-                "claims": [*claims, claim],
+                "entries": updated,
             }
         )
         try:
@@ -2967,34 +2938,132 @@ class GitHubPlanRepository:
                 self.repository,
                 self.branch,
                 expected_ref_digest=ref_digest,
-                changes={_PLANNING_EFFECT_AUTHORIZATIONS_PATH: rendered},
-                message="GWO authorize Planning provider effect",
+                changes={_PLANNING_EFFECT_DISPATCH_PATH: rendered},
+                message="GWO enter Planning provider dispatch",
             )
         except Exception:
-            return self._recovered_planning_effect_authorization(subject, boundary)
+            _recovered, recovered_ref, _before, recovered_authority = (
+                self._read_ref_state()
+            )
+            recovered_entries = self._planning_effect_dispatch_entries(recovered_ref)
+            recovered = [
+                value
+                for value in recovered_entries
+                if self._dispatch_entry_matches_subject(
+                    value,
+                    subject,
+                    boundary,
+                    recovered_authority,
+                )
+                and value["state"] == "active"
+            ]
+            if len(recovered) == 1:
+                return str(recovered[0]["ticket"])
+            return None
         if type(committed) is not str or not committed:
             raise PlanControlError(
                 "DURABLE_STATE_READBACK_INVALID",
-                "Planning effect authorization CAS omitted its committed control ref",
+                "Planning effect dispatch CAS omitted its committed control ref",
             )
-        return self._recovered_planning_effect_authorization(subject, boundary)
+        return ticket
 
-    def _recovered_planning_effect_authorization(
+    def _resolve_planning_effect_dispatch(self, ticket: str) -> None:
+        """Close one active dispatch after a provider result or ambiguity."""
+
+        if type(ticket) is not str or not ticket or not self._uses_ref_cas:
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "Planning effect dispatch resolution has no exact durable ticket",
+            )
+        _repo, ref_digest, _before, _authority = self._read_ref_state()
+        entries = list(self._planning_effect_dispatch_entries(ref_digest))
+        matching = [entry for entry in entries if entry["ticket"] == ticket]
+        if len(matching) != 1:
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "Planning effect dispatch ticket is stale or missing",
+            )
+        entry = matching[0]
+        if entry["state"] == "recovery":
+            return
+        if entry["state"] != "active":
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "Planning effect dispatch ticket is outside its active state",
+            )
+        resolved = {**entry, "state": "recovery"}
+        entries[entries.index(entry)] = resolved
+        rendered = canonical_bytes(
+            {
+                "schema_version": _PLANNING_EFFECT_DISPATCH_SCHEMA,
+                "repository": self.repository,
+                "entries": entries,
+            }
+        )
+        try:
+            committed = self.client.compare_and_swap_ref(
+                self.repository,
+                self.branch,
+                expected_ref_digest=ref_digest,
+                changes={_PLANNING_EFFECT_DISPATCH_PATH: rendered},
+                message="GWO resolve Planning provider dispatch",
+            )
+        except Exception as error:
+            _repo, recovered_ref, _before, _authority = self._read_ref_state()
+            recovered = self._planning_effect_dispatch_entries(recovered_ref)
+            if any(
+                value["ticket"] == ticket and value["state"] == "recovery"
+                for value in recovered
+            ):
+                return
+            raise PlanControlError(
+                "DURABLE_CAS_CONFLICT",
+                "Planning effect dispatch resolution did not commit",
+            ) from error
+        if type(committed) is not str or not committed:
+            raise PlanControlError(
+                "DURABLE_STATE_READBACK_INVALID",
+                "Planning effect dispatch resolution omitted its control ref",
+            )
+
+    def _reconcile_planning_effect_dispatch(
         self,
         subject: CampaignPlanningSubject,
-        boundary: str,
-    ) -> bool:
+        observation_kind: str,
+    ) -> None:
+        """Resolve only an active ticket whose readback proves its effect."""
+
+        if (
+            type(subject) is not CampaignPlanningSubject
+            or subject.repository != self.repository
+            or observation_kind not in {"authoritative_absence", "prepared", "bound"}
+            or not self._uses_ref_cas
+        ):
+            return
         _repo, ref_digest, _before, authority = self._read_ref_state()
-        claims = self._read_planning_effect_claims_at_ref(ref_digest)
-        return any(
-            self._planning_effect_claim_matches(
-                claim,
-                subject,
-                boundary,
-                authority,
+        entries = self._planning_effect_dispatch_entries(ref_digest)
+        active = [
+            entry
+            for entry in entries
+            if entry["state"] == "active"
+            and self._dispatch_entry_for_action(entry, subject, authority)
+        ]
+        if len(active) > 1:
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "Planning action has more than one active dispatch",
             )
-            for claim in claims
+        if not active:
+            return
+        entry = active[0]
+        proven = (
+            entry["effect_boundary"] == "prepare"
+            and observation_kind in {"prepared", "bound"}
+        ) or (
+            entry["effect_boundary"] == "start" and observation_kind == "bound"
         )
+        if proven:
+            self._resolve_planning_effect_dispatch(str(entry["ticket"]))
 
     def reserve_claims(self, receipt: ActivationReceipt) -> None:
         self._assert_repository(receipt.repository)

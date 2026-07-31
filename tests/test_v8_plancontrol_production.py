@@ -620,6 +620,7 @@ class _RefContentClient:
         self.writes = []
         self.before_ref_cas = None
         self.after_ref_cas = None
+        self.drain_blockers = []
         self.activation_barrier = None
 
     def read_ref(self, repository, branch):
@@ -672,6 +673,21 @@ class _RefContentClient:
 
     def advance_writer(self, writer_generation, *, status="cut_over"):
         from gwo_v8._canonical import canonical_bytes
+        from gwo_v8.transition import _writer_drain_dispatch_blocker
+
+        if status == "draining":
+            blocker = _writer_drain_dispatch_blocker(
+                self,
+                "owner/repository",
+                self.head,
+                writer_generation=writer_generation,
+                cut_over_record_id=self._writer_value(writer_generation)["current"][
+                    "record_id"
+                ],
+            )
+            if blocker is not None:
+                self.drain_blockers.append(blocker)
+                raise RuntimeError(blocker)
 
         tree = dict(self._commits[self.head])
         tree[".gwo-v8/writer-transition.json"] = self._content_type(
@@ -2512,45 +2528,51 @@ def test_r7c1_github_writer_policy_exposes_only_closed_progress_modes(status):
     assert repository.planning_progress_mode(subject) == status
 
 
-def test_r8_github_effect_claim_loses_when_writer_drains_before_ref_cas():
-    """The provider gate cannot win after the Writer's durable drain."""
+@pytest.mark.parametrize("initial_state", ("absent", "prepared"))
+def test_r9_writer_drain_before_active_dispatch_cas_has_zero_effects(
+    initial_state,
+    tmp_path,
+):
+    """A pre-existing drain rejects either provider-effect boundary."""
 
     from gwo_v8.plan_control_github import GitHubPlanRepository
-    from gwo_v8.runtime_gateway import CampaignPlanningSubject
+    from gwo_v8.runtime_gateway import RuntimeGatewayError
 
     client = _RefContentClient()
-    client.before_ref_cas = lambda: client.advance_writer(
-        "writer:one", status="draining"
-    )
+    client.advance_writer("writer:one", status="draining")
     repository = GitHubPlanRepository(
         client,
         repository="owner/repository",
         branch="gwo-control",
         writer_generation="writer:one",
     )
-    subject = CampaignPlanningSubject(
-        repository="owner/repository",
-        campaign_key="campaign:r8-cas",
-        campaign_handle="campaign-handle:r8-cas",
-        expected_previous_plan_revision_digest=None,
-        snapshot_artifact_digest="a" * 64,
-        policy_witness_digest="b" * 64,
-        planning_request_artifact_digest="c" * 64,
-        stable_action_id="planning:r8-cas",
+    gateway, subject, preflight, adapter = _r8_authorized_runtime_gateway(
+        tmp_path,
+        repository,
+        initial_state,
+    )
+    before = (
+        len(adapter.prepare_calls),
+        adapter.created_agent_count,
+        len(adapter.command_calls),
     )
 
-    assert repository.planning_effect_authorization(subject, "prepare") is False
-    assert repository.planning_progress_mode(subject) == "draining"
-    assert ".gwo-v8/planning-effect-authorizations.json" not in client._commits[
-        client.head
-    ]
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        gateway.progress(subject, preflight)
+
+    assert rejected.value.code == "RUNTIME_RECOVERY_ONLY"
+    assert (
+        len(adapter.prepare_calls),
+        adapter.created_agent_count,
+        len(adapter.command_calls),
+    ) == before
 
 
 @pytest.mark.parametrize("boundary", ("prepare", "start"))
-def test_r8_github_effect_claim_survives_only_as_post_drain_recovery_evidence(
+def test_r9_dispatch_ticket_is_exact_and_draining_rejects_replay(
     boundary,
 ):
-    """A claim that wins before drain cannot dispatch after the drain commits."""
+    """One active ticket is exact; a later drain admits no replay."""
 
     from dataclasses import replace
 
@@ -2575,11 +2597,20 @@ def test_r8_github_effect_claim_survives_only_as_post_drain_recovery_evidence(
         stable_action_id="planning:r8-replay",
     )
 
-    assert repository.planning_effect_authorization(subject, boundary) is True
-    writes_after_claim = len(client.writes)
-    assert ".gwo-v8/planning-effect-authorizations.json" in client._commits[
-        client.head
-    ]
+    dispatch = repository.planning_effect_dispatch()
+    ticket = dispatch.enter(subject, boundary)
+    assert type(ticket) is str and ticket
+    assert dispatch.enter(subject, boundary) == ticket
+    assert dispatch.enter(
+        replace(subject, campaign_key="campaign:r8-other"), boundary
+    ) is None
+    assert dispatch.enter(
+        subject, "start" if boundary == "prepare" else "prepare"
+    ) is None
+    dispatch.resolve(ticket)
+    assert dispatch.enter(
+        replace(subject, campaign_key="campaign:r8-other"), boundary
+    ) is None
     client.advance_writer("writer:one", status="draining")
     restarted = GitHubPlanRepository(
         client,
@@ -2588,14 +2619,14 @@ def test_r8_github_effect_claim_survives_only_as_post_drain_recovery_evidence(
         writer_generation="writer:one",
     )
 
-    assert restarted.planning_effect_authorization(subject, boundary) is False
-    assert len(client.writes) == writes_after_claim
-    assert restarted.planning_effect_authorization(
+    recovered_dispatch = restarted.planning_effect_dispatch()
+    assert recovered_dispatch.enter(subject, boundary) is None
+    assert recovered_dispatch.enter(
         subject, "start" if boundary == "prepare" else "prepare"
-    ) is False
-    assert restarted.planning_effect_authorization(
+    ) is None
+    assert recovered_dispatch.enter(
         replace(subject, campaign_key="campaign:r8-other"), boundary
-    ) is False
+    ) is None
 
 
 def _r8_authorized_runtime_gateway(tmp_path, repository, initial_state):
@@ -2655,8 +2686,7 @@ def _r8_authorized_runtime_gateway(tmp_path, repository, initial_state):
             host_mappings={"coordinator": ProfileMapping(profile.digest)},
         ),
         _artifacts=store,
-        _planning_progress_policy=repository.planning_progress_mode,
-        _planning_effect_authorizer=repository.planning_effect_authorization,
+        _planning_effect_dispatch=repository.planning_effect_dispatch(),
     )
     preflight = gateway.planning_preflight(subject)
     if initial_state == "prepared":
@@ -2678,14 +2708,18 @@ def _r8_authorized_runtime_gateway(tmp_path, repository, initial_state):
 
 
 @pytest.mark.parametrize("initial_state", ("absent", "prepared"))
-def test_r8_claim_then_drain_before_dispatch_has_zero_post_drain_effects(
+def test_r9_active_dispatch_rejects_writer_drain_before_provider_effect(
     initial_state,
     tmp_path,
 ):
-    """A post-claim drain blocks `prepare` and `start` before provider I/O."""
+    """A Writer drain cannot commit after the active dispatch CAS wins."""
 
     from gwo_v8.plan_control_github import GitHubPlanRepository
-    from gwo_v8.runtime_gateway import RuntimeGatewayError
+    from gwo_v8.transition import (
+        GitHubWriterTransitionControl,
+        WriterTransitionBlocked,
+        _record,
+    )
 
     client = _RefContentClient()
     repository = GitHubPlanRepository(
@@ -2699,25 +2733,302 @@ def test_r8_claim_then_drain_before_dispatch_has_zero_post_drain_effects(
         repository,
         initial_state,
     )
-    client.after_ref_cas = lambda: client.advance_writer(
-        "writer:one", status="draining"
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
     )
-    before = (
-        len(adapter.prepare_calls),
-        adapter.created_agent_count,
-        len(adapter.command_calls),
+    drain = _record(
+        repository="owner/repository",
+        kind="drain",
+        status="draining",
+        previous_writer_generation="writer:one",
+        writer_generation="writer:one",
+        activation_id="activation:cutover",
+        plan_digest="a" * 64,
+        canary_evidence_digest="b" * 64,
+        canary_evidence_refs=("github://canary/evidence",),
+        canary_manifest_ref="github://canary/manifest",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="r9 dispatch race",
     )
+    drain_blockers = []
 
-    with pytest.raises(RuntimeGatewayError) as rejected:
-        gateway.progress(subject, preflight)
+    def attempt_drain():
+        with pytest.raises(WriterTransitionBlocked) as rejected:
+            transitions.publish(drain)
+        drain_blockers.append(rejected.value.code)
 
-    assert rejected.value.code == "RUNTIME_RECOVERY_ONLY"
-    assert repository.planning_progress_mode(subject) == "draining"
-    assert ".gwo-v8/planning-effect-authorizations.json" in client._commits[
+    if initial_state == "absent":
+        prepare = adapter.prepare
+
+        def prepare_after_dispatch(spec):
+            attempt_drain()
+            return prepare(spec)
+
+        adapter.prepare = prepare_after_dispatch
+    else:
+        command = adapter.command
+
+        def command_after_dispatch(stable_action_id, transition):
+            attempt_drain()
+            return command(stable_action_id, transition)
+
+        adapter.command = command_after_dispatch
+
+    receipt = gateway.progress(subject, preflight)
+
+    assert receipt.status == "completed"
+    assert drain_blockers == ["WRITER_DRAIN_DISPATCH_ACTIVE"]
+    assert repository.planning_progress_mode(subject) == "cut_over"
+    assert ".gwo-v8/planning-effect-dispatch-v1.json" in client._commits[
         client.head
     ]
-    assert (
-        len(adapter.prepare_calls),
-        adapter.created_agent_count,
-        len(adapter.command_calls),
-    ) == before
+    if initial_state == "absent":
+        assert adapter.prepare_calls == [subject.stable_action_id]
+    else:
+        assert adapter.created_agent_count == 1
+        assert adapter.command_calls == [(subject.stable_action_id, "start")]
+    transitions.publish(drain)
+    assert repository.planning_progress_mode(subject) == "draining"
+
+
+def test_r9_writer_snapshot_losing_to_active_dispatch_is_a_typed_blocker():
+    """A drain CAS race re-reads the winning active dispatch, never commits."""
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import CampaignPlanningSubject
+    from gwo_v8.transition import (
+        GitHubWriterTransitionControl,
+        WriterTransitionBlocked,
+        _record,
+    )
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    subject = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r9-snapshot-race",
+        campaign_handle="campaign-handle:r9-snapshot-race",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest="a" * 64,
+        policy_witness_digest="b" * 64,
+        planning_request_artifact_digest="c" * 64,
+        stable_action_id="planning:r9-snapshot-race",
+    )
+    dispatch = repository.planning_effect_dispatch()
+    client.before_ref_cas = lambda: dispatch.enter(subject, "prepare")
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    drain = _record(
+        repository="owner/repository",
+        kind="drain",
+        status="draining",
+        previous_writer_generation="writer:one",
+        writer_generation="writer:one",
+        activation_id="activation:cutover",
+        plan_digest="a" * 64,
+        canary_evidence_digest="b" * 64,
+        canary_evidence_refs=("github://canary/evidence",),
+        canary_manifest_ref="github://canary/manifest",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="r9 snapshot race",
+    )
+
+    with pytest.raises(WriterTransitionBlocked) as blocked:
+        transitions.publish(drain)
+
+    assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"
+    assert repository.planning_progress_mode(subject) == "cut_over"
+    assert dispatch.enter(subject, "prepare").startswith("planning-dispatch:")
+
+
+@pytest.mark.parametrize("initial_state", ("absent", "prepared"))
+def test_r9_restart_after_active_dispatch_before_provider_call_recovers_once(
+    initial_state,
+    tmp_path,
+):
+    """A pre-call crash leaves one reusable active ticket, never a dead lock."""
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import RuntimeGateway
+    from gwo_v8.transition import (
+        GitHubWriterTransitionControl,
+        WriterTransitionBlocked,
+        _record,
+    )
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    gateway, subject, preflight, adapter = _r8_authorized_runtime_gateway(
+        tmp_path,
+        repository,
+        initial_state,
+    )
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    drain = _record(
+        repository="owner/repository",
+        kind="drain",
+        status="draining",
+        previous_writer_generation="writer:one",
+        writer_generation="writer:one",
+        activation_id="activation:cutover",
+        plan_digest="a" * 64,
+        canary_evidence_digest="b" * 64,
+        canary_evidence_refs=("github://canary/evidence",),
+        canary_manifest_ref="github://canary/manifest",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="r9 pre-call crash",
+    )
+    if initial_state == "absent":
+        adapter.prepare = lambda _spec: (_ for _ in ()).throw(KeyboardInterrupt())
+    else:
+        adapter.command = lambda _action, _transition: (
+            _ for _ in ()
+        ).throw(KeyboardInterrupt())
+
+    with pytest.raises(KeyboardInterrupt):
+        gateway.progress(subject, preflight)
+    with pytest.raises(WriterTransitionBlocked) as blocked:
+        transitions.publish(drain)
+
+    assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"
+    if initial_state == "absent":
+        assert adapter.prepare_calls == []
+    else:
+        assert adapter.created_agent_count == 0
+        assert adapter.command_calls == []
+
+    if initial_state == "absent":
+        adapter.prepare = type(adapter).prepare.__get__(adapter, type(adapter))
+    else:
+        adapter.command = type(adapter).command.__get__(adapter, type(adapter))
+    restarted = RuntimeGateway(
+        store_path=tmp_path / "gateway.json",
+        _adapter=adapter,
+        configuration=gateway._configuration,
+        _artifacts=adapter._artifacts,
+        _planning_effect_dispatch=repository.planning_effect_dispatch(),
+    )
+
+    assert restarted.progress(subject, preflight).status == "completed"
+    transitions.publish(drain)
+    assert repository.planning_progress_mode(subject) == "draining"
+    if initial_state == "absent":
+        assert adapter.prepare_calls == [subject.stable_action_id]
+    else:
+        assert adapter.created_agent_count == 1
+        assert adapter.command_calls == [(subject.stable_action_id, "start")]
+
+
+@pytest.mark.parametrize("initial_state", ("absent", "prepared"))
+def test_r9_restart_after_provider_dispatch_before_resolution_recovers_once(
+    initial_state,
+    tmp_path,
+):
+    """A post-call crash resolves by readback without a duplicate dispatch."""
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import RuntimeGateway
+    from gwo_v8.transition import (
+        GitHubWriterTransitionControl,
+        WriterTransitionBlocked,
+        _record,
+    )
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    gateway, subject, preflight, adapter = _r8_authorized_runtime_gateway(
+        tmp_path,
+        repository,
+        initial_state,
+    )
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    drain = _record(
+        repository="owner/repository",
+        kind="drain",
+        status="draining",
+        previous_writer_generation="writer:one",
+        writer_generation="writer:one",
+        activation_id="activation:cutover",
+        plan_digest="a" * 64,
+        canary_evidence_digest="b" * 64,
+        canary_evidence_refs=("github://canary/evidence",),
+        canary_manifest_ref="github://canary/manifest",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="r9 post-call crash",
+    )
+    if initial_state == "absent":
+        prepare = adapter.prepare
+
+        def crash_after_prepare(spec):
+            prepare(spec)
+            raise KeyboardInterrupt()
+
+        adapter.prepare = crash_after_prepare
+    else:
+        command = adapter.command
+
+        def crash_after_start(stable_action_id, transition):
+            command(stable_action_id, transition)
+            raise KeyboardInterrupt()
+
+        adapter.command = crash_after_start
+
+    with pytest.raises(KeyboardInterrupt):
+        gateway.progress(subject, preflight)
+    with pytest.raises(WriterTransitionBlocked) as blocked:
+        transitions.publish(drain)
+
+    assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"
+    if initial_state == "absent":
+        assert adapter.prepare_calls == [subject.stable_action_id]
+        adapter.prepare = type(adapter).prepare.__get__(adapter, type(adapter))
+    else:
+        assert adapter.created_agent_count == 1
+        assert adapter.command_calls == [(subject.stable_action_id, "start")]
+        adapter.command = type(adapter).command.__get__(adapter, type(adapter))
+    restarted = RuntimeGateway(
+        store_path=tmp_path / "gateway.json",
+        _adapter=adapter,
+        configuration=gateway._configuration,
+        _artifacts=adapter._artifacts,
+        _planning_effect_dispatch=repository.planning_effect_dispatch(),
+    )
+
+    assert restarted.progress(subject, preflight).status == "completed"
+    transitions.publish(drain)
+    assert repository.planning_progress_mode(subject) == "draining"
+    assert adapter.created_agent_count == 1
+    assert adapter.command_calls == [(subject.stable_action_id, "start")]
+    assert adapter.prepare_calls == [subject.stable_action_id]

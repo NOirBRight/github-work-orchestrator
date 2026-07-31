@@ -13885,6 +13885,20 @@ def test_r7c1_progress_recovery_state_matrix(mode, action_state, expected, tmp_p
     )
     subject = replace(unsigned, planning_request_artifact_digest=prompt.digest)
     selected_mode = {"value": "cut_over"}
+
+    class RecoveryPolicy:
+        def mode(self, _subject):
+            return selected_mode["value"]
+
+        def enter(self, _subject, boundary):
+            return f"r7:{boundary}"
+
+        def resolve(self, _ticket):
+            return None
+
+        def reconcile(self, _subject, _observation_kind):
+            return None
+
     adapter = _InMemoryRuntimeProviderAdapter(store)
     gateway = RuntimeGateway(
         store_path=tmp_path / "gateway.json",
@@ -13894,7 +13908,7 @@ def test_r7c1_progress_recovery_state_matrix(mode, action_state, expected, tmp_p
             host_mappings={"coordinator": ProfileMapping(_profile().digest)},
         ),
         _artifacts=store,
-        _planning_progress_policy=lambda _subject: selected_mode["value"],
+        _planning_effect_dispatch=RecoveryPolicy(),
     )
     preflight = gateway.planning_preflight(subject)
 
@@ -13986,15 +14000,22 @@ def test_r8_writer_effect_claim_cannot_dispatch_after_drain(
     writer = {"mode": "cut_over", "samples": []}
     effect_claims = []
 
-    def planning_mode(_subject):
-        writer["samples"].append(writer["mode"])
-        return writer["mode"]
+    class DrainBeforeDispatch:
+        def mode(self, _subject):
+            writer["samples"].append(writer["mode"])
+            return writer["mode"]
 
-    def authorize_effect(authorized_subject, boundary):
-        assert authorized_subject == subject
-        effect_claims.append(boundary)
-        writer["mode"] = "draining"
-        return writer["mode"] == "cut_over"
+        def enter(self, authorized_subject, boundary):
+            assert authorized_subject == subject
+            effect_claims.append(boundary)
+            writer["mode"] = "draining"
+            return None
+
+        def resolve(self, _ticket):
+            return None
+
+        def reconcile(self, _subject, _observation_kind):
+            return None
 
     adapter = _InMemoryRuntimeProviderAdapter(store)
     gateway = RuntimeGateway(
@@ -14005,8 +14026,7 @@ def test_r8_writer_effect_claim_cannot_dispatch_after_drain(
             host_mappings={"coordinator": ProfileMapping(_profile().digest)},
         ),
         _artifacts=store,
-        _planning_progress_policy=planning_mode,
-        _planning_effect_authorizer=authorize_effect,
+        _planning_effect_dispatch=DrainBeforeDispatch(),
     )
     preflight = gateway.planning_preflight(subject)
     if initial_state == "prepared":
@@ -14076,10 +14096,20 @@ def test_r8_writer_effect_authorization_is_not_replayable_across_boundaries(
     subject = replace(unsigned, planning_request_artifact_digest=prompt.digest)
     authorizations = []
 
-    def authorize_effect(authorized_subject, boundary):
-        assert authorized_subject == subject
-        authorizations.append(boundary)
-        return boundary == "prepare"
+    class BoundaryDispatch:
+        def mode(self, _subject):
+            return "cut_over"
+
+        def enter(self, authorized_subject, boundary):
+            assert authorized_subject == subject
+            authorizations.append(boundary)
+            return "r8:prepare" if boundary == "prepare" else None
+
+        def resolve(self, ticket):
+            assert ticket == "r8:prepare"
+
+        def reconcile(self, _subject, _observation_kind):
+            return None
 
     adapter = _InMemoryRuntimeProviderAdapter(store)
     gateway = RuntimeGateway(
@@ -14090,7 +14120,7 @@ def test_r8_writer_effect_authorization_is_not_replayable_across_boundaries(
             host_mappings={"coordinator": ProfileMapping(_profile().digest)},
         ),
         _artifacts=store,
-        _planning_effect_authorizer=authorize_effect,
+        _planning_effect_dispatch=BoundaryDispatch(),
     )
     preflight = gateway.planning_preflight(subject)
 
