@@ -488,7 +488,12 @@ class _RefContentClient:
     """One exact control-branch-ref fake for RP3 persistence tests."""
 
     @staticmethod
-    def _writer_value(writer_generation, *, status="cut_over"):
+    def _writer_value(
+        writer_generation,
+        *,
+        status="cut_over",
+        repository="owner/repository",
+    ):
         from gwo_v8._canonical import digest_value
 
         def record_id(value):
@@ -514,7 +519,7 @@ class _RefContentClient:
 
         pending = {
             "record_id": "",
-            "repository": "owner/repository",
+            "repository": repository,
             "kind": "cutover_pending",
             "status": "pending",
             "previous_writer_generation": "v6.1",
@@ -566,7 +571,7 @@ class _RefContentClient:
         return {
             "schema_version": 1,
             "current": {
-                "repository": "owner/repository",
+                "repository": repository,
                 "writer_generation": writer_generation,
                 "record_id": current["record_id"],
             },
@@ -574,30 +579,35 @@ class _RefContentClient:
         }
 
     @staticmethod
-    def _activation_value(writer_generation):
+    def _activation_value(writer_generation, *, repository="owner/repository"):
         receipt = {
             "schema_version": 1,
-            "repository": "owner/repository",
+            "repository": repository,
             "writer_generation": writer_generation,
             "activation_id": "activation:cutover",
             "plan_digest": "a" * 64,
             "expected_previous_digest": None,
-            "plan_record_ref": "github://owner/repository/cutover-plan",
+            "plan_record_ref": f"github://{repository}/cutover-plan",
             "created_at": "2026-07-30T00:00:00+00:00",
         }
         return {
             "schema_version": 1,
-            "repository": "owner/repository",
+            "repository": repository,
             "active_plan_digest": receipt["plan_digest"],
             "receipts": [receipt],
         }
 
-    def __init__(self, writer_generation="writer:one"):
+    def __init__(self, writer_generation="writer:one", *, repository="owner/repository"):
         from gwo_v8._canonical import canonical_bytes
         from gwo_v8.activation import GitHubContent
 
-        writer = canonical_bytes(self._writer_value(writer_generation))
-        activation = canonical_bytes(self._activation_value(writer_generation))
+        self.repository = repository
+        writer = canonical_bytes(
+            self._writer_value(writer_generation, repository=repository)
+        )
+        activation = canonical_bytes(
+            self._activation_value(writer_generation, repository=repository)
+        )
         policy = canonical_bytes(_policy())
         self._content_type = GitHubContent
         self._commits = {
@@ -624,16 +634,16 @@ class _RefContentClient:
         self.activation_barrier = None
 
     def read_ref(self, repository, branch):
-        assert repository == "owner/repository"
+        assert repository == self.repository
         assert branch == "gwo-control"
         return self.head
 
     def read_at_ref(self, repository, ref_digest, path):
-        assert repository == "owner/repository"
+        assert repository == self.repository
         return self._commits[ref_digest].get(path)
 
     def read(self, repository, branch, path):
-        assert repository == "owner/repository"
+        assert repository == self.repository
         assert branch == "gwo-control"
         return self._commits[self.head].get(path)
 
@@ -646,7 +656,7 @@ class _RefContentClient:
         changes,
         message,
     ):
-        assert repository == "owner/repository"
+        assert repository == self.repository
         assert branch == "gwo-control"
         if "activate Plan Revision" in message and self.activation_barrier is not None:
             self.activation_barrier.wait()
@@ -678,12 +688,13 @@ class _RefContentClient:
         if status == "draining":
             blocker = _writer_drain_dispatch_blocker(
                 self,
-                "owner/repository",
+                self.repository,
                 self.head,
                 writer_generation=writer_generation,
-                cut_over_record_id=self._writer_value(writer_generation)["current"][
-                    "record_id"
-                ],
+                cut_over_record_id=self._writer_value(
+                    writer_generation,
+                    repository=self.repository,
+                )["current"]["record_id"],
             )
             if blocker is not None:
                 self.drain_blockers.append(blocker)
@@ -692,12 +703,21 @@ class _RefContentClient:
         tree = dict(self._commits[self.head])
         tree[".gwo-v8/writer-transition.json"] = self._content_type(
             canonical_bytes(
-                self._writer_value(writer_generation, status=status)
+                self._writer_value(
+                    writer_generation,
+                    status=status,
+                    repository=self.repository,
+                )
             ),
             "blob:writer:two",
         )
         tree[".gwo/v8/active-plan.json"] = self._content_type(
-            canonical_bytes(self._activation_value(writer_generation)),
+            canonical_bytes(
+                self._activation_value(
+                    writer_generation,
+                    repository=self.repository,
+                )
+            ),
             "blob:activation:two",
         )
         self.head = f"commit:{len(self._commits) + 1}"
@@ -2789,11 +2809,11 @@ def test_r10_dispatch_resolution_requires_exact_subject_boundary_and_ticket(
     assert repository.planning_progress_mode(owner) == "draining"
 
 
-def _r10_dispatch_subject(ordinal):
+def _r10_dispatch_subject(ordinal, *, repository="owner/repository"):
     from gwo_v8.runtime_gateway import CampaignPlanningSubject
 
     return CampaignPlanningSubject(
-        repository="owner/repository",
+        repository=repository,
         campaign_key=f"campaign:r10-ledger:{ordinal}",
         campaign_handle=f"campaign-handle:r10-ledger:{ordinal}",
         expected_previous_plan_revision_digest=None,
@@ -2827,7 +2847,12 @@ def _r10_dispatch_entry(client, subject, *, state="recovery", attempt=1):
     return {**entry, "ticket": _planning_effect_dispatch_ticket(entry)}
 
 
-def _r10_install_dispatch_entries(client, entries):
+def _r10_install_dispatch_entries(
+    client,
+    entries,
+    *,
+    repository="owner/repository",
+):
     from gwo_v8._canonical import canonical_bytes
     from gwo_v8.transition import _PLANNING_EFFECT_DISPATCH_PATH, _PLANNING_EFFECT_DISPATCH_SCHEMA
 
@@ -2836,7 +2861,7 @@ def _r10_install_dispatch_entries(client, entries):
         canonical_bytes(
             {
                 "schema_version": _PLANNING_EFFECT_DISPATCH_SCHEMA,
-                "repository": "owner/repository",
+                "repository": repository,
                 "entries": entries,
             }
         ),
@@ -2846,11 +2871,11 @@ def _r10_install_dispatch_entries(client, entries):
     client._commits[client.head] = tree
 
 
-def _r10_drain_record(reason):
+def _r10_drain_record(reason, *, repository="owner/repository"):
     from gwo_v8.transition import _record
 
     return _record(
-        repository="owner/repository",
+        repository=repository,
         kind="drain",
         status="draining",
         previous_writer_generation="writer:one",
@@ -3706,3 +3731,73 @@ def test_r10_planning_transition_matrix_never_dispatches(
 
     assert rejected.value.code == "RUNTIME_PLANNING_TRANSITION_FORBIDDEN"
     assert (adapter.created_agent_count, tuple(adapter.command_calls)) == before
+
+
+@pytest.mark.parametrize(
+    ("ledger_repository", "consumer_repository", "accepted"),
+    (
+        pytest.param("r" * 256, "r" * 256, True, id="exact-256-bytes"),
+        pytest.param("r" * 257, "r" * 257, False, id="257-bytes"),
+        pytest.param("", "owner/repository", False, id="empty"),
+        pytest.param(None, "owner/repository", False, id="non-string"),
+    ),
+)
+def test_r11_dispatch_ledger_repository_header_is_bounded_for_both_consumers(
+    ledger_repository,
+    consumer_repository,
+    accepted,
+):
+    """Plan admission and Writer drain share one exact header-repository bound."""
+
+    from gwo_v8.plan_control import PlanControlError
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.transition import GitHubWriterTransitionControl, WriterTransitionBlocked
+
+    plan_client = _RefContentClient(repository=consumer_repository)
+    _r10_install_dispatch_entries(
+        plan_client,
+        [],
+        repository=ledger_repository,
+    )
+    subject = _r10_dispatch_subject(0, repository=consumer_repository)
+    plan_repository = GitHubPlanRepository(
+        plan_client,
+        repository=consumer_repository,
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    if accepted:
+        assert plan_repository.planning_effect_dispatch().enter(
+            subject,
+            "prepare",
+        ).startswith("planning-dispatch:")
+        assert len(plan_client.writes) == 1
+    else:
+        with pytest.raises(PlanControlError) as rejected:
+            plan_repository.planning_effect_dispatch().enter(subject, "prepare")
+        assert rejected.value.code == "WRITER_FENCE_READBACK_INVALID"
+        assert plan_client.writes == []
+
+    writer_client = _RefContentClient(repository=consumer_repository)
+    _r10_install_dispatch_entries(
+        writer_client,
+        [],
+        repository=ledger_repository,
+    )
+    transitions = GitHubWriterTransitionControl(
+        writer_client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    drain = _r10_drain_record(
+        "r11 repository header",
+        repository=consumer_repository,
+    )
+    if accepted:
+        transitions.publish(drain)
+        assert len(writer_client.writes) == 1
+    else:
+        with pytest.raises(WriterTransitionBlocked) as blocked:
+            transitions.publish(drain)
+        assert blocked.value.code == "WRITER_DRAIN_DISPATCH_INVALID"
+        assert writer_client.writes == []

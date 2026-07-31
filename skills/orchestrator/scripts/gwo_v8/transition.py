@@ -847,6 +847,22 @@ def _planning_effect_dispatch_ledger_bytes(
     return rendered
 
 
+def _planning_effect_dispatch_text(value: object, label: str) -> str:
+    """Validate one exact bounded dispatch-ledger text field."""
+
+    if type(value) is not str or not value:
+        raise ValueError(f"control-ref dispatch {label} is not exact text")
+    try:
+        byte_length = len(value.encode("utf-8"))
+    except UnicodeError as error:
+        raise ValueError(
+            f"control-ref dispatch {label} is not UTF-8 text"
+        ) from error
+    if byte_length > _PLANNING_EFFECT_DISPATCH_MAX_TEXT_BYTES:
+        raise ValueError(f"control-ref dispatch {label} exceeds its text budget")
+    return value
+
+
 def _validate_planning_effect_dispatch_entries(
     repository: str,
     raw_entries: object,
@@ -879,16 +895,14 @@ def _validate_planning_effect_dispatch_entries(
             or type(raw["attempt"]) is not int
             or isinstance(raw["attempt"], bool)
             or not 1 <= raw["attempt"] <= _PLANNING_EFFECT_DISPATCH_MAX_ATTEMPT
-            or any(
-                type(raw[name]) is not str
-                or not raw[name]
-                or len(raw[name].encode("utf-8"))
-                > _PLANNING_EFFECT_DISPATCH_MAX_TEXT_BYTES
-                for name in _PLANNING_EFFECT_DISPATCH_FIELDS - {"attempt"}
-            )
             or raw["ticket"] != _planning_effect_dispatch_ticket(raw)
         ):
             raise ValueError("control-ref dispatch entry fields are invalid")
+        try:
+            for name in _PLANNING_EFFECT_DISPATCH_FIELDS - {"attempt"}:
+                _planning_effect_dispatch_text(raw[name], f"entry {name}")
+        except ValueError as error:
+            raise ValueError("control-ref dispatch entry fields are invalid") from error
         key = (
             raw["writer_generation"],
             raw["writer_cut_over_record_id"],
@@ -929,7 +943,11 @@ def _planning_effect_dispatch_entries_at_ref(
         type(value) is not dict
         or set(value) != {"schema_version", "repository", "entries"}
         or value["schema_version"] != _PLANNING_EFFECT_DISPATCH_SCHEMA
-        or value["repository"] != repository
+    ):
+        raise ValueError("control-ref dispatch ledger schema is invalid")
+    if (
+        _planning_effect_dispatch_text(value["repository"], "ledger repository")
+        != repository
     ):
         raise ValueError("control-ref dispatch ledger schema is invalid")
     return _validate_planning_effect_dispatch_entries(repository, value["entries"])
