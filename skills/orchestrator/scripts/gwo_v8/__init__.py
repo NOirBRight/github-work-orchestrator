@@ -18,12 +18,28 @@ from .activation import (
 )
 from .compiler import CompiledPlan, CompileError, PlanCompiler
 from .plan_control import (
+    ActivePlanReadback,
+    ActivationReceipt as PlanControlActivationReceipt,
     CampaignHandle,
     PlanControlError,
+    TicketClaimProof,
     start,
 )
 from .plan_control_host import (
     install_github_plan_control_start,
+)
+from .execution_kernel import (
+    CampaignOutcome,
+    CampaignStatus,
+    Diagnostics,
+    ExecutionKernel,
+    ExecutionKernelConfiguration,
+    ExecutionKernelError,
+    WorkRunAction,
+    WorkRunObservation,
+    advance,
+    inspect,
+    install_execution_kernel,
 )
 from .entry import (
     ImplementGwoDecision,
@@ -156,11 +172,19 @@ from .transition import (
     WriterTransitionRecord,
 )
 
+# ``ActivationReceipt`` was published by the predecessor activation module.
+# Keep that compatibility spelling for guarded V2 migration callers, while
+# every V3 execution caller uses the explicit #109 name below.  The two
+# records have different schemas and are never interchangeable.
+LegacyActivationReceipt = ActivationReceipt
+
 __all__ = [
     "ActivationError",
     "ActivationCheckpointCrash",
     "ActivationOutcome",
     "ActivationReceipt",
+    "ActivePlanReadback",
+    "advance",
     "ActiveTurnPools",
     "AuthoritativeNodeReadback",
     "AuthoritativeRepositoryReadback",
@@ -168,13 +192,19 @@ __all__ = [
     "CanaryEvidenceControl",
     "CanaryRunReadback",
     "CanaryRunVerifier",
+    "CampaignOutcome",
+    "CampaignStatus",
     "CandidatePublication",
     "CompiledPlan",
     "CompileError",
     "DeliveryControl",
     "DeliveryControlError",
+    "Diagnostics",
     "EvidenceVerifier",
     "ExecutionBudgetReadback",
+    "ExecutionKernel",
+    "ExecutionKernelConfiguration",
+    "ExecutionKernelError",
     "PublicationEligibility",
     "ReviewGateDecision",
     "DurablePlanControl",
@@ -201,6 +231,7 @@ __all__ = [
     "GoalSnapshot",
     "HostedCheckReadback",
     "IntegrationReadback",
+    "inspect",
     "IntegrationBatch",
     "IntegrationBatchError",
     "IntegrationBatchMember",
@@ -229,8 +260,10 @@ __all__ = [
     "KernelReconciliationPlan",
     "LocalPlanPublication",
     "LegacyWriterControl",
+    "LegacyActivationReceipt",
     "LegacyWriterReadback",
     "PlanCompiler",
+    "PlanControlActivationReceipt",
     "PaseoAgentRecord",
     "PaseoCliClient",
     "PaseoClient",
@@ -247,6 +280,7 @@ __all__ = [
     "ReconstructionResult",
     "ResultClaim",
     "TypedEvidence",
+    "TicketClaimProof",
     "RuntimeAdapterError",
     "RuntimeAdapter",
     "RuntimeAdmission",
@@ -264,6 +298,8 @@ __all__ = [
     "RuntimeGatewayError",
     "RuntimeProgressReceipt",
     "RuntimeTransition",
+    "WorkRunAction",
+    "WorkRunObservation",
     "WorkRunPurpose",
     "WorkRunSubject",
     "build_runtime_gateway",
@@ -289,5 +325,6 @@ __all__ = [
     "CampaignHandle",
     "PlanControlError",
     "install_github_plan_control_start",
+    "install_execution_kernel",
     "start",
 ]

@@ -1509,6 +1509,53 @@ def test_public_start_binds_explicit_empty_runtime_assertion_after_preflight(
     assert len(gateways[0].preflights) == 1
 
 
+def test_production_start_host_forwards_only_exact_active_plan_readback(tmp_path):
+    """#110 consumes #109 authority without reopening Planning or claims."""
+
+    from gwo_v8.plan_control import InMemoryPlanRepository
+    from gwo_v8.plan_control_host import ProductionPlanControlStartHost
+    from gwo_v8.runtime_gateway import ProfileMapping, RuntimeConfiguration
+    from gwo_v8.runtime_profile import RuntimeProfile
+
+    profile = RuntimeProfile(
+        name="host",
+        provider="test-provider",
+        model="model:host",
+        thinking="high",
+        mode="safe",
+        features={},
+    )
+    repository = InMemoryPlanRepository(writer_generation="writer:one")
+    gateways = []
+
+    def builder(*, artifacts, **_kwargs):
+        gateway = _Gateway(artifacts)
+        gateways.append(gateway)
+        return gateway
+
+    host = ProductionPlanControlStartHost(
+        source=_Source(),
+        repository=repository,
+        runtime_configuration=RuntimeConfiguration(
+            profiles={profile.digest: profile},
+            host_mappings={"coordinator": ProfileMapping(profile.digest)},
+        ),
+        repository_contexts={},
+        gateway_store_path=tmp_path / "gateway.json",
+        artifact_root=tmp_path / "artifacts",
+        _gateway_builder=builder,
+    )
+    handle = host.start("owner/repository", ["issue:109"])
+    active = host.read_active(handle)
+
+    assert active.handle == handle
+    assert active.current_revision_digest == active.activation_receipt.revision_digest
+    assert [proof.ticket_key for proof in active.claim_proofs] == ["issue:109"]
+    assert len(gateways) == 2
+    assert gateways[1].preflights == []
+    assert gateways[1].progresses == []
+
+
 @pytest.mark.parametrize("failure", ["composition", "preflight"])
 def test_public_start_never_binds_runtime_assertion_before_exact_preflight(
     tmp_path,

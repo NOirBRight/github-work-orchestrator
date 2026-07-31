@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-from typing import Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from .plan_control import (
+    ActivePlanReadback,
     CampaignHandle,
     CampaignSnapshotSource,
     PlanControl,
@@ -44,6 +45,13 @@ from .plan_control_github import (
     WriterGenerationReadback,
     validate_github_plan_control_paths,
 )
+
+if TYPE_CHECKING:
+    from .execution_kernel import (
+        ExecutionKernel,
+        ExecutionKernelConfiguration,
+        WorkRunEffects,
+    )
 
 
 _GatewayBuilder = Callable[..., Any]
@@ -438,6 +446,64 @@ class ProductionPlanControlStartHost:
             refs,
             campaign_key=handle.campaign_key,
             expected_previous_revision_digest=expected_previous_revision_digest,
+        )
+
+    def read_active(self, handle: CampaignHandle) -> ActivePlanReadback:
+        """Expose the sole #110 active-reader seam for V3 execution.
+
+        This recreates only the exact PlanControl composition needed to verify
+        #109's immutable Plan Revision, Activation Receipt, and Ticket claims.
+        It performs no Planning, publication, claim, or Runtime effect.
+        """
+
+        if type(handle) is not CampaignHandle:
+            raise PlanControlError(
+                "ACTIVE_READBACK_INVALID",
+                "active readback requires the exact CampaignHandle",
+            )
+        fixed_repository = getattr(self._repository, "repository", None)
+        if (
+            type(fixed_repository) is str
+            and fixed_repository
+            and handle.repository != fixed_repository
+        ):
+            raise PlanControlError(
+                "ACTIVE_READBACK_INVALID",
+                "CampaignHandle belongs to another configured repository",
+            )
+        assertion_key = (
+            handle.repository,
+            handle.campaign_key,
+            _handle_ref(handle),
+        )
+        assertion = self._configuration.campaign_assertions.get(assertion_key)
+        return self._control_for(
+            handle=handle,
+            assertion=assertion,
+            configuration=self._runtime_configuration_for(handle, assertion),
+        ).read_active(handle)
+
+    def install_execution_kernel(
+        self,
+        *,
+        store_path: Path,
+        effects: "WorkRunEffects",
+        configuration: "ExecutionKernelConfiguration | None" = None,
+    ) -> "ExecutionKernel":
+        """Compose the V3 public path as ``start`` then ``advance/inspect``.
+
+        Only the typed effect port crosses this host boundary.  The Kernel
+        receives this host solely as the #109 active reader; it cannot call a
+        legacy driver, PlanControl mutation, Runtime provider, or V2 decoder.
+        """
+
+        from .execution_kernel import install_execution_kernel
+
+        return install_execution_kernel(
+            store_path=store_path,
+            plan_control=self,
+            effects=effects,
+            configuration=configuration,
         )
 
 
