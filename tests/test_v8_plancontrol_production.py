@@ -2707,13 +2707,13 @@ def test_r10_foreign_campaign_reconcile_cannot_resolve_active_dispatch():
         reason="r10 foreign reconcile",
     )
 
-    dispatch.reconcile(subject_b, "prepared")
+    dispatch.reconcile(subject_b, ("prepare",))
 
     with pytest.raises(WriterTransitionBlocked) as blocked:
         transitions.publish(drain)
     assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"
 
-    dispatch.reconcile(subject_a, "prepared")
+    dispatch.reconcile(subject_a, ("prepare",))
     transitions.publish(drain)
     assert repository.planning_progress_mode(subject_a) == "draining"
 
@@ -3831,3 +3831,424 @@ def test_r11_dispatch_ledger_repository_header_is_bounded_for_both_consumers(
             transitions.publish(drain)
         assert blocked.value.code == "WRITER_DRAIN_DISPATCH_INVALID"
         assert writer_client.writes == []
+
+
+@pytest.mark.parametrize(
+    ("boundary", "initial_state", "transition"),
+    (
+        ("prepare", "absent", None),
+        ("start", "prepared", "start"),
+        ("resume", "parked", "resume"),
+        ("permission_allow", "running", "permission_allow"),
+    ),
+)
+def test_r13_effect_ticket_blocks_writer_drain_until_authoritative_proof(
+    boundary,
+    initial_state,
+    transition,
+    tmp_path,
+):
+    """A returned effect remains Writer-fenced until its readback proves it."""
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import PermissionResponse, RuntimeCommand
+    from gwo_v8.transition import GitHubWriterTransitionControl, WriterTransitionBlocked
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    gateway, subject, preflight, adapter = _r8_authorized_runtime_gateway(
+        tmp_path,
+        repository,
+        "prepared" if initial_state != "absent" else "absent",
+    )
+    if initial_state == "parked":
+        adapter._complete_action = lambda _action: None  # type: ignore[method-assign]
+        assert gateway.progress(subject, preflight).status == "running"
+        assert gateway.transition(subject.stable_action_id, RuntimeCommand.PARK).status == "parked"
+    elif initial_state == "running":
+        adapter._complete_action = lambda _action: None  # type: ignore[method-assign]
+        adapter._actions[subject.stable_action_id].pending_permissions = [
+            ("request:r13", "write", "repository")
+        ]
+        assert gateway.progress(subject, preflight).status == "running"
+
+    command = (
+        None
+        if transition is None
+        else (
+            getattr(RuntimeCommand, transition.upper())
+            if transition != "permission_allow"
+            else PermissionResponse("request:r13", "allow")
+        )
+    )
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    returned = False
+    drain_blockers = []
+    native_observe = adapter.observe
+
+    def observe_after_effect(stable_action_id):
+        if returned and not drain_blockers:
+            with pytest.raises(WriterTransitionBlocked) as blocked:
+                transitions.publish(_r10_drain_record(f"r13 {boundary} proof"))
+            drain_blockers.append(blocked.value.code)
+        return native_observe(stable_action_id)
+
+    adapter.observe = observe_after_effect  # type: ignore[method-assign]
+    if boundary == "prepare":
+        native_prepare = adapter.prepare
+
+        def prepare_then_mark(spec):
+            nonlocal returned
+            result = native_prepare(spec)
+            returned = True
+            return result
+
+        adapter.prepare = prepare_then_mark  # type: ignore[method-assign]
+        assert gateway.progress(subject, preflight).status == "completed"
+    else:
+        native_command = adapter.command
+
+        def command_then_mark(stable_action_id, observed_transition):
+            nonlocal returned
+            result = native_command(stable_action_id, observed_transition)
+            if observed_transition == command:
+                returned = True
+            return result
+
+        adapter.command = command_then_mark  # type: ignore[method-assign]
+        assert gateway.transition(subject.stable_action_id, command).status in {
+            "running",
+            "completed",
+        }
+
+    assert drain_blockers == ["WRITER_DRAIN_DISPATCH_ACTIVE"]
+    transitions.publish(_r10_drain_record(f"r13 {boundary} converged"))
+
+
+def _r13_fill_dispatch_ledger_to_limit(entries):
+    """Pad exact valid entry fields to the shared canonical-byte boundary."""
+
+    from gwo_v8._canonical import canonical_bytes
+    from gwo_v8.transition import (
+        _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES,
+        _PLANNING_EFFECT_DISPATCH_SCHEMA,
+        _planning_effect_dispatch_ticket,
+    )
+
+    def payload_size():
+        return len(
+            canonical_bytes(
+                {
+                    "schema_version": _PLANNING_EFFECT_DISPATCH_SCHEMA,
+                    "repository": "owner/repository",
+                    "entries": entries,
+                }
+            )
+        )
+
+    for entry in entries[1:]:
+        for field in (
+            "campaign_key",
+            "campaign_handle",
+            "stable_action_id",
+            "writer_generation",
+            "writer_cut_over_record_id",
+            "writer_observation_ref",
+        ):
+            remaining = _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES - payload_size()
+            if remaining <= 0:
+                break
+            current = entry[field]
+            growth = min(remaining, 256 - len(current.encode("utf-8")))
+            entry[field] = current + ("x" * growth)
+            entry["ticket"] = _planning_effect_dispatch_ticket(entry)
+        if payload_size() == _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES:
+            break
+    assert payload_size() == _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES
+
+
+def test_r13_exact_limit_resolution_compacts_recovery_evidence_before_cas():
+    """Resolution uses the shared bounded renderer and keeps its own evidence."""
+
+    from gwo_v8._canonical import load_canonical_json
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.transition import (
+        GitHubWriterTransitionControl,
+        WriterTransitionBlocked,
+        _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES,
+    )
+
+    client = _RefContentClient()
+    owner = _r10_dispatch_subject(80)
+    entries = [_r10_dispatch_entry(client, owner, state="active")]
+    entries.extend(
+        _r10_dispatch_entry(
+            client,
+            _r10_dispatch_subject(ordinal),
+            state="active" if ordinal < 86 else "recovery",
+        )
+        for ordinal in range(81, 88)
+    )
+    _r13_fill_dispatch_ledger_to_limit(entries)
+    _r10_install_dispatch_entries(client, entries)
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    dispatch = repository.planning_effect_dispatch()
+    ticket = entries[0]["ticket"]
+
+    dispatch.resolve(owner, "prepare", ticket)
+
+    ledger = load_canonical_json(
+        client._commits[client.head][
+            ".gwo-v8/planning-effect-dispatch-v1.json"
+        ].content
+    )
+    assert len(
+        client._commits[client.head][
+            ".gwo-v8/planning-effect-dispatch-v1.json"
+        ].content
+    ) <= _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES
+    resolved = [entry for entry in ledger["entries"] if entry["ticket"] == ticket]
+    assert len(resolved) == 1 and resolved[0]["state"] == "recovery"
+    assert dispatch.enter(_r10_dispatch_subject(99), "prepare").startswith(
+        "planning-dispatch:"
+    )
+
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    with pytest.raises(WriterTransitionBlocked) as blocked:
+        transitions.publish(_r10_drain_record("r13 compacted reader"))
+    assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"
+
+
+def test_r13_uncompactable_limit_resolution_fails_before_cas():
+    """No over-budget recovery ledger is committed when nothing is prunable."""
+
+    from gwo_v8.plan_control import PlanControlError
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+
+    client = _RefContentClient()
+    owner = _r10_dispatch_subject(100)
+    entries = [_r10_dispatch_entry(client, owner, state="active")]
+    entries.extend(
+        _r10_dispatch_entry(client, _r10_dispatch_subject(ordinal), state="active")
+        for ordinal in range(101, 108)
+    )
+    _r13_fill_dispatch_ledger_to_limit(entries)
+    _r10_install_dispatch_entries(client, entries)
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    dispatch = repository.planning_effect_dispatch()
+    before = client.head
+
+    with pytest.raises(PlanControlError) as rejected:
+        dispatch.resolve(owner, "prepare", entries[0]["ticket"])
+
+    assert rejected.value.code == "PLANNING_EFFECT_DISPATCH_BOUNDED"
+    assert client.head == before
+
+
+@pytest.mark.parametrize(
+    ("boundary", "initial_state", "transition"),
+    (
+        ("prepare", "absent", None),
+        ("start", "prepared", "start"),
+        ("resume", "parked", "resume"),
+        ("permission_allow", "running", "permission_allow"),
+    ),
+)
+def test_r13_restart_after_return_before_readback_proves_once_without_duplicate_effect(
+    boundary,
+    initial_state,
+    transition,
+    tmp_path,
+):
+    """A post-return crash leaves one active ticket until exact restart proof."""
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import (
+        PermissionResponse,
+        RuntimeCommand,
+        RuntimeGateway,
+    )
+    from gwo_v8.transition import GitHubWriterTransitionControl, WriterTransitionBlocked
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    gateway, subject, preflight, adapter = _r8_authorized_runtime_gateway(
+        tmp_path,
+        repository,
+        "prepared" if initial_state != "absent" else "absent",
+    )
+    if initial_state in {"parked", "running"}:
+        adapter._complete_action = lambda _action: None  # type: ignore[method-assign]
+        if initial_state == "running":
+            adapter._actions[subject.stable_action_id].pending_permissions = [
+                ("request:r13-crash", "write", "repository")
+            ]
+        assert gateway.progress(subject, preflight).status == "running"
+        if initial_state == "parked":
+            assert gateway.transition(subject.stable_action_id, RuntimeCommand.PARK).status == "parked"
+    command = (
+        None
+        if transition is None
+        else (
+            getattr(RuntimeCommand, transition.upper())
+            if transition != "permission_allow"
+            else PermissionResponse("request:r13-crash", "allow")
+        )
+    )
+    returned = False
+    native_observe = adapter.observe
+
+    def crash_before_readback(stable_action_id):
+        nonlocal returned
+        if returned:
+            returned = False
+            raise KeyboardInterrupt()
+        return native_observe(stable_action_id)
+
+    adapter.observe = crash_before_readback  # type: ignore[method-assign]
+    if boundary == "prepare":
+        native_prepare = adapter.prepare
+
+        def prepare_then_mark(spec):
+            nonlocal returned
+            result = native_prepare(spec)
+            returned = True
+            return result
+
+        adapter.prepare = prepare_then_mark  # type: ignore[method-assign]
+        with pytest.raises(KeyboardInterrupt):
+            gateway.progress(subject, preflight)
+    else:
+        native_command = adapter.command
+
+        def command_then_mark(stable_action_id, observed_transition):
+            nonlocal returned
+            result = native_command(stable_action_id, observed_transition)
+            if observed_transition == command:
+                returned = True
+            return result
+
+        adapter.command = command_then_mark  # type: ignore[method-assign]
+        with pytest.raises(KeyboardInterrupt):
+            gateway.transition(subject.stable_action_id, command)
+
+    after_crash = (
+        tuple(adapter.prepare_calls),
+        adapter.created_agent_count,
+        tuple(adapter.command_calls),
+    )
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    with pytest.raises(WriterTransitionBlocked) as blocked:
+        transitions.publish(_r10_drain_record(f"r13 {boundary} crash"))
+    assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"
+
+    adapter.observe = native_observe  # type: ignore[method-assign]
+    restarted = RuntimeGateway(
+        store_path=tmp_path / "gateway.json",
+        _adapter=adapter,
+        configuration=gateway._configuration,
+        _artifacts=adapter._artifacts,
+        _planning_effect_dispatch=repository.planning_effect_dispatch(),
+    )
+    assert restarted.progress(subject, preflight).status in {"running", "completed"}
+    if boundary == "prepare":
+        assert tuple(adapter.prepare_calls) == after_crash[0]
+    else:
+        assert (
+            tuple(adapter.prepare_calls),
+            adapter.created_agent_count,
+            tuple(adapter.command_calls),
+        ) == after_crash
+    transitions.publish(_r10_drain_record(f"r13 {boundary} recovered"))
+
+
+@pytest.mark.parametrize(
+    ("boundary", "evidence"),
+    (
+        ("resume", "parked"),
+        ("permission_allow", "pending"),
+        ("permission_allow", "deny"),
+    ),
+)
+def test_r13_restart_readback_does_not_resolve_the_wrong_effect_boundary(
+    boundary,
+    evidence,
+    tmp_path,
+):
+    """Only the ticket's exact boundary proof may release Writer drain."""
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import PermissionResponse, RuntimeCommand
+    from gwo_v8.transition import GitHubWriterTransitionControl, WriterTransitionBlocked
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    gateway, subject, preflight, adapter = _r8_authorized_runtime_gateway(
+        tmp_path,
+        repository,
+        "prepared",
+    )
+    adapter._complete_action = lambda _action: None  # type: ignore[method-assign]
+    if boundary == "resume":
+        assert gateway.progress(subject, preflight).status == "running"
+        assert gateway.transition(subject.stable_action_id, RuntimeCommand.PARK).status == "parked"
+    else:
+        adapter._actions[subject.stable_action_id].pending_permissions = [
+            ("request:r13-proof", "write", "repository")
+        ]
+        assert gateway.progress(subject, preflight).status == "running"
+    dispatch = repository.planning_effect_dispatch()
+    assert dispatch.enter(subject, boundary).startswith("planning-dispatch:")
+    if evidence == "deny":
+        adapter.observe(subject.stable_action_id)
+        assert adapter.command(
+            subject.stable_action_id,
+            PermissionResponse("request:r13-proof", "deny"),
+        )
+
+    assert gateway.transition(subject.stable_action_id, RuntimeCommand.PARK).status == "parked"
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    with pytest.raises(WriterTransitionBlocked) as blocked:
+        transitions.publish(_r10_drain_record(f"r13 wrong {boundary} {evidence}"))
+    assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"

@@ -7704,7 +7704,7 @@ class _PlanningEffectDispatch(Protocol):
     def reconcile(
         self,
         subject: CampaignPlanningSubject,
-        observation_kind: str,
+        effect_proofs: tuple[str, ...],
     ) -> None: ...
 
 
@@ -8021,18 +8021,10 @@ class RuntimeGateway:
             None if not isinstance(subject, CampaignPlanningSubject) else persisted_preflight,
         )
         self._validate_static_assignment(subject, record)
+        prepared_dispatch_ticket: str | None = None
         observation_verdict = self._observe_verdict(
             subject.stable_action_id
         )
-        if (
-            type(subject) is CampaignPlanningSubject
-            and observation_verdict.kind
-            in {"authoritative_absence", "prepared", "bound"}
-        ):
-            self._reconcile_planning_effect_dispatch(
-                subject,
-                observation_verdict.kind,
-            )
         if observation_verdict.kind == "authoritative_absence":
             if planning_mode == "draining":
                 raise RuntimeGatewayError(
@@ -8052,16 +8044,11 @@ class RuntimeGateway:
                 prompt_artifact=prompt_artifact,
                 input_artifacts=input_artifacts,
             )
-            dispatch_ticket = self._enter_planning_effect_dispatch(
+            prepared_dispatch_ticket = self._enter_planning_effect_dispatch(
                 subject,
                 "prepare",
             )
             prepared_verdict = self._prepare_verdict(spec)
-            self._resolve_planning_effect_dispatch(
-                subject,
-                "prepare",
-                dispatch_ticket,
-            )
             if prepared_verdict.kind == "recoverable_failure":
                 assert prepared_verdict.failure is not None
                 prepare_failure = prepared_verdict.failure
@@ -8104,6 +8091,17 @@ class RuntimeGateway:
             observation = observation_verdict.observation
             assert observation is not None
             self._validate_prepared_observation(subject, record, observation)
+            if prepared_dispatch_ticket is not None:
+                self._resolve_planning_effect_dispatch(
+                    subject,
+                    "prepare",
+                    prepared_dispatch_ticket,
+                )
+            elif type(subject) is CampaignPlanningSubject:
+                self._reconcile_planning_effect_dispatch(
+                    subject,
+                    observation_verdict,
+                )
             if planning_mode == "draining":
                 raise RuntimeGatewayError(
                     "RUNTIME_RECOVERY_ONLY",
@@ -8128,6 +8126,17 @@ class RuntimeGateway:
             observation = observation_verdict.observation
             assert observation is not None
             self._validate_bound_observation(subject, record, observation)
+            if prepared_dispatch_ticket is not None:
+                self._resolve_planning_effect_dispatch(
+                    subject,
+                    "prepare",
+                    prepared_dispatch_ticket,
+                )
+            elif type(subject) is CampaignPlanningSubject:
+                self._reconcile_planning_effect_dispatch(
+                    subject,
+                    observation_verdict,
+                )
             if planning_mode == "draining" and observation.lifecycle != "completed":
                 raise RuntimeGatewayError(
                     "RUNTIME_RECOVERY_ONLY",
@@ -8277,13 +8286,18 @@ class RuntimeGateway:
     def _reconcile_planning_effect_dispatch(
         self,
         subject: CampaignPlanningSubject,
-        observation_kind: str,
+        observation_verdict: _RuntimeObservationVerdict,
     ) -> None:
+        """Resolve only the active boundary mechanically proved by readback."""
+
         dispatch = self._planning_effect_dispatch
         if dispatch is None:
             return
+        effect_proofs = self._planning_effect_readback_proofs(observation_verdict)
+        if not effect_proofs:
+            return
         try:
-            dispatch.reconcile(subject, observation_kind)
+            dispatch.reconcile(subject, effect_proofs)
         except RuntimeGatewayError:
             raise
         except Exception as error:
@@ -8291,6 +8305,33 @@ class RuntimeGateway:
                 "RUNTIME_RECOVERY_ONLY",
                 "Planning provider-effect dispatch could not reconcile its durable state",
             ) from error
+
+    @staticmethod
+    def _planning_effect_readback_proofs(
+        observation_verdict: _RuntimeObservationVerdict,
+    ) -> tuple[str, ...]:
+        """Project validated readback into closed, adapter-private effect proofs."""
+
+        if observation_verdict.kind == "prepared":
+            return ("prepare",)
+        if observation_verdict.kind != "bound":
+            return ()
+        observation = observation_verdict.observation
+        assert observation is not None
+        proofs = ["prepare"]
+        if observation.lifecycle in {"running", "completed"}:
+            proofs.extend(("start", "resume"))
+        completed = observation.completed_permission_response
+        if (
+            type(completed) is _CompletedPermissionResponse
+            and completed.decision == "allow"
+            and _completed_permission_effect_matches(
+                PermissionResponse(completed.request_id, "allow"),
+                observation,
+            )
+        ):
+            proofs.append("permission_allow")
+        return tuple(proofs)
 
     def _planning_command_with_readback(
         self,
@@ -8368,11 +8409,6 @@ class RuntimeGateway:
             ):
                 assert observation_verdict.failure is not None
                 self._raise_failure(observation_verdict.failure)
-            if type(subject) is CampaignPlanningSubject:
-                self._reconcile_planning_effect_dispatch(
-                    subject,
-                    observation_verdict.kind,
-                )
             if (
                 command is RuntimeCommand.START
                 and observation_verdict.kind != "prepared"
@@ -8405,6 +8441,11 @@ class RuntimeGateway:
                 )
             else:
                 self._validate_bound_observation(subject, record, observed)
+            if type(subject) is CampaignPlanningSubject:
+                self._reconcile_planning_effect_dispatch(
+                    subject,
+                    observation_verdict,
+                )
             self._record_observation(record, observation_verdict)
             progressed_verdict = self._planning_command_with_readback(
                 subject,
@@ -8436,7 +8477,7 @@ class RuntimeGateway:
         assert observation is not None
         self._validate_bound_observation(subject, record, observation)
         if type(subject) is CampaignPlanningSubject:
-            self._reconcile_planning_effect_dispatch(subject, observation_verdict.kind)
+            self._reconcile_planning_effect_dispatch(subject, observation_verdict)
         if type(command) is PermissionResponse:
             if observation.lifecycle in {"completed", "retired"}:
                 if _completed_permission_effect_matches(command, observation):
@@ -9214,8 +9255,6 @@ class RuntimeGateway:
             result = _RuntimeFailure(
                 "RUNTIME_PROVIDER_PROTOCOL_INVALID", "Runtime provider command failed"
             )
-        if _after_dispatch is not None:
-            _after_dispatch()
         verdict = _RuntimeCommandResultProtocol.validate(
             result,
             stable_action_id,
@@ -9244,6 +9283,8 @@ class RuntimeGateway:
                     "command acknowledgement loss read back an unbound Runtime action",
                 )
             self._validate_command_effect(command, observation_verdict)
+            if _after_dispatch is not None:
+                _after_dispatch()
             return observation_verdict
         assert verdict.kind == "receipt"
         assert verdict.receipt is not None
@@ -9251,6 +9292,8 @@ class RuntimeGateway:
             stable_action_id
         )
         self._validate_command_effect(command, observation_verdict)
+        if _after_dispatch is not None:
+            _after_dispatch()
         return observation_verdict
 
     def _validate_command_effect(

@@ -323,11 +323,11 @@ class _GitHubPlanningEffectDispatch:
     def reconcile(
         self,
         subject: CampaignPlanningSubject,
-        observation_kind: str,
+        effect_proofs: tuple[str, ...],
     ) -> None:
         self._repository._reconcile_planning_effect_dispatch(
             subject,
-            observation_kind,
+            effect_proofs,
         )
 
 
@@ -2873,6 +2873,8 @@ class GitHubPlanRepository:
     def _compact_planning_effect_dispatch_entries(
         self,
         entries: list[dict[str, Any]],
+        *,
+        retain_ticket: str | None = None,
     ) -> tuple[list[dict[str, Any]], bytes]:
         """Retain active facts and trim only ordered recovery evidence."""
 
@@ -2904,14 +2906,17 @@ class GitHubPlanRepository:
                     (
                         entry
                         for entry in ordered
-                        if entry["state"] == "recovery"
+                        if (
+                            entry["state"] == "recovery"
+                            and entry["ticket"] != retain_ticket
+                        )
                     ),
                     None,
                 )
                 if recovery is None:
                     raise PlanControlError(
                         "PLANNING_EFFECT_DISPATCH_BOUNDED",
-                        "Planning effect dispatch cannot fit one exact active ticket",
+                        "Planning effect dispatch cannot fit one exact retained ticket",
                     ) from error
                 compacted.remove(recovery)
 
@@ -3099,12 +3104,9 @@ class GitHubPlanRepository:
             )
         resolved = {**entry, "state": "recovery"}
         entries[entries.index(entry)] = resolved
-        rendered = canonical_bytes(
-            {
-                "schema_version": _PLANNING_EFFECT_DISPATCH_SCHEMA,
-                "repository": self.repository,
-                "entries": entries,
-            }
+        _compacted, rendered = self._compact_planning_effect_dispatch_entries(
+            entries,
+            retain_ticket=ticket,
         )
         try:
             committed = self.client.compare_and_swap_ref(
@@ -3142,14 +3144,20 @@ class GitHubPlanRepository:
     def _reconcile_planning_effect_dispatch(
         self,
         subject: CampaignPlanningSubject,
-        observation_kind: str,
+        effect_proofs: tuple[str, ...],
     ) -> None:
         """Resolve only an active ticket whose readback proves its effect."""
 
         if (
             type(subject) is not CampaignPlanningSubject
             or subject.repository != self.repository
-            or observation_kind not in {"authoritative_absence", "prepared", "bound"}
+            or type(effect_proofs) is not tuple
+            or not effect_proofs
+            or any(
+                type(boundary) is not str
+                or boundary not in _PLANNING_EFFECT_DISPATCH_BOUNDARIES
+                for boundary in effect_proofs
+            )
             or not self._uses_ref_cas
         ):
             return
@@ -3169,15 +3177,7 @@ class GitHubPlanRepository:
         if not active:
             return
         entry = active[0]
-        proven = (
-            entry["effect_boundary"] == "prepare"
-            and observation_kind in {"prepared", "bound"}
-        ) or (
-            entry["effect_boundary"]
-            in _PLANNING_EFFECT_DISPATCH_BOUNDARIES - {"prepare"}
-            and observation_kind == "bound"
-        )
-        if proven:
+        if entry["effect_boundary"] in effect_proofs:
             self._resolve_planning_effect_dispatch(
                 subject,
                 str(entry["effect_boundary"]),
