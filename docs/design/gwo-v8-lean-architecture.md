@@ -1028,9 +1028,9 @@ that Coordinators and Workers must learn.
 
 ## Bounded Campaign replanning
 
-A Worker, Formal Review, Repair Verification, or CandidateGate scope audit may
-prove that the active Plan Revision cannot safely satisfy one Ticket as
-written. That proof is **Plan Invalidation** Evidence: a typed,
+A Worker, Formal Review, verification of a repaired Candidate, or CandidateGate
+scope audit may prove that the active Plan Revision cannot safely satisfy one
+Ticket as written. That proof is **Plan Invalidation** Evidence: a typed,
 digest-addressed observation bound to the exact Campaign, Plan Revision,
 Ticket, Work Run, Runtime Binding, authority-subtree digest, reporter role,
 Evidence digest, and a stable deduplication identity. It is not a replacement
@@ -1113,8 +1113,9 @@ existing compare-and-swap and readback path. A changed dependency, Ticket
 contract, authority root, or required shared fact creates new Work Run and
 Evidence identities; output bound to the old revision is rejected.
 
-Old Work Runs and Candidates remain diagnostic lineage only. An old workspace
-or Candidate is retained only as diagnostic Evidence; it is never adopted,
+Old Work Runs, workspaces, and Candidates remain diagnostic lineage only.
+Separately produced Evidence may reference their exact identities, but neither a
+workspace nor a Candidate becomes Evidence or a Result. They are never adopted,
 submitted, reviewed, or integrated under a successor Plan Revision. Accepted
 Results and unaffected exact Evidence survive only when their complete Ticket
 contract, subject, dependencies, authority, policy, and target facts remain

@@ -110,10 +110,11 @@ time required for deterministic continuation.
 _Avoid_: inactivity, silent stop, failure
 
 **Plan Invalidation**:
-A typed, digest-addressed Evidence observation that the active Plan Revision
-cannot safely satisfy one Ticket as written, proven by a Worker, Formal Review,
-Repair Verification, or CandidateGate scope audit. It is not a replacement plan,
-a Ticket ownership decision, or authority to widen a Candidate.
+A kind of Evidence bound to one Work Run and its active Plan Revision that
+records why the Ticket cannot safely be satisfied as written. Its resolution may
+require a Wait for an observable prerequisite or a Decision before scope,
+authority, or acceptance can change. It is not a replacement plan, a Ticket
+ownership decision, or authority to widen a Candidate.
 _Avoid_: mutable plan, replacement PlanSpec, Worker rewrite, scope escalation
 
 **Decision**:

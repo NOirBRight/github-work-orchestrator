@@ -40,38 +40,46 @@ of the architecture.
 
 ## Published successor sequence
 
-The native blocker graph was read back on 2026-07-27. Issue #121 was a
-temporary dedicated-runner prerequisite. The repository now uses the standard
-GitHub-hosted `windows-2025` runner; that migration supersedes #121's
+The native blocker graph was read back on 2026-08-01. Issue #121 was a
+temporary dedicated-runner prerequisite; the repository now uses the standard
+GitHub-hosted `windows-2025` runner, so the migration supersedes #121's
 self-hosted operational assumption and remains outside the V8 Candidate graph.
-Issue #131 decomposed bounded Campaign replanning into successor Tickets
-#132–#137; #132 is the documentation prefactor that freezes the shared
-contract, and #118 is additionally blocked by #136 and #137 so V8 cannot cut
-over before both the successor/human-gate and late-discovery paths converge.
+Closed prerequisite Tickets #123 and #126 remain visible below because they
+are native blockers even though they add no remaining work. Issue #131
+decomposed bounded Campaign replanning into successor Tickets #132–#137; #132
+is the unblocked documentation prefactor, and #118 is additionally blocked by
+#136 and #137 so V8 cannot cut over before both the successor/human-gate and
+late-discovery paths converge.
 
-| Ticket | Outcome | Native blockers | State |
-| --- | --- | --- | --- |
-| #108 | Land this accepted contract | none | completed |
-| #109 | Start one immutable PlanSpec v3 Campaign | #111 | completed |
-| #110 | Advance four Work Runs without Coordinator continuation | #109 | in flight |
-| #111 | Route semantic roles through one RuntimeGateway | #108 | completed |
-| #112 | Bound permission waits and terminal Runtime recovery | #111 | in flight |
-| #113 | Resume Campaigns without LLM polling | #110, #112 | open |
-| #114 | Accept standard Candidates through one CandidateGate | #110, #111 | open |
-| #115 | Bound strict Review and Review Finding repair | #112, #114 | open |
-| #116 | Deliver compatible Candidates through one exact Batch | #110, #114 | open |
-| #117 | Recover Batch failures without repeating unaffected work | #115, #116 | open |
-| #118 | Cut over new Campaigns through a fail-closed Guard | #113, #117, #136, #137 | open |
-| #119 | Prove and enable V8 with a four-Ticket root Canary | #118 | open |
-| #132 | Freeze bounded Campaign replanning contract | #131 | open |
-| #133 | Quiesce a Work Run on Plan Revision invalidation Evidence | #132, #110, #112 | open |
-| #134 | Classify Plan Revision invalidation against the complete Campaign | #133 | open |
-| #135 | Activate a successor Plan Revision from approved Campaign Tickets | #134 | open |
-| #136 | Gate new scope and authority on human-approved tracker readback | #135 | open |
-| #137 | Route Candidate and Repair scope escapes into Campaign replanning | #134, #114, #115 | open |
+At the #132 contract readback, #108, #109, and #111 were completed repository
+base while #110 and #112 were the in-flight foundations for #133. This records
+the accepted sequencing premise, not live Ticket state; GitHub remains the
+authority for current state.
+
+| Ticket | Outcome | Native blockers |
+| --- | --- | --- |
+| #108 | Land this accepted contract | none |
+| #109 | Start one immutable PlanSpec v3 Campaign | #111 |
+| #110 | Advance four Work Runs without Coordinator continuation | #109 |
+| #111 | Route semantic roles through one RuntimeGateway | #108, #126 |
+| #112 | Bound permission waits and terminal Runtime recovery | #111 |
+| #113 | Resume Campaigns without LLM polling | #110, #112 |
+| #114 | Accept standard Candidates through one CandidateGate | #110, #111 |
+| #115 | Bound strict Review and Review Finding repair | #112, #114 |
+| #116 | Deliver compatible Candidates through one exact Batch | #110, #114 |
+| #117 | Recover Batch failures without repeating unaffected work | #115, #116 |
+| #118 | Cut over new Campaigns through a fail-closed Guard | #113, #117, #136, #137 |
+| #119 | Prove and enable V8 with a four-Ticket root Canary | #118, #123 |
+| #132 | Freeze bounded Campaign replanning contract | none |
+| #133 | Quiesce a Work Run on Plan Invalidation | #132, #110, #112 |
+| #134 | Classify Plan Invalidation against the complete Campaign | #133 |
+| #135 | Activate a successor Plan Revision from approved Campaign Tickets | #134 |
+| #136 | Gate new scope and authority on human-approved tracker readback | #135 |
+| #137 | Route Candidate and repair scope escapes into Campaign replanning | #134, #114, #115 |
 
 ```mermaid
 flowchart LR
+    T126["#126 CI headroom"] --> T111
     T108["#108 Contract"] --> T111["#111 RuntimeGateway seam"]
     T111 --> T109["#109 PlanControl"]
     T109 --> T110["#110 ExecutionKernel"]
@@ -86,8 +94,7 @@ flowchart LR
     T114 --> T116
     T115 --> T117["#117 Batch recovery"]
     T116 --> T117
-    T110 --> T132["#132 Replan contract"]
-    T112 --> T132
+    T132["#132 Replan contract"]
     T132 --> T133["#133 Quiesce"]
     T110 --> T133
     T112 --> T133
@@ -102,6 +109,7 @@ flowchart LR
     T136 --> T118
     T137 --> T118
     T118 --> T119["#119 Root Canary"]
+    T123["#123 Canary singleton"] --> T119
 ```
 
 ## Stage 0 — Contract
@@ -355,7 +363,7 @@ Exit criteria for #119:
 - V8 becomes the default here only after exact acceptance readback.
 
 
-## Stage 7 - Bounded Campaign replanning
+## Stage 7 — Bounded Campaign replanning
 
 Tickets: #132 (documentation prefactor), then #133 through #137.
 
@@ -459,8 +467,9 @@ Exit criteria for #137:
   Review and persists the same typed Evidence contract;
 - a Formal Review Finding proving out-of-scope work is preserved as Evidence
   and is not converted into an impossible Repair obligation;
-- Repair Verification discovering out-of-scope work invalidates repair lineage
-  and emits bounded Evidence without reopening exploratory Review; and
+- CandidateGate verification of a repaired Candidate that discovers work
+  outside the consolidated repair request invalidates repair lineage and emits
+  bounded Evidence without reopening exploratory Review; and
 - deterministic audit failure consumes zero Reviewer calls and plan
   invalidation adds no Formal Review, Candidate submission, or Repair budget.
 
@@ -476,13 +485,15 @@ The safe critical path is:
               (#112 + #114) -> #115
               (#110 + #114) -> #116
               (#115 + #116) -> #117
-              (#110 + #112) -> #132 -> #133 -> #134 -> #135 -> #136
-              (#134 + #114 + #115) -> #137
-              (#113 + #117 + #136 + #137) -> #118 -> #119
+#132
+(#132 + #110 + #112) -> #133 -> #134 -> #135 -> #136
+(#134 + #114 + #115) -> #137
+(#113 + #117 + #136 + #137) -> #118 -> #119
 ```
 
-All replanning paths must converge before #118. #132 may proceed once #110 and
-#112 are in flight; #137 may proceed once #134, #114, and #115 are open.
+All replanning paths must converge before #118. #132 may proceed immediately;
+#133 becomes executable after #132, #110, and #112 complete, and #137 becomes
+executable after #134, #114, and #115 complete.
 
 Inside one Ticket, fixtures, private adapters, documentation, and independent
 contract tests may proceed concurrently. Changes to the same deep-module

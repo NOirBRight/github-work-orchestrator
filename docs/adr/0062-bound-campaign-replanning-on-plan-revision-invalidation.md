@@ -6,28 +6,29 @@ amends: ADR-0055, ADR-0056, ADR-0057, ADR-0058, ADR-0059
 # Bound Campaign replanning on Plan Revision invalidation
 
 V8 freezes one Plan Revision before Work Runs begin, but implementation, Formal
-Review, Repair Verification, or CandidateGate scope audit can prove a fact the
-selected Ticket contracts and dependency graph did not anticipate. That fact may
-be valid and necessary—a local catalog change may expose a legitimate
-atomic-persistence obligation—but the reporting semantic role sees only its own
-Ticket and workspace. It does not have the complete Campaign Ticket graph,
-active Work Runs, canonical blockers, adjacent Ticket ownership, or repository
-policy needed to decide the global route.
+Review, verification of a repaired Candidate, or CandidateGate scope audit can
+prove a fact the selected Ticket contracts and dependency graph did not
+anticipate. That fact may be valid and necessary—a local catalog change may
+expose a legitimate atomic-persistence obligation—but the reporting semantic
+role sees only its own Ticket and workspace. It does not have the complete
+Campaign Ticket graph, active Work Runs, canonical blockers, adjacent Ticket
+ownership, or repository policy needed to decide the global route.
 
 This ADR freezes the shared contract for bounded Campaign replanning before the
-six successor Tickets (#132–#137) implement it. It changes no Runtime, Campaign,
-repository writer, Candidate, or GitHub execution state. It amends the five
-accepted ADRs governing PlanSpec v3, one Campaign Planning Pass per Plan
-Revision, CandidateGate, ExecutionKernel, and RuntimeGateway by one coherent
-decision record rather than silently reinterpreting them.
+five implementation Tickets (#133–#137) deliver it. It changes no Runtime,
+Campaign, repository writer, Candidate, or GitHub execution state. It amends
+the five accepted ADRs governing PlanSpec v3, one Campaign Planning Pass per
+Plan Revision, CandidateGate, ExecutionKernel, and RuntimeGateway by one
+coherent decision record rather than silently reinterpreting them.
 
 ## The invalidation observation
 
-A Worker, Formal Review, Repair Verification, or CandidateGate scope audit may
-submit one typed, digest-addressed observation that identifies a newly
-discovered fact and explains why the active Plan Revision cannot safely satisfy
-the affected Ticket as written. The observation is **Plan Invalidation**
-Evidence, not a replacement plan and not authority to widen a Candidate.
+A Worker, Formal Review, verification of a repaired Candidate, or CandidateGate
+scope audit may submit one typed, digest-addressed observation that identifies
+a newly discovered fact and explains why the active Plan Revision cannot safely
+satisfy the affected Ticket as written. The observation is **Plan
+Invalidation** Evidence, not a replacement plan and not authority to widen a
+Candidate.
 
 It binds the exact Campaign, active Plan Revision, Ticket, Work Run, Runtime
 Binding, authority-subtree digest, reporter role, Evidence digest, and a stable
@@ -132,9 +133,10 @@ any Formal Review invocation and persists the same typed Evidence contract used
 by the Worker path. A Formal Review Finding that proves a required persistent
 protocol, deep-module owner, Campaign dependency, or authority lies outside the
 frozen Ticket is preserved as Evidence and is not converted into an impossible
-ordinary Repair obligation. Repair Verification that discovers work outside the
-Repair Packet's allowed scope invalidates the repair lineage, emits the bounded
-Evidence, and cannot reopen a full exploratory Formal Review.
+ordinary repair obligation. CandidateGate verification of a repaired Candidate
+that discovers work outside the consolidated repair request's allowed scope
+invalidates the repair lineage, emits the bounded Evidence, and cannot reopen a
+full exploratory Formal Review.
 
 ## Worker and Reviewer role boundaries
 
@@ -176,8 +178,9 @@ Each invalidation observation receives exactly one stable disposition:
 
 ## Lineage and adoption
 
-Old Work Runs and Candidates remain diagnostic lineage only. An old workspace
-or Candidate is retained only as diagnostic Evidence; it is never adopted,
+Old Work Runs, workspaces, and Candidates remain diagnostic lineage only.
+Separately produced Evidence may reference their exact identities, but neither a
+workspace nor a Candidate becomes Evidence or a Result. They are never adopted,
 submitted, reviewed, or integrated under a successor Plan Revision. Accepted
 Results and unaffected exact Evidence survive only when their complete Ticket
 contract, subject, dependencies, authority, policy, and target facts remain
@@ -220,7 +223,8 @@ their coherent composition, without redefining their existing decisions:
   is the one Campaign Planning Pass for the successor revision; it is transient,
   receives the complete bounded snapshot, and cannot become a resident LLM loop.
 - **ADR-0057 (CandidateGate)**: scope audit and Formal Review may produce the
-  same invalidation observation; they do not issue a broader Repair Packet.
+  same invalidation observation; they do not issue a broader consolidated repair
+  request.
 - **ADR-0058 (ExecutionKernel)**: Work Run quiescence, Worker Slot release,
   idempotency, and five-status derivation own the replanning transition; no
   sixth status or driver is introduced.
