@@ -74,10 +74,10 @@ content, enlarge budgets, weaken Assurance Policy, or alter delivery policy.
 
 | Module | Small interface, hidden behavior |
 | --- | --- |
-| PlanControl | Selected Ticket readback, one Campaign Planning Pass, PlanSpec v3 compilation, Authority Grant compilation, publication, activation, and readback |
-| ExecutionKernel | The only persisted Campaign state machine, capacity owner, budget owner, and next-action authority |
-| RuntimeGateway | Runtime selector resolution, multi-CLI execution, identity readback, exact permission handling, fallback, recovery, and retirement |
-| CandidateGate | Authoritative Candidate readback, private Candidate receipt and complete diff identity, affected checks, Assurance Requirement derivation, Formal Review, Review Finding reconciliation, and consolidated repair |
+| PlanControl | Selected Ticket readback, one Campaign Planning Pass, PlanSpec v3 compilation, Authority Grant compilation, publication, activation, readback, and bounded Campaign replanning snapshot and successor compilation |
+| ExecutionKernel | The only persisted Campaign state machine, capacity owner, budget owner, next-action authority, and Work Run quiescence on Plan Invalidation |
+| RuntimeGateway | Runtime selector resolution, multi-CLI execution, identity readback, exact permission handling, fallback, recovery, retirement, and authoritative Plan Invalidation observation readback with capability-policy proof |
+| CandidateGate | Authoritative Candidate readback, private Candidate receipt and complete diff identity, affected checks, Assurance Requirement derivation, Formal Review, Review Finding reconciliation, consolidated repair, and scope-audit invalidation routing |
 | BatchIntegrator | Campaign-scoped compatibility, composition, exact verification, PR, hosted CI, serial integration, and delivery recovery |
 
 Campaign Watchdog is an event-and-timer wake adapter, not a sixth domain
@@ -103,6 +103,10 @@ flowchart TD
     LC --> GH["One PR and hosted CI"]
     GH --> IN["Serial target integration"]
     IN --> EK
+    W -->|Plan Invalidation Evidence| EK
+    EK -->|Quiesce and release slot| PC
+    CG -->|Scope-audit invalidation| EK
+    PC -->|One successor Planning Pass| PR
 ```
 
 ## PlanControl and Campaign planning
@@ -1021,6 +1025,126 @@ Detailed admission, action, permission, Review, and delivery records are
 module-private implementation facts. They are not public actors or vocabulary
 that Coordinators and Workers must learn.
 
+
+## Bounded Campaign replanning
+
+A Worker, Formal Review, Repair Verification, or CandidateGate scope audit may
+prove that the active Plan Revision cannot safely satisfy one Ticket as
+written. That proof is **Plan Invalidation** Evidence: a typed,
+digest-addressed observation bound to the exact Campaign, Plan Revision,
+Ticket, Work Run, Runtime Binding, authority-subtree digest, reporter role,
+Evidence digest, and a stable deduplication identity. It is not a replacement
+plan, a Ticket ownership decision, or authority to widen a Candidate.
+
+The observation contains only discovered facts, reproducible Evidence, the
+invalidated Ticket obligation, newly required effects, interfaces, or state,
+and current workspace or Candidate identity. It cannot carry an authoritative
+Issue ownership decision, dependency mutation, Campaign order, or replacement
+PlanSpec.
+
+### Component ownership
+
+| Component | Replanning responsibility |
+| --- | --- |
+| RuntimeGateway | Authoritative observation readback and effective capability-policy proof |
+| ExecutionKernel | Work Run quiescence, idempotency, Worker Slot release, and public status |
+| PlanControl | Bounded Campaign snapshot, one Coordinator Planning Pass, successor compilation, and activation |
+| CandidateGate | Scope-audit invalidation routing and Review/Repair escape routing |
+
+RuntimeGateway reads one typed, Artifact-backed report and proves via effective
+capability-policy readback that the Worker and Coordinator cannot create or
+edit Issues, change blockers, activate a Plan Revision, merge, expand
+authority, or invoke global planning. Inability to prove that policy fails
+closed. RuntimeGateway does not decide the replanning route.
+
+ExecutionKernel authoritatively reads and persists the observation under a
+stable deduplication identity before changing Work Run state. It quiesces the
+affected Work Run-no further Worker, Candidate, Review, Repair, or delivery
+effect may occur under the invalidated revision-and releases the Worker Slot
+only after the quiescent state is read back. Workspace and diagnostic Evidence
+remain attributable and read-only until disposition. Unaffected Work Runs
+continue only when their Ticket contracts, dependencies, claims, authority
+roots, and required shared facts remain valid. An observation bound to another
+Campaign, Plan Revision, Ticket, Work Run, Runtime Binding, or authority digest
+cannot stop current work. Duplicate callbacks, restart, and repeated `advance`
+cannot repeat the transition.
+
+PlanControl constructs one bounded replanning snapshot from the active Plan
+Revision, all approved Tickets within the Campaign source, their complete
+native blocker graph, active and terminal Work Runs and claims, accepted
+Results, all pending valid invalidation observations for that active revision,
+the Policy Witness, and any explicitly referenced external dependency. An
+external Ticket may inform ownership or blocking analysis but is not silently
+admitted. All pending valid observations for one active revision are coalesced
+into one Planning Pass; a later observation against a successor revision
+requires a new, independently bounded revision.
+
+### Legal dispositions
+
+Each invalidation observation receives exactly one stable disposition:
+
+1. **Reject invalid Evidence and resume** under the unchanged contract.
+2. **Defer a non-blocking concern** that is real but not required for the
+   frozen acceptance.
+3. **Use approved Campaign Tickets in a successor revision** when an approved
+   existing Ticket owns the work or a Coordinator-justified dependency
+   addition among approved Tickets is valid.
+4. **Require a human-approved tracker or authority change** when the discovery
+   changes product scope, Ticket acceptance, Campaign membership, or authority.
+5. **Stop after a finite replan budget** when successor-revision or repeated
+   invalidation bounds are exhausted.
+
+A disposition requiring no successor revision resumes only after ExecutionKernel
+reads it back and reacquires a Worker Slot. A disposition requiring plan or
+product change remains quiescent and exposes the exact required successor or
+Decision through `inspect`. Worker and Reviewer roles may report facts and
+bounded alternatives but cannot choose Ticket ownership, mutate tracker state,
+rewrite acceptance, expand authority, activate a Plan Revision, merge work, or
+invoke a global planning workflow.
+
+### Successor revision
+
+A successor Plan Revision may admit or reorder only approved Campaign Tickets
+present in the authoritative replanning snapshot and may add only
+Coordinator-justified dependencies or genuine Exclusive Resources allowed by
+frozen contracts and policy. PlanControl performs the one required Campaign
+Planning Pass for the successor, validates it, and activates through the
+existing compare-and-swap and readback path. A changed dependency, Ticket
+contract, authority root, or required shared fact creates new Work Run and
+Evidence identities; output bound to the old revision is rejected.
+
+Old Work Runs and Candidates remain diagnostic lineage only. An old workspace
+or Candidate is retained only as diagnostic Evidence; it is never adopted,
+submitted, reviewed, or integrated under a successor Plan Revision. Accepted
+Results and unaffected exact Evidence survive only when their complete Ticket
+contract, subject, dependencies, authority, policy, and target facts remain
+identical and valid. Cross-Plan Candidate adoption remains outside this release
+and stays distinct from #69.
+
+### Replan budgets
+
+Repository policy defines finite bounds for successor revisions per Campaign
+and repeated invalidation of the same Ticket obligation. Duplicate Evidence
+does not consume either bound. Exhausting either bound returns one human
+Decision with the complete revision and invalidation lineage rather than
+launching another Coordinator pass.
+
+### Public interface
+
+Replanning uses the existing `start`, `advance`, and `inspect` operations. No
+new public workflow operation or public status is introduced. `advance`
+processes the authoritative observation, the bounded Coordinator action,
+tracker Decisions, and successor activation. `inspect` exposes the invalidated
+assumption, Evidence identity, affected Work Run, Slot and claim state,
+retained diagnostic identity, outstanding Decision or Wait, Coordinator action
+identity, and active or successor Plan Revision without requiring a model
+transcript.
+
+The bounded replanning contract is defined by
+[ADR-0062](../adr/0062-bound-campaign-replanning-on-plan-revision-invalidation.md).
+It does not expand the #110, #112, #114, or #115 deliveries; those Tickets
+integrate through the new seam where relevant.
+
 ## Defaults
 
 The current deterministic defaults are:
@@ -1036,6 +1160,8 @@ The current deterministic defaults are:
 | Runtime transport-unavailable episode | initial plus at most 2 retries, independent of provider availability | fixed V8.0 policy |
 | Distinct Candidate SHAs per Work Run | at most 3 | fixed V8.0 policy |
 | Worker bindings per Work Run | initial plus at most one replacement | fixed V8.0 policy |
+| Successor revisions per Campaign | finite, repository-policy defined | host-global, repository override |
+| Repeated invalidation of one Ticket obligation | finite, repository-policy defined | host-global, repository override |
 
 No default is inferred by an LLM or embedded as a Runtime assignment in
 PlanSpec.
@@ -1057,7 +1183,8 @@ V8.0 does not add:
 - cross-SHA Review approval reuse;
 - a permanent GWO daemon or event bus;
 - a long-lived shadow execution phase; or
-- automatic authority expansion.
+- automatic authority expansion; or
+- cross-Plan Candidate adoption across successor Plan Revisions.
 
 ## Cutover
 
