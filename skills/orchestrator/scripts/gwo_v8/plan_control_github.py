@@ -309,8 +309,18 @@ class _GitHubPlanningEffectDispatch:
     def mode(self, subject: CampaignPlanningSubject) -> str:
         return self._repository.planning_progress_mode(subject)
 
-    def enter(self, subject: CampaignPlanningSubject, boundary: str) -> str | None:
-        return self._repository._enter_planning_effect_dispatch(subject, boundary)
+    def enter(
+        self,
+        subject: CampaignPlanningSubject,
+        boundary: str,
+        *,
+        permission_request_id: str | None = None,
+    ) -> str | None:
+        return self._repository._enter_planning_effect_dispatch(
+            subject,
+            boundary,
+            permission_request_id=permission_request_id,
+        )
 
     def resolve(
         self,
@@ -323,7 +333,7 @@ class _GitHubPlanningEffectDispatch:
     def reconcile(
         self,
         subject: CampaignPlanningSubject,
-        effect_proofs: tuple[str, ...],
+        effect_proofs: tuple[tuple[str, str | None, str | None], ...],
     ) -> None:
         self._repository._reconcile_planning_effect_dispatch(
             subject,
@@ -2810,6 +2820,8 @@ class GitHubPlanRepository:
         subject: CampaignPlanningSubject,
         boundary: str,
         authority: Mapping[str, str],
+        *,
+        permission_request_id: str | None = None,
     ) -> bool:
         return (
             entry.get("repository") == subject.repository
@@ -2818,6 +2830,9 @@ class GitHubPlanRepository:
             and entry.get("subject_digest") == subject.digest
             and entry.get("stable_action_id") == subject.stable_action_id
             and entry.get("effect_boundary") == boundary
+            and entry.get("permission_request_id") == permission_request_id
+            and entry.get("permission_decision")
+            == ("allow" if boundary == "permission_allow" else None)
             and entry.get("writer_generation") == authority.get("writer_generation")
             and entry.get("writer_cut_over_record_id")
             == authority.get("cut_over_record_id")
@@ -2924,6 +2939,8 @@ class GitHubPlanRepository:
         self,
         subject: CampaignPlanningSubject,
         boundary: str,
+        *,
+        permission_request_id: str | None = None,
     ) -> str | None:
         """Publish one active dispatch fence before the adapter may be called."""
 
@@ -2932,6 +2949,14 @@ class GitHubPlanRepository:
             or subject.repository != self.repository
             or type(boundary) is not str
             or boundary not in _PLANNING_EFFECT_DISPATCH_BOUNDARIES
+            or (
+                boundary == "permission_allow"
+                and (type(permission_request_id) is not str or not permission_request_id)
+            )
+            or (
+                boundary != "permission_allow"
+                and permission_request_id is not None
+            )
             or not self._uses_ref_cas
         ):
             return None
@@ -2959,11 +2984,16 @@ class GitHubPlanRepository:
                 "Planning effect dispatch has duplicate boundary identities",
             )
         previous = None if not boundary_entries else boundary_entries[0]
-        if previous is not None and not self._dispatch_entry_matches_subject(
+        if (
+            previous is not None
+            and previous["state"] == "active"
+            and not self._dispatch_entry_matches_subject(
             previous,
             subject,
             boundary,
             authority,
+                permission_request_id=permission_request_id,
+            )
         ):
             # The stable Planning action/boundary has already produced
             # recovery evidence for another exact Campaign subject.  Never
@@ -2997,6 +3027,10 @@ class GitHubPlanRepository:
             "subject_digest": subject.digest,
             "stable_action_id": subject.stable_action_id,
             "effect_boundary": boundary,
+            "permission_request_id": permission_request_id,
+            "permission_decision": (
+                "allow" if boundary == "permission_allow" else None
+            ),
             "writer_generation": authority["writer_generation"],
             "writer_cut_over_record_id": authority["cut_over_record_id"],
             "writer_observation_ref": ref_digest,
@@ -3042,6 +3076,7 @@ class GitHubPlanRepository:
                     subject,
                     boundary,
                     recovered_authority,
+                    permission_request_id=permission_request_id,
                 )
                 and value["state"] == "active"
             ]
@@ -3090,6 +3125,7 @@ class GitHubPlanRepository:
             subject,
             boundary,
             authority,
+            permission_request_id=entry["permission_request_id"],
         ):
             raise PlanControlError(
                 "WRITER_FENCE_READBACK_INVALID",
@@ -3127,6 +3163,7 @@ class GitHubPlanRepository:
                     subject,
                     boundary,
                     recovered_authority,
+                    permission_request_id=value["permission_request_id"],
                 )
                 for value in recovered
             ):
@@ -3144,7 +3181,7 @@ class GitHubPlanRepository:
     def _reconcile_planning_effect_dispatch(
         self,
         subject: CampaignPlanningSubject,
-        effect_proofs: tuple[str, ...],
+        effect_proofs: tuple[tuple[str, str | None, str | None], ...],
     ) -> None:
         """Resolve only an active ticket whose readback proves its effect."""
 
@@ -3154,9 +3191,23 @@ class GitHubPlanRepository:
             or type(effect_proofs) is not tuple
             or not effect_proofs
             or any(
-                type(boundary) is not str
-                or boundary not in _PLANNING_EFFECT_DISPATCH_BOUNDARIES
-                for boundary in effect_proofs
+                type(proof) is not tuple
+                or len(proof) != 3
+                or type(proof[0]) is not str
+                or proof[0] not in _PLANNING_EFFECT_DISPATCH_BOUNDARIES
+                or (
+                    proof[0] == "permission_allow"
+                    and (
+                        type(proof[1]) is not str
+                        or not proof[1]
+                        or proof[2] != "allow"
+                    )
+                )
+                or (
+                    proof[0] != "permission_allow"
+                    and (proof[1] is not None or proof[2] is not None)
+                )
+                for proof in effect_proofs
             )
             or not self._uses_ref_cas
         ):
@@ -3177,7 +3228,11 @@ class GitHubPlanRepository:
         if not active:
             return
         entry = active[0]
-        if entry["effect_boundary"] in effect_proofs:
+        if (
+            entry["effect_boundary"],
+            entry["permission_request_id"],
+            entry["permission_decision"],
+        ) in effect_proofs:
             self._resolve_planning_effect_dispatch(
                 subject,
                 str(entry["effect_boundary"]),

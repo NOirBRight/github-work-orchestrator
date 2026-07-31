@@ -2707,13 +2707,13 @@ def test_r10_foreign_campaign_reconcile_cannot_resolve_active_dispatch():
         reason="r10 foreign reconcile",
     )
 
-    dispatch.reconcile(subject_b, ("prepare",))
+    dispatch.reconcile(subject_b, (("prepare", None, None),))
 
     with pytest.raises(WriterTransitionBlocked) as blocked:
         transitions.publish(drain)
     assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"
 
-    dispatch.reconcile(subject_a, ("prepare",))
+    dispatch.reconcile(subject_a, (("prepare", None, None),))
     transitions.publish(drain)
     assert repository.planning_progress_mode(subject_a) == "draining"
 
@@ -2838,6 +2838,8 @@ def _r10_dispatch_entry(client, subject, *, state="recovery", attempt=1):
         "subject_digest": subject.digest,
         "stable_action_id": subject.stable_action_id,
         "effect_boundary": "prepare",
+        "permission_request_id": None,
+        "permission_decision": None,
         "writer_generation": "writer:one",
         "writer_cut_over_record_id": writer["current"]["record_id"],
         "writer_observation_ref": client.head,
@@ -4235,7 +4237,13 @@ def test_r13_restart_readback_does_not_resolve_the_wrong_effect_boundary(
         ]
         assert gateway.progress(subject, preflight).status == "running"
     dispatch = repository.planning_effect_dispatch()
-    assert dispatch.enter(subject, boundary).startswith("planning-dispatch:")
+    assert dispatch.enter(
+        subject,
+        boundary,
+        permission_request_id=(
+            "request:r13-proof" if boundary == "permission_allow" else None
+        ),
+    ).startswith("planning-dispatch:")
     if evidence == "deny":
         adapter.observe(subject.stable_action_id)
         assert adapter.command(
@@ -4252,3 +4260,107 @@ def test_r13_restart_readback_does_not_resolve_the_wrong_effect_boundary(
     with pytest.raises(WriterTransitionBlocked) as blocked:
         transitions.publish(_r10_drain_record(f"r13 wrong {boundary} {evidence}"))
     assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"
+
+
+def test_r14_permission_allow_ticket_is_bound_to_its_exact_request_across_restart(
+    tmp_path,
+):
+    """Request-B evidence cannot release request-A's active Writer fence."""
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import (
+        PermissionResponse,
+        RuntimeGateway,
+        RuntimeGatewayError,
+    )
+    from gwo_v8.transition import GitHubWriterTransitionControl, WriterTransitionBlocked
+
+    request_a = "request:r14-a"
+    request_b = "request:r14-b"
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    gateway, subject, preflight, adapter = _r8_authorized_runtime_gateway(
+        tmp_path,
+        repository,
+        "prepared",
+    )
+    adapter._complete_action = lambda _action: None  # type: ignore[method-assign]
+    adapter._actions[subject.stable_action_id].pending_permissions = [
+        (request_a, "write", "repository"),
+        (request_b, "write", "repository"),
+    ]
+    assert gateway.progress(subject, preflight).status == "running"
+
+    native_command = adapter.command
+
+    def crash_after_a_admission(stable_action_id, transition):
+        if transition == PermissionResponse(request_a, "allow"):
+            raise KeyboardInterrupt()
+        return native_command(stable_action_id, transition)
+
+    adapter.command = crash_after_a_admission  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        gateway.transition(
+            subject.stable_action_id,
+            PermissionResponse(request_a, "allow"),
+        )
+    adapter.command = native_command  # type: ignore[method-assign]
+    before_b = tuple(adapter.command_calls)
+
+    with pytest.raises(RuntimeGatewayError) as foreign:
+        gateway.transition(
+            subject.stable_action_id,
+            PermissionResponse(request_b, "allow"),
+        )
+    assert foreign.value.code == "RUNTIME_RECOVERY_ONLY"
+    assert tuple(adapter.command_calls) == before_b
+
+    # Simulate the provider's authoritative receipt for B while A is still
+    # pending, then restart the Gateway so reconciliation cannot use caller
+    # memory for the expected permission identity.
+    adapter.observe(subject.stable_action_id)
+    assert adapter.command(
+        subject.stable_action_id,
+        PermissionResponse(request_b, "allow"),
+    )
+    after_b = tuple(adapter.command_calls)
+    restarted = RuntimeGateway(
+        store_path=tmp_path / "gateway.json",
+        _adapter=adapter,
+        configuration=gateway._configuration,
+        _artifacts=adapter._artifacts,
+        _planning_effect_dispatch=repository.planning_effect_dispatch(),
+    )
+    assert restarted.progress(subject, preflight).status == "running"
+    assert tuple(adapter.command_calls) == after_b
+
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    with pytest.raises(WriterTransitionBlocked) as blocked:
+        transitions.publish(_r10_drain_record("r14 request-b is not request-a"))
+    assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"
+
+    adapter.observe(subject.stable_action_id)
+    assert adapter.command(
+        subject.stable_action_id,
+        PermissionResponse(request_a, "allow"),
+    )
+    after_a = tuple(adapter.command_calls)
+    restarted_again = RuntimeGateway(
+        store_path=tmp_path / "gateway.json",
+        _adapter=adapter,
+        configuration=gateway._configuration,
+        _artifacts=adapter._artifacts,
+        _planning_effect_dispatch=repository.planning_effect_dispatch(),
+    )
+    assert restarted_again.progress(subject, preflight).status == "running"
+    assert tuple(adapter.command_calls) == after_a
+    transitions.publish(_r10_drain_record("r14 request-a exact proof"))

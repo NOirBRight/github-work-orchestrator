@@ -7692,7 +7692,13 @@ class _PlanningEffectDispatch(Protocol):
 
     def mode(self, subject: CampaignPlanningSubject) -> str: ...
 
-    def enter(self, subject: CampaignPlanningSubject, boundary: str) -> str | None: ...
+    def enter(
+        self,
+        subject: CampaignPlanningSubject,
+        boundary: str,
+        *,
+        permission_request_id: str | None = None,
+    ) -> str | None: ...
 
     def resolve(
         self,
@@ -7704,7 +7710,7 @@ class _PlanningEffectDispatch(Protocol):
     def reconcile(
         self,
         subject: CampaignPlanningSubject,
-        effect_proofs: tuple[str, ...],
+        effect_proofs: tuple[tuple[str, str | None, str | None], ...],
     ) -> None: ...
 
 
@@ -8217,6 +8223,8 @@ class RuntimeGateway:
         self,
         subject: CampaignPlanningSubject,
         boundary: str,
+        *,
+        permission_request_id: str | None = None,
     ) -> str | None:
         """Enter a Writer-blocking durable state immediately before I/O."""
 
@@ -8230,11 +8238,25 @@ class RuntimeGateway:
                 "RUNTIME_RECOVERY_ONLY",
                 "Planning provider-effect boundary is outside the closed dispatch union",
             )
+        if (
+            boundary == "permission_allow"
+            and (type(permission_request_id) is not str or not permission_request_id)
+        ) or (
+            boundary != "permission_allow" and permission_request_id is not None
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_RECOVERY_ONLY",
+                "Planning permission dispatch identity is missing or malformed",
+            )
         dispatch = self._planning_effect_dispatch
         if dispatch is None:
             return None
         try:
-            ticket = dispatch.enter(subject, boundary)
+            ticket = dispatch.enter(
+                subject,
+                boundary,
+                permission_request_id=permission_request_id,
+            )
         except RuntimeGatewayError:
             raise
         except Exception as error:
@@ -8309,28 +8331,29 @@ class RuntimeGateway:
     @staticmethod
     def _planning_effect_readback_proofs(
         observation_verdict: _RuntimeObservationVerdict,
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, str | None, str | None], ...]:
         """Project validated readback into closed, adapter-private effect proofs."""
 
         if observation_verdict.kind == "prepared":
-            return ("prepare",)
+            return (("prepare", None, None),)
         if observation_verdict.kind != "bound":
             return ()
         observation = observation_verdict.observation
         assert observation is not None
-        proofs = ["prepare"]
+        proofs = [("prepare", None, None)]
         if observation.lifecycle in {"running", "completed"}:
-            proofs.extend(("start", "resume"))
+            proofs.extend(
+                (("start", None, None), ("resume", None, None))
+            )
         completed = observation.completed_permission_response
         if (
             type(completed) is _CompletedPermissionResponse
             and completed.decision == "allow"
-            and _completed_permission_effect_matches(
-                PermissionResponse(completed.request_id, "allow"),
-                observation,
-            )
+            and _completed_permission_evidence_is_bound(observation)
         ):
-            proofs.append("permission_allow")
+            proofs.append(
+                ("permission_allow", completed.request_id, completed.decision)
+            )
         return tuple(proofs)
 
     def _planning_command_with_readback(
@@ -8357,7 +8380,15 @@ class RuntimeGateway:
                 "RUNTIME_RECOVERY_ONLY",
                 "Draining Writer authority cannot authorize new Planning semantic work",
             )
-        ticket = self._enter_planning_effect_dispatch(subject, boundary)
+        ticket = self._enter_planning_effect_dispatch(
+            subject,
+            boundary,
+            permission_request_id=(
+                command.request_id
+                if type(command) is PermissionResponse
+                else None
+            ),
+        )
         return self._command_with_readback(
             subject.stable_action_id,
             command,

@@ -802,7 +802,7 @@ def test_r12_transition_contract_matrix_preserves_controls_and_writer_fences(
         def mode(self, _subject):
             return self.mode_value
 
-        def enter(self, _subject, boundary):
+        def enter(self, _subject, boundary, *, permission_request_id=None):
             self.boundaries.append(boundary)
             return f"matrix:{boundary}"
 
@@ -14044,7 +14044,7 @@ def test_r7c1_progress_recovery_state_matrix(mode, action_state, expected, tmp_p
         def mode(self, _subject):
             return selected_mode["value"]
 
-        def enter(self, _subject, boundary):
+        def enter(self, _subject, boundary, *, permission_request_id=None):
             return f"r7:{boundary}"
 
         def resolve(self, _subject, _boundary, _ticket):
@@ -14159,7 +14159,7 @@ def test_r8_writer_effect_claim_cannot_dispatch_after_drain(
             writer["samples"].append(writer["mode"])
             return writer["mode"]
 
-        def enter(self, authorized_subject, boundary):
+        def enter(self, authorized_subject, boundary, *, permission_request_id=None):
             assert authorized_subject == subject
             effect_claims.append(boundary)
             writer["mode"] = "draining"
@@ -14254,7 +14254,7 @@ def test_r8_writer_effect_authorization_is_not_replayable_across_boundaries(
         def mode(self, _subject):
             return "cut_over"
 
-        def enter(self, authorized_subject, boundary):
+        def enter(self, authorized_subject, boundary, *, permission_request_id=None):
             assert authorized_subject == subject
             authorizations.append(boundary)
             return "r8:prepare" if boundary == "prepare" else None

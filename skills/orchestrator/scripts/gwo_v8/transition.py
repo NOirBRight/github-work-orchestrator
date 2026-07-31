@@ -49,6 +49,8 @@ _PLANNING_EFFECT_DISPATCH_FIELDS = {
     "subject_digest",
     "stable_action_id",
     "effect_boundary",
+    "permission_request_id",
+    "permission_decision",
     "writer_generation",
     "writer_cut_over_record_id",
     "writer_observation_ref",
@@ -829,7 +831,10 @@ def _planning_effect_dispatch_ticket(entry: Mapping[str, Any]) -> str:
 def _planning_effect_dispatch_entry_order(entry: Mapping[str, Any]) -> tuple[Any, ...]:
     """Give compaction one stable identity order, independent of map order."""
 
-    return tuple(entry[name] for name in sorted(_PLANNING_EFFECT_DISPATCH_FIELDS))
+    return tuple(
+        "" if entry[name] is None else entry[name]
+        for name in sorted(_PLANNING_EFFECT_DISPATCH_FIELDS)
+    )
 
 
 def _planning_effect_dispatch_ledger_bytes(
@@ -902,10 +907,35 @@ def _validate_planning_effect_dispatch_entries(
         ):
             raise ValueError("control-ref dispatch entry fields are invalid")
         try:
-            for name in _PLANNING_EFFECT_DISPATCH_FIELDS - {"attempt"}:
+            for name in _PLANNING_EFFECT_DISPATCH_FIELDS - {
+                "attempt",
+                "permission_request_id",
+                "permission_decision",
+            }:
                 _planning_effect_dispatch_text(raw[name], f"entry {name}")
         except ValueError as error:
             raise ValueError("control-ref dispatch entry fields are invalid") from error
+        if raw["effect_boundary"] == "permission_allow":
+            try:
+                _planning_effect_dispatch_text(
+                    raw["permission_request_id"],
+                    "entry permission_request_id",
+                )
+                if raw["permission_decision"] != "allow":
+                    raise ValueError("permission decision is not allow")
+                _planning_effect_dispatch_text(
+                    raw["permission_decision"],
+                    "entry permission_decision",
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "control-ref permission dispatch identity is invalid"
+                ) from error
+        elif (
+            raw["permission_request_id"] is not None
+            or raw["permission_decision"] is not None
+        ):
+            raise ValueError("control-ref non-permission dispatch identity is invalid")
         key = (
             raw["writer_generation"],
             raw["writer_cut_over_record_id"],
