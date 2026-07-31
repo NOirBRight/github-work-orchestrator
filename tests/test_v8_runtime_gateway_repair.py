@@ -206,7 +206,9 @@ def _adapter_command(adapter, stable_action_id: str, command):
 
 
 def _put_subject_artifacts(store: ArtifactStore, subject: CampaignPlanningSubject):
-    snapshot = store.put_canonical({"tickets": ["issue:111"]})
+    from gwo_v8.planning_protocol import planning_prompt
+
+    snapshot = store.put_canonical({"tickets": [{"key": "issue:111"}]})
     policy = store.put_canonical({"policy": "frozen"})
     unsigned = CampaignPlanningSubject(
         repository=subject.repository,
@@ -219,12 +221,12 @@ def _put_subject_artifacts(store: ArtifactStore, subject: CampaignPlanningSubjec
         stable_action_id=subject.stable_action_id,
     )
     prompt = store.put_canonical(
-        {
-            "schema_version": "gwo.runtime.prompt.v1",
-            "subject_digest": unsigned.prompt_binding_digest,
-            "authority_digest": policy.digest,
-            "payload": {"complete_contract": "x" * 200_000},
-        }
+        planning_prompt(
+            subject_digest=unsigned.prompt_binding_digest,
+            authority_digest=policy.digest,
+            snapshot_artifact_digest=snapshot.digest,
+            policy_witness_artifact_digest=policy.digest,
+        )
     )
     return CampaignPlanningSubject(
         repository=unsigned.repository,
@@ -462,7 +464,7 @@ def test_artifact_backed_prompt_and_output_are_durable_and_tampering_fails_close
     completed = gateway.progress(subject, receipt)
     assert completed.planning_output_artifact_digest is not None
     assert store.get(completed.planning_output_artifact_digest)
-    assert adapter.last_prompt_byte_lengths[0] > 200_000
+    assert adapter.last_prompt_byte_lengths[0] > 0
 
     output_path = store.path_for(completed.planning_output_artifact_digest)
     output_path.write_bytes(b"tampered")
@@ -734,6 +736,160 @@ def test_in_memory_conforms_for_permission_and_each_closed_transition(tmp_path):
     assert gateway.transition(subject.stable_action_id, RuntimeCommand.INTERRUPT).status == "parked"
     assert gateway.transition(subject.stable_action_id, RuntimeCommand.FENCE).status == "parked"
     assert gateway.transition(subject.stable_action_id, RuntimeCommand.RETIRE).status == "retired"
+
+
+@pytest.mark.parametrize(
+    (
+        "subject_kind",
+        "writer_mode",
+        "lifecycle",
+        "command",
+        "expected_status",
+        "expected_error",
+        "expected_dispatch_boundary",
+    ),
+    (
+        # Planning cut-over admits the #111 transition contract.  Only actions
+        # that can begin or resume semantic Planning work enter the Writer
+        # dispatch protocol; quiescing controls do not.
+        ("planning", "cut_over", "prepared", RuntimeCommand.START, "completed", None, "start"),
+        ("planning", "cut_over", "parked", RuntimeCommand.RESUME, "running", None, "resume"),
+        ("planning", "cut_over", "running", RuntimeCommand.PARK, "parked", None, None),
+        ("planning", "cut_over", "running", RuntimeCommand.INTERRUPT, "parked", None, None),
+        ("planning", "cut_over", "running", RuntimeCommand.FENCE, "running", None, None),
+        ("planning", "cut_over", "running", RuntimeCommand.RETIRE, "retired", None, None),
+        ("planning", "cut_over", "running", PermissionResponse("request:matrix", "allow"), "running", None, "permission_allow"),
+        ("planning", "cut_over", "running", PermissionResponse("request:matrix", "deny"), "running", None, None),
+        # Draining rejects only transitions that can authorize new Planning
+        # work.  It retains the closed quiescing and deny-control contract.
+        ("planning", "draining", "prepared", RuntimeCommand.START, None, "RUNTIME_RECOVERY_ONLY", None),
+        ("planning", "draining", "parked", RuntimeCommand.RESUME, None, "RUNTIME_RECOVERY_ONLY", None),
+        ("planning", "draining", "running", RuntimeCommand.PARK, "parked", None, None),
+        ("planning", "draining", "running", RuntimeCommand.INTERRUPT, "parked", None, None),
+        ("planning", "draining", "running", RuntimeCommand.FENCE, "running", None, None),
+        ("planning", "draining", "running", RuntimeCommand.RETIRE, "retired", None, None),
+        ("planning", "draining", "running", PermissionResponse("request:matrix", "allow"), None, "RUNTIME_RECOVERY_ONLY", None),
+        ("planning", "draining", "running", PermissionResponse("request:matrix", "deny"), "running", None, None),
+        # Writer mode is not a Work Run concern; every closed transition keeps
+        # its established #111 behavior through the same Gateway surface.
+        ("work", None, "prepared", RuntimeCommand.START, "completed", None, None),
+        ("work", None, "parked", RuntimeCommand.RESUME, "running", None, None),
+        ("work", None, "running", RuntimeCommand.PARK, "parked", None, None),
+        ("work", None, "running", RuntimeCommand.INTERRUPT, "parked", None, None),
+        ("work", None, "running", RuntimeCommand.FENCE, "running", None, None),
+        ("work", None, "running", RuntimeCommand.RETIRE, "retired", None, None),
+        ("work", None, "running", PermissionResponse("request:matrix", "allow"), "running", None, None),
+        ("work", None, "running", PermissionResponse("request:matrix", "deny"), "running", None, None),
+    ),
+)
+def test_r12_transition_contract_matrix_preserves_controls_and_writer_fences(
+    tmp_path,
+    subject_kind,
+    writer_mode,
+    lifecycle,
+    command,
+    expected_status,
+    expected_error,
+    expected_dispatch_boundary,
+):
+    """The two subject kinds share #111 transitions without Planning bypasses."""
+
+    class PlanningDispatch:
+        def __init__(self, mode):
+            self.mode_value = mode
+            self.boundaries = []
+
+        def mode(self, _subject):
+            return self.mode_value
+
+        def enter(self, _subject, boundary, *, permission_request_id=None):
+            self.boundaries.append(boundary)
+            return f"matrix:{boundary}"
+
+        def resolve(self, _subject, _boundary, _ticket):
+            return None
+
+        def reconcile(self, _subject, _observation_kind):
+            return None
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    profile = _profile()
+    dispatch = PlanningDispatch("cut_over") if subject_kind == "planning" else None
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.journal",
+        _adapter=(adapter := _InMemoryRuntimeProviderAdapter(store)),
+        configuration=RuntimeConfiguration(
+            profiles={profile.digest: profile},
+            host_mappings={
+                "coordinator": ProfileMapping(profile.digest),
+                "worker": ProfileMapping(profile.digest),
+            },
+        ),
+        _artifacts=store,
+        _planning_effect_dispatch=dispatch,
+    )
+    planning_subject = _put_subject_artifacts(store, _subject())
+    subject = (
+        planning_subject
+        if subject_kind == "planning"
+        else _put_work_subject_artifacts(
+            store,
+            planning_subject,
+            stable_action_id="work:transition-matrix",
+        )
+    )
+    planning_preflight = gateway.planning_preflight(planning_subject)
+    preflight = planning_preflight if subject_kind == "planning" else None
+    if lifecycle == "prepared":
+        record = gateway._assignment_for_progress(
+            subject,
+            (
+                gateway._data["preflights"][subject.stable_action_id]
+                if subject_kind == "planning"
+                else None
+            ),
+        )
+        prompt, inputs = gateway._resolve_input_artifacts(subject)
+        prepared = adapter.prepare(
+            _RuntimeActionSpec(
+                subject.stable_action_id,
+                subject,
+                gateway._profile(record["profile_digest"]),
+                prompt,
+                inputs,
+            )
+        )
+        assert not isinstance(prepared, _RuntimeFailure)
+    else:
+        if lifecycle != "completed":
+            adapter._complete_action = lambda _action: None  # type: ignore[method-assign]
+        if type(command) is PermissionResponse:
+            adapter._pending_permissions[subject.stable_action_id] = [
+                (command.request_id, "write", "repository")
+            ]
+        assert gateway.progress(subject, preflight).status == (
+            "completed" if lifecycle == "completed" else "running"
+        )
+        if lifecycle == "parked":
+            gateway.transition(subject.stable_action_id, RuntimeCommand.PARK)
+
+    if dispatch is not None:
+        dispatch.mode_value = writer_mode
+        dispatch.boundaries.clear()
+    before = tuple(adapter.command_calls)
+    if expected_error is None:
+        receipt = gateway.transition(subject.stable_action_id, command)
+        assert receipt.status == expected_status
+        assert receipt.command == command
+    else:
+        with pytest.raises(RuntimeGatewayError) as rejected:
+            gateway.transition(subject.stable_action_id, command)
+        assert rejected.value.code == expected_error
+        assert tuple(adapter.command_calls) == before
+    if dispatch is not None:
+        assert dispatch.boundaries == (
+            [] if expected_dispatch_boundary is None else [expected_dispatch_boundary]
+        )
 
 
 class _RecordingPaseoCli:
@@ -13687,6 +13843,8 @@ def test_repair_packet_19_runtime_output_proof_rejects_the_same_closedness_drift
 def test_repair_packet_19_paseo_stages_the_compatible_closed_output_schema(
     tmp_path,
 ):
+    from gwo_v8.planning_protocol import planning_output_payload_schema
+
     _store, _source, _workspace, _client, adapter, subject, _spec = (
         _prepared_paseo_adapter(tmp_path)
     )
@@ -13707,9 +13865,426 @@ def test_repair_packet_19_paseo_stages_the_compatible_closed_output_schema(
             "subject_digest": {"const": subject.digest},
             "stable_action_id": {"const": subject.stable_action_id},
             "authority_digest": {"const": subject.authority_digest},
-            "payload": {},
+            "payload": planning_output_payload_schema(),
         },
         "additionalProperties": False,
     }
 
     assert schema_path.read_bytes() == gateway_module.canonical_bytes(expected)
+
+
+def test_r7c2_subject_prompt_schema_matrix_is_shared_by_both_adapters(tmp_path):
+    """Prompt shape cannot grant Planning protocol outside its exact subject."""
+
+    from gwo_v8.planning_protocol import planning_output_payload_schema, planning_prompt
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    snapshot = store.put_canonical({"tickets": [{"key": "issue:111"}]})
+    policy = store.put_canonical({"policy": "frozen"})
+    planning_unsigned = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r7",
+        campaign_handle="handle:r7",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest=snapshot.digest,
+        policy_witness_digest=policy.digest,
+        planning_request_artifact_digest="0" * 64,
+        stable_action_id="planning:r7",
+    )
+
+    def planning_with_prompt(prompt_value):
+        prompt = store.put_canonical(prompt_value(planning_unsigned))
+        return replace(planning_unsigned, planning_request_artifact_digest=prompt.digest)
+
+    def valid_planning_prompt(subject):
+        return planning_prompt(
+            subject_digest=subject.prompt_binding_digest,
+            authority_digest=subject.authority_digest,
+            snapshot_artifact_digest=subject.snapshot_artifact_digest,
+            policy_witness_artifact_digest=subject.policy_witness_digest,
+        )
+
+    def malformed_prompt(subject):
+        return {
+            "schema_version": "gwo.runtime.prompt.v1",
+            "subject_digest": subject.prompt_binding_digest,
+            "authority_digest": subject.authority_digest,
+            "payload": {"work_run": "not a Planning request"},
+        }
+
+    planning = planning_with_prompt(valid_planning_prompt)
+    malformed_planning = planning_with_prompt(malformed_prompt)
+    tampered_planning = planning_with_prompt(
+        lambda subject: planning_prompt(
+            subject_digest=subject.prompt_binding_digest,
+            authority_digest=subject.authority_digest,
+            snapshot_artifact_digest=store.put_canonical({"other": True}).digest,
+            policy_witness_artifact_digest=subject.policy_witness_digest,
+        )
+    )
+    work_unsigned = WorkRunSubject(
+        repository=planning.repository,
+        campaign_key=planning.campaign_key,
+        campaign_handle=planning.campaign_handle,
+        plan_revision_digest=store.put_canonical({"revision": "r7"}).digest,
+        work_run_key="work:r7",
+        ticket_key="issue:111",
+        purpose=gateway_module.WorkRunPurpose.implementation(),
+        prompt_artifact_digest="0" * 64,
+        authority_subtree_digest=policy.digest,
+        stable_action_id="work:r7",
+    )
+    work_planning_prompt = store.put_canonical(
+        planning_prompt(
+            subject_digest=work_unsigned.prompt_binding_digest,
+            authority_digest=work_unsigned.authority_digest,
+            snapshot_artifact_digest=snapshot.digest,
+            policy_witness_artifact_digest=policy.digest,
+        )
+    )
+    work_with_planning_prompt = replace(
+        work_unsigned, prompt_artifact_digest=work_planning_prompt.digest
+    )
+    planning_subclass = _CampaignPlanningSubjectSubclass(**planning.__dict__)
+
+    rows = (
+        ("planning", planning, None),
+        ("planning-malformed-prompt", malformed_planning, "RUNTIME_PROMPT_ARTIFACT_INVALID"),
+        ("planning-tampered-inputs", tampered_planning, "RUNTIME_PROMPT_ARTIFACT_INVALID"),
+        ("work-run-with-planning-prompt", work_with_planning_prompt, "RUNTIME_PROMPT_ARTIFACT_INVALID"),
+        ("planning-subclass", planning_subclass, "RUNTIME_SUBJECT_INVALID"),
+    )
+    production = _PaseoRuntimeProviderAdapter(
+        client=SimpleNamespace(),  # type: ignore[arg-type]
+        artifacts=store,
+        repository_contexts={},
+        state_path=tmp_path / "paseo.json",
+    )
+
+    for name, subject, expected_error in rows:
+        prompt_digest = (
+            subject.planning_request_artifact_digest
+            if isinstance(subject, CampaignPlanningSubject)
+            else subject.prompt_artifact_digest
+        )
+        spec = _RuntimeActionSpec(
+            subject.stable_action_id,
+            subject,
+            _profile(),
+            store.get(prompt_digest),
+            (store.get(prompt_digest),),
+        )
+        in_memory = _InMemoryRuntimeProviderAdapter(store)
+        if expected_error is None:
+            production_schema = production._output_schema_payload(spec)
+            assert production_schema == gateway_module._runtime_output_schema_bytes(
+                gateway_module._RuntimeOutputIdentity(
+                    subject_digest=subject.digest,
+                    stable_action_id=subject.stable_action_id,
+                    authority_digest=subject.authority_digest,
+                ),
+                planning_output_payload_schema(),
+            )
+            assert not isinstance(in_memory.prepare(spec), _RuntimeFailure), name
+        else:
+            with pytest.raises(RuntimeGatewayError) as production_error:
+                production._output_schema_payload(spec)
+            in_memory_result = in_memory.prepare(spec)
+            assert production_error.value.code == expected_error, name
+            assert isinstance(in_memory_result, _RuntimeFailure), name
+            assert in_memory_result.code == expected_error, name
+            assert in_memory.prepare_calls == [], name
+
+
+@pytest.mark.parametrize(
+    ("mode", "action_state", "expected"),
+    (
+        ("cut_over", "absent", "completed"),
+        ("cut_over", "prepared", "completed"),
+        ("cut_over", "running", "running"),
+        ("cut_over", "parked", "running"),
+        ("cut_over", "completed", "completed"),
+        ("draining", "absent", "RUNTIME_RECOVERY_ONLY"),
+        ("draining", "prepared", "RUNTIME_RECOVERY_ONLY"),
+        ("draining", "running", "RUNTIME_RECOVERY_ONLY"),
+        ("draining", "parked", "RUNTIME_RECOVERY_ONLY"),
+        ("draining", "completed", "completed"),
+    ),
+)
+def test_r7c1_progress_recovery_state_matrix(mode, action_state, expected, tmp_path):
+    """Only progress owns exact action recovery; draining never dispatches."""
+
+    from gwo_v8.planning_protocol import planning_prompt
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    snapshot = store.put_canonical({"tickets": [{"key": "issue:111"}]})
+    policy = store.put_canonical({"policy": "frozen"})
+    unsigned = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r7-progress",
+        campaign_handle="handle:r7-progress",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest=snapshot.digest,
+        policy_witness_digest=policy.digest,
+        planning_request_artifact_digest="0" * 64,
+        stable_action_id="planning:r7-progress",
+    )
+    prompt = store.put_canonical(
+        planning_prompt(
+            subject_digest=unsigned.prompt_binding_digest,
+            authority_digest=unsigned.authority_digest,
+            snapshot_artifact_digest=snapshot.digest,
+            policy_witness_artifact_digest=policy.digest,
+        )
+    )
+    subject = replace(unsigned, planning_request_artifact_digest=prompt.digest)
+    selected_mode = {"value": "cut_over"}
+
+    class RecoveryPolicy:
+        def mode(self, _subject):
+            return selected_mode["value"]
+
+        def enter(self, _subject, boundary, *, permission_request_id=None):
+            return f"r7:{boundary}"
+
+        def resolve(self, _subject, _boundary, _ticket):
+            return None
+
+        def reconcile(self, _subject, _observation_kind):
+            return None
+
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.json",
+        _adapter=adapter,
+        configuration=RuntimeConfiguration(
+            profiles={_profile().digest: _profile()},
+            host_mappings={"coordinator": ProfileMapping(_profile().digest)},
+        ),
+        _artifacts=store,
+        _planning_effect_dispatch=RecoveryPolicy(),
+    )
+    preflight = gateway.planning_preflight(subject)
+
+    def seed(state):
+        if state == "absent":
+            return
+        if state == "prepared":
+            record = gateway._assignment_for_progress(
+                subject, gateway._data["preflights"][subject.stable_action_id]
+            )
+            prompt_artifact, input_artifacts = gateway._resolve_input_artifacts(subject)
+            prepared = adapter.prepare(
+                _RuntimeActionSpec(
+                    subject.stable_action_id,
+                    subject,
+                    gateway._profile(record["profile_digest"]),
+                    prompt_artifact,
+                    input_artifacts,
+                )
+            )
+            assert not isinstance(prepared, _RuntimeFailure)
+            return
+        if state in {"running", "parked"}:
+            adapter._complete_action = lambda _action: None  # type: ignore[method-assign]
+            running = gateway.progress(subject, preflight)
+            assert running.status == "running"
+            if state == "parked":
+                adapter.observe(subject.stable_action_id)
+                parked = adapter.command(subject.stable_action_id, RuntimeCommand.PARK)
+                assert not isinstance(parked, _RuntimeFailure)
+            return
+        assert state == "completed"
+        assert gateway.progress(subject, preflight).status == "completed"
+
+    seed(action_state)
+    selected_mode["value"] = mode
+    before = (
+        len(adapter.prepare_calls),
+        adapter.created_agent_count,
+        len(adapter.command_calls),
+    )
+    if expected in {"completed", "running"}:
+        receipt = gateway.progress(subject, preflight)
+        assert receipt.status == expected
+    else:
+        with pytest.raises(RuntimeGatewayError) as rejected:
+            gateway.progress(subject, preflight)
+        assert rejected.value.code == expected
+    after = (
+        len(adapter.prepare_calls),
+        adapter.created_agent_count,
+        len(adapter.command_calls),
+    )
+    if mode == "draining":
+        assert after == before
+
+
+@pytest.mark.parametrize("initial_state", ("absent", "prepared"))
+def test_r8_writer_effect_claim_cannot_dispatch_after_drain(
+    initial_state,
+    tmp_path,
+):
+    """A pre-drain claim is recovery evidence, never a draining dispatch lease."""
+
+    from gwo_v8.planning_protocol import planning_prompt
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    snapshot = store.put_canonical({"tickets": [{"key": "issue:111"}]})
+    policy = store.put_canonical({"policy": "frozen"})
+    unsigned = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r8-race",
+        campaign_handle="handle:r8-race",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest=snapshot.digest,
+        policy_witness_digest=policy.digest,
+        planning_request_artifact_digest="0" * 64,
+        stable_action_id="planning:r8-race",
+    )
+    prompt = store.put_canonical(
+        planning_prompt(
+            subject_digest=unsigned.prompt_binding_digest,
+            authority_digest=unsigned.authority_digest,
+            snapshot_artifact_digest=snapshot.digest,
+            policy_witness_artifact_digest=policy.digest,
+        )
+    )
+    subject = replace(unsigned, planning_request_artifact_digest=prompt.digest)
+    writer = {"mode": "cut_over", "samples": []}
+    effect_claims = []
+
+    class DrainBeforeDispatch:
+        def mode(self, _subject):
+            writer["samples"].append(writer["mode"])
+            return writer["mode"]
+
+        def enter(self, authorized_subject, boundary, *, permission_request_id=None):
+            assert authorized_subject == subject
+            effect_claims.append(boundary)
+            writer["mode"] = "draining"
+            return None
+
+        def resolve(self, _subject, _boundary, _ticket):
+            return None
+
+        def reconcile(self, _subject, _observation_kind):
+            return None
+
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.json",
+        _adapter=adapter,
+        configuration=RuntimeConfiguration(
+            profiles={_profile().digest: _profile()},
+            host_mappings={"coordinator": ProfileMapping(_profile().digest)},
+        ),
+        _artifacts=store,
+        _planning_effect_dispatch=DrainBeforeDispatch(),
+    )
+    preflight = gateway.planning_preflight(subject)
+    if initial_state == "prepared":
+        record = gateway._assignment_for_progress(
+            subject, gateway._data["preflights"][subject.stable_action_id]
+        )
+        prompt_artifact, input_artifacts = gateway._resolve_input_artifacts(subject)
+        prepared = adapter.prepare(
+            _RuntimeActionSpec(
+                subject.stable_action_id,
+                subject,
+                gateway._profile(record["profile_digest"]),
+                prompt_artifact,
+                input_artifacts,
+            )
+        )
+        assert not isinstance(prepared, _RuntimeFailure)
+    before = (
+        len(adapter.prepare_calls),
+        adapter.created_agent_count,
+        len(adapter.command_calls),
+    )
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        gateway.progress(subject, preflight)
+
+    assert rejected.value.code == "RUNTIME_RECOVERY_ONLY"
+    assert writer["samples"] == ["cut_over"]
+    assert effect_claims == [
+        "prepare" if initial_state == "absent" else "start"
+    ]
+    assert (
+        len(adapter.prepare_calls),
+        adapter.created_agent_count,
+        len(adapter.command_calls),
+    ) == before
+
+
+def test_r8_writer_effect_authorization_is_not_replayable_across_boundaries(
+    tmp_path,
+):
+    """One exact prepare claim cannot be replayed as a start claim."""
+
+    from gwo_v8.planning_protocol import planning_prompt
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    snapshot = store.put_canonical({"tickets": [{"key": "issue:111"}]})
+    policy = store.put_canonical({"policy": "frozen"})
+    unsigned = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r8-boundaries",
+        campaign_handle="handle:r8-boundaries",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest=snapshot.digest,
+        policy_witness_digest=policy.digest,
+        planning_request_artifact_digest="0" * 64,
+        stable_action_id="planning:r8-boundaries",
+    )
+    prompt = store.put_canonical(
+        planning_prompt(
+            subject_digest=unsigned.prompt_binding_digest,
+            authority_digest=unsigned.authority_digest,
+            snapshot_artifact_digest=snapshot.digest,
+            policy_witness_artifact_digest=policy.digest,
+        )
+    )
+    subject = replace(unsigned, planning_request_artifact_digest=prompt.digest)
+    authorizations = []
+
+    class BoundaryDispatch:
+        def mode(self, _subject):
+            return "cut_over"
+
+        def enter(self, authorized_subject, boundary, *, permission_request_id=None):
+            assert authorized_subject == subject
+            authorizations.append(boundary)
+            return "r8:prepare" if boundary == "prepare" else None
+
+        def resolve(self, resolved_subject, boundary, ticket):
+            assert resolved_subject == subject
+            assert boundary == "prepare"
+            assert ticket == "r8:prepare"
+
+        def reconcile(self, _subject, _observation_kind):
+            return None
+
+    adapter = _InMemoryRuntimeProviderAdapter(store)
+    gateway = RuntimeGateway(
+        store_path=tmp_path / "gateway.json",
+        _adapter=adapter,
+        configuration=RuntimeConfiguration(
+            profiles={_profile().digest: _profile()},
+            host_mappings={"coordinator": ProfileMapping(_profile().digest)},
+        ),
+        _artifacts=store,
+        _planning_effect_dispatch=BoundaryDispatch(),
+    )
+    preflight = gateway.planning_preflight(subject)
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        gateway.progress(subject, preflight)
+
+    assert rejected.value.code == "RUNTIME_RECOVERY_ONLY"
+    assert authorizations == ["prepare", "start"]
+    assert adapter.prepare_calls == [subject.stable_action_id]
+    assert adapter.created_agent_count == 0
+    assert adapter.command_calls == []

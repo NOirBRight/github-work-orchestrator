@@ -8,9 +8,9 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
-from ._canonical import canonical_bytes, digest_bytes, digest_value
+from ._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
 from .activation import GitHubContentClient, LocalPlanPublication
 from .compiler import CompiledPlan
 from .evidence import TypedEvidence
@@ -34,6 +34,49 @@ REQUIRED_CANARY_COVERAGE = frozenset(
         "rollback",
     }
 )
+
+
+# This private ledger is deliberately read by the production Writer transition
+# owner as part of its exact control-ref CAS.  It is not PlanControl state: it
+# merely fences the narrow interval between a Gateway's provider dispatch
+# admission and the adapter's durable readback.
+_PLANNING_EFFECT_DISPATCH_PATH = ".gwo-v8/planning-effect-dispatch-v1.json"
+_PLANNING_EFFECT_DISPATCH_SCHEMA = "gwo.planning-effect-dispatch.v1"
+_PLANNING_EFFECT_DISPATCH_FIELDS = {
+    "repository",
+    "campaign_key",
+    "campaign_handle",
+    "subject_digest",
+    "stable_action_id",
+    "effect_boundary",
+    "permission_request_id",
+    "permission_decision",
+    "writer_generation",
+    "writer_cut_over_record_id",
+    "writer_observation_ref",
+    "ticket",
+    "attempt",
+    "state",
+}
+_PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES = 12_288
+_PLANNING_EFFECT_DISPATCH_MAX_ENTRIES = 16
+_PLANNING_EFFECT_DISPATCH_MAX_ACTIVE_ENTRIES = 8
+_PLANNING_EFFECT_DISPATCH_MAX_TEXT_BYTES = 256
+_PLANNING_EFFECT_DISPATCH_MAX_ATTEMPT = 16
+_PLANNING_EFFECT_DISPATCH_BOUNDARIES = frozenset(
+    {"prepare", "start", "resume", "permission_allow"}
+)
+_PLANNING_EFFECT_DISPATCH_TICKET_FIELDS = tuple(
+    sorted(_PLANNING_EFFECT_DISPATCH_FIELDS - {"ticket", "state"})
+)
+
+
+class WriterTransitionBlocked(RuntimeError):
+    """A typed retry outcome from the durable Writer transition owner."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -776,6 +819,201 @@ class InMemoryWriterTransitionControl:
         return record.worker_capacity, record.coordinator_capacity
 
 
+def _planning_effect_dispatch_ticket(entry: Mapping[str, Any]) -> str:
+    """Derive the opaque ticket from every immutable dispatch identity field."""
+
+    identity = {
+        name: entry[name] for name in _PLANNING_EFFECT_DISPATCH_TICKET_FIELDS
+    }
+    return "planning-dispatch:" + digest_value(identity)[:32]
+
+
+def _planning_effect_dispatch_entry_order(entry: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Give compaction one stable identity order, independent of map order."""
+
+    return tuple(
+        "" if entry[name] is None else entry[name]
+        for name in sorted(_PLANNING_EFFECT_DISPATCH_FIELDS)
+    )
+
+
+def _planning_effect_dispatch_ledger_bytes(
+    repository: str,
+    entries: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> bytes:
+    """Render one bounded canonical dispatch ledger before a ref CAS."""
+
+    rendered = canonical_bytes(
+        {
+            "schema_version": _PLANNING_EFFECT_DISPATCH_SCHEMA,
+            "repository": repository,
+            "entries": list(entries),
+        }
+    )
+    if len(rendered) > _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES:
+        raise ValueError("control-ref dispatch ledger exceeds its canonical byte budget")
+    return rendered
+
+
+def _planning_effect_dispatch_text(value: object, label: str) -> str:
+    """Validate one exact bounded dispatch-ledger text field."""
+
+    if type(value) is not str or not value:
+        raise ValueError(f"control-ref dispatch {label} is not exact text")
+    try:
+        byte_length = len(value.encode("utf-8"))
+    except UnicodeError as error:
+        raise ValueError(
+            f"control-ref dispatch {label} is not UTF-8 text"
+        ) from error
+    if byte_length > _PLANNING_EFFECT_DISPATCH_MAX_TEXT_BYTES:
+        raise ValueError(f"control-ref dispatch {label} exceeds its text budget")
+    return value
+
+
+def _validate_planning_effect_dispatch_entries(
+    repository: str,
+    raw_entries: object,
+) -> tuple[dict[str, Any], ...]:
+    """Apply the shared closed dispatch-ledger policy before use or CAS."""
+
+    if type(raw_entries) is not list:
+        raise ValueError("control-ref dispatch entries are not one exact list")
+    if len(raw_entries) > _PLANNING_EFFECT_DISPATCH_MAX_ENTRIES:
+        raise ValueError("control-ref dispatch ledger exceeds its entry budget")
+    entries: list[dict[str, Any]] = []
+    keys: set[tuple[str, str, str, str]] = set()
+    tickets: set[str] = set()
+    active_entries = 0
+    for raw in raw_entries:
+        if type(raw) is not dict or set(raw) != _PLANNING_EFFECT_DISPATCH_FIELDS:
+            raise ValueError("control-ref dispatch entry schema is invalid")
+        if (
+            raw["repository"] != repository
+            or type(raw["subject_digest"]) is not str
+            or len(raw["subject_digest"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in raw["subject_digest"]
+            )
+            or type(raw["effect_boundary"]) is not str
+            or raw["effect_boundary"] not in _PLANNING_EFFECT_DISPATCH_BOUNDARIES
+            or type(raw["state"]) is not str
+            or raw["state"] not in {"active", "recovery"}
+            or type(raw["attempt"]) is not int
+            or isinstance(raw["attempt"], bool)
+            or not 1 <= raw["attempt"] <= _PLANNING_EFFECT_DISPATCH_MAX_ATTEMPT
+            or raw["ticket"] != _planning_effect_dispatch_ticket(raw)
+        ):
+            raise ValueError("control-ref dispatch entry fields are invalid")
+        try:
+            for name in _PLANNING_EFFECT_DISPATCH_FIELDS - {
+                "attempt",
+                "permission_request_id",
+                "permission_decision",
+            }:
+                _planning_effect_dispatch_text(raw[name], f"entry {name}")
+        except ValueError as error:
+            raise ValueError("control-ref dispatch entry fields are invalid") from error
+        if raw["effect_boundary"] == "permission_allow":
+            try:
+                _planning_effect_dispatch_text(
+                    raw["permission_request_id"],
+                    "entry permission_request_id",
+                )
+                if raw["permission_decision"] != "allow":
+                    raise ValueError("permission decision is not allow")
+                _planning_effect_dispatch_text(
+                    raw["permission_decision"],
+                    "entry permission_decision",
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "control-ref permission dispatch identity is invalid"
+                ) from error
+        elif (
+            raw["permission_request_id"] is not None
+            or raw["permission_decision"] is not None
+        ):
+            raise ValueError("control-ref non-permission dispatch identity is invalid")
+        key = (
+            raw["writer_generation"],
+            raw["writer_cut_over_record_id"],
+            raw["stable_action_id"],
+            raw["effect_boundary"],
+        )
+        if key in keys or raw["ticket"] in tickets:
+            raise ValueError("control-ref dispatch entry identity is duplicated")
+        keys.add(key)
+        tickets.add(raw["ticket"])
+        if raw["state"] == "active":
+            active_entries += 1
+        entries.append(dict(raw))
+    if active_entries > _PLANNING_EFFECT_DISPATCH_MAX_ACTIVE_ENTRIES:
+        raise ValueError("control-ref dispatch ledger exceeds its active-entry budget")
+    _planning_effect_dispatch_ledger_bytes(repository, entries)
+    return tuple(entries)
+
+
+def _planning_effect_dispatch_entries_at_ref(
+    client: object,
+    repository: str,
+    ref_digest: str,
+) -> tuple[dict[str, Any], ...]:
+    """Decode the one closed dispatch ledger visible at a control-ref OID."""
+
+    reader = getattr(client, "read_at_ref", None)
+    if not callable(reader):
+        raise ValueError("control-ref dispatch read is unavailable")
+    content = reader(repository, ref_digest, _PLANNING_EFFECT_DISPATCH_PATH)
+    if content is None:
+        return ()
+    payload = getattr(content, "content", None)
+    if type(payload) is not bytes:
+        raise ValueError("control-ref dispatch ledger bytes are invalid")
+    value = load_canonical_json(payload)
+    if (
+        type(value) is not dict
+        or set(value) != {"schema_version", "repository", "entries"}
+        or value["schema_version"] != _PLANNING_EFFECT_DISPATCH_SCHEMA
+    ):
+        raise ValueError("control-ref dispatch ledger schema is invalid")
+    if (
+        _planning_effect_dispatch_text(value["repository"], "ledger repository")
+        != repository
+    ):
+        raise ValueError("control-ref dispatch ledger schema is invalid")
+    return _validate_planning_effect_dispatch_entries(repository, value["entries"])
+
+
+def _writer_drain_dispatch_blocker(
+    client: object,
+    repository: str,
+    ref_digest: str,
+    *,
+    writer_generation: str,
+    cut_over_record_id: str,
+) -> str | None:
+    """Return the exact blocker before the Writer can append `draining`."""
+
+    try:
+        entries = _planning_effect_dispatch_entries_at_ref(
+            client,
+            repository,
+            ref_digest,
+        )
+    except Exception:
+        return "WRITER_DRAIN_DISPATCH_INVALID"
+    if any(
+        entry["state"] == "active"
+        and entry["writer_generation"] == writer_generation
+        and entry["writer_cut_over_record_id"] == cut_over_record_id
+        for entry in entries
+    ):
+        return "WRITER_DRAIN_DISPATCH_ACTIVE"
+    return None
+
+
 class GitHubWriterTransitionControl:
     """Append-only writer transition record on a dedicated GitHub branch."""
 
@@ -791,6 +1029,42 @@ class GitHubWriterTransitionControl:
         self.client = client
         self.branch = branch
         self.initial_writer = initial_writer
+
+    @property
+    def _uses_ref_cas(self) -> bool:
+        return all(
+            callable(getattr(self.client, name, None))
+            for name in ("read_ref", "read_at_ref", "compare_and_swap_ref")
+        )
+
+    def _read_control_at_ref(
+        self,
+        repository: str,
+        ref_digest: str,
+    ) -> dict[str, Any]:
+        content = self.client.read_at_ref(repository, ref_digest, self._PATH)
+        if content is None:
+            return {
+                "schema_version": 1,
+                "current": {
+                    "repository": repository,
+                    "writer_generation": self.initial_writer,
+                    "record_id": "initial-writer",
+                },
+                "records": [],
+            }
+        try:
+            value = load_canonical_json(content.content)
+        except Exception as error:
+            raise ValueError("durable writer transition control is invalid") from error
+        if (
+            type(value) is not dict
+            or value.get("schema_version") != 1
+            or not isinstance(value.get("current"), dict)
+            or not isinstance(value.get("records"), list)
+        ):
+            raise ValueError("durable writer transition control is malformed")
+        return value
 
     def _read_control(
         self,
@@ -850,6 +1124,9 @@ class GitHubWriterTransitionControl:
         )
 
     def publish(self, record: WriterTransitionRecord) -> None:
+        if self._uses_ref_cas:
+            self._publish_at_ref(record)
+            return
         value, blob_sha = self._read_control(record.repository)
         current = value["current"]
         existing = next(
@@ -891,6 +1168,107 @@ class GitHubWriterTransitionControl:
             record.repository,
             record.record_id,
         ) != record:
+            raise ValueError("Writer Transition Record did not read back")
+
+    def _publish_at_ref(self, record: WriterTransitionRecord) -> None:
+        ref_digest = self.client.read_ref(record.repository, self.branch)
+        if type(ref_digest) is not str or not ref_digest:
+            raise ValueError("durable writer transition ref is invalid")
+        value = self._read_control_at_ref(record.repository, ref_digest)
+        current = value["current"]
+        existing = next(
+            (
+                self._record_from_dict(item)
+                for item in value["records"]
+                if item.get("record_id") == record.record_id
+            ),
+            None,
+        )
+        if existing is not None:
+            if replace(existing, created_at=record.created_at) != record:
+                raise ValueError("Writer Transition Records are immutable")
+            return
+        if current.get("writer_generation") != record.previous_writer_generation:
+            raise ValueError("writer generation changed before transition commit")
+        if record.status == "draining":
+            blocker = _writer_drain_dispatch_blocker(
+                self.client,
+                record.repository,
+                ref_digest,
+                writer_generation=record.writer_generation,
+                cut_over_record_id=str(current.get("record_id", "")),
+            )
+            if blocker is not None:
+                raise WriterTransitionBlocked(blocker)
+        value["records"].append(asdict(record))
+        if record.status in {"pending", "cut_over", "draining", "rolled_back"}:
+            value["current"] = {
+                "repository": record.repository,
+                "writer_generation": record.writer_generation,
+                "record_id": record.record_id,
+            }
+        rendered = canonical_bytes(value)
+        try:
+            committed = self.client.compare_and_swap_ref(
+                record.repository,
+                self.branch,
+                expected_ref_digest=ref_digest,
+                changes={self._PATH: rendered},
+                message=f"GWO V8 {record.kind} {record.record_id}",
+            )
+        except Exception as error:
+            if record.status != "draining":
+                raise
+            # A dispatch CAS can win after this transition read the ref but
+            # before its Writer CAS.  Re-read that exact newer state so this
+            # loss has the same typed, durable outcome as an already-visible
+            # active dispatch rather than an unclassified CAS failure.
+            try:
+                recovered_ref = self.client.read_ref(
+                    record.repository,
+                    self.branch,
+                )
+                recovered_value = self._read_control_at_ref(
+                    record.repository,
+                    recovered_ref,
+                )
+                recovered_existing = next(
+                    (
+                        self._record_from_dict(item)
+                        for item in recovered_value["records"]
+                        if item.get("record_id") == record.record_id
+                    ),
+                    None,
+                )
+                if recovered_existing is not None:
+                    if (
+                        replace(recovered_existing, created_at=record.created_at)
+                        != record
+                    ):
+                        raise ValueError("Writer Transition Records are immutable")
+                    return
+                recovered_current = recovered_value["current"]
+                blocker = _writer_drain_dispatch_blocker(
+                    self.client,
+                    record.repository,
+                    recovered_ref,
+                    writer_generation=record.writer_generation,
+                    cut_over_record_id=str(
+                        recovered_current.get("record_id", "")
+                    ),
+                )
+            except Exception as recovery_error:
+                raise WriterTransitionBlocked("WRITER_DRAIN_RETRY") from recovery_error
+            if blocker is not None:
+                raise WriterTransitionBlocked(blocker) from error
+            raise WriterTransitionBlocked("WRITER_DRAIN_RETRY") from error
+        if type(committed) is not str or not committed:
+            raise ValueError("Writer Transition Record ref CAS did not commit")
+        readback = self._read_control_at_ref(record.repository, committed)
+        if not any(
+            self._record_from_dict(item) == record
+            for item in readback["records"]
+        ):
             raise ValueError("Writer Transition Record did not read back")
 
     def read(
@@ -1250,17 +1628,6 @@ class WriterCutoverController:
             blockers.add("ROLLBACK_TRANSITION_MISSING")
         if not blockers:
             was_pending = current_record.status == "pending"
-            was_draining = current_record.status == "draining"
-            if (
-                activation_id is not None
-                and not was_pending
-                and current_record.status != "draining"
-            ):
-                self.publication.begin_writer_drain(
-                    repository,
-                    writer_generation=current.writer_generation,
-                    activation_id=activation_id,
-                )
             if current_record.status != "draining":
                 drain_record = _record(
                     repository=repository,
@@ -1279,7 +1646,23 @@ class WriterCutoverController:
                     coordinator_capacity=0,
                     reason=reason,
                 )
-                self.transitions.publish(drain_record)
+                try:
+                    self.transitions.publish(drain_record)
+                except WriterTransitionBlocked as error:
+                    # The GitHub Writer transition owner saw a durable active
+                    # provider-dispatch fence at its own control-ref CAS.
+                    # Leave every local drain state untouched; a Gateway
+                    # retry/readback must resolve that exact fence first.
+                    return WriterTransitionOutcome(
+                        status="blocked",
+                        repository=repository,
+                        writer_generation=current.writer_generation,
+                        record_id=current_record.record_id,
+                        activation_id=activation_id,
+                        worker_capacity=0,
+                        coordinator_capacity=0,
+                        blockers=(error.code,),
+                    )
                 current_record = drain_record
             if (
                 was_pending
@@ -1312,9 +1695,7 @@ class WriterCutoverController:
                     plan_record,
                     receipt,
                 )
-            if activation_id is not None and (
-                was_pending or was_draining
-            ):
+            if activation_id is not None:
                 self.publication.begin_writer_drain(
                     repository,
                     writer_generation=current.writer_generation,

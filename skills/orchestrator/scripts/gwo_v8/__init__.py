@@ -17,6 +17,14 @@ from .activation import (
     WriterAuthorityControl,
 )
 from .compiler import CompiledPlan, CompileError, PlanCompiler
+from .plan_control import (
+    CampaignHandle,
+    PlanControlError,
+    start,
+)
+from .plan_control_host import (
+    install_github_plan_control_start,
+)
 from .entry import (
     ImplementGwoDecision,
     ImplementGwoEntry,
@@ -278,4 +286,8 @@ __all__ = [
     "Reconciler",
     "VerificationDecision",
     "VerifiedResult",
+    "CampaignHandle",
+    "PlanControlError",
+    "install_github_plan_control_start",
+    "start",
 ]
