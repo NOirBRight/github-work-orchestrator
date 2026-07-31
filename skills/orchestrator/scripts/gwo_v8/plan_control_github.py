@@ -31,9 +31,14 @@ from .runtime_gateway import CampaignPlanningSubject
 from .transition import (
     WriterTransitionRecord,
     _PLANNING_EFFECT_DISPATCH_FIELDS,
+    _PLANNING_EFFECT_DISPATCH_MAX_ACTIVE_ENTRIES,
     _PLANNING_EFFECT_DISPATCH_PATH,
     _PLANNING_EFFECT_DISPATCH_SCHEMA,
+    _planning_effect_dispatch_entry_order,
     _planning_effect_dispatch_entries_at_ref,
+    _planning_effect_dispatch_ledger_bytes,
+    _planning_effect_dispatch_ticket,
+    _validate_planning_effect_dispatch_entries,
 )
 
 
@@ -306,8 +311,13 @@ class _GitHubPlanningEffectDispatch:
     def enter(self, subject: CampaignPlanningSubject, boundary: str) -> str | None:
         return self._repository._enter_planning_effect_dispatch(subject, boundary)
 
-    def resolve(self, ticket: str) -> None:
-        self._repository._resolve_planning_effect_dispatch(ticket)
+    def resolve(
+        self,
+        subject: CampaignPlanningSubject,
+        boundary: str,
+        ticket: str,
+    ) -> None:
+        self._repository._resolve_planning_effect_dispatch(subject, boundary, ticket)
 
     def reconcile(
         self,
@@ -2819,6 +2829,23 @@ class GitHubPlanRepository:
         authority: Mapping[str, str],
     ) -> bool:
         return (
+            GitHubPlanRepository._dispatch_entry_same_action_lineage(
+                entry,
+                subject,
+                authority,
+            )
+            and entry.get("campaign_key") == subject.campaign_key
+            and entry.get("campaign_handle") == subject.campaign_handle
+            and entry.get("subject_digest") == subject.digest
+        )
+
+    @staticmethod
+    def _dispatch_entry_same_action_lineage(
+        entry: Mapping[str, Any],
+        subject: CampaignPlanningSubject,
+        authority: Mapping[str, str],
+    ) -> bool:
+        return (
             entry.get("repository") == subject.repository
             and entry.get("stable_action_id") == subject.stable_action_id
             and entry.get("writer_generation") == authority.get("writer_generation")
@@ -2834,13 +2861,58 @@ class GitHubPlanRepository:
         authority: Mapping[str, str],
     ) -> bool:
         return (
-            GitHubPlanRepository._dispatch_entry_for_action(
+            GitHubPlanRepository._dispatch_entry_same_action_lineage(
                 entry,
                 subject,
                 authority,
             )
             and entry.get("effect_boundary") == boundary
         )
+
+    def _compact_planning_effect_dispatch_entries(
+        self,
+        entries: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], bytes]:
+        """Retain active facts and trim only ordered recovery evidence."""
+
+        if (
+            sum(entry["state"] == "active" for entry in entries)
+            > _PLANNING_EFFECT_DISPATCH_MAX_ACTIVE_ENTRIES
+        ):
+            raise PlanControlError(
+                "PLANNING_EFFECT_DISPATCH_BOUNDED",
+                "Planning effect dispatch has reached its active-ticket budget",
+            )
+        compacted = list(entries)
+        while True:
+            ordered = sorted(
+                compacted,
+                key=_planning_effect_dispatch_entry_order,
+            )
+            try:
+                _validate_planning_effect_dispatch_entries(
+                    self.repository,
+                    ordered,
+                )
+                return ordered, _planning_effect_dispatch_ledger_bytes(
+                    self.repository,
+                    ordered,
+                )
+            except ValueError as error:
+                recovery = next(
+                    (
+                        entry
+                        for entry in ordered
+                        if entry["state"] == "recovery"
+                    ),
+                    None,
+                )
+                if recovery is None:
+                    raise PlanControlError(
+                        "PLANNING_EFFECT_DISPATCH_BOUNDED",
+                        "Planning effect dispatch cannot fit one exact active ticket",
+                    ) from error
+                compacted.remove(recovery)
 
     def _enter_planning_effect_dispatch(
         self,
@@ -2859,6 +2931,12 @@ class GitHubPlanRepository:
             return None
         _repo, ref_digest, _before, authority = self._read_ref_state()
         entries = self._planning_effect_dispatch_entries(ref_digest)
+        if any(
+            self._dispatch_entry_same_action_lineage(entry, subject, authority)
+            and not self._dispatch_entry_for_action(entry, subject, authority)
+            for entry in entries
+        ):
+            return None
         boundary_entries = [
             entry
             for entry in entries
@@ -2897,6 +2975,14 @@ class GitHubPlanRepository:
             authority.get("record_id") != authority.get("cut_over_record_id")
         ):
             return None
+        if (
+            sum(entry["state"] == "active" for entry in entries)
+            >= _PLANNING_EFFECT_DISPATCH_MAX_ACTIVE_ENTRIES
+        ):
+            raise PlanControlError(
+                "PLANNING_EFFECT_DISPATCH_BOUNDED",
+                "Planning effect dispatch has reached its active-ticket budget",
+            )
         attempt = 1 if previous is None else int(previous["attempt"]) + 1
         identity = {
             "repository": self.repository,
@@ -2910,7 +2996,7 @@ class GitHubPlanRepository:
             "writer_observation_ref": ref_digest,
             "attempt": attempt,
         }
-        ticket = "planning-dispatch:" + digest_value(identity)[:32]
+        ticket = _planning_effect_dispatch_ticket(identity)
         entry = {
             **identity,
             "ticket": ticket,
@@ -2926,12 +3012,8 @@ class GitHubPlanRepository:
             updated.append(entry)
         else:
             updated[updated.index(previous)] = entry
-        rendered = canonical_bytes(
-            {
-                "schema_version": _PLANNING_EFFECT_DISPATCH_SCHEMA,
-                "repository": self.repository,
-                "entries": updated,
-            }
+        updated, rendered = self._compact_planning_effect_dispatch_entries(
+            updated
         )
         try:
             committed = self.client.compare_and_swap_ref(
@@ -2967,15 +3049,28 @@ class GitHubPlanRepository:
             )
         return ticket
 
-    def _resolve_planning_effect_dispatch(self, ticket: str) -> None:
+    def _resolve_planning_effect_dispatch(
+        self,
+        subject: CampaignPlanningSubject,
+        boundary: str,
+        ticket: str,
+    ) -> None:
         """Close one active dispatch after a provider result or ambiguity."""
 
-        if type(ticket) is not str or not ticket or not self._uses_ref_cas:
+        if (
+            type(subject) is not CampaignPlanningSubject
+            or subject.repository != self.repository
+            or type(boundary) is not str
+            or boundary not in {"prepare", "start"}
+            or type(ticket) is not str
+            or not ticket
+            or not self._uses_ref_cas
+        ):
             raise PlanControlError(
                 "WRITER_FENCE_READBACK_INVALID",
-                "Planning effect dispatch resolution has no exact durable ticket",
+                "Planning effect dispatch resolution lacks one exact identity",
             )
-        _repo, ref_digest, _before, _authority = self._read_ref_state()
+        _repo, ref_digest, _before, authority = self._read_ref_state()
         entries = list(self._planning_effect_dispatch_entries(ref_digest))
         matching = [entry for entry in entries if entry["ticket"] == ticket]
         if len(matching) != 1:
@@ -2984,6 +3079,16 @@ class GitHubPlanRepository:
                 "Planning effect dispatch ticket is stale or missing",
             )
         entry = matching[0]
+        if not self._dispatch_entry_matches_subject(
+            entry,
+            subject,
+            boundary,
+            authority,
+        ):
+            raise PlanControlError(
+                "WRITER_FENCE_READBACK_INVALID",
+                "Planning effect dispatch ticket does not bind this subject and boundary",
+            )
         if entry["state"] == "recovery":
             return
         if entry["state"] != "active":
@@ -3009,10 +3114,17 @@ class GitHubPlanRepository:
                 message="GWO resolve Planning provider dispatch",
             )
         except Exception as error:
-            _repo, recovered_ref, _before, _authority = self._read_ref_state()
+            _repo, recovered_ref, _before, recovered_authority = self._read_ref_state()
             recovered = self._planning_effect_dispatch_entries(recovered_ref)
             if any(
-                value["ticket"] == ticket and value["state"] == "recovery"
+                value["ticket"] == ticket
+                and value["state"] == "recovery"
+                and self._dispatch_entry_matches_subject(
+                    value,
+                    subject,
+                    boundary,
+                    recovered_authority,
+                )
                 for value in recovered
             ):
                 return
@@ -3063,7 +3175,11 @@ class GitHubPlanRepository:
             entry["effect_boundary"] == "start" and observation_kind == "bound"
         )
         if proven:
-            self._resolve_planning_effect_dispatch(str(entry["ticket"]))
+            self._resolve_planning_effect_dispatch(
+                subject,
+                str(entry["effect_boundary"]),
+                str(entry["ticket"]),
+            )
 
     def reserve_claims(self, receipt: ActivationReceipt) -> None:
         self._assert_repository(receipt.repository)

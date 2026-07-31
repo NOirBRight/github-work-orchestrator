@@ -2607,7 +2607,7 @@ def test_r9_dispatch_ticket_is_exact_and_draining_rejects_replay(
     assert dispatch.enter(
         subject, "start" if boundary == "prepare" else "prepare"
     ) is None
-    dispatch.resolve(ticket)
+    dispatch.resolve(subject, boundary, ticket)
     assert dispatch.enter(
         replace(subject, campaign_key="campaign:r8-other"), boundary
     ) is None
@@ -2627,6 +2627,589 @@ def test_r9_dispatch_ticket_is_exact_and_draining_rejects_replay(
     assert recovered_dispatch.enter(
         replace(subject, campaign_key="campaign:r8-other"), boundary
     ) is None
+
+
+def test_r10_foreign_campaign_reconcile_cannot_resolve_active_dispatch():
+    """Only the exact Campaign can turn its active ticket into recovery."""
+
+    from dataclasses import replace
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import CampaignPlanningSubject
+    from gwo_v8.transition import (
+        GitHubWriterTransitionControl,
+        WriterTransitionBlocked,
+        _record,
+    )
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    subject_a = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r10-owner",
+        campaign_handle="campaign-handle:r10-owner",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest="a" * 64,
+        policy_witness_digest="b" * 64,
+        planning_request_artifact_digest="c" * 64,
+        stable_action_id="planning:r10-shared-action",
+    )
+    subject_b = replace(
+        subject_a,
+        campaign_key="campaign:r10-foreign",
+        campaign_handle="campaign-handle:r10-foreign",
+    )
+    dispatch = repository.planning_effect_dispatch()
+    assert dispatch.enter(subject_a, "prepare").startswith("planning-dispatch:")
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    drain = _record(
+        repository="owner/repository",
+        kind="drain",
+        status="draining",
+        previous_writer_generation="writer:one",
+        writer_generation="writer:one",
+        activation_id="activation:cutover",
+        plan_digest="a" * 64,
+        canary_evidence_digest="b" * 64,
+        canary_evidence_refs=("github://canary/evidence",),
+        canary_manifest_ref="github://canary/manifest",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="r10 foreign reconcile",
+    )
+
+    dispatch.reconcile(subject_b, "prepared")
+
+    with pytest.raises(WriterTransitionBlocked) as blocked:
+        transitions.publish(drain)
+    assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"
+
+    dispatch.reconcile(subject_a, "prepared")
+    transitions.publish(drain)
+    assert repository.planning_progress_mode(subject_a) == "draining"
+
+
+@pytest.mark.parametrize(
+    ("foreign", "boundary", "ticket_suffix"),
+    (
+        ("campaign", "prepare", ""),
+        ("action", "prepare", ""),
+        ("boundary", "start", ""),
+        ("ticket", "prepare", ":foreign"),
+    ),
+)
+def test_r10_dispatch_resolution_requires_exact_subject_boundary_and_ticket(
+    foreign,
+    boundary,
+    ticket_suffix,
+):
+    """Foreign resolution leaves the owner active and Writer-drain blocked."""
+
+    from dataclasses import replace
+
+    from gwo_v8.plan_control import PlanControlError
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import CampaignPlanningSubject
+    from gwo_v8.transition import (
+        GitHubWriterTransitionControl,
+        WriterTransitionBlocked,
+        _record,
+    )
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    owner = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:r10-resolution-owner",
+        campaign_handle="campaign-handle:r10-resolution-owner",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest="a" * 64,
+        policy_witness_digest="b" * 64,
+        planning_request_artifact_digest="c" * 64,
+        stable_action_id="planning:r10-resolution-owner",
+    )
+    subject = (
+        replace(
+            owner,
+            campaign_key="campaign:r10-resolution-foreign",
+            campaign_handle="campaign-handle:r10-resolution-foreign",
+        )
+        if foreign == "campaign"
+        else replace(owner, stable_action_id="planning:r10-resolution-foreign")
+        if foreign == "action"
+        else owner
+    )
+    dispatch = repository.planning_effect_dispatch()
+    ticket = dispatch.enter(owner, "prepare")
+    assert type(ticket) is str
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    drain = _record(
+        repository="owner/repository",
+        kind="drain",
+        status="draining",
+        previous_writer_generation="writer:one",
+        writer_generation="writer:one",
+        activation_id="activation:cutover",
+        plan_digest="a" * 64,
+        canary_evidence_digest="b" * 64,
+        canary_evidence_refs=("github://canary/evidence",),
+        canary_manifest_ref="github://canary/manifest",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="r10 exact resolution",
+    )
+
+    with pytest.raises(PlanControlError) as rejected:
+        dispatch.resolve(subject, boundary, ticket + ticket_suffix)
+    assert rejected.value.code == "WRITER_FENCE_READBACK_INVALID"
+    with pytest.raises(WriterTransitionBlocked) as blocked:
+        transitions.publish(drain)
+    assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"
+
+    dispatch.resolve(owner, "prepare", ticket)
+    transitions.publish(drain)
+    assert repository.planning_progress_mode(owner) == "draining"
+
+
+def _r10_dispatch_subject(ordinal):
+    from gwo_v8.runtime_gateway import CampaignPlanningSubject
+
+    return CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key=f"campaign:r10-ledger:{ordinal}",
+        campaign_handle=f"campaign-handle:r10-ledger:{ordinal}",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest="a" * 64,
+        policy_witness_digest="b" * 64,
+        planning_request_artifact_digest="c" * 64,
+        stable_action_id=f"planning:r10-ledger:{ordinal}",
+    )
+
+
+def _r10_dispatch_entry(client, subject, *, state="recovery", attempt=1):
+    from gwo_v8._canonical import load_canonical_json
+    from gwo_v8.transition import _planning_effect_dispatch_ticket
+
+    writer = load_canonical_json(
+        client._commits[client.head][".gwo-v8/writer-transition.json"].content
+    )
+    entry = {
+        "repository": subject.repository,
+        "campaign_key": subject.campaign_key,
+        "campaign_handle": subject.campaign_handle,
+        "subject_digest": subject.digest,
+        "stable_action_id": subject.stable_action_id,
+        "effect_boundary": "prepare",
+        "writer_generation": "writer:one",
+        "writer_cut_over_record_id": writer["current"]["record_id"],
+        "writer_observation_ref": client.head,
+        "attempt": attempt,
+        "state": state,
+    }
+    return {**entry, "ticket": _planning_effect_dispatch_ticket(entry)}
+
+
+def _r10_install_dispatch_entries(client, entries):
+    from gwo_v8._canonical import canonical_bytes
+    from gwo_v8.transition import _PLANNING_EFFECT_DISPATCH_PATH, _PLANNING_EFFECT_DISPATCH_SCHEMA
+
+    tree = dict(client._commits[client.head])
+    tree[_PLANNING_EFFECT_DISPATCH_PATH] = client._content_type(
+        canonical_bytes(
+            {
+                "schema_version": _PLANNING_EFFECT_DISPATCH_SCHEMA,
+                "repository": "owner/repository",
+                "entries": entries,
+            }
+        ),
+        "blob:r10-dispatch-ledger",
+    )
+    client.head = f"commit:{len(client._commits) + 1}"
+    client._commits[client.head] = tree
+
+
+def _r10_drain_record(reason):
+    from gwo_v8.transition import _record
+
+    return _record(
+        repository="owner/repository",
+        kind="drain",
+        status="draining",
+        previous_writer_generation="writer:one",
+        writer_generation="writer:one",
+        activation_id="activation:cutover",
+        plan_digest="a" * 64,
+        canary_evidence_digest="b" * 64,
+        canary_evidence_refs=("github://canary/evidence",),
+        canary_manifest_ref="github://canary/manifest",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason=reason,
+    )
+
+
+def test_r10_recovery_compaction_is_bounded_stable_and_retains_exact_retry():
+    """The sixteenth recovery is compacted by immutable identity, not history order."""
+
+    from gwo_v8._canonical import load_canonical_json
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.transition import _planning_effect_dispatch_entry_order
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    dispatch = repository.planning_effect_dispatch()
+    for ordinal in range(16):
+        subject = _r10_dispatch_subject(ordinal)
+        ticket = dispatch.enter(subject, "prepare")
+        dispatch.resolve(subject, "prepare", ticket)
+
+    new_subject = _r10_dispatch_subject(16)
+    ticket = dispatch.enter(new_subject, "prepare")
+    ledger = load_canonical_json(
+        client._commits[client.head][
+            ".gwo-v8/planning-effect-dispatch-v1.json"
+        ].content
+    )
+
+    assert len(ledger["entries"]) == 16
+    assert [entry["campaign_key"] for entry in ledger["entries"]] == sorted(
+        entry["campaign_key"] for entry in ledger["entries"]
+    )
+    assert "campaign:r10-ledger:0" not in {
+        entry["campaign_key"] for entry in ledger["entries"]
+    }
+    assert "campaign:r10-ledger:15" in {
+        entry["campaign_key"] for entry in ledger["entries"]
+    }
+    assert ledger["entries"] == sorted(
+        ledger["entries"],
+        key=_planning_effect_dispatch_entry_order,
+    )
+
+    dispatch.resolve(new_subject, "prepare", ticket)
+    retry = dispatch.enter(_r10_dispatch_subject(15), "prepare")
+    assert retry.startswith("planning-dispatch:") and retry != ticket
+
+
+@pytest.mark.parametrize("kind", ("entry_count", "text", "canonical_bytes", "attempt"))
+def test_r10_writer_and_plan_owner_reject_the_same_invalid_dispatch_ledger(kind):
+    """The shared parser fails closed before either admission or drain CAS."""
+
+    from gwo_v8.plan_control import PlanControlError
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.transition import (
+        GitHubWriterTransitionControl,
+        WriterTransitionBlocked,
+        _planning_effect_dispatch_ticket,
+    )
+
+    client = _RefContentClient()
+    subject = _r10_dispatch_subject(0)
+    entries = [_r10_dispatch_entry(client, subject)]
+    if kind == "entry_count":
+        entries = [
+            _r10_dispatch_entry(client, _r10_dispatch_subject(ordinal))
+            for ordinal in range(17)
+        ]
+    elif kind == "text":
+        entries[0]["campaign_handle"] = "x" * 257
+        entries[0]["ticket"] = _planning_effect_dispatch_ticket(entries[0])
+    elif kind == "canonical_bytes":
+        from gwo_v8._canonical import canonical_bytes
+        from gwo_v8.transition import (
+            _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES,
+            _PLANNING_EFFECT_DISPATCH_SCHEMA,
+        )
+
+        entries = [
+            _r10_dispatch_entry(client, _r10_dispatch_subject(ordinal))
+            for ordinal in range(16)
+        ]
+        for entry in entries:
+            entry["campaign_key"] = entry["campaign_key"].ljust(256, "k")
+            entry["campaign_handle"] = entry["campaign_handle"].ljust(256, "h")
+            entry["stable_action_id"] = entry["stable_action_id"].ljust(256, "a")
+            entry["writer_generation"] = entry["writer_generation"].ljust(256, "g")
+            entry["writer_cut_over_record_id"] = entry[
+                "writer_cut_over_record_id"
+            ].ljust(256, "r")
+            entry["writer_observation_ref"] = entry[
+                "writer_observation_ref"
+            ].ljust(256, "o")
+            entry["ticket"] = _planning_effect_dispatch_ticket(entry)
+        assert len(
+            canonical_bytes(
+                {
+                    "schema_version": _PLANNING_EFFECT_DISPATCH_SCHEMA,
+                    "repository": "owner/repository",
+                    "entries": entries,
+                }
+            )
+        ) > _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES
+    else:
+        entries[0]["attempt"] = 17
+        entries[0]["ticket"] = _planning_effect_dispatch_ticket(entries[0])
+    _r10_install_dispatch_entries(client, entries)
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+
+    with pytest.raises(PlanControlError) as rejected:
+        repository.planning_effect_dispatch().enter(subject, "prepare")
+    assert rejected.value.code == "WRITER_FENCE_READBACK_INVALID"
+    with pytest.raises(WriterTransitionBlocked) as blocked:
+        transitions.publish(_r10_drain_record(f"r10 invalid {kind}"))
+    assert blocked.value.code == "WRITER_DRAIN_DISPATCH_INVALID"
+    assert client.writes == []
+
+
+def test_r10_canonical_byte_limit_accepts_exactly_one_last_byte_and_no_more():
+    """The Writer parser accepts the exact canonical limit and rejects +1."""
+
+    from copy import deepcopy
+
+    from gwo_v8._canonical import canonical_bytes
+    from gwo_v8.plan_control import PlanControlError
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.transition import (
+        GitHubWriterTransitionControl,
+        WriterTransitionBlocked,
+        _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES,
+        _PLANNING_EFFECT_DISPATCH_MAX_TEXT_BYTES,
+        _PLANNING_EFFECT_DISPATCH_SCHEMA,
+        _planning_effect_dispatch_ticket,
+    )
+
+    def ledger_bytes(entries):
+        return canonical_bytes(
+            {
+                "schema_version": _PLANNING_EFFECT_DISPATCH_SCHEMA,
+                "repository": "owner/repository",
+                "entries": entries,
+            }
+        )
+
+    client = _RefContentClient()
+    entries = [
+        _r10_dispatch_entry(client, _r10_dispatch_subject(ordinal))
+        for ordinal in range(16)
+    ]
+    fields = (
+        "campaign_key",
+        "campaign_handle",
+        "stable_action_id",
+        "writer_generation",
+        "writer_cut_over_record_id",
+        "writer_observation_ref",
+    )
+    for entry in entries:
+        for field in fields:
+            while len(entry[field].encode("utf-8")) < _PLANNING_EFFECT_DISPATCH_MAX_TEXT_BYTES:
+                entry[field] += "x"
+                entry["ticket"] = _planning_effect_dispatch_ticket(entry)
+                if len(ledger_bytes(entries)) == _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES:
+                    break
+            if len(ledger_bytes(entries)) == _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES:
+                break
+        if len(ledger_bytes(entries)) == _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES:
+            break
+    assert len(ledger_bytes(entries)) == _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES
+
+    _r10_install_dispatch_entries(client, entries)
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    transitions.publish(_r10_drain_record("r10 exact canonical bytes"))
+
+    overflow_client = _RefContentClient()
+    overflow_entries = deepcopy(entries)
+    expanded = False
+    for entry in overflow_entries:
+        for field in fields:
+            if len(entry[field].encode("utf-8")) < _PLANNING_EFFECT_DISPATCH_MAX_TEXT_BYTES:
+                entry[field] += "x"
+                entry["ticket"] = _planning_effect_dispatch_ticket(entry)
+                expanded = True
+                break
+        if expanded:
+            break
+    assert expanded
+    assert len(ledger_bytes(overflow_entries)) == (
+        _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES + 1
+    )
+    _r10_install_dispatch_entries(overflow_client, overflow_entries)
+    overflow_repository = GitHubPlanRepository(
+        overflow_client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    with pytest.raises(PlanControlError) as rejected:
+        overflow_repository.planning_effect_dispatch().enter(
+            _r10_dispatch_subject(0),
+            "prepare",
+        )
+    assert rejected.value.code == "WRITER_FENCE_READBACK_INVALID"
+    overflow_transitions = GitHubWriterTransitionControl(
+        overflow_client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    with pytest.raises(WriterTransitionBlocked) as blocked:
+        overflow_transitions.publish(_r10_drain_record("r10 overflow bytes"))
+    assert blocked.value.code == "WRITER_DRAIN_DISPATCH_INVALID"
+
+
+def test_r10_maximum_attempt_is_valid_but_the_next_exact_retry_is_bounded():
+    """Attempt sixteen parses for Writer recovery; attempt seventeen cannot enter."""
+
+    from gwo_v8.plan_control import PlanControlError
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.transition import GitHubWriterTransitionControl
+
+    client = _RefContentClient()
+    subject = _r10_dispatch_subject(0)
+    _r10_install_dispatch_entries(
+        client,
+        [_r10_dispatch_entry(client, subject, attempt=16)],
+    )
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    with pytest.raises(PlanControlError) as rejected:
+        repository.planning_effect_dispatch().enter(subject, "prepare")
+    assert rejected.value.code == "PLANNING_EFFECT_DISPATCH_BOUNDED"
+
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    transitions.publish(_r10_drain_record("r10 maximum attempt"))
+    assert repository.planning_progress_mode(subject) == "draining"
+
+
+def test_r10_active_dispatch_saturation_fails_closed_before_writer_effect(tmp_path):
+    """The fixed active-ticket budget leaves the Writer cut-over but blocked."""
+
+    from gwo_v8.plan_control import PlanControlError
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import (
+        CampaignPlanningSubject,
+        RuntimeGatewayError,
+    )
+    from gwo_v8.transition import (
+        GitHubWriterTransitionControl,
+        WriterTransitionBlocked,
+        _record,
+    )
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    dispatch = repository.planning_effect_dispatch()
+
+    def subject(ordinal):
+        return CampaignPlanningSubject(
+            repository="owner/repository",
+            campaign_key=f"campaign:r10-active:{ordinal}",
+            campaign_handle=f"campaign-handle:r10-active:{ordinal}",
+            expected_previous_plan_revision_digest=None,
+            snapshot_artifact_digest="a" * 64,
+            policy_witness_digest="b" * 64,
+            planning_request_artifact_digest="c" * 64,
+            stable_action_id=f"planning:r10-active:{ordinal}",
+        )
+
+    for ordinal in range(8):
+        assert dispatch.enter(subject(ordinal), "prepare").startswith(
+            "planning-dispatch:"
+        )
+    with pytest.raises(PlanControlError) as rejected:
+        dispatch.enter(subject(8), "prepare")
+    assert rejected.value.code == "PLANNING_EFFECT_DISPATCH_BOUNDED"
+    gateway, planning_subject, preflight, adapter = _r8_authorized_runtime_gateway(
+        tmp_path,
+        repository,
+        "absent",
+    )
+    before = (
+        tuple(adapter.prepare_calls),
+        adapter.created_agent_count,
+        tuple(adapter.command_calls),
+    )
+    with pytest.raises(RuntimeGatewayError) as gateway_rejected:
+        gateway.progress(planning_subject, preflight)
+    assert gateway_rejected.value.code == "RUNTIME_PLANNING_DISPATCH_BOUNDED"
+    assert (
+        tuple(adapter.prepare_calls),
+        adapter.created_agent_count,
+        tuple(adapter.command_calls),
+    ) == before
+
+    transitions = GitHubWriterTransitionControl(
+        client,
+        branch="gwo-control",
+        initial_writer="writer:one",
+    )
+    drain = _record(
+        repository="owner/repository",
+        kind="drain",
+        status="draining",
+        previous_writer_generation="writer:one",
+        writer_generation="writer:one",
+        activation_id="activation:cutover",
+        plan_digest="a" * 64,
+        canary_evidence_digest="b" * 64,
+        canary_evidence_refs=("github://canary/evidence",),
+        canary_manifest_ref="github://canary/manifest",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="r10 active saturation",
+    )
+    with pytest.raises(WriterTransitionBlocked) as blocked:
+        transitions.publish(drain)
+    assert blocked.value.code == "WRITER_DRAIN_DISPATCH_ACTIVE"
 
 
 def _r8_authorized_runtime_gateway(tmp_path, repository, initial_state):
@@ -3032,3 +3615,94 @@ def test_r9_restart_after_provider_dispatch_before_resolution_recovers_once(
     assert adapter.created_agent_count == 1
     assert adapter.command_calls == [(subject.stable_action_id, "start")]
     assert adapter.prepare_calls == [subject.stable_action_id]
+
+
+@pytest.mark.parametrize("writer_status", ("cut_over", "draining"))
+def test_r10_planning_transition_start_is_rejected_before_adapter_effect(
+    writer_status,
+    tmp_path,
+):
+    """Planning START belongs exclusively to progress(), in either Writer mode."""
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import RuntimeCommand, RuntimeGatewayError
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    gateway, subject, _preflight, adapter = _r8_authorized_runtime_gateway(
+        tmp_path,
+        repository,
+        "prepared",
+    )
+    if writer_status == "draining":
+        client.advance_writer("writer:one", status="draining")
+    before = (
+        adapter.created_agent_count,
+        tuple(adapter.command_calls),
+    )
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        gateway.transition(subject.stable_action_id, RuntimeCommand.START)
+
+    assert rejected.value.code == "RUNTIME_PLANNING_TRANSITION_FORBIDDEN"
+    assert (adapter.created_agent_count, tuple(adapter.command_calls)) == before
+
+
+@pytest.mark.parametrize("writer_status", ("cut_over", "draining"))
+@pytest.mark.parametrize(
+    ("state", "command"),
+    (
+        ("prepared", "START"),
+        ("running", "PARK"),
+        ("parked", "RESUME"),
+        ("completed", "PARK"),
+    ),
+)
+def test_r10_planning_transition_matrix_never_dispatches(
+    writer_status,
+    state,
+    command,
+    tmp_path,
+):
+    """Every observed Planning state rejects the caller command surface."""
+
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.runtime_gateway import RuntimeCommand, RuntimeGatewayError
+
+    client = _RefContentClient()
+    repository = GitHubPlanRepository(
+        client,
+        repository="owner/repository",
+        branch="gwo-control",
+        writer_generation="writer:one",
+    )
+    gateway, subject, preflight, adapter = _r8_authorized_runtime_gateway(
+        tmp_path,
+        repository,
+        "prepared",
+    )
+    if state in {"running", "parked"}:
+        adapter._complete_action = lambda _action: None  # type: ignore[method-assign]
+        assert gateway.progress(subject, preflight).status == "running"
+        if state == "parked":
+            adapter.observe(subject.stable_action_id)
+            adapter.command(subject.stable_action_id, RuntimeCommand.PARK)
+    elif state == "completed":
+        assert gateway.progress(subject, preflight).status == "completed"
+    if writer_status == "draining":
+        client.advance_writer("writer:one", status="draining")
+    before = (
+        adapter.created_agent_count,
+        tuple(adapter.command_calls),
+    )
+
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        gateway.transition(subject.stable_action_id, getattr(RuntimeCommand, command))
+
+    assert rejected.value.code == "RUNTIME_PLANNING_TRANSITION_FORBIDDEN"
+    assert (adapter.created_agent_count, tuple(adapter.command_calls)) == before

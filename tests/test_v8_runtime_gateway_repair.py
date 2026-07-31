@@ -13893,7 +13893,7 @@ def test_r7c1_progress_recovery_state_matrix(mode, action_state, expected, tmp_p
         def enter(self, _subject, boundary):
             return f"r7:{boundary}"
 
-        def resolve(self, _ticket):
+        def resolve(self, _subject, _boundary, _ticket):
             return None
 
         def reconcile(self, _subject, _observation_kind):
@@ -13936,9 +13936,9 @@ def test_r7c1_progress_recovery_state_matrix(mode, action_state, expected, tmp_p
             running = gateway.progress(subject, preflight)
             assert running.status == "running"
             if state == "parked":
-                assert gateway.transition(
-                    subject.stable_action_id, RuntimeCommand.PARK
-                ).status == "parked"
+                adapter.observe(subject.stable_action_id)
+                parked = adapter.command(subject.stable_action_id, RuntimeCommand.PARK)
+                assert not isinstance(parked, _RuntimeFailure)
             return
         assert state == "completed"
         assert gateway.progress(subject, preflight).status == "completed"
@@ -14011,7 +14011,7 @@ def test_r8_writer_effect_claim_cannot_dispatch_after_drain(
             writer["mode"] = "draining"
             return None
 
-        def resolve(self, _ticket):
+        def resolve(self, _subject, _boundary, _ticket):
             return None
 
         def reconcile(self, _subject, _observation_kind):
@@ -14105,7 +14105,9 @@ def test_r8_writer_effect_authorization_is_not_replayable_across_boundaries(
             authorizations.append(boundary)
             return "r8:prepare" if boundary == "prepare" else None
 
-        def resolve(self, ticket):
+        def resolve(self, resolved_subject, boundary, ticket):
+            assert resolved_subject == subject
+            assert boundary == "prepare"
             assert ticket == "r8:prepare"
 
         def reconcile(self, _subject, _observation_kind):

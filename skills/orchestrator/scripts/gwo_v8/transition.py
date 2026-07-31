@@ -56,6 +56,14 @@ _PLANNING_EFFECT_DISPATCH_FIELDS = {
     "attempt",
     "state",
 }
+_PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES = 12_288
+_PLANNING_EFFECT_DISPATCH_MAX_ENTRIES = 16
+_PLANNING_EFFECT_DISPATCH_MAX_ACTIVE_ENTRIES = 8
+_PLANNING_EFFECT_DISPATCH_MAX_TEXT_BYTES = 256
+_PLANNING_EFFECT_DISPATCH_MAX_ATTEMPT = 16
+_PLANNING_EFFECT_DISPATCH_TICKET_FIELDS = tuple(
+    sorted(_PLANNING_EFFECT_DISPATCH_FIELDS - {"ticket", "state"})
+)
 
 
 class WriterTransitionBlocked(RuntimeError):
@@ -806,6 +814,100 @@ class InMemoryWriterTransitionControl:
         return record.worker_capacity, record.coordinator_capacity
 
 
+def _planning_effect_dispatch_ticket(entry: Mapping[str, Any]) -> str:
+    """Derive the opaque ticket from every immutable dispatch identity field."""
+
+    identity = {
+        name: entry[name] for name in _PLANNING_EFFECT_DISPATCH_TICKET_FIELDS
+    }
+    return "planning-dispatch:" + digest_value(identity)[:32]
+
+
+def _planning_effect_dispatch_entry_order(entry: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Give compaction one stable identity order, independent of map order."""
+
+    return tuple(entry[name] for name in sorted(_PLANNING_EFFECT_DISPATCH_FIELDS))
+
+
+def _planning_effect_dispatch_ledger_bytes(
+    repository: str,
+    entries: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> bytes:
+    """Render one bounded canonical dispatch ledger before a ref CAS."""
+
+    rendered = canonical_bytes(
+        {
+            "schema_version": _PLANNING_EFFECT_DISPATCH_SCHEMA,
+            "repository": repository,
+            "entries": list(entries),
+        }
+    )
+    if len(rendered) > _PLANNING_EFFECT_DISPATCH_MAX_CANONICAL_BYTES:
+        raise ValueError("control-ref dispatch ledger exceeds its canonical byte budget")
+    return rendered
+
+
+def _validate_planning_effect_dispatch_entries(
+    repository: str,
+    raw_entries: object,
+) -> tuple[dict[str, Any], ...]:
+    """Apply the shared closed dispatch-ledger policy before use or CAS."""
+
+    if type(raw_entries) is not list:
+        raise ValueError("control-ref dispatch entries are not one exact list")
+    if len(raw_entries) > _PLANNING_EFFECT_DISPATCH_MAX_ENTRIES:
+        raise ValueError("control-ref dispatch ledger exceeds its entry budget")
+    entries: list[dict[str, Any]] = []
+    keys: set[tuple[str, str, str, str]] = set()
+    tickets: set[str] = set()
+    active_entries = 0
+    for raw in raw_entries:
+        if type(raw) is not dict or set(raw) != _PLANNING_EFFECT_DISPATCH_FIELDS:
+            raise ValueError("control-ref dispatch entry schema is invalid")
+        if (
+            raw["repository"] != repository
+            or type(raw["subject_digest"]) is not str
+            or len(raw["subject_digest"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in raw["subject_digest"]
+            )
+            or type(raw["effect_boundary"]) is not str
+            or raw["effect_boundary"] not in {"prepare", "start"}
+            or type(raw["state"]) is not str
+            or raw["state"] not in {"active", "recovery"}
+            or type(raw["attempt"]) is not int
+            or isinstance(raw["attempt"], bool)
+            or not 1 <= raw["attempt"] <= _PLANNING_EFFECT_DISPATCH_MAX_ATTEMPT
+            or any(
+                type(raw[name]) is not str
+                or not raw[name]
+                or len(raw[name].encode("utf-8"))
+                > _PLANNING_EFFECT_DISPATCH_MAX_TEXT_BYTES
+                for name in _PLANNING_EFFECT_DISPATCH_FIELDS - {"attempt"}
+            )
+            or raw["ticket"] != _planning_effect_dispatch_ticket(raw)
+        ):
+            raise ValueError("control-ref dispatch entry fields are invalid")
+        key = (
+            raw["writer_generation"],
+            raw["writer_cut_over_record_id"],
+            raw["stable_action_id"],
+            raw["effect_boundary"],
+        )
+        if key in keys or raw["ticket"] in tickets:
+            raise ValueError("control-ref dispatch entry identity is duplicated")
+        keys.add(key)
+        tickets.add(raw["ticket"])
+        if raw["state"] == "active":
+            active_entries += 1
+        entries.append(dict(raw))
+    if active_entries > _PLANNING_EFFECT_DISPATCH_MAX_ACTIVE_ENTRIES:
+        raise ValueError("control-ref dispatch ledger exceeds its active-entry budget")
+    _planning_effect_dispatch_ledger_bytes(repository, entries)
+    return tuple(entries)
+
+
 def _planning_effect_dispatch_entries_at_ref(
     client: object,
     repository: str,
@@ -828,44 +930,9 @@ def _planning_effect_dispatch_entries_at_ref(
         or set(value) != {"schema_version", "repository", "entries"}
         or value["schema_version"] != _PLANNING_EFFECT_DISPATCH_SCHEMA
         or value["repository"] != repository
-        or type(value["entries"]) is not list
     ):
         raise ValueError("control-ref dispatch ledger schema is invalid")
-    entries: list[dict[str, Any]] = []
-    keys: set[tuple[str, str, str, str]] = set()
-    tickets: set[str] = set()
-    for raw in value["entries"]:
-        if type(raw) is not dict or set(raw) != _PLANNING_EFFECT_DISPATCH_FIELDS:
-            raise ValueError("control-ref dispatch entry schema is invalid")
-        if (
-            raw["repository"] != repository
-            or type(raw["subject_digest"]) is not str
-            or len(raw["subject_digest"]) != 64
-            or any(character not in "0123456789abcdef" for character in raw["subject_digest"])
-            or raw["effect_boundary"] not in {"prepare", "start"}
-            or raw["state"] not in {"active", "recovery"}
-            or type(raw["attempt"]) is not int
-            or isinstance(raw["attempt"], bool)
-            or raw["attempt"] < 1
-            or any(
-                type(raw[name]) is not str or not raw[name]
-                for name in _PLANNING_EFFECT_DISPATCH_FIELDS
-                - {"subject_digest", "effect_boundary", "attempt", "state"}
-            )
-        ):
-            raise ValueError("control-ref dispatch entry fields are invalid")
-        key = (
-            raw["writer_generation"],
-            raw["writer_cut_over_record_id"],
-            raw["stable_action_id"],
-            raw["effect_boundary"],
-        )
-        if key in keys or raw["ticket"] in tickets:
-            raise ValueError("control-ref dispatch entry identity is duplicated")
-        keys.add(key)
-        tickets.add(raw["ticket"])
-        entries.append(dict(raw))
-    return tuple(entries)
+    return _validate_planning_effect_dispatch_entries(repository, value["entries"])
 
 
 def _writer_drain_dispatch_blocker(

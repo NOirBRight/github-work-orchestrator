@@ -7680,7 +7680,12 @@ class _PlanningEffectDispatch(Protocol):
 
     def enter(self, subject: CampaignPlanningSubject, boundary: str) -> str | None: ...
 
-    def resolve(self, ticket: str) -> None: ...
+    def resolve(
+        self,
+        subject: CampaignPlanningSubject,
+        boundary: str,
+        ticket: str,
+    ) -> None: ...
 
     def reconcile(
         self,
@@ -8038,7 +8043,11 @@ class RuntimeGateway:
                 "prepare",
             )
             prepared_verdict = self._prepare_verdict(spec)
-            self._resolve_planning_effect_dispatch(dispatch_ticket)
+            self._resolve_planning_effect_dispatch(
+                subject,
+                "prepare",
+                dispatch_ticket,
+            )
             if prepared_verdict.kind == "recoverable_failure":
                 assert prepared_verdict.failure is not None
                 prepare_failure = prepared_verdict.failure
@@ -8100,6 +8109,8 @@ class RuntimeGateway:
                 subject.stable_action_id,
                 RuntimeCommand.START,
                 _after_dispatch=lambda: self._resolve_planning_effect_dispatch(
+                    subject,
+                    "start",
                     dispatch_ticket
                 ),
             )
@@ -8206,6 +8217,11 @@ class RuntimeGateway:
         except RuntimeGatewayError:
             raise
         except Exception as error:
+            if getattr(error, "code", None) == "PLANNING_EFFECT_DISPATCH_BOUNDED":
+                raise RuntimeGatewayError(
+                    "RUNTIME_PLANNING_DISPATCH_BOUNDED",
+                    "Planning provider-effect dispatch exceeded its durable budget",
+                ) from error
             raise RuntimeGatewayError(
                 "RUNTIME_RECOVERY_ONLY",
                 "Planning provider-effect dispatch admission is unavailable",
@@ -8217,7 +8233,12 @@ class RuntimeGateway:
             )
         return ticket
 
-    def _resolve_planning_effect_dispatch(self, ticket: str | None) -> None:
+    def _resolve_planning_effect_dispatch(
+        self,
+        subject: CampaignPlanningSubject,
+        boundary: str,
+        ticket: str | None,
+    ) -> None:
         dispatch = self._planning_effect_dispatch
         if dispatch is None:
             if ticket is not None:
@@ -8232,7 +8253,7 @@ class RuntimeGateway:
                 "Planning provider-effect dispatch ticket is missing or malformed",
             )
         try:
-            dispatch.resolve(ticket)
+            dispatch.resolve(subject, boundary, ticket)
         except RuntimeGatewayError:
             raise
         except Exception as error:
@@ -8278,6 +8299,11 @@ class RuntimeGateway:
         if not isinstance(record, dict):
             raise RuntimeGatewayError("RUNTIME_ACTION_UNKNOWN", "stable action is unknown")
         subject = _subject_from_canonical(record.get("subject"))
+        if type(subject) is CampaignPlanningSubject:
+            raise RuntimeGatewayError(
+                "RUNTIME_PLANNING_TRANSITION_FORBIDDEN",
+                "Campaign Planning semantic choreography belongs exclusively to progress",
+            )
         self._validate_static_assignment(subject, record)
         if command in {RuntimeCommand.START, RuntimeCommand.RESUME}:
             observation_verdict = self._observe_verdict(stable_action_id)
