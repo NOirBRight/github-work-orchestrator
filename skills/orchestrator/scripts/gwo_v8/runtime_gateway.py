@@ -52,6 +52,12 @@ _TICKET_ROLES = {
     "review_primary",
     "review_strong",
 }
+_PLAN_INVALIDATION_REPORT_ROLES = frozenset({"worker", "recovery_worker", "review"})
+_PLAN_INVALIDATION_ROLE_GRANTS = {
+    "worker": frozenset({("workspace.write.v1", "work-run.workspace.v1")}),
+    "recovery_worker": frozenset({("workspace.write.v1", "work-run.workspace.v1")}),
+    "review": frozenset({("repository.read.v1", "review.subject.v1")}),
+}
 _BOUND_LIFECYCLES = frozenset(
     {"running", "parked", "completed", "retired"}
 )
@@ -1431,7 +1437,7 @@ class PlanInvalidationReport(tuple, metaclass=_SealedValueMeta):
             ("evidence_digest", evidence_digest),
         ):
             _require_digest(value, digest_field)
-        if reporter_role not in {"worker", "recovery_worker", "review_primary", "review_strong", "candidate_gate"}:
+        if reporter_role not in _PLAN_INVALIDATION_REPORT_ROLES:
             raise RuntimeGatewayError(
                 "PLAN_INVALIDATION_REPORT_INVALID",
                 "reporter_role must be one exact semantic role",
@@ -1568,6 +1574,7 @@ class PlanInvalidationReceipt:
     report_digest: str
     receipt_digest: str
     capability_policy_proof: CapabilityPolicyProof
+    observation: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _require_digest(self.report_digest, "report_digest")
@@ -1577,6 +1584,37 @@ class PlanInvalidationReceipt:
                 "PLAN_INVALIDATION_RECEIPT_INVALID",
                 "capability policy proof must be an exact CapabilityPolicyProof",
             )
+        if self.observation is not None:
+            expected = {
+                "kind",
+                "repository",
+                "campaign_key",
+                "plan_revision_digest",
+                "ticket_key",
+                "work_run_key",
+                "runtime_binding_id",
+                "authority_subtree_digest",
+                "reporter_role",
+                "report_digest",
+                "evidence_digest",
+                "dedup_identity",
+                "invalidated_obligation",
+                "required_effects",
+                "workspace_identity",
+            }
+            if (
+                not isinstance(self.observation, Mapping)
+                or set(self.observation) != expected
+                or self.observation.get("kind")
+                != "plan_invalidation_observation.v1"
+                or self.observation.get("report_digest") != self.report_digest
+                or type(self.observation.get("required_effects")) is not list
+            ):
+                raise RuntimeGatewayError(
+                    "PLAN_INVALIDATION_RECEIPT_INVALID",
+                    "receipt observation is not the exact closed observation schema",
+                )
+            object.__setattr__(self, "observation", dict(self.observation))
 
 
 @dataclass(frozen=True, order=True, init=False)
@@ -2750,6 +2788,9 @@ class _ArtifactAuthorityReadback:
         grants = _authority_pairs(subtree.get("grants"))
         if grants is None:
             return None
+        expected_grants = _PLAN_INVALIDATION_ROLE_GRANTS.get(role)
+        if expected_grants is None or grants != expected_grants:
+            return None
         if digest_value(
             {
                 "policy_witness_digest": policy_witness_digest,
@@ -2765,7 +2806,7 @@ class _ArtifactAuthorityReadback:
         except RuntimeGatewayError:
             return None
         witness_pairs = _policy_witness_pairs(witness, role, policy_witness_digest)
-        if witness_pairs is None:
+        if witness_pairs is None or witness_pairs != expected_grants:
             return None
         return _FrozenPermissionAuthorityV1(
             plan_revision_digest=subject.plan_revision_digest,
@@ -2775,6 +2816,15 @@ class _ArtifactAuthorityReadback:
             policy_witness_digest=policy_witness_digest,
             grant_pairs=grants,
             witness_pairs=witness_pairs,
+            capability_policy=CapabilityPolicy(
+                worker_can_edit_issues=False,
+                worker_can_edit_blockers=False,
+                worker_can_edit_campaign_membership=False,
+                worker_can_activate_plan_revision=False,
+                worker_can_merge=False,
+                worker_can_expand_authority=False,
+                worker_can_invoke_global_planning=False,
+            ),
         )
 
 
@@ -2834,6 +2884,12 @@ def _policy_witness_pairs(
         or digest_value(value) != expected_digest
     ):
         return None
+    for field_name in ("allowed_capabilities", "exclusive_resources"):
+        facts = value.get(field_name)
+        if type(facts) is not list or any(type(fact) is not str or not fact for fact in facts):
+            return None
+        if len(set(facts)) != len(facts):
+            return None
     return _authority_pairs(value["authority_grants"].get(role))
 
 
@@ -9134,14 +9190,11 @@ class RuntimeGateway:
             ),
         )
 
-    # Caller interface operation for Plan Invalidation (#133).
-    # A Worker, Formal Review, Repair Verification, or CandidateGate scope
-    # audit submits one typed, Artifact-backed report.  RuntimeGateway reads
-    # it and proves the reporting role's capability policy; it does not
-    # decide whether or how the Campaign is replanned.  It does not give the
-    # caller authority to edit Issues, blockers, Campaign membership,
-    # authority, merge state, or the global route.
-    def report_plan_invalidation(
+    # Private Coordinator handoff for Plan Invalidation (#133).  It is not a
+    # fourth public workflow operation: the public seam remains
+    # start -> advance -> inspect.  The returned receipt is consumed by the
+    # Kernel's existing ``advance(..., plan_invalidation=...)`` keyword.
+    def _report_plan_invalidation(
         self,
         subject: WorkRunSubject,
         report: PlanInvalidationReport,
@@ -9149,12 +9202,12 @@ class RuntimeGateway:
         if type(subject) is not WorkRunSubject:
             raise RuntimeGatewayError(
                 "PLAN_INVALIDATION_SUBJECT_INVALID",
-                "report_plan_invalidation accepts a WorkRunSubject only",
+                "Plan Invalidation accepts a WorkRunSubject only",
             )
         if type(report) is not PlanInvalidationReport:
             raise RuntimeGatewayError(
                 "PLAN_INVALIDATION_REPORT_INVALID",
-                "report_plan_invalidation requires an exact PlanInvalidationReport",
+                "Plan Invalidation requires an exact PlanInvalidationReport",
             )
         # Bind the report to the exact Campaign, Plan Revision, Ticket, Work
         # Run, Runtime Binding, and authority subtree of the submitted subject.
@@ -9173,16 +9226,73 @@ class RuntimeGateway:
             )
         self._assert_configuration_identity()
         self._refresh()
-        # The Evidence Artifact must already be persisted by the caller; the
-        # report only names its digest.  Prove the digest is a real Artifact
-        # before any Gateway mutation.
+        record = self._data["actions"].get(subject.stable_action_id)
+        if type(record) is not dict:
+            raise RuntimeGatewayError(
+                "PLAN_INVALIDATION_RUNTIME_BINDING_INVALID",
+                "Plan Invalidation requires a persisted Runtime action",
+            )
+        verdict = self._observe_verdict(subject.stable_action_id)
+        if verdict.kind != "bound" or type(verdict.observation) is not _BoundRuntimeObservation:
+            raise RuntimeGatewayError(
+                "PLAN_INVALIDATION_RUNTIME_BINDING_INVALID",
+                "Plan Invalidation requires an authoritative Bound Runtime readback",
+            )
+        bound = verdict.observation
+        self._validate_bound_observation(subject, record, bound)
+        expected_role = _authority_role_for_purpose(subject.purpose)
+        if report.reporter_role != expected_role:
+            raise RuntimeGatewayError(
+                "PLAN_INVALIDATION_AUTHORITY_ROLE_MISMATCH",
+                "Plan Invalidation reporter role does not match the Work Run purpose",
+            )
+        if (
+            bound.stable_action_id != report.runtime_binding_id
+            or report.workspace_identity != bound.workspace_id
+        ):
+            raise RuntimeGatewayError(
+                "PLAN_INVALIDATION_RUNTIME_BINDING_INVALID",
+                "Plan Invalidation report does not bind the current Runtime Workspace",
+            )
+        # Read and validate the complete canonical Evidence payload.  Merely
+        # finding bytes at a digest is insufficient: arbitrary junk must not
+        # become a plan-invalidating fact.
         try:
-            self._artifacts.get(report.evidence_digest)
+            evidence = self._artifacts.read_json(report.evidence_digest)
         except RuntimeGatewayError as error:
             raise RuntimeGatewayError(
                 "PLAN_INVALIDATION_REPORT_INVALID",
                 "Plan Invalidation Evidence Artifact is not readable",
             ) from error
+        expected_evidence_keys = {
+            "schema_version",
+            "kind",
+            "subject",
+            "discovered_facts",
+            "reproduction",
+            "invalidated_obligation",
+            "required_effects",
+            "workspace_identity",
+        }
+        if (
+            type(evidence) is not dict
+            or set(evidence) != expected_evidence_keys
+            or evidence.get("schema_version") != "gwo.evidence.v1"
+            or evidence.get("kind") != "plan_invalidation"
+            or evidence.get("subject") != subject.canonical()
+            or type(evidence.get("discovered_facts")) is not list
+            or not evidence["discovered_facts"]
+            or any(type(fact) is not str or not fact for fact in evidence["discovered_facts"])
+            or type(evidence.get("reproduction")) is not str
+            or not evidence["reproduction"]
+            or evidence.get("invalidated_obligation") != report.invalidated_obligation
+            or evidence.get("required_effects") != list(report.required_effects)
+            or evidence.get("workspace_identity") != report.workspace_identity
+        ):
+            raise RuntimeGatewayError(
+                "PLAN_INVALIDATION_REPORT_INVALID",
+                "Plan Invalidation Evidence Artifact does not prove the exact report",
+            )
         # Effective capability-policy readback must prove the reporting role
         # cannot edit Issues, blockers, Campaign membership, activate a Plan
         # Revision, merge, expand authority, or invoke global planning.
@@ -9192,6 +9302,25 @@ class RuntimeGateway:
             raise RuntimeGatewayError(
                 "PLAN_INVALIDATION_CAPABILITY_PROOF_FAIL_CLOSED",
                 "Plan Invalidation requires an authoritative capability policy proof",
+            )
+        if type(authority) is not _FrozenPermissionAuthorityV1:
+            raise RuntimeGatewayError(
+                "PLAN_INVALIDATION_CAPABILITY_PROOF_FAIL_CLOSED",
+                "Plan Invalidation authority readback is not an exact frozen record",
+            )
+        if (
+            authority.plan_revision_digest != subject.plan_revision_digest
+            or authority.ticket_key != subject.ticket_key
+            or authority.purpose != subject.purpose
+            or authority.authority_subtree_digest != subject.authority_digest
+            or authority.grant_pairs
+            != _PLAN_INVALIDATION_ROLE_GRANTS[expected_role]
+            or authority.witness_pairs
+            != _PLAN_INVALIDATION_ROLE_GRANTS[expected_role]
+        ):
+            raise RuntimeGatewayError(
+                "PLAN_INVALIDATION_CAPABILITY_PROOF_FAIL_CLOSED",
+                "Plan Invalidation authority readback does not prove the exact role boundary",
             )
         capability_policy = authority.capability_policy
         if capability_policy is None or not capability_policy.is_proven:
@@ -9220,24 +9349,36 @@ class RuntimeGateway:
                 "authority_record_digest": authority_record_digest,
             }
         )
+        observation = {
+            "kind": "plan_invalidation_observation.v1",
+            "repository": report.repository,
+            "campaign_key": report.campaign_key,
+            "plan_revision_digest": report.plan_revision_digest,
+            "ticket_key": report.ticket_key,
+            "work_run_key": report.work_run_key,
+            "runtime_binding_id": report.runtime_binding_id,
+            "authority_subtree_digest": report.authority_subtree_digest,
+            "reporter_role": report.reporter_role,
+            "report_digest": report.digest,
+            "evidence_digest": report.evidence_digest,
+            "dedup_identity": report.dedup_identity,
+            "invalidated_obligation": report.invalidated_obligation,
+            "required_effects": list(report.required_effects),
+            "workspace_identity": report.workspace_identity,
+        }
 
         def commit(data: dict[str, Any]) -> None:
             invalidations = data.setdefault("plan_invalidation", {})
-            dedup_key = report.dedup_identity
-            existing = invalidations.get(dedup_key)
-            if existing is not None:
-                # Duplicate callbacks cannot repeat the transition.  The
-                # stored record is authoritative; a replay must not change
-                # the receipt digest or consume a slot/budget/LLM turn.
-                if existing.get("receipt_digest") != receipt_digest:
-                    raise RuntimeGatewayError(
-                        "PLAN_INVALIDATION_IDENTITY_MISMATCH",
-                        "duplicate Plan Invalidation dedup identity bound to a different report",
-                    )
-                return
-            invalidations[dedup_key] = {
+            dedup_key = digest_value(
+                {
+                    "subject_digest": subject.digest,
+                    "dedup_identity": report.dedup_identity,
+                }
+            )
+            candidate = {
                 "report_digest": report.digest,
                 "receipt_digest": receipt_digest,
+                "subject_digest": subject.digest,
                 "repository": report.repository,
                 "campaign_key": report.campaign_key,
                 "plan_revision_digest": report.plan_revision_digest,
@@ -9251,15 +9392,29 @@ class RuntimeGateway:
                 "invalidated_obligation": report.invalidated_obligation,
                 "required_effects": list(report.required_effects),
                 "workspace_identity": report.workspace_identity,
+                "observation": observation,
                 "capability_policy": capability_policy.canonical(),
                 "authority_record_digest": authority_record_digest,
+                "policy_witness_digest": authority.policy_witness_digest,
             }
+            existing = invalidations.get(dedup_key)
+            if existing is not None:
+                # Duplicate callbacks compare the complete identity, not only
+                # a receipt digest that could be reused with changed Evidence.
+                if existing != candidate:
+                    raise RuntimeGatewayError(
+                        "PLAN_INVALIDATION_DEDUP_CONFLICT",
+                        "duplicate Plan Invalidation dedup identity bound to a different report",
+                    )
+                return
+            invalidations[dedup_key] = candidate
 
         self._transact(commit)
         return PlanInvalidationReceipt(
             report_digest=report.digest,
             receipt_digest=receipt_digest,
             capability_policy_proof=proof,
+            observation=observation,
         )
 
     # Caller interface operation 3.  Binding refs remain private, including
@@ -10891,6 +11046,7 @@ class RuntimeGateway:
         if migrate_v1 or migrate_v2 or migrate_v3:
             normalized["schema_version"] = 4
             normalized["plan_invalidation"] = {}
+        self._validate_plan_invalidation_store(normalized["plan_invalidation"])
         rebuilt_identities: dict[str, dict[str, str]] = {}
 
         def rebuild_identity(
@@ -11257,6 +11413,202 @@ class RuntimeGateway:
 
         with self._journal.exclusive():
             self._data = self._load_unlocked()
+
+    @staticmethod
+    def _validate_plan_invalidation_store(value: object) -> None:
+        """Validate the closed durable #133 journal projection on every read."""
+
+        if type(value) is not dict:
+            raise RuntimeGatewayError(
+                "RUNTIME_STORE_INVALID",
+                "RuntimeGateway Plan Invalidation collection is invalid",
+            )
+        expected_record = {
+            "report_digest",
+            "receipt_digest",
+            "subject_digest",
+            "repository",
+            "campaign_key",
+            "plan_revision_digest",
+            "ticket_key",
+            "work_run_key",
+            "runtime_binding_id",
+            "authority_subtree_digest",
+            "reporter_role",
+            "evidence_digest",
+            "dedup_identity",
+            "invalidated_obligation",
+            "required_effects",
+            "workspace_identity",
+            "observation",
+            "capability_policy",
+            "authority_record_digest",
+            "policy_witness_digest",
+        }
+        expected_observation = {
+            "kind",
+            "repository",
+            "campaign_key",
+            "plan_revision_digest",
+            "ticket_key",
+            "work_run_key",
+            "runtime_binding_id",
+            "authority_subtree_digest",
+            "reporter_role",
+            "report_digest",
+            "evidence_digest",
+            "dedup_identity",
+            "invalidated_obligation",
+            "required_effects",
+            "workspace_identity",
+        }
+        expected_policy = {
+            "worker_can_edit_issues",
+            "worker_can_edit_blockers",
+            "worker_can_edit_campaign_membership",
+            "worker_can_activate_plan_revision",
+            "worker_can_merge",
+            "worker_can_expand_authority",
+            "worker_can_invoke_global_planning",
+        }
+        for dedup_key, record in value.items():
+            if (
+                type(dedup_key) is not str
+                or _DIGEST_RE.fullmatch(dedup_key) is None
+                or type(record) is not dict
+                or set(record) != expected_record
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway Plan Invalidation record schema is invalid",
+                )
+            if any(
+                type(record.get(name)) is not str
+                or _DIGEST_RE.fullmatch(record[name]) is None
+                for name in (
+                    "report_digest",
+                    "receipt_digest",
+                    "subject_digest",
+                    "plan_revision_digest",
+                    "authority_subtree_digest",
+                    "evidence_digest",
+                    "policy_witness_digest",
+                    "authority_record_digest",
+                )
+            ) or any(
+                type(record.get(name)) is not str or not record[name]
+                for name in (
+                    "repository",
+                    "campaign_key",
+                    "ticket_key",
+                    "work_run_key",
+                    "runtime_binding_id",
+                    "reporter_role",
+                    "dedup_identity",
+                    "invalidated_obligation",
+                    "workspace_identity",
+                )
+            ) or record["reporter_role"] not in _PLAN_INVALIDATION_REPORT_ROLES:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway Plan Invalidation identity is invalid",
+                )
+            effects = record["required_effects"]
+            if type(effects) is not list or any(
+                type(effect) is not str or not effect for effect in effects
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway Plan Invalidation effects are invalid",
+                )
+            observation = record["observation"]
+            if (
+                type(observation) is not dict
+                or set(observation) != expected_observation
+                or observation.get("kind") != "plan_invalidation_observation.v1"
+                or observation.get("required_effects") != effects
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway Plan Invalidation observation is invalid",
+                )
+            for name in expected_observation - {"kind", "required_effects"}:
+                if observation.get(name) != record.get(name):
+                    raise RuntimeGatewayError(
+                        "RUNTIME_STORE_INVALID",
+                        "RuntimeGateway Plan Invalidation observation identity changed",
+                    )
+            policy = record["capability_policy"]
+            if (
+                type(policy) is not dict
+                or set(policy) != expected_policy
+                or any(value is not False for value in policy.values())
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway capability policy proof is not closed",
+                )
+            report_value = {
+                "kind": "plan_invalidation_report.v1",
+                "repository": record["repository"],
+                "campaign_key": record["campaign_key"],
+                "plan_revision_digest": record["plan_revision_digest"],
+                "ticket_key": record["ticket_key"],
+                "work_run_key": record["work_run_key"],
+                "runtime_binding_id": record["runtime_binding_id"],
+                "authority_subtree_digest": record["authority_subtree_digest"],
+                "reporter_role": record["reporter_role"],
+                "evidence_digest": record["evidence_digest"],
+                "dedup_identity": record["dedup_identity"],
+                "invalidated_obligation": record["invalidated_obligation"],
+                "required_effects": effects,
+                "workspace_identity": record["workspace_identity"],
+            }
+            if record["authority_record_digest"] != digest_value(
+                {
+                    "plan_revision_digest": record["plan_revision_digest"],
+                    "ticket_key": record["ticket_key"],
+                    "authority_subtree_digest": record["authority_subtree_digest"],
+                    "policy_witness_digest": record["policy_witness_digest"],
+                    "capability_policy": policy,
+                }
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway authority proof changed",
+                )
+            if record["report_digest"] != digest_value(report_value):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway Plan Invalidation report digest changed",
+                )
+            if record["observation"].get("report_digest") != record["report_digest"]:
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway Plan Invalidation report identity changed",
+                )
+            if record["receipt_digest"] != digest_value(
+                {
+                    "kind": "plan_invalidation_receipt.v1",
+                    "report_digest": record["report_digest"],
+                    "subject_digest": record["subject_digest"],
+                    "authority_record_digest": record["authority_record_digest"],
+                }
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway Plan Invalidation receipt digest changed",
+                )
+            if dedup_key != digest_value(
+                {
+                    "subject_digest": record["subject_digest"],
+                    "dedup_identity": record["dedup_identity"],
+                }
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_STORE_INVALID",
+                    "RuntimeGateway Plan Invalidation dedup identity changed",
+                )
 
     def _verify_completed_outputs_unlocked(
         self,
