@@ -1,0 +1,4 @@
+# These are deterministic redaction fixtures in historical tests, not credentials.
+# Keep the exact fingerprints narrow so new findings still fail the audit.
+d9844091e10a8a84d891cfc8c8a38e6cb493eb3c:tests/test_entry_policy.py:aws-access-token:203
+d9844091e10a8a84d891cfc8c8a38e6cb493eb3c:tests/test_repository_room.py:aws-access-token:143

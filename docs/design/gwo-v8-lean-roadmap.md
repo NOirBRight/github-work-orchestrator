@@ -40,9 +40,11 @@ of the architecture.
 
 ## Published successor sequence
 
-The native blocker graph was read back on 2026-07-27. Issue #121 subsequently
-landed the self-hosted acceptance runner and is part of the repository base,
-not the V8 Candidate graph.
+The native blocker graph was read back on 2026-07-27. Issue #121 was a
+temporary dedicated-runner prerequisite. The repository now migrates acceptance
+to the standard GitHub-hosted `windows-2025` runner; the migration supersedes
+#121's self-hosted operational assumption and remains outside the V8 Candidate
+graph.
 
 | Ticket | Outcome | Native blockers |
 | --- | --- | --- |
