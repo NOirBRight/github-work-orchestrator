@@ -630,3 +630,115 @@ def _active_campaign(ticket_keys, *, work_facts=None):
         ),
         handle,
     )
+
+
+def test_module_level_advance_hands_gateway_receipt_to_kernel(tmp_path):
+    """The public advance wrapper must not drop the #133 receipt keyword."""
+
+    from types import SimpleNamespace
+
+    from gwo_v8.execution_kernel import (
+        PlanInvalidationObservation,
+        advance,
+        install_execution_kernel,
+    )
+
+    active, handle = _active_campaign(("issue:1",))
+    effects = _Effects()
+    install_execution_kernel(
+        store_path=tmp_path / "receipt.sqlite3",
+        plan_control=_Plans(active),
+        effects=effects,
+    )
+    advance(handle)
+    binding = effects.executed[0].stable_action_id
+    observation = PlanInvalidationObservation(
+        repository=active.handle.repository,
+        campaign_key=active.handle.campaign_key,
+        plan_revision_digest=active.current_revision_digest,
+        ticket_key="issue:1",
+        work_run_key="work-run:issue:1",
+        runtime_binding_id=binding,
+        authority_subtree_digest="a" * 64,
+        reporter_role="worker",
+        report_digest="a" * 64,
+        evidence_digest="b" * 64,
+        dedup_identity="receipt:one",
+        invalidated_obligation="issue:1 contract is incomplete",
+        required_effects=("workspace.write.v1",),
+        workspace_identity="workspace:one",
+    )
+    receipt = SimpleNamespace(
+        report_digest=observation.report_digest,
+        receipt_digest="c" * 64,
+        observation=observation.canonical(),
+    )
+
+    advance(handle, plan_invalidation=receipt)
+
+    summary = _summary(
+        __import__("gwo_v8.execution_kernel", fromlist=["ExecutionKernel"])
+        .ExecutionKernel(
+            store_path=tmp_path / "receipt.sqlite3",
+            plan_control=_Plans(active),
+            effects=effects,
+        ),
+        handle,
+        "issue:1",
+    )
+    assert summary.phase == "quiescent"
+    assert summary.claim_state == "released"
+
+
+def test_plan_invalidation_reconciles_after_report_save_crash(tmp_path):
+    """A crash after the durable report write cannot strand the Work Run."""
+
+    from gwo_v8.execution_kernel import ExecutionKernel, PlanInvalidationObservation
+
+    active, handle = _active_campaign(("issue:1",))
+    effects = _Effects()
+    kernel = ExecutionKernel(
+        store_path=tmp_path / "crash.sqlite3",
+        plan_control=_Plans(active),
+        effects=effects,
+    )
+    kernel.advance(handle)
+    binding = effects.executed[0].stable_action_id
+    observation = PlanInvalidationObservation(
+        repository=active.handle.repository,
+        campaign_key=active.handle.campaign_key,
+        plan_revision_digest=active.current_revision_digest,
+        ticket_key="issue:1",
+        work_run_key="work-run:issue:1",
+        runtime_binding_id=binding,
+        authority_subtree_digest="a" * 64,
+        reporter_role="worker",
+        report_digest="a" * 64,
+        evidence_digest="b" * 64,
+        dedup_identity="crash:one",
+        invalidated_obligation="issue:1 contract is incomplete",
+        required_effects=("workspace.write.v1",),
+        workspace_identity="workspace:one",
+    )
+    original_save = kernel._save
+    crashed = {"value": False}
+
+    def save_then_crash(handle_value, state):
+        original_save(handle_value, state)
+        if not crashed["value"]:
+            crashed["value"] = True
+            raise RuntimeError("after plan invalidation record")
+
+    kernel._save = save_then_crash
+    with pytest.raises(RuntimeError, match="after plan invalidation record"):
+        kernel.advance(handle, plan_invalidation=observation)
+
+    recovered = ExecutionKernel(
+        store_path=tmp_path / "crash.sqlite3",
+        plan_control=_Plans(active),
+        effects=effects,
+    )
+    recovered.advance(handle, plan_invalidation=observation)
+    assert len(effects.executed) == 1
+    assert _summary(recovered, handle, "issue:1").phase == "quiescent"
+    assert _summary(recovered, handle, "issue:1").slot_held is False

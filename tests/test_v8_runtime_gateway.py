@@ -24,8 +24,10 @@ from gwo_v8.runtime import RuntimeProfile  # noqa: E402
 from gwo_v8.planning_protocol import planning_prompt  # noqa: E402
 from gwo_v8.runtime_gateway import (  # noqa: E402
     ArtifactStore,
+    CapabilityPolicy,
     CampaignStartRuntimeOverrides,
     ProfileMapping,
+    PlanInvalidationReport,
     _FrozenPermissionAuthorityV1,
     _InMemoryRuntimeProviderAdapter,
     _RuntimeFailure,
@@ -136,6 +138,92 @@ class _InMemoryAuthorityReadback:
     def read(self, subject):
         self.subjects.append(subject)
         return self.authority
+
+
+def test_plan_invalidation_requires_exact_evidence_and_bound_workspace(tmp_path):
+    """#133 rejects junk Evidence and a report for a different Workspace."""
+
+    profile = _profile("invalidation")
+    configuration = RuntimeConfiguration(
+        profiles={profile.digest: profile},
+        host_mappings={
+            "coordinator": ProfileMapping(profile.digest),
+            "worker": ProfileMapping(profile.digest),
+        },
+    )
+    gateway, artifacts, adapter = _gateway(tmp_path, configuration)
+    planning = _planning(artifacts, action="planning:invalidation")
+    work = _work(
+        artifacts,
+        planning,
+        purpose=WorkRunPurpose.implementation(),
+        action="work:invalidation",
+    )
+    authority = _FrozenPermissionAuthorityV1(
+        plan_revision_digest=work.plan_revision_digest,
+        ticket_key=work.ticket_key,
+        purpose=work.purpose,
+        authority_subtree_digest=work.authority_digest,
+        policy_witness_digest="b" * 64,
+        grant_pairs=frozenset({("workspace.write.v1", "work-run.workspace.v1")}),
+        witness_pairs=frozenset({("workspace.write.v1", "work-run.workspace.v1")}),
+        capability_policy=CapabilityPolicy(
+            worker_can_edit_issues=False,
+            worker_can_edit_blockers=False,
+            worker_can_edit_campaign_membership=False,
+            worker_can_activate_plan_revision=False,
+            worker_can_merge=False,
+            worker_can_expand_authority=False,
+            worker_can_invoke_global_planning=False,
+        ),
+    )
+    gateway._authority_readback = _InMemoryAuthorityReadback(authority)
+    preflight = gateway.planning_preflight(planning)
+    gateway.progress(planning, preflight)
+    gateway.progress(work)
+    observed = adapter.observe(work.stable_action_id)
+    assert observed is not None
+
+    def report_for(evidence_digest, *, workspace_identity=observed.workspace_id):
+        return PlanInvalidationReport(
+            repository=work.repository,
+            campaign_key=work.campaign_key,
+            plan_revision_digest=work.plan_revision_digest,
+            ticket_key=work.ticket_key,
+            work_run_key=work.work_run_key,
+            runtime_binding_id=work.stable_action_id,
+            authority_subtree_digest=work.authority_digest,
+            reporter_role="worker",
+            evidence_digest=evidence_digest,
+            dedup_identity="invalidation:exact",
+            invalidated_obligation="issue:111 requires an atomic write",
+            required_effects=("workspace.write.v1",),
+            workspace_identity=workspace_identity,
+        )
+
+    junk = artifacts.put_canonical({"junk": True})
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        gateway._report_plan_invalidation(work, report_for(junk.digest))
+    assert rejected.value.code == "PLAN_INVALIDATION_REPORT_INVALID"
+
+    evidence = artifacts.put_canonical(
+        {
+            "schema_version": "gwo.evidence.v1",
+            "kind": "plan_invalidation",
+            "subject": work.canonical(),
+            "discovered_facts": ["the write is not atomic"],
+            "reproduction": "python -m repro",
+            "invalidated_obligation": "issue:111 requires an atomic write",
+            "required_effects": ["workspace.write.v1"],
+            "workspace_identity": observed.workspace_id,
+        }
+    )
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        gateway._report_plan_invalidation(
+            work,
+            report_for(evidence.digest, workspace_identity="workspace:foreign"),
+        )
+    assert rejected.value.code == "PLAN_INVALIDATION_RUNTIME_BINDING_INVALID"
 
 
 def test_exact_selector_precedence_and_same_profile_fallback_are_persisted(tmp_path):
