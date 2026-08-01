@@ -25,6 +25,10 @@ from .plan_control import ActivePlanReadback, CampaignHandle
 _DIGEST_LENGTH = 64
 _TERMINAL_PHASES = frozenset({"completed"})
 _SLOT_PHASES = frozenset({"running", "candidate_checks", "formal_review", "repair"})
+# A quiescent Work Run has been authoritatively stopped by Plan Invalidation.
+# It retains diagnostic identity and performs no further Worker/Candidate/
+# Review/Repair/delivery effect, but it does not hold a Worker Slot.
+_QUIESCENT_PHASES = frozenset({"quiescent"})
 _KERNEL_LOCKS_GUARD = threading.Lock()
 _KERNEL_LOCKS: dict[str, threading.RLock] = {}
 
@@ -59,6 +63,7 @@ class WorkRunSummary:
     slot_held: bool
     reason: str | None
     next_check_at: str | None
+    plan_invalidation: PlanInvalidationDiagnostic | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +156,7 @@ class WorkRunObservation:
             "wait",
             "blocked",
             "runtime_unavailable",
+            "quiescent",
         }
     )
 
@@ -178,6 +184,113 @@ class WorkRunObservation:
     @classmethod
     def running(cls, stable_action_id: str) -> "WorkRunObservation":
         return cls("running", stable_action_id, digest_value({"action": stable_action_id, "phase": "running"}))
+
+
+@dataclass(frozen=True)
+class PlanInvalidationObservation:
+    """One authoritative Plan Invalidation report bound to exact identities.
+
+    The RuntimeGateway publishes this typed observation after it reads the
+    Artifact-backed report and proves the reporting role's capability policy.
+    ExecutionKernel persists it under ``dedup_identity`` and transitions only
+    the affected Work Run to ``quiescent``.  It is Evidence of plan
+    invalidation, not a replacement plan and not authority to widen a
+    Candidate.  It cannot mutate Issues, blockers, Campaign membership,
+    authority, merge state, or the global route.
+    """
+
+    repository: str
+    campaign_key: str
+    plan_revision_digest: str
+    ticket_key: str
+    work_run_key: str
+    runtime_binding_id: str
+    authority_subtree_digest: str
+    reporter_role: str
+    report_digest: str
+    evidence_digest: str
+    dedup_identity: str
+    invalidated_obligation: str
+    required_effects: tuple[str, ...]
+    workspace_identity: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "repository",
+            "campaign_key",
+            "ticket_key",
+            "work_run_key",
+            "runtime_binding_id",
+            "reporter_role",
+            "dedup_identity",
+            "invalidated_obligation",
+            "workspace_identity",
+        ):
+            if type(getattr(self, field_name)) is not str or not getattr(self, field_name):
+                raise ExecutionKernelError(
+                    "PLAN_INVALIDATION_OBSERVATION_INVALID",
+                    f"Plan Invalidation {field_name} is missing",
+                )
+        for digest_field in (
+            "plan_revision_digest",
+            "authority_subtree_digest",
+            "report_digest",
+            "evidence_digest",
+        ):
+            value = getattr(self, digest_field)
+            if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ExecutionKernelError(
+                    "PLAN_INVALIDATION_OBSERVATION_INVALID",
+                    f"Plan Invalidation {digest_field} is not a SHA-256 digest",
+                )
+        if type(self.required_effects) is not tuple or any(
+            type(effect) is not str or not effect for effect in self.required_effects
+        ):
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_OBSERVATION_INVALID",
+                "Plan Invalidation required effects must be a tuple of non-empty strings",
+            )
+
+    @property
+    def digest(self) -> str:
+        return digest_value(self.canonical())
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "kind": "plan_invalidation_observation.v1",
+            "repository": self.repository,
+            "campaign_key": self.campaign_key,
+            "plan_revision_digest": self.plan_revision_digest,
+            "ticket_key": self.ticket_key,
+            "work_run_key": self.work_run_key,
+            "runtime_binding_id": self.runtime_binding_id,
+            "authority_subtree_digest": self.authority_subtree_digest,
+            "reporter_role": self.reporter_role,
+            "report_digest": self.report_digest,
+            "evidence_digest": self.evidence_digest,
+            "dedup_identity": self.dedup_identity,
+            "invalidated_obligation": self.invalidated_obligation,
+            "required_effects": list(self.required_effects),
+            "workspace_identity": self.workspace_identity,
+        }
+
+
+@dataclass(frozen=True)
+class PlanInvalidationDiagnostic:
+    """The inspect-facing diagnostic for one quiescent Work Run.
+
+    It names the invalidated obligation, Evidence identity, retained
+    diagnostic identity, and the exact continuation condition without a
+    model transcript.  It is read-only Evidence; it never carries a
+    replacement plan or authority to resume.
+    """
+
+    report_digest: str
+    evidence_digest: str
+    invalidated_obligation: str
+    required_effects: tuple[str, ...]
+    workspace_identity: str
+    continuation_condition: str
 
 
 class ActivePlanReader(Protocol):
@@ -220,13 +333,19 @@ class ExecutionKernel:
             )
 
     def advance(
-        self, campaign_handle: CampaignHandle, wake_ref: str | None = None
+        self,
+        campaign_handle: CampaignHandle,
+        wake_ref: str | None = None,
+        *,
+        plan_invalidation: PlanInvalidationObservation | None = None,
     ) -> CampaignOutcome:
         """Read back authority, perform all currently due effects, derive one status."""
 
         with self._campaign_lock(campaign_handle):
             active, work = self._authoritative_active(campaign_handle)
             state = self._load_or_initialize(active, work)
+            if plan_invalidation is not None:
+                self._apply_plan_invalidation(active, state, work, plan_invalidation)
             is_new_wake = False
             if wake_ref is not None:
                 if type(wake_ref) is not str or not wake_ref:
@@ -277,13 +396,7 @@ class ExecutionKernel:
             )
         outcome = self._outcome(active.handle, state)
         runs = tuple(
-            WorkRunSummary(
-                ticket_key=key,
-                phase=run["phase"],
-                slot_held=bool(run["slot_held"]),
-                reason=run.get("reason"),
-                next_check_at=run.get("next_check_at"),
-            )
+            self._run_summary(key, run)
             for key, run in sorted(state["runs"].items())
         )
         held = sum(1 for run in state["runs"].values() if run["slot_held"])
@@ -301,6 +414,31 @@ class ExecutionKernel:
             worker_slots={"limit": limit, "held": held, "available": limit - held},
             work_runs=runs,
             outstanding_effect_ids=outstanding,
+        )
+
+    @staticmethod
+    def _run_summary(
+        ticket_key: str,
+        run: dict[str, Any],
+    ) -> WorkRunSummary:
+        invalidation_record = run.get("plan_invalidation")
+        diagnostic: PlanInvalidationDiagnostic | None = None
+        if invalidation_record is not None:
+            diagnostic = PlanInvalidationDiagnostic(
+                report_digest=invalidation_record["report_digest"],
+                evidence_digest=invalidation_record["evidence_digest"],
+                invalidated_obligation=invalidation_record["invalidated_obligation"],
+                required_effects=tuple(invalidation_record.get("required_effects", ())),
+                workspace_identity=invalidation_record["workspace_identity"],
+                continuation_condition="PlanControlReplanRequired",
+            )
+        return WorkRunSummary(
+            ticket_key=ticket_key,
+            phase=run["phase"],
+            slot_held=bool(run["slot_held"]),
+            reason=run.get("reason"),
+            next_check_at=run.get("next_check_at"),
+            plan_invalidation=diagnostic,
         )
 
     def _authoritative_active(
@@ -394,11 +532,14 @@ class ExecutionKernel:
                         "semantic_action_id": None,
                         "resume_ordinal": 0,
                         "next_check_at": None,
+                        "work_run_key": f"work-run:{key}",
+                        "plan_invalidation": None,
                     }
                     for key in sorted(work)
                 },
                 "effects": {},
                 "wake_refs": [],
+                "plan_invalidation": {},
             }
             self._save(active.handle, state)
             return state
@@ -412,6 +553,16 @@ class ExecutionKernel:
                 "CAMPAIGN_REVISION_CHANGED",
                 "a successor Plan Revision requires its own durable execution state",
             )
+        state.setdefault("plan_invalidation", {})
+        # Backfill the work_run_key on any historical run record that was
+        # persisted before #133 introduced Plan Invalidation.  The key is the
+        # stable Work Run identity the Gateway binds reports to; an absent
+        # value would make every invalidation fail with INVALIDATION_IDENTITY_MISMATCH.
+        for ticket_key, run in state.get("runs", {}).items():
+            if type(run) is dict and not run.get("work_run_key"):
+                run["work_run_key"] = f"work-run:{ticket_key}"
+            if type(run) is dict and "plan_invalidation" not in run:
+                run["plan_invalidation"] = None
         return state
 
     def _next_due_run(
@@ -465,9 +616,9 @@ class ExecutionKernel:
                 # A PlanSpec declaration becomes an actual Exclusive Resource
                 # claim only after this Kernel has admitted its Work Run.
                 # Pending Tickets never reserve each other merely by naming
-                # the same resource.
+                # the same resource.  A quiescent Work Run holds no resource.
                 if other_key != ticket_key
-                and other["phase"] not in {"pending", *_TERMINAL_PHASES}
+                and other["phase"] not in {"pending", *_TERMINAL_PHASES, *_QUIESCENT_PHASES}
                 for resource in work[other_key].get("exclusive_resources", [])
             }
             if any(resource in claimed_elsewhere for resource in work[ticket_key]["exclusive_resources"]):
@@ -480,6 +631,149 @@ class ExecutionKernel:
             return ticket_key
         self._save(active.handle, state)
         return None
+
+    def _apply_plan_invalidation(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        work: dict[str, dict[str, Any]],
+        observation: PlanInvalidationObservation,
+    ) -> None:
+        """Persist and deduplicate one authoritative Plan Invalidation observation.
+
+        The observation is persisted under its stable deduplication identity
+        before any Work Run state changes.  Stale or mismatched Campaign, Plan
+        Revision, Ticket, Work Run, Runtime Binding, or authority identity
+        fails closed: it cannot quiesce or replan current work.  A duplicate
+        observation is a durable no-op; it never repeats the transition or
+        consumes a slot, budget, or LLM turn.
+        """
+
+        if type(observation) is not PlanInvalidationObservation:
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_OBSERVATION_INVALID",
+                "plan_invalidation requires an exact PlanInvalidationObservation",
+            )
+        if (
+            observation.repository != active.handle.repository
+            or observation.campaign_key != active.handle.campaign_key
+            or observation.plan_revision_digest != active.current_revision_digest
+        ):
+            raise ExecutionKernelError(
+                "INVALIDATION_IDENTITY_MISMATCH",
+                "Plan Invalidation observation is not bound to this Campaign or Plan Revision",
+            )
+        run = state["runs"].get(observation.ticket_key)
+        if run is None:
+            raise ExecutionKernelError(
+                "INVALIDATION_IDENTITY_MISMATCH",
+                "Plan Invalidation observation names a Ticket that is not admitted",
+            )
+        if run.get("work_run_key") != observation.work_run_key:
+            raise ExecutionKernelError(
+                "INVALIDATION_IDENTITY_MISMATCH",
+                "Plan Invalidation observation is not bound to this Work Run",
+            )
+        # The Runtime Binding id must match the stable semantic action id
+        # established for this Work Run.  A pending run has no binding yet;
+        # an executing or parked run has one.  The Gateway binds the report
+        # to its exact binding, so a stale or foreign binding fails closed.
+        if (
+            run.get("semantic_action_id") is not None
+            and run["semantic_action_id"] != observation.runtime_binding_id
+        ):
+            raise ExecutionKernelError(
+                "INVALIDATION_IDENTITY_MISMATCH",
+                "Plan Invalidation observation is not bound to this Runtime Binding",
+            )
+        # The authority subtree digest must match the PlanSpec authority for
+        # this Ticket's reporting role.  A foreign authority cannot stop work.
+        # The Kernel fails closed when the frozen authority structure is
+        # missing: it never accepts an invalidation whose authority boundary
+        # it cannot independently prove.
+        work_item = work.get(observation.ticket_key)
+        if type(work_item) is not dict:
+            raise ExecutionKernelError(
+                "INVALIDATION_IDENTITY_MISMATCH",
+                "Plan Invalidation observation names a Ticket that is not in the active PlanSpec",
+            )
+        authority = work_item.get("authority")
+        if type(authority) is not dict:
+            raise ExecutionKernelError(
+                "INVALIDATION_IDENTITY_MISMATCH",
+                "Plan Invalidation requires a frozen authority record for the Ticket",
+            )
+        role_authority = authority.get(observation.reporter_role)
+        if type(role_authority) is not dict:
+            raise ExecutionKernelError(
+                "INVALIDATION_IDENTITY_MISMATCH",
+                "Plan Invalidation requires a frozen authority record for the reporter role",
+            )
+        subtree_digest = role_authority.get("subtree_digest")
+        if type(subtree_digest) is not str or subtree_digest != observation.authority_subtree_digest:
+            raise ExecutionKernelError(
+                "INVALIDATION_IDENTITY_MISMATCH",
+                "Plan Invalidation observation is not bound to this authority subtree",
+            )
+        invalidations = state.setdefault("plan_invalidation", {})
+        dedup_key = observation.dedup_identity
+        if dedup_key in invalidations:
+            # A duplicate callback, restart replay, or repeated advance must
+            # not repeat the transition.  Return without changing state.
+            return
+        invalidations[dedup_key] = {
+            "repository": observation.repository,
+            "campaign_key": observation.campaign_key,
+            "plan_revision_digest": observation.plan_revision_digest,
+            "ticket_key": observation.ticket_key,
+            "work_run_key": observation.work_run_key,
+            "runtime_binding_id": observation.runtime_binding_id,
+            "authority_subtree_digest": observation.authority_subtree_digest,
+            "reporter_role": observation.reporter_role,
+            "report_digest": observation.report_digest,
+            "evidence_digest": observation.evidence_digest,
+            "dedup_identity": observation.dedup_identity,
+            "invalidated_obligation": observation.invalidated_obligation,
+            "required_effects": list(observation.required_effects),
+            "workspace_identity": observation.workspace_identity,
+            "observation_digest": observation.digest,
+        }
+        self._save(active.handle, state)
+        # The Work Run becomes quiescent before its Worker Slot is released.
+        # No further Worker/Candidate/Review/Repair/delivery effect may occur
+        # under the invalidated revision.  Workspace and diagnostic Evidence
+        # remain attributable and read-only until disposition.
+        run["phase"] = "quiescent"
+        run["reason"] = "PlanInvalidation"
+        run["plan_invalidation"] = invalidations[dedup_key]
+        run["last_action_id"] = None
+        run["next_check_at"] = None
+        # The slot is retained while the quiescent state is durable.  ADR-0062
+        # requires the Worker Slot to be released only after the quiescent
+        # state is read back, so the transition is two persisted steps: first
+        # mark quiescent with the slot retained, then read that back from the
+        # authoritative store, then release the slot.
+        self._save(active.handle, state)
+        readback = self._load(active.handle)
+        if readback is None:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign state disappeared after Plan Invalidation persistence",
+            )
+        readback_run = readback["runs"].get(observation.ticket_key)
+        if (
+            type(readback_run) is not dict
+            or readback_run.get("phase") != "quiescent"
+            or readback_run.get("plan_invalidation") is None
+        ):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Quiescent Work Run state was not read back before slot release",
+            )
+        # The readback proves the quiescent state is durable; now release the
+        # slot so unrelated eligible Tickets can continue while replanning waits.
+        run["slot_held"] = False
+        self._save(active.handle, state)
 
     def _perform_due_effect(
         self,
@@ -593,6 +887,31 @@ class ExecutionKernel:
                 CampaignStatus.DECISION,
                 run.get("reason") or f"DecisionRequired:{ticket_key}",
             )
+        # A quiescent Work Run is an explicit, named Decision until PlanControl
+        # (#134) wires the bounded Coordinator replanning path.  No sixth public
+        # status is introduced: the Campaign-level outcome is Decision, and the
+        # Work Run phase remains private Kernel-internal state.
+        quiescent = next(
+            (
+                (ticket_key, run)
+                for ticket_key, run in sorted(state["runs"].items())
+                if run["phase"] == "quiescent"
+            ),
+            None,
+        )
+        if quiescent is not None:
+            ticket_key, run = quiescent
+            obligation = (
+                run.get("plan_invalidation", {}).get("invalidated_obligation")
+                if run.get("plan_invalidation")
+                else None
+            )
+            detail = (
+                f"PlanInvalidation:{ticket_key}:{obligation}"
+                if obligation is not None
+                else f"PlanInvalidation:{ticket_key}"
+            )
+            return CampaignOutcome(CampaignStatus.DECISION, detail)
         waiting = next(
             (
                 (ticket_key, run)

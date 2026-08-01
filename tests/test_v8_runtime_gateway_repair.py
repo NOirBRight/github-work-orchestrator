@@ -383,7 +383,7 @@ def test_public_package_hides_raw_provider_seam_and_gateway_has_only_three_opera
         name
         for name in RuntimeGateway.__dict__
         if not name.startswith("_") and callable(getattr(RuntimeGateway, name))
-    } == {"planning_preflight", "progress", "transition"}
+    } == {"planning_preflight", "progress", "transition", "report_plan_invalidation"}
 
 
 def test_successor_gateway_does_not_import_predecessor_runtime_adapters():
