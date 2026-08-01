@@ -12826,6 +12826,7 @@ def test_repair_packet_16_gateway_v1_migrates_atomically_without_adapter_read(
     durable = json.loads(journal_path.read_text(encoding="utf-8"))
     durable["schema_version"] = 1
     durable.pop("action_identities")
+    durable.pop("plan_invalidation")
     journal_path.write_bytes(gateway_module.canonical_bytes(durable))
     operations_before = (
         list(adapter.prepare_calls),
@@ -12846,7 +12847,8 @@ def test_repair_packet_16_gateway_v1_migrates_atomically_without_adapter_read(
         adapter.command_calls,
     ) == operations_before
     migrated = json.loads(journal_path.read_text(encoding="utf-8"))
-    assert migrated["schema_version"] == 3
+    assert migrated["schema_version"] == 4
+    assert migrated["plan_invalidation"] == {}
     assert migrated["action_identities"] == {
         planning.stable_action_id: {
             "subject_kind": "campaign_planning",
@@ -12903,6 +12905,7 @@ def test_repair_packet_16_gateway_v1_conflict_fails_without_rewrite_or_adapter_r
     durable["actions"][planning.stable_action_id] = action
     durable["schema_version"] = 1
     durable.pop("action_identities")
+    durable.pop("plan_invalidation")
     legacy_bytes = gateway_module.canonical_bytes(durable)
     journal_path.write_bytes(legacy_bytes)
     tracking_adapter = _InMemoryRuntimeProviderAdapter(store)
