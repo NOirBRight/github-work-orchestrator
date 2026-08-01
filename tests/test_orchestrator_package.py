@@ -151,7 +151,7 @@ def test_openai_metadata_is_explicit_and_invocable():
     assert "allow_implicit_invocation: false" in alias
 
 
-def test_ci_uses_the_pinned_hosted_windows_python313_image():
+def test_ci_uses_pinned_action_revisions_on_hosted_windows_python313():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )

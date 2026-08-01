@@ -15,7 +15,7 @@ Before opening a pull request:
 
 1. Run `python scripts/quick_validate.py`.
 2. Run the relevant focused tests and the full `python -m pytest -q` suite.
-3. Keep changes inside the issue's declared claims and explain any newly
+3. Keep changes inside the Ticket's declared claims and explain any newly
    discovered dependency instead of silently expanding the pull request.
 
 Do not commit `.tmp/` or `.paseo-permission-audit-temp/`; these paths are
