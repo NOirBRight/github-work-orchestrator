@@ -532,9 +532,16 @@ def test_authoritative_absence_is_the_only_prepare_authority(tmp_path):
     receipt = gateway.planning_preflight(subject)
     adapter.observe_failure = _RuntimeFailure.transport("synthetic")
 
-    with pytest.raises(RuntimeGatewayError) as stopped:
-        gateway.progress(subject, receipt)
-    assert stopped.value.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    outcomes = [
+        gateway.progress(subject, receipt).recovery_outcome for _ in range(3)
+    ]
+    assert [outcome.kind for outcome in outcomes] == ["wait", "wait", "blocked"]
+    assert [outcome.reason for outcome in outcomes] == [
+        "RuntimeTransportUnavailable",
+        "RuntimeTransportUnavailable",
+        "RuntimeTransportUnavailable",
+    ]
+    assert outcomes[-1].next_check_at is None
     assert adapter.prepare_calls == []
 
     adapter.observe_failure = None
@@ -2952,17 +2959,35 @@ def test_workspace_action_save_failure_rolls_back_and_retains_pinned_intent(tmp_
     assert sum(command[:2] == ["workspace", "create"] for command in client.commands) == 1
 
 
-@pytest.mark.parametrize("failure_code", ("RUNTIME_CONFIGURATION_INVALID", "RUNTIME_TRANSPORT_UNAVAILABLE"))
-def test_prepare_failure_with_authoritative_absence_preserves_original_code(tmp_path, failure_code):
+@pytest.mark.parametrize(
+    ("failure_code", "expected_kind", "expected_reason"),
+    (
+        (
+            "RUNTIME_CONFIGURATION_INVALID",
+            "blocked",
+            "RuntimeConfigurationInvalid",
+        ),
+        (
+            "RUNTIME_TRANSPORT_UNAVAILABLE",
+            "wait",
+            "RuntimeTransportUnavailable",
+        ),
+    ),
+)
+def test_prepare_failure_with_authoritative_absence_returns_typed_recovery(
+    tmp_path, failure_code, expected_kind, expected_reason
+):
     gateway, store, adapter = _gateway(tmp_path)
     subject = _put_subject_artifacts(store, _subject())
     preflight = gateway.planning_preflight(subject)
     adapter.prepare = lambda _spec: _RuntimeFailure(failure_code, "original failure")  # type: ignore[method-assign]
 
-    with pytest.raises(RuntimeGatewayError) as failed:
-        gateway.progress(subject, preflight)
+    progressed = gateway.progress(subject, preflight)
 
-    assert failed.value.code == failure_code
+    assert progressed.status == expected_kind
+    assert progressed.recovery_outcome is not None
+    assert progressed.recovery_outcome.kind == expected_kind
+    assert progressed.recovery_outcome.reason == expected_reason
 
 
 def test_gateway_rejects_unknown_and_permanent_permission_response_without_recovery(tmp_path):
@@ -9970,14 +9995,16 @@ def test_repair_packet_8_action_bound_failure_codes_require_a_stable_action_id(
 
 
 @pytest.mark.parametrize(
-    ("failure", "expected_code"),
+    ("failure", "expected_code", "expected_kind", "expected_reason"),
     (
         (
             _RuntimeFailure(
                 "RUNTIME_CONFIGURATION_INVALID",
                 "permanent configuration failure",
             ),
-            "RUNTIME_CONFIGURATION_INVALID",
+            None,
+            "blocked",
+            "RuntimeConfigurationInvalid",
         ),
         (
             _RuntimeFailure(
@@ -9985,6 +10012,8 @@ def test_repair_packet_8_action_bound_failure_codes_require_a_stable_action_id(
                 "closed protocol failure",
             ),
             "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+            None,
+            None,
         ),
         (
             _RuntimeFailure(
@@ -9992,10 +10021,14 @@ def test_repair_packet_8_action_bound_failure_codes_require_a_stable_action_id(
                 "unknown provider failure",
             ),
             "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+            None,
+            None,
         ),
         (
             _RuntimeFailure.transport(),
-            "RUNTIME_TRANSPORT_UNAVAILABLE",
+            None,
+            "wait",
+            "RuntimeTransportUnavailable",
         ),
     ),
 )
@@ -10003,6 +10036,8 @@ def test_repair_packet_8_prepare_readback_never_swallows_nonrecoverable_failure(
     tmp_path,
     failure,
     expected_code,
+    expected_kind,
+    expected_reason,
 ):
     gateway, store, adapter = _gateway(tmp_path)
     subject = _put_subject_artifacts(store, _subject())
@@ -10015,10 +10050,16 @@ def test_repair_packet_8_prepare_readback_never_swallows_nonrecoverable_failure(
 
     adapter.prepare = stage_then_fail  # type: ignore[method-assign]
 
-    with pytest.raises(RuntimeGatewayError) as stopped:
-        gateway.progress(subject, preflight)
-
-    assert stopped.value.code == expected_code
+    if expected_kind is None:
+        with pytest.raises(RuntimeGatewayError) as stopped:
+            gateway.progress(subject, preflight)
+        assert stopped.value.code == expected_code
+    else:
+        progressed = gateway.progress(subject, preflight)
+        assert progressed.status == expected_kind
+        assert progressed.recovery_outcome is not None
+        assert progressed.recovery_outcome.kind == expected_kind
+        assert progressed.recovery_outcome.reason == expected_reason
     assert adapter.command_calls == []
     assert adapter.created_agent_count == 0
     assert isinstance(
@@ -12805,7 +12846,7 @@ def test_repair_packet_16_gateway_v1_migrates_atomically_without_adapter_read(
         adapter.command_calls,
     ) == operations_before
     migrated = json.loads(journal_path.read_text(encoding="utf-8"))
-    assert migrated["schema_version"] == 2
+    assert migrated["schema_version"] == 3
     assert migrated["action_identities"] == {
         planning.stable_action_id: {
             "subject_kind": "campaign_planning",
