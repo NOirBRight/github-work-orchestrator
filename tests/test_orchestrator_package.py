@@ -151,24 +151,25 @@ def test_openai_metadata_is_explicit_and_invocable():
     assert "allow_implicit_invocation: false" in alias
 
 
-def test_ci_resolves_a_validated_python313_before_creating_its_venv():
+def test_ci_uses_pinned_action_revisions_on_hosted_windows_python313():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )
 
     for required in (
-        "Get-Command python3.13 -CommandType Application",
-        "$env:LOCALAPPDATA",
-        "Programs\\Python\\Python313\\python.exe",
-        "[System.IO.Path]::IsPathFullyQualified($candidate)",
-        "[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)",
-        "-not $seen.Add($candidate)",
-        '($version | Out-String).Trim() -ne "3.13"',
-        '"GWO_RUNNER_PYTHON=$runnerPython"',
-        "& $env:GWO_RUNNER_PYTHON -m venv $venvPath",
+        "runs-on: windows-2025",
+        "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+        "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
+        'python-version: "3.13"',
+        "--require-hashes",
+        "--no-cache-dir",
+        'Write-Host "ImageOS: $env:ImageOS"',
+        'Write-Host "ImageVersion: $env:ImageVersion"',
     ):
         assert required in workflow
-    assert "& python -m venv" not in workflow
+    assert "self-hosted" not in workflow
+    assert "pull_request_target" not in workflow
+    assert "actions/cache" not in workflow
 
 
 def test_v61_parallel_frontier_remains_documented_during_compatibility_release():

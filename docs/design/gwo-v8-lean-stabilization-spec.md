@@ -214,9 +214,10 @@ before historical tracker cleanup:
 | #118 | Cut over new Campaigns through a fail-closed Guard | #113, #117 |
 | #119 | Prove and enable V8 with a four-Ticket root Canary | #118 |
 
-Issue #121 later established the dedicated self-hosted acceptance runner. It is
-a repository-base prerequisite already merged into `main`, not a successor V8
-mechanics Ticket.
+Issue #121 established a temporary dedicated acceptance runner. The public
+repository migration replaces that self-hosted assumption with the standard
+GitHub-hosted `windows-2025` runner. This remains a repository-base
+prerequisite, not a successor V8 mechanics Ticket.
 
 The implementation and exit sequence for the published graph is maintained
 only in
