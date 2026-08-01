@@ -539,7 +539,20 @@ def _planning_value(reservation: PlanningReservation) -> dict[str, Any]:
 
 def _planning_from(value: object) -> PlanningReservation:
     fields = set(PlanningReservation.__dataclass_fields__)
-    item = _exact(value, fields, "Planning reservation")
+    legacy_fields = fields - {
+        "snapshot_artifact_digest",
+        "policy_witness_digest",
+        "planning_request_artifact_digest",
+    }
+    if type(value) is dict and set(value) == legacy_fields:
+        item = {
+            **value,
+            "snapshot_artifact_digest": None,
+            "policy_witness_digest": None,
+            "planning_request_artifact_digest": None,
+        }
+    else:
+        item = _exact(value, fields, "Planning reservation")
     return PlanningReservation(
         **{
             **item,

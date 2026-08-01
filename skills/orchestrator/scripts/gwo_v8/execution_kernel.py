@@ -19,7 +19,12 @@ import threading
 from typing import Any, Mapping, Protocol
 
 from ._canonical import CanonicalJsonError, digest_bytes, digest_value, load_canonical_json
-from .plan_control import ActivePlanReadback, CampaignHandle
+from .plan_control import (
+    ActivePlanReadback,
+    CampaignHandle,
+    PlanInvalidationClassification,
+    PlanInvalidationDisposition,
+)
 
 
 _DIGEST_LENGTH = 64
@@ -79,6 +84,13 @@ class Diagnostics:
     worker_slots: dict[str, int]
     work_runs: tuple[WorkRunSummary, ...]
     outstanding_effect_ids: tuple[str, ...]
+    invalidation_classification: PlanInvalidationClassification | None = None
+
+    @property
+    def plan_invalidation_classification(self) -> PlanInvalidationClassification | None:
+        """Compatibility spelling for the Campaign-level readback."""
+
+        return self.invalidation_classification
 
 
 @dataclass(frozen=True)
@@ -390,10 +402,23 @@ class PlanInvalidationDiagnostic:
     dedup_identity: str | None = None
     claim_state: str = "released"
     exclusive_resources: tuple[str, ...] = ()
+    classification_action_id: str | None = None
+    classification_disposition: str | None = None
 
 
 class ActivePlanReader(Protocol):
     def read_active(self, handle: CampaignHandle) -> ActivePlanReadback: ...
+
+
+class PlanInvalidationClassifier(Protocol):
+    """Private PlanControl seam used only after a Work Run is quiescent."""
+
+    def classify_plan_invalidations(
+        self,
+        handle: CampaignHandle,
+        invalidations: tuple[PlanInvalidationObservation, ...],
+        execution_snapshot: Mapping[str, Any],
+    ) -> PlanInvalidationClassification | None: ...
 
 
 class WorkRunEffects(Protocol):
@@ -447,6 +472,7 @@ class ExecutionKernel:
             if plan_invalidation is not None:
                 observation = self._coerce_plan_invalidation(plan_invalidation)
                 self._apply_plan_invalidation(active, state, work, observation)
+            self._classify_plan_invalidations_if_needed(active, state, work)
             is_new_wake = False
             if wake_ref is not None:
                 if type(wake_ref) is not str or not wake_ref:
@@ -496,6 +522,10 @@ class ExecutionKernel:
                 outstanding_effect_ids=(),
             )
         outcome = self._outcome(active.handle, state)
+        classification = self._current_classification(
+            state,
+            active.current_revision_digest,
+        )
         runs = tuple(
             self._run_summary(key, run)
             for key, run in sorted(state["runs"].items())
@@ -515,6 +545,7 @@ class ExecutionKernel:
             worker_slots={"limit": limit, "held": held, "available": limit - held},
             work_runs=runs,
             outstanding_effect_ids=outstanding,
+            invalidation_classification=classification,
         )
 
     @staticmethod
@@ -538,6 +569,16 @@ class ExecutionKernel:
                 dedup_identity=invalidation_record.get("dedup_identity"),
                 claim_state=run.get("claim_state", "released"),
                 exclusive_resources=tuple(run.get("exclusive_resources", ())),
+                classification_action_id=(
+                    run.get("plan_invalidation_resolution", {}).get("action_id")
+                    if type(run.get("plan_invalidation_resolution")) is dict
+                    else None
+                ),
+                classification_disposition=(
+                    run.get("plan_invalidation_resolution", {}).get("disposition")
+                    if type(run.get("plan_invalidation_resolution")) is dict
+                    else None
+                ),
             )
         return WorkRunSummary(
             ticket_key=ticket_key,
@@ -661,12 +702,17 @@ class ExecutionKernel:
                         "exclusive_resources": list(work[key].get("exclusive_resources", [])),
                         "claim_state": "unclaimed",
                         "plan_invalidation": None,
+                        "plan_invalidation_resolution": None,
+                        "resume_after_invalidation": False,
                     }
                     for key in sorted(work)
                 },
                 "effects": {},
                 "wake_refs": [],
                 "plan_invalidation": {},
+                "plan_invalidation_resolutions": {},
+                "plan_invalidation_classifications": {},
+                "accepted_results": [],
             }
             self._save(active.handle, state)
             return state
@@ -681,6 +727,9 @@ class ExecutionKernel:
                 "a successor Plan Revision requires its own durable execution state",
             )
         state.setdefault("plan_invalidation", {})
+        state.setdefault("plan_invalidation_resolutions", {})
+        state.setdefault("plan_invalidation_classifications", {})
+        state.setdefault("accepted_results", [])
         # Backfill the work_run_key on any historical run record that was
         # persisted before #133 introduced Plan Invalidation.  The key is the
         # stable Work Run identity the Gateway binds reports to; an absent
@@ -698,6 +747,10 @@ class ExecutionKernel:
                     "unclaimed" if run.get("phase") == "pending" else
                     "released"
                 )
+            if type(run) is dict and "plan_invalidation_resolution" not in run:
+                run["plan_invalidation_resolution"] = None
+            if type(run) is dict and "resume_after_invalidation" not in run:
+                run["resume_after_invalidation"] = False
         return state
 
     def _next_due_run(
@@ -738,10 +791,7 @@ class ExecutionKernel:
             # A durable invalidation record fences this Work Run even if the
             # process crashed between the record save and the quiescent save.
             # Reconciliation repairs that window before any external effect.
-            if run.get("plan_invalidation") is not None or any(
-                type(record) is dict and record.get("ticket_key") == ticket_key
-                for record in state.get("plan_invalidation", {}).values()
-            ):
+            if self._has_pending_plan_invalidation(state, ticket_key):
                 continue
             if run["phase"] != "pending":
                 continue
@@ -894,6 +944,7 @@ class ExecutionKernel:
             "accepted_awaiting_delivery",
             "parked",
             "runtime_unavailable",
+            "quiescent",
         }:
             raise ExecutionKernelError(
                 "INVALIDATION_PHASE_INVALID",
@@ -903,6 +954,356 @@ class ExecutionKernel:
         # Persist the observation before changing any Work Run field.
         self._save(active.handle, state)
         self._reconcile_plan_invalidations(active, state, work)
+
+    @staticmethod
+    def _decode_classification(value: object) -> PlanInvalidationClassification:
+        """Decode one exact persisted Coordinator result or fail closed."""
+
+        if type(value) is not dict:
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                "persisted invalidation classification is not an object",
+            )
+        try:
+            classification = PlanInvalidationClassification.from_canonical(value)
+        except Exception as error:
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                "persisted invalidation classification cannot be decoded",
+            ) from error
+        if classification.canonical() != value:
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                "persisted invalidation classification is not canonical",
+            )
+        return classification
+
+    @staticmethod
+    def _replanning_action_id(
+        active: ActivePlanReadback,
+        evidence_digests: tuple[str, ...],
+    ) -> str:
+        return "replan:" + digest_value(
+            {
+                "repository": active.handle.repository,
+                "campaign_key": active.handle.campaign_key,
+                "plan_revision_digest": active.current_revision_digest,
+                "evidence_digests": list(evidence_digests),
+            }
+        )
+
+    @staticmethod
+    def _pending_invalidation_observations(
+        state: Mapping[str, Any],
+    ) -> tuple[tuple[PlanInvalidationObservation, ...], tuple[str, ...]]:
+        records = state.get("plan_invalidation", {})
+        resolutions = state.get("plan_invalidation_resolutions", {})
+        if type(records) is not dict or type(resolutions) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign Plan Invalidation records are invalid",
+            )
+        observations: list[PlanInvalidationObservation] = []
+        for dedup_key, record in sorted(records.items()):
+            if dedup_key in resolutions:
+                continue
+            if type(record) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Campaign Plan Invalidation record is invalid",
+                )
+            raw = {
+                "kind": "plan_invalidation_observation.v1",
+                **{
+                    key: value
+                    for key, value in record.items()
+                    if key != "observation_digest"
+                },
+            }
+            try:
+                observation = PlanInvalidationObservation.from_canonical(raw)
+            except Exception as error:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Campaign Plan Invalidation record cannot be decoded",
+                ) from error
+            if record.get("observation_digest") != observation.digest:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Campaign Plan Invalidation observation digest changed",
+                )
+            observations.append(observation)
+        evidence_digests = tuple(sorted({item.evidence_digest for item in observations}))
+        return tuple(observations), evidence_digests
+
+    @staticmethod
+    def _execution_snapshot(
+        active: ActivePlanReadback,
+        state: Mapping[str, Any],
+        work: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        runs = state.get("runs")
+        if type(runs) is not dict or tuple(sorted(runs)) != tuple(sorted(work)):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel Work Run set does not match the active PlanSpec",
+            )
+        run_facts: list[dict[str, Any]] = []
+        for ticket_key in sorted(work):
+            run = runs[ticket_key]
+            if type(run) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "ExecutionKernel Work Run is not an object",
+                )
+            run_facts.append(
+                {
+                    "ticket_key": ticket_key,
+                    "work_run_key": run.get("work_run_key"),
+                    "phase": run.get("phase"),
+                    "slot_held": run.get("slot_held"),
+                    "reason": run.get("reason"),
+                    "next_check_at": run.get("next_check_at"),
+                    "runtime_binding_id": run.get("semantic_action_id"),
+                    "claim_state": run.get("claim_state"),
+                    "exclusive_resources": list(
+                        work[ticket_key].get("exclusive_resources", [])
+                    ),
+                }
+            )
+        claims = [
+            {
+                "ticket_key": proof.ticket_key,
+                "repository": proof.repository,
+                "campaign_key": proof.campaign_key,
+                "plan_revision_digest": proof.plan_revision_digest,
+            }
+            for proof in active.claim_proofs
+        ]
+        accepted_results = state.get("accepted_results", [])
+        if type(accepted_results) is not list:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel accepted Results are not a list",
+            )
+        return {
+            "runs": run_facts,
+            "claims": sorted(claims, key=lambda item: item["ticket_key"]),
+            "accepted_results": list(accepted_results),
+        }
+
+    def _current_classification(
+        self,
+        state: Mapping[str, Any],
+        plan_revision_digest: str,
+    ) -> PlanInvalidationClassification | None:
+        records = state.get("plan_invalidation_classifications", {})
+        if type(records) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign invalidation classifications are not a mapping",
+            )
+        decoded = [self._decode_classification(value) for value in records.values()]
+        if any(item.plan_revision_digest != plan_revision_digest for item in decoded):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign invalidation classification belongs to another Plan Revision",
+            )
+        if len(decoded) > 1:
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_CLASSIFICATION_CONFLICT",
+                "one active Plan Revision has more than one classification",
+            )
+        return decoded[0] if decoded else None
+
+    def _classify_plan_invalidations_if_needed(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        work: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        classifier = getattr(self._plan_control, "classify_plan_invalidations", None)
+        if not callable(classifier):
+            return
+        observations, evidence_digests = self._pending_invalidation_observations(state)
+        if not observations:
+            return
+        expected_action_id = self._replanning_action_id(active, evidence_digests)
+        existing = self._current_classification(state, active.current_revision_digest)
+        if existing is not None:
+            if (
+                existing.action_id != expected_action_id
+                or existing.evidence_digests != evidence_digests
+            ):
+                raise ExecutionKernelError(
+                    "PLAN_INVALIDATION_CLASSIFICATION_CONFLICT",
+                    "new same-revision Evidence appeared after classification",
+                )
+            self._apply_invalidation_classification(
+                active,
+                state,
+                work,
+                existing,
+                evidence_digests,
+            )
+            return
+        execution_snapshot = self._execution_snapshot(active, state, work)
+        try:
+            classification = classifier(
+                active.handle,
+                observations,
+                execution_snapshot,
+            )
+        except ExecutionKernelError:
+            raise
+        except Exception as error:
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_CLASSIFICATION_FAILED",
+                "PlanControl invalidation classification did not complete",
+            ) from error
+        if classification is None:
+            return
+        if type(classification) is not PlanInvalidationClassification:
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                "PlanControl returned an untyped invalidation classification",
+            )
+        if (
+            classification.action_id != expected_action_id
+            or classification.plan_revision_digest != active.current_revision_digest
+            or classification.evidence_digests != evidence_digests
+        ):
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                "PlanControl classification is bound to another Evidence set",
+            )
+        state["plan_invalidation_classifications"] = {
+            classification.action_id: classification.canonical()
+        }
+        self._save(active.handle, state)
+        readback = self._load(active.handle)
+        if readback is None:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign state disappeared after classification persistence",
+            )
+        state.clear()
+        state.update(readback)
+        persisted = self._current_classification(
+            state,
+            active.current_revision_digest,
+        )
+        if persisted != classification:
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                "PlanControl classification did not read back exactly",
+            )
+        self._apply_invalidation_classification(
+            active,
+            state,
+            work,
+            persisted,
+            evidence_digests,
+        )
+
+    def _apply_invalidation_classification(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        work: Mapping[str, Mapping[str, Any]],
+        classification: PlanInvalidationClassification,
+        evidence_digests: tuple[str, ...],
+    ) -> None:
+        if (
+            classification.plan_revision_digest != active.current_revision_digest
+            or classification.evidence_digests != evidence_digests
+        ):
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                "classification Evidence does not cover all pending invalidations",
+            )
+        if classification.disposition is PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR:
+            if not set(classification.successor_ticket_keys).issubset(work):
+                raise ExecutionKernelError(
+                    "PLAN_INVALIDATION_TICKET_INVALID",
+                    "classification successor names a Ticket outside the active Campaign",
+                )
+            approved_edges = {
+                (dependency, ticket_key)
+                for ticket_key, item in work.items()
+                for dependency in item.get("depends_on", [])
+                if dependency in work
+            }
+            if any(
+                (item.from_ticket, item.to_ticket) not in approved_edges
+                for item in classification.dependency_additions
+            ):
+                raise ExecutionKernelError(
+                    "PLAN_INVALIDATION_DEPENDENCY_UNPROVED",
+                    "classification successor names an unproved dependency",
+                )
+        if classification.disposition in {
+            PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR,
+            PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION,
+        }:
+            # The affected Work Runs remain quiescent.  #135/#136 own the
+            # later successor activation or tracker/authority gate.
+            return
+        records = state.get("plan_invalidation", {})
+        resolutions = state.setdefault("plan_invalidation_resolutions", {})
+        if type(records) is not dict or type(resolutions) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign Plan Invalidation resolution records are invalid",
+            )
+        for dedup_key, record in records.items():
+            if dedup_key in resolutions:
+                continue
+            if type(record) is not dict or record.get("evidence_digest") not in evidence_digests:
+                raise ExecutionKernelError(
+                    "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                    "classification omitted a pending invalidation record",
+                )
+            ticket_key = record.get("ticket_key")
+            run = state.get("runs", {}).get(ticket_key)
+            if type(run) is not dict or ticket_key not in work:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Plan Invalidation resolution names an unknown Work Run",
+                )
+            resolutions[dedup_key] = classification.action_id
+            run["phase"] = "pending"
+            run["slot_held"] = False
+            run["reason"] = None
+            run["next_check_at"] = None
+            run["last_action_id"] = None
+            run["claim_state"] = "unclaimed"
+            run["resume_ordinal"] = int(run.get("resume_ordinal", 0)) + 1
+            run["resume_after_invalidation"] = True
+            run["plan_invalidation_resolution"] = {
+                "action_id": classification.action_id,
+                "disposition": classification.disposition.value,
+            }
+        self._save(active.handle, state)
+        readback = self._load(active.handle)
+        if readback is None:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign state disappeared after invalidation classification application",
+            )
+        state.clear()
+        state.update(readback)
+        for ticket_key, run in state.get("runs", {}).items():
+            if self._has_pending_plan_invalidation(state, ticket_key):
+                continue
+            resolution = run.get("plan_invalidation_resolution")
+            if type(resolution) is not dict or resolution.get("action_id") != classification.action_id:
+                continue
+            if run.get("phase") != "pending" or run.get("slot_held"):
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "resumed Work Run was not read back before admission",
+                )
 
     @staticmethod
     def _scoped_dedup_key(observation: PlanInvalidationObservation) -> str:
@@ -916,6 +1317,25 @@ class ExecutionKernel:
                 "work_run_key": observation.work_run_key,
                 "dedup_identity": observation.dedup_identity,
             }
+        )
+
+    @staticmethod
+    def _has_pending_plan_invalidation(
+        state: Mapping[str, Any],
+        ticket_key: str,
+    ) -> bool:
+        records = state.get("plan_invalidation", {})
+        resolutions = state.get("plan_invalidation_resolutions", {})
+        if type(records) is not dict or type(resolutions) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign Plan Invalidation resolution records are invalid",
+            )
+        return any(
+            type(record) is dict
+            and record.get("ticket_key") == ticket_key
+            and dedup_key not in resolutions
+            for dedup_key, record in records.items()
         )
 
     @staticmethod
@@ -951,6 +1371,13 @@ class ExecutionKernel:
             raise ExecutionKernelError(
                 "EXECUTION_STORE_INVALID",
                 "Campaign Plan Invalidation records are invalid",
+            )
+        resolutions = state.setdefault("plan_invalidation_resolutions", {})
+        classifications = state.setdefault("plan_invalidation_classifications", {})
+        if type(resolutions) is not dict or type(classifications) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign Plan Invalidation readback lineage is invalid",
             )
         for dedup_key, record in list(invalidations.items()):
             if type(record) is not dict:
@@ -1037,6 +1464,36 @@ class ExecutionKernel:
                     "EXECUTION_STORE_INVALID",
                     "Campaign Plan Invalidation record is not bound to the current authority",
                 )
+            resolution_action_id = resolutions.get(dedup_key)
+            if resolution_action_id is not None:
+                if type(resolution_action_id) is not str or not resolution_action_id:
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "Plan Invalidation resolution identity is invalid",
+                    )
+                classification = self._decode_classification(
+                    classifications.get(resolution_action_id)
+                )
+                if (
+                    classification.action_id != resolution_action_id
+                    or classification.plan_revision_digest
+                    != active.current_revision_digest
+                    or observation.evidence_digest
+                    not in classification.evidence_digests
+                    or classification.disposition
+                    not in {
+                        PlanInvalidationDisposition.RESUME_UNCHANGED,
+                        PlanInvalidationDisposition.DEFER_NON_BLOCKING,
+                        PlanInvalidationDisposition.REJECT_INVALID_EVIDENCE,
+                    }
+                ):
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "Plan Invalidation resolution is not a valid resume classification",
+                    )
+                # The observation remains diagnostic lineage, but it no longer
+                # fences the Work Run after the exact classification readback.
+                continue
             if run.get("phase") not in {
                 *_SLOT_PHASES,
                 "accepted_awaiting_delivery",
@@ -1091,7 +1548,9 @@ class ExecutionKernel:
         wake_ref: str | None,
     ) -> None:
         run = state["runs"][ticket_key]
-        resuming = run["phase"] == "parked"
+        resuming = run["phase"] == "parked" or bool(
+            run.get("resume_after_invalidation")
+        )
         kind = "semantic_resume" if resuming else "semantic_execution"
         action_id = digest_value(
             {
@@ -1143,6 +1602,7 @@ class ExecutionKernel:
         run["slot_held"] = observation.phase in _SLOT_PHASES
         run["claim_state"] = "held" if run["slot_held"] else "released"
         run["last_wake_ref"] = wake_ref
+        run["resume_after_invalidation"] = False
         if observation.phase == "runtime_unavailable" and observation.binding_established:
             # A live unavailable binding retains the Slot until #112 proves a
             # park/terminal transition.  The phase itself is a durable Wait.
