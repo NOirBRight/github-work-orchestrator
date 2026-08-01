@@ -532,9 +532,16 @@ def test_authoritative_absence_is_the_only_prepare_authority(tmp_path):
     receipt = gateway.planning_preflight(subject)
     adapter.observe_failure = _RuntimeFailure.transport("synthetic")
 
-    with pytest.raises(RuntimeGatewayError) as stopped:
-        gateway.progress(subject, receipt)
-    assert stopped.value.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+    outcomes = [
+        gateway.progress(subject, receipt).recovery_outcome for _ in range(3)
+    ]
+    assert [outcome.kind for outcome in outcomes] == ["wait", "wait", "blocked"]
+    assert [outcome.reason for outcome in outcomes] == [
+        "RuntimeTransportUnavailable",
+        "RuntimeTransportUnavailable",
+        "RuntimeTransportUnavailable",
+    ]
+    assert outcomes[-1].next_check_at is None
     assert adapter.prepare_calls == []
 
     adapter.observe_failure = None

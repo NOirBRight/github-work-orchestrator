@@ -9848,14 +9848,31 @@ class RuntimeGateway:
     def _recovery_observation_digest(
         record: Mapping[str, Any], failure: _RuntimeFailure
     ) -> str:
-        return digest_value(
-            {
-                "failure_code": failure.code,
-                "stable_action_id": record.get("subject", {}).get("stable_action_id"),
-                "provider_observation_id": failure.observation_id,
-                "last_observation_digest": record.get("observation_digest"),
-            }
-        )
+        payload = {
+            "failure_code": failure.code,
+            "stable_action_id": record.get("subject", {}).get(
+                "stable_action_id"
+            ),
+            "provider_observation_id": failure.observation_id,
+            "last_observation_digest": record.get("observation_digest"),
+        }
+        if (
+            failure.code == "RUNTIME_TRANSPORT_UNAVAILABLE"
+            and failure.observation_id is None
+        ):
+            # A transport failure carries no provider observation identity. Each
+            # fresh authoritative read is nevertheless a bounded retry; bind
+            # its digest to the durable episode length so repeated reads can
+            # reach the declared terminal transport outcome without inventing
+            # provider identity.
+            recovery = record.get("recovery")
+            entries = (
+                recovery.get("transport_unavailable", [])
+                if isinstance(recovery, Mapping)
+                else []
+            )
+            payload["transport_attempt"] = len(entries)
+        return digest_value(payload)
 
     def _persist_recovery_observation(
         self,
