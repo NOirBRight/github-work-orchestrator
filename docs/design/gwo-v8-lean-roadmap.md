@@ -1,6 +1,6 @@
 # GWO V8 lean landing roadmap
 
-Status: accepted sequencing and exit-criteria record for Issues #108–#119.
+Status: accepted sequencing and exit-criteria record for Issues #108–#119, extended by the #131 bounded replanning successor Tickets #132–#137.
 This document does not define V8 mechanics, authorize tracker mutation, or
 authorize production writer cutover.
 
@@ -40,29 +40,46 @@ of the architecture.
 
 ## Published successor sequence
 
-The native blocker graph was read back on 2026-07-27. Issue #121 was a
-temporary dedicated-runner prerequisite. The repository now migrates acceptance
-to the standard GitHub-hosted `windows-2025` runner; the migration supersedes
-#121's self-hosted operational assumption and remains outside the V8 Candidate
-graph.
+The native blocker graph was read back on 2026-08-01. Issue #121 was a
+temporary dedicated-runner prerequisite; the repository now uses the standard
+GitHub-hosted `windows-2025` runner, so the migration supersedes #121's
+self-hosted operational assumption and remains outside the V8 Candidate graph.
+Closed prerequisite Tickets #123 and #126 remain visible below because they
+are native blockers even though they add no remaining work. Issue #131
+decomposed bounded Campaign replanning into successor Tickets #132–#137; #132
+is the unblocked documentation prefactor, and #118 is additionally blocked by
+#136 and #137 so V8 cannot cut over before both the successor/human-gate and
+late-discovery paths converge.
+
+At the #132 contract readback, #108, #109, and #111 were completed repository
+base while #110 and #112 were the in-flight foundations for #133. This records
+the accepted sequencing premise, not live Ticket state; GitHub remains the
+authority for current state.
 
 | Ticket | Outcome | Native blockers |
 | --- | --- | --- |
 | #108 | Land this accepted contract | none |
 | #109 | Start one immutable PlanSpec v3 Campaign | #111 |
 | #110 | Advance four Work Runs without Coordinator continuation | #109 |
-| #111 | Route semantic roles through one RuntimeGateway | #108 |
+| #111 | Route semantic roles through one RuntimeGateway | #108, #126 |
 | #112 | Bound permission waits and terminal Runtime recovery | #111 |
 | #113 | Resume Campaigns without LLM polling | #110, #112 |
 | #114 | Accept standard Candidates through one CandidateGate | #110, #111 |
 | #115 | Bound strict Review and Review Finding repair | #112, #114 |
 | #116 | Deliver compatible Candidates through one exact Batch | #110, #114 |
 | #117 | Recover Batch failures without repeating unaffected work | #115, #116 |
-| #118 | Cut over new Campaigns through a fail-closed Guard | #113, #117 |
-| #119 | Prove and enable V8 with a four-Ticket root Canary | #118 |
+| #118 | Cut over new Campaigns through a fail-closed Guard | #113, #117, #136, #137 |
+| #119 | Prove and enable V8 with a four-Ticket root Canary | #118, #123 |
+| #132 | Freeze bounded Campaign replanning contract | none |
+| #133 | Quiesce a Work Run on Plan Invalidation | #132, #110, #112 |
+| #134 | Classify Plan Invalidation against the complete Campaign | #133 |
+| #135 | Activate a successor Plan Revision from approved Campaign Tickets | #134 |
+| #136 | Gate new scope and authority on human-approved tracker readback | #135 |
+| #137 | Route Candidate and repair scope escapes into Campaign replanning | #134, #114, #115 |
 
 ```mermaid
 flowchart LR
+    T126["#126 CI headroom"] --> T111
     T108["#108 Contract"] --> T111["#111 RuntimeGateway seam"]
     T111 --> T109["#109 PlanControl"]
     T109 --> T110["#110 ExecutionKernel"]
@@ -77,9 +94,22 @@ flowchart LR
     T114 --> T116
     T115 --> T117["#117 Batch recovery"]
     T116 --> T117
+    T132["#132 Replan contract"]
+    T132 --> T133["#133 Quiesce"]
+    T110 --> T133
+    T112 --> T133
+    T133 --> T134["#134 Classify"]
+    T134 --> T135["#135 Successor revision"]
+    T135 --> T136["#136 Human gate"]
+    T134 --> T137["#137 Late escape"]
+    T114 --> T137
+    T115 --> T137
     T113 --> T118["#118 Cutover Guard"]
     T117 --> T118
+    T136 --> T118
+    T137 --> T118
     T118 --> T119["#119 Root Canary"]
+    T123["#123 Canary singleton"] --> T119
 ```
 
 ## Stage 0 — Contract
@@ -332,6 +362,117 @@ Exit criteria for #119:
   restart is needed; and
 - V8 becomes the default here only after exact acceptance readback.
 
+
+## Stage 7 — Bounded Campaign replanning
+
+Tickets: #132 (documentation prefactor), then #133 through #137.
+
+#132 freezes the shared V8 contract for bounded Campaign replanning before the
+four deep modules implement it. It changes no Runtime, Campaign, repository
+writer, Candidate, or GitHub execution state. The acceptance contract is
+defined by
+[ADR-0062](../adr/0062-bound-campaign-replanning-on-plan-revision-invalidation.md)
+and the
+[`Bounded Campaign replanning`](gwo-v8-lean-architecture.md#bounded-campaign-replanning)
+architecture section.
+
+Exit criteria for #132:
+
+- the domain glossary names Plan Invalidation and its relationship to Evidence,
+  Plan Revision, Work Run, Wait, and Decision without a second mutable-plan
+  vocabulary;
+- ADRs governing PlanSpec v3, one Planning Pass per revision, CandidateGate,
+  ExecutionKernel, and RuntimeGateway are amended by one coherent decision
+  record (ADR-0062) rather than silently reinterpreted;
+- the architecture assigns authoritative observation readback to
+  RuntimeGateway, Work Run quiescence and public status to ExecutionKernel,
+  bounded Campaign snapshot and successor compilation to PlanControl, and
+  scope-audit/Review entry routing to CandidateGate;
+- the contract states Worker and Reviewer role boundaries, legal dispositions,
+  lineage policy, replan budgets, and the public interface invariant; and
+- documentation links, package validation, and repository documentation checks
+  pass without product implementation changes.
+
+Exit criteria for #133:
+
+- RuntimeGateway reads one typed, Artifact-backed invalidation report bound to
+  the exact Campaign, Plan Revision, Ticket, Work Run, stable action, Runtime
+  Binding, authority-subtree digest, reporter role, and Evidence digest;
+- effective capability readback proves the Worker cannot create or edit Issues,
+  change blockers, activate a Plan Revision, merge, expand authority, or invoke
+  global planning;
+- ExecutionKernel persists the observation under a stable deduplication
+  identity, quiesces the affected Work Run, releases its Worker Slot after
+  quiescent readback, and preserves diagnostic context;
+- unrelated valid Work Runs continue and refill released capacity;
+- stale or mismatched identity cannot stop current work; duplicate callbacks,
+  restart, and repeated `advance` cannot repeat the transition; and
+- `inspect` exposes the invalidated obligation, Evidence identity, affected
+  Work Run, Slot and claim state, and continuation condition without a
+  transcript.
+
+Exit criteria for #134:
+
+- PlanControl snapshots the active Plan Revision, complete approved Campaign
+  Ticket contracts and native blocker graph, active and terminal Work Runs,
+  claims, accepted Results, pending invalidation Evidence, Policy Witness, and
+  explicitly referenced external dependencies;
+- all pending valid Evidence for one active revision is coalesced into one
+  Coordinator semantic action;
+- the Coordinator receives the complete bounded snapshot and Runtime capability
+  readback proves read-only repository and tracker authority with delegation
+  disabled;
+- Coordinator output is typed and limited to resume, defer, successor,
+  Decision, or reject invalid Evidence;
+- a validated unchanged-contract or defer disposition resumes without a
+  successor Plan Revision; and
+- a disposition requiring plan or product change remains quiescent with no
+  tracker or Plan Revision mutation in this Ticket.
+
+Exit criteria for #135:
+
+- a successor may admit or reorder only approved Campaign Tickets from the
+  replanning snapshot and add only Coordinator-justified dependencies or
+  genuine Exclusive Resources allowed by frozen contracts and policy;
+- PlanControl performs one Campaign Planning Pass, validates, compiles,
+  activates through compare-and-swap, and reads back exactly once;
+- a changed dependency, Ticket contract, authority root, or required shared
+  fact creates new Work Run and Evidence identities; old output is rejected;
+- an old workspace or Candidate is retained only as diagnostic lineage and is
+  never adopted under the successor revision; and
+- accepted Results and unaffected exact Evidence survive only when their
+  complete subjects remain identical and valid.
+
+Exit criteria for #136:
+
+- a required new Ticket, acceptance change, Campaign-membership change,
+  product/release choice, or broader authority returns a named human Decision
+  with the exact Evidence and required durable source change;
+- no component performs Issue creation/editing, blocker mutation, label
+  mutation, Campaign-membership mutation, or authority grant while the Decision
+  is outstanding;
+- only authoritative tracker and policy readback with exact digests can
+  continue the Decision;
+- repository policy defines finite successor-revision and repeated-invalidation
+  bounds; exhaustion returns Decision with complete lineage; and
+- restart, duplicate tracker events, repeated `advance`, and delayed readback
+  cannot repeat the Decision, Planning Pass, source adoption, or successor
+  activation.
+
+Exit criteria for #137:
+
+- CandidateGate distinguishes an ordinary unauthorized Candidate change from
+  Evidence that the frozen Ticket cannot be satisfied safely;
+- a deterministic scope audit proving plan invalidation stops before Formal
+  Review and persists the same typed Evidence contract;
+- a Formal Review Finding proving out-of-scope work is preserved as Evidence
+  and is not converted into an impossible Repair obligation;
+- CandidateGate verification of a repaired Candidate that discovers work
+  outside the consolidated repair request invalidates repair lineage and emits
+  bounded Evidence without reopening exploratory Review; and
+- deterministic audit failure consumes zero Reviewer calls and plan
+  invalidation adds no Formal Review, Candidate submission, or Repair budget.
+
 ## Parallelism and critical path
 
 The safe critical path is:
@@ -344,8 +485,15 @@ The safe critical path is:
               (#112 + #114) -> #115
               (#110 + #114) -> #116
               (#115 + #116) -> #117
-              (#113 + #117) -> #118 -> #119
+#132
+(#132 + #110 + #112) -> #133 -> #134 -> #135 -> #136
+(#134 + #114 + #115) -> #137
+(#113 + #117 + #136 + #137) -> #118 -> #119
 ```
+
+All replanning paths must converge before #118. #132 may proceed immediately;
+#133 becomes executable after #132, #110, and #112 complete, and #137 becomes
+executable after #134, #114, and #115 complete.
 
 Inside one Ticket, fixtures, private adapters, documentation, and independent
 contract tests may proceed concurrently. Changes to the same deep-module

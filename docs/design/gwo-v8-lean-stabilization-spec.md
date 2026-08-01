@@ -89,6 +89,7 @@ The integrated definitions are intentionally not duplicated here:
 | Tree-delta identity and per-member Clean Base Advance | [`PatchIdentityV1 and Clean Base Advance`](gwo-v8-lean-architecture.md#patchidentityv1-and-clean-base-advance) |
 | Terminal hosted-check restart adoption | [`Durable hosted result adoption`](gwo-v8-lean-architecture.md#durable-hosted-result-adoption) |
 | Writer-generation migration boundary | [`Cutover`](gwo-v8-lean-architecture.md#cutover) |
+| Bounded Campaign replanning on Plan Revision invalidation | [`Bounded Campaign replanning`](gwo-v8-lean-architecture.md#bounded-campaign-replanning) |
 | Fixed and configurable defaults | [`Defaults`](gwo-v8-lean-architecture.md#defaults) |
 
 ## Stabilization acceptance
@@ -218,6 +219,18 @@ Issue #121 established a temporary dedicated acceptance runner. The public
 repository migration replaces that self-hosted assumption with the standard
 GitHub-hosted `windows-2025` runner. This remains a repository-base
 prerequisite, not a successor V8 mechanics Ticket.
+
+Issue #131 decomposed bounded Campaign replanning into successor Tickets
+#132–#137 under the user-approved parent-Issue exception. #132 is the
+documentation prefactor that freezes the shared contract; #118 is additionally
+blocked by #136 and #137 so V8 cannot cut over before both the
+successor/human-gate and late-discovery paths converge. The bounded replanning
+mechanics are defined by
+[ADR-0062](../adr/0062-bound-campaign-replanning-on-plan-revision-invalidation.md)
+and the
+[`Bounded Campaign replanning`](gwo-v8-lean-architecture.md#bounded-campaign-replanning)
+architecture section. Those Tickets extend, but do not replace, the published
+#108–#119 graph.
 
 The implementation and exit sequence for the published graph is maintained
 only in

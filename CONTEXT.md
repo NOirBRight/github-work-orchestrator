@@ -109,6 +109,14 @@ A non-terminal Campaign or Work Run state naming the observable event or due
 time required for deterministic continuation.
 _Avoid_: inactivity, silent stop, failure
 
+**Plan Invalidation**:
+A kind of Evidence bound to one Work Run and its active Plan Revision that
+records why the Ticket cannot safely be satisfied as written. Its resolution may
+require a Wait for an observable prerequisite or a Decision before scope,
+authority, or acceptance can change. It is not a replacement plan, a Ticket
+ownership decision, or authority to widen a Candidate.
+_Avoid_: mutable plan, replacement PlanSpec, Worker rewrite, scope escalation
+
 **Decision**:
 A durable semantic or human choice required before scope, authority,
 acceptance meaning, or exhausted recovery may change.
