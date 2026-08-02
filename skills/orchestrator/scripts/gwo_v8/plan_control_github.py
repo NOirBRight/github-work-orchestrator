@@ -27,6 +27,7 @@ from .plan_control import (
     _PlanningAttempt,
     _SplitCampaignDecisionRecord,
 )
+from .planning_protocol import PLANNING_OUTPUT_PROTOCOL_ID
 from .runtime_gateway import CampaignPlanningSubject
 from .transition import (
     WriterTransitionRecord,
@@ -578,6 +579,7 @@ def _attempt_value(attempt: _PlanningAttempt) -> dict[str, Any]:
         "planning_request_artifact_digest": (
             attempt.planning_request_artifact_digest
         ),
+        "planning_protocol_id": attempt.planning_protocol_id,
         "subject": attempt.subject.canonical(),
         "compilation_record_artifact_digest": (
             attempt.compilation_record_artifact_digest
@@ -594,22 +596,27 @@ def _attempt_value(attempt: _PlanningAttempt) -> dict[str, Any]:
 
 
 def _attempt_from(value: object) -> _PlanningAttempt:
+    fields = {
+        "handle",
+        "ready_refs",
+        "ticket_keys",
+        "expected_previous_revision_digest",
+        "snapshot_bytes_base64",
+        "snapshot_artifact_digest",
+        "policy_witness_digest",
+        "planning_request_artifact_digest",
+        "planning_protocol_id",
+        "subject",
+        "compilation_record_artifact_digest",
+        "revision",
+        "compilation_record_bytes_base64",
+    }
+    legacy_fields = fields - {"planning_protocol_id"}
+    if type(value) is dict and set(value) == legacy_fields:
+        value = {**value, "planning_protocol_id": PLANNING_OUTPUT_PROTOCOL_ID}
     item = _exact(
         value,
-        {
-            "handle",
-            "ready_refs",
-            "ticket_keys",
-            "expected_previous_revision_digest",
-            "snapshot_bytes_base64",
-            "snapshot_artifact_digest",
-            "policy_witness_digest",
-            "planning_request_artifact_digest",
-            "subject",
-            "compilation_record_artifact_digest",
-            "revision",
-            "compilation_record_bytes_base64",
-        },
+        fields,
         "Planning attempt",
     )
     handle_value = _exact(
@@ -663,6 +670,10 @@ def _attempt_from(value: object) -> _PlanningAttempt:
         planning_request_artifact_digest=_text(
             item["planning_request_artifact_digest"],
             "Planning request digest",
+        ),
+        planning_protocol_id=_text(
+            item["planning_protocol_id"],
+            "Planning protocol id",
         ),
         subject=CampaignPlanningSubject(
             **{
