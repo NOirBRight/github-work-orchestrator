@@ -35,7 +35,11 @@ from ._canonical import (
     load_canonical_json,
     strict_json_loads,
 )
-from .planning_protocol import planning_output_schema_from_prompt
+from .planning_protocol import (
+    planning_output_schema_from_prompt,
+    planning_protocol_kind_from_prompt,
+    replanning_output_schema_from_prompt,
+)
 from .runtime_profile import (
     RuntimeProfile,
     _SealedValueMeta,
@@ -1341,6 +1345,73 @@ class CapabilityPolicy:
 
 
 @dataclass(frozen=True)
+class CoordinatorCapabilityProof:
+    """Read-back proof for the transient Campaign Coordinator boundary.
+
+    The Coordinator may inspect the bounded repository/Tracker snapshot, but
+    it is not a repository writer, Tracker writer, Plan activator, authority
+    owner, or delegating workflow driver.  These booleans are intentionally
+    explicit: a missing or positive forbidden capability fails closed rather
+    than being inferred from a prompt or Runtime Profile.
+    """
+
+    subject_digest: str
+    repository_read_only: bool
+    tracker_read_only: bool
+    can_activate_plan_revision: bool
+    can_edit_tracker: bool
+    can_expand_authority: bool
+    delegation_enabled: bool
+
+    def __post_init__(self) -> None:
+        _require_digest(self.subject_digest, "Coordinator subject digest")
+        for field_name in (
+            "repository_read_only",
+            "tracker_read_only",
+            "can_activate_plan_revision",
+            "can_edit_tracker",
+            "can_expand_authority",
+            "delegation_enabled",
+        ):
+            if type(getattr(self, field_name)) is not bool:
+                raise RuntimeGatewayError(
+                    "COORDINATOR_CAPABILITY_PROOF_INVALID",
+                    f"Coordinator capability {field_name} must be boolean",
+                )
+        if not self.is_proven:
+            raise RuntimeGatewayError(
+                "COORDINATOR_CAPABILITY_PROOF_FAIL_CLOSED",
+                "Coordinator capability readback permits a forbidden effect",
+            )
+
+    @property
+    def is_proven(self) -> bool:
+        return (
+            self.repository_read_only
+            and self.tracker_read_only
+            and not self.can_activate_plan_revision
+            and not self.can_edit_tracker
+            and not self.can_expand_authority
+            and not self.delegation_enabled
+        )
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "subject_digest": self.subject_digest,
+            "repository_read_only": self.repository_read_only,
+            "tracker_read_only": self.tracker_read_only,
+            "can_activate_plan_revision": self.can_activate_plan_revision,
+            "can_edit_tracker": self.can_edit_tracker,
+            "can_expand_authority": self.can_expand_authority,
+            "delegation_enabled": self.delegation_enabled,
+        }
+
+    @property
+    def digest(self) -> str:
+        return digest_value(self.canonical())
+
+
+@dataclass(frozen=True)
 class CapabilityPolicyProof:
     """The read-back proof that a reporting role's capability policy is closed.
 
@@ -2405,11 +2476,12 @@ def _resolve_runtime_subject_protocol(
             "Prompt Artifact does not bind its exact Runtime subject and authority",
         )
     planning_schema = planning_output_schema_from_prompt(prompt)
+    replanning_schema = replanning_output_schema_from_prompt(prompt)
     if type(subject) is CampaignPlanningSubject:
-        if planning_schema is None:
+        if (planning_schema is None) == (replanning_schema is None):
             raise RuntimeGatewayError(
                 "RUNTIME_PROMPT_ARTIFACT_INVALID",
-                "Campaign Planning requires one exact canonical Planning prompt",
+                "Campaign Planning requires one exact canonical Planning or invalidation prompt",
             )
         inputs = prompt["payload"]["input_artifacts"]
         if (
@@ -2421,11 +2493,11 @@ def _resolve_runtime_subject_protocol(
                 "RUNTIME_PROMPT_ARTIFACT_INVALID",
                 "Campaign Planning prompt changed its frozen input Artifact identities",
             )
-        return planning_schema
-    if planning_schema is not None:
+        return planning_schema or replanning_schema
+    if planning_schema is not None or replanning_schema is not None:
         raise RuntimeGatewayError(
             "RUNTIME_PROMPT_ARTIFACT_INVALID",
-            "Plan-Revision Work Run cannot use the exclusive Planning protocol",
+            "Plan-Revision Work Run cannot use the exclusive Campaign Planning protocol",
         )
     return None
 
@@ -8742,6 +8814,36 @@ class RuntimeGateway:
             receipt_digest=receipt_digest,
         )
 
+    def _read_coordinator_capability(
+        self,
+        subject: CampaignPlanningSubject,
+    ) -> CoordinatorCapabilityProof:
+        """Read back the closed Coordinator capability boundary.
+
+        This is a private semantic readback seam, not another workflow
+        operation.  It requires the exact persisted planning preflight and
+        returns only the safe, non-delegating capability projection consumed
+        by PlanControl's invalidation classifier.
+        """
+
+        if type(subject) is not CampaignPlanningSubject:
+            raise RuntimeGatewayError(
+                "COORDINATOR_CAPABILITY_SUBJECT_INVALID",
+                "Coordinator capability readback accepts CampaignPlanningSubject only",
+            )
+        self._assert_configuration_identity()
+        self._refresh()
+        self._preflight_receipt(subject)
+        return CoordinatorCapabilityProof(
+            subject_digest=subject.digest,
+            repository_read_only=True,
+            tracker_read_only=True,
+            can_activate_plan_revision=False,
+            can_edit_tracker=False,
+            can_expand_authority=False,
+            delegation_enabled=False,
+        )
+
     # Caller interface operation 2.  This owns the entire readback-first
     # prepare/observe/start-or-resume loop; callers cannot issue provider
     # commands or inspect a Runtime Binding.
@@ -12839,11 +12941,39 @@ class _InMemoryRuntimeProviderAdapter:
             action.spec.subject,
             prompt,
         )
+        planning_kind = planning_protocol_kind_from_prompt(prompt)
         payload: dict[str, Any]
         if planning_schema is not None:
             snapshot = self._artifacts.read_json(
                 action.spec.subject.snapshot_artifact_digest
             )
+            if planning_kind == "invalidation":
+                pending = snapshot.get("pending_invalidations") if type(snapshot) is dict else None
+                if (
+                    type(pending) is not list
+                    or not pending
+                    or any(
+                        type(item) is not dict
+                        or type(item.get("evidence_digest")) is not str
+                        or not item["evidence_digest"]
+                        for item in pending
+                    )
+                ):
+                    raise RuntimeGatewayError(
+                        "RUNTIME_ARTIFACT_INVALID",
+                        "Campaign invalidation snapshot has no closed pending Evidence",
+                    )
+                payload = {
+                    "evidence_digests": sorted(
+                        {item["evidence_digest"] for item in pending}
+                    ),
+                    "disposition": "reject_invalid_evidence",
+                    "reason": "The deterministic Coordinator default rejects unproved invalidation Evidence.",
+                    "successor": None,
+                    "decision": None,
+                }
+            else:
+                payload = None
             if (
                 type(snapshot) is not dict
                 or type(snapshot.get("tickets")) is not list
@@ -12864,13 +12994,14 @@ class _InMemoryRuntimeProviderAdapter:
                     "RUNTIME_ARTIFACT_INVALID",
                     "Campaign Planning snapshot repeats or omits Ticket keys",
                 )
-            payload = {
-                "admitted_work": ticket_keys,
-                "dependency_additions": [],
-                "exclusive_resources": {key: [] for key in ticket_keys},
-                "capability_requirements": {key: [] for key in ticket_keys},
-                "decision_requirements": [],
-            }
+            if planning_kind == "initial":
+                payload = {
+                    "admitted_work": ticket_keys,
+                    "dependency_additions": [],
+                    "exclusive_resources": {key: [] for key in ticket_keys},
+                    "capability_requirements": {key: [] for key in ticket_keys},
+                    "decision_requirements": [],
+                }
         else:
             payload = {
                 "input_artifact_digests": [

@@ -10,14 +10,20 @@ session, Workspace, or command seam.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 from functools import wraps
 import re
 import threading
 from typing import Any, Mapping, Protocol, Sequence
 
 from ._canonical import CanonicalJsonError, canonical_bytes, digest_bytes, digest_value, load_canonical_json
-from .planning_protocol import planning_prompt
-from .runtime_gateway import CampaignPlanningSubject, PlanningPreflightReceipt, PlanningReceipt
+from .planning_protocol import planning_prompt, replanning_prompt
+from .runtime_gateway import (
+    CampaignPlanningSubject,
+    CoordinatorCapabilityProof,
+    PlanningPreflightReceipt,
+    PlanningReceipt,
+)
 
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -71,6 +77,310 @@ class DecisionFinding:
     code: str
     detail: str
     ticket_key: str | None = None
+
+
+class PlanInvalidationDisposition(str, Enum):
+    """The closed legal result of one Campaign invalidation classification."""
+
+    RESUME_UNCHANGED = "resume_unchanged"
+    DEFER_NON_BLOCKING = "defer_non_blocking"
+    USE_APPROVED_SUCCESSOR = "use_approved_successor"
+    REQUIRE_HUMAN_DECISION = "require_human_decision"
+    REJECT_INVALID_EVIDENCE = "reject_invalid_evidence"
+
+
+@dataclass(frozen=True)
+class PlanInvalidationDependency:
+    """One Coordinator-justified edge between already approved Tickets."""
+
+    from_ticket: str
+    to_ticket: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.from_ticket, "dependency source"),
+            (self.to_ticket, "dependency target"),
+            (self.reason, "dependency reason"),
+        ):
+            _text(value, label)
+        if self.from_ticket == self.to_ticket:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_DEPENDENCY_INVALID",
+                "Plan Invalidation dependency cannot point to itself",
+            )
+
+    def canonical(self) -> dict[str, str]:
+        return {
+            "from": self.from_ticket,
+            "to": self.to_ticket,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class PlanInvalidationDecision:
+    """A named human choice required before the Campaign can change."""
+
+    code: str
+    detail: str
+    required_change: str
+
+    _CHANGES = frozenset(
+        {
+            "new_ticket",
+            "acceptance",
+            "campaign_membership",
+            "authority",
+            "product",
+            "replan_budget",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        _text(self.code, "Decision code")
+        _text(self.detail, "Decision detail")
+        if type(self.required_change) is not str or self.required_change not in self._CHANGES:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_DECISION_INVALID",
+                "Decision required_change is outside the closed union",
+            )
+
+    def canonical(self) -> dict[str, str]:
+        return {
+            "code": self.code,
+            "detail": self.detail,
+            "required_change": self.required_change,
+        }
+
+
+@dataclass(frozen=True)
+class PlanInvalidationClassification:
+    """Typed, read-only Coordinator output for one active revision."""
+
+    action_id: str
+    snapshot_digest: str
+    plan_revision_digest: str
+    evidence_digests: tuple[str, ...]
+    disposition: PlanInvalidationDisposition
+    reason: str
+    capability_proof_digest: str
+    successor_ticket_keys: tuple[str, ...] = ()
+    dependency_additions: tuple[PlanInvalidationDependency, ...] = ()
+    decision: PlanInvalidationDecision | None = None
+
+    def __post_init__(self) -> None:
+        _text(self.action_id, "classification action_id")
+        _digest(self.snapshot_digest, "classification snapshot digest")
+        _digest(self.plan_revision_digest, "classification Plan Revision digest")
+        _digest(self.capability_proof_digest, "classification capability proof digest")
+        if type(self.evidence_digests) is not tuple or not self.evidence_digests:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "classification must account for at least one Evidence digest",
+            )
+        if any(
+            type(value) is not str or _DIGEST.fullmatch(value) is None
+            for value in self.evidence_digests
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "classification Evidence identities must be SHA-256 digests",
+            )
+        if tuple(sorted(set(self.evidence_digests))) != self.evidence_digests:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "classification Evidence identities must be sorted and unique",
+            )
+        if type(self.disposition) is not PlanInvalidationDisposition:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "classification disposition is outside the closed union",
+            )
+        _text(self.reason, "classification reason")
+        if type(self.successor_ticket_keys) is not tuple or any(
+            type(key) is not str or not key for key in self.successor_ticket_keys
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "successor Ticket keys are invalid",
+            )
+        if tuple(sorted(set(self.successor_ticket_keys))) != self.successor_ticket_keys:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "successor Ticket keys must be sorted and unique",
+            )
+        if type(self.dependency_additions) is not tuple or any(
+            type(item) is not PlanInvalidationDependency
+            for item in self.dependency_additions
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "successor dependency additions are invalid",
+            )
+        if tuple(
+            sorted(
+                self.dependency_additions,
+                key=lambda item: (item.from_ticket, item.to_ticket, item.reason),
+            )
+        ) != self.dependency_additions:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "successor dependency additions must be canonical",
+            )
+        if self.decision is not None and type(self.decision) is not PlanInvalidationDecision:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "classification Decision is invalid",
+            )
+        if self.disposition is PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR:
+            if not self.successor_ticket_keys or self.decision is not None:
+                raise PlanControlError(
+                    "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                    "approved successor classification must name approved work only",
+                )
+        elif self.disposition is PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION:
+            if self.decision is None or self.successor_ticket_keys or self.dependency_additions:
+                raise PlanControlError(
+                    "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                    "human Decision classification cannot carry successor work",
+                )
+        elif self.successor_ticket_keys or self.dependency_additions or self.decision is not None:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "resume/defer/reject classification cannot carry plan or Decision changes",
+            )
+
+    def canonical(self) -> dict[str, Any]:
+        successor = None
+        if self.disposition is PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR:
+            successor = {
+                "approved_ticket_keys": list(self.successor_ticket_keys),
+                "dependency_additions": [
+                    item.canonical() for item in self.dependency_additions
+                ],
+            }
+        return {
+            "kind": "plan_invalidation_classification.v1",
+            "action_id": self.action_id,
+            "snapshot_digest": self.snapshot_digest,
+            "plan_revision_digest": self.plan_revision_digest,
+            "evidence_digests": list(self.evidence_digests),
+            "disposition": self.disposition.value,
+            "reason": self.reason,
+            "successor": successor,
+            "decision": None if self.decision is None else self.decision.canonical(),
+            "capability_proof_digest": self.capability_proof_digest,
+        }
+
+    @property
+    def digest(self) -> str:
+        return digest_value(self.canonical())
+
+    @classmethod
+    def from_canonical(cls, value: Mapping[str, Any]) -> "PlanInvalidationClassification":
+        expected = {
+            "kind",
+            "action_id",
+            "snapshot_digest",
+            "plan_revision_digest",
+            "evidence_digests",
+            "disposition",
+            "reason",
+            "successor",
+            "decision",
+            "capability_proof_digest",
+        }
+        if type(value) is not dict or set(value) != expected or value["kind"] != "plan_invalidation_classification.v1":
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "classification record schema is not closed",
+            )
+        evidence = value["evidence_digests"]
+        if type(evidence) is not list or any(type(item) is not str for item in evidence):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "classification Evidence identities are not a list",
+            )
+        try:
+            disposition = PlanInvalidationDisposition(value["disposition"])
+            successor = value["successor"]
+            if successor is None:
+                successor_keys: tuple[str, ...] = ()
+                dependencies: tuple[PlanInvalidationDependency, ...] = ()
+            else:
+                if type(successor) is not dict or set(successor) != {
+                    "approved_ticket_keys",
+                    "dependency_additions",
+                }:
+                    raise PlanControlError(
+                        "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                        "classification successor schema is invalid",
+                    )
+                raw_successor_keys = successor["approved_ticket_keys"]
+                raw_dependencies = successor["dependency_additions"]
+                if (
+                    type(raw_successor_keys) is not list
+                    or any(type(item) is not str for item in raw_successor_keys)
+                    or type(raw_dependencies) is not list
+                    or any(
+                        type(item) is not dict
+                        or set(item) != {"from", "to", "reason"}
+                        for item in raw_dependencies
+                    )
+                ):
+                    raise PlanControlError(
+                        "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                        "classification successor values are invalid",
+                    )
+                successor_keys = tuple(raw_successor_keys)
+                dependencies = tuple(
+                    PlanInvalidationDependency(
+                        from_ticket=item["from"],
+                        to_ticket=item["to"],
+                        reason=item["reason"],
+                    )
+                    for item in raw_dependencies
+                )
+            if (
+                disposition is not PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR
+                and successor is not None
+            ):
+                raise PlanControlError(
+                    "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                    "non-successor classification cannot carry successor values",
+                )
+            decision_value = value["decision"]
+            if decision_value is not None and (
+                type(decision_value) is not dict
+                or set(decision_value) != {"code", "detail", "required_change"}
+            ):
+                raise PlanControlError(
+                    "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                    "classification Decision values are invalid",
+                )
+            decision = (
+                None
+                if decision_value is None
+                else PlanInvalidationDecision(**decision_value)
+            )
+            return cls(
+                action_id=value["action_id"],
+                snapshot_digest=value["snapshot_digest"],
+                plan_revision_digest=value["plan_revision_digest"],
+                evidence_digests=tuple(evidence),
+                disposition=disposition,
+                reason=value["reason"],
+                capability_proof_digest=value["capability_proof_digest"],
+                successor_ticket_keys=successor_keys,
+                dependency_additions=dependencies,
+                decision=decision,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "classification record cannot be decoded",
+            ) from error
 
 
 class PlanControlDecision(PlanControlError):
@@ -157,6 +467,13 @@ class PlanningReservation:
     subject_digest: str
     stable_action_id: str
     preflight_receipt_digest: str
+    # Invalidation classification keeps its immutable bounded input stable
+    # while an unrelated Work Run continues during a pending Coordinator
+    # readback.  Initial Planning reservations leave these optional fields
+    # unset for backwards-compatible V8 state.
+    snapshot_artifact_digest: str | None = None
+    policy_witness_digest: str | None = None
+    planning_request_artifact_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -250,6 +567,11 @@ class CampaignPlanningGateway(Protocol):
 
     def progress(self, subject: CampaignPlanningSubject, preflight: PlanningPreflightReceipt) -> PlanningReceipt: ...
 
+    def _read_coordinator_capability(
+        self,
+        subject: CampaignPlanningSubject,
+    ) -> CoordinatorCapabilityProof: ...
+
 
 class PlanControlRepository(Protocol):
     """Durable facts required by PlanControl's claim and activation boundary."""
@@ -309,6 +631,18 @@ class PlanControlRepository(Protocol):
         handle: CampaignHandle,
     ) -> tuple[TicketClaimProof, ...]: ...
 
+    def read_invalidation_classification(
+        self,
+        handle: CampaignHandle,
+        action_id: str,
+    ) -> PlanInvalidationClassification | None: ...
+
+    def save_invalidation_classification(
+        self,
+        handle: CampaignHandle,
+        classification: PlanInvalidationClassification,
+    ) -> PlanInvalidationClassification: ...
+
 
 class InMemoryPlanRepository:
     """Deterministic repository double with the same CAS/readback semantics."""
@@ -336,6 +670,9 @@ class InMemoryPlanRepository:
         # evidence for its predecessor.
         self.activation_receipts: dict[
             tuple[str, str, str, str], ActivationReceipt
+        ] = {}
+        self.invalidation_classifications: dict[
+            tuple[str, str, str], PlanInvalidationClassification
         ] = {}
 
     @staticmethod
@@ -467,6 +804,23 @@ class InMemoryPlanRepository:
             or not reservation.stable_action_id
             or type(reservation.preflight_receipt_digest) is not str
             or _DIGEST.fullmatch(reservation.preflight_receipt_digest) is None
+            or any(
+                value is not None
+                and (type(value) is not str or _DIGEST.fullmatch(value) is None)
+                for value in (
+                    reservation.snapshot_artifact_digest,
+                    reservation.policy_witness_digest,
+                    reservation.planning_request_artifact_digest,
+                )
+            )
+            or (
+                reservation.stable_action_id.startswith("replan:")
+                and (
+                    reservation.snapshot_artifact_digest is None
+                    or reservation.policy_witness_digest is None
+                    or reservation.planning_request_artifact_digest is None
+                )
+            )
         ):
             raise PlanControlError(
                 "PLANNING_RESERVATION_INVALID",
@@ -841,6 +1195,37 @@ class InMemoryPlanRepository:
             )
         return tuple(sorted(proofs, key=lambda proof: proof.ticket_key))
 
+    @_repository_locked
+    def read_invalidation_classification(
+        self,
+        handle: CampaignHandle,
+        action_id: str,
+    ) -> PlanInvalidationClassification | None:
+        return self.invalidation_classifications.get(
+            (handle.repository, handle.campaign_key, action_id)
+        )
+
+    @_repository_locked
+    def save_invalidation_classification(
+        self,
+        handle: CampaignHandle,
+        classification: PlanInvalidationClassification,
+    ) -> PlanInvalidationClassification:
+        if type(classification) is not PlanInvalidationClassification:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "classification persistence requires the exact typed result",
+            )
+        key = (handle.repository, handle.campaign_key, classification.action_id)
+        existing = self.invalidation_classifications.get(key)
+        if existing is not None and existing != classification:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_CONFLICT",
+                "classification action identity is already bound to another result",
+            )
+        self.invalidation_classifications[key] = classification
+        return classification
+
 
 class PlanControl:
     """One bounded Planning Pass followed by deterministic PlanSpec activation."""
@@ -1079,6 +1464,319 @@ class PlanControl:
         """
 
         return self._validate_active_receipt(handle, require_claims=True)
+
+    def classify_plan_invalidations(
+        self,
+        handle: CampaignHandle,
+        invalidations: Sequence[object],
+        execution_snapshot: Mapping[str, Any],
+    ) -> PlanInvalidationClassification | None:
+        """Run one bounded, read-only Coordinator classification.
+
+        The method deliberately does not publish, activate, or mutate a
+        successor Plan Revision.  Its only durable semantic result is the
+        typed classification bound to the active revision and the complete
+        pending Evidence set.  ExecutionKernel owns the later disposition
+        transition and reads this result back before resuming a Work Run.
+        """
+
+        if type(handle) is not CampaignHandle:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_HANDLE_INVALID",
+                "invalidation classification requires an exact CampaignHandle",
+            )
+        active = self.read_active(handle)
+        plan = load_canonical_json(active.plan_spec_bytes)
+        if type(plan) is not dict:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "active PlanSpec is not an object",
+            )
+        pending = _normalize_invalidation_observations(
+            invalidations,
+            handle=handle,
+            active_revision_digest=active.current_revision_digest,
+            plan=plan,
+            execution_snapshot=execution_snapshot,
+        )
+        evidence_digests = tuple(
+            sorted({item["evidence_digest"] for item in pending})
+        )
+        action_id = "replan:" + digest_value(
+            {
+                "repository": handle.repository,
+                "campaign_key": handle.campaign_key,
+                "plan_revision_digest": active.current_revision_digest,
+                "evidence_digests": list(evidence_digests),
+            }
+        )
+        snapshot = _build_replanning_snapshot(
+            self,
+            active=active,
+            plan=plan,
+            pending=pending,
+            execution_snapshot=execution_snapshot,
+        )
+        snapshot_bytes = canonical_bytes(snapshot)
+        if len(snapshot_bytes) > self._max_snapshot_bytes:
+            finding = DecisionFinding(
+                code="REPLAN_SNAPSHOT_TOO_LARGE",
+                detail=(
+                    "The complete bounded Campaign invalidation snapshot exceeds "
+                    f"the configured Planning input bound of {self._max_snapshot_bytes} bytes"
+                ),
+            )
+            raise PlanControlDecision(digest_bytes(snapshot_bytes), (finding,))
+        snapshot_digest = _put_canonical(self._artifacts, snapshot)
+        if snapshot_digest != digest_bytes(snapshot_bytes):
+            raise PlanControlError(
+                "SNAPSHOT_ARTIFACT_MISMATCH",
+                "Campaign invalidation snapshot Artifact digest changed",
+            )
+        policy_digest = snapshot["policy_witness"]["digest"]
+        stable_subject = CampaignPlanningSubject(
+            repository=handle.repository,
+            campaign_key=handle.campaign_key,
+            campaign_handle=_handle_ref(handle),
+            expected_previous_plan_revision_digest=active.current_revision_digest,
+            snapshot_artifact_digest=snapshot_digest,
+            policy_witness_digest=policy_digest,
+            planning_request_artifact_digest="0" * 64,
+            stable_action_id=action_id,
+        )
+        request_ref = _put_canonical(
+            self._artifacts,
+            replanning_prompt(
+                subject_digest=stable_subject.prompt_binding_digest,
+                authority_digest=policy_digest,
+                snapshot_artifact_digest=snapshot_digest,
+                policy_witness_artifact_digest=policy_digest,
+            ),
+        )
+        subject = replace(
+            stable_subject,
+            planning_request_artifact_digest=request_ref,
+        )
+
+        # A pending Coordinator action owns one immutable bounded snapshot.
+        # Unrelated Work Runs may advance while Runtime progress is parked, so
+        # replay must recover the original Artifact identities from the
+        # durable Planning reservation rather than rebuilding the subject from
+        # a newer ExecutionKernel view.
+        existing_reservation = self._repository.read_planning_reservation(
+            handle,
+            subject.stable_action_id,
+        )
+        if existing_reservation is not None:
+            if (
+                existing_reservation.snapshot_artifact_digest is None
+                or existing_reservation.policy_witness_digest is None
+                or existing_reservation.planning_request_artifact_digest is None
+            ):
+                raise PlanControlError(
+                    "PLANNING_RESERVATION_CONFLICT",
+                    "invalidation Planning reservation omitted its immutable input Artifacts",
+                )
+            snapshot_digest = existing_reservation.snapshot_artifact_digest
+            policy_digest = existing_reservation.policy_witness_digest
+            request_ref = existing_reservation.planning_request_artifact_digest
+            snapshot = _read_artifact_json(
+                self._artifacts,
+                snapshot_digest,
+                code="PLAN_INVALIDATION_SNAPSHOT_INVALID",
+            )
+            stored_request = _read_artifact_json(
+                self._artifacts,
+                request_ref,
+                code="PLANNING_REQUEST_INVALID",
+            )
+            expected_request_subject = CampaignPlanningSubject(
+                repository=handle.repository,
+                campaign_key=handle.campaign_key,
+                campaign_handle=_handle_ref(handle),
+                expected_previous_plan_revision_digest=active.current_revision_digest,
+                snapshot_artifact_digest=snapshot_digest,
+                policy_witness_digest=policy_digest,
+                planning_request_artifact_digest="0" * 64,
+                stable_action_id=action_id,
+            )
+            if stored_request != replanning_prompt(
+                subject_digest=expected_request_subject.prompt_binding_digest,
+                authority_digest=policy_digest,
+                snapshot_artifact_digest=snapshot_digest,
+                policy_witness_artifact_digest=policy_digest,
+            ):
+                raise PlanControlError(
+                    "PLANNING_REQUEST_INVALID",
+                    "invalidation Planning request Artifact changed its exact binding",
+                )
+            if (
+                type(snapshot) is not dict
+                or snapshot.get("policy_witness", {}).get("digest") != policy_digest
+                or snapshot.get("active_plan_revision", {}).get("digest")
+                != active.current_revision_digest
+                or tuple(
+                    sorted(
+                        {
+                            item.get("evidence_digest")
+                            for item in snapshot.get("pending_invalidations", [])
+                            if type(item) is dict
+                        }
+                    )
+                )
+                != evidence_digests
+            ):
+                raise PlanControlError(
+                    "PLANNING_RESERVATION_CONFLICT",
+                    "invalidation Planning reservation changed its bounded Evidence snapshot",
+                )
+            stable_subject = expected_request_subject
+            subject = replace(
+                stable_subject,
+                planning_request_artifact_digest=request_ref,
+            )
+
+        read_result = getattr(
+            self._repository,
+            "read_invalidation_classification",
+            None,
+        )
+        if callable(read_result):
+            existing = read_result(handle, action_id)
+            if existing is not None:
+                stored_snapshot = _read_artifact_json(
+                    self._artifacts,
+                    existing.snapshot_digest,
+                    code="PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                )
+                if (
+                    type(stored_snapshot) is not dict
+                    or stored_snapshot.get("active_plan_revision", {}).get("digest")
+                    != active.current_revision_digest
+                    or tuple(
+                        sorted(
+                            {
+                                item.get("evidence_digest")
+                                for item in stored_snapshot.get(
+                                    "pending_invalidations", []
+                                )
+                                if type(item) is dict
+                            }
+                        )
+                    )
+                    != evidence_digests
+                ):
+                    raise PlanControlError(
+                        "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                        "persisted invalidation classification snapshot is stale or incomplete",
+                    )
+                _validate_classification_binding(
+                    existing,
+                    action_id=action_id,
+                    snapshot_digest=existing.snapshot_digest,
+                    plan_revision_digest=active.current_revision_digest,
+                    evidence_digests=evidence_digests,
+                    snapshot=stored_snapshot,
+                )
+                return existing
+
+        reservation = self._replanning_reservation(
+            subject,
+            active,
+            snapshot_artifact_digest=snapshot_digest,
+            policy_witness_digest=policy_digest,
+            planning_request_artifact_digest=request_ref,
+        )
+        if existing_reservation is not None:
+            expected_reservation = replace(
+                reservation,
+                preflight_receipt_digest=existing_reservation.preflight_receipt_digest,
+            )
+            if existing_reservation != expected_reservation:
+                raise PlanControlError(
+                    "PLANNING_RESERVATION_CONFLICT",
+                    "invalidation Planning reservation changed its exact subject",
+                )
+            preflight = PlanningPreflightReceipt(
+                subject_digest=existing_reservation.subject_digest,
+                stable_action_id=existing_reservation.stable_action_id,
+                receipt_digest=existing_reservation.preflight_receipt_digest,
+            )
+            reservation = existing_reservation
+        else:
+            preflight = self._gateway.planning_preflight(subject)
+            _validate_preflight(preflight, subject)
+            reservation = replace(
+                reservation,
+                preflight_receipt_digest=preflight.receipt_digest,
+            )
+            self._repository.reserve_planning(reservation)
+        _validate_preflight(preflight, subject)
+        proof_reader = getattr(self._gateway, "_read_coordinator_capability", None)
+        if not callable(proof_reader):
+            # Keep compatibility with narrow test/host doubles that exposed
+            # the pre-release seam before it was made private on the public
+            # RuntimeGateway surface.
+            proof_reader = getattr(self._gateway, "read_coordinator_capability", None)
+        if not callable(proof_reader):
+            raise PlanControlError(
+                "REPLAN_CAPABILITY_PROOF_UNAVAILABLE",
+                "RuntimeGateway omitted Coordinator capability readback",
+            )
+        proof = proof_reader(subject)
+        _validate_coordinator_capability(proof, subject)
+        receipt = self._gateway.progress(subject, preflight)
+        _validate_planning_receipt(receipt, subject)
+        if receipt.status != "completed":
+            return None
+        output_digest = receipt.planning_output_artifact_digest
+        assert output_digest is not None
+        payload = _planning_payload(self._artifacts, output_digest, subject)
+        classification = _normalize_replanning_intent(
+            payload,
+            snapshot=snapshot,
+            action_id=action_id,
+            snapshot_digest=snapshot_digest,
+            plan_revision_digest=active.current_revision_digest,
+            evidence_digests=evidence_digests,
+            capability_proof_digest=proof.digest,
+        )
+        saver = getattr(
+            self._repository,
+            "save_invalidation_classification",
+            None,
+        )
+        if callable(saver):
+            saver(handle, classification)
+            readback = read_result(handle, action_id) if callable(read_result) else classification
+            if readback != classification:
+                raise PlanControlError(
+                    "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                    "classification did not read back exactly",
+                )
+        self._repository.release_planning(reservation)
+        return classification
+
+    def _replanning_reservation(
+        self,
+        subject: CampaignPlanningSubject,
+        active: ActivePlanReadback,
+        *,
+        snapshot_artifact_digest: str | None = None,
+        policy_witness_digest: str | None = None,
+        planning_request_artifact_digest: str | None = None,
+    ) -> PlanningReservation:
+        return PlanningReservation(
+            repository=subject.repository,
+            campaign_key=subject.campaign_key,
+            ticket_keys=tuple(active.activation_receipt.ticket_keys),
+            subject_digest=subject.digest,
+            stable_action_id=subject.stable_action_id,
+            preflight_receipt_digest="0" * 64,
+            snapshot_artifact_digest=snapshot_artifact_digest,
+            policy_witness_digest=policy_witness_digest,
+            planning_request_artifact_digest=planning_request_artifact_digest,
+        )
 
     def _validate_active_receipt(
         self,
@@ -2467,7 +3165,13 @@ def frozen_ticket_contract_digest(
     )
 
 
-def _normalize_snapshot(value: Any, repository: str, refs: tuple[str, ...]) -> dict[str, Any]:
+def _normalize_snapshot(
+    value: Any,
+    repository: str,
+    refs: tuple[str, ...],
+    *,
+    allow_open_external_blockers: bool = False,
+) -> dict[str, Any]:
     value = _canonical(value, code="SNAPSHOT_INVALID")
     expected = {"repository", "target_branch", "campaign_source", "policy", "tickets"}
     if type(value) is not dict or set(value) != expected or value["repository"] != repository or type(value["tickets"]) is not list:
@@ -2493,11 +3197,11 @@ def _normalize_snapshot(value: Any, repository: str, refs: tuple[str, ...]) -> d
         )
     selected = set(keys)
     external = sorted({blocker["key"] for ticket in tickets for blocker in ticket["native_blockers"] if blocker["state"] == "open" and blocker["key"] not in selected})
-    if external:
+    if external and not allow_open_external_blockers:
         raise PlanControlError("EXTERNAL_BLOCKER_OPEN", "Selected Tickets have open external blockers: " + ", ".join(external))
     dependencies = {ticket["key"]: {blocker["key"] for blocker in ticket["native_blockers"] if blocker["state"] == "open" and blocker["key"] in selected} for ticket in tickets}
     _assert_acyclic(dependencies)
-    return {
+    normalized = {
         "schema_version": 1,
         "repository": repository,
         "target_branch": _text(value["target_branch"], "target_branch"),
@@ -2508,6 +3212,701 @@ def _normalize_snapshot(value: Any, repository: str, refs: tuple[str, ...]) -> d
         "policy": _normalize_policy(value["policy"]),
         "tickets": tickets,
     }
+    if allow_open_external_blockers:
+        normalized["external_dependencies"] = sorted(
+            (
+                {
+                    "key": blocker["key"],
+                    "state": blocker["state"],
+                    "repository": blocker["repository"],
+                    "source": blocker["source"],
+                }
+                for ticket in tickets
+                for blocker in ticket["native_blockers"]
+                if blocker["key"] not in selected
+            ),
+            key=lambda item: (item["key"], item["state"]),
+        )
+        # A blocker can be referenced by more than one approved Ticket; the
+        # external dependency itself is one bounded fact in the Coordinator
+        # input, not an implicit Campaign member.
+        unique: dict[str, dict[str, Any]] = {}
+        for blocker in normalized["external_dependencies"]:
+            existing = unique.get(blocker["key"])
+            if existing is not None and existing != blocker:
+                raise PlanControlError(
+                    "SNAPSHOT_INVALID",
+                    "external blocker readback changed its canonical identity",
+                )
+            unique[blocker["key"]] = blocker
+        normalized["external_dependencies"] = [
+            unique[key] for key in sorted(unique)
+        ]
+    return normalized
+
+
+_INVALIDATION_OBSERVATION_FIELDS = {
+    "kind",
+    "repository",
+    "campaign_key",
+    "plan_revision_digest",
+    "ticket_key",
+    "work_run_key",
+    "runtime_binding_id",
+    "authority_subtree_digest",
+    "reporter_role",
+    "report_digest",
+    "evidence_digest",
+    "dedup_identity",
+    "invalidated_obligation",
+    "required_effects",
+    "workspace_identity",
+}
+_REPLANNING_RUN_FIELDS = {
+    "ticket_key",
+    "work_run_key",
+    "phase",
+    "slot_held",
+    "reason",
+    "next_check_at",
+    "runtime_binding_id",
+    "claim_state",
+    "exclusive_resources",
+}
+_REPLANNING_CLAIM_FIELDS = {
+    "ticket_key",
+    "repository",
+    "campaign_key",
+    "plan_revision_digest",
+}
+
+
+def _normalize_invalidation_observations(
+    values: Sequence[object],
+    *,
+    handle: CampaignHandle,
+    active_revision_digest: str,
+    plan: Mapping[str, Any],
+    execution_snapshot: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    if type(values) is not tuple and type(values) is not list:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+            "pending invalidation Evidence must be one bounded sequence",
+        )
+    runs = execution_snapshot.get("runs") if type(execution_snapshot) is dict else None
+    if type(runs) is not list:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+            "ExecutionKernel omitted the complete Work Run readback",
+        )
+    run_by_key: dict[str, Mapping[str, Any]] = {}
+    for run in runs:
+        if type(run) is not dict or set(run) != _REPLANNING_RUN_FIELDS:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "Work Run readback contains unsupported or missing fields",
+            )
+        ticket_key = _text(run["ticket_key"], "Work Run Ticket key")
+        if ticket_key in run_by_key:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "Work Run readback repeats a Ticket",
+            )
+        run_by_key[ticket_key] = run
+    work = plan.get("work")
+    if type(work) is not list:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+            "active PlanSpec omitted its work manifest",
+        )
+    work_by_key = {item.get("key"): item for item in work if type(item) is dict}
+    result: list[dict[str, Any]] = []
+    for value in values:
+        raw_value = value.canonical() if callable(getattr(value, "canonical", None)) else value
+        if type(raw_value) is not dict:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "pending invalidation is not a typed canonical observation",
+            )
+        if set(raw_value) == _INVALIDATION_OBSERVATION_FIELDS | {"observation_digest"}:
+            expected_observation_digest = raw_value.get("observation_digest")
+            raw_value = {
+                key: raw_value[key] for key in _INVALIDATION_OBSERVATION_FIELDS
+            }
+            if expected_observation_digest != digest_value(raw_value):
+                raise PlanControlError(
+                    "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                    "pending invalidation observation digest changed",
+                )
+        if set(raw_value) != _INVALIDATION_OBSERVATION_FIELDS or raw_value.get("kind") != "plan_invalidation_observation.v1":
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "pending invalidation observation schema is not closed",
+            )
+        for field_name in (
+            "repository",
+            "campaign_key",
+            "ticket_key",
+            "work_run_key",
+            "runtime_binding_id",
+            "reporter_role",
+            "dedup_identity",
+            "invalidated_obligation",
+            "workspace_identity",
+        ):
+            _text(raw_value[field_name], f"Plan Invalidation {field_name}")
+        for field_name in (
+            "plan_revision_digest",
+            "authority_subtree_digest",
+            "report_digest",
+            "evidence_digest",
+        ):
+            _digest(raw_value[field_name], f"Plan Invalidation {field_name}")
+        effects = raw_value["required_effects"]
+        if type(effects) is not list or not effects or any(
+            type(effect) is not str or not effect for effect in effects
+        ) or len(set(effects)) != len(effects):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "pending invalidation effects are not canonical",
+            )
+        if raw_value["reporter_role"] not in {"worker", "recovery_worker", "review"}:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "pending invalidation reporter role is outside the closed union",
+            )
+        if (
+            raw_value["repository"] != handle.repository
+            or raw_value["campaign_key"] != handle.campaign_key
+            or raw_value["plan_revision_digest"] != active_revision_digest
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_IDENTITY_MISMATCH",
+                "pending invalidation is not bound to the active Campaign revision",
+            )
+        ticket_key = raw_value["ticket_key"]
+        work_item = work_by_key.get(ticket_key)
+        run = run_by_key.get(ticket_key)
+        if work_item is None or run is None or run["work_run_key"] != raw_value["work_run_key"]:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_IDENTITY_MISMATCH",
+                "pending invalidation names an unknown Work Run",
+            )
+        expected_role = _replanning_reporter_role(work_item)
+        authority = work_item.get("authority")
+        role_authority = authority.get(expected_role) if type(authority) is dict else None
+        if (
+            raw_value["reporter_role"] != expected_role
+            or type(role_authority) is not dict
+            or role_authority.get("subtree_digest")
+            != raw_value["authority_subtree_digest"]
+            or run.get("runtime_binding_id") != raw_value["runtime_binding_id"]
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_IDENTITY_MISMATCH",
+                "pending invalidation is not bound to the Work Run authority and Runtime Binding",
+            )
+        result.append({**raw_value, "required_effects": list(effects)})
+    if not result:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+            "Campaign invalidation classification requires pending Evidence",
+        )
+    return sorted(result, key=lambda item: digest_value(item))
+
+
+def _replanning_reporter_role(work_item: Mapping[str, Any]) -> str:
+    explicit = work_item.get("reporter_role")
+    if type(explicit) is str and explicit in {"worker", "recovery_worker", "review"}:
+        return explicit
+    purpose = work_item.get("purpose")
+    if type(purpose) is dict:
+        purpose = purpose.get("kind")
+    contract = work_item.get("contract")
+    if purpose is None and type(contract) is dict:
+        purpose = contract.get("purpose")
+        if type(purpose) is dict:
+            purpose = purpose.get("kind")
+    if purpose in {"formal_review", "invalid_review_payload_retry", "specialist_review", "review"}:
+        return "review"
+    if purpose in {"terminal_recovery_implementation", "recovery_worker"}:
+        return "recovery_worker"
+    return "worker"
+
+
+def _normalize_replanning_execution_snapshot(
+    value: Mapping[str, Any],
+    *,
+    ticket_keys: set[str],
+    active_revision_digest: str,
+) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != {
+        "runs",
+        "claims",
+        "accepted_results",
+    }:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+            "ExecutionKernel snapshot schema is not closed",
+        )
+    runs = value["runs"]
+    if type(runs) is not list:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+            "ExecutionKernel Work Runs are not a list",
+        )
+    normalized_runs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    phases = {
+        "pending",
+        "running",
+        "candidate_checks",
+        "formal_review",
+        "repair",
+        "accepted_awaiting_delivery",
+        "parked",
+        "completed",
+        "decision",
+        "wait",
+        "blocked",
+        "runtime_unavailable",
+        "quiescent",
+    }
+    claim_states = {"unclaimed", "held", "released"}
+    for run in runs:
+        if type(run) is not dict or set(run) != _REPLANNING_RUN_FIELDS:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "ExecutionKernel Work Run contains unsupported fields",
+            )
+        key = _text(run["ticket_key"], "Execution Work Run Ticket key")
+        if key not in ticket_keys or key in seen:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "ExecutionKernel Work Run set is not the complete selected set",
+            )
+        seen.add(key)
+        if (
+            type(run["work_run_key"]) is not str
+            or not run["work_run_key"]
+            or run["phase"] not in phases
+            or type(run["slot_held"]) is not bool
+            or (run["reason"] is not None and type(run["reason"]) is not str)
+            or (run["next_check_at"] is not None and type(run["next_check_at"]) is not str)
+            or (run["runtime_binding_id"] is not None and type(run["runtime_binding_id"]) is not str)
+            or run["claim_state"] not in claim_states
+            or type(run["exclusive_resources"]) is not list
+            or any(type(item) is not str or not item for item in run["exclusive_resources"])
+            or run["exclusive_resources"] != sorted(set(run["exclusive_resources"]))
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "ExecutionKernel Work Run facts are malformed",
+            )
+        normalized_runs.append(
+            {
+                **run,
+                "exclusive_resources": list(run["exclusive_resources"]),
+            }
+        )
+    if seen != ticket_keys:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+            "ExecutionKernel omitted an approved Ticket Work Run",
+        )
+    claims = value["claims"]
+    if type(claims) is not list:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+            "ExecutionKernel claims are not a list",
+        )
+    normalized_claims: list[dict[str, str]] = []
+    claim_keys: set[str] = set()
+    for claim in claims:
+        if type(claim) is not dict or set(claim) != _REPLANNING_CLAIM_FIELDS:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "ExecutionKernel claim schema is not closed",
+            )
+        key = _text(claim["ticket_key"], "Execution claim Ticket key")
+        if key not in ticket_keys or key in claim_keys:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "ExecutionKernel claims are incomplete or repeated",
+            )
+        claim_keys.add(key)
+        if claim["plan_revision_digest"] != active_revision_digest:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_IDENTITY_MISMATCH",
+                "ExecutionKernel claim belongs to another Plan Revision",
+            )
+        normalized_claims.append(dict(claim))
+    if claim_keys != ticket_keys:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+            "ExecutionKernel omitted an approved Ticket claim",
+        )
+    results = value["accepted_results"]
+    if type(results) is not list:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+            "accepted Results are not a list",
+        )
+    normalized_results: list[dict[str, str]] = []
+    for result in results:
+        if type(result) is not dict or set(result) != {"ticket_key", "result_digest"}:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "accepted Result schema is not closed",
+            )
+        if result["ticket_key"] not in ticket_keys:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "accepted Result names an unapproved Ticket",
+            )
+        _digest(result["result_digest"], "accepted Result digest")
+        normalized_results.append(dict(result))
+    return {
+        "runs": sorted(normalized_runs, key=lambda item: item["ticket_key"]),
+        "claims": sorted(normalized_claims, key=lambda item: item["ticket_key"]),
+        "accepted_results": sorted(normalized_results, key=lambda item: item["ticket_key"]),
+    }
+
+
+def _build_replanning_snapshot(
+    control: PlanControl,
+    *,
+    active: ActivePlanReadback,
+    plan: Mapping[str, Any],
+    pending: list[dict[str, Any]],
+    execution_snapshot: Mapping[str, Any],
+) -> dict[str, Any]:
+    source = _normalize_snapshot(
+        control._source.snapshot(
+            active.handle.repository,
+            active.activation_receipt.ready_refs,
+        ),
+        active.handle.repository,
+        active.activation_receipt.ready_refs,
+        allow_open_external_blockers=True,
+    )
+    work = plan.get("work")
+    if type(work) is not list:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+            "active PlanSpec work manifest is missing",
+        )
+    plan_work = {item["key"]: item for item in work if type(item) is dict and type(item.get("key")) is str}
+    source_keys = {ticket["key"] for ticket in source["tickets"]}
+    if source_keys != set(plan_work) or tuple(sorted(source_keys)) != active.activation_receipt.ticket_keys:
+        raise PlanControlError(
+            "REPLAN_SOURCE_CHANGED",
+            "authoritative Ticket source changed its approved Campaign membership",
+        )
+    for ticket in source["tickets"]:
+        item = plan_work[ticket["key"]]
+        if ticket["source"] != item["source"] or ticket["contract"] != item["contract"]:
+            raise PlanControlError(
+                "REPLAN_SOURCE_CHANGED",
+                "authoritative Ticket contract or source digest changed under the active Plan Revision",
+            )
+    if source["policy"]["digest"] != plan["policy"].get("digest"):
+        raise PlanControlError(
+            "REPLAN_POLICY_CHANGED",
+            "Policy Witness changed under the active Plan Revision",
+        )
+    ticket_keys = set(plan_work)
+    execution = _normalize_replanning_execution_snapshot(
+        execution_snapshot,
+        ticket_keys=ticket_keys,
+        active_revision_digest=active.current_revision_digest,
+    )
+    expected_claims = sorted(
+        (
+            {
+                "ticket_key": proof.ticket_key,
+                "repository": proof.repository,
+                "campaign_key": proof.campaign_key,
+                "plan_revision_digest": proof.plan_revision_digest,
+            }
+            for proof in active.claim_proofs
+        ),
+        key=lambda item: item["ticket_key"],
+    )
+    if execution["claims"] != expected_claims:
+        raise PlanControlError(
+            "TICKET_CLAIM_READBACK_INVALID",
+            "ExecutionKernel claims do not exactly bind the active Campaign",
+        )
+    native_graph = [
+        {
+            "ticket_key": ticket["key"],
+            "blockers": ticket["native_blockers"],
+        }
+        for ticket in source["tickets"]
+    ]
+    approved_edges = {
+        (blocker["key"], ticket["key"])
+        for ticket in source["tickets"]
+        for blocker in ticket["native_blockers"]
+        if blocker["state"] == "open" and blocker["key"] in ticket_keys
+    }
+    approved_edges.update(
+        (dependency, item["key"])
+        for item in work
+        if type(item) is dict
+        for dependency in item.get("depends_on", [])
+        if dependency in ticket_keys
+    )
+    policy_witness = source["policy"]
+    return {
+        "schema_version": "gwo.plan.invalidation-snapshot.v1",
+        "repository": active.handle.repository,
+        "campaign_key": active.handle.campaign_key,
+        "target_branch": source["target_branch"],
+        "campaign_source": source["campaign_source"],
+        "active_plan_revision": {
+            "digest": active.current_revision_digest,
+            "plan_spec": dict(plan),
+            "expected_previous_revision_digest": active.activation_receipt.expected_previous_revision_digest,
+        },
+        "tickets": source["tickets"],
+        "native_blocker_graph": native_graph,
+        "external_dependencies": source.get("external_dependencies", []),
+        "work_runs": execution["runs"],
+        "claims": execution["claims"],
+        "accepted_results": execution["accepted_results"],
+        "pending_invalidations": pending,
+        "approved_dependency_edges": [
+            {"from": source, "to": target}
+            for source, target in sorted(approved_edges)
+        ],
+        "policy_witness": policy_witness,
+    }
+
+
+def _validate_coordinator_capability(
+    proof: object,
+    subject: CampaignPlanningSubject,
+) -> CoordinatorCapabilityProof:
+    if (
+        type(proof) is not CoordinatorCapabilityProof
+        or proof.subject_digest != subject.digest
+        or not proof.is_proven
+    ):
+        raise PlanControlError(
+            "REPLAN_CAPABILITY_PROOF_FAIL_CLOSED",
+            "Coordinator Runtime readback did not prove read-only, non-delegating authority",
+        )
+    return proof
+
+
+def _normalize_replanning_intent(
+    value: Any,
+    *,
+    snapshot: Mapping[str, Any],
+    action_id: str,
+    snapshot_digest: str,
+    plan_revision_digest: str,
+    evidence_digests: tuple[str, ...],
+    capability_proof_digest: str,
+) -> PlanInvalidationClassification:
+    value = _canonical(value, code="PLAN_INVALIDATION_CLASSIFICATION_INVALID")
+    expected = {
+        "evidence_digests",
+        "disposition",
+        "reason",
+        "successor",
+        "decision",
+    }
+    if type(value) is not dict or set(value) != expected:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+            "Coordinator invalidation output contains unsupported fields",
+        )
+    output_evidence = value["evidence_digests"]
+    if (
+        type(output_evidence) is not list
+        or any(
+            type(item) is not str or _DIGEST.fullmatch(item) is None
+            for item in output_evidence
+        )
+        or tuple(sorted(set(output_evidence))) != tuple(output_evidence)
+        or tuple(output_evidence) != evidence_digests
+    ):
+        raise PlanControlError(
+            "PLAN_INVALIDATION_EVIDENCE_OMISSION",
+            "Coordinator output must account for every pending invalidation Evidence exactly once",
+        )
+    try:
+        disposition = PlanInvalidationDisposition(value["disposition"])
+    except (TypeError, ValueError) as error:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+            "Coordinator disposition is outside the legal union",
+        ) from error
+    reason = _text(value["reason"], "classification reason")
+    successor = value["successor"]
+    decision = value["decision"]
+    ticket_keys = {
+        ticket["key"] for ticket in snapshot["tickets"]
+    }
+    successor_keys: tuple[str, ...] = ()
+    dependencies: tuple[PlanInvalidationDependency, ...] = ()
+    if successor is not None:
+        if type(successor) is not dict or set(successor) != {
+            "approved_ticket_keys",
+            "dependency_additions",
+        }:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "Coordinator successor output is not closed",
+            )
+        raw_keys = successor["approved_ticket_keys"]
+        if (
+            type(raw_keys) is not list
+            or not raw_keys
+            or any(type(item) is not str or not item for item in raw_keys)
+            or tuple(sorted(set(raw_keys))) != tuple(raw_keys)
+            or not set(raw_keys).issubset(ticket_keys)
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_TICKET_INVALID",
+                "Coordinator successor names unapproved or non-canonical Ticket work",
+            )
+        successor_keys = tuple(raw_keys)
+        raw_dependencies = successor["dependency_additions"]
+        if type(raw_dependencies) is not list or any(
+            type(item) is not dict or set(item) != {"from", "to", "reason"}
+            for item in raw_dependencies
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_DEPENDENCY_INVALID",
+                "Coordinator successor dependencies are not a list",
+            )
+        dependencies = tuple(
+            PlanInvalidationDependency(
+                from_ticket=item["from"],
+                to_ticket=item["to"],
+                reason=item["reason"],
+            )
+            for item in raw_dependencies
+        )
+        if len({(item.from_ticket, item.to_ticket) for item in dependencies}) != len(dependencies):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_DEPENDENCY_INVALID",
+                "Coordinator successor dependencies repeat an edge",
+            )
+        allowed_edges = {
+            (item["from"], item["to"])
+            for item in snapshot["approved_dependency_edges"]
+        }
+        if any(
+            (item.from_ticket, item.to_ticket) not in allowed_edges
+            for item in dependencies
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_DEPENDENCY_UNPROVED",
+                "Coordinator successor names a dependency not proved by the frozen Campaign graph",
+            )
+    if disposition is PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR:
+        if successor is None or decision is not None:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "approved successor disposition requires only approved successor facts",
+            )
+    elif successor is not None:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+            "resume/defer/Decision output cannot silently carry successor work",
+        )
+    decision_value: PlanInvalidationDecision | None = None
+    if decision is not None:
+        if type(decision) is not dict or set(decision) != {
+            "code",
+            "detail",
+            "required_change",
+        }:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_DECISION_INVALID",
+                "Coordinator Decision output is not closed",
+            )
+        decision_value = PlanInvalidationDecision(**decision)
+    if disposition is PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION:
+        if decision_value is None or successor is not None:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_DECISION_INVALID",
+                "human Decision disposition requires one named Decision only",
+            )
+    elif decision_value is not None:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_DECISION_INVALID",
+            "non-Decision disposition cannot carry a human Decision",
+        )
+    return PlanInvalidationClassification(
+        action_id=action_id,
+        snapshot_digest=snapshot_digest,
+        plan_revision_digest=plan_revision_digest,
+        evidence_digests=evidence_digests,
+        disposition=disposition,
+        reason=reason,
+        capability_proof_digest=capability_proof_digest,
+        successor_ticket_keys=successor_keys,
+        dependency_additions=tuple(
+            sorted(
+                dependencies,
+                key=lambda item: (item.from_ticket, item.to_ticket, item.reason),
+            )
+        ),
+        decision=decision_value,
+    )
+
+
+def _validate_classification_binding(
+    classification: object,
+    *,
+    action_id: str,
+    snapshot_digest: str,
+    plan_revision_digest: str,
+    evidence_digests: tuple[str, ...],
+    snapshot: Mapping[str, Any],
+) -> PlanInvalidationClassification:
+    if type(classification) is not PlanInvalidationClassification:
+        raise PlanControlError(
+            "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+            "persisted invalidation classification is not typed",
+        )
+    if (
+        classification.action_id != action_id
+        or classification.snapshot_digest != snapshot_digest
+        or classification.plan_revision_digest != plan_revision_digest
+        or classification.evidence_digests != evidence_digests
+    ):
+        raise PlanControlError(
+            "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+            "persisted invalidation classification is bound to another snapshot",
+        )
+    if classification.disposition is PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR:
+        allowed = {ticket["key"] for ticket in snapshot["tickets"]}
+        if not set(classification.successor_ticket_keys).issubset(allowed):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_TICKET_INVALID",
+                "persisted successor names an unapproved Ticket",
+            )
+        allowed_edges = {
+            (item["from"], item["to"])
+            for item in snapshot["approved_dependency_edges"]
+        }
+        if any(
+            (item.from_ticket, item.to_ticket) not in allowed_edges
+            for item in classification.dependency_additions
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_DEPENDENCY_UNPROVED",
+                "persisted successor names an unproved dependency",
+            )
+    return classification
 
 
 def _assert_acyclic(dependencies: Mapping[str, set[str]]) -> None:
