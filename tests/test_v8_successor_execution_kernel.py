@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import replace
 import sys
 from pathlib import Path
 
@@ -371,6 +373,326 @@ def test_historical_invalidation_record_keeps_legacy_work_run_key_on_advance(tmp
     assert migrated["runs"]["issue:109"]["work_run_key"] == legacy_work_run
     assert migrated["plan_invalidation"][dedup_key] == record
     assert effects.executed == []
+
+
+def test_successor_transition_is_durable_before_activation(tmp_path):
+    from gwo_v8.execution_kernel import ExecutionKernel
+
+    kernel, plans, effects, handle, invalidation = _successor_fixture(tmp_path)
+    plans.kernel = kernel
+
+    kernel.advance(handle, plan_invalidation=invalidation)
+
+    expected = {
+        "kind": "successor_transition.v1",
+        "classification_action_id": plans.classification.action_id,
+        "classification_digest": plans.classification.digest,
+        "snapshot_digest": plans.classification.snapshot_digest,
+        "previous_revision_digest": plans.predecessor.current_revision_digest,
+        "evidence_digests": list(plans.classification.evidence_digests),
+        "state": "activation_due",
+    }
+    assert plans.intent_at_activation == expected
+    assert plans.activate_calls == 1
+
+
+def test_exact_successor_readback_replaces_revision_once(tmp_path):
+    from gwo_v8._canonical import digest_value
+
+    kernel, plans, effects, handle, invalidation = _successor_fixture(tmp_path)
+
+    kernel.advance(handle, plan_invalidation=invalidation)
+    state = kernel._load(handle)
+
+    assert plans.activate_calls == 1
+    assert plans.active == plans.successor
+    assert state["plan_revision_digest"] == plans.successor.current_revision_digest
+    assert state["activation_receipt_digest"] == digest_value(
+        plans.successor.activation_receipt.__dict__
+    )
+    assert len(state["revision_lineage"]) == 1
+    assert state["runs"]["issue:109"]["phase"] == "running"
+
+    kernel.advance(handle)
+
+    assert plans.activate_calls == 1
+    assert len(kernel._load(handle)["revision_lineage"]) == 1
+
+
+def test_restart_after_activation_before_migration_rolls_forward(tmp_path):
+    from gwo_v8.execution_kernel import ExecutionKernel, ExecutionKernelError
+
+    kernel, plans, effects, handle, invalidation = _successor_fixture(tmp_path)
+    plans.kernel = kernel
+    plans.return_value = object()
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.advance(handle, plan_invalidation=invalidation)
+    assert raised.value.code == "SUCCESSOR_ACTIVATION_READBACK_INVALID"
+    assert kernel._load(handle)["plan_revision_digest"] == plans.predecessor.current_revision_digest
+    assert plans.active == plans.successor
+
+    restarted = ExecutionKernel(
+        store_path=tmp_path / "execution.sqlite3",
+        plan_control=plans,
+        effects=effects,
+    )
+    plans.kernel = restarted
+    plans.return_value = plans.successor
+
+    restarted.advance(handle)
+
+    migrated = restarted._load(handle)
+    assert plans.activate_calls == 1
+    assert migrated["plan_revision_digest"] == plans.successor.current_revision_digest
+    assert len(migrated["revision_lineage"]) == 1
+
+
+def test_affected_run_rekeys_and_unaffected_result_survives(tmp_path):
+    kernel, plans, effects, handle, invalidation = _successor_fixture(tmp_path)
+    before = kernel.inspect(handle)
+    result_run = next(run for run in before.work_runs if run.ticket_key == "issue:108")
+    affected_run = next(run for run in before.work_runs if run.ticket_key == "issue:109")
+
+    kernel.advance(handle, plan_invalidation=invalidation)
+    after = kernel.inspect(handle)
+    retained = next(run for run in after.work_runs if run.ticket_key == "issue:108")
+    replaced = next(run for run in after.work_runs if run.ticket_key == "issue:109")
+
+    assert after.plan_revision_digest != before.plan_revision_digest
+    assert retained.result_digest == result_run.result_digest
+    assert retained.evidence_digests == result_run.evidence_digests
+    assert retained.work_run_key == result_run.work_run_key
+    assert replaced.work_run_key != affected_run.work_run_key
+    assert replaced.phase in {"pending", "running"}
+
+
+def test_old_workspace_and_candidate_are_lineage_only(tmp_path):
+    kernel, plans, effects, handle, invalidation = _successor_fixture(tmp_path)
+
+    kernel.advance(handle, plan_invalidation=invalidation)
+    diagnostics = kernel.inspect(handle)
+    current = next(run for run in diagnostics.work_runs if run.ticket_key == "issue:109")
+
+    assert current.candidate_identity is None
+    assert diagnostics.revision_lineage[0].candidate_identities == (
+        "candidate:r0:109",
+    )
+    assert diagnostics.revision_lineage[0].workspace_identities == (
+        "workspace:r0:109",
+    )
+    assert "candidate:r0:109" not in {
+        run.candidate_identity for run in diagnostics.work_runs if run.candidate_identity
+    }
+
+
+def test_stale_candidate_never_enters_checks_review_or_delivery(tmp_path):
+    from gwo_v8.execution_kernel import ExecutionKernel, ExecutionKernelError
+
+    kernel, plans, effects, handle, invalidation = _successor_fixture(tmp_path)
+    stale_action_id = kernel._load(handle)["runs"]["issue:109"]["last_action_id"]
+    effects.stale_action_id = stale_action_id
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.advance(handle, plan_invalidation=invalidation)
+
+    assert raised.value.code == "EFFECT_READBACK_INVALID"
+    assert plans.active == plans.successor
+    run = kernel.inspect(handle).work_runs[1]
+    assert run.ticket_key == "issue:109"
+    assert run.phase == "pending"
+    assert run.candidate_identity is None
+    assert all(action.plan_revision_digest != plans.successor.current_revision_digest for action in effects.executed)
+
+
+def test_unrelated_revision_change_still_fails_closed(tmp_path):
+    from gwo_v8.execution_kernel import ExecutionKernel, ExecutionKernelError
+
+    kernel, plans, effects, handle, _ = _successor_fixture(tmp_path)
+    kernel.advance(handle)
+    foreign = _successor_readback(
+        plans.predecessor,
+        plans.classification,
+        changed_ticket="issue:108",
+        planning_action_id="foreign-planning-action",
+        expected_previous="f" * 64,
+    )
+    plans.active = foreign
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.advance(handle)
+    assert raised.value.code == "CAMPAIGN_REVISION_CHANGED"
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.inspect(handle)
+    assert raised.value.code == "CAMPAIGN_REVISION_CHANGED"
+    assert effects.executed
+
+
+def _successor_fixture(tmp_path):
+    from gwo_v8.execution_kernel import ExecutionKernel, PlanInvalidationObservation
+
+    predecessor, handle = _active_campaign(("issue:108", "issue:109"))
+    classification = _approved_successor_classification(predecessor)
+    successor = _successor_readback(predecessor, classification)
+    plans = _SuccessorPlans(predecessor, successor, classification)
+    effects = _SuccessorEffects(successor.current_revision_digest)
+    kernel = ExecutionKernel(
+        store_path=tmp_path / "execution.sqlite3",
+        plan_control=plans,
+        effects=effects,
+    )
+    plans.kernel = kernel
+    kernel.advance(handle)
+    state = kernel._load(handle)
+    run = state["runs"]["issue:109"]
+    work = kernel._authoritative_active(handle)[1]
+    invalidation = PlanInvalidationObservation(
+        repository=handle.repository,
+        campaign_key=handle.campaign_key,
+        plan_revision_digest=predecessor.current_revision_digest,
+        ticket_key="issue:109",
+        work_run_key=run["work_run_key"],
+        runtime_binding_id=run["semantic_action_id"],
+        authority_subtree_digest=work["issue:109"]["authority"]["worker"]["subtree_digest"],
+        reporter_role="worker",
+        report_digest="a" * 64,
+        evidence_digest="b" * 64,
+        dedup_identity="successor-fixture:issue-109",
+        invalidated_obligation="successor fixture requires an exact successor",
+        required_effects=("workspace.write.v1",),
+        workspace_identity="workspace:r0:109",
+    )
+    return kernel, plans, effects, handle, invalidation
+
+
+def _approved_successor_classification(active):
+    from gwo_v8.execution_kernel import ExecutionKernel
+    from gwo_v8.plan_control import PlanInvalidationClassification, PlanInvalidationDisposition
+
+    evidence_digests = ("b" * 64,)
+    return PlanInvalidationClassification(
+        action_id=ExecutionKernel._replanning_action_id(active, evidence_digests),
+        snapshot_digest="c" * 64,
+        plan_revision_digest=active.current_revision_digest,
+        evidence_digests=evidence_digests,
+        disposition=PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR,
+        reason="approved successor fixture",
+        capability_proof_digest="d" * 64,
+        successor_ticket_keys=("issue:108", "issue:109"),
+    )
+
+
+def _successor_readback(
+    predecessor,
+    classification,
+    *,
+    changed_ticket="issue:109",
+    planning_action_id=None,
+    expected_previous=None,
+):
+    from gwo_v8._canonical import canonical_bytes, digest_bytes, load_canonical_json
+    from gwo_v8.plan_control import ActivePlanReadback, TicketClaimProof
+
+    spec = deepcopy(load_canonical_json(predecessor.plan_spec_bytes))
+    for item in spec["work"]:
+        if item["key"] == changed_ticket:
+            item["contract"] = {"acceptance": ["the successor Ticket is satisfied"]}
+    payload = canonical_bytes(spec)
+    revision_digest = digest_bytes(payload)
+    receipt = replace(
+        predecessor.activation_receipt,
+        revision_digest=revision_digest,
+        expected_previous_revision_digest=(
+            predecessor.current_revision_digest
+            if expected_previous is None
+            else expected_previous
+        ),
+        planning_stable_action_id=(
+            classification.action_id if planning_action_id is None else planning_action_id
+        ),
+        ticket_keys=tuple(item["key"] for item in spec["work"]),
+        ready_refs=tuple(item["key"] for item in spec["work"]),
+    )
+    return ActivePlanReadback(
+        handle=predecessor.handle,
+        current_revision_digest=revision_digest,
+        plan_spec_bytes=payload,
+        activation_receipt=receipt,
+        claim_proofs=tuple(
+            TicketClaimProof(
+                ticket_key=item["key"],
+                repository=predecessor.handle.repository,
+                campaign_key=predecessor.handle.campaign_key,
+                plan_revision_digest=revision_digest,
+            )
+            for item in spec["work"]
+        ),
+    )
+
+
+class _SuccessorPlans:
+    def __init__(self, predecessor, successor, classification):
+        self.predecessor = predecessor
+        self.successor = successor
+        self.active = predecessor
+        self.classification = classification
+        self.activate_calls = 0
+        self.intent_at_activation = None
+        self.return_value = successor
+        self.kernel = None
+
+    def read_active(self, handle):
+        assert handle == self.active.handle
+        return self.active
+
+    def classify_plan_invalidations(self, handle, invalidations, execution_snapshot):
+        assert handle == self.active.handle
+        assert invalidations
+        return self.classification
+
+    def activate_successor(self, handle, classification):
+        assert handle == self.active.handle
+        assert classification == self.classification
+        self.activate_calls += 1
+        self.intent_at_activation = deepcopy(self.kernel._load(handle)["successor_transition"])
+        self.active = self.successor
+        return self.return_value
+
+
+class _SuccessorEffects:
+    def __init__(self, successor_digest):
+        self.successor_digest = successor_digest
+        self.executed = []
+        self.stale_action_id = None
+
+    def readback(self, action):
+        if self.stale_action_id is None:
+            return None
+        return _observation(
+            "candidate_checks",
+            self.stale_action_id,
+            candidate_identity="candidate:r0:109",
+        )
+
+    def execute(self, action):
+        self.executed.append(action)
+        if action.ticket_key == "issue:108":
+            return _observation(
+                "completed",
+                action.stable_action_id,
+                result_digest="7" * 64,
+                evidence_digests=("8" * 64,),
+            )
+        return _observation(
+            "running",
+            action.stable_action_id,
+            candidate_identity=(
+                "candidate:r0:109"
+                if action.plan_revision_digest != self.successor_digest
+                else None
+            ),
+        )
 
 
 class _Plans:
