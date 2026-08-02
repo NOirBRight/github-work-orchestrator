@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import sys
 from pathlib import Path
 
@@ -56,6 +57,41 @@ def test_revision_digest_is_not_the_semantic_work_run_key():
     assert before_subject == after_subject
     assert work_run_key("issue:109", before_subject) == work_run_key(
         "issue:109", after_subject
+    )
+
+
+@pytest.mark.parametrize("field", ("repository", "target_branch", "campaign_source"))
+def test_target_facts_covers_every_target_fact(field):
+    from gwo_v8.revision_identity import target_facts_digest
+    from v8_successor_test_support import active_plan_spec
+
+    before = active_plan_spec()
+    after = deepcopy(before)
+    if field == "repository":
+        after["repository"] = "other/repository"
+    elif field == "target_branch":
+        after["target_branch"] = "release"
+    else:
+        after["campaign"]["source"]["resolved_commit_oid"] = "c" * 40
+    assert target_facts_digest(before) != target_facts_digest(after)
+
+
+def test_changed_work_subject_changes_the_same_ticket_work_run_key():
+    from gwo_v8._canonical import digest_value
+    from gwo_v8.revision_identity import work_run_key, work_subject_digest
+    from v8_successor_test_support import active_plan_spec, changed_plan_spec
+
+    before = active_plan_spec()
+    after = changed_plan_spec("contract")
+    before_item = next(item for item in before["work"] if item["key"] == "issue:108")
+    after_item = next(item for item in after["work"] if item["key"] == "issue:108")
+    before_subject = work_subject_digest(before, before_item)
+    after_subject = work_subject_digest(after, after_item)
+
+    assert digest_value(before) != digest_value(after)
+    assert before_subject != after_subject
+    assert work_run_key("issue:108", before_subject) != work_run_key(
+        "issue:108", after_subject
     )
 
 
