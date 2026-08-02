@@ -164,8 +164,26 @@ def replanning_output_payload_schema() -> dict[str, Any]:
                 },
                 "uniqueItems": True,
             },
+            "exclusive_resource_additions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["ticket_key", "resource_id", "reason"],
+                    "properties": {
+                        "ticket_key": {"type": "string", "minLength": 1},
+                        "resource_id": {"type": "string", "minLength": 1},
+                        "reason": {"type": "string", "minLength": 1},
+                    },
+                    "additionalProperties": False,
+                },
+                "uniqueItems": True,
+            },
         },
-        "required": ["approved_ticket_keys", "dependency_additions"],
+        "required": [
+            "approved_ticket_keys",
+            "dependency_additions",
+            "exclusive_resource_additions",
+        ],
         "additionalProperties": False,
     }
     decision = {

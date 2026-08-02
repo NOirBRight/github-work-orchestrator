@@ -17,7 +17,12 @@ import threading
 from typing import Any, Mapping, Protocol, Sequence
 
 from ._canonical import CanonicalJsonError, canonical_bytes, digest_bytes, digest_value, load_canonical_json
-from .planning_protocol import planning_prompt, replanning_prompt
+from .planning_protocol import (
+    PLANNING_OUTPUT_PROTOCOL_ID,
+    REPLANNING_OUTPUT_PROTOCOL_ID,
+    planning_prompt,
+    replanning_prompt,
+)
 from .runtime_gateway import (
     CampaignPlanningSubject,
     CoordinatorCapabilityProof,
@@ -119,6 +124,25 @@ class PlanInvalidationDependency:
 
 
 @dataclass(frozen=True)
+class PlanInvalidationExclusiveResource:
+    ticket_key: str
+    resource_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        _text(self.ticket_key, "Exclusive Resource Ticket")
+        _text(self.resource_id, "Exclusive Resource ID")
+        _text(self.reason, "Exclusive Resource reason")
+
+    def canonical(self) -> dict[str, str]:
+        return {
+            "ticket_key": self.ticket_key,
+            "resource_id": self.resource_id,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class PlanInvalidationDecision:
     """A named human choice required before the Campaign can change."""
 
@@ -167,6 +191,7 @@ class PlanInvalidationClassification:
     capability_proof_digest: str
     successor_ticket_keys: tuple[str, ...] = ()
     dependency_additions: tuple[PlanInvalidationDependency, ...] = ()
+    exclusive_resource_additions: tuple[PlanInvalidationExclusiveResource, ...] = ()
     decision: PlanInvalidationDecision | None = None
 
     def __post_init__(self) -> None:
@@ -228,6 +253,34 @@ class PlanInvalidationClassification:
                 "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
                 "successor dependency additions must be canonical",
             )
+        if type(self.exclusive_resource_additions) is not tuple or any(
+            type(item) is not PlanInvalidationExclusiveResource
+            for item in self.exclusive_resource_additions
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "successor exclusive resource additions are invalid",
+            )
+        if tuple(
+            sorted(
+                self.exclusive_resource_additions,
+                key=lambda item: (item.ticket_key, item.resource_id, item.reason),
+            )
+        ) != self.exclusive_resource_additions:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "successor exclusive resource additions must be canonical",
+            )
+        if len(
+            {
+                (item.ticket_key, item.resource_id)
+                for item in self.exclusive_resource_additions
+            }
+        ) != len(self.exclusive_resource_additions):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "successor exclusive resource additions repeat a resource",
+            )
         if self.decision is not None and type(self.decision) is not PlanInvalidationDecision:
             raise PlanControlError(
                 "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
@@ -240,12 +293,22 @@ class PlanInvalidationClassification:
                     "approved successor classification must name approved work only",
                 )
         elif self.disposition is PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION:
-            if self.decision is None or self.successor_ticket_keys or self.dependency_additions:
+            if (
+                self.decision is None
+                or self.successor_ticket_keys
+                or self.dependency_additions
+                or self.exclusive_resource_additions
+            ):
                 raise PlanControlError(
                     "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
                     "human Decision classification cannot carry successor work",
                 )
-        elif self.successor_ticket_keys or self.dependency_additions or self.decision is not None:
+        elif (
+            self.successor_ticket_keys
+            or self.dependency_additions
+            or self.exclusive_resource_additions
+            or self.decision is not None
+        ):
             raise PlanControlError(
                 "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
                 "resume/defer/reject classification cannot carry plan or Decision changes",
@@ -258,6 +321,9 @@ class PlanInvalidationClassification:
                 "approved_ticket_keys": list(self.successor_ticket_keys),
                 "dependency_additions": [
                     item.canonical() for item in self.dependency_additions
+                ],
+                "exclusive_resource_additions": [
+                    item.canonical() for item in self.exclusive_resource_additions
                 ],
             }
         return {
@@ -308,10 +374,12 @@ class PlanInvalidationClassification:
             if successor is None:
                 successor_keys: tuple[str, ...] = ()
                 dependencies: tuple[PlanInvalidationDependency, ...] = ()
+                resources: tuple[PlanInvalidationExclusiveResource, ...] = ()
             else:
                 if type(successor) is not dict or set(successor) != {
                     "approved_ticket_keys",
                     "dependency_additions",
+                    "exclusive_resource_additions",
                 }:
                     raise PlanControlError(
                         "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
@@ -319,6 +387,7 @@ class PlanInvalidationClassification:
                     )
                 raw_successor_keys = successor["approved_ticket_keys"]
                 raw_dependencies = successor["dependency_additions"]
+                raw_resources = successor["exclusive_resource_additions"]
                 if (
                     type(raw_successor_keys) is not list
                     or any(type(item) is not str for item in raw_successor_keys)
@@ -327,6 +396,12 @@ class PlanInvalidationClassification:
                         type(item) is not dict
                         or set(item) != {"from", "to", "reason"}
                         for item in raw_dependencies
+                    )
+                    or type(raw_resources) is not list
+                    or any(
+                        type(item) is not dict
+                        or set(item) != {"ticket_key", "resource_id", "reason"}
+                        for item in raw_resources
                     )
                 ):
                     raise PlanControlError(
@@ -341,6 +416,14 @@ class PlanInvalidationClassification:
                         reason=item["reason"],
                     )
                     for item in raw_dependencies
+                )
+                resources = tuple(
+                    PlanInvalidationExclusiveResource(
+                        ticket_key=item["ticket_key"],
+                        resource_id=item["resource_id"],
+                        reason=item["reason"],
+                    )
+                    for item in raw_resources
                 )
             if (
                 disposition is not PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR
@@ -374,6 +457,7 @@ class PlanInvalidationClassification:
                 capability_proof_digest=value["capability_proof_digest"],
                 successor_ticket_keys=successor_keys,
                 dependency_additions=dependencies,
+                exclusive_resource_additions=resources,
                 decision=decision,
             )
         except (KeyError, TypeError, ValueError) as error:
@@ -536,12 +620,23 @@ class _PlanningAttempt:
     policy_witness_digest: str
     planning_request_artifact_digest: str
     subject: CampaignPlanningSubject
+    planning_protocol_id: str = PLANNING_OUTPUT_PROTOCOL_ID
     compilation_record_artifact_digest: str | None = None
     revision: PlanRevision | None = None
     # The governed production repository persists this immutable copy so a
     # fresh host can reconstruct the Artifact-backed record before any active
     # Plan readback.  It is absent only while Planning is still incomplete.
     compilation_record_bytes: bytes | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.planning_protocol_id) is not str or self.planning_protocol_id not in {
+            PLANNING_OUTPUT_PROTOCOL_ID,
+            REPLANNING_OUTPUT_PROTOCOL_ID,
+        }:
+            raise PlanControlError(
+                "PLANNING_ATTEMPT_PROTOCOL_INVALID",
+                "Planning attempt protocol is outside the closed protocol union",
+            )
 
 
 class CampaignSnapshotSource(Protocol):
