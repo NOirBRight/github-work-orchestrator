@@ -9,7 +9,7 @@ nor Runtime/provider policy.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import json
 from pathlib import Path
@@ -18,12 +18,20 @@ import sqlite3
 import threading
 from typing import Any, Mapping, Protocol
 
-from ._canonical import CanonicalJsonError, digest_bytes, digest_value, load_canonical_json
+from ._canonical import (
+    CanonicalJsonError,
+    canonical_bytes,
+    digest_bytes,
+    digest_value,
+    load_canonical_json,
+)
 from .plan_control import (
     ActivePlanReadback,
+    ActivationReceipt,
     CampaignHandle,
     PlanInvalidationClassification,
     PlanInvalidationDisposition,
+    TicketClaimProof,
 )
 
 
@@ -38,6 +46,88 @@ _KERNEL_LOCKS_GUARD = threading.Lock()
 _KERNEL_LOCKS: dict[str, threading.RLock] = {}
 
 
+def _has_revision_identity_facts(
+    plan: Mapping[str, Any], work_item: Mapping[str, Any]
+) -> bool:
+    """Return whether this PlanSpec has the Task 3 semantic identity shape."""
+
+    campaign = plan.get("campaign")
+    return (
+        type(campaign) is dict
+        and "source" in campaign
+        and "authority" in campaign
+        and "target_branch" in plan
+        and "policy" in plan
+        and all(
+            field in work_item
+            for field in (
+                "source",
+                "contract",
+                "capabilities",
+                "authority",
+            )
+        )
+    )
+
+
+def _legacy_work_subject_digest(
+    plan: Mapping[str, Any], work_item: Mapping[str, Any]
+) -> str:
+    campaign = plan.get("campaign")
+    if type(campaign) is not dict:
+        campaign = {}
+    return digest_value(
+        {
+            "kind": "gwo.work-subject.v1",
+            "repository": plan["repository"],
+            "campaign_key": campaign.get("key"),
+            "target_branch": plan.get("target_branch"),
+            "campaign_source": campaign.get("source"),
+            "campaign_authority": campaign.get("authority"),
+            "policy": plan.get("policy"),
+            "ticket_key": work_item["key"],
+            "source": work_item.get("source"),
+            "contract": work_item.get("contract"),
+            "depends_on": list(work_item.get("depends_on", ())),
+            "exclusive_resources": list(work_item.get("exclusive_resources", ())),
+            "capabilities": list(work_item.get("capabilities", ())),
+            "authority": work_item.get("authority"),
+        }
+    )
+
+
+def _work_subject_digest_for_kernel(
+    plan: Mapping[str, Any], work_item: Mapping[str, Any]
+) -> str:
+    if not _has_revision_identity_facts(plan, work_item):
+        return _legacy_work_subject_digest(plan, work_item)
+    return work_subject_digest(plan, work_item)
+
+
+def _target_facts_digest_for_kernel(plan: Mapping[str, Any]) -> str:
+    campaign = plan.get("campaign")
+    if type(campaign) is not dict or "source" not in campaign:
+        return digest_value(
+            {
+                "kind": "gwo.target-facts.v1",
+                "repository": plan["repository"],
+                "target_branch": plan.get("target_branch"),
+                "campaign_source": campaign.get("source")
+                if type(campaign) is dict
+                else None,
+            }
+        )
+    return target_facts_digest(plan)
+
+
+def _work_run_key_for_kernel(
+    plan: Mapping[str, Any], work_item: Mapping[str, Any], subject_digest: str
+) -> str:
+    if _has_revision_identity_facts(plan, work_item):
+        return work_run_key(work_item["key"], subject_digest)
+    return f"work-run:{work_item['key']}"
+
+
 class ExecutionKernelError(RuntimeError):
     """A named fail-closed ExecutionKernel outcome."""
 
@@ -46,6 +136,14 @@ class ExecutionKernelError(RuntimeError):
         self.code = code
         self.detail = detail
 
+
+from .revision_identity import (
+    AcceptedResultBinding,
+    can_preserve_result,
+    target_facts_digest,
+    work_run_key,
+    work_subject_digest,
+)
 
 class CampaignStatus(str, Enum):
     COMPLETE = "Complete"
@@ -73,6 +171,24 @@ class WorkRunSummary:
     runtime_binding_id: str | None = None
     claim_state: str = "unclaimed"
     exclusive_resources: tuple[str, ...] = ()
+    work_subject_digest: str = ""
+    candidate_identity: str | None = None
+    result_digest: str | None = None
+    evidence_digests: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RevisionLineageSummary:
+    """Inspect-only summary of a predecessor Plan Revision's retained facts."""
+
+    plan_revision_digest: str
+    activation_receipt_digest: str
+    classification_action_id: str
+    work_run_keys: tuple[str, ...]
+    workspace_identities: tuple[str, ...]
+    candidate_identities: tuple[str, ...]
+    result_digests: tuple[str, ...]
+    evidence_digests: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -85,6 +201,7 @@ class Diagnostics:
     work_runs: tuple[WorkRunSummary, ...]
     outstanding_effect_ids: tuple[str, ...]
     invalidation_classification: PlanInvalidationClassification | None = None
+    revision_lineage: tuple[RevisionLineageSummary, ...] = ()
 
     @property
     def plan_invalidation_classification(self) -> PlanInvalidationClassification | None:
@@ -141,6 +258,8 @@ class WorkRunAction:
     ticket_key: str
     kind: str
     semantic_action_id: str
+    work_run_key: str = ""
+    work_subject_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -158,6 +277,9 @@ class WorkRunObservation:
     reason: str | None = None
     next_check_at: str | None = None
     binding_established: bool = True
+    candidate_identity: str | None = None
+    result_digest: str | None = None
+    evidence_digests: tuple[str, ...] = ()
 
     _PHASES = frozenset(
         {
@@ -195,6 +317,38 @@ class WorkRunObservation:
         if self.next_check_at is not None and type(self.next_check_at) is not str:
             raise ExecutionKernelError(
                 "WORK_RUN_OBSERVATION_INVALID", "Work Run due time is invalid"
+            )
+        if self.candidate_identity is not None and (
+            type(self.candidate_identity) is not str or not self.candidate_identity
+        ):
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "Candidate identity must be non-empty text when present",
+            )
+        if type(self.evidence_digests) is not tuple:
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "Evidence identities must be a tuple",
+            )
+        for digest, label in (
+            (self.result_digest, "Result"),
+            *(
+                (evidence_digest, "Evidence")
+                for evidence_digest in self.evidence_digests
+            ),
+        ):
+            if digest is not None and (
+                type(digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise ExecutionKernelError(
+                    "WORK_RUN_OBSERVATION_INVALID",
+                    f"{label} digest is invalid",
+                )
+        if self.evidence_digests != tuple(sorted(set(self.evidence_digests))):
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "Evidence identities are not canonical",
             )
 
     @classmethod
@@ -410,6 +564,16 @@ class ActivePlanReader(Protocol):
     def read_active(self, handle: CampaignHandle) -> ActivePlanReadback: ...
 
 
+class SuccessorPlanActivator(Protocol):
+    """Private PlanControl port for one exact approved successor transition."""
+
+    def activate_successor(
+        self,
+        handle: CampaignHandle,
+        classification: PlanInvalidationClassification,
+    ) -> ActivePlanReadback: ...
+
+
 class PlanInvalidationClassifier(Protocol):
     """Private PlanControl seam used only after a Work Run is quiescent."""
 
@@ -467,12 +631,22 @@ class ExecutionKernel:
 
         with self._campaign_lock(campaign_handle):
             active, work = self._authoritative_active(campaign_handle)
-            state = self._load_or_initialize(active, work)
+            state = self._load_initialize_or_reconcile_successor(active, work)
             self._reconcile_plan_invalidations(active, state, work)
             if plan_invalidation is not None:
                 observation = self._coerce_plan_invalidation(plan_invalidation)
                 self._apply_plan_invalidation(active, state, work, observation)
             self._classify_plan_invalidations_if_needed(active, state, work)
+            classification = self._current_classification(
+                state,
+                active.current_revision_digest,
+            )
+            active, work, state = self._activate_successor_if_due(
+                active,
+                work,
+                state,
+                classification,
+            )
             is_new_wake = False
             if wake_ref is not None:
                 if type(wake_ref) is not str or not wake_ref:
@@ -505,7 +679,7 @@ class ExecutionKernel:
     def inspect(self, campaign_handle: CampaignHandle) -> Diagnostics:
         """Mechanically explain the durable Campaign state; it sends no effect."""
 
-        active, _work = self._authoritative_active(campaign_handle)
+        active, work = self._authoritative_active(campaign_handle)
         state = self._load(active.handle)
         if state is None:
             return Diagnostics(
@@ -521,10 +695,19 @@ class ExecutionKernel:
                 work_runs=(),
                 outstanding_effect_ids=(),
             )
-        outcome = self._outcome(active.handle, state)
+        migration_due = state.get("plan_revision_digest") != active.current_revision_digest
+        if migration_due:
+            self._validate_successor_state_match(active, state)
+            outcome = CampaignOutcome(CampaignStatus.WAIT, "SuccessorMigrationDue")
+        else:
+            # Reuse the same identity backfill as advance, but do not admit or
+            # execute an effect.  Historical inspect must not expose an empty or
+            # Ticket-shaped Work Run identity after an upgrade.
+            state = self._load_or_initialize(active, work)
+            outcome = self._outcome(active.handle, state)
         classification = self._current_classification(
             state,
-            active.current_revision_digest,
+            state["plan_revision_digest"],
         )
         runs = tuple(
             self._run_summary(key, run)
@@ -546,6 +729,7 @@ class ExecutionKernel:
             work_runs=runs,
             outstanding_effect_ids=outstanding,
             invalidation_classification=classification,
+            revision_lineage=self._revision_lineage_summaries(state),
         )
 
     @staticmethod
@@ -591,6 +775,10 @@ class ExecutionKernel:
             runtime_binding_id=run.get("semantic_action_id"),
             claim_state=run.get("claim_state", "unclaimed"),
             exclusive_resources=tuple(run.get("exclusive_resources", ())),
+            work_subject_digest=run.get("work_subject_digest", ""),
+            candidate_identity=run.get("candidate_identity"),
+            result_digest=run.get("result_digest"),
+            evidence_digests=tuple(run.get("evidence_digests", ())),
         )
 
     @staticmethod
@@ -684,35 +872,53 @@ class ExecutionKernel:
     def _load_or_initialize(
         self, active: ActivePlanReadback, work: dict[str, dict[str, Any]]
     ) -> dict[str, Any]:
+        try:
+            plan = load_canonical_json(active.plan_spec_bytes)
+        except CanonicalJsonError as error:  # pragma: no cover - validated earlier
+            raise ExecutionKernelError(
+                "ACTIVE_PLAN_INVALID", "PlanSpec bytes are not canonical"
+            ) from error
+        if type(plan) is not dict:
+            raise ExecutionKernelError("ACTIVE_PLAN_INVALID", "active PlanSpec is not an object")
         state = self._load(active.handle)
         if state is None:
+            runs: dict[str, dict[str, Any]] = {}
+            for key in sorted(work):
+                subject_digest = _work_subject_digest_for_kernel(plan, work[key])
+                runs[key] = {
+                    "phase": "pending",
+                    "slot_held": False,
+                    "reason": None,
+                    "last_action_id": None,
+                    "semantic_action_id": None,
+                    "resume_ordinal": 0,
+                    "next_check_at": None,
+                    "work_subject_digest": subject_digest,
+                    "work_run_key": (
+                        work_run_key(key, subject_digest)
+                        if _has_revision_identity_facts(plan, work[key])
+                        else f"work-run:{key}"
+                    ),
+                    "exclusive_resources": list(work[key].get("exclusive_resources", [])),
+                    "claim_state": "unclaimed",
+                    "candidate_identity": None,
+                    "result_digest": None,
+                    "evidence_digests": [],
+                    "plan_invalidation": None,
+                    "plan_invalidation_resolution": None,
+                    "resume_after_invalidation": False,
+                }
             state = {
                 "plan_revision_digest": active.current_revision_digest,
                 "activation_receipt_digest": digest_value(active.activation_receipt.__dict__),
-                "runs": {
-                    key: {
-                        "phase": "pending",
-                        "slot_held": False,
-                        "reason": None,
-                        "last_action_id": None,
-                        "semantic_action_id": None,
-                        "resume_ordinal": 0,
-                        "next_check_at": None,
-                        "work_run_key": f"work-run:{key}",
-                        "exclusive_resources": list(work[key].get("exclusive_resources", [])),
-                        "claim_state": "unclaimed",
-                        "plan_invalidation": None,
-                        "plan_invalidation_resolution": None,
-                        "resume_after_invalidation": False,
-                    }
-                    for key in sorted(work)
-                },
+                "runs": runs,
                 "effects": {},
                 "wake_refs": [],
                 "plan_invalidation": {},
                 "plan_invalidation_resolutions": {},
                 "plan_invalidation_classifications": {},
                 "accepted_results": [],
+                "revision_lineage": [],
             }
             self._save(active.handle, state)
             return state
@@ -730,28 +936,841 @@ class ExecutionKernel:
         state.setdefault("plan_invalidation_resolutions", {})
         state.setdefault("plan_invalidation_classifications", {})
         state.setdefault("accepted_results", [])
-        # Backfill the work_run_key on any historical run record that was
-        # persisted before #133 introduced Plan Invalidation.  The key is the
-        # stable Work Run identity the Gateway binds reports to; an absent
-        # value would make every invalidation fail with INVALIDATION_IDENTITY_MISMATCH.
+        state.setdefault("revision_lineage", [])
+        if type(state["revision_lineage"]) is not list:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel revision lineage is not a list",
+            )
+        state.setdefault("effects", {})
+        if type(state["effects"]) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID", "ExecutionKernel effects are not a mapping"
+            )
+        dirty = False
+        # Backfill only a missing historical Work Run identity.  An existing
+        # key is already bound state: preserve the legacy Ticket-shaped key so
+        # same-revision invalidation records remain exact.  Only successor
+        # activation may rekey that historical identity.
         for ticket_key, run in state.get("runs", {}).items():
-            if type(run) is dict and not run.get("work_run_key"):
-                run["work_run_key"] = f"work-run:{ticket_key}"
-            if type(run) is dict and "plan_invalidation" not in run:
+            if type(run) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID", "ExecutionKernel Work Run is not an object"
+                )
+            subject_digest = _work_subject_digest_for_kernel(plan, work[ticket_key])
+            expected_work_run_key = _work_run_key_for_kernel(
+                plan, work[ticket_key], subject_digest
+            )
+            existing_subject_digest = run.get("work_subject_digest")
+            if (
+                existing_subject_digest is not None
+                and existing_subject_digest != subject_digest
+            ):
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "historical Work Subject identity is not bound to the active Plan Revision",
+                )
+            if existing_subject_digest != subject_digest:
+                run["work_subject_digest"] = subject_digest
+                dirty = True
+            existing_work_run_key = run.get("work_run_key")
+            legacy_work_run_key = f"work-run:{ticket_key}"
+            if existing_work_run_key not in {
+                None,
+                legacy_work_run_key,
+                expected_work_run_key,
+            }:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "historical Work Run identity is not bound to the active Plan Revision",
+                )
+            if existing_work_run_key is None:
+                run["work_run_key"] = legacy_work_run_key
+                dirty = True
+            if "plan_invalidation" not in run:
                 run["plan_invalidation"] = None
-            if type(run) is dict and "exclusive_resources" not in run:
+                dirty = True
+            if "exclusive_resources" not in run:
                 run["exclusive_resources"] = list(work[ticket_key].get("exclusive_resources", []))
-            if type(run) is dict and "claim_state" not in run:
+                dirty = True
+            if "claim_state" not in run:
                 run["claim_state"] = (
                     "held" if run.get("slot_held") else
                     "unclaimed" if run.get("phase") == "pending" else
                     "released"
                 )
-            if type(run) is dict and "plan_invalidation_resolution" not in run:
+                dirty = True
+            if "candidate_identity" not in run:
+                run["candidate_identity"] = None
+                dirty = True
+            if "result_digest" not in run:
+                run["result_digest"] = None
+                dirty = True
+            if "evidence_digests" not in run:
+                run["evidence_digests"] = []
+                dirty = True
+            if "plan_invalidation_resolution" not in run:
                 run["plan_invalidation_resolution"] = None
-            if type(run) is dict and "resume_after_invalidation" not in run:
+                dirty = True
+            if "resume_after_invalidation" not in run:
                 run["resume_after_invalidation"] = False
+                dirty = True
+
+        # Re-key any historical effect referenced by the Work Run's last
+        # action.  The migration is deterministic and idempotent: after the
+        # first readback only the revision-bound key remains.
+        for ticket_key, run in state["runs"].items():
+            legacy_action_id = run.get("last_action_id")
+            if type(legacy_action_id) is not str:
+                continue
+            effect = state["effects"].get(legacy_action_id)
+            if type(effect) is not dict:
+                continue
+            if effect.get("ticket_key") != ticket_key:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "historical effect is not bound to its Work Run",
+                )
+            execution_action_id = self._effect_action_id(
+                active, ticket_key, run, resuming=False
+            )
+            resume_action_id = self._effect_action_id(
+                active, ticket_key, run, resuming=True
+            )
+            if legacy_action_id in {execution_action_id, resume_action_id}:
+                revision_bound_action_id = legacy_action_id
+            else:
+                resuming = legacy_action_id != run.get("semantic_action_id")
+                revision_bound_action_id = self._effect_action_id(
+                    active, ticket_key, run, resuming=resuming
+                )
+            effect_identity = {
+                "plan_revision_digest": active.current_revision_digest,
+                "work_run_key": run["work_run_key"],
+                "work_subject_digest": run["work_subject_digest"],
+            }
+            migrated_effect = dict(effect)
+            for field, value in effect_identity.items():
+                if field in migrated_effect and migrated_effect[field] != value:
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "historical effect identity is not bound to the active Plan Revision",
+                    )
+                migrated_effect[field] = value
+            if revision_bound_action_id != legacy_action_id:
+                existing_effect = state["effects"].get(revision_bound_action_id)
+                if existing_effect is not None and existing_effect != migrated_effect:
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "historical effect migration conflicts with a revision-bound effect",
+                    )
+                state["effects"].pop(legacy_action_id, None)
+                state["effects"][revision_bound_action_id] = migrated_effect
+                run["last_action_id"] = revision_bound_action_id
+                dirty = True
+            elif state["effects"].get(revision_bound_action_id) != migrated_effect:
+                state["effects"][revision_bound_action_id] = migrated_effect
+                dirty = True
+        if dirty:
+            self._save(active.handle, state)
         return state
+
+    def _load_initialize_or_reconcile_successor(
+        self,
+        active: ActivePlanReadback,
+        work: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Load R0, or reconcile exactly one durably committed successor."""
+
+        state = self._load(active.handle)
+        if state is None:
+            return self._load_or_initialize(active, work)
+        if state.get("plan_revision_digest") == active.current_revision_digest:
+            return self._load_or_initialize(active, work)
+
+        classification = self._validate_successor_state_match(active, state)
+        transition = state["successor_transition"]
+        previous_writer_generation = state.get(
+            "successor_previous_writer_generation"
+        )
+        if (
+            type(previous_writer_generation) is not str
+            or not previous_writer_generation
+        ):
+            raise ExecutionKernelError(
+                "SUCCESSOR_ACTIVATION_READBACK_INVALID",
+                "successor transition omitted its predecessor writer generation",
+            )
+        # A crash can leave the durable predecessor row behind after
+        # PlanControl has already switched the active authority.  Do not let
+        # that recovery path trust only the transition envelope: the active
+        # readback must pass the same closed receipt/PlanSpec/claim fence as
+        # the original activation before migration or effects are admitted.
+        self._validate_successor_readback(
+            active.handle,
+            transition,
+            classification,
+            active,
+            active,
+            expected_writer_generation=previous_writer_generation,
+        )
+        try:
+            plan = load_canonical_json(active.plan_spec_bytes)
+        except CanonicalJsonError as error:
+            raise ExecutionKernelError(
+                "ACTIVE_PLAN_INVALID", "successor PlanSpec bytes are not canonical"
+            ) from error
+        if type(plan) is not dict:
+            raise ExecutionKernelError(
+                "ACTIVE_PLAN_INVALID", "successor PlanSpec is not an object"
+            )
+        return self._reconcile_successor_revision(active, state, work, plan)
+
+    def _validate_successor_state_match(
+        self,
+        active: ActivePlanReadback,
+        state: Mapping[str, Any],
+    ) -> PlanInvalidationClassification:
+        """Prove that an active revision is the one recorded successor."""
+
+        try:
+            transition = state.get("successor_transition")
+            previous_digest = state.get("plan_revision_digest")
+            if (
+                type(transition) is not dict
+                or set(transition)
+                != {
+                    "kind",
+                    "classification_action_id",
+                    "classification_digest",
+                    "snapshot_digest",
+                    "previous_revision_digest",
+                    "evidence_digests",
+                    "state",
+                }
+                or transition.get("kind") != "successor_transition.v1"
+                or transition.get("state") not in {"activation_due", "activated"}
+                or transition.get("previous_revision_digest") != previous_digest
+                or type(previous_digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", previous_digest) is None
+                or active.current_revision_digest == previous_digest
+                or active.activation_receipt.expected_previous_revision_digest
+                != previous_digest
+                or active.activation_receipt.planning_stable_action_id
+                != transition.get("classification_action_id")
+            ):
+                raise ValueError("successor transition does not match active receipt")
+            classifications = state.get("plan_invalidation_classifications")
+            if type(classifications) is not dict:
+                raise ValueError("successor classification map is missing")
+            classification = self._decode_classification(
+                classifications.get(transition["classification_action_id"])
+            )
+            if (
+                classification.action_id != transition["classification_action_id"]
+                or classification.digest != transition["classification_digest"]
+                or classification.snapshot_digest != transition["snapshot_digest"]
+                or classification.plan_revision_digest != previous_digest
+                or list(classification.evidence_digests)
+                != transition["evidence_digests"]
+                or classification.action_id
+                != "replan:"
+                + digest_value(
+                    {
+                        "repository": active.handle.repository,
+                        "campaign_key": active.handle.campaign_key,
+                        "plan_revision_digest": previous_digest,
+                        "evidence_digests": list(classification.evidence_digests),
+                    }
+                )
+                or classification.disposition
+                is not PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR
+            ):
+                raise ValueError("successor classification does not match transition")
+            return classification
+        except Exception as error:
+            if isinstance(error, ExecutionKernelError) and error.code == "CAMPAIGN_REVISION_CHANGED":
+                raise
+            raise ExecutionKernelError(
+                "CAMPAIGN_REVISION_CHANGED",
+                "active revision changed without one exact durable successor transition",
+            ) from error
+
+    def _activate_successor_if_due(
+        self,
+        active: ActivePlanReadback,
+        work: dict[str, dict[str, Any]],
+        state: dict[str, Any],
+        classification: PlanInvalidationClassification | None,
+    ) -> tuple[ActivePlanReadback, dict[str, dict[str, Any]], dict[str, Any]]:
+        """Commit and reconcile one approved successor, if the private port exists."""
+
+        if (
+            classification is None
+            or classification.disposition
+            is not PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR
+        ):
+            return active, work, state
+        if (
+            classification.plan_revision_digest != active.current_revision_digest
+            or classification.action_id
+            != self._replanning_action_id(active, classification.evidence_digests)
+        ):
+            raise ExecutionKernelError(
+                "SUCCESSOR_TRANSITION_READBACK_INVALID",
+                "successor classification action is not bound to the predecessor revision",
+            )
+        activator = getattr(self._plan_control, "activate_successor", None)
+        if not callable(activator):
+            # The #134 classifier double intentionally has no successor port;
+            # it remains quiescent rather than gaining a second public route.
+            return active, work, state
+
+        transition = {
+            "kind": "successor_transition.v1",
+            "classification_action_id": classification.action_id,
+            "classification_digest": classification.digest,
+            "snapshot_digest": classification.snapshot_digest,
+            "previous_revision_digest": active.current_revision_digest,
+            "evidence_digests": list(classification.evidence_digests),
+            "state": "activation_due",
+        }
+        existing = state.get("successor_transition")
+        if (
+            type(existing) is dict
+            and existing.get("previous_revision_digest") == active.current_revision_digest
+            and existing != transition
+        ):
+            raise ExecutionKernelError(
+                "SUCCESSOR_TRANSITION_READBACK_INVALID",
+                "successor activation intent conflicts with the current classification",
+            )
+        state["successor_transition"] = load_canonical_json(canonical_bytes(transition))
+        state["successor_previous_writer_generation"] = (
+            active.activation_receipt.writer_generation
+        )
+        self._save(active.handle, state)
+        persisted = self._load(active.handle)
+        if persisted is None or persisted.get("successor_transition") != transition:
+            raise ExecutionKernelError(
+                "SUCCESSOR_TRANSITION_READBACK_INVALID",
+                "successor activation intent did not read back exactly",
+            )
+        state.clear()
+        state.update(persisted)
+
+        try:
+            candidate = activator(active.handle, classification)
+        except Exception as error:
+            raise ExecutionKernelError(
+                "SUCCESSOR_ACTIVATION_FAILED",
+                "PlanControl successor activation did not complete",
+            ) from error
+        try:
+            fresh = self._plan_control.read_active(active.handle)
+        except Exception as error:
+            raise ExecutionKernelError(
+                "SUCCESSOR_ACTIVATION_READBACK_INVALID",
+                "successor active authority could not be read back",
+            ) from error
+        self._validate_successor_readback(
+            active.handle,
+            transition,
+            classification,
+            candidate,
+            fresh,
+            expected_writer_generation=active.activation_receipt.writer_generation,
+        )
+        successor_plan = load_canonical_json(candidate.plan_spec_bytes)
+        if type(successor_plan) is not dict:  # pragma: no cover - validated above
+            raise ExecutionKernelError(
+                "SUCCESSOR_ACTIVATION_READBACK_INVALID",
+                "successor PlanSpec is not an object",
+            )
+        successor_work = {
+            item["key"]: item for item in successor_plan["work"]
+        }
+        migrated = self._reconcile_successor_revision(
+            candidate,
+            state,
+            successor_work,
+            successor_plan,
+        )
+        return candidate, successor_work, migrated
+
+    @staticmethod
+    def _validate_successor_readback(
+        handle: CampaignHandle,
+        transition: Mapping[str, Any],
+        classification: PlanInvalidationClassification,
+        candidate: object,
+        fresh: object,
+        *,
+        expected_writer_generation: str | None = None,
+    ) -> ActivePlanReadback:
+        """Require one exact receipt/PlanSpec/claim readback before migration."""
+
+        try:
+            if (
+                type(classification) is not PlanInvalidationClassification
+                or type(candidate) is not ActivePlanReadback
+                or type(fresh) is not ActivePlanReadback
+                or candidate != fresh
+                or type(candidate.activation_receipt) is not ActivationReceipt
+                or candidate.handle != handle
+                or candidate.activation_receipt.repository != handle.repository
+                or candidate.activation_receipt.campaign_key != handle.campaign_key
+                or type(candidate.plan_spec_bytes) is not bytes
+            ):
+                raise ValueError("successor authority readback is untyped or inconsistent")
+            plan = load_canonical_json(candidate.plan_spec_bytes)
+            if type(plan) is not dict or canonical_bytes(plan) != candidate.plan_spec_bytes:
+                raise ValueError("successor PlanSpec is not canonical")
+            # PlanControl owns the compiler, but the ExecutionKernel owns the
+            # readback fence.  Reuse its closed V3 validator here so a hostile
+            # or stale activator cannot smuggle a partial PlanSpec into the
+            # migration path (which would otherwise fall back to legacy
+            # identity derivation for missing authority facts).
+            from .plan_control import _validate_plan_spec
+
+            _validate_plan_spec(candidate.plan_spec_bytes)
+            if (
+                plan["repository"] != handle.repository
+                or plan["campaign"]["key"] != handle.campaign_key
+                or type(plan["target_branch"]) is not str
+                or not plan["target_branch"]
+            ):
+                raise ValueError("successor PlanSpec identity is malformed")
+            plan_keys: list[str] = []
+            for item in plan["work"]:
+                if (
+                    type(item) is not dict
+                    or type(item.get("key")) is not str
+                    or not item["key"]
+                    or type(item.get("depends_on")) is not list
+                    or type(item.get("exclusive_resources")) is not list
+                    or any(
+                        type(value) is not str or not value
+                        for value in item.get("depends_on", [])
+                        + item.get("exclusive_resources", [])
+                    )
+                ):
+                    raise ValueError("successor PlanSpec work item is invalid")
+                plan_keys.append(item["key"])
+            if len(set(plan_keys)) != len(plan_keys):
+                raise ValueError("successor PlanSpec work keys are not unique")
+            receipt = candidate.activation_receipt
+            claim_proofs = candidate.claim_proofs
+            ready_refs = tuple(
+                sorted(item["source"]["ref"] for item in plan["work"])
+            )
+            if (
+                type(receipt.writer_generation) is not str
+                or not receipt.writer_generation
+                or (
+                    expected_writer_generation is not None
+                    and receipt.writer_generation != expected_writer_generation
+                )
+                or type(receipt.ready_refs) is not tuple
+                or receipt.ready_refs != ready_refs
+                or not receipt.ready_refs
+                or len(set(receipt.ready_refs)) != len(receipt.ready_refs)
+                or any(type(ref) is not str or not ref for ref in receipt.ready_refs)
+                or type(receipt.ticket_keys) is not tuple
+                or any(type(key) is not str or not key for key in receipt.ticket_keys)
+                or tuple(sorted(set(receipt.ticket_keys))) != receipt.ticket_keys
+                or type(receipt.expected_previous_revision_digest) is not str
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", receipt.expected_previous_revision_digest
+                ) is None
+                or type(receipt.planning_stable_action_id) is not str
+                or not receipt.planning_stable_action_id
+                or type(receipt.planning_subject_digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", receipt.planning_subject_digest)
+                is None
+                or type(receipt.planning_preflight_receipt_digest) is not str
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", receipt.planning_preflight_receipt_digest
+                )
+                is None
+                or type(receipt.compilation_record_artifact_digest) is not str
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", receipt.compilation_record_artifact_digest
+                )
+                is None
+                or type(receipt.planning_receipt_digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", receipt.planning_receipt_digest)
+                is None
+                or type(receipt.planning_output_artifact_digest) is not str
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", receipt.planning_output_artifact_digest
+                )
+                is None
+                or type(candidate.current_revision_digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", candidate.current_revision_digest)
+                is None
+            ):
+                raise ValueError("successor Activation Receipt fields are invalid")
+            if type(claim_proofs) is not tuple:
+                raise ValueError("successor claims are not a tuple")
+            if any(type(proof) is not TicketClaimProof for proof in claim_proofs):
+                raise ValueError("successor claims are untyped")
+            if any(
+                type(proof.ticket_key) is not str
+                or not proof.ticket_key
+                or type(proof.repository) is not str
+                or type(proof.campaign_key) is not str
+                or type(proof.plan_revision_digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", proof.plan_revision_digest) is None
+                for proof in claim_proofs
+            ):
+                raise ValueError("successor claim fields are invalid")
+            claim_keys = tuple(proof.ticket_key for proof in claim_proofs)
+            if (
+                candidate.current_revision_digest != receipt.revision_digest
+                or candidate.current_revision_digest
+                == transition["previous_revision_digest"]
+                or receipt.expected_previous_revision_digest
+                != transition["previous_revision_digest"]
+                or receipt.planning_stable_action_id
+                != classification.action_id
+                or digest_bytes(candidate.plan_spec_bytes)
+                != candidate.current_revision_digest
+                or tuple(plan_keys) != receipt.ticket_keys
+                or claim_keys != receipt.ticket_keys
+                or tuple(sorted(set(receipt.ticket_keys))) != receipt.ticket_keys
+                or len(claim_proofs) != len(plan_keys)
+                or any(
+                    proof.repository != handle.repository
+                    or proof.campaign_key != handle.campaign_key
+                    or proof.plan_revision_digest != candidate.current_revision_digest
+                    for proof in claim_proofs
+                )
+            ):
+                raise ValueError("successor authority did not read back exactly")
+            return candidate
+        except Exception as error:
+            raise ExecutionKernelError(
+                "SUCCESSOR_ACTIVATION_READBACK_INVALID",
+                "successor authority did not read back exactly",
+            ) from error
+
+    def _reconcile_successor_revision(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        work: dict[str, dict[str, Any]],
+        plan: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically replace R0 execution state with exact R1 state."""
+
+        classification = self._validate_successor_state_match(active, state)
+        old_runs = state.get("runs")
+        accepted_values = state.get("accepted_results")
+        old_lineage = state.get("revision_lineage", [])
+        if type(old_runs) is not dict or type(accepted_values) is not list:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "predecessor execution state is not migratable",
+            )
+        if type(old_lineage) is not list:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "predecessor revision lineage is not a list",
+            )
+
+        lineage = load_canonical_json(
+            canonical_bytes(
+                {
+                    "kind": "revision_lineage.v1",
+                    "plan_revision_digest": state["plan_revision_digest"],
+                    "activation_receipt_digest": state["activation_receipt_digest"],
+                    "classification_action_id": classification.action_id,
+                    "runs": old_runs,
+                    "accepted_results": accepted_values,
+                    "plan_invalidation": state.get("plan_invalidation", {}),
+                    "plan_invalidation_classifications": state.get(
+                        "plan_invalidation_classifications", {}
+                    ),
+                }
+            )
+        )
+        if type(lineage) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "successor lineage could not be canonicalized",
+            )
+        if lineage in old_lineage:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "successor lineage was already archived in predecessor state",
+            )
+
+        bindings: dict[str, AcceptedResultBinding] = {}
+        for value in accepted_values:
+            if type(value) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "predecessor accepted Result is not an object",
+                )
+            if set(value) == {"ticket_key", "result_digest"}:
+                continue
+            try:
+                binding = AcceptedResultBinding.from_canonical(value)
+            except Exception as error:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "predecessor accepted Result binding is invalid",
+                ) from error
+            if binding.ticket_key in bindings:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "predecessor contains duplicate accepted Results",
+                )
+            bindings[binding.ticket_key] = binding
+
+        successor_accepted: list[dict[str, Any]] = []
+        successor_runs: dict[str, dict[str, Any]] = {}
+        successor_target_digest = _target_facts_digest_for_kernel(plan)
+        for ticket_key in sorted(work):
+            item = work[ticket_key]
+            run = self._new_run_state(plan, ticket_key, item)
+            binding = bindings.get(ticket_key)
+            predecessor_run = old_runs.get(ticket_key)
+            if binding is not None and can_preserve_result(
+                binding,
+                run["work_subject_digest"],
+                successor_target_digest,
+            ):
+                if type(predecessor_run) is not dict:
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "accepted Result has no predecessor Work Run",
+                    )
+                if predecessor_run.get("phase") not in {None, "completed"}:
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "accepted Result is not backed by a completed predecessor Work Run",
+                    )
+                if (
+                    predecessor_run.get("result_digest") not in {None, binding.result_digest}
+                    or (
+                        predecessor_run.get("evidence_digests") is not None
+                        and predecessor_run.get("evidence_digests")
+                        != list(binding.evidence_digests)
+                    )
+                ):
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "accepted Result binding disagrees with its predecessor Work Run",
+                    )
+                run.update(
+                    {
+                        "phase": "completed",
+                        "result_digest": binding.result_digest,
+                        "evidence_digests": list(binding.evidence_digests),
+                    }
+                )
+                successor_accepted.append(binding.canonical())
+            successor_runs[ticket_key] = run
+
+        transition = load_canonical_json(
+            canonical_bytes(state["successor_transition"])
+        )
+        new_state: dict[str, Any] = {
+            "plan_revision_digest": active.current_revision_digest,
+            "activation_receipt_digest": digest_value(
+                active.activation_receipt.__dict__
+            ),
+            "runs": successor_runs,
+            "effects": {},
+            "wake_refs": [],
+            "plan_invalidation": {},
+            "plan_invalidation_resolutions": {},
+            "plan_invalidation_classifications": {},
+            "accepted_results": sorted(
+                successor_accepted,
+                key=lambda value: value["ticket_key"],
+            ),
+            "revision_lineage": [*old_lineage, lineage],
+            "successor_transition": transition,
+        }
+        self._save(active.handle, new_state)
+        readback = self._load(active.handle)
+        if readback != new_state:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "successor execution state did not read back exactly",
+            )
+        state.clear()
+        state.update(readback)
+        return state
+
+    @staticmethod
+    def _new_run_state(
+        plan: Mapping[str, Any],
+        ticket_key: str,
+        work_item: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        subject_digest = _work_subject_digest_for_kernel(plan, work_item)
+        return {
+            "phase": "pending",
+            "slot_held": False,
+            "reason": None,
+            "last_action_id": None,
+            "semantic_action_id": None,
+            "resume_ordinal": 0,
+            "next_check_at": None,
+            "work_subject_digest": subject_digest,
+            "work_run_key": _work_run_key_for_kernel(plan, work_item, subject_digest),
+            "exclusive_resources": list(work_item.get("exclusive_resources", [])),
+            "claim_state": "unclaimed",
+            "candidate_identity": None,
+            "result_digest": None,
+            "evidence_digests": [],
+            "plan_invalidation": None,
+            "plan_invalidation_resolution": None,
+            "resume_after_invalidation": False,
+        }
+
+    @staticmethod
+    def _revision_lineage_summaries(
+        state: Mapping[str, Any],
+    ) -> tuple[RevisionLineageSummary, ...]:
+        records = state.get("revision_lineage", [])
+        if type(records) is not list:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel revision lineage is not a list",
+            )
+        summaries: list[RevisionLineageSummary] = []
+        for record in records:
+            if type(record) is not dict or set(record) != {
+                "kind",
+                "plan_revision_digest",
+                "activation_receipt_digest",
+                "classification_action_id",
+                "runs",
+                "accepted_results",
+                "plan_invalidation",
+                "plan_invalidation_classifications",
+            } or record.get("kind") != "revision_lineage.v1":
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "revision lineage record schema is not exact",
+                )
+            work_run_keys: set[str] = set()
+            workspace_identities: set[str] = set()
+            candidate_identities: set[str] = set()
+            result_digests: set[str] = set()
+            evidence_digests: set[str] = set()
+            runs = record["runs"]
+            if type(runs) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "revision lineage runs are not a mapping",
+                )
+            for run in runs.values():
+                if type(run) is not dict:
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "revision lineage Work Run is not an object",
+                    )
+                for value, target in (
+                    (run.get("work_run_key"), work_run_keys),
+                    (run.get("workspace_identity"), workspace_identities),
+                    (run.get("candidate_identity"), candidate_identities),
+                    (run.get("result_digest"), result_digests),
+                ):
+                    if type(value) is str and value:
+                        target.add(value)
+                evidence = run.get("evidence_digests", [])
+                if type(evidence) is list:
+                    evidence_digests.update(
+                        value for value in evidence if type(value) is str and value
+                    )
+                invalidation = run.get("plan_invalidation")
+                if type(invalidation) is dict:
+                    workspace = invalidation.get("workspace_identity")
+                    if type(workspace) is str and workspace:
+                        workspace_identities.add(workspace)
+            invalidations = record["plan_invalidation"]
+            if type(invalidations) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "revision lineage invalidations are not a mapping",
+                )
+            for invalidation in invalidations.values():
+                if type(invalidation) is dict:
+                    workspace = invalidation.get("workspace_identity")
+                    if type(workspace) is str and workspace:
+                        workspace_identities.add(workspace)
+            accepted = record["accepted_results"]
+            if type(accepted) is not list:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "revision lineage accepted Results are not a list",
+                )
+            for value in accepted:
+                if type(value) is not dict:
+                    continue
+                if set(value) == {"ticket_key", "result_digest"}:
+                    if type(value.get("result_digest")) is str:
+                        result_digests.add(value["result_digest"])
+                    continue
+                try:
+                    binding = AcceptedResultBinding.from_canonical(value)
+                except Exception as error:
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "revision lineage accepted Result is invalid",
+                    ) from error
+                result_digests.add(binding.result_digest)
+                evidence_digests.update(binding.evidence_digests)
+            summaries.append(
+                RevisionLineageSummary(
+                    plan_revision_digest=record["plan_revision_digest"],
+                    activation_receipt_digest=record["activation_receipt_digest"],
+                    classification_action_id=record["classification_action_id"],
+                    work_run_keys=tuple(sorted(work_run_keys)),
+                    workspace_identities=tuple(sorted(workspace_identities)),
+                    candidate_identities=tuple(sorted(candidate_identities)),
+                    result_digests=tuple(sorted(result_digests)),
+                    evidence_digests=tuple(sorted(evidence_digests)),
+                )
+            )
+        return tuple(
+            sorted(
+                summaries,
+                key=lambda summary: (
+                    summary.plan_revision_digest,
+                    summary.activation_receipt_digest,
+                    summary.classification_action_id,
+                ),
+            )
+        )
+
+    @staticmethod
+    def _effect_action_id(
+        active: ActivePlanReadback,
+        ticket_key: str,
+        run: Mapping[str, Any],
+        *,
+        resuming: bool,
+    ) -> str:
+        kind = "semantic_resume" if resuming else "semantic_execution"
+        return digest_value(
+            {
+                "kind": f"work-run.{kind}.v1",
+                "repository": active.handle.repository,
+                "campaign_key": active.handle.campaign_key,
+                "plan_revision_digest": active.current_revision_digest,
+                "ticket_key": ticket_key,
+                "work_run_key": run["work_run_key"],
+                "work_subject_digest": run["work_subject_digest"],
+                "ordinal": run["resume_ordinal"] if resuming else 0,
+            }
+        )
 
     def _next_due_run(
         self,
@@ -861,9 +1880,18 @@ class ExecutionKernel:
                 "Plan Invalidation observation names a Ticket that is not admitted",
             )
         if run.get("work_run_key") != observation.work_run_key:
-            raise ExecutionKernelError(
-                "INVALIDATION_IDENTITY_MISMATCH",
-                "Plan Invalidation observation is not bound to this Work Run",
+            # #133 callers may still report the historical Ticket-shaped key.
+            # Rebind that compatibility spelling to the already persisted
+            # semantic Work Run before recording the observation; any other
+            # mismatch remains fail-closed.
+            if observation.work_run_key != f"work-run:{observation.ticket_key}":
+                raise ExecutionKernelError(
+                    "INVALIDATION_IDENTITY_MISMATCH",
+                    "Plan Invalidation observation is not bound to this Work Run",
+                )
+            observation = replace(
+                observation,
+                work_run_key=run["work_run_key"],
             )
         # A report is only meaningful after the Runtime Binding exists.  A
         # pending/unbound run must not be quiesced by a forged identity.
@@ -1086,10 +2114,35 @@ class ExecutionKernel:
                 "EXECUTION_STORE_INVALID",
                 "ExecutionKernel accepted Results are not a list",
             )
+        snapshot_results: list[dict[str, Any]] = []
+        for result in accepted_results:
+            if type(result) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "ExecutionKernel accepted Result is not an object",
+                )
+            if set(result) == {"ticket_key", "result_digest"}:
+                snapshot_results.append(
+                    {
+                        "ticket_key": result["ticket_key"],
+                        "result_digest": result["result_digest"],
+                    }
+                )
+                continue
+            try:
+                binding = AcceptedResultBinding.from_canonical(result)
+            except Exception as error:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "ExecutionKernel accepted Result binding is invalid",
+                ) from error
+            snapshot_results.append(binding.canonical())
         return {
             "runs": run_facts,
             "claims": sorted(claims, key=lambda item: item["ticket_key"]),
-            "accepted_results": list(accepted_results),
+            "accepted_results": sorted(
+                snapshot_results, key=lambda item: item["ticket_key"]
+            ),
         }
 
     def _current_classification(
@@ -1228,19 +2281,13 @@ class ExecutionKernel:
                     "PLAN_INVALIDATION_TICKET_INVALID",
                     "classification successor names a Ticket outside the active Campaign",
                 )
-            approved_edges = {
-                (dependency, ticket_key)
-                for ticket_key, item in work.items()
-                for dependency in item.get("depends_on", [])
-                if dependency in work
-            }
             if any(
-                (item.from_ticket, item.to_ticket) not in approved_edges
+                item.from_ticket not in work or item.to_ticket not in work
                 for item in classification.dependency_additions
             ):
                 raise ExecutionKernelError(
                     "PLAN_INVALIDATION_DEPENDENCY_UNPROVED",
-                    "classification successor names an unproved dependency",
+                    "classification successor names a Ticket outside the active Campaign",
                 )
         if classification.disposition in {
             PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR,
@@ -1552,15 +2599,8 @@ class ExecutionKernel:
             run.get("resume_after_invalidation")
         )
         kind = "semantic_resume" if resuming else "semantic_execution"
-        action_id = digest_value(
-            {
-                "kind": f"work-run.{kind}.v1",
-                "repository": active.handle.repository,
-                "campaign_key": active.handle.campaign_key,
-                "plan_revision_digest": active.current_revision_digest,
-                "ticket_key": ticket_key,
-                "ordinal": run["resume_ordinal"] if resuming else 0,
-            }
+        action_id = self._effect_action_id(
+            active, ticket_key, run, resuming=resuming
         )
         semantic_action_id = run.get("semantic_action_id") or action_id
         action = WorkRunAction(
@@ -1571,11 +2611,33 @@ class ExecutionKernel:
             ticket_key=ticket_key,
             kind=kind,
             semantic_action_id=semantic_action_id,
+            work_run_key=run["work_run_key"],
+            work_subject_digest=run["work_subject_digest"],
         )
         # The intent becomes durable before the external boundary.  A restart
         # observes this same identity through the effect owner before retry.
         prior_effect = state["effects"].get(action_id)
-        state["effects"].setdefault(action_id, {"state": "intent", "ticket_key": ticket_key})
+        effect_identity = {
+            "plan_revision_digest": active.current_revision_digest,
+            "work_run_key": run["work_run_key"],
+            "work_subject_digest": run["work_subject_digest"],
+        }
+        if prior_effect is not None and any(
+            field in prior_effect and prior_effect[field] != value
+            for field, value in effect_identity.items()
+        ):
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "durable effect intent is not bound to the current revision and Work Run",
+            )
+        state["effects"].setdefault(
+            action_id,
+            {
+                "state": "intent",
+                "ticket_key": ticket_key,
+                **effect_identity,
+            },
+        )
         run["last_action_id"] = action_id
         run["semantic_action_id"] = semantic_action_id
         run["slot_held"] = True
@@ -1603,6 +2665,8 @@ class ExecutionKernel:
         run["claim_state"] = "held" if run["slot_held"] else "released"
         run["last_wake_ref"] = wake_ref
         run["resume_after_invalidation"] = False
+        if observation.candidate_identity is not None:
+            run["candidate_identity"] = observation.candidate_identity
         if observation.phase == "runtime_unavailable" and observation.binding_established:
             # A live unavailable binding retains the Slot until #112 proves a
             # park/terminal transition.  The phase itself is a durable Wait.
@@ -1614,7 +2678,30 @@ class ExecutionKernel:
             "state": "read_back",
             "ticket_key": ticket_key,
             "receipt_digest": observation.receipt_digest,
+            **effect_identity,
         }
+        if observation.phase == "completed":
+            try:
+                plan = load_canonical_json(active.plan_spec_bytes)
+            except CanonicalJsonError as error:  # pragma: no cover - validated earlier
+                raise ExecutionKernelError(
+                    "ACTIVE_PLAN_INVALID", "PlanSpec bytes are not canonical"
+                ) from error
+            binding = AcceptedResultBinding(
+                ticket_key=ticket_key,
+                result_digest=observation.result_digest or observation.receipt_digest,
+                evidence_digests=observation.evidence_digests,
+                work_subject_digest=run["work_subject_digest"],
+                target_facts_digest=_target_facts_digest_for_kernel(plan),
+            )
+            state["accepted_results"] = [
+                value
+                for value in state["accepted_results"]
+                if value["ticket_key"] != ticket_key
+            ] + [binding.canonical()]
+            state["accepted_results"].sort(key=lambda value: value["ticket_key"])
+            run["result_digest"] = binding.result_digest
+            run["evidence_digests"] = list(binding.evidence_digests)
         self._save(active.handle, state)
 
     def _outcome(self, handle: CampaignHandle, state: dict[str, Any] | None) -> CampaignOutcome:

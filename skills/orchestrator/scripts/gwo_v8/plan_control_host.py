@@ -18,6 +18,7 @@ from .plan_control import (
     CampaignSnapshotSource,
     PlanControl,
     PlanControlError,
+    PlanInvalidationClassification,
     PlanControlRepository,
     _handle_ref,
     _install_start_host,
@@ -74,6 +75,10 @@ class _PlanControlGateway:
 
     def progress(self, subject, preflight):
         return self._gateway.progress(subject, preflight)
+
+    def _read_coordinator_capability(self, subject):
+        return self._gateway._read_coordinator_capability(subject)
+
 
 def _mapping(value: Any, label: str) -> ProfileMapping:
     if type(value) is not dict or set(value) != {
@@ -298,6 +303,21 @@ class ProductionPlanControlStartHost:
             campaign_assertions=assertions,
         )
 
+    def _existing_control(self, handle: CampaignHandle) -> PlanControl:
+        """Recompose one existing Campaign without replacing its assertion."""
+
+        assertion_key = (
+            handle.repository,
+            handle.campaign_key,
+            _handle_ref(handle),
+        )
+        assertion = self._configuration.campaign_assertions.get(assertion_key)
+        return self._control_for(
+            handle=handle,
+            assertion=assertion,
+            configuration=self._runtime_configuration_for(handle, assertion),
+        )
+
     def start(
         self,
         repository: str,
@@ -471,17 +491,29 @@ class ProductionPlanControlStartHost:
                 "ACTIVE_READBACK_INVALID",
                 "CampaignHandle belongs to another configured repository",
             )
-        assertion_key = (
-            handle.repository,
-            handle.campaign_key,
-            _handle_ref(handle),
+        return self._existing_control(handle).read_active(handle)
+
+    def classify_plan_invalidations(
+        self,
+        handle: CampaignHandle,
+        invalidations: Sequence[object],
+        execution_snapshot: Mapping[str, Any],
+    ) -> PlanInvalidationClassification | None:
+        return self._existing_control(handle).classify_plan_invalidations(
+            handle,
+            invalidations,
+            execution_snapshot,
         )
-        assertion = self._configuration.campaign_assertions.get(assertion_key)
-        return self._control_for(
-            handle=handle,
-            assertion=assertion,
-            configuration=self._runtime_configuration_for(handle, assertion),
-        ).read_active(handle)
+
+    def activate_successor(
+        self,
+        handle: CampaignHandle,
+        classification: PlanInvalidationClassification,
+    ) -> ActivePlanReadback:
+        return self._existing_control(handle).activate_successor(
+            handle,
+            classification,
+        )
 
     def install_execution_kernel(
         self,

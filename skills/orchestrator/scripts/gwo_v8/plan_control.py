@@ -17,13 +17,19 @@ import threading
 from typing import Any, Mapping, Protocol, Sequence
 
 from ._canonical import CanonicalJsonError, canonical_bytes, digest_bytes, digest_value, load_canonical_json
-from .planning_protocol import planning_prompt, replanning_prompt
+from .planning_protocol import (
+    PLANNING_OUTPUT_PROTOCOL_ID,
+    REPLANNING_OUTPUT_PROTOCOL_ID,
+    planning_prompt,
+    replanning_prompt,
+)
 from .runtime_gateway import (
     CampaignPlanningSubject,
     CoordinatorCapabilityProof,
     PlanningPreflightReceipt,
     PlanningReceipt,
 )
+from .revision_identity import AcceptedResultBinding
 
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -119,6 +125,25 @@ class PlanInvalidationDependency:
 
 
 @dataclass(frozen=True)
+class PlanInvalidationExclusiveResource:
+    ticket_key: str
+    resource_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        _text(self.ticket_key, "Exclusive Resource Ticket")
+        _text(self.resource_id, "Exclusive Resource ID")
+        _text(self.reason, "Exclusive Resource reason")
+
+    def canonical(self) -> dict[str, str]:
+        return {
+            "ticket_key": self.ticket_key,
+            "resource_id": self.resource_id,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class PlanInvalidationDecision:
     """A named human choice required before the Campaign can change."""
 
@@ -167,6 +192,7 @@ class PlanInvalidationClassification:
     capability_proof_digest: str
     successor_ticket_keys: tuple[str, ...] = ()
     dependency_additions: tuple[PlanInvalidationDependency, ...] = ()
+    exclusive_resource_additions: tuple[PlanInvalidationExclusiveResource, ...] = ()
     decision: PlanInvalidationDecision | None = None
 
     def __post_init__(self) -> None:
@@ -228,6 +254,34 @@ class PlanInvalidationClassification:
                 "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
                 "successor dependency additions must be canonical",
             )
+        if type(self.exclusive_resource_additions) is not tuple or any(
+            type(item) is not PlanInvalidationExclusiveResource
+            for item in self.exclusive_resource_additions
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "successor exclusive resource additions are invalid",
+            )
+        if tuple(
+            sorted(
+                self.exclusive_resource_additions,
+                key=lambda item: (item.ticket_key, item.resource_id, item.reason),
+            )
+        ) != self.exclusive_resource_additions:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "successor exclusive resource additions must be canonical",
+            )
+        if len(
+            {
+                (item.ticket_key, item.resource_id)
+                for item in self.exclusive_resource_additions
+            }
+        ) != len(self.exclusive_resource_additions):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "successor exclusive resource additions repeat a resource",
+            )
         if self.decision is not None and type(self.decision) is not PlanInvalidationDecision:
             raise PlanControlError(
                 "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
@@ -240,12 +294,22 @@ class PlanInvalidationClassification:
                     "approved successor classification must name approved work only",
                 )
         elif self.disposition is PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION:
-            if self.decision is None or self.successor_ticket_keys or self.dependency_additions:
+            if (
+                self.decision is None
+                or self.successor_ticket_keys
+                or self.dependency_additions
+                or self.exclusive_resource_additions
+            ):
                 raise PlanControlError(
                     "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
                     "human Decision classification cannot carry successor work",
                 )
-        elif self.successor_ticket_keys or self.dependency_additions or self.decision is not None:
+        elif (
+            self.successor_ticket_keys
+            or self.dependency_additions
+            or self.exclusive_resource_additions
+            or self.decision is not None
+        ):
             raise PlanControlError(
                 "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
                 "resume/defer/reject classification cannot carry plan or Decision changes",
@@ -258,6 +322,9 @@ class PlanInvalidationClassification:
                 "approved_ticket_keys": list(self.successor_ticket_keys),
                 "dependency_additions": [
                     item.canonical() for item in self.dependency_additions
+                ],
+                "exclusive_resource_additions": [
+                    item.canonical() for item in self.exclusive_resource_additions
                 ],
             }
         return {
@@ -308,10 +375,12 @@ class PlanInvalidationClassification:
             if successor is None:
                 successor_keys: tuple[str, ...] = ()
                 dependencies: tuple[PlanInvalidationDependency, ...] = ()
+                resources: tuple[PlanInvalidationExclusiveResource, ...] = ()
             else:
                 if type(successor) is not dict or set(successor) != {
                     "approved_ticket_keys",
                     "dependency_additions",
+                    "exclusive_resource_additions",
                 }:
                     raise PlanControlError(
                         "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
@@ -319,6 +388,7 @@ class PlanInvalidationClassification:
                     )
                 raw_successor_keys = successor["approved_ticket_keys"]
                 raw_dependencies = successor["dependency_additions"]
+                raw_resources = successor["exclusive_resource_additions"]
                 if (
                     type(raw_successor_keys) is not list
                     or any(type(item) is not str for item in raw_successor_keys)
@@ -327,6 +397,12 @@ class PlanInvalidationClassification:
                         type(item) is not dict
                         or set(item) != {"from", "to", "reason"}
                         for item in raw_dependencies
+                    )
+                    or type(raw_resources) is not list
+                    or any(
+                        type(item) is not dict
+                        or set(item) != {"ticket_key", "resource_id", "reason"}
+                        for item in raw_resources
                     )
                 ):
                     raise PlanControlError(
@@ -341,6 +417,14 @@ class PlanInvalidationClassification:
                         reason=item["reason"],
                     )
                     for item in raw_dependencies
+                )
+                resources = tuple(
+                    PlanInvalidationExclusiveResource(
+                        ticket_key=item["ticket_key"],
+                        resource_id=item["resource_id"],
+                        reason=item["reason"],
+                    )
+                    for item in raw_resources
                 )
             if (
                 disposition is not PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR
@@ -374,6 +458,7 @@ class PlanInvalidationClassification:
                 capability_proof_digest=value["capability_proof_digest"],
                 successor_ticket_keys=successor_keys,
                 dependency_additions=dependencies,
+                exclusive_resource_additions=resources,
                 decision=decision,
             )
         except (KeyError, TypeError, ValueError) as error:
@@ -536,12 +621,23 @@ class _PlanningAttempt:
     policy_witness_digest: str
     planning_request_artifact_digest: str
     subject: CampaignPlanningSubject
+    planning_protocol_id: str = PLANNING_OUTPUT_PROTOCOL_ID
     compilation_record_artifact_digest: str | None = None
     revision: PlanRevision | None = None
     # The governed production repository persists this immutable copy so a
     # fresh host can reconstruct the Artifact-backed record before any active
     # Plan readback.  It is absent only while Planning is still incomplete.
     compilation_record_bytes: bytes | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.planning_protocol_id) is not str or self.planning_protocol_id not in {
+            PLANNING_OUTPUT_PROTOCOL_ID,
+            REPLANNING_OUTPUT_PROTOCOL_ID,
+        }:
+            raise PlanControlError(
+                "PLANNING_ATTEMPT_PROTOCOL_INVALID",
+                "Planning attempt protocol is outside the closed protocol union",
+            )
 
 
 class CampaignSnapshotSource(Protocol):
@@ -991,7 +1087,21 @@ class InMemoryPlanRepository:
                         "Pending Ticket reservation changed its immutable identity",
                     )
                 return
-            if self.planning_reservations.get(planning_key) != expected_planning:
+            existing_planning = self.planning_reservations.get(planning_key)
+            if existing_planning is None or any(
+                (
+                    getattr(existing_planning, field)
+                    != getattr(expected_planning, field)
+                )
+                for field in (
+                    "repository",
+                    "campaign_key",
+                    "ticket_keys",
+                    "subject_digest",
+                    "stable_action_id",
+                    "preflight_receipt_digest",
+                )
+            ):
                 raise PlanControlError(
                     "PLANNING_RESERVATION_MISSING",
                     "Plan publication lacks its exact preflight Planning reservation",
@@ -1281,6 +1391,27 @@ class PlanControl:
                         "ACTIVATION_CAS_CONFLICT",
                         "Successor request names a stale previous Plan Revision digest",
                     )
+            successor_attempt = self._repository.read_attempt(handle, expected)
+            if (
+                type(successor_attempt) is _PlanningAttempt
+                and successor_attempt.planning_protocol_id
+                == REPLANNING_OUTPUT_PROTOCOL_ID
+            ):
+                # A tagged successor attempt is already the completed
+                # one-pass continuation.  Dispatch it through the same
+                # no-Gateway activation seam instead of treating its
+                # ``policy_witness`` snapshot as an initial ``policy``
+                # snapshot.
+                self._verify_attempt_artifacts(successor_attempt)
+                self._read_successor_compilation_record(successor_attempt)
+                successor_classification = (
+                    self._read_durable_successor_classification(
+                        handle,
+                        successor_attempt,
+                    )
+                )
+                self.activate_successor(handle, successor_classification)
+                return handle
         if active is not None:
             # This is deliberately before every claim-finalization path.  A
             # topologically plausible forged receipt must never seize Ticket
@@ -1365,11 +1496,15 @@ class PlanControl:
             )
             raise PlanControlDecision(attempt.snapshot_artifact_digest, findings)
 
-        expected_revision = _compile_plan(
-            attempt.snapshot_bytes,
-            attempt.snapshot_artifact_digest,
-            intent_bytes,
-            handle,
+        expected_revision = (
+            self._compile_successor_revision(handle, attempt, intent_bytes)
+            if attempt.planning_protocol_id == REPLANNING_OUTPUT_PROTOCOL_ID
+            else _compile_plan(
+                attempt.snapshot_bytes,
+                attempt.snapshot_artifact_digest,
+                intent_bytes,
+                handle,
+            )
         )
         if attempt.revision is not None:
             _validate_revision_provenance(
@@ -1379,22 +1514,6 @@ class PlanControl:
         revision = expected_revision
         if attempt.revision is None:
             attempt = self._repository.save_attempt(replace(attempt, revision=revision))
-
-        # Both the complete immutable PlanSpec and the full Policy Witness are
-        # digest-addressed facts.  RuntimeGateway and later permission work
-        # can reconstruct authority from these exact bytes without accepting a
-        # mutable PlanControl projection.
-        plan_artifact_digest = _put_canonical(self._artifacts, revision.plan_spec)
-        if (
-            plan_artifact_digest != revision.digest
-            or _read_artifact_json(
-                self._artifacts,
-                plan_artifact_digest,
-                code="PLAN_READBACK_INVALID",
-            )
-            != revision.plan_spec
-        ):
-            raise PlanControlError("PLAN_READBACK_INVALID", "PlanSpec Artifact does not read back at its revision digest")
 
         planning_reservation = self._planning_reservation_from_compilation(
             attempt
@@ -1424,36 +1543,12 @@ class PlanControl:
             ]["planning_output_artifact_digest"],
         )
 
-        # An explicitly replayed successor request is idempotent only when it
-        # reconstructs the exact already-active receipt for the same required
-        # predecessor.  Do not ask it to recreate a consumed reservation.
-        current = self._repository.active_receipt(handle)
-        if current == receipt:
-            self._validate_active_receipt(
-                handle,
-                receipt=current,
-                require_claims=False,
-            )
-            self._repository.finalize_claims(current)
-            self.read_active(handle)
-            return handle
-
-        # Reservation is durable but cannot replace an active claim.  The
-        # revision is published before activation; claims move only after the
-        # winning CAS receipt has read back exactly.
-        self._repository.reserve_claims(receipt)
-        self._repository.publish_revision(revision)
-        if self._repository.read_revision(revision.digest) != revision:
-            raise PlanControlError("PLAN_READBACK_INVALID", "Published Plan Revision does not read back exactly")
-        self._repository.activate(receipt)
-        if self._repository.read_activation(handle) != receipt:
-            raise PlanControlError("ACTIVATION_READBACK_INVALID", "Activation Receipt does not read back exactly")
-        self._validate_active_receipt(
-            handle,
+        self._publish_activate_readback(
+            handle=handle,
+            attempt=attempt,
+            revision=revision,
             receipt=receipt,
-            require_claims=False,
         )
-        self._repository.finalize_claims(receipt)
         return handle
 
     def read_active(self, handle: CampaignHandle) -> ActivePlanReadback:
@@ -1464,6 +1559,374 @@ class PlanControl:
         """
 
         return self._validate_active_receipt(handle, require_claims=True)
+
+    def activate_successor(
+        self,
+        handle: CampaignHandle,
+        classification: PlanInvalidationClassification,
+    ) -> ActivePlanReadback:
+        """Continue one durably completed ``replan:`` action without Gateway work.
+
+        Classification owns the only semantic Planning Pass.  This boundary
+        consumes only its exact repository readback and the frozen successor
+        compilation record; it never asks RuntimeGateway to preflight or
+        progress the action again.
+        """
+
+        if (
+            type(handle) is not CampaignHandle
+            or type(classification) is not PlanInvalidationClassification
+            or classification.disposition
+            is not PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR
+        ):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "successor activation requires one exact approved classification",
+            )
+        durable = self._repository.read_invalidation_classification(
+            handle,
+            classification.action_id,
+        )
+        if durable != classification:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                "successor classification did not read back exactly",
+            )
+        attempt = self._repository.read_attempt(
+            handle,
+            classification.plan_revision_digest,
+        )
+        if type(attempt) is not _PlanningAttempt:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                "successor classification has no exact Planning attempt",
+            )
+        self._verify_attempt_artifacts(attempt)
+        intent_bytes = self._read_successor_compilation_record(attempt)
+        self._validate_successor_classification_readback(
+            handle,
+            attempt,
+            classification,
+        )
+        current = self._repository.active_receipt(handle)
+        if current is None:
+            raise PlanControlError(
+                "ACTIVATION_CAS_CONFLICT",
+                "successor predecessor is no longer active",
+            )
+        if current.revision_digest != classification.plan_revision_digest:
+            return self._read_exact_successor_replay(
+                handle=handle,
+                attempt=attempt,
+                classification=classification,
+                active=current,
+            )
+
+        predecessor = self._validate_active_receipt(
+            handle,
+            receipt=current,
+            require_claims=False,
+        )
+        self._validate_successor_attempt_identity(
+            handle,
+            attempt,
+            predecessor.activation_receipt,
+            classification,
+        )
+        self._validate_fresh_successor_source(handle, attempt)
+
+        revision = self._compile_successor_revision(
+            handle,
+            attempt,
+            intent_bytes,
+        )
+        if attempt.revision is not None:
+            _validate_revision_provenance(attempt.revision, revision)
+            revision = attempt.revision
+        else:
+            attempt = self._repository.save_attempt(
+                replace(attempt, revision=revision)
+            )
+            if self._repository.read_attempt(
+                handle,
+                classification.plan_revision_digest,
+            ) != attempt:
+                raise PlanControlError(
+                    "PLAN_READBACK_INVALID",
+                    "Successor Planning attempt did not read back exactly",
+                )
+        receipt = self._successor_activation_receipt(attempt, revision)
+        return self._publish_activate_readback(
+            handle=handle,
+            attempt=attempt,
+            revision=revision,
+            receipt=receipt,
+        )
+
+    def _read_durable_successor_classification(
+        self,
+        handle: CampaignHandle,
+        attempt: _PlanningAttempt,
+    ) -> PlanInvalidationClassification:
+        record = self._compilation_authority(attempt)
+        try:
+            embedded = PlanInvalidationClassification.from_canonical(
+                record["classification"]
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlanControlError(
+                "COMPILATION_RECORD_INVALID",
+                "Successor compilation record omitted its exact classification",
+            ) from error
+        durable = self._repository.read_invalidation_classification(
+            handle,
+            embedded.action_id,
+        )
+        if durable != embedded:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                "Successor compilation classification does not match durable classification",
+            )
+        return durable
+
+    def _validate_successor_classification_readback(
+        self,
+        handle: CampaignHandle,
+        attempt: _PlanningAttempt,
+        classification: PlanInvalidationClassification,
+    ) -> None:
+        embedded = self._read_durable_successor_classification(handle, attempt)
+        if embedded != classification:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                "Successor classification does not match its immutable compilation record",
+            )
+
+    def _validate_successor_attempt_identity(
+        self,
+        handle: CampaignHandle,
+        attempt: _PlanningAttempt,
+        predecessor: ActivationReceipt,
+        classification: PlanInvalidationClassification,
+    ) -> None:
+        if (
+            attempt.handle != handle
+            or attempt.planning_protocol_id != REPLANNING_OUTPUT_PROTOCOL_ID
+            or attempt.expected_previous_revision_digest
+            != classification.plan_revision_digest
+            or attempt.ready_refs != predecessor.ready_refs
+            or attempt.ticket_keys != predecessor.ticket_keys
+            or attempt.subject.stable_action_id != classification.action_id
+        ):
+            raise PlanControlError(
+                "PLANNING_ATTEMPT_IDENTITY_CONFLICT",
+                "Successor Planning attempt does not bind its active predecessor",
+            )
+
+    def _validate_fresh_successor_source(
+        self,
+        handle: CampaignHandle,
+        attempt: _PlanningAttempt,
+    ) -> None:
+        try:
+            _derive_successor, _compile_successor, validate_fresh = (
+                _successor_plan_api()
+            )
+            fresh = _normalize_snapshot(
+                self._source.snapshot(handle.repository, attempt.ready_refs),
+                handle.repository,
+                attempt.ready_refs,
+                allow_open_external_blockers=True,
+            )
+            validate_fresh(
+                _snapshot_from_bytes(attempt.snapshot_bytes),
+                fresh,
+            )
+        except PlanControlError:
+            raise
+        except Exception as error:
+            raise PlanControlError(
+                getattr(error, "code", "REPLAN_SOURCE_CHANGED"),
+                getattr(error, "detail", "authoritative successor source changed"),
+            ) from error
+
+    def _read_exact_successor_replay(
+        self,
+        *,
+        handle: CampaignHandle,
+        attempt: _PlanningAttempt,
+        classification: PlanInvalidationClassification,
+        active: ActivationReceipt,
+    ) -> ActivePlanReadback:
+        if attempt.revision is None:
+            raise PlanControlError(
+                "ACTIVATION_CAS_CONFLICT",
+                "active revision changed before this successor was durably compiled",
+            )
+        expected = self._successor_activation_receipt(attempt, attempt.revision)
+        if (
+            active != expected
+            or active.expected_previous_revision_digest
+            != classification.plan_revision_digest
+            or active.planning_stable_action_id != classification.action_id
+        ):
+            raise PlanControlError(
+                "ACTIVATION_CAS_CONFLICT",
+                "another successor owns the active Campaign revision",
+            )
+        self._validate_active_receipt(
+            handle,
+            receipt=active,
+            require_claims=False,
+        )
+        self._repository.finalize_claims(active)
+        return self.read_active(handle)
+
+    def _compile_successor_revision(
+        self,
+        handle: CampaignHandle,
+        attempt: _PlanningAttempt,
+        intent_bytes: bytes,
+    ) -> PlanRevision:
+        try:
+            intent = load_canonical_json(intent_bytes)
+            if canonical_bytes(intent) != intent_bytes:
+                raise PlanControlError(
+                    "PLAN_INTENT_READBACK_INVALID",
+                    "Successor normalized intent is not canonical",
+                )
+            _derive, compile_successor, _validate_source = _successor_plan_api()
+            snapshot = _snapshot_from_bytes(attempt.snapshot_bytes)
+            plan = compile_successor(snapshot, intent)
+            payload = canonical_bytes(plan)
+            _validate_plan_spec(payload)
+        except PlanControlError:
+            raise
+        except Exception as error:
+            raise PlanControlError(
+                getattr(error, "code", "SUCCESSOR_PLAN_INVALID"),
+                getattr(error, "detail", "successor PlanSpec compilation failed"),
+            ) from error
+        return PlanRevision(
+            repository=handle.repository,
+            campaign_key=handle.campaign_key,
+            snapshot_digest=attempt.snapshot_artifact_digest,
+            canonical_bytes=payload,
+            digest=digest_bytes(payload),
+        )
+
+    def _successor_activation_receipt(
+        self,
+        attempt: _PlanningAttempt,
+        revision: PlanRevision,
+    ) -> ActivationReceipt:
+        record = self._compilation_authority(attempt)
+        return ActivationReceipt(
+            repository=attempt.handle.repository,
+            campaign_key=attempt.handle.campaign_key,
+            revision_digest=revision.digest,
+            expected_previous_revision_digest=attempt.expected_previous_revision_digest,
+            writer_generation=self._writer_generation(),
+            ready_refs=attempt.ready_refs,
+            ticket_keys=attempt.ticket_keys,
+            planning_subject_digest=attempt.subject.digest,
+            planning_stable_action_id=attempt.subject.stable_action_id,
+            planning_preflight_receipt_digest=record["preflight_receipt"][
+                "receipt_digest"
+            ],
+            compilation_record_artifact_digest=(
+                attempt.compilation_record_artifact_digest
+            ),
+            planning_receipt_digest=record["planning_receipt"]["receipt_digest"],
+            planning_output_artifact_digest=record["planning_receipt"][
+                "planning_output_artifact_digest"
+            ],
+        )
+
+    def _publish_activate_readback(
+        self,
+        *,
+        handle: CampaignHandle,
+        attempt: _PlanningAttempt,
+        revision: PlanRevision,
+        receipt: ActivationReceipt,
+    ) -> ActivePlanReadback:
+        """Run the one publication/CAS/claim-readback sequence for every revision."""
+
+        current = self._repository.active_receipt(handle)
+        if current == receipt:
+            self._validate_active_receipt(
+                handle,
+                receipt=current,
+                require_claims=False,
+            )
+            self._repository.finalize_claims(current)
+            return self.read_active(handle)
+        pending_reservation = self._repository.read_pending_reservation(receipt)
+        if pending_reservation != receipt:
+            planning_reservation = self._repository.read_planning_reservation(
+                handle,
+                attempt.subject.stable_action_id,
+            )
+            if (
+                planning_reservation is None
+                or planning_reservation.subject_digest != attempt.subject.digest
+                or planning_reservation.ticket_keys != attempt.ticket_keys
+                or planning_reservation.preflight_receipt_digest
+                != receipt.planning_preflight_receipt_digest
+                or (
+                    attempt.planning_protocol_id == REPLANNING_OUTPUT_PROTOCOL_ID
+                    and (
+                        planning_reservation.snapshot_artifact_digest
+                        != attempt.snapshot_artifact_digest
+                        or planning_reservation.policy_witness_digest
+                        != attempt.policy_witness_digest
+                        or planning_reservation.planning_request_artifact_digest
+                        != attempt.planning_request_artifact_digest
+                    )
+                )
+            ):
+                raise PlanControlError(
+                    "PLANNING_RESERVATION_MISSING",
+                    "Plan activation lacks its exact retained Planning reservation",
+                )
+        plan_artifact_digest = _put_canonical(
+            self._artifacts,
+            revision.plan_spec,
+        )
+        if (
+            plan_artifact_digest != revision.digest
+            or _read_artifact_json(
+                self._artifacts,
+                revision.digest,
+                code="PLAN_READBACK_INVALID",
+            )
+            != revision.plan_spec
+        ):
+            raise PlanControlError(
+                "PLAN_READBACK_INVALID",
+                "PlanSpec Artifact does not read back exactly",
+            )
+        self._repository.reserve_claims(receipt)
+        self._repository.publish_revision(revision)
+        if self._repository.read_revision(revision.digest) != revision:
+            raise PlanControlError(
+                "PLAN_READBACK_INVALID",
+                "Published Plan Revision does not read back exactly",
+            )
+        self._repository.activate(receipt)
+        if self._repository.read_activation(handle) != receipt:
+            raise PlanControlError(
+                "ACTIVATION_READBACK_INVALID",
+                "Activation Receipt does not read back exactly",
+            )
+        self._validate_active_receipt(
+            handle,
+            receipt=receipt,
+            require_claims=False,
+        )
+        self._repository.finalize_claims(receipt)
+        return self.read_active(handle)
 
     def classify_plan_invalidations(
         self,
@@ -1585,6 +2048,12 @@ class PlanControl:
                 snapshot_digest,
                 code="PLAN_INVALIDATION_SNAPSHOT_INVALID",
             )
+            snapshot_bytes = canonical_bytes(snapshot)
+            if digest_bytes(snapshot_bytes) != snapshot_digest:
+                raise PlanControlError(
+                    "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                    "invalidation Planning reservation snapshot bytes changed",
+                )
             stored_request = _read_artifact_json(
                 self._artifacts,
                 request_ref,
@@ -1641,6 +2110,11 @@ class PlanControl:
             "read_invalidation_classification",
             None,
         )
+        saver = getattr(
+            self._repository,
+            "save_invalidation_classification",
+            None,
+        )
         if callable(read_result):
             existing = read_result(handle, action_id)
             if existing is not None:
@@ -1678,6 +2152,32 @@ class PlanControl:
                     evidence_digests=evidence_digests,
                     snapshot=stored_snapshot,
                 )
+                if existing.disposition is PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR:
+                    persisted_attempt = self._repository.read_attempt(
+                        handle,
+                        existing.plan_revision_digest,
+                    )
+                    if (
+                        type(persisted_attempt) is not _PlanningAttempt
+                        or persisted_attempt.planning_protocol_id
+                        != REPLANNING_OUTPUT_PROTOCOL_ID
+                        or persisted_attempt.compilation_record_artifact_digest
+                        is None
+                    ):
+                        raise PlanControlError(
+                            "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                            "successor classification has no exact durable Planning attempt",
+                        )
+                    self._read_successor_compilation_record(persisted_attempt)
+                    retained = self._repository.read_planning_reservation(
+                        handle,
+                        existing.action_id,
+                    )
+                    if retained is None:
+                        raise PlanControlError(
+                            "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                            "successor classification lost its retained Planning reservation",
+                        )
                 return existing
 
         reservation = self._replanning_reservation(
@@ -1712,6 +2212,61 @@ class PlanControl:
             )
             self._repository.reserve_planning(reservation)
         _validate_preflight(preflight, subject)
+
+        # A crash after the successor attempt is durably committed but before
+        # its classification is saved must resume from that exact one-pass
+        # record.  Re-entering RuntimeGateway here would create a second
+        # semantic Planning Pass and could produce a different classification
+        # for the same stable action.
+        persisted_attempt = self._repository.read_attempt(
+            handle,
+            active.current_revision_digest,
+        )
+        if (
+            type(persisted_attempt) is _PlanningAttempt
+            and persisted_attempt.planning_protocol_id
+            == REPLANNING_OUTPUT_PROTOCOL_ID
+        ):
+            if existing_reservation is None:
+                raise PlanControlError(
+                    "PLANNING_RESERVATION_MISSING",
+                    "Successor Planning attempt has no retained Planning reservation",
+                )
+            record = self._compilation_authority(persisted_attempt)
+            recovered = PlanInvalidationClassification.from_canonical(
+                record["classification"]
+            )
+            _validate_classification_binding(
+                recovered,
+                action_id=action_id,
+                snapshot_digest=snapshot_digest,
+                plan_revision_digest=active.current_revision_digest,
+                evidence_digests=evidence_digests,
+                snapshot=snapshot,
+            )
+            retained = self._repository.read_planning_reservation(
+                handle,
+                recovered.action_id,
+            )
+            if retained != existing_reservation:
+                raise PlanControlError(
+                    "PLANNING_RESERVATION_READBACK_INVALID",
+                    "Successor Planning reservation changed during recovery",
+                )
+            if callable(saver):
+                saver(handle, recovered)
+                readback = (
+                    read_result(handle, recovered.action_id)
+                    if callable(read_result)
+                    else recovered
+                )
+                if readback != recovered:
+                    raise PlanControlError(
+                        "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+                        "recovered successor classification did not read back exactly",
+                    )
+            return recovered
+
         proof_reader = getattr(self._gateway, "_read_coordinator_capability", None)
         if not callable(proof_reader):
             # Keep compatibility with narrow test/host doubles that exposed
@@ -1741,11 +2296,22 @@ class PlanControl:
             evidence_digests=evidence_digests,
             capability_proof_digest=proof.digest,
         )
-        saver = getattr(
-            self._repository,
-            "save_invalidation_classification",
-            None,
-        )
+        successor_attempt = None
+        if classification.disposition is PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR:
+            successor_attempt = self._save_completed_successor_attempt(
+                handle=handle,
+                active=active,
+                snapshot=snapshot,
+                snapshot_bytes=snapshot_bytes,
+                snapshot_digest=snapshot_digest,
+                subject=subject,
+                preflight=preflight,
+                receipt=receipt,
+                proof=proof,
+                classification=classification,
+                reservation=reservation,
+                output_digest=output_digest,
+            )
         if callable(saver):
             saver(handle, classification)
             readback = read_result(handle, action_id) if callable(read_result) else classification
@@ -1754,8 +2320,131 @@ class PlanControl:
                     "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
                     "classification did not read back exactly",
                 )
-        self._repository.release_planning(reservation)
+        if classification.disposition is not PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR:
+            self._repository.release_planning(reservation)
+        elif successor_attempt is None:
+            raise PlanControlError(
+                "COMPILATION_RECORD_INVALID",
+                "successor classification was not bound to a completed attempt",
+            )
         return classification
+
+    def _save_completed_successor_attempt(
+        self,
+        *,
+        handle: CampaignHandle,
+        active: ActivePlanReadback,
+        snapshot: Mapping[str, Any],
+        snapshot_bytes: bytes,
+        snapshot_digest: str,
+        subject: CampaignPlanningSubject,
+        preflight: PlanningPreflightReceipt,
+        receipt: PlanningReceipt,
+        proof: CoordinatorCapabilityProof,
+        classification: PlanInvalidationClassification,
+        reservation: PlanningReservation,
+        output_digest: str,
+    ) -> _PlanningAttempt:
+        """Persist the completed replan pass before its classification."""
+
+        if receipt.status != "completed":
+            raise PlanControlError(
+                "RUNTIME_PLANNING_RECEIPT_INVALID",
+                "successor attempt requires a completed Planning Receipt",
+            )
+        try:
+            derive_successor, _compile_successor, _validate_source = _successor_plan_api()
+            normalized_intent = derive_successor(
+                snapshot,
+                classification.canonical(),
+            )
+        except PlanControlError:
+            raise
+        except Exception as error:
+            raise PlanControlError(
+                getattr(error, "code", "SUCCESSOR_PLAN_INVALID"),
+                getattr(error, "detail", "successor intent derivation failed"),
+            ) from error
+        output_value = _read_artifact_json(
+            self._artifacts,
+            output_digest,
+            code="RUNTIME_PLANNING_OUTPUT_INVALID",
+        )
+        record = {
+            "schema_version": "gwo.plan.successor-compilation.v1",
+            "subject": subject.canonical(),
+            "subject_digest": subject.digest,
+            "snapshot_artifact_digest": snapshot_digest,
+            "policy_witness_digest": subject.policy_witness_digest,
+            "planning_request_artifact_digest": subject.planning_request_artifact_digest,
+            "stable_action_id": subject.stable_action_id,
+            "preflight_receipt": {
+                "subject_digest": preflight.subject_digest,
+                "stable_action_id": preflight.stable_action_id,
+                "receipt_digest": preflight.receipt_digest,
+            },
+            "planning_receipt": {
+                "subject_digest": receipt.subject_digest,
+                "stable_action_id": receipt.stable_action_id,
+                "status": receipt.status,
+                "receipt_digest": receipt.receipt_digest,
+                "command": None,
+                "wake_cursor": receipt.wake_cursor,
+                "wake_hints": list(receipt.wake_hints),
+                "output_artifact_digest": receipt.output_artifact_digest,
+                "planning_output_artifact_digest": receipt.planning_output_artifact_digest,
+            },
+            "output_artifact_digest": output_digest,
+            "planning_output": output_value,
+            "coordinator_capability_proof": proof.canonical(),
+            "coordinator_capability_proof_digest": proof.digest,
+            "classification": classification.canonical(),
+            "classification_digest": classification.digest,
+            "normalized_intent": normalized_intent,
+            "normalized_intent_digest": digest_value(normalized_intent),
+        }
+        record_bytes = canonical_bytes(record)
+        record_digest = _put_canonical(self._artifacts, record)
+        if record_digest != digest_bytes(record_bytes):
+            raise PlanControlError(
+                "COMPILATION_RECORD_INVALID",
+                "Successor compilation record Artifact changed its canonical bytes",
+            )
+        attempt = _PlanningAttempt(
+            handle=handle,
+            ready_refs=active.activation_receipt.ready_refs,
+            ticket_keys=active.activation_receipt.ticket_keys,
+            expected_previous_revision_digest=active.current_revision_digest,
+            snapshot_bytes=snapshot_bytes,
+            snapshot_artifact_digest=snapshot_digest,
+            policy_witness_digest=subject.policy_witness_digest,
+            planning_request_artifact_digest=subject.planning_request_artifact_digest,
+            subject=subject,
+            planning_protocol_id=REPLANNING_OUTPUT_PROTOCOL_ID,
+            compilation_record_artifact_digest=record_digest,
+            compilation_record_bytes=record_bytes,
+        )
+        saved = self._repository.save_attempt(attempt)
+        readback = self._repository.read_attempt(
+            handle,
+            active.current_revision_digest,
+        )
+        if readback != saved:
+            raise PlanControlError(
+                "PLANNING_ATTEMPT_READBACK_INVALID",
+                "Successor Planning attempt did not read back exactly",
+            )
+        self._read_successor_compilation_record(readback)
+        retained = self._repository.read_planning_reservation(
+            handle,
+            subject.stable_action_id,
+        )
+        if retained != reservation:
+            raise PlanControlError(
+                "PLANNING_RESERVATION_READBACK_INVALID",
+                "Successor Planning reservation did not read back exactly",
+            )
+        return readback
 
     def _replanning_reservation(
         self,
@@ -2012,11 +2701,15 @@ class PlanControl:
         # Rebuild it from the frozen snapshot and validated one-pass intent on
         # every active readback so a self-consistent repository substitution
         # cannot redirect an already activated Campaign.
-        expected_revision = _compile_plan(
-            attempt.snapshot_bytes,
-            attempt.snapshot_artifact_digest,
-            intent_bytes,
-            handle,
+        expected_revision = (
+            self._compile_successor_revision(handle, attempt, intent_bytes)
+            if attempt.planning_protocol_id == REPLANNING_OUTPUT_PROTOCOL_ID
+            else _compile_plan(
+                attempt.snapshot_bytes,
+                attempt.snapshot_artifact_digest,
+                intent_bytes,
+                handle,
+            )
         )
         _validate_revision_provenance(revision, expected_revision)
         _validate_plan_spec(revision.canonical_bytes)
@@ -2322,6 +3015,13 @@ class PlanControl:
         )
 
     def _read_compilation_record(self, attempt: _PlanningAttempt) -> bytes:
+        if attempt.planning_protocol_id == REPLANNING_OUTPUT_PROTOCOL_ID:
+            return self._read_successor_compilation_record(attempt)
+        if attempt.planning_protocol_id != PLANNING_OUTPUT_PROTOCOL_ID:
+            raise PlanControlError(
+                "COMPILATION_RECORD_INVALID",
+                "Planning attempt names an unsupported protocol",
+            )
         digest = attempt.compilation_record_artifact_digest
         if digest is None:
             raise PlanControlError(
@@ -2334,16 +3034,20 @@ class PlanControl:
                 digest,
                 code="COMPILATION_RECORD_INVALID",
             )
-            if attempt.compilation_record_bytes is not None:
-                if (
-                    digest_bytes(attempt.compilation_record_bytes) != digest
-                    or load_canonical_json(attempt.compilation_record_bytes)
-                    != record
-                ):
-                    raise PlanControlError(
-                        "COMPILATION_RECORD_INVALID",
-                        "Durable compilation record bytes do not bind the Artifact",
-                    )
+            if type(attempt.compilation_record_bytes) is not bytes:
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Durable compilation record bytes are missing",
+                )
+            if (
+                digest_bytes(attempt.compilation_record_bytes) != digest
+                or load_canonical_json(attempt.compilation_record_bytes) != record
+                or canonical_bytes(record) != attempt.compilation_record_bytes
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Durable compilation record bytes do not bind the Artifact",
+                )
             expected = {
                 "schema_version",
                 "subject",
@@ -2497,6 +3201,252 @@ class PlanControl:
                 "Compilation record is missing or malformed",
             ) from error
 
+    def _read_successor_compilation_record(
+        self,
+        attempt: _PlanningAttempt,
+    ) -> bytes:
+        """Decode one exact successor compilation record and its authority."""
+
+        digest = attempt.compilation_record_artifact_digest
+        if digest is None:
+            raise PlanControlError(
+                "COMPILATION_RECORD_INVALID",
+                "Successor attempt has no completed compilation record",
+            )
+        try:
+            record = _read_artifact_json(
+                self._artifacts,
+                digest,
+                code="COMPILATION_RECORD_INVALID",
+            )
+            if type(attempt.compilation_record_bytes) is not bytes:
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Durable successor compilation record bytes are missing",
+                )
+            if (
+                digest_bytes(attempt.compilation_record_bytes) != digest
+                or load_canonical_json(attempt.compilation_record_bytes) != record
+                or canonical_bytes(record) != attempt.compilation_record_bytes
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Durable successor compilation record bytes do not bind the Artifact",
+                )
+            expected = {
+                "schema_version",
+                "subject",
+                "subject_digest",
+                "snapshot_artifact_digest",
+                "policy_witness_digest",
+                "planning_request_artifact_digest",
+                "stable_action_id",
+                "preflight_receipt",
+                "planning_receipt",
+                "output_artifact_digest",
+                "planning_output",
+                "coordinator_capability_proof",
+                "coordinator_capability_proof_digest",
+                "classification",
+                "classification_digest",
+                "normalized_intent",
+                "normalized_intent_digest",
+            }
+            if (
+                type(record) is not dict
+                or set(record) != expected
+                or record["schema_version"]
+                != "gwo.plan.successor-compilation.v1"
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Successor compilation record has an unknown schema",
+                )
+
+            raw_subject = record["subject"]
+            if type(raw_subject) is not dict or set(raw_subject) != {
+                "kind",
+                "repository",
+                "campaign_key",
+                "campaign_handle",
+                "expected_previous_plan_revision_digest",
+                "snapshot_artifact_digest",
+                "policy_witness_digest",
+                "planning_request_artifact_digest",
+                "stable_action_id",
+            } or raw_subject.get("kind") != "campaign_planning":
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Successor Planning subject is malformed",
+                )
+            subject = CampaignPlanningSubject(
+                **{
+                    key: value
+                    for key, value in raw_subject.items()
+                    if key != "kind"
+                }
+            )
+            if (
+                subject != attempt.subject
+                or record["subject_digest"] != subject.digest
+                or record["snapshot_artifact_digest"]
+                != attempt.snapshot_artifact_digest
+                or record["policy_witness_digest"]
+                != attempt.policy_witness_digest
+                or record["planning_request_artifact_digest"]
+                != attempt.planning_request_artifact_digest
+                or record["stable_action_id"] != subject.stable_action_id
+                or attempt.expected_previous_revision_digest is None
+                or subject.expected_previous_plan_revision_digest
+                != attempt.expected_previous_revision_digest
+                or not subject.stable_action_id.startswith("replan:")
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Successor compilation record changed its immutable subject binding",
+                )
+
+            preflight_value = record["preflight_receipt"]
+            if type(preflight_value) is not dict or set(preflight_value) != {
+                "subject_digest",
+                "stable_action_id",
+                "receipt_digest",
+            }:
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Successor preflight receipt is malformed",
+                )
+            preflight = PlanningPreflightReceipt(**preflight_value)
+            _validate_preflight(preflight, subject)
+
+            planning_value = record["planning_receipt"]
+            if type(planning_value) is not dict or set(planning_value) != {
+                "subject_digest",
+                "stable_action_id",
+                "status",
+                "receipt_digest",
+                "command",
+                "wake_cursor",
+                "wake_hints",
+                "output_artifact_digest",
+                "planning_output_artifact_digest",
+            } or type(planning_value["wake_hints"]) is not list:
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Successor Planning receipt is malformed",
+                )
+            planning = PlanningReceipt(
+                **{
+                    **planning_value,
+                    "wake_hints": tuple(planning_value["wake_hints"]),
+                }
+            )
+            _validate_planning_receipt(planning, subject)
+            if (
+                planning.status != "completed"
+                or planning.planning_output_artifact_digest
+                != record["output_artifact_digest"]
+                or record["output_artifact_digest"]
+                != record["planning_receipt"]["planning_output_artifact_digest"]
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Successor record is not bound to one completed Planning receipt",
+                )
+
+            output = _read_artifact_json(
+                self._artifacts,
+                record["output_artifact_digest"],
+                code="RUNTIME_PLANNING_OUTPUT_INVALID",
+            )
+            if output != record["planning_output"]:
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Successor Planning output does not read back exactly",
+                )
+            payload = _planning_payload(
+                self._artifacts,
+                record["output_artifact_digest"],
+                subject,
+            )
+
+            proof_value = record["coordinator_capability_proof"]
+            if type(proof_value) is not dict or set(proof_value) != {
+                "subject_digest",
+                "repository_read_only",
+                "tracker_read_only",
+                "can_activate_plan_revision",
+                "can_edit_tracker",
+                "can_expand_authority",
+                "delegation_enabled",
+            }:
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Successor Coordinator capability proof is malformed",
+                )
+            proof = CoordinatorCapabilityProof(**proof_value)
+            _validate_coordinator_capability(proof, subject)
+            if record["coordinator_capability_proof_digest"] != proof.digest:
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Successor Coordinator capability proof digest changed",
+                )
+
+            classification = PlanInvalidationClassification.from_canonical(
+                record["classification"]
+            )
+            if (
+                record["classification_digest"] != classification.digest
+                or classification.action_id != subject.stable_action_id
+                or classification.snapshot_digest
+                != attempt.snapshot_artifact_digest
+                or classification.plan_revision_digest
+                != attempt.expected_previous_revision_digest
+                or classification.capability_proof_digest != proof.digest
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Successor classification is not bound to its exact subject",
+                )
+
+            output_classification = _normalize_replanning_intent(
+                payload,
+                snapshot=_snapshot_from_bytes(attempt.snapshot_bytes),
+                action_id=classification.action_id,
+                snapshot_digest=classification.snapshot_digest,
+                plan_revision_digest=classification.plan_revision_digest,
+                evidence_digests=classification.evidence_digests,
+                capability_proof_digest=proof.digest,
+            )
+            if output_classification != classification:
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Successor output classification does not read back exactly",
+                )
+
+            derive_successor, _compile_successor, _validate_source = _successor_plan_api()
+            normalized = derive_successor(
+                _snapshot_from_bytes(attempt.snapshot_bytes),
+                classification.canonical(),
+            )
+            if (
+                record["normalized_intent"] != normalized
+                or record["normalized_intent_digest"] != digest_value(normalized)
+                or canonical_bytes(normalized) != canonical_bytes(record["normalized_intent"])
+            ):
+                raise PlanControlError(
+                    "COMPILATION_RECORD_INVALID",
+                    "Successor normalized intent changed identity",
+                )
+            return canonical_bytes(normalized)
+        except PlanControlError:
+            raise
+        except Exception as error:
+            raise PlanControlError(
+                getattr(error, "code", "COMPILATION_RECORD_INVALID"),
+                getattr(error, "detail", "Successor compilation record is missing or malformed"),
+            ) from error
+
     def _compilation_authority(
         self,
         attempt: _PlanningAttempt,
@@ -2572,6 +3522,26 @@ class PlanControl:
     def _verify_attempt_artifacts(self, attempt: _PlanningAttempt) -> None:
         """Read back the immutable snapshot and Policy Witness before use."""
 
+        if type(attempt) is not _PlanningAttempt:
+            raise PlanControlError(
+                "PLANNING_ATTEMPT_IDENTITY_CONFLICT",
+                "Planning attempt is not the exact durable attempt type",
+            )
+        if type(attempt.snapshot_bytes) is not bytes:
+            raise PlanControlError(
+                "SNAPSHOT_READBACK_INVALID",
+                "Planning attempt snapshot bytes are missing",
+            )
+        if type(attempt.handle) is not CampaignHandle:
+            raise PlanControlError(
+                "PLANNING_ATTEMPT_IDENTITY_CONFLICT",
+                "Planning attempt handle is malformed",
+            )
+        if type(attempt.subject) is not CampaignPlanningSubject:
+            raise PlanControlError(
+                "PLANNING_ATTEMPT_IDENTITY_CONFLICT",
+                "Planning attempt subject is malformed",
+            )
         snapshot = _snapshot_from_bytes(attempt.snapshot_bytes)
         if digest_bytes(attempt.snapshot_bytes) != attempt.snapshot_artifact_digest:
             raise PlanControlError("SNAPSHOT_DIGEST_MISMATCH", "Attempt snapshot digest changed")
@@ -2584,7 +3554,18 @@ class PlanControl:
             != snapshot
         ):
             raise PlanControlError("SNAPSHOT_READBACK_INVALID", "Snapshot Artifact does not read back exactly")
-        witness = {key: value for key, value in snapshot["policy"].items() if key != "digest"}
+        policy_key = (
+            "policy_witness"
+            if attempt.planning_protocol_id == REPLANNING_OUTPUT_PROTOCOL_ID
+            else "policy"
+        )
+        policy_value = snapshot.get(policy_key)
+        if type(policy_value) is not dict:
+            raise PlanControlError(
+                "SNAPSHOT_READBACK_INVALID",
+                f"Snapshot omitted its required {policy_key} binding",
+            )
+        witness = {key: value for key, value in policy_value.items() if key != "digest"}
         if (
             digest_value(witness) != attempt.policy_witness_digest
             or _read_artifact_json(
@@ -2615,7 +3596,11 @@ class PlanControl:
             or subject.policy_witness_digest != attempt.policy_witness_digest
             or subject.planning_request_artifact_digest
             != attempt.planning_request_artifact_digest
-            or subject.stable_action_id != expected_action
+            or (
+                subject.stable_action_id != expected_action
+                if attempt.planning_protocol_id == PLANNING_OUTPUT_PROTOCOL_ID
+                else not subject.stable_action_id.startswith("replan:")
+            )
         ):
             raise PlanControlError(
                 "PLANNING_ATTEMPT_IDENTITY_CONFLICT",
@@ -2626,12 +3611,22 @@ class PlanControl:
             attempt.planning_request_artifact_digest,
             code="PLANNING_REQUEST_INVALID",
         )
-        if request != planning_prompt(
-            subject_digest=subject.prompt_binding_digest,
-            authority_digest=attempt.policy_witness_digest,
-            snapshot_artifact_digest=attempt.snapshot_artifact_digest,
-            policy_witness_artifact_digest=attempt.policy_witness_digest,
-        ):
+        expected_request = (
+            planning_prompt(
+                subject_digest=subject.prompt_binding_digest,
+                authority_digest=attempt.policy_witness_digest,
+                snapshot_artifact_digest=attempt.snapshot_artifact_digest,
+                policy_witness_artifact_digest=attempt.policy_witness_digest,
+            )
+            if attempt.planning_protocol_id == PLANNING_OUTPUT_PROTOCOL_ID
+            else replanning_prompt(
+                subject_digest=subject.prompt_binding_digest,
+                authority_digest=attempt.policy_witness_digest,
+                snapshot_artifact_digest=attempt.snapshot_artifact_digest,
+                policy_witness_artifact_digest=attempt.policy_witness_digest,
+            )
+        )
+        if request != expected_request:
             raise PlanControlError(
                 "PLANNING_REQUEST_INVALID",
                 "Planning request Artifact changed its subject or authority binding",
@@ -3553,20 +4548,47 @@ def _normalize_replanning_execution_snapshot(
             "PLAN_INVALIDATION_SNAPSHOT_INVALID",
             "accepted Results are not a list",
         )
-    normalized_results: list[dict[str, str]] = []
+    normalized_results: list[dict[str, Any]] = []
     for result in results:
-        if type(result) is not dict or set(result) != {"ticket_key", "result_digest"}:
+        if type(result) is not dict:
             raise PlanControlError(
                 "PLAN_INVALIDATION_SNAPSHOT_INVALID",
                 "accepted Result schema is not closed",
             )
-        if result["ticket_key"] not in ticket_keys:
+        if set(result) == {"ticket_key", "result_digest"}:
+            if result["ticket_key"] not in ticket_keys:
+                raise PlanControlError(
+                    "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                    "accepted Result names an unapproved Ticket",
+                )
+            _digest(result["result_digest"], "accepted Result digest")
+            normalized_results.append(dict(result))
+            continue
+        if set(result) != {
+            "kind",
+            "ticket_key",
+            "result_digest",
+            "evidence_digests",
+            "work_subject_digest",
+            "target_facts_digest",
+        }:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "accepted Result schema is not closed",
+            )
+        try:
+            binding = AcceptedResultBinding.from_canonical(result)
+        except (KeyError, TypeError, ValueError) as error:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                "accepted Result binding identities are malformed",
+            ) from error
+        if binding.ticket_key not in ticket_keys:
             raise PlanControlError(
                 "PLAN_INVALIDATION_SNAPSHOT_INVALID",
                 "accepted Result names an unapproved Ticket",
             )
-        _digest(result["result_digest"], "accepted Result digest")
-        normalized_results.append(dict(result))
+        normalized_results.append(binding.canonical())
     return {
         "runs": sorted(normalized_runs, key=lambda item: item["ticket_key"]),
         "claims": sorted(normalized_claims, key=lambda item: item["ticket_key"]),
@@ -3754,10 +4776,12 @@ def _normalize_replanning_intent(
     }
     successor_keys: tuple[str, ...] = ()
     dependencies: tuple[PlanInvalidationDependency, ...] = ()
+    resources: tuple[PlanInvalidationExclusiveResource, ...] = ()
     if successor is not None:
         if type(successor) is not dict or set(successor) != {
             "approved_ticket_keys",
             "dependency_additions",
+            "exclusive_resource_additions",
         }:
             raise PlanControlError(
                 "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
@@ -3798,17 +4822,33 @@ def _normalize_replanning_intent(
                 "PLAN_INVALIDATION_DEPENDENCY_INVALID",
                 "Coordinator successor dependencies repeat an edge",
             )
-        allowed_edges = {
-            (item["from"], item["to"])
-            for item in snapshot["approved_dependency_edges"]
-        }
-        if any(
-            (item.from_ticket, item.to_ticket) not in allowed_edges
-            for item in dependencies
+        raw_resources = successor["exclusive_resource_additions"]
+        if type(raw_resources) is not list or any(
+            type(item) is not dict
+            or set(item) != {"ticket_key", "resource_id", "reason"}
+            for item in raw_resources
         ):
             raise PlanControlError(
-                "PLAN_INVALIDATION_DEPENDENCY_UNPROVED",
-                "Coordinator successor names a dependency not proved by the frozen Campaign graph",
+                "PLAN_INVALIDATION_RESOURCE_INVALID",
+                "Coordinator successor Exclusive Resources are not a closed list",
+            )
+        resources = tuple(
+            PlanInvalidationExclusiveResource(
+                ticket_key=item["ticket_key"],
+                resource_id=item["resource_id"],
+                reason=item["reason"],
+            )
+            for item in raw_resources
+        )
+        if any(item.ticket_key not in ticket_keys for item in resources):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_TICKET_INVALID",
+                "Coordinator successor Exclusive Resource names an unapproved Ticket",
+            )
+        if len({(item.ticket_key, item.resource_id) for item in resources}) != len(resources):
+            raise PlanControlError(
+                "PLAN_INVALIDATION_RESOURCE_INVALID",
+                "Coordinator successor Exclusive Resources repeat a resource",
             )
     if disposition is PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR:
         if successor is None or decision is not None:
@@ -3859,6 +4899,12 @@ def _normalize_replanning_intent(
                 key=lambda item: (item.from_ticket, item.to_ticket, item.reason),
             )
         ),
+        exclusive_resource_additions=tuple(
+            sorted(
+                resources,
+                key=lambda item: (item.ticket_key, item.resource_id, item.reason),
+            )
+        ),
         decision=decision_value,
     )
 
@@ -3894,17 +4940,13 @@ def _validate_classification_binding(
                 "PLAN_INVALIDATION_TICKET_INVALID",
                 "persisted successor names an unapproved Ticket",
             )
-        allowed_edges = {
-            (item["from"], item["to"])
-            for item in snapshot["approved_dependency_edges"]
-        }
         if any(
-            (item.from_ticket, item.to_ticket) not in allowed_edges
-            for item in classification.dependency_additions
+            item.ticket_key not in allowed
+            for item in classification.exclusive_resource_additions
         ):
             raise PlanControlError(
-                "PLAN_INVALIDATION_DEPENDENCY_UNPROVED",
-                "persisted successor names an unproved dependency",
+                "PLAN_INVALIDATION_TICKET_INVALID",
+                "persisted successor Exclusive Resource names an unapproved Ticket",
             )
     return classification
 
@@ -4275,6 +5317,27 @@ def _planning_payload(artifacts: PlanningArtifacts, output_digest: str, subject:
     if type(output) is not dict or set(output) != expected or output["schema_version"] != "gwo.runtime.output.v1" or output["subject_digest"] != subject.digest or output["stable_action_id"] != subject.stable_action_id or output["authority_digest"] != subject.authority_digest:
         raise PlanControlError("RUNTIME_PLANNING_OUTPUT_INVALID", "Planning output Artifact does not bind its exact subject and authority")
     return output["payload"]
+
+
+def _successor_plan_api():
+    """Load the exact pure Task 2 successor-plan interface lazily."""
+
+    try:
+        from .successor_plan import (
+            compile_successor_plan_spec,
+            derive_successor_plan_intent,
+            validate_fresh_successor_source,
+        )
+    except ImportError as error:
+        raise PlanControlError(
+            "SUCCESSOR_PLAN_UNAVAILABLE",
+            "Task 2 successor_plan.py is required to activate an approved successor",
+        ) from error
+    return (
+        derive_successor_plan_intent,
+        compile_successor_plan_spec,
+        validate_fresh_successor_source,
+    )
 
 
 class _DirectControlStartHost:
