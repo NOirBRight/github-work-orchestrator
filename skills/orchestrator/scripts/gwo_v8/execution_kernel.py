@@ -2281,19 +2281,13 @@ class ExecutionKernel:
                     "PLAN_INVALIDATION_TICKET_INVALID",
                     "classification successor names a Ticket outside the active Campaign",
                 )
-            approved_edges = {
-                (dependency, ticket_key)
-                for ticket_key, item in work.items()
-                for dependency in item.get("depends_on", [])
-                if dependency in work
-            }
             if any(
-                (item.from_ticket, item.to_ticket) not in approved_edges
+                item.from_ticket not in work or item.to_ticket not in work
                 for item in classification.dependency_additions
             ):
                 raise ExecutionKernelError(
                     "PLAN_INVALIDATION_DEPENDENCY_UNPROVED",
-                    "classification successor names an unproved dependency",
+                    "classification successor names a Ticket outside the active Campaign",
                 )
         if classification.disposition in {
             PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR,

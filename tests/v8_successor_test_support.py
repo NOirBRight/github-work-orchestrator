@@ -701,6 +701,7 @@ class _ProductionGitHubContentClient:
             )
         }
         self.writes = 0
+        self._cas_conflict_message: str | None = None
 
     def read(self, repository, branch, path):
         return self.contents.get((repository, branch, path))
@@ -715,12 +716,19 @@ class _ProductionGitHubContentClient:
         expected_blob_sha,
         message,
     ):
-        del message
         from gwo_v8.activation import GitHubContent
 
         key = (repository, branch, path)
         current = self.contents.get(key)
         current_sha = None if current is None else current.blob_sha
+        if self._cas_conflict_message == message:
+            self._cas_conflict_message = None
+            if current is not None:
+                self.contents[key] = GitHubContent(
+                    content=current.content,
+                    blob_sha=f"blob:concurrent:{self.writes + 1}",
+                )
+            raise RuntimeError("synthetic GitHub CAS conflict")
         if current_sha != expected_blob_sha:
             raise RuntimeError("synthetic GitHub CAS conflict")
         self.writes += 1
@@ -730,6 +738,11 @@ class _ProductionGitHubContentClient:
         )
         self.contents[key] = written
         return written
+
+    def arm_cas_conflict(self, message: str) -> None:
+        if type(message) is not str or not message:
+            raise ValueError("CAS conflict message must be non-empty text")
+        self._cas_conflict_message = message
 
     def replace_policy(self, policy: Mapping[str, Any]) -> None:
         from gwo_v8.activation import GitHubContent
@@ -1229,9 +1242,14 @@ class RevisionBoundEffects:
         if not any(action.ticket_key == ticket_key for action in self.executed):
             raise AssertionError(f"no predecessor effect exists for {ticket_key}")
         self._replay_ticket = ticket_key
-        return next(
+        current = next(
             action for action in reversed(self.executed) if action.ticket_key == ticket_key
-        ).stable_action_id
+        )
+        # Force the next public advance to cross the effect readback boundary;
+        # otherwise the already-read successor action would correctly be
+        # reused and the stale predecessor receipt would never be presented.
+        self._readbacks.pop(current.stable_action_id, None)
+        return current.stable_action_id
 
 
 class _TestHost:
@@ -1349,6 +1367,13 @@ class SuccessorHarness:
         if not callable(arm):
             raise AttributeError("host does not expose activation readback tampering")
         arm(field)
+
+    def arm_cas_conflict(self) -> None:
+        content_client = getattr(self.source, "_content_client", None)
+        arm = getattr(content_client, "arm_cas_conflict", None)
+        if not callable(arm):
+            raise AttributeError("successor harness source has no CAS test seam")
+        arm("GWO PlanControl activate Plan Revision")
 
     def mutate_source(self, field: str) -> None:
         if field not in {"contract", "membership", "campaign_source", "target_branch", "policy"}:
