@@ -20,12 +20,16 @@ from .plan_control import (
     ActivationReceipt,
     CampaignHandle,
     InMemoryPlanRepository,
+    PlanInvalidationClassification,
     PlanControlError,
     PlanRevision,
     PlanningReservation,
     TicketClaimProof,
     _PlanningAttempt,
     _SplitCampaignDecisionRecord,
+    _normalize_intent,
+    _normalize_replanning_intent,
+    _snapshot_from_bytes,
 )
 from .planning_protocol import (
     PLANNING_OUTPUT_PROTOCOL_ID,
@@ -47,8 +51,10 @@ from .transition import (
 )
 
 
-_STATE_SCHEMA = "gwo.plan.github-state.v3"
-_INDEX_SCHEMA = "gwo.plan.github-index.v5"
+_LEGACY_STATE_SCHEMA = "gwo.plan.github-state.v3"
+_STATE_SCHEMA = "gwo.plan.github-state.v4"
+_LEGACY_INDEX_SCHEMA = "gwo.plan.github-index.v5"
+_INDEX_SCHEMA = "gwo.plan.github-index.v6"
 _OBJECT_SCHEMA = "gwo.plan.github-object.v1"
 _OBJECT_MANIFEST_SCHEMA = "gwo.plan.github-object-manifest.v1"
 _DEFAULT_PATH = ".gwo-v8/plan-control-v3.json"
@@ -73,6 +79,7 @@ _CATEGORY_NAMES = (
     "revisions",
     "activations",
     "activation_receipts",
+    "invalidation_classifications",
 )
 
 
@@ -598,7 +605,329 @@ def _attempt_value(attempt: _PlanningAttempt) -> dict[str, Any]:
     }
 
 
-def _attempt_from(value: object) -> _PlanningAttempt:
+def _validate_compilation_record(
+    value: object,
+    *,
+    subject: CampaignPlanningSubject,
+    snapshot_bytes: bytes,
+    expected_previous_revision_digest: str | None,
+    snapshot_artifact_digest: str,
+    policy_witness_digest: str,
+    planning_request_artifact_digest: str,
+    protocol_id: str,
+) -> None:
+    """Validate the closed, inlined compilation receipt in one attempt.
+
+    GitHub stores the immutable compilation object beside the attempt because
+    a fresh host must be able to recover a same-pass Planning result without
+    calling the Gateway again.  The object is therefore not merely a schema
+    marker: every identity that is also present on the attempt is compared
+    before the attempt can enter the in-memory repository.
+    """
+
+    initial_fields = {
+        "schema_version",
+        "subject",
+        "subject_digest",
+        "snapshot_artifact_digest",
+        "policy_witness_digest",
+        "planning_request_artifact_digest",
+        "stable_action_id",
+        "preflight_receipt",
+        "planning_receipt",
+        "output_artifact_digest",
+        "planning_output",
+        "normalized_intent",
+        "normalized_intent_digest",
+    }
+    successor_fields = initial_fields | {
+        "coordinator_capability_proof",
+        "coordinator_capability_proof_digest",
+        "classification",
+        "classification_digest",
+    }
+    expected_fields = (
+        successor_fields
+        if protocol_id == REPLANNING_OUTPUT_PROTOCOL_ID
+        else initial_fields
+    )
+    if type(value) is not dict or set(value) != expected_fields:
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable Planning compilation record has an unknown schema",
+        )
+    expected_schema = (
+        "gwo.plan.successor-compilation.v1"
+        if protocol_id == REPLANNING_OUTPUT_PROTOCOL_ID
+        else "gwo.plan.compilation.v1"
+    )
+    if value["schema_version"] != expected_schema:
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable Planning compilation record does not match its protocol",
+        )
+
+    if (
+        value["subject"] != subject.canonical()
+        or value["subject_digest"] != subject.digest
+        or value["snapshot_artifact_digest"] != snapshot_artifact_digest
+        or value["policy_witness_digest"] != policy_witness_digest
+        or value["planning_request_artifact_digest"]
+        != planning_request_artifact_digest
+        or value["stable_action_id"] != subject.stable_action_id
+        or subject.expected_previous_plan_revision_digest
+        != expected_previous_revision_digest
+    ):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable Planning compilation record changed its subject binding",
+        )
+    if (
+        protocol_id == REPLANNING_OUTPUT_PROTOCOL_ID
+        and (
+            expected_previous_revision_digest is None
+            or not subject.stable_action_id.startswith("replan:")
+        )
+    ) or (
+        protocol_id == PLANNING_OUTPUT_PROTOCOL_ID
+        and subject.stable_action_id.startswith("replan:")
+    ):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable Planning compilation record action is not bound to its protocol",
+        )
+
+    for field in (
+        "subject_digest",
+        "snapshot_artifact_digest",
+        "policy_witness_digest",
+        "planning_request_artifact_digest",
+        "output_artifact_digest",
+        "normalized_intent_digest",
+    ):
+        if not _is_digest(value[field]):
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                f"Durable Planning compilation record {field} is not a digest",
+            )
+
+    preflight = _exact(
+        value["preflight_receipt"],
+        {"subject_digest", "stable_action_id", "receipt_digest"},
+        "Planning preflight receipt",
+    )
+    if (
+        preflight["subject_digest"] != subject.digest
+        or preflight["stable_action_id"] != subject.stable_action_id
+        or not _is_digest(preflight["receipt_digest"])
+    ):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable Planning preflight receipt changed its subject binding",
+        )
+
+    planning = _exact(
+        value["planning_receipt"],
+        {
+            "subject_digest",
+            "stable_action_id",
+            "status",
+            "receipt_digest",
+            "command",
+            "wake_cursor",
+            "wake_hints",
+            "output_artifact_digest",
+            "planning_output_artifact_digest",
+        },
+        "Planning receipt",
+    )
+    if (
+        planning["subject_digest"] != subject.digest
+        or planning["stable_action_id"] != subject.stable_action_id
+        or planning["status"] != "completed"
+        or not _is_digest(planning["receipt_digest"])
+        or planning["command"] is not None
+        or (
+            planning["wake_cursor"] is not None
+            and (
+                type(planning["wake_cursor"]) is not str
+                or not planning["wake_cursor"]
+            )
+        )
+        or type(planning["wake_hints"]) is not list
+        or any(type(hint) is not str or not hint for hint in planning["wake_hints"])
+        or not _is_digest(planning["output_artifact_digest"])
+        or planning["output_artifact_digest"]
+        != planning["planning_output_artifact_digest"]
+        or planning["output_artifact_digest"] != value["output_artifact_digest"]
+    ):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable Planning receipt is not one completed exact output",
+        )
+
+    output = _exact(
+        value["planning_output"],
+        {
+            "schema_version",
+            "subject_digest",
+            "stable_action_id",
+            "authority_digest",
+            "payload",
+        },
+        "Planning output Artifact",
+    )
+    if (
+        output["schema_version"] != "gwo.runtime.output.v1"
+        or output["subject_digest"] != subject.digest
+        or output["stable_action_id"] != subject.stable_action_id
+        or output["authority_digest"] != subject.authority_digest
+        or digest_value(output) != value["output_artifact_digest"]
+    ):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable Planning output changed its subject binding",
+        )
+    if type(value["normalized_intent"]) is not dict:
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable Planning normalized intent is not an object",
+        )
+    try:
+        snapshot = _snapshot_from_bytes(snapshot_bytes)
+        if protocol_id == PLANNING_OUTPUT_PROTOCOL_ID:
+            expected_intent = _normalize_intent(
+                output["payload"],
+                snapshot,
+            )
+        else:
+            # Successor output is a classification payload rather than an
+            # initial Plan Intent.  Its exact normalized Plan Intent is
+            # derived from the already-bound classification below.
+            expected_intent = None
+        if (
+            expected_intent is not None
+            and value["normalized_intent"] != expected_intent
+        ):
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "Durable Planning normalized intent changed its identity",
+            )
+        if digest_value(value["normalized_intent"]) != value[
+            "normalized_intent_digest"
+        ]:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "Durable Planning normalized intent changed its digest",
+            )
+    except PlanControlError:
+        raise
+    except Exception as error:
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable Planning normalized intent is not canonical",
+        ) from error
+
+    if protocol_id != REPLANNING_OUTPUT_PROTOCOL_ID:
+        return
+
+    proof = _exact(
+        value["coordinator_capability_proof"],
+        {
+            "subject_digest",
+            "repository_read_only",
+            "tracker_read_only",
+            "can_activate_plan_revision",
+            "can_edit_tracker",
+            "can_expand_authority",
+            "delegation_enabled",
+        },
+        "Coordinator capability proof",
+    )
+    if (
+        proof["subject_digest"] != subject.digest
+        or type(proof["repository_read_only"]) is not bool
+        or type(proof["tracker_read_only"]) is not bool
+        or type(proof["can_activate_plan_revision"]) is not bool
+        or type(proof["can_edit_tracker"]) is not bool
+        or type(proof["can_expand_authority"]) is not bool
+        or type(proof["delegation_enabled"]) is not bool
+        or not proof["repository_read_only"]
+        or not proof["tracker_read_only"]
+        or proof["can_activate_plan_revision"]
+        or proof["can_edit_tracker"]
+        or proof["can_expand_authority"]
+        or proof["delegation_enabled"]
+        or digest_value(proof) != value["coordinator_capability_proof_digest"]
+    ):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable Coordinator capability proof changed its authority",
+        )
+
+    try:
+        classification = PlanInvalidationClassification.from_canonical(
+            value["classification"]
+        )
+    except Exception as error:
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable successor classification is malformed",
+        ) from error
+    if (
+        not _is_digest(value["coordinator_capability_proof_digest"])
+        or not _is_digest(value["classification_digest"])
+        or value["classification_digest"] != classification.digest
+        or classification.action_id != subject.stable_action_id
+        or classification.snapshot_digest != snapshot_artifact_digest
+        or classification.plan_revision_digest != expected_previous_revision_digest
+        or classification.capability_proof_digest
+        != value["coordinator_capability_proof_digest"]
+    ):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable successor classification changed its exact subject binding",
+        )
+    try:
+        output_classification = _normalize_replanning_intent(
+            output["payload"],
+            snapshot=snapshot,
+            action_id=classification.action_id,
+            snapshot_digest=classification.snapshot_digest,
+            plan_revision_digest=classification.plan_revision_digest,
+            evidence_digests=classification.evidence_digests,
+            capability_proof_digest=value["coordinator_capability_proof_digest"],
+        )
+        if output_classification != classification:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "Durable successor output classification changed its identity",
+            )
+        from .successor_plan import derive_successor_plan_intent
+
+        expected_intent = derive_successor_plan_intent(
+            snapshot,
+            classification.canonical(),
+        )
+        if value["normalized_intent"] != expected_intent:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "Durable successor normalized intent changed its identity",
+            )
+    except PlanControlError:
+        raise
+    except Exception as error:
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable successor compilation record failed closed validation",
+        ) from error
+
+
+def _attempt_from(
+    value: object,
+    *,
+    allow_legacy_protocol: bool = False,
+) -> _PlanningAttempt:
     fields = {
         "handle",
         "ready_refs",
@@ -614,25 +943,31 @@ def _attempt_from(value: object) -> _PlanningAttempt:
         "revision",
         "compilation_record_bytes_base64",
     }
-    if type(value) is not dict or "planning_protocol_id" not in value:
-        raise PlanControlError(
-            "PLANNING_ATTEMPT_PROTOCOL_INVALID",
-            "Durable Planning attempt must name its explicit protocol",
-        )
-    protocol_id = value["planning_protocol_id"]
-    if type(protocol_id) is not str or protocol_id not in {
-        PLANNING_OUTPUT_PROTOCOL_ID,
-        REPLANNING_OUTPUT_PROTOCOL_ID,
-    }:
-        raise PlanControlError(
-            "PLANNING_ATTEMPT_PROTOCOL_INVALID",
-            "Durable Planning attempt protocol is outside the closed protocol union",
-        )
-    item = _exact(
-        value,
-        fields,
-        "Planning attempt",
+    legacy_fields = fields - {"planning_protocol_id"}
+    legacy = (
+        type(value) is dict
+        and set(value) == legacy_fields
+        and allow_legacy_protocol
     )
+    if legacy:
+        item = _exact(value, legacy_fields, "Planning attempt")
+        protocol_id = None
+    else:
+        if type(value) is not dict or "planning_protocol_id" not in value:
+            raise PlanControlError(
+                "PLANNING_ATTEMPT_PROTOCOL_INVALID",
+                "Durable Planning attempt must name its explicit protocol",
+            )
+        protocol_id = value["planning_protocol_id"]
+        if type(protocol_id) is not str or protocol_id not in {
+            PLANNING_OUTPUT_PROTOCOL_ID,
+            REPLANNING_OUTPUT_PROTOCOL_ID,
+        }:
+            raise PlanControlError(
+                "PLANNING_ATTEMPT_PROTOCOL_INVALID",
+                "Durable Planning attempt protocol is outside the closed protocol union",
+            )
+        item = _exact(value, fields, "Planning attempt")
     handle_value = _exact(
         item["handle"],
         {"repository", "campaign_key"},
@@ -658,6 +993,88 @@ def _attempt_from(value: object) -> _PlanningAttempt:
             "DURABLE_STATE_INVALID",
             "Durable Planning subject kind is invalid",
         )
+    subject = CampaignPlanningSubject(
+        **{
+            key: child
+            for key, child in subject_value.items()
+            if key != "kind"
+        }
+    )
+    protocol_id = (
+        (
+            REPLANNING_OUTPUT_PROTOCOL_ID
+            if subject.stable_action_id.startswith("replan:")
+            else PLANNING_OUTPUT_PROTOCOL_ID
+        )
+        if legacy
+        else _text(item["planning_protocol_id"], "Planning protocol id")
+    )
+    if (
+        subject.stable_action_id.startswith("replan:")
+        != (protocol_id == REPLANNING_OUTPUT_PROTOCOL_ID)
+    ):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Planning attempt protocol does not match its stable action",
+        )
+    snapshot_bytes = _bytes(
+        item["snapshot_bytes_base64"],
+        "Planning snapshot bytes",
+    )
+    compilation_record_digest = item["compilation_record_artifact_digest"]
+    compilation_record_value = item["compilation_record_bytes_base64"]
+    if (compilation_record_digest is None) != (compilation_record_value is None):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable Planning compilation record digest and bytes must be paired",
+        )
+    if compilation_record_digest is not None and not _is_digest(
+        compilation_record_digest
+    ):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Durable Planning compilation record digest is invalid",
+        )
+    compilation_record_bytes = (
+        None
+        if compilation_record_value is None
+        else _bytes(
+            compilation_record_value,
+            "Planning compilation record bytes",
+        )
+    )
+    if compilation_record_bytes is not None:
+        if digest_bytes(compilation_record_bytes) != compilation_record_digest:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "Durable Planning compilation record digest does not bind its bytes",
+            )
+        try:
+            compilation_record = load_canonical_json(compilation_record_bytes)
+        except Exception as error:
+            raise PlanControlError(
+                "DURABLE_STATE_INVALID",
+                "Durable Planning compilation record is not canonical JSON",
+            ) from error
+        _validate_compilation_record(
+            compilation_record,
+            subject=subject,
+            snapshot_bytes=snapshot_bytes,
+            expected_previous_revision_digest=(
+                item["expected_previous_revision_digest"]
+            ),
+            snapshot_artifact_digest=item["snapshot_artifact_digest"],
+            policy_witness_digest=item["policy_witness_digest"],
+            planning_request_artifact_digest=item[
+                "planning_request_artifact_digest"
+            ],
+            protocol_id=protocol_id,
+        )
+    elif legacy and protocol_id == REPLANNING_OUTPUT_PROTOCOL_ID:
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "Legacy successor Planning attempt must carry its bound compilation record",
+        )
     revision_value = item["revision"]
     return _PlanningAttempt(
         handle=CampaignHandle(
@@ -669,10 +1086,7 @@ def _attempt_from(value: object) -> _PlanningAttempt:
         expected_previous_revision_digest=item[
             "expected_previous_revision_digest"
         ],
-        snapshot_bytes=_bytes(
-            item["snapshot_bytes_base64"],
-            "Planning snapshot bytes",
-        ),
+        snapshot_bytes=snapshot_bytes,
         snapshot_artifact_digest=_text(
             item["snapshot_artifact_digest"],
             "Planning snapshot digest",
@@ -685,32 +1099,32 @@ def _attempt_from(value: object) -> _PlanningAttempt:
             item["planning_request_artifact_digest"],
             "Planning request digest",
         ),
-        planning_protocol_id=_text(
-            item["planning_protocol_id"],
-            "Planning protocol id",
-        ),
-        subject=CampaignPlanningSubject(
-            **{
-                key: child
-                for key, child in subject_value.items()
-                if key != "kind"
-            }
-        ),
+        planning_protocol_id=protocol_id,
+        subject=subject,
         compilation_record_artifact_digest=item[
             "compilation_record_artifact_digest"
         ],
         revision=(
             None if revision_value is None else _revision_from(revision_value)
         ),
-        compilation_record_bytes=(
-            None
-            if item["compilation_record_bytes_base64"] is None
-            else _bytes(
-                item["compilation_record_bytes_base64"],
-                "Planning compilation record bytes",
-            )
-        ),
+        compilation_record_bytes=compilation_record_bytes,
     )
+
+
+def _classification_value(
+    classification: PlanInvalidationClassification,
+) -> dict[str, Any]:
+    return classification.canonical()
+
+
+def _classification_from(value: object) -> PlanInvalidationClassification:
+    try:
+        return PlanInvalidationClassification.from_canonical(value)
+    except PlanControlError as error:
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "durable invalidation classification is malformed",
+        ) from error
 
 
 def _split_value(record: _SplitCampaignDecisionRecord) -> dict[str, Any]:
@@ -779,6 +1193,7 @@ def _empty_state(repository: str, writer_generation: str) -> dict[str, Any]:
         "revisions": [],
         "activations": [],
         "activation_receipts": [],
+        "invalidation_classifications": [],
     }
 
 
@@ -860,6 +1275,19 @@ def _repo_value(
                 item["planning_stable_action_id"],
             ),
         ),
+        "invalidation_classifications": sorted(
+            (
+                {
+                    "campaign_key": campaign_key,
+                    "action_id": action_id,
+                    "classification": _classification_value(classification),
+                }
+                for (claim_repository, campaign_key, action_id), classification
+                in repo.invalidation_classifications.items()
+                if claim_repository == repository
+            ),
+            key=lambda item: (item["campaign_key"], item["action_id"]),
+        ),
     }
 
 
@@ -867,14 +1295,27 @@ def _repo_from_state(
     value: object,
     repository: str,
     writer_generation: str,
+    *,
+    allow_legacy_protocol: bool = False,
 ) -> InMemoryPlanRepository:
-    state = _exact(
-        value,
-        set(_empty_state(repository, writer_generation)),
-        "PlanControl state",
+    current_fields = set(_empty_state(repository, writer_generation))
+    legacy_fields = current_fields - {"invalidation_classifications"}
+    legacy = (
+        type(value) is dict
+        and set(value) == legacy_fields
+        and value.get("schema_version") == _LEGACY_STATE_SCHEMA
     )
+    state = _exact(value, legacy_fields if legacy else current_fields, "PlanControl state")
+    allow_legacy_attempts = legacy or allow_legacy_protocol
+    if legacy:
+        state = {
+            **state,
+            "schema_version": _STATE_SCHEMA,
+            "invalidation_classifications": [],
+        }
     if (
         state["schema_version"] != _STATE_SCHEMA
+        and state["schema_version"] != _LEGACY_STATE_SCHEMA
         or state["repository"] != repository
         or state["writer_generation"] != writer_generation
     ):
@@ -904,16 +1345,31 @@ def _repo_from_state(
         "revisions",
         "activations",
         "activation_receipts",
+        "invalidation_classifications",
     }
     if any(type(state[field]) is not list for field in list_fields):
         raise PlanControlError(
             "DURABLE_STATE_INVALID",
             "Durable PlanControl state collections must be exact lists",
         )
+    if allow_legacy_attempts:
+        # v3 attempts did not carry the protocol discriminator.  Normalize
+        # each decoded attempt before the exact canonical-order check so a
+        # v3 state or v5 category index can be read without weakening the
+        # current v4/v6 write format.
+        state["attempts"] = [
+            _attempt_value(
+                _attempt_from(raw, allow_legacy_protocol=allow_legacy_attempts)
+            )
+            for raw in state["attempts"]
+        ]
     repo = InMemoryPlanRepository(writer_generation=writer_generation)
     try:
         for raw in state["attempts"]:
-            attempt = _attempt_from(raw)
+            attempt = _attempt_from(
+                raw,
+                allow_legacy_protocol=allow_legacy_attempts,
+            )
             if attempt.handle.repository != repository:
                 raise PlanControlError(
                     "DURABLE_STATE_INVALID",
@@ -1014,6 +1470,33 @@ def _repo_from_state(
                     "Durable activation receipts repeat or cross repositories",
                 )
             repo.activation_receipts[key] = receipt
+        for raw in state["invalidation_classifications"]:
+            item = _exact(
+                raw,
+                {"campaign_key", "action_id", "classification"},
+                "invalidation classification",
+            )
+            campaign_key = _text(
+                item["campaign_key"],
+                "invalidation classification Campaign key",
+            )
+            action_id = _text(
+                item["action_id"],
+                "invalidation classification action id",
+            )
+            classification = _classification_from(item["classification"])
+            if classification.action_id != action_id:
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "Durable invalidation classification action identity changed",
+                )
+            key = (repository, campaign_key, action_id)
+            if key in repo.invalidation_classifications:
+                raise PlanControlError(
+                    "DURABLE_STATE_INVALID",
+                    "Durable invalidation classifications repeat an identity",
+                )
+            repo.invalidation_classifications[key] = classification
     except PlanControlError:
         raise
     except Exception as error:
@@ -1126,6 +1609,8 @@ def _repo_from_categories(
     repository: str,
     writer_generation: str,
     categories: Mapping[str, Any],
+    *,
+    allow_legacy_protocol: bool = False,
 ) -> InMemoryPlanRepository:
     if type(categories) is not dict or set(categories) != set(_CATEGORY_NAMES):
         raise PlanControlError(
@@ -1134,7 +1619,12 @@ def _repo_from_categories(
         )
     state = _empty_state(repository, writer_generation)
     state.update(categories)
-    return _repo_from_state(state, repository, writer_generation)
+    return _repo_from_state(
+        state,
+        repository,
+        writer_generation,
+        allow_legacy_protocol=allow_legacy_protocol,
+    )
 
 
 def _object_manifest_path(prefix: str, digest: str) -> str:
@@ -1204,17 +1694,28 @@ def _index_value(
     authority: Mapping[str, str],
     category_digests: Mapping[str, str],
 ) -> dict[str, Any]:
-    if set(category_digests) != set(_CATEGORY_NAMES):
+    category_names = set(category_digests)
+    legacy_category_names = set(_CATEGORY_NAMES) - {
+        "invalidation_classifications"
+    }
+    if category_names == set(_CATEGORY_NAMES):
+        schema_version = _INDEX_SCHEMA
+    elif category_names == legacy_category_names:
+        # Keep the pre-classification index readable for an existing Campaign
+        # until its first classification is written.  A classification
+        # mutation always renders the v6 category set below.
+        schema_version = _LEGACY_INDEX_SCHEMA
+    else:
         raise PlanControlError(
             "DURABLE_STATE_INVALID",
             "PlanControl category index has an unknown schema",
         )
     return {
-        "schema_version": _INDEX_SCHEMA,
+        "schema_version": schema_version,
         "repository": repository,
         "writer_authority": _writer_index_authority(authority),
         "categories": {
-            name: category_digests[name] for name in _CATEGORY_NAMES
+            name: category_digests[name] for name in sorted(category_digests)
         },
     }
 
@@ -1999,30 +2500,43 @@ class GitHubPlanRepository:
                 "DURABLE_STATE_INVALID",
                 "GitHub PlanControl index is not canonical JSON",
             ) from error
+        category_names = set(_CATEGORY_NAMES)
+        legacy_category_names = category_names - {
+            "invalidation_classifications"
+        }
+        categories = value["categories"]
+        legacy_index = (
+            value["schema_version"] == _LEGACY_INDEX_SCHEMA
+            and type(categories) is dict
+            and set(categories) == legacy_category_names
+        )
+        current_index = (
+            value["schema_version"] == _INDEX_SCHEMA
+            and type(categories) is dict
+            and set(categories) == category_names
+        )
         if (
-            value["schema_version"] != _INDEX_SCHEMA
+            not (legacy_index or current_index)
             or value["repository"] != self.repository
             or value["writer_authority"] != _writer_index_authority(authority)
-            or type(value["categories"]) is not dict
-            or set(value["categories"]) != set(_CATEGORY_NAMES)
             or any(
                 type(digest) is not str
                 or len(digest) != 64
                 or any(character not in "0123456789abcdef" for character in digest)
-                for digest in value["categories"].values()
+                for digest in categories.values()
             )
         ):
             raise PlanControlError(
                 "DURABLE_STATE_INVALID",
                 "GitHub PlanControl index changed its authority or categories",
             )
-        categories: dict[str, Any] = {}
-        for name in _CATEGORY_NAMES:
+        decoded_categories: dict[str, Any] = {}
+        for name in sorted(categories):
             try:
                 object_value = load_canonical_json(
                     self._read_object_at_ref(
                         ref_digest,
-                        value["categories"][name],
+                        categories[name],
                     )
                 )
                 object_value = _exact(
@@ -2054,17 +2568,20 @@ class GitHubPlanRepository:
                     "DURABLE_STATE_INVALID",
                     "GitHub governed category changed its identity",
                 )
-            categories[name] = object_value["items"]
-        return (
-            _repo_from_categories(
-                self.repository,
-                self.writer_generation,
-                categories,
-            ),
-            ref_digest,
-            root.content,
-            authority,
+            decoded_categories[name] = object_value["items"]
+        if legacy_index:
+            decoded_categories["invalidation_classifications"] = []
+        repo = _repo_from_categories(
+            self.repository,
+            self.writer_generation,
+            decoded_categories,
+            allow_legacy_protocol=legacy_index,
         )
+        # Preserve a v6 empty category set across an unrelated mutation while
+        # still allowing the v5 compatibility form to remain stable until a
+        # classification is first written.
+        repo._github_index_schema = value["schema_version"]
+        return (repo, ref_digest, root.content, authority)
 
     def _render_ref_state(
         self,
@@ -2073,11 +2590,17 @@ class GitHubPlanRepository:
     ) -> tuple[bytes, dict[str, bytes]]:
         category_digests: dict[str, str] = {}
         changes: dict[str, bytes] = {}
-        for name, items in _category_values_for(
+        category_values = _category_values_for(
             self.repository,
             self.writer_generation,
             repo,
-        ).items():
+        )
+        if (
+            not repo.invalidation_classifications
+            and getattr(repo, "_github_index_schema", None) != _INDEX_SCHEMA
+        ):
+            category_values.pop("invalidation_classifications")
+        for name, items in category_values.items():
             payload = canonical_bytes(
                 {
                     "schema_version": _OBJECT_SCHEMA,
@@ -2427,26 +2950,48 @@ class GitHubPlanRepository:
                     f"GitHub governed {label} cannot restore the exact Artifact",
                 ) from error
 
-        attempts = (
-            (observation.attempt,)
-            if observation is not None
-            else tuple(repo.attempts.values())
-        )
+        if observation is None:
+            attempts = tuple(repo.attempts.values())
+        else:
+            successor_attempts = tuple(
+                attempt
+                for attempt in repo.attempts.values()
+                if (
+                    attempt.handle == observation.handle
+                    and attempt.expected_previous_revision_digest
+                    == observation.receipt.revision_digest
+                    and attempt.planning_protocol_id
+                    == REPLANNING_OUTPUT_PROTOCOL_ID
+                )
+            )
+            attempts = (observation.attempt,) + successor_attempts
         for attempt in attempts:
             try:
                 snapshot = load_canonical_json(attempt.snapshot_bytes)
                 if digest_bytes(attempt.snapshot_bytes) != attempt.snapshot_artifact_digest:
                     raise ValueError("snapshot digest")
                 restore(snapshot, attempt.snapshot_artifact_digest, "snapshot")
+                policy_key = (
+                    "policy_witness"
+                    if attempt.planning_protocol_id
+                    == REPLANNING_OUTPUT_PROTOCOL_ID
+                    else "policy"
+                )
                 policy = {
                     key: value
-                    for key, value in snapshot["policy"].items()
+                    for key, value in snapshot[policy_key].items()
                     if key != "digest"
                 }
                 restore(policy, attempt.policy_witness_digest, "Policy Witness")
-                from .planning_protocol import planning_prompt
+                from .planning_protocol import planning_prompt, replanning_prompt
 
-                request = planning_prompt(
+                request_builder = (
+                    replanning_prompt
+                    if attempt.planning_protocol_id
+                    == REPLANNING_OUTPUT_PROTOCOL_ID
+                    else planning_prompt
+                )
+                request = request_builder(
                     subject_digest=attempt.subject.prompt_binding_digest,
                     authority_digest=attempt.policy_witness_digest,
                     snapshot_artifact_digest=attempt.snapshot_artifact_digest,
@@ -2479,11 +3024,16 @@ class GitHubPlanRepository:
                     "DURABLE_STATE_INVALID",
                     "GitHub governed Planning attempt cannot hydrate a fresh host",
                 ) from error
-        revisions = (
-            (observation.revision,)
-            if observation is not None
-            else tuple(repo.revisions.values())
-        )
+        if observation is None:
+            revisions = tuple(repo.revisions.values())
+        else:
+            successor_revisions = tuple(
+                attempt.revision
+                for attempt in attempts
+                if attempt.revision is not None
+                and attempt.revision != observation.revision
+            )
+            revisions = (observation.revision,) + successor_revisions
         for revision in revisions:
             try:
                 restore(
@@ -2740,6 +3290,45 @@ class GitHubPlanRepository:
             "save Planning attempt",
             lambda repo: repo.save_attempt(attempt),
             classify=lambda repo: self._attempt_operation(repo, attempt),
+        )
+
+    def read_invalidation_classification(
+        self,
+        handle: CampaignHandle,
+        action_id: str,
+    ) -> PlanInvalidationClassification | None:
+        self._assert_repository(handle.repository)
+        return self._read_repo().read_invalidation_classification(
+            handle,
+            action_id,
+        )
+
+    def save_invalidation_classification(
+        self,
+        handle: CampaignHandle,
+        classification: PlanInvalidationClassification,
+    ) -> PlanInvalidationClassification:
+        if type(classification) is not PlanInvalidationClassification:
+            raise PlanControlError(
+                "PLAN_INVALIDATION_CLASSIFICATION_INVALID",
+                "invalidation classification caller value is not typed",
+            )
+        self._assert_repository(handle.repository)
+        return self._mutate(
+            "save invalidation classification",
+            lambda repo: repo.save_invalidation_classification(
+                handle,
+                classification,
+            ),
+            classify=lambda repo: (
+                _WriterOperation.RECOVER_ATTEMPT
+                if repo.read_invalidation_classification(
+                    handle,
+                    classification.action_id,
+                )
+                == classification
+                else _WriterOperation.NEW_ATTEMPT
+            ),
         )
 
     def read_split_decision(
