@@ -27,7 +27,10 @@ from .plan_control import (
     _PlanningAttempt,
     _SplitCampaignDecisionRecord,
 )
-from .planning_protocol import PLANNING_OUTPUT_PROTOCOL_ID
+from .planning_protocol import (
+    PLANNING_OUTPUT_PROTOCOL_ID,
+    REPLANNING_OUTPUT_PROTOCOL_ID,
+)
 from .runtime_gateway import CampaignPlanningSubject
 from .transition import (
     WriterTransitionRecord,
@@ -611,9 +614,20 @@ def _attempt_from(value: object) -> _PlanningAttempt:
         "revision",
         "compilation_record_bytes_base64",
     }
-    legacy_fields = fields - {"planning_protocol_id"}
-    if type(value) is dict and set(value) == legacy_fields:
-        value = {**value, "planning_protocol_id": PLANNING_OUTPUT_PROTOCOL_ID}
+    if type(value) is not dict or "planning_protocol_id" not in value:
+        raise PlanControlError(
+            "PLANNING_ATTEMPT_PROTOCOL_INVALID",
+            "Durable Planning attempt must name its explicit protocol",
+        )
+    protocol_id = value["planning_protocol_id"]
+    if type(protocol_id) is not str or protocol_id not in {
+        PLANNING_OUTPUT_PROTOCOL_ID,
+        REPLANNING_OUTPUT_PROTOCOL_ID,
+    }:
+        raise PlanControlError(
+            "PLANNING_ATTEMPT_PROTOCOL_INVALID",
+            "Durable Planning attempt protocol is outside the closed protocol union",
+        )
     item = _exact(
         value,
         fields,

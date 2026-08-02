@@ -150,6 +150,46 @@ def test_planning_attempt_protocol_survives_github_state_round_trip():
     assert _attempt_from(encoded) == attempt
 
 
+@pytest.mark.parametrize("mutation", ("missing", "invalid"))
+def test_github_attempt_decoder_rejects_missing_or_invalid_protocol(mutation):
+    from gwo_v8.plan_control import CampaignHandle, _PlanningAttempt, PlanControlError
+    from gwo_v8.plan_control_github import _attempt_from, _attempt_value
+    from gwo_v8.runtime_gateway import CampaignPlanningSubject
+
+    subject = CampaignPlanningSubject(
+        repository="owner/repository",
+        campaign_key="campaign:one",
+        campaign_handle="campaign:one",
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest="1" * 64,
+        policy_witness_digest="2" * 64,
+        planning_request_artifact_digest="3" * 64,
+        stable_action_id="planning:one",
+    )
+    encoded = _attempt_value(
+        _PlanningAttempt(
+            handle=CampaignHandle("owner/repository", "campaign:one"),
+            ready_refs=("issue:108",),
+            ticket_keys=("issue:108",),
+            expected_previous_revision_digest=None,
+            snapshot_bytes=b"{}",
+            snapshot_artifact_digest="1" * 64,
+            policy_witness_digest="2" * 64,
+            planning_request_artifact_digest="3" * 64,
+            subject=subject,
+        )
+    )
+    if mutation == "missing":
+        del encoded["planning_protocol_id"]
+    else:
+        encoded["planning_protocol_id"] = "campaign.unknown-output.v1"
+
+    with pytest.raises(PlanControlError) as raised:
+        _attempt_from(encoded)
+
+    assert raised.value.code == "PLANNING_ATTEMPT_PROTOCOL_INVALID"
+
+
 def test_non_successor_disposition_rejects_resource_additions():
     from gwo_v8.plan_control import (
         PlanControlError,
@@ -211,3 +251,82 @@ def test_shared_successor_builders_are_canonical_and_independent():
         "repository.target.v1"
     )
     assert active_plan_spec() != changed_plan_spec("target_branch")
+
+
+def test_shared_successor_support_exposes_the_complete_fixture_surface():
+    import v8_successor_test_support as support
+
+    methods = {
+        "invalidation_for",
+        "active_plan",
+        "ledger_snapshot",
+        "set_successor_payload",
+        "arm_crash",
+        "arm_activation_readback_tamper",
+        "mutate_source",
+        "install_competing_successor",
+        "reinstall",
+    }
+    assert methods.issubset(vars(support.SuccessorHarness))
+    assert callable(support.ScriptedPlanningGateway().planning_preflight)
+    assert callable(support.ScriptedPlanningGateway().progress)
+    assert callable(support.RevisionBoundEffects().replay_predecessor_candidate)
+    assert callable(support.CrashBoundaryRepository().save_attempt)
+    assert issubclass(support.InjectedCrash, RuntimeError)
+    assert all(
+        name in vars(support)
+        for name in (
+            "successor_control",
+            "github_successor_repository",
+            "kernel_with_one_ticket",
+            "kernel_with_completed_result",
+            "successor_kernel",
+            "successor_host",
+            "public_successor",
+            "public_dependency_successor",
+        )
+    )
+
+
+def test_three_ticket_replanning_builder_freezes_execution_and_source_facts():
+    from v8_successor_test_support import three_ticket_replanning_snapshot
+
+    snapshot = three_ticket_replanning_snapshot()
+    tickets = {item["key"]: item for item in snapshot["tickets"]}
+    runs = {item["ticket_key"]: item for item in snapshot["work_runs"]}
+    claims = {item["ticket_key"]: item for item in snapshot["claims"]}
+
+    assert tuple(tickets) == ("issue:108", "issue:109", "issue:110")
+    assert snapshot["campaign_source"] == {
+        "repository": "owner/repository",
+        "input_ref": "refs/heads/main",
+        "resolved_commit_oid": "a" * 40,
+        "tree_oid": "b" * 40,
+        "digest": snapshot["campaign_source"]["digest"],
+    }
+    assert snapshot["policy_witness"] == snapshot["policy"]
+    assert tickets["issue:109"]["native_blockers"][0]["key"] == "issue:900"
+    assert tickets["issue:109"]["native_blockers"][0]["state"] == "closed"
+    assert runs["issue:108"]["phase"] == "completed"
+    assert runs["issue:108"]["result_digest"] == "7" * 64
+    assert runs["issue:108"]["evidence_digests"] == ["8" * 64]
+    assert runs["issue:109"]["phase"] == "quiescent"
+    assert runs["issue:109"]["candidate_identity"] == "candidate:r0:109"
+    assert runs["issue:110"]["phase"] == "pending"
+    assert claims["issue:109"]["plan_revision_digest"] == snapshot["plan_revision_digest"]
+    accepted = snapshot["accepted_results"]
+    assert len(accepted) == 1
+    assert accepted[0]["kind"] == "accepted_result_binding.v1"
+    assert accepted[0]["ticket_key"] == "issue:108"
+    assert accepted[0]["result_digest"] == "7" * 64
+    assert accepted[0]["evidence_digests"] == ["8" * 64]
+    assert accepted[0]["work_subject_digest"] == runs["issue:108"]["work_subject_digest"]
+    assert len(accepted[0]["target_facts_digest"]) == 64
+    assert snapshot["external_dependencies"] == [
+        {
+            "key": "issue:900",
+            "state": "closed",
+            "repository": "owner/repository",
+            "source": tickets["issue:109"]["native_blockers"][0]["source"],
+        }
+    ]
