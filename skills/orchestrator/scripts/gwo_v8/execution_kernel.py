@@ -1090,6 +1090,17 @@ class ExecutionKernel:
 
         classification = self._validate_successor_state_match(active, state)
         transition = state["successor_transition"]
+        previous_writer_generation = state.get(
+            "successor_previous_writer_generation"
+        )
+        if (
+            type(previous_writer_generation) is not str
+            or not previous_writer_generation
+        ):
+            raise ExecutionKernelError(
+                "SUCCESSOR_ACTIVATION_READBACK_INVALID",
+                "successor transition omitted its predecessor writer generation",
+            )
         # A crash can leave the durable predecessor row behind after
         # PlanControl has already switched the active authority.  Do not let
         # that recovery path trust only the transition envelope: the active
@@ -1101,6 +1112,7 @@ class ExecutionKernel:
             classification,
             active,
             active,
+            expected_writer_generation=previous_writer_generation,
         )
         try:
             plan = load_canonical_json(active.plan_spec_bytes)
@@ -1234,6 +1246,9 @@ class ExecutionKernel:
                 "successor activation intent conflicts with the current classification",
             )
         state["successor_transition"] = load_canonical_json(canonical_bytes(transition))
+        state["successor_previous_writer_generation"] = (
+            active.activation_receipt.writer_generation
+        )
         self._save(active.handle, state)
         persisted = self._load(active.handle)
         if persisted is None or persisted.get("successor_transition") != transition:

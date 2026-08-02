@@ -620,7 +620,7 @@ def test_restart_revalidates_successor_authority_before_migration(tmp_path, muta
             plans.successor,
             activation_receipt=replace(
                 plans.successor.activation_receipt,
-                writer_generation=None,
+                writer_generation="writer:foreign",
             ),
         )
     else:
