@@ -628,6 +628,7 @@ class _Source:
         self.value = deepcopy(dict(value))
         self.calls = 0
         self._mutate_after_snapshot: Callable[[], None] | None = None
+        self._mutation_readbacks_remaining = 0
 
     def snapshot(self, repository: str, ready_refs: tuple[str, ...]):
         assert repository == "owner/repository"
@@ -638,12 +639,27 @@ class _Source:
         )
         self.calls += 1
         if self._mutate_after_snapshot is not None and self.calls > 1:
-            mutation = self._mutate_after_snapshot
-            self._mutate_after_snapshot = None
-            mutation()
+            if self._mutation_readbacks_remaining:
+                self._mutation_readbacks_remaining -= 1
+            else:
+                mutation = self._mutate_after_snapshot
+                self._mutate_after_snapshot = None
+                mutation()
         return _canonical_copy(self.value)
 
     def mutate(self, field: str) -> None:
+        if field not in {
+            "contract",
+            "membership",
+            "campaign_source",
+            "target_branch",
+            "policy",
+        }:
+            raise ValueError(f"unknown source mutation: {field}")
+        self._mutate_after_snapshot = lambda: self._apply_mutation(field)
+        self._mutation_readbacks_remaining = 1
+
+    def _apply_mutation(self, field: str) -> None:
         if field == "contract":
             ticket = next(item for item in self.value["tickets"] if item["key"] == "issue:108")
             ticket["contract"]["body"] = "Authoritative contract changed"
@@ -666,8 +682,222 @@ class _Source:
             self.value["policy"] = policy
             if "policy_witness" in self.value:
                 self.value["policy_witness"] = deepcopy(policy)
-        else:
+
+
+class _ProductionGitHubContentClient:
+    """Small durable GitHub Content API double for the public fixture."""
+
+    def __init__(self):
+        from gwo_v8.activation import GitHubContent
+
+        self.contents: dict[tuple[str, str, str], GitHubContent] = {
+            (
+                "owner/repository",
+                "gwo-control",
+                ".gwo-v8/policy-witness.json",
+            ): GitHubContent(
+                content=_canonical_bytes(_policy()),
+                blob_sha="blob:policy",
+            )
+        }
+        self.writes = 0
+
+    def read(self, repository, branch, path):
+        return self.contents.get((repository, branch, path))
+
+    def compare_and_swap(
+        self,
+        repository,
+        branch,
+        path,
+        content,
+        *,
+        expected_blob_sha,
+        message,
+    ):
+        del message
+        from gwo_v8.activation import GitHubContent
+
+        key = (repository, branch, path)
+        current = self.contents.get(key)
+        current_sha = None if current is None else current.blob_sha
+        if current_sha != expected_blob_sha:
+            raise RuntimeError("synthetic GitHub CAS conflict")
+        self.writes += 1
+        written = GitHubContent(
+            content=content,
+            blob_sha=f"blob:{self.writes}",
+        )
+        self.contents[key] = written
+        return written
+
+    def replace_policy(self, policy: Mapping[str, Any]) -> None:
+        from gwo_v8.activation import GitHubContent
+
+        self.contents[
+            (
+                "owner/repository",
+                "gwo-control",
+                ".gwo-v8/policy-witness.json",
+            )
+        ] = GitHubContent(
+            content=_canonical_bytes(policy),
+            blob_sha="blob:policy:changed",
+        )
+
+
+def _github_issue(number: int, *, state: str = "open") -> dict[str, Any]:
+    repository = "owner/repository"
+    api_repository = f"https://api.github.com/repos/{repository}"
+    body = f"Complete successor work {number}"
+    if number == 109:
+        body += "\n\n## Blocked by\n- #900"
+    labels = [] if number == 900 else [
+        {
+            "id": 1,
+            "node_id": "LABEL_READY",
+            "url": f"{api_repository}/labels/ready-for-agent",
+            "name": "ready-for-agent",
+            "color": "0052cc",
+            "default": False,
+            "description": "ready",
+        }
+    ]
+    return {
+        "id": number,
+        "node_id": f"ISSUE_{number}",
+        "number": number,
+        "title": f"Successor contract {number}",
+        "body": body,
+        "state": state,
+        "state_reason": None,
+        "type": None,
+        "repository_url": api_repository,
+        "url": f"{api_repository}/issues/{number}",
+        "html_url": f"https://github.com/{repository}/issues/{number}",
+        "labels": labels,
+        "updated_at": "2026-07-30T00:00:00Z",
+    }
+
+
+class _ProductionGitHubIssueClient:
+    """Deterministic issue/dependency/source readback for GitHubReadySnapshotSource."""
+
+    def __init__(self):
+        self.issues = {
+            number: _github_issue(number)
+            for number in (108, 109, 110)
+        }
+        self.issues[900] = _github_issue(900, state="closed")
+        self.branch_sources = {
+            "main": {
+                "input_ref": "refs/heads/main",
+                "resolved_commit_oid": "a" * 40,
+                "tree_oid": "b" * 40,
+            }
+        }
+
+    def read_issue(self, repository, number):
+        del repository
+        return deepcopy(self.issues[number])
+
+    def read_comments(self, repository, number):
+        del repository, number
+        return ()
+
+    def read_blockers(self, repository, number):
+        del repository
+        return () if number != 109 else (deepcopy(self.issues[900]),)
+
+    def read_branch_source(self, repository, branch):
+        del repository
+        source = self.branch_sources.get(branch)
+        if source is None:
+            source = {
+                "input_ref": f"refs/heads/{branch}",
+                "resolved_commit_oid": "a" * 40,
+                "tree_oid": "b" * 40,
+            }
+            self.branch_sources[branch] = source
+        return deepcopy(source)
+
+    def mutate_contract(self) -> None:
+        self.issues[108]["body"] = "Authoritative contract changed"
+        self.issues[108]["updated_at"] = "2026-08-01T00:00:00Z"
+
+    def mutate_campaign_source(self) -> None:
+        self.branch_sources["main"]["resolved_commit_oid"] = "c" * 40
+
+
+class _ProductionWriterGeneration:
+    def read_current(self, repository):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            repository=repository,
+            writer_generation="writer:successor",
+            record_id="writer-record:successor",
+        )
+
+
+class _DelayedProductionSnapshotSource:
+    """Production GitHub source with one frozen read before a one-shot drift."""
+
+    def __init__(self, delegate, content_client, issue_client):
+        self._delegate = delegate
+        self._content_client = content_client
+        self._issue_client = issue_client
+        self._mutate_after_snapshot: Callable[[], None] | None = None
+        self._mutation_readbacks_remaining = 0
+        self._membership_removed = False
+
+    def canonical_ready_refs(self, repository, ready_refs):
+        return self._delegate.canonical_ready_refs(repository, ready_refs)
+
+    def snapshot(self, repository, ready_refs):
+        if self._mutate_after_snapshot is not None:
+            if self._mutation_readbacks_remaining:
+                self._mutation_readbacks_remaining -= 1
+            else:
+                mutation = self._mutate_after_snapshot
+                self._mutate_after_snapshot = None
+                mutation()
+        value = dict(self._delegate.snapshot(repository, ready_refs))
+        if self._membership_removed:
+            value["tickets"] = [
+                item for item in value["tickets"] if item["key"] != "issue:110"
+            ]
+        return value
+
+    def mutate(self, field: str) -> None:
+        if field not in {
+            "contract",
+            "membership",
+            "campaign_source",
+            "target_branch",
+            "policy",
+        }:
             raise ValueError(f"unknown source mutation: {field}")
+        self._mutate_after_snapshot = lambda: self._apply_mutation(field)
+        self._mutation_readbacks_remaining = 1
+
+    def _apply_mutation(self, field: str) -> None:
+        if field == "contract":
+            self._issue_client.mutate_contract()
+        elif field == "membership":
+            self._membership_removed = True
+        elif field == "campaign_source":
+            self._issue_client.mutate_campaign_source()
+        elif field == "target_branch":
+            self._delegate.target_branch = "release"
+            self._issue_client.read_branch_source("owner/repository", "release")
+        elif field == "policy":
+            policy = _policy()
+            policy["ref"] = "policy:changed"
+            policy["digest"] = _digest(
+                {key: value for key, value in policy.items() if key != "digest"}
+            )
+            self._content_client.replace_policy(policy)
 
 
 class InjectedCrash(RuntimeError):
@@ -905,6 +1135,8 @@ class RevisionBoundEffects:
         self.evidence_digests = tuple(evidence_digests)
         self.executed: list[Any] = []
         self._readbacks: dict[str, Any] = {}
+        self.completed_results: dict[str, tuple[str, tuple[str, ...]]] = {}
+        self.candidate_identities: dict[str, str] = {}
         self._replay_ticket: str | None = None
         self._crash_boundary: str | None = None
 
@@ -984,6 +1216,13 @@ class RevisionBoundEffects:
         )
         observation = self._make_observation(action, phase, candidate=candidate)
         self._readbacks[action.stable_action_id] = observation
+        if candidate is not None:
+            self.candidate_identities[ticket] = candidate
+        if phase == "completed":
+            self.completed_results[ticket] = (
+                self.result_digest or "7" * 64,
+                self.evidence_digests or ("8" * 64,),
+            )
         return observation
 
     def replay_predecessor_candidate(self, ticket_key: str):
@@ -1133,6 +1372,8 @@ class SuccessorHarness:
         reinstall = getattr(self.host, "reinstall", None)
         if callable(reinstall):
             reinstall()
+            return
+        raise AttributeError("successor harness has no real reinstall seam")
 
 
 def _source_projection() -> dict[str, Any]:
@@ -1203,6 +1444,21 @@ def _direct_setup(payload: Mapping[str, Any] | None = None):
         effects=RevisionBoundEffects(initial_revision_digest=active.current_revision_digest),
         initial_revision_digest=active.current_revision_digest,
     )
+
+    def reinstall_direct() -> None:
+        fresh_host = _TestHost(control)
+        kernel = harness._kernel
+        harness.host = fresh_host
+        if kernel is not None:
+            store_path = getattr(kernel, "_store_path", None)
+            if store_path is None:
+                raise RuntimeError("direct successor kernel has no durable store path")
+            harness._kernel = fresh_host.install_execution_kernel(
+                store_path=store_path,
+                effects=harness.effects,
+            )
+
+    harness._reinstaller = reinstall_direct
     return control, repository, gateway, artifacts, source, host, handle, harness
 
 
@@ -1344,32 +1600,114 @@ def successor_host():
 
 
 def _public_harness(tmp_path, *, dependency: bool = True) -> SuccessorHarness:
-    _control, repository, gateway, _artifacts, source, host, handle, harness = _direct_setup()
-    from gwo_v8.execution_kernel import ExecutionKernel
+    from gwo_v8 import advance, inspect, start
+    from gwo_v8.plan_control_host import install_github_plan_control_start
+    from gwo_v8.runtime_gateway import ProfileMapping, RuntimeConfiguration
+    from gwo_v8.runtime_profile import RuntimeProfile
 
+    content_client = _ProductionGitHubContentClient()
+    issue_client = _ProductionGitHubIssueClient()
+    writer_control = _ProductionWriterGeneration()
+    gateway_box: dict[str, ScriptedPlanningGateway] = {}
+
+    def gateway_builder(*, artifacts, **_kwargs):
+        gateway = gateway_box.get("gateway")
+        if gateway is None:
+            gateway = ScriptedPlanningGateway(artifacts)
+            gateway_box["gateway"] = gateway
+        else:
+            # The host is rebuilt, but the semantic Gateway journal is shared.
+            gateway.artifacts = artifacts
+        return gateway
+
+    profile = RuntimeProfile(
+        name="successor-public-fixture",
+        provider="test-provider",
+        model="model:successor-public-fixture",
+        thinking="high",
+        mode="safe",
+        features={},
+    )
+    runtime_configuration = RuntimeConfiguration(
+        profiles={profile.digest: profile},
+        host_mappings={"coordinator": ProfileMapping(profile.digest)},
+    )
+    sqlite_path = tmp_path / (
+        "public-dependency.sqlite3" if dependency else "public.sqlite3"
+    )
+    gateway_path = tmp_path / "gateway.json"
+    artifact_root = tmp_path / "artifacts"
+
+    def install_host(previous=None):
+        host = install_github_plan_control_start(
+            repository="owner/repository",
+            control_branch="gwo-control",
+            target_branch="main",
+            writer_generation="writer:successor",
+            runtime_configuration=runtime_configuration,
+            repository_contexts={},
+            gateway_store_path=gateway_path,
+            artifact_root=artifact_root,
+            _content_client=content_client,
+            _issue_client=issue_client,
+            _writer_control=writer_control,
+            _gateway_builder=gateway_builder,
+        )
+        if previous is not None:
+            # Recompose a fresh production host over the exact durable seams.
+            host._repository = previous._repository
+            host._artifacts = previous._artifacts
+        return host
+
+    host = install_host()
+    source = _DelayedProductionSnapshotSource(
+        host._source,
+        content_client,
+        issue_client,
+    )
+    host._source = source
+    handle = start(
+        "owner/repository",
+        ("issue:108", "issue:109", "issue:110"),
+    )
+    repository = host._repository
     active = host.read_active(handle)
     effects = RevisionBoundEffects(initial_revision_digest=active.current_revision_digest)
     kernel = host.install_execution_kernel(
-        store_path=tmp_path / ("public-dependency.sqlite3" if dependency else "public.sqlite3"),
+        store_path=sqlite_path,
         effects=effects,
     )
-    kernel.advance(handle)
-    harness.effects = effects
-    harness._kernel = kernel
-    harness._reinstaller = lambda: setattr(
-        harness,
-        "_kernel",
-        host.install_execution_kernel(
-            store_path=tmp_path / ("public-dependency.sqlite3" if dependency else "public.sqlite3"),
-            effects=effects,
-        ),
+    advance(handle)
+    inspect(handle)
+    harness = SuccessorHarness(
+        handle=handle,
+        host=host,
+        repository=repository,
+        source=source,
+        gateway=gateway_box["gateway"],
+        effects=effects,
+        initial_revision_digest=active.current_revision_digest,
+        _kernel=kernel,
     )
+
+    def reinstall_public() -> None:
+        fresh_host = install_host(harness.host)
+        fresh_kernel = fresh_host.install_execution_kernel(
+            store_path=sqlite_path,
+            effects=harness.effects,
+        )
+        fresh_host._source = source
+        harness.host = fresh_host
+        harness.repository = fresh_host._repository
+        harness._kernel = fresh_kernel
+
+    harness._reinstaller = reinstall_public
     return harness
 
 
 @pytest.fixture
 def public_successor(tmp_path):
-    return _public_harness(tmp_path, dependency=True)
+    return _public_harness(tmp_path, dependency=False)
 
 
 @pytest.fixture

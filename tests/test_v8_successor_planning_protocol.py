@@ -330,3 +330,100 @@ def test_three_ticket_replanning_builder_freezes_execution_and_source_facts():
             "source": tickets["issue:109"]["native_blockers"][0]["source"],
         }
     ]
+
+
+def test_successor_harness_source_mutation_is_delayed_until_following_readback():
+    import v8_successor_test_support as support
+
+    _control, _repository, _gateway, _artifacts, source, _host, _handle, harness = (
+        support._direct_setup()
+    )
+    frozen = source.snapshot(
+        "owner/repository",
+        ("issue:108", "issue:109", "issue:110"),
+    )
+
+    harness.mutate_source("target_branch")
+
+    first_readback = source.snapshot(
+        "owner/repository",
+        ("issue:108", "issue:109", "issue:110"),
+    )
+    second_readback = source.snapshot(
+        "owner/repository",
+        ("issue:108", "issue:109", "issue:110"),
+    )
+
+    assert first_readback == frozen
+    assert second_readback["target_branch"] == "release"
+
+
+@pytest.mark.parametrize("fixture_name", ("public_successor", "public_dependency_successor"))
+def test_public_successor_fixtures_use_github_repository_and_production_host(
+    request,
+    fixture_name,
+):
+    from gwo_v8.plan_control_github import GitHubPlanRepository
+    from gwo_v8.plan_control_host import ProductionPlanControlStartHost
+
+    harness = request.getfixturevalue(fixture_name)
+
+    assert isinstance(harness.repository, GitHubPlanRepository)
+    assert isinstance(harness.host, ProductionPlanControlStartHost)
+
+
+def test_public_successor_fixture_installs_exported_start_advance_and_inspect(
+    public_successor,
+):
+    import gwo_v8
+    import gwo_v8.plan_control as plan_control
+
+    assert plan_control._default_start_host is public_successor.host
+    outcome = gwo_v8.advance(public_successor.handle)
+    diagnostics = gwo_v8.inspect(public_successor.handle)
+    runs = {run.ticket_key: run for run in diagnostics.work_runs}
+
+    assert outcome.status == diagnostics.status
+    assert runs["issue:108"].phase == "completed"
+    assert public_successor.effects.completed_results["issue:108"] == (
+        "7" * 64,
+        ("8" * 64,),
+    )
+    assert public_successor.effects.candidate_identities["issue:109"] == (
+        "candidate:r0:109"
+    )
+    assert runs["issue:110"].phase not in {"completed", "failed"}
+
+
+def test_public_successor_reinstall_recomposes_host_and_exported_kernel(
+    public_successor,
+):
+    import gwo_v8
+    import gwo_v8.plan_control as plan_control
+    from gwo_v8.plan_control_host import ProductionPlanControlStartHost
+
+    old_host = public_successor.host
+    old_kernel = public_successor._kernel
+    old_repository = public_successor.repository
+    old_gateway = public_successor.gateway
+    old_effects = public_successor.effects
+
+    public_successor.reinstall()
+
+    assert public_successor.host is not old_host
+    assert public_successor._kernel is not old_kernel
+    assert public_successor.repository is old_repository
+    assert public_successor.gateway is old_gateway
+    assert public_successor.effects is old_effects
+    assert isinstance(public_successor.host, ProductionPlanControlStartHost)
+    assert plan_control._default_start_host is public_successor.host
+
+    diagnostics = gwo_v8.inspect(public_successor.handle)
+    runs = {run.ticket_key: run for run in diagnostics.work_runs}
+    assert public_successor.effects.completed_results["issue:108"] == (
+        "7" * 64,
+        ("8" * 64,),
+    )
+    assert public_successor.effects.candidate_identities["issue:109"] == (
+        "candidate:r0:109"
+    )
