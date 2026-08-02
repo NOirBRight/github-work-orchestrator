@@ -607,6 +607,46 @@ def test_successor_readback_requires_closed_activation_receipt(
     )
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing_target_branch", "missing_work_authority", "writer_generation"),
+)
+def test_restart_revalidates_successor_authority_before_migration(tmp_path, mutation):
+    from gwo_v8.execution_kernel import ExecutionKernel, ExecutionKernelError
+
+    kernel, plans, effects, handle, invalidation = _successor_fixture(tmp_path)
+    if mutation == "writer_generation":
+        plans.successor = replace(
+            plans.successor,
+            activation_receipt=replace(
+                plans.successor.activation_receipt,
+                writer_generation=None,
+            ),
+        )
+    else:
+        plans.successor = _tampered_successor(plans.successor, mutation)
+    plans.return_value = plans.successor
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.advance(handle, plan_invalidation=invalidation)
+    assert raised.value.code == "SUCCESSOR_ACTIVATION_READBACK_INVALID"
+    assert plans.active == plans.successor
+
+    restarted = ExecutionKernel(
+        store_path=tmp_path / "execution.sqlite3",
+        plan_control=plans,
+        effects=effects,
+    )
+    plans.kernel = restarted
+    with pytest.raises(ExecutionKernelError) as raised:
+        restarted.advance(handle)
+
+    assert raised.value.code == "SUCCESSOR_ACTIVATION_READBACK_INVALID"
+    assert restarted._load(handle)["plan_revision_digest"] == (
+        plans.predecessor.current_revision_digest
+    )
+
+
 def _successor_fixture(tmp_path):
     from gwo_v8.execution_kernel import ExecutionKernel, PlanInvalidationObservation
 

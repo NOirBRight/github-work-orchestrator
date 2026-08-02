@@ -1088,7 +1088,20 @@ class ExecutionKernel:
         if state.get("plan_revision_digest") == active.current_revision_digest:
             return self._load_or_initialize(active, work)
 
-        self._validate_successor_state_match(active, state)
+        classification = self._validate_successor_state_match(active, state)
+        transition = state["successor_transition"]
+        # A crash can leave the durable predecessor row behind after
+        # PlanControl has already switched the active authority.  Do not let
+        # that recovery path trust only the transition envelope: the active
+        # readback must pass the same closed receipt/PlanSpec/claim fence as
+        # the original activation before migration or effects are admitted.
+        self._validate_successor_readback(
+            active.handle,
+            transition,
+            classification,
+            active,
+            active,
+        )
         try:
             plan = load_canonical_json(active.plan_spec_bytes)
         except CanonicalJsonError as error:
