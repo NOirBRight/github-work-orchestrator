@@ -1337,8 +1337,10 @@ class ExecutionKernel:
             if (
                 plan["repository"] != handle.repository
                 or plan["campaign"]["key"] != handle.campaign_key
+                or type(plan["target_branch"]) is not str
+                or not plan["target_branch"]
             ):
-                raise ValueError("successor PlanSpec belongs to another Campaign")
+                raise ValueError("successor PlanSpec identity is malformed")
             plan_keys: list[str] = []
             for item in plan["work"]:
                 if (

@@ -534,6 +534,7 @@ def test_unrelated_revision_change_still_fails_closed(tmp_path):
     (
         "missing_schema_version",
         "missing_repository",
+        "invalid_target_branch",
         "missing_target_branch",
         "missing_campaign_key",
         "missing_campaign_source",
@@ -694,6 +695,8 @@ def _tampered_successor(successor, mutation):
         spec.pop("repository")
     elif mutation == "missing_target_branch":
         spec.pop("target_branch")
+    elif mutation == "invalid_target_branch":
+        spec["target_branch"] = None
     elif mutation == "missing_campaign_key":
         spec["campaign"].pop("key")
     elif mutation == "missing_campaign_source":
