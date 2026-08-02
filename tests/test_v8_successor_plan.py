@@ -31,12 +31,27 @@ except ModuleNotFoundError:
     )
 
 
+def _bound_successor_classification(snapshot, **kwargs):
+    from gwo_v8._canonical import digest_value
+
+    classification = successor_classification_value(**kwargs).canonical()
+    classification["snapshot_digest"] = snapshot.get(
+        "snapshot_digest", digest_value(snapshot)
+    )
+    classification["plan_revision_digest"] = snapshot.get(
+        "plan_revision_digest", snapshot["active_plan_revision"]["digest"]
+    )
+    return classification
+
+
 def test_existing_owner_keeps_all_campaign_tickets():
     from gwo_v8.successor_plan import derive_successor_plan_intent
 
+    snapshot = three_ticket_replanning_snapshot()
     intent = derive_successor_plan_intent(
-        three_ticket_replanning_snapshot(),
-        successor_classification_value(
+        snapshot,
+        _bound_successor_classification(
+            snapshot,
             owners=("issue:110",),
             resources=(
                 (
@@ -57,10 +72,11 @@ def test_owner_without_plan_delta_is_not_a_successor():
         derive_successor_plan_intent,
     )
 
+    snapshot = three_ticket_replanning_snapshot()
     with pytest.raises(SuccessorPlanError) as raised:
         derive_successor_plan_intent(
-            three_ticket_replanning_snapshot(),
-            successor_classification_value(owners=("issue:110",)),
+            snapshot,
+            _bound_successor_classification(snapshot, owners=("issue:110",)),
         )
 
     assert raised.value.code == "SUCCESSOR_PLAN_UNCHANGED"
@@ -75,7 +91,8 @@ def test_justified_new_dependency_is_added_in_from_depends_on_to_direction():
     snapshot = three_ticket_replanning_snapshot()
     intent = derive_successor_plan_intent(
         snapshot,
-        successor_classification_value(
+        _bound_successor_classification(
+            snapshot,
             dependencies=(("issue:109", "issue:110", "110 owns persistence"),),
         ),
     )
@@ -96,7 +113,8 @@ def test_policy_allowed_resource_is_added_without_authority_change():
     before = deepcopy(snapshot["active_plan_revision"]["plan_spec"])
     intent = derive_successor_plan_intent(
         snapshot,
-        successor_classification_value(
+        _bound_successor_classification(
+            snapshot,
             resources=(
                 (
                     "issue:110",
@@ -132,7 +150,8 @@ def test_policy_allowed_resource_is_added_without_authority_change():
 def test_illegal_successor_fact_matrix_fails_closed(case):
     from gwo_v8.successor_plan import SuccessorPlanError, derive_successor_plan_intent
 
-    classification = successor_classification_value().canonical()
+    snapshot = three_ticket_replanning_snapshot()
+    classification = _bound_successor_classification(snapshot)
     successor = classification["successor"]
     if case == "unapproved_ticket":
         successor["approved_ticket_keys"] = ["issue:999"]
@@ -188,9 +207,29 @@ def test_illegal_successor_fact_matrix_fails_closed(case):
 
     with pytest.raises(SuccessorPlanError):
         derive_successor_plan_intent(
-            three_ticket_replanning_snapshot(),
+            snapshot,
             classification,
         )
+
+
+@pytest.mark.parametrize("binding_field", ("snapshot_digest", "plan_revision_digest"))
+def test_classification_must_bind_active_snapshot_and_revision(binding_field):
+    from gwo_v8.successor_plan import (
+        SuccessorPlanError,
+        derive_successor_plan_intent,
+    )
+
+    snapshot = three_ticket_replanning_snapshot()
+    classification = _bound_successor_classification(
+        snapshot,
+        dependencies=(("issue:109", "issue:110", "110 owns persistence"),),
+    )
+    classification[binding_field] = "f" * 64
+
+    with pytest.raises(SuccessorPlanError) as raised:
+        derive_successor_plan_intent(snapshot, classification)
+
+    assert raised.value.code == "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID"
 
 
 @pytest.mark.parametrize(
@@ -226,9 +265,25 @@ def test_fresh_source_must_equal_the_frozen_projection(field, code):
             }
         )
     else:
-        fresh["policy_witness"]["ref"] = "policy:changed"
+        fresh["policy"]["ref"] = "policy:changed"
 
     with pytest.raises(SuccessorPlanError) as raised:
         validate_fresh_successor_source(snapshot, fresh)
 
     assert raised.value.code == code
+
+
+def test_fresh_source_requires_observed_policy_projection():
+    from gwo_v8.successor_plan import (
+        SuccessorPlanError,
+        validate_fresh_successor_source,
+    )
+
+    snapshot = three_ticket_replanning_snapshot()
+    fresh = deepcopy(snapshot)
+    del fresh["policy"]
+
+    with pytest.raises(SuccessorPlanError) as raised:
+        validate_fresh_successor_source(snapshot, fresh)
+
+    assert raised.value.code == "REPLAN_POLICY_CHANGED"

@@ -182,7 +182,14 @@ def _require_active_plan(snapshot: Mapping[str, Any]) -> tuple[dict[str, Any], l
 
 def _require_snapshot(value: Any) -> dict[str, Any]:
     snapshot = _canonical(value)
-    if type(snapshot) is not dict or not {"repository", "target_branch", "campaign_source", "tickets", "active_plan_revision"}.issubset(snapshot):
+    if type(snapshot) is not dict or not {
+        "repository",
+        "target_branch",
+        "campaign_source",
+        "policy_witness",
+        "tickets",
+        "active_plan_revision",
+    }.issubset(snapshot):
         _fail("SUCCESSOR_PLAN_INVALID", "replanning snapshot is missing required authority facts")
     if not set(snapshot).issubset(_SNAPSHOT_FIELDS):
         _fail("SUCCESSOR_PLAN_INVALID", "replanning snapshot contains unsupported fields")
@@ -190,7 +197,7 @@ def _require_snapshot(value: Any) -> dict[str, Any]:
     _text(snapshot["target_branch"], "snapshot target branch")
     if type(snapshot["campaign_source"]) is not dict:
         _fail("SUCCESSOR_PLAN_INVALID", "snapshot Campaign source is invalid")
-    policy = _require_policy(snapshot.get("policy_witness", snapshot.get("policy")))
+    policy = _require_policy(snapshot["policy_witness"])
     if "policy" in snapshot and "policy_witness" in snapshot and snapshot["policy"] != policy:
         _fail("SUCCESSOR_PLAN_INVALID", "snapshot Policy projections disagree")
     tickets = snapshot["tickets"]
@@ -207,8 +214,10 @@ def _require_snapshot(value: Any) -> dict[str, Any]:
         _fail("SUCCESSOR_PLAN_INVALID", "active PlanSpec is bound to another Policy Witness")
     if (
         "plan_revision_digest" in snapshot
-        and snapshot["plan_revision_digest"]
-        != snapshot["active_plan_revision"]["digest"]
+        and (
+            _digest(snapshot["plan_revision_digest"], "snapshot Plan Revision digest")
+            != snapshot["active_plan_revision"]["digest"]
+        )
     ):
         _fail("SUCCESSOR_PLAN_INVALID", "snapshot Plan Revision identity is inconsistent")
     graph = {item["key"]: set(item["depends_on"]) for item in work}
@@ -216,6 +225,18 @@ def _require_snapshot(value: Any) -> dict[str, Any]:
     if "external_dependencies" in snapshot and type(snapshot["external_dependencies"]) is not list:
         _fail("SUCCESSOR_PLAN_INVALID", "snapshot external dependencies are invalid")
     return snapshot
+
+
+def _snapshot_identity(snapshot: dict[str, Any]) -> str:
+    if "snapshot_digest" not in snapshot:
+        return digest_value(snapshot)
+    declared = snapshot["snapshot_digest"]
+    _digest(declared, "snapshot digest")
+    content = dict(snapshot)
+    del content["snapshot_digest"]
+    if digest_value(content) != declared:
+        _fail("SUCCESSOR_PLAN_INVALID", "snapshot digest does not bind its facts")
+    return declared
 
 
 def _classification_mapping(value: Any) -> dict[str, Any]:
@@ -227,7 +248,12 @@ def _classification_mapping(value: Any) -> dict[str, Any]:
     return _canonical(value, code="SUCCESSOR_PLAN_INVALID")
 
 
-def _require_classification(value: Any) -> dict[str, Any]:
+def _require_classification(
+    value: Any,
+    *,
+    snapshot_digest: str,
+    plan_revision_digest: str,
+) -> dict[str, Any]:
     classification = _classification_mapping(value)
     expected = {
         "kind",
@@ -252,6 +278,14 @@ def _require_classification(value: Any) -> dict[str, Any]:
     _text(classification["action_id"], "classification action")
     _digest(classification["snapshot_digest"], "classification snapshot digest")
     _digest(classification["plan_revision_digest"], "classification Plan Revision digest")
+    if (
+        classification["snapshot_digest"] != snapshot_digest
+        or classification["plan_revision_digest"] != plan_revision_digest
+    ):
+        _fail(
+            "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID",
+            "successor classification is bound to another snapshot or Plan Revision",
+        )
     _digest(classification["capability_proof_digest"], "classification capability proof digest")
     _sorted_unique_texts(classification["evidence_digests"], "classification Evidence digests")
     _text(classification["reason"], "classification reason")
@@ -443,7 +477,11 @@ def derive_successor_plan_intent(
     """Derive a canonical full-Campaign successor intent from frozen facts."""
 
     frozen = _require_snapshot(snapshot)
-    normalized_classification = _require_classification(classification)
+    normalized_classification = _require_classification(
+        classification,
+        snapshot_digest=_snapshot_identity(frozen),
+        plan_revision_digest=frozen["active_plan_revision"]["digest"],
+    )
     intent, changed = _derive_values(frozen, normalized_classification)
     if not changed:
         _fail(
@@ -585,24 +623,15 @@ def compile_successor_plan_spec(
     return _canonical(result)
 
 
-def _source_projection(snapshot: dict[str, Any]) -> dict[str, Any]:
-    policy_witness = snapshot.get("policy_witness")
-    policy = snapshot.get("policy")
-    if policy_witness is None:
-        policy_projection = policy
-    elif policy is None or policy == policy_witness:
-        policy_projection = policy_witness
-    else:
-        # A source adapter that returns both projections must keep them
-        # identical.  Returning a sentinel makes the mismatch a policy drift
-        # result without accidentally treating either projection as authority.
-        policy_projection = ("inconsistent-policy-projections", policy_witness, policy)
+def _source_projection(
+    snapshot: dict[str, Any], *, observed: bool = False
+) -> dict[str, Any]:
     return {
         "target_branch": snapshot.get("target_branch"),
         "campaign_source": snapshot.get("campaign_source"),
         "tickets": snapshot.get("tickets"),
         "external_dependencies": snapshot.get("external_dependencies", []),
-        "policy": policy_projection,
+        "policy": snapshot.get("policy") if observed else snapshot["policy_witness"],
     }
 
 
@@ -616,7 +645,7 @@ def validate_fresh_successor_source(
     if type(observed) is not dict:
         _fail("REPLAN_SOURCE_CHANGED", "fresh authoritative source is not an object")
     expected_projection = _source_projection(frozen)
-    observed_projection = _source_projection(observed)
+    observed_projection = _source_projection(observed, observed=True)
     source_fields = (
         "target_branch",
         "campaign_source",
