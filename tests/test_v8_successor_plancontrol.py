@@ -528,6 +528,63 @@ def _seed_completed_successor(control, repository, gateway, artifacts, handle):
     return classification
 
 
+def _durable_state(repository, handle):
+    return (
+        repository.active_receipt(handle),
+        dict(repository.claims),
+        dict(repository.revisions),
+        dict(repository.activation_receipts),
+        dict(repository.pending_reservations),
+        dict(repository.planning_reservations),
+    )
+
+
+def _rewrite_successor_record_classification(
+    repository,
+    artifacts,
+    handle,
+    classification,
+):
+    from gwo_v8._canonical import canonical_bytes
+
+    attempt = repository.read_attempt(handle, classification.plan_revision_digest)
+    assert attempt is not None
+    record = deepcopy(artifacts.values[attempt.compilation_record_artifact_digest])
+    embedded = replace(
+        classification,
+        reason="A different durable classification must not activate this successor.",
+    )
+    output_digest = record["output_artifact_digest"]
+    output = deepcopy(artifacts.values[output_digest])
+    output["payload"]["reason"] = embedded.reason
+    output_ref = artifacts.put_canonical(output)
+    record["planning_receipt"]["output_artifact_digest"] = output_ref.digest
+    record["planning_receipt"]["planning_output_artifact_digest"] = output_ref.digest
+    record["output_artifact_digest"] = output_ref.digest
+    record["planning_output"] = artifacts.read_json(output_ref.digest)
+    record["classification"] = embedded.canonical()
+    record["classification_digest"] = embedded.digest
+    record_ref = artifacts.put_canonical(record)
+    repository.attempts[
+        (handle.repository, handle.campaign_key, classification.plan_revision_digest)
+    ] = replace(
+        attempt,
+        compilation_record_artifact_digest=record_ref.digest,
+        compilation_record_bytes=canonical_bytes(record),
+    )
+
+
+def _canonical_accepted_result_binding():
+    return {
+        "kind": "accepted_result_binding.v1",
+        "ticket_key": "issue:108",
+        "result_digest": "1" * 64,
+        "evidence_digests": ["2" * 64, "3" * 64],
+        "work_subject_digest": "4" * 64,
+        "target_facts_digest": "5" * 64,
+    }
+
+
 def test_activate_successor_never_calls_gateway_again():
     control, repository, gateway, artifacts, _source, handle = _initial_control()
     classification = _seed_completed_successor(
@@ -820,14 +877,191 @@ def test_successor_compilation_record_tamper_fails_closed():
     assert attempt is not None
     record = artifacts.values[attempt.compilation_record_artifact_digest]
     record["normalized_intent_digest"] = "0" * 64
+    before = _durable_state(repository, handle)
 
     with pytest.raises(PlanControlError) as raised:
         control.activate_successor(handle, classification)
 
     assert raised.value.code == "COMPILATION_RECORD_INVALID"
-    assert repository.active_receipt(handle).revision_digest == (
-        classification.plan_revision_digest
+    assert _durable_state(repository, handle) == before
+
+
+@pytest.mark.parametrize(
+    ("artifact", "field", "expected_code"),
+    (
+        ("snapshot", "target_branch", "SNAPSHOT_READBACK_INVALID"),
+        ("policy", "ref", "POLICY_WITNESS_INVALID"),
+        ("request", "authority_digest", "PLANNING_REQUEST_INVALID"),
+    ),
+)
+def test_successor_immutable_input_tamper_fails_before_any_effect(
+    artifact,
+    field,
+    expected_code,
+):
+    from gwo_v8.plan_control import PlanControlError
+
+    control, repository, _gateway, artifacts, _source, handle, classification = (
+        _classified_control()
     )
+    attempt = repository.read_attempt(handle, classification.plan_revision_digest)
+    assert attempt is not None
+    digests = {
+        "snapshot": attempt.snapshot_artifact_digest,
+        "policy": attempt.policy_witness_digest,
+        "request": attempt.planning_request_artifact_digest,
+    }
+    artifacts.values[digests[artifact]][field] = "tampered"
+    before = _durable_state(repository, handle)
+
+    with pytest.raises(PlanControlError) as raised:
+        control.activate_successor(handle, classification)
+
+    assert raised.value.code == expected_code
+    assert _durable_state(repository, handle) == before
+
+
+def test_successor_snapshot_bytes_tamper_fails_before_any_effect():
+    from gwo_v8._canonical import canonical_bytes, load_canonical_json
+    from gwo_v8.plan_control import PlanControlError
+
+    control, repository, _gateway, _artifacts, _source, handle, classification = (
+        _classified_control()
+    )
+    attempt = repository.read_attempt(handle, classification.plan_revision_digest)
+    assert attempt is not None
+    snapshot = load_canonical_json(attempt.snapshot_bytes)
+    snapshot["target_branch"] = "release"
+    repository.attempts[
+        (handle.repository, handle.campaign_key, classification.plan_revision_digest)
+    ] = replace(attempt, snapshot_bytes=canonical_bytes(snapshot))
+    before = _durable_state(repository, handle)
+
+    with pytest.raises(PlanControlError) as raised:
+        control.activate_successor(handle, classification)
+
+    assert raised.value.code == "SNAPSHOT_DIGEST_MISMATCH"
+    assert _durable_state(repository, handle) == before
+
+
+def test_successor_compilation_record_bytes_are_required():
+    from gwo_v8.plan_control import PlanControlError
+
+    control, repository, _gateway, _artifacts, _source, handle, classification = (
+        _classified_control()
+    )
+    attempt = repository.read_attempt(handle, classification.plan_revision_digest)
+    assert attempt is not None
+    repository.attempts[
+        (handle.repository, handle.campaign_key, classification.plan_revision_digest)
+    ] = replace(attempt, compilation_record_bytes=None)
+    before = _durable_state(repository, handle)
+
+    with pytest.raises(PlanControlError) as raised:
+        control.activate_successor(handle, classification)
+
+    assert raised.value.code == "COMPILATION_RECORD_INVALID"
+    assert _durable_state(repository, handle) == before
+
+
+def test_successor_embedded_classification_must_match_durable_classification():
+    from gwo_v8.plan_control import PlanControlError
+
+    control, repository, _gateway, artifacts, _source, handle, classification = (
+        _classified_control()
+    )
+    _rewrite_successor_record_classification(
+        repository,
+        artifacts,
+        handle,
+        classification,
+    )
+    before = _durable_state(repository, handle)
+
+    with pytest.raises(PlanControlError) as raised:
+        control.activate_successor(handle, classification)
+
+    assert raised.value.code == "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID"
+    assert _durable_state(repository, handle) == before
+
+
+def test_start_dispatches_successor_recovery_without_a_second_planning_pass():
+    control, repository, gateway, _artifacts, _source, handle, classification = (
+        _classified_control()
+    )
+    predecessor = repository.active_receipt(handle)
+
+    result = control.start(
+        handle.repository,
+        ["issue:108", "issue:109", "issue:110"],
+        campaign_key=handle.campaign_key,
+        expected_previous_revision_digest=classification.plan_revision_digest,
+    )
+
+    assert result == handle
+    assert gateway.replan_progresses == 1
+    assert repository.active_receipt(handle) != predecessor
+
+
+def test_start_successor_recovery_missing_classification_is_named_and_fail_closed():
+    from gwo_v8.plan_control import PlanControlError
+
+    control, repository, _gateway, _artifacts, _source, handle, classification = (
+        _classified_control()
+    )
+    repository.invalidation_classifications.pop(
+        (handle.repository, handle.campaign_key, classification.action_id)
+    )
+    before = _durable_state(repository, handle)
+
+    with pytest.raises(PlanControlError) as raised:
+        control.start(
+            handle.repository,
+            ["issue:108", "issue:109", "issue:110"],
+            campaign_key=handle.campaign_key,
+            expected_previous_revision_digest=classification.plan_revision_digest,
+        )
+
+    assert raised.value.code == "PLAN_INVALIDATION_CLASSIFICATION_READBACK_INVALID"
+    assert _durable_state(repository, handle) == before
+
+
+def test_execution_snapshot_retains_canonical_accepted_result_binding():
+    control, _repository, gateway, artifacts, _source, handle = _initial_control()
+    gateway.payload = _successor_payload()
+    active = control.read_active(handle)
+    execution = _execution_snapshot(active)
+    binding = _canonical_accepted_result_binding()
+    execution["accepted_results"] = [binding]
+
+    classification = control.classify_plan_invalidations(
+        handle,
+        (_invalidation(control, handle),),
+        execution,
+    )
+
+    assert classification is not None
+    snapshot = artifacts.read_json(classification.snapshot_digest)
+    assert snapshot["accepted_results"] == [binding]
+
+
+def test_execution_snapshot_accepts_explicit_legacy_accepted_result_record():
+    control, _repository, gateway, artifacts, _source, handle = _initial_control()
+    gateway.payload = _successor_payload()
+    active = control.read_active(handle)
+    execution = _execution_snapshot(active)
+    legacy = {"ticket_key": "issue:108", "result_digest": "6" * 64}
+    execution["accepted_results"] = [legacy]
+
+    classification = control.classify_plan_invalidations(
+        handle,
+        (_invalidation(control, handle),),
+        execution,
+    )
+
+    assert classification is not None
+    snapshot = artifacts.read_json(classification.snapshot_digest)
+    assert snapshot["accepted_results"] == [legacy]
 
 
 def test_allowed_exclusive_resource_delta_reaches_compiled_plan():
