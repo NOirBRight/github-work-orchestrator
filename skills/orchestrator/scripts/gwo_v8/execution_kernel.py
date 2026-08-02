@@ -1251,6 +1251,7 @@ class ExecutionKernel:
             classification,
             candidate,
             fresh,
+            expected_writer_generation=active.activation_receipt.writer_generation,
         )
         successor_plan = load_canonical_json(candidate.plan_spec_bytes)
         if type(successor_plan) is not dict:  # pragma: no cover - validated above
@@ -1276,6 +1277,8 @@ class ExecutionKernel:
         classification: PlanInvalidationClassification,
         candidate: object,
         fresh: object,
+        *,
+        expected_writer_generation: str | None = None,
     ) -> ActivePlanReadback:
         """Require one exact receipt/PlanSpec/claim readback before migration."""
 
@@ -1293,16 +1296,21 @@ class ExecutionKernel:
             ):
                 raise ValueError("successor authority readback is untyped or inconsistent")
             plan = load_canonical_json(candidate.plan_spec_bytes)
-            if (
-                type(plan) is not dict
-                or canonical_bytes(plan) != candidate.plan_spec_bytes
-                or plan.get("schema_version") != 3
-                or plan.get("repository") != handle.repository
-                or type(plan.get("campaign")) is not dict
-                or plan["campaign"].get("key") != handle.campaign_key
-                or type(plan.get("work")) is not list
-            ):
+            if type(plan) is not dict or canonical_bytes(plan) != candidate.plan_spec_bytes:
                 raise ValueError("successor PlanSpec is not canonical")
+            # PlanControl owns the compiler, but the ExecutionKernel owns the
+            # readback fence.  Reuse its closed V3 validator here so a hostile
+            # or stale activator cannot smuggle a partial PlanSpec into the
+            # migration path (which would otherwise fall back to legacy
+            # identity derivation for missing authority facts).
+            from .plan_control import _validate_plan_spec
+
+            _validate_plan_spec(candidate.plan_spec_bytes)
+            if (
+                plan["repository"] != handle.repository
+                or plan["campaign"]["key"] != handle.campaign_key
+            ):
+                raise ValueError("successor PlanSpec belongs to another Campaign")
             plan_keys: list[str] = []
             for item in plan["work"]:
                 if (
@@ -1323,8 +1331,22 @@ class ExecutionKernel:
                 raise ValueError("successor PlanSpec work keys are not unique")
             receipt = candidate.activation_receipt
             claim_proofs = candidate.claim_proofs
+            ready_refs = tuple(
+                sorted(item["source"]["ref"] for item in plan["work"])
+            )
             if (
-                type(receipt.ticket_keys) is not tuple
+                type(receipt.writer_generation) is not str
+                or not receipt.writer_generation
+                or (
+                    expected_writer_generation is not None
+                    and receipt.writer_generation != expected_writer_generation
+                )
+                or type(receipt.ready_refs) is not tuple
+                or receipt.ready_refs != ready_refs
+                or not receipt.ready_refs
+                or len(set(receipt.ready_refs)) != len(receipt.ready_refs)
+                or any(type(ref) is not str or not ref for ref in receipt.ready_refs)
+                or type(receipt.ticket_keys) is not tuple
                 or any(type(key) is not str or not key for key in receipt.ticket_keys)
                 or tuple(sorted(set(receipt.ticket_keys))) != receipt.ticket_keys
                 or type(receipt.expected_previous_revision_digest) is not str
@@ -1333,6 +1355,27 @@ class ExecutionKernel:
                 ) is None
                 or type(receipt.planning_stable_action_id) is not str
                 or not receipt.planning_stable_action_id
+                or type(receipt.planning_subject_digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", receipt.planning_subject_digest)
+                is None
+                or type(receipt.planning_preflight_receipt_digest) is not str
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", receipt.planning_preflight_receipt_digest
+                )
+                is None
+                or type(receipt.compilation_record_artifact_digest) is not str
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", receipt.compilation_record_artifact_digest
+                )
+                is None
+                or type(receipt.planning_receipt_digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", receipt.planning_receipt_digest)
+                is None
+                or type(receipt.planning_output_artifact_digest) is not str
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", receipt.planning_output_artifact_digest
+                )
+                is None
                 or type(candidate.current_revision_digest) is not str
                 or re.fullmatch(r"[0-9a-f]{64}", candidate.current_revision_digest)
                 is None

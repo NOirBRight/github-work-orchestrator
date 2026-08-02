@@ -529,6 +529,84 @@ def test_unrelated_revision_change_still_fails_closed(tmp_path):
     assert effects.executed
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing_schema_version",
+        "missing_repository",
+        "missing_target_branch",
+        "missing_campaign_key",
+        "missing_campaign_source",
+        "missing_campaign_authority",
+        "missing_policy",
+        "missing_work_source",
+        "missing_work_contract",
+        "missing_work_capabilities",
+        "missing_work_authority",
+        "missing_work_depends_on",
+        "missing_work_exclusive_resources",
+        "extra_plan_field",
+        "extra_work_field",
+    ),
+)
+def test_successor_readback_requires_closed_plan_identity(tmp_path, mutation):
+    from gwo_v8.execution_kernel import ExecutionKernelError
+
+    kernel, plans, effects, handle, invalidation = _successor_fixture(tmp_path)
+    plans.successor = _tampered_successor(plans.successor, mutation)
+    plans.return_value = plans.successor
+    effects_before = tuple(effects.executed)
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.advance(handle, plan_invalidation=invalidation)
+
+    assert raised.value.code == "SUCCESSOR_ACTIVATION_READBACK_INVALID"
+    assert effects.executed == list(effects_before)
+    assert kernel._load(handle)["plan_revision_digest"] == (
+        plans.predecessor.current_revision_digest
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("writer_generation", "writer:foreign"),
+        ("writer_generation", None),
+        ("ready_refs", ("issue:108",)),
+        ("ready_refs", ()),
+        ("planning_subject_digest", "not-a-digest"),
+        ("planning_preflight_receipt_digest", "not-a-digest"),
+        ("compilation_record_artifact_digest", "not-a-digest"),
+        ("planning_receipt_digest", "not-a-digest"),
+        ("planning_output_artifact_digest", "not-a-digest"),
+    ),
+)
+def test_successor_readback_requires_closed_activation_receipt(
+    tmp_path, field, value
+):
+    from gwo_v8.execution_kernel import ExecutionKernelError
+
+    kernel, plans, effects, handle, invalidation = _successor_fixture(tmp_path)
+    plans.successor = replace(
+        plans.successor,
+        activation_receipt=replace(
+            plans.successor.activation_receipt,
+            **{field: value},
+        ),
+    )
+    plans.return_value = plans.successor
+    effects_before = tuple(effects.executed)
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.advance(handle, plan_invalidation=invalidation)
+
+    assert raised.value.code == "SUCCESSOR_ACTIVATION_READBACK_INVALID"
+    assert effects.executed == list(effects_before)
+    assert kernel._load(handle)["plan_revision_digest"] == (
+        plans.predecessor.current_revision_digest
+    )
+
+
 def _successor_fixture(tmp_path):
     from gwo_v8.execution_kernel import ExecutionKernel, PlanInvalidationObservation
 
@@ -566,6 +644,61 @@ def _successor_fixture(tmp_path):
     return kernel, plans, effects, handle, invalidation
 
 
+def _tampered_successor(successor, mutation):
+    from gwo_v8._canonical import canonical_bytes, digest_bytes, load_canonical_json
+
+    spec = deepcopy(load_canonical_json(successor.plan_spec_bytes))
+    if mutation == "missing_schema_version":
+        spec.pop("schema_version")
+    elif mutation == "missing_repository":
+        spec.pop("repository")
+    elif mutation == "missing_target_branch":
+        spec.pop("target_branch")
+    elif mutation == "missing_campaign_key":
+        spec["campaign"].pop("key")
+    elif mutation == "missing_campaign_source":
+        spec["campaign"].pop("source")
+    elif mutation == "missing_campaign_authority":
+        spec["campaign"].pop("authority")
+    elif mutation == "missing_policy":
+        spec.pop("policy")
+    elif mutation == "missing_work_source":
+        spec["work"][0].pop("source")
+    elif mutation == "missing_work_contract":
+        spec["work"][0].pop("contract")
+    elif mutation == "missing_work_capabilities":
+        spec["work"][0].pop("capabilities")
+    elif mutation == "missing_work_authority":
+        spec["work"][0].pop("authority")
+    elif mutation == "missing_work_depends_on":
+        spec["work"][0].pop("depends_on")
+    elif mutation == "missing_work_exclusive_resources":
+        spec["work"][0].pop("exclusive_resources")
+    elif mutation == "extra_plan_field":
+        spec["unexpected"] = True
+    elif mutation == "extra_work_field":
+        spec["work"][0]["unexpected"] = True
+    else:  # pragma: no cover - the parameter list is closed above
+        raise AssertionError(mutation)
+    payload = canonical_bytes(spec)
+    revision_digest = digest_bytes(payload)
+    receipt = replace(
+        successor.activation_receipt,
+        revision_digest=revision_digest,
+    )
+    claims = tuple(
+        replace(proof, plan_revision_digest=revision_digest)
+        for proof in successor.claim_proofs
+    )
+    return replace(
+        successor,
+        current_revision_digest=revision_digest,
+        plan_spec_bytes=payload,
+        activation_receipt=receipt,
+        claim_proofs=claims,
+    )
+
+
 def _approved_successor_classification(active):
     from gwo_v8.execution_kernel import ExecutionKernel
     from gwo_v8.plan_control import PlanInvalidationClassification, PlanInvalidationDisposition
@@ -592,12 +725,22 @@ def _successor_readback(
     expected_previous=None,
 ):
     from gwo_v8._canonical import canonical_bytes, digest_bytes, load_canonical_json
-    from gwo_v8.plan_control import ActivePlanReadback, TicketClaimProof
+    from gwo_v8.plan_control import (
+        ActivePlanReadback,
+        TicketClaimProof,
+        frozen_ticket_contract_digest,
+    )
 
     spec = deepcopy(load_canonical_json(predecessor.plan_spec_bytes))
     for item in spec["work"]:
         if item["key"] == changed_ticket:
-            item["contract"] = {"acceptance": ["the successor Ticket is satisfied"]}
+            item["contract"]["body"] = "the successor Ticket is satisfied"
+            item["source"]["digest"] = frozen_ticket_contract_digest(
+                key=item["key"],
+                contract=item["contract"],
+                labels=["ready-for-agent"],
+                native_blockers=[],
+            )
     payload = canonical_bytes(spec)
     revision_digest = digest_bytes(payload)
     receipt = replace(
@@ -769,24 +912,143 @@ def _observation(
 
 
 def _active_campaign(ticket_keys):
-    from gwo_v8._canonical import canonical_bytes, digest_bytes
+    from gwo_v8._canonical import canonical_bytes, digest_bytes, digest_value
     from gwo_v8.plan_control import (
         ActivationReceipt,
         ActivePlanReadback,
         CampaignHandle,
+        frozen_ticket_contract_digest,
         TicketClaimProof,
     )
 
     handle = CampaignHandle("owner/repository", "campaign:successor-kernel")
+    policy_core = {
+        "schema_version": 1,
+        "ref": "policy:successor-kernel",
+        "authority_grants": {
+            "campaign": [
+                {
+                    "operation_id": "repository.read.v1",
+                    "resource_id": "campaign.snapshot.v1",
+                }
+            ],
+            "worker": [
+                {
+                    "operation_id": "workspace.write.v1",
+                    "resource_id": "work-run.workspace.v1",
+                }
+            ],
+            "recovery_worker": [
+                {
+                    "operation_id": "workspace.write.v1",
+                    "resource_id": "work-run.workspace.v1",
+                }
+            ],
+            "review": [
+                {
+                    "operation_id": "repository.read.v1",
+                    "resource_id": "review.subject.v1",
+                }
+            ],
+        },
+        "allowed_capabilities": ["git", "local_check"],
+        "exclusive_resources": ["repository.target.v1"],
+    }
+    policy = {**policy_core, "digest": digest_value(policy_core)}
+    campaign_source_core = {
+        "repository": handle.repository,
+        "input_ref": "refs/heads/main",
+        "resolved_commit_oid": "2" * 40,
+        "tree_oid": "3" * 40,
+    }
+    campaign_source = {
+        **campaign_source_core,
+        "digest": digest_value(campaign_source_core),
+    }
+
+    def authority(grants):
+        core = {
+            "policy_witness_digest": policy["digest"],
+            "grants": grants,
+        }
+        return {**core, "subtree_digest": digest_value(core)}
+
     work = [
         {
             "key": key,
-            "source": {"issue": key, "commit": "1" * 40},
-            "contract": {"acceptance": ["the Ticket is satisfied"]},
+            "source": {
+                "ref": key,
+                "digest": frozen_ticket_contract_digest(
+                    key=key,
+                    contract={
+                        "id": int(key.split(":")[1]),
+                        "node_id": f"ISSUE_{key.split(':')[1]}",
+                        "number": int(key.split(":")[1]),
+                        "title": f"Successor kernel {key}",
+                        "body": f"Complete successor kernel work {key}",
+                        "state": "open",
+                        "state_reason": None,
+                        "type": None,
+                        "repository": {
+                            "full_name": handle.repository,
+                            "url": "https://api.github.com/repos/owner/repository",
+                        },
+                        "labels": [
+                            {
+                                "id": 1,
+                                "node_id": "LABEL_READY",
+                                "url": "https://api.github.com/repos/owner/repository/labels/ready-for-agent",
+                                "name": "ready-for-agent",
+                                "color": "0052cc",
+                                "default": False,
+                                "description": "ready",
+                            }
+                        ],
+                        "comments": [],
+                        "updated_at": "2026-08-02T00:00:00Z",
+                    },
+                    labels=["ready-for-agent"],
+                    native_blockers=[],
+                ),
+            },
+            "contract": {
+                "id": int(key.split(":")[1]),
+                "node_id": f"ISSUE_{key.split(':')[1]}",
+                "number": int(key.split(":")[1]),
+                "title": f"Successor kernel {key}",
+                "body": f"Complete successor kernel work {key}",
+                "state": "open",
+                "state_reason": None,
+                "type": None,
+                "repository": {
+                    "full_name": handle.repository,
+                    "url": "https://api.github.com/repos/owner/repository",
+                },
+                "labels": [
+                    {
+                        "id": 1,
+                        "node_id": "LABEL_READY",
+                        "url": "https://api.github.com/repos/owner/repository/labels/ready-for-agent",
+                        "name": "ready-for-agent",
+                        "color": "0052cc",
+                        "default": False,
+                        "description": "ready",
+                    }
+                ],
+                "comments": [],
+                "updated_at": "2026-08-02T00:00:00Z",
+            },
             "depends_on": [],
             "exclusive_resources": [],
-            "capabilities": ["repository.read"],
-            "authority": {"worker": {"subtree_digest": "a" * 64}},
+            "capabilities": ["git", "local_check"],
+            "authority": {
+                "policy_witness_digest": policy["digest"],
+                "worker": authority(policy["authority_grants"]["worker"]),
+                "recovery_worker": authority(
+                    policy["authority_grants"]["recovery_worker"]
+                ),
+                "review": authority(policy["authority_grants"]["review"]),
+            },
         }
         for key in ticket_keys
     ]
@@ -796,10 +1058,10 @@ def _active_campaign(ticket_keys):
         "target_branch": "main",
         "campaign": {
             "key": handle.campaign_key,
-            "source": {"commit": "2" * 40, "tree": "3" * 40},
-            "authority": {"worker": {"subtree_digest": "b" * 64}},
+            "source": campaign_source,
+            "authority": authority(policy["authority_grants"]["campaign"]),
         },
-        "policy": {"version": "policy:v1", "digest": "c" * 64},
+        "policy": {"ref": policy["ref"], "digest": policy["digest"]},
         "work": work,
     }
     payload = canonical_bytes(spec)
@@ -810,7 +1072,7 @@ def _active_campaign(ticket_keys):
         revision_digest=revision,
         expected_previous_revision_digest=None,
         writer_generation="writer:one",
-        ready_refs=ticket_keys,
+        ready_refs=tuple(sorted(item["source"]["ref"] for item in work)),
         ticket_keys=ticket_keys,
         planning_subject_digest="d" * 64,
         planning_stable_action_id="campaign-plan:one",
