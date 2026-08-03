@@ -110,6 +110,49 @@ def test_conflicting_page_rolls_back_wake_rows_and_preserves_dispatch(tmp_path):
     assert after == before
 
 
+def test_post_insert_cas_failure_rolls_back_wake_and_cursor(tmp_path):
+    source = RecordingWakeSource(pages=[page(runtime_wake("7", "action:a"))])
+    advancer = RecordingAdvancer()
+    watchdog = make_watchdog(tmp_path, source=source, advancer=advancer)
+    watchdog.run_once(NOW)
+    with sqlite3.connect(watchdog._store_path) as connection:
+        before_source = connection.execute(
+            "SELECT cursor, page_digest FROM v8_watchdog_sources "
+            "WHERE stream='runtime_gateway'"
+        ).fetchone()
+        before_wakes = connection.execute(
+            "SELECT wake_ref, cursor, source_identity FROM v8_watchdog_wakes"
+        ).fetchall()
+        connection.execute(
+            """
+            CREATE TRIGGER force_watchdog_cas_failure
+            AFTER INSERT ON v8_watchdog_wakes
+            BEGIN
+                DELETE FROM v8_watchdog_sources
+                WHERE stream = 'runtime_gateway';
+            END
+            """
+        )
+
+    source.pages = [page(runtime_wake("8", "action:b"))]
+    with pytest.raises(CampaignWatchdogError) as raised:
+        watchdog.run_once(NOW)
+
+    assert raised.value.code == "WATCHDOG_CURSOR_CONFLICT"
+    assert advancer.calls == [(handle(), "watchdog:runtime:7:action:a")]
+    assert watchdog.read_cursor("runtime_gateway") == "7"
+    with sqlite3.connect(watchdog._store_path) as connection:
+        after_source = connection.execute(
+            "SELECT cursor, page_digest FROM v8_watchdog_sources "
+            "WHERE stream='runtime_gateway'"
+        ).fetchone()
+        after_wakes = connection.execute(
+            "SELECT wake_ref, cursor, source_identity FROM v8_watchdog_wakes"
+        ).fetchall()
+    assert after_source == before_source
+    assert after_wakes == before_wakes
+
+
 @pytest.mark.parametrize(
     "invalid_now",
     ["2026-08-03T10:00:00Z", "2026-08-03T10:00:00+08:00"],
