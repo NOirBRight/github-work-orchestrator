@@ -264,3 +264,29 @@ def test_read_cursor_does_not_modify_the_store_bytes(tmp_path):
     assert watchdog.read_cursor("runtime_gateway") == "11"
 
     assert watchdog._store_path.read_bytes() == before
+
+
+def test_restart_rebuilds_overdue_campaign_and_calls_advance_once(tmp_path):
+    campaigns = RecordingCampaignSource(
+        {handle(): make_snapshot(next_check_at="2026-08-03T09:59:00+00:00")}
+    )
+    source = RecordingWakeSource([])
+    advancer = RecordingAdvancer()
+    first = make_watchdog(
+        tmp_path,
+        source=source,
+        campaign_source=campaigns,
+        advancer=advancer,
+    )
+    first.rebuild_due_queue()
+    restarted = make_watchdog(
+        tmp_path,
+        source=source,
+        campaign_source=campaigns,
+        advancer=advancer,
+    )
+
+    outcomes = restarted.run_once("2026-08-03T10:00:00+00:00")
+
+    assert len(outcomes) == 1
+    assert advancer.calls == [(handle(), None)]

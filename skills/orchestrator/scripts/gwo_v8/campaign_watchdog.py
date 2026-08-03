@@ -595,6 +595,35 @@ class CampaignWatchdog:
                 outcomes.append(self._advancer.advance(wake.campaign, wake.wake_ref))
 
         self.rebuild_due_queue()
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(self._store_path)
+            due = connection.execute(
+                "SELECT repository, campaign_key FROM v8_watchdog_due "
+                "WHERE next_check_at <= ?",
+                (now,),
+            ).fetchall()
+        except (OSError, sqlite3.Error) as error:
+            raise CampaignWatchdogError(
+                WATCHDOG_STORE_INVALID,
+                "Watchdog due work could not be read",
+            ) from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+        for repository, campaign_key in due:
+            handle = CampaignHandle(repository, campaign_key)
+            snapshot = _validate_snapshot_for_handle(
+                handle,
+                self._campaign_source.watchdog_snapshot(handle),
+            )
+            if (
+                snapshot.status is not CampaignStatus.COMPLETE
+                and snapshot.next_check_at is not None
+                and snapshot.next_check_at <= now
+            ):
+                outcomes.append(self._advancer.advance(handle, None))
         return tuple(outcomes)
 
     def read_cursor(self, stream: str) -> str | None:
