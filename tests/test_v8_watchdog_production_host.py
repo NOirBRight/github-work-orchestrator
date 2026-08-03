@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -13,6 +14,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from gwo_v8.runtime_gateway import (  # noqa: E402
     ArtifactStore,
+    CampaignPlanningSubject,
     ProfileMapping,
     RuntimeConfiguration,
     RuntimeGateway,
@@ -43,11 +45,86 @@ def _gateway(tmp_path: Path):
         _adapter=adapter,
         configuration=RuntimeConfiguration(
             profiles={profile.digest: profile},
-            host_mappings={"coordinator": ProfileMapping(profile.digest)},
+            host_mappings={
+                selector: ProfileMapping(profile.digest)
+                for selector in (
+                    "coordinator",
+                    "worker",
+                    "recovery_worker",
+                    "review_primary",
+                    "review_strong",
+                    "specialist:policy-1",
+                )
+            },
         ),
         _artifacts=store,
     )
     return gateway, store, adapter
+
+
+def _subject(*, purpose: WorkRunPurpose | None = None) -> WorkRunSubject:
+    return WorkRunSubject(
+        repository="owner/repository",
+        campaign_key="campaign:watchdog",
+        campaign_handle="handle:watchdog",
+        plan_revision_digest="0" * 64,
+        work_run_key="work-run:watchdog",
+        ticket_key="issue:113",
+        purpose=purpose or WorkRunPurpose.implementation(),
+        prompt_artifact_digest="0" * 64,
+        authority_subtree_digest="1" * 64,
+        stable_action_id="action:watchdog",
+    )
+
+
+def _put_subject_artifacts(store: ArtifactStore, subject: WorkRunSubject) -> WorkRunSubject:
+    plan = store.put_canonical({"revision": 1})
+    unsigned = replace(
+        subject,
+        plan_revision_digest=plan.digest,
+        prompt_artifact_digest="0" * 64,
+    )
+    prompt = store.put_canonical(
+        {
+            "schema_version": "gwo.runtime.prompt.v1",
+            "subject_digest": unsigned.prompt_binding_digest,
+            "authority_digest": unsigned.authority_digest,
+            "payload": {"complete_contract": "watchdog"},
+        }
+    )
+    return replace(unsigned, prompt_artifact_digest=prompt.digest)
+
+
+def _put_planning_subject(store: ArtifactStore, subject: WorkRunSubject) -> CampaignPlanningSubject:
+    snapshot = store.put_canonical({"tickets": [{"key": subject.ticket_key}]})
+    policy = store.put_canonical({"policy": "frozen"})
+    unsigned = CampaignPlanningSubject(
+        repository=subject.repository,
+        campaign_key=subject.campaign_key,
+        campaign_handle=subject.campaign_handle,
+        expected_previous_plan_revision_digest=None,
+        snapshot_artifact_digest=snapshot.digest,
+        policy_witness_digest=policy.digest,
+        planning_request_artifact_digest="0" * 64,
+        stable_action_id=f"planning:{subject.stable_action_id}",
+    )
+    from gwo_v8.planning_protocol import planning_prompt
+
+    prompt = store.put_canonical(
+        planning_prompt(
+            subject_digest=unsigned.prompt_binding_digest,
+            authority_digest=policy.digest,
+            snapshot_artifact_digest=snapshot.digest,
+            policy_witness_artifact_digest=policy.digest,
+        )
+    )
+    return replace(unsigned, planning_request_artifact_digest=prompt.digest)
+
+
+def _prepare_and_start(gateway: RuntimeGateway, subject: WorkRunSubject) -> None:
+    planning = _put_planning_subject(gateway._artifacts, subject)
+    gateway.planning_preflight(planning)
+    gateway.progress(subject)
 
 
 def test_read_watchdog_events_passes_cursor_once_and_returns_page_cursor(tmp_path):
@@ -62,3 +139,39 @@ def test_read_watchdog_events_passes_cursor_once_and_returns_page_cursor(tmp_pat
     adapter.events.assert_called_once_with("11")
     assert page.next_cursor == "11"
     assert page.events == ()
+
+
+@pytest.mark.parametrize(
+    ("purpose", "event_kind", "expected_source"),
+    (
+        (WorkRunPurpose.implementation(), "state:running", "runtime"),
+        (WorkRunPurpose.implementation(), "candidate:reference", "candidate"),
+        (WorkRunPurpose.formal_review(), "state:running", "review"),
+        (WorkRunPurpose.specialist_review("policy-1"), "state:completed", "review"),
+    ),
+)
+def test_read_watchdog_events_maps_source_from_subject_and_event(
+    tmp_path,
+    purpose,
+    event_kind,
+    expected_source,
+):
+    gateway, store, adapter = _gateway(tmp_path)
+    subject = _put_subject_artifacts(
+        store,
+        replace(_subject(purpose=purpose), stable_action_id=f"action:{expected_source}"),
+    )
+    _prepare_and_start(gateway, subject)
+    adapter.events = Mock(
+        return_value=_RuntimeEventPage(
+            events=(_RuntimeEvent("13", subject.stable_action_id, event_kind),),
+            next_cursor="13",
+        )
+    )
+    wake = gateway._read_watchdog_events("12").events[0]
+    assert wake.source == expected_source
+    assert (wake.repository, wake.campaign_key) == (
+        subject.repository,
+        subject.campaign_key,
+    )
+    assert wake.stable_action_id == subject.stable_action_id

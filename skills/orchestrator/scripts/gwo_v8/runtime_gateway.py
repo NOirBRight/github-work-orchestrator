@@ -88,6 +88,7 @@ _MAXIMUM_RUNTIME_EVENT_CURSOR = _MAXIMUM_RUNTIME_SCALAR_INTEGER
 _MAXIMUM_RUNTIME_EVENT_CURSOR_TEXT = str(_MAXIMUM_RUNTIME_EVENT_CURSOR)
 _RUNTIME_EVENT_KINDS = frozenset(
     {
+        "candidate:reference",
         "state:prepared",
         "state:running",
         "state:parked",
@@ -10618,6 +10619,48 @@ class RuntimeGateway:
         return _RuntimeCampaignWakePage(
             events=tuple(self._watchdog_wake_for_event(event) for event in verdict.page.events),
             next_cursor=verdict.page.next_cursor,
+        )
+
+    def _watchdog_wake_for_event(
+        self,
+        event: _RuntimeEvent,
+    ) -> _RuntimeCampaignWake:
+        record = self._data["actions"].get(event.stable_action_id)
+        if type(record) is not dict:
+            raise RuntimeGatewayError(
+                "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+                "event action has no persisted record",
+            )
+        subject = _subject_from_canonical(record.get("subject"))
+        if subject.stable_action_id != event.stable_action_id:
+            raise RuntimeGatewayError(
+                "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+                "event action and Subject differ",
+            )
+        if (
+            event.kind == "candidate:reference"
+            or record.get("candidate_reference_emitted") is True
+        ):
+            source = "candidate"
+        elif (
+            type(subject) is WorkRunSubject
+            and subject.purpose.kind
+            in {
+                "formal_review",
+                "invalid_review_payload_retry",
+                "specialist_review",
+            }
+        ):
+            source = "review"
+        else:
+            source = "runtime"
+        return _RuntimeCampaignWake(
+            event.cursor,
+            subject.repository,
+            subject.campaign_key,
+            source,
+            subject.stable_action_id,
+            event.kind,
         )
 
     @staticmethod
