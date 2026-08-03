@@ -6,6 +6,8 @@ from unittest.mock import Mock
 
 import pytest
 
+pytest_plugins = ("v8_successor_test_support",)
+
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scripts"
 import sys
@@ -27,6 +29,12 @@ from gwo_v8.runtime_gateway import (  # noqa: E402
     _RuntimeEventPage,
 )
 from gwo_v8.runtime_profile import RuntimeProfile  # noqa: E402
+from v8_watchdog_test_support import (  # noqa: E402
+    NOW,
+    RecordingWakeSource,
+    page,
+    runtime_wake,
+)
 
 
 def _gateway(tmp_path: Path):
@@ -218,3 +226,31 @@ def test_read_watchdog_events_rejects_missing_persisted_action(tmp_path):
     with pytest.raises(RuntimeGatewayError) as raised:
         gateway._read_watchdog_events("14")
     assert raised.value.code == "RUNTIME_PROVIDER_PROTOCOL_INVALID"
+
+
+def test_host_runtime_event_wakes_the_same_installed_advance(
+    tmp_path,
+    public_successor,
+):
+    kernel = public_successor._kernel
+    source = RecordingWakeSource(
+        [
+            page(
+                runtime_wake(
+                    "1",
+                    "implementation:issue:113",
+                    campaign=public_successor.handle,
+                )
+            )
+        ]
+    )
+    watchdog = public_successor.host.install_campaign_watchdog(
+        store_path=tmp_path / "watchdog.db",
+        execution_kernel=kernel,
+        _runtime_event_source=source,
+    )
+    watchdog.run_once(NOW)
+    assert any(
+        run.last_wake_ref == "watchdog:runtime:1:implementation:issue:113"
+        for run in kernel.inspect(public_successor.handle).work_runs
+    )
