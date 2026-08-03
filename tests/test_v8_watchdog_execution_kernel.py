@@ -16,14 +16,19 @@ if str(SCRIPTS) not in sys.path:
 from gwo_v8.execution_kernel import (
     ExecutionKernel,
     ExecutionKernelError,
+    StaleDiagnosisPacket,
     StaleBindingObservation,
     StaleDiagnosisDisposition,
     StaleDiagnosisObservation,
+    StaleFollowUpKind,
+    StaleFollowUpObservation,
     StaleReadbackState,
+    TerminalBindingEvidence,
     WorkRunAction,
     WorkRunObservation,
 )
 from gwo_v8._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
+from gwo_v8.candidate_gate import CandidateReceipt
 from v8_candidate_assurance_test_support import kernel_with_candidate_receipt
 from v8_successor_test_support import (
     _StaticPlanReader,
@@ -48,13 +53,21 @@ class _StaleRecordingEffects:
         self.readbacks: dict[str, object] = {}
         self.stale_state = StaleReadbackState.AMBIGUOUS_RUNNING
         self.diagnosis_disposition = StaleDiagnosisDisposition.CONTINUE
+        self.omit_candidate_receipt = False
+        self.raise_diagnosis = False
         self.zero_llm_readbacks = 0
         self.coordinator_diagnoses = 0
+        self.calls: list[tuple[str, str]] = []
+        self.executed: list[WorkRunAction] = []
+        self.diagnosis_packets: list[object] = []
 
     def readback(self, action: WorkRunAction) -> object | None:
+        self.calls.append(("readback", action.kind))
         return self.readbacks.get(action.stable_action_id)
 
     def execute(self, action: WorkRunAction) -> object:
+        self.calls.append(("execute", action.kind))
+        self.executed.append(action)
         if action.kind in {"semantic_execution", "semantic_resume"}:
             observation: object = WorkRunObservation(
                 phase="running",
@@ -64,6 +77,37 @@ class _StaleRecordingEffects:
             )
         elif action.kind == "stale_readback":
             self.zero_llm_readbacks += 1
+            candidate_receipt = None
+            if (
+                self.stale_state is StaleReadbackState.CANDIDATE_RECEIVED
+                and not self.omit_candidate_receipt
+            ):
+                candidate_receipt = CandidateReceipt(
+                    parent_digest=digest_value({"parent": action.work_run_key}),
+                    repository=action.repository,
+                    campaign_key=action.campaign_key,
+                    campaign_handle=action.campaign_key,
+                    plan_revision_digest=action.plan_revision_digest,
+                    work_run_key=action.work_run_key,
+                    ticket_key=action.ticket_key,
+                    reported_reference="refs/heads/candidate",
+                    base_commit_oid="1" * 40,
+                    base_tree_oid="2" * 40,
+                    candidate_commit_oid="3" * 40,
+                    candidate_tree_oid="4" * 40,
+                    diff_schema_version="CandidateDiffRecordV1",
+                    diff_record_digest="5" * 64,
+                    authority_subtree_digest="6" * 64,
+                    runtime_subject_digest=action.work_subject_digest,
+                )
+            stale_receipt_digest = digest_value(
+                {
+                    "action": action.stable_action_id,
+                    "state": self.stale_state.value,
+                }
+            )
+            if candidate_receipt is not None:
+                stale_receipt_digest = candidate_receipt.digest
             observation = StaleBindingObservation(
                 stable_action_id=action.stable_action_id,
                 runtime_binding_id="binding:initial",
@@ -72,15 +116,14 @@ class _StaleRecordingEffects:
                 process_readback_digest="3" * 64,
                 workspace_readback_digest="4" * 64,
                 campaign_readback_digest="5" * 64,
-                receipt_digest=digest_value(
-                    {
-                        "action": action.stable_action_id,
-                        "state": self.stale_state.value,
-                    }
-                ),
+                receipt_digest=stale_receipt_digest,
+                candidate_receipt=candidate_receipt,
             )
         elif action.kind == "stale_diagnosis":
             self.coordinator_diagnoses += 1
+            self.diagnosis_packets.append(action.stale_diagnosis_packet)
+            if self.raise_diagnosis:
+                raise RuntimeError("stale diagnosis crashed")
             observation = StaleDiagnosisObservation(
                 stable_action_id=action.stable_action_id,
                 runtime_binding_id="binding:initial",
@@ -90,6 +133,20 @@ class _StaleRecordingEffects:
                         "action": action.stable_action_id,
                         "disposition": self.diagnosis_disposition.value,
                     }
+                ),
+            )
+        elif action.kind in {"stale_guidance", "stale_same_binding_recovery"}:
+            kind = (
+                StaleFollowUpKind.GUIDANCE
+                if action.kind == "stale_guidance"
+                else StaleFollowUpKind.SAME_BINDING_RECOVERY
+            )
+            observation = StaleFollowUpObservation(
+                stable_action_id=action.stable_action_id,
+                runtime_binding_id="binding:initial",
+                kind=kind,
+                receipt_digest=digest_value(
+                    {"action": action.stable_action_id, "kind": kind.value}
                 ),
             )
         else:
@@ -405,7 +462,9 @@ def test_raw_wake_preserves_stale_progress_fields_and_state_version(
     assert state is not None
     run = next(iter(state["runs"].values()))
     run["last_trusted_progress_at"] = "2026-08-03T09:00:00+00:00"
-    run["stale_due_at"] = "2026-08-03T10:00:00+00:00"
+    run["stale_due_at"] = kernel._timestamp(
+        kernel._clock_value() + timedelta(hours=1)
+    )
     state["state_version"] = 7
     kernel._save(campaign, state)
     before = kernel._load(campaign)
@@ -455,3 +514,389 @@ def test_replayed_wake_ref_does_not_repeat_read_back_effect(kernel_with_one_tick
     kernel.advance(campaign, wake_ref)
 
     assert len(effects.executed) == 1
+
+
+def test_due_stale_binding_cannot_be_bypassed_by_a_wake_hint(stale_kernel):
+    stale_kernel.advance_clock(minutes=30)
+    stale_kernel.effects.calls.clear()
+    stale_kernel.effects.stale_state = StaleReadbackState.AMBIGUOUS_RUNNING
+
+    stale_kernel.kernel.advance(
+        stale_kernel.handle,
+        "watchdog:runtime:due:semantic:issue:109",
+    )
+
+    assert stale_kernel.effects.calls[0] == ("readback", "stale_readback")
+    assert [kind for _operation, kind in stale_kernel.effects.calls].index(
+        "stale_readback"
+    ) < [kind for _operation, kind in stale_kernel.effects.calls].index(
+        "semantic_execution"
+    )
+
+
+def test_candidate_received_requires_an_exact_persisted_candidate_receipt(stale_kernel):
+    stale_kernel.advance_clock(minutes=30)
+    stale_kernel.effects.stale_state = StaleReadbackState.CANDIDATE_RECEIVED
+    stale_kernel.effects.omit_candidate_receipt = True
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        stale_kernel.kernel.advance(stale_kernel.handle)
+
+    assert raised.value.code == "EFFECT_READBACK_INVALID"
+    state = stale_kernel.kernel._load(stale_kernel.handle)
+    assert state is not None
+    run = next(iter(state["runs"].values()))
+    assert run["candidate_receipt"] is None
+
+
+@pytest.mark.parametrize(
+    "state",
+    (StaleReadbackState.PERMISSION_WAITING, StaleReadbackState.PROVIDER_UNAVAILABLE),
+)
+def test_stale_wait_readback_keeps_the_worker_slot_until_park_or_terminal(
+    stale_kernel, state
+):
+    stale_kernel.advance_clock(minutes=30)
+    stale_kernel.effects.stale_state = state
+    stale_kernel.kernel.advance(stale_kernel.handle)
+
+    run = next(iter(stale_kernel.kernel._load(stale_kernel.handle)["runs"].values()))
+    assert run["slot_held"] is True
+    assert run["claim_state"] == "held"
+
+    semantic = next(
+        action
+        for action in reversed(stale_kernel.effects.executed)
+        if action.kind == "semantic_execution"
+    )
+    stale_kernel.effects.readbacks[semantic.stable_action_id] = WorkRunObservation(
+        phase="parked",
+        stable_action_id=semantic.stable_action_id,
+        receipt_digest=digest_value({"action": semantic.stable_action_id, "phase": "parked"}),
+        runtime_binding_id="binding:initial",
+    )
+    stale_kernel.kernel.advance(stale_kernel.handle, "watchdog:runtime:park-proof")
+    run = next(iter(stale_kernel.kernel._load(stale_kernel.handle)["runs"].values()))
+    assert run["slot_held"] is False
+    assert run["claim_state"] == "released"
+
+
+def test_post_identity_wait_readback_keeps_the_worker_slot(stale_kernel):
+    semantic = next(
+        action
+        for action in reversed(stale_kernel.effects.executed)
+        if action.kind == "semantic_execution"
+    )
+    stale_kernel.effects.readbacks[semantic.stable_action_id] = WorkRunObservation(
+        phase="wait",
+        stable_action_id=semantic.stable_action_id,
+        receipt_digest=digest_value(
+            {"action": semantic.stable_action_id, "phase": "wait"}
+        ),
+        binding_established=True,
+        runtime_binding_id="binding:initial",
+    )
+
+    stale_kernel.kernel.advance(stale_kernel.handle, "watchdog:runtime:wait")
+
+    run = next(iter(stale_kernel.kernel._load(stale_kernel.handle)["runs"].values()))
+    assert run["phase"] == "wait"
+    assert run["slot_held"] is True
+    assert run["claim_state"] == "held"
+
+
+def test_stale_diagnosis_crash_fences_the_exact_action_to_readback_only(stale_kernel):
+    stale_kernel.advance_clock(minutes=30)
+    stale_kernel.effects.stale_state = StaleReadbackState.AMBIGUOUS_RUNNING
+    stale_kernel.effects.raise_diagnosis = True
+
+    with pytest.raises(RuntimeError, match="stale diagnosis crashed"):
+        stale_kernel.kernel.advance(stale_kernel.handle)
+
+    stale_kernel.effects.raise_diagnosis = False
+    stale_kernel.kernel.advance(stale_kernel.handle)
+    assert stale_kernel.effects.coordinator_diagnoses == 1
+    state = stale_kernel.kernel._load(stale_kernel.handle)
+    assert state is not None
+    run = next(iter(state["runs"].values()))
+    diagnosis_id = run["stale_diagnosis_action_id"]
+    assert state["effects"][diagnosis_id]["execute_attempted"] is True
+    assert run["stale_disposition"] is None
+
+    stale_kernel.effects.readbacks[diagnosis_id] = StaleDiagnosisObservation(
+        stable_action_id=diagnosis_id,
+        runtime_binding_id="binding:initial",
+        disposition=StaleDiagnosisDisposition.CONTINUE,
+        receipt_digest=digest_value({"action": diagnosis_id, "disposition": "continue"}),
+    )
+    stale_kernel.kernel.advance(stale_kernel.handle)
+    assert stale_kernel.effects.coordinator_diagnoses == 1
+
+
+def test_stale_diagnosis_action_carries_a_bounded_persisted_packet(stale_kernel):
+    stale_kernel.advance_clock(minutes=30)
+    stale_kernel.effects.stale_state = StaleReadbackState.AMBIGUOUS_RUNNING
+    stale_kernel.kernel.advance(stale_kernel.handle)
+
+    packet = stale_kernel.effects.diagnosis_packets[0]
+    assert isinstance(packet, StaleDiagnosisPacket)
+    assert packet.ticket_key == "issue:109"
+    assert packet.runtime_binding_id == "binding:initial"
+    assert len(packet.transcript_tail) <= StaleDiagnosisPacket.MAX_TRANSCRIPT_ITEMS
+    assert sum(len(item) for item in packet.transcript_tail) <= StaleDiagnosisPacket.MAX_TRANSCRIPT_BYTES
+    assert packet.packet_digest is not None
+    state = stale_kernel.kernel._load(stale_kernel.handle)
+    assert state is not None
+    diagnosis = next(
+        action
+        for action in state["effects"].values()
+        if action.get("kind") == "stale_diagnosis"
+    )
+    assert diagnosis["packet_digest"] == packet.digest
+    assert diagnosis["packet_identity"] == packet.identity
+
+
+@pytest.mark.parametrize("field", ("candidate_identities", "transcript_tail"))
+def test_stale_diagnosis_packet_requires_json_array_canonical_fields(
+    stale_kernel, field
+):
+    stale_kernel.advance_clock(minutes=30)
+    stale_kernel.effects.stale_state = StaleReadbackState.AMBIGUOUS_RUNNING
+    stale_kernel.kernel.advance(stale_kernel.handle)
+    packet = stale_kernel.effects.diagnosis_packets[0]
+    canonical = packet.canonical()
+    malformed = dict(canonical)
+    malformed[field] = ("candidate:one",) if field == "candidate_identities" else (
+        "tail",
+    )
+    body = {
+        key: value
+        for key, value in malformed.items()
+        if key not in {"packet_digest", "packet_identity"}
+    }
+    malformed["packet_digest"] = digest_value(body)
+    malformed["packet_identity"] = f"stale-diagnosis-packet:{malformed['packet_digest'][:32]}"
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        StaleDiagnosisPacket.from_canonical(malformed)
+    assert raised.value.code == "EXECUTION_STORE_INVALID"
+
+
+def test_restart_does_not_rekey_stale_diagnosis_as_semantic_resume(stale_kernel):
+    stale_kernel.advance_clock(minutes=30)
+    stale_kernel.effects.stale_state = StaleReadbackState.AMBIGUOUS_RUNNING
+    stale_kernel.kernel.advance(stale_kernel.handle)
+    before = stale_kernel.kernel._load(stale_kernel.handle)
+    assert before is not None
+    run = next(iter(before["runs"].values()))
+    diagnosis_id = run["stale_diagnosis_action_id"]
+    assert diagnosis_id is not None
+    assert before["effects"][diagnosis_id]["kind"] == "stale_diagnosis"
+
+    restarted = ExecutionKernel(
+        store_path=stale_kernel.kernel._store_path,
+        plan_control=stale_kernel.kernel._plan_control,
+        effects=stale_kernel.effects,
+        _clock=stale_kernel.clock,
+    )
+    restarted.advance(stale_kernel.handle)
+
+    after = restarted._load(stale_kernel.handle)
+    assert after is not None
+    assert after["runs"]["issue:109"]["last_action_id"] == diagnosis_id
+    assert after["effects"][diagnosis_id]["kind"] == "stale_diagnosis"
+
+
+@pytest.mark.parametrize(
+    ("disposition", "follow_up_kind", "action_kind"),
+    (
+        (
+            StaleDiagnosisDisposition.GUIDE_SAME_WORKER,
+            StaleFollowUpKind.GUIDANCE,
+            "stale_guidance",
+        ),
+        (
+            StaleDiagnosisDisposition.RECOVER_SAME_BINDING,
+            StaleFollowUpKind.SAME_BINDING_RECOVERY,
+            "stale_same_binding_recovery",
+        ),
+    ),
+)
+def test_stale_follow_up_dispositions_invoke_typed_idempotent_effects(
+    stale_kernel, disposition, follow_up_kind, action_kind
+):
+    stale_kernel.advance_clock(minutes=30)
+    stale_kernel.effects.stale_state = StaleReadbackState.AMBIGUOUS_RUNNING
+    stale_kernel.effects.diagnosis_disposition = disposition
+    stale_kernel.kernel.advance(stale_kernel.handle)
+
+    follow_ups = [
+        action for action in stale_kernel.effects.executed if action.kind == action_kind
+    ]
+    assert len(follow_ups) == 1
+    assert follow_ups[0].runtime_binding_id == "binding:initial"
+    assert follow_ups[0].stale_follow_up_kind is follow_up_kind
+    stale_kernel.kernel.advance(stale_kernel.handle, "watchdog:runtime:follow-up-replay")
+    assert len(
+        [action for action in stale_kernel.effects.executed if action.kind == action_kind]
+    ) == 1
+    run = next(iter(stale_kernel.kernel._load(stale_kernel.handle)["runs"].values()))
+    assert run["runtime_binding_id"] == "binding:initial"
+
+
+def _terminal_binding_evidence(prior_action_id: str) -> TerminalBindingEvidence:
+    return TerminalBindingEvidence(
+        prior_action_id=prior_action_id,
+        prior_runtime_binding_id="binding:initial",
+        agent_id="agent:initial",
+        session_id="session:initial",
+        workspace_id="workspace:initial",
+        terminal_state="terminal",
+        fence_digest="7" * 64,
+        checkpoint_digest="8" * 64,
+    )
+
+
+class _BindingReplacementEffects:
+    def __init__(self, *, replacement_evidence: bool) -> None:
+        self.replacement_evidence = replacement_evidence
+        self.executed: list[WorkRunAction] = []
+        self.readbacks: dict[str, object] = {}
+        self.next_phase: str | None = None
+        self.next_binding = "binding:replacement"
+        self.replacement_count = 0
+        self.prior_action_id: str | None = None
+
+    def readback(self, action: WorkRunAction) -> object | None:
+        return self.readbacks.get(action.stable_action_id)
+
+    def execute(self, action: WorkRunAction) -> WorkRunObservation:
+        self.executed.append(action)
+        if action.kind == "semantic_execution" and self.next_phase is not None:
+            phase = self.next_phase
+            self.next_phase = None
+            self.prior_action_id = action.stable_action_id
+            observation = WorkRunObservation(
+                phase=phase,
+                stable_action_id=action.stable_action_id,
+                receipt_digest=digest_value({"action": action.stable_action_id, "phase": phase}),
+                runtime_binding_id="binding:initial",
+                agent_id="agent:initial",
+                session_id="session:initial",
+                workspace_id="workspace:initial",
+            )
+        elif action.kind == "semantic_resume":
+            self.replacement_count += 1
+            evidence = (
+                _terminal_binding_evidence(self.prior_action_id or "")
+                if self.replacement_evidence
+                else None
+            )
+            observation = WorkRunObservation(
+                phase="running",
+                stable_action_id=action.stable_action_id,
+                receipt_digest=digest_value({"action": action.stable_action_id, "phase": "running"}),
+                runtime_binding_id=self.next_binding,
+                agent_id="agent:replacement",
+                session_id="session:replacement",
+                workspace_id="workspace:replacement",
+                terminal_binding_evidence=evidence,
+            )
+        else:
+            observation = WorkRunObservation(
+                phase="running",
+                stable_action_id=action.stable_action_id,
+                receipt_digest=digest_value({"action": action.stable_action_id, "phase": "running"}),
+                runtime_binding_id="binding:initial",
+            )
+        self.readbacks[action.stable_action_id] = observation
+        return observation
+
+
+def _prepare_parked_binding_replacement(kernel, effects, campaign):
+    effects.next_phase = "parked"
+    kernel.advance(campaign)
+
+
+def test_runtime_binding_replacement_requires_terminal_binding_evidence(tmp_path):
+    active, campaign = _minimal_active_campaign(("issue:109",))
+    effects = _BindingReplacementEffects(replacement_evidence=False)
+    kernel = ExecutionKernel(
+        store_path=tmp_path / "binding-replacement.db",
+        plan_control=_StaticPlanReader(active),
+        effects=effects,
+    )
+    _bind_successor_fixture_to_campaign(kernel, campaign)
+    _prepare_parked_binding_replacement(kernel, effects, campaign)
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.advance(campaign, "watchdog:runtime:replacement")
+    assert raised.value.code == "EFFECT_READBACK_INVALID"
+
+
+def test_terminal_binding_evidence_allows_only_one_persisted_replacement(tmp_path):
+    active, campaign = _minimal_active_campaign(("issue:109",))
+    effects = _BindingReplacementEffects(replacement_evidence=True)
+    kernel = ExecutionKernel(
+        store_path=tmp_path / "binding-replacement-once.db",
+        plan_control=_StaticPlanReader(active),
+        effects=effects,
+    )
+    _bind_successor_fixture_to_campaign(kernel, campaign)
+    _prepare_parked_binding_replacement(kernel, effects, campaign)
+    kernel.advance(campaign, "watchdog:runtime:replacement")
+
+    state = kernel._load(campaign)
+    assert state is not None
+    run = next(iter(state["runs"].values()))
+    assert run["binding_replacement_ordinal"] == 1
+    first_execution = next(
+        action for action in effects.executed if action.kind == "semantic_execution"
+    )
+    assert run["terminal_binding_evidence"]["prior_action_id"] == first_execution.stable_action_id
+    assert run["runtime_agent_id"] == "agent:replacement"
+    assert run["runtime_session_id"] == "session:replacement"
+    assert run["runtime_workspace_id"] == "workspace:replacement"
+    assert run["terminal_binding_evidence"]["agent_id"] == "agent:initial"
+
+    effects.next_binding = "binding:replacement:again"
+    effects.readbacks[first_execution.stable_action_id] = WorkRunObservation(
+        phase="parked",
+        stable_action_id=first_execution.stable_action_id,
+        receipt_digest=digest_value(
+            {"action": first_execution.stable_action_id, "phase": "parked"}
+        ),
+        runtime_binding_id="binding:replacement",
+    )
+    kernel.advance(campaign, "watchdog:runtime:park-again")
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.advance(campaign, "watchdog:runtime:replacement-again")
+    assert raised.value.code == "EFFECT_READBACK_INVALID"
+
+
+def test_campaign_save_uses_durable_compare_and_swap_across_kernel_instances(tmp_path):
+    active, campaign = _minimal_active_campaign(("issue:109",))
+    first = ExecutionKernel(
+        store_path=tmp_path / "campaign-cas.db",
+        plan_control=_StaticPlanReader(active),
+        effects=_StaleRecordingEffects(),
+    )
+    _bind_successor_fixture_to_campaign(first, campaign)
+    first.advance(campaign)
+    second = ExecutionKernel(
+        store_path=tmp_path / "campaign-cas.db",
+        plan_control=_StaticPlanReader(first._plan_control.active),
+        effects=_StaleRecordingEffects(),
+    )
+    winner = first._load(campaign)
+    loser = second._load(campaign)
+    assert winner is not None and loser is not None
+    winner["race_marker"] = "winner"
+    loser["race_marker"] = "loser"
+    first._save(campaign, winner)
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        second._save(campaign, loser)
+    assert raised.value.code == "EXECUTION_STORE_CONFLICT"
+    persisted = first._load(campaign)
+    assert persisted is not None
+    assert persisted["race_marker"] == "winner"
