@@ -38,6 +38,25 @@ are defined in the
 [`Defaults`](gwo-v8-lean-architecture.md#defaults) and owning-module sections
 of the architecture.
 
+## Release train
+
+Release sequencing and publication boundaries are recorded in
+[`gwo-v8-release-train.md`](../releases/gwo-v8-release-train.md). The train is
+metadata and exit-criteria work; it does not redefine V8 mechanics or
+authorize a production writer.
+
+| Release | Required merged state | Production authority |
+| --- | --- | --- |
+| Beta1 / Core Preview | Green `origin/main` baseline, release metadata, and owner-approved tracker readback | No production admission |
+| Beta2 / Feature Complete Preview | #113–#117 complete, #137 revalidated, and isolated Production V3 acceptance | No writer cutover |
+| Beta3 / Cutover Candidate | #118 Guard and activation contract pass; legacy writer paths absent or unreachable | Guarded rehearsal only; no default change |
+| GA / `v8.0.0` | #119 root Canary accepted with exact Activation/default-writer readback | Lean V8 is default for new Campaigns |
+
+The Beta1 baseline record names the exact `origin/main` SHA and dynamic main-CI
+readback, rather than this roadmap or the metadata branch SHA. Package
+publication is not writer activation; the durable writer-generation and
+Activation Receipt remain the sole authority-transfer commit point.
+
 ## Published successor sequence
 
 The native blocker graph was read back on 2026-08-01. Issue #121 was a

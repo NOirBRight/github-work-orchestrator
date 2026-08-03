@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -245,3 +246,43 @@ def test_three_install_surfaces_receive_both_packages_and_cli_smokes(tmp_path):
     assert payload["status"] == "idle"
     assert payload["actions"] == []
     assert payload["warnings"] == []
+
+
+def test_v8_release_train_names_exact_gates():
+    text = (ROOT / "docs" / "releases" / "gwo-v8-release-train.md").read_text(
+        "utf-8"
+    )
+    for required in (
+        "v8.0.0-beta.1",
+        "v8.0.0-beta.2",
+        "v8.0.0-beta.3",
+        "v8.0.0",
+        "#113",
+        "#114",
+        "#115",
+        "#116",
+        "#117",
+        "#118",
+        "#119",
+        "#123",
+        "#136",
+        "#137",
+        "no production admission",
+        "root Canary acceptance readback",
+    ):
+        assert required in text
+
+
+def test_beta1_release_contract_has_structured_baseline_ci_dynamic_issue_and_nongoal():
+    note = (ROOT / "docs" / "releases" / "v8.0.0-beta.1.md").read_text("utf-8")
+    match = re.search(r"```json\n(\{.*?\})\n```", note, re.DOTALL)
+    assert match is not None
+    evidence = json.loads(match.group(1))
+    assert re.fullmatch(r"[0-9a-f]{40}", evidence["core_baseline_sha"])
+    assert re.fullmatch(
+        r"https://github\.com/.+/actions/runs/[0-9]+", evidence["ci_url"]
+    )
+    assert re.search(r"[0-9]+ passed", evidence["dynamic_pass_summary"])
+    assert set(evidence["issues"]) == {"113", "114", "115", "116", "117", "118", "119"}
+    assert all(value in {"OPEN", "CLOSED"} for value in evidence["issues"].values())
+    assert evidence["non_goal"] == "Lean V8 production cutover"
