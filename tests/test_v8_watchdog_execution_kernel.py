@@ -286,3 +286,14 @@ def test_watchdog_snapshot_projects_binding_due_and_diagnosis_state(
     assert snapshot.next_check_at == "2026-08-03T10:00:00+00:00"
     assert snapshot.active_binding_ids == ("binding:active",)
     assert snapshot.diagnosed_binding_ids == ("binding:diagnosed",)
+
+
+def test_replayed_wake_ref_does_not_repeat_read_back_effect(kernel_with_one_ticket):
+    kernel, effects, campaign = kernel_with_one_ticket
+    wake_ref = "watchdog:runtime:9:semantic:issue:113"
+    _bind_successor_fixture_to_campaign(kernel, campaign)
+
+    kernel.advance(campaign, wake_ref)
+    kernel.advance(campaign, wake_ref)
+
+    assert len(effects.executed) == 1

@@ -343,3 +343,21 @@ def test_due_work_orders_by_timestamp_then_campaign_and_rebuilds_after_advance(t
         ).fetchall() == [
             ("owner/repo", "campaign:a", "2026-08-03T10:05:00+00:00")
         ]
+
+
+def test_exact_event_replay_reuses_wake_ref_and_advances_cursor_once(tmp_path):
+    replay = page(wake("9"))
+    source = RecordingWakeSource([replay, replay])
+    advancer = RecordingAdvancer()
+    watchdog = make_watchdog(tmp_path, source=source, advancer=advancer)
+
+    watchdog.run_once(NOW)
+    with sqlite3.connect(tmp_path / "watchdog.db") as connection:
+        connection.execute(
+            "DELETE FROM v8_watchdog_sources WHERE stream='runtime_gateway'"
+        )
+    watchdog.run_once(NOW)
+
+    expected = "watchdog:runtime:9:semantic:issue:113"
+    assert advancer.calls == [(handle(), expected)]
+    assert watchdog.read_cursor("runtime_gateway") == "9"

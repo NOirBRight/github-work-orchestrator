@@ -392,6 +392,20 @@ class CampaignWatchdog:
         return row[0], row[1]
 
     @staticmethod
+    def _persisted_wake_refs(
+        connection: sqlite3.Connection,
+        campaign: CampaignHandle,
+    ) -> frozenset[str]:
+        return frozenset(
+            row[0]
+            for row in connection.execute(
+                "SELECT wake_ref FROM v8_watchdog_wakes "
+                "WHERE repository=? AND campaign_key=?",
+                (campaign.repository, campaign.campaign_key),
+            ).fetchall()
+        )
+
+    @staticmethod
     def _rollback(connection: sqlite3.Connection | None) -> None:
         if connection is not None:
             try:
@@ -513,6 +527,13 @@ class CampaignWatchdog:
                 connection = sqlite3.connect(self._store_path)
                 connection.execute("BEGIN IMMEDIATE")
                 saved = self._read_saved_source(connection, stream)
+                persisted_wake_refs: dict[CampaignHandle, frozenset[str]] = {}
+                for wake in page.events:
+                    if wake.campaign not in persisted_wake_refs:
+                        persisted_wake_refs[wake.campaign] = self._persisted_wake_refs(
+                            connection,
+                            wake.campaign,
+                        )
 
                 if saved == (page.next_cursor, page_digest):
                     self._rollback(connection)
@@ -592,6 +613,8 @@ class CampaignWatchdog:
                     connection.close()
 
             for wake in page.events:
+                if wake.wake_ref in persisted_wake_refs[wake.campaign]:
+                    continue
                 outcomes.append(self._advancer.advance(wake.campaign, wake.wake_ref))
 
         self.rebuild_due_queue()
