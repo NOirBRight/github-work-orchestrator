@@ -518,6 +518,9 @@ class CampaignWatchdog:
                     self._rollback(connection)
                     continue
                 if saved is not None and saved[0] == page.next_cursor:
+                    if not page.events:
+                        self._rollback(connection)
+                        continue
                     _fail(
                         WATCHDOG_CURSOR_CONFLICT,
                         "cursor was reused with a changed page",
