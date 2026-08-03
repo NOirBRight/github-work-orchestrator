@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import re
 from typing import Any, Mapping, Protocol
@@ -30,8 +30,6 @@ from .runtime_gateway import (
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _MISSING = object()
-_LEGACY_DIFF_ENTRY_IDS: set[int] = set()
-_LEGACY_DIFF_RECORD_REPOSITORIES: dict[int, str] = {}
 
 
 class CandidateGateError(RuntimeError):
@@ -399,6 +397,7 @@ class CandidateDiffEntryV1:
     new_object_type: str | None
     old_oid: str | None
     new_oid: str | None
+    _legacy_mode: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __init__(
         self,
@@ -478,7 +477,6 @@ class CandidateDiffEntryV1:
                     old_object_type = "gitlink"
                 else:
                     new_object_type = "gitlink"
-            _LEGACY_DIFF_ENTRY_IDS.add(id(self))
         for name, value in (
             ("old_path", old_path),
             ("new_path", new_path),
@@ -491,11 +489,8 @@ class CandidateDiffEntryV1:
             ("new_oid", new_oid),
         ):
             object.__setattr__(self, name, None if value is _MISSING else value)
-        try:
-            self.__post_init__()
-        except Exception:
-            _LEGACY_DIFF_ENTRY_IDS.discard(id(self))
-            raise
+        object.__setattr__(self, "_legacy_mode", legacy)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if self.change_kind not in {"add", "delete", "modify", "type-change"}:
@@ -503,14 +498,13 @@ class CandidateDiffEntryV1:
                 "CANDIDATE_GATE_DIFF_INVALID",
                 "Candidate diff change kind is outside the closed union",
             )
-        legacy = id(self) in _LEGACY_DIFF_ENTRY_IDS
         _validate_diff_side(
             path=self.old_path,
             mode=self.old_mode,
             object_type=self.old_object_type,
             oid=self.old_oid,
             side="old",
-            legacy=legacy,
+            legacy=self._legacy_mode,
         )
         _validate_diff_side(
             path=self.new_path,
@@ -518,7 +512,7 @@ class CandidateDiffEntryV1:
             object_type=self.new_object_type,
             oid=self.new_oid,
             side="new",
-            legacy=legacy,
+            legacy=self._legacy_mode,
         )
         old_missing = self.old_path is None
         new_missing = self.new_path is None
@@ -602,6 +596,13 @@ class CandidateDiffRecordV1:
     candidate_tree_oid: str
     entries: tuple[CandidateDiffEntryV1, ...]
     record_digest: str | None = None
+    _legacy_mode: bool = field(default=False, init=False, repr=False, compare=False)
+    _legacy_repository: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __init__(
         self,
@@ -621,10 +622,7 @@ class CandidateDiffRecordV1:
         if args:
             if legacy:
                 raise TypeError("CandidateDiffRecordV1 mixes old and new arguments")
-            if len(args) == 7 or (
-                len(args) == 8
-                and args[0] in {"CandidateDiffRecordV1", "gwo.candidate-diff.v1"}
-            ):
+            if len(args) == 7:
                 (
                     schema_version,
                     repository_object_format,
@@ -634,8 +632,26 @@ class CandidateDiffRecordV1:
                     candidate_tree_oid,
                     entries,
                 ) = args[:7]
-                if len(args) == 8:
-                    record_digest = args[7]
+                legacy = schema_version == "gwo.candidate-diff.v1"
+                if legacy:
+                    object_format = repository_object_format
+            elif len(args) == 8 and args[0] in {
+                "CandidateDiffRecordV1",
+                "gwo.candidate-diff.v1",
+            }:
+                (
+                    schema_version,
+                    repository_object_format,
+                    base_commit_oid,
+                    base_tree_oid,
+                    candidate_commit_oid,
+                    candidate_tree_oid,
+                    entries,
+                    record_digest,
+                ) = args
+                legacy = schema_version == "gwo.candidate-diff.v1"
+                if legacy:
+                    object_format = repository_object_format
             elif len(args) in {8, 9}:
                 # The predecessor positional order started with repository and
                 # object_format and is retained for existing callers.
@@ -691,19 +707,20 @@ class CandidateDiffRecordV1:
             ("record_digest", record_digest),
         ):
             object.__setattr__(self, name, value)
-        if repository is not _MISSING:
-            _LEGACY_DIFF_RECORD_REPOSITORIES[id(self)] = repository
-        try:
-            self.__post_init__()
-        except Exception:
-            _LEGACY_DIFF_RECORD_REPOSITORIES.pop(id(self), None)
-            raise
+        object.__setattr__(self, "_legacy_mode", legacy)
+        object.__setattr__(
+            self,
+            "_legacy_repository",
+            None if repository is _MISSING else repository,
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        legacy = id(self) in _LEGACY_DIFF_RECORD_REPOSITORIES
-        if self.schema_version != "CandidateDiffRecordV1" and not (
-            legacy and self.schema_version == "gwo.candidate-diff.v1"
-        ):
+        if self._legacy_mode:
+            expected_schema = "gwo.candidate-diff.v1"
+        else:
+            expected_schema = "CandidateDiffRecordV1"
+        if self.schema_version != expected_schema:
             raise CandidateGateError(
                 "CANDIDATE_GATE_DIFF_INVALID",
                 "Candidate diff schema version is invalid",
@@ -727,11 +744,22 @@ class CandidateDiffRecordV1:
                 "CANDIDATE_GATE_DIFF_INVALID",
                 "Candidate diff entries are not an exact immutable tuple",
             )
+        if self._legacy_mode:
+            if any(not entry._legacy_mode for entry in self.entries):
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_DIFF_INVALID",
+                    "legacy Candidate diff entries are not explicit legacy values",
+                )
+        elif any(entry._legacy_mode for entry in self.entries):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_DIFF_INVALID",
+                "exact CandidateDiffRecordV1 cannot contain legacy entries",
+            )
 
         def path_key(token: str | None, entry: CandidateDiffEntryV1) -> tuple[int, bytes]:
             if token is None:
                 return (0, b"")
-            if id(entry) in _LEGACY_DIFF_ENTRY_IDS:
+            if self._legacy_mode:
                 return (1, token.encode("utf-8"))
             return (1, _decode_candidate_path_token(token, "entry path"))
 
@@ -838,14 +866,14 @@ class CandidateDiffRecordV1:
 
     @property
     def repository(self) -> str | None:
-        return _LEGACY_DIFF_RECORD_REPOSITORIES.get(id(self))
+        return self._legacy_repository if self._legacy_mode else None
 
     @property
     def object_format(self) -> str:
         return self.repository_object_format
 
     def _body(self) -> dict[str, object]:
-        if id(self) in _LEGACY_DIFF_RECORD_REPOSITORIES:
+        if self._legacy_mode:
             return {
                 "schema_version": self.schema_version,
                 "kind": "candidate_diff_record.v1",
@@ -883,6 +911,12 @@ class CandidateReadback:
     candidate: CandidateIdentity
     diff_record: CandidateDiffRecordV1
     readback_digest: str | None = None
+    _legacy_compatibility: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _require_text(self.repository, "Candidate readback repository")
@@ -893,6 +927,11 @@ class CandidateReadback:
                 "CANDIDATE_GATE_READBACK_INVALID",
                 "Candidate readback has an invalid typed identity",
             )
+        object.__setattr__(
+            self,
+            "_legacy_compatibility",
+            self.diff_record._legacy_mode,
+        )
         if (
             self.diff_record.base_commit_oid != self.candidate.base_commit_oid
             or self.diff_record.base_tree_oid != self.candidate.base_tree_oid
@@ -1233,6 +1272,12 @@ class CandidateAuditReport:
     check_evidence_digests: tuple[str, ...] = ()
     assurance_requirement: str = "standard"
     report_digest: str | None = None
+    _legacy_compatibility: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _require_digest(self.parent_digest, "parent_digest")
@@ -1247,6 +1292,11 @@ class CandidateAuditReport:
                     "CANDIDATE_GATE_EVIDENCE_INVALID",
                     "Candidate audit diff record is not the exact V1 type",
                 )
+            object.__setattr__(
+                self,
+                "_legacy_compatibility",
+                self.diff_record._legacy_mode,
+            )
             if self.diff_record.changed_paths != self.candidate.changed_paths:
                 raise CandidateGateError(
                     "CANDIDATE_GATE_EVIDENCE_INVALID",
