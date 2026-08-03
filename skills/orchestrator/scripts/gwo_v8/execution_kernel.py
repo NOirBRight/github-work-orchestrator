@@ -34,6 +34,7 @@ from .plan_control import (
     PlanInvalidationDisposition,
     TicketClaimProof,
 )
+from .candidate_gate import CandidateGateError, CandidateReceipt
 from .human_gate import (
     HumanDecisionChoice,
     HumanDecisionRecord,
@@ -295,6 +296,7 @@ class WorkRunObservation:
     candidate_identity: str | None = None
     result_digest: str | None = None
     evidence_digests: tuple[str, ...] = ()
+    candidate_receipt: CandidateReceipt | None = None
 
     _PHASES = frozenset(
         {
@@ -364,6 +366,21 @@ class WorkRunObservation:
             raise ExecutionKernelError(
                 "WORK_RUN_OBSERVATION_INVALID",
                 "Evidence identities are not canonical",
+            )
+        if self.candidate_receipt is not None and type(
+            self.candidate_receipt
+        ) is not CandidateReceipt:
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "candidate_receipt is not an exact CandidateReceipt",
+            )
+        if (
+            self.candidate_receipt is not None
+            and self.receipt_digest != self.candidate_receipt.digest
+        ):
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "effect receipt digest does not bind CandidateReceipt",
             )
 
     @classmethod
@@ -810,6 +827,72 @@ class ExecutionKernel:
             revision_lineage=self._revision_lineage_summaries(state),
             human_gate=self._human_gate_summary(state),
         )
+
+    def read_candidate_receipt(
+        self,
+        campaign_handle: CampaignHandle,
+        ticket_key: str,
+    ) -> CandidateReceipt | None:
+        state = self._load(campaign_handle)
+        if state is None:
+            return None
+        runs = state.get("runs")
+        if type(runs) is not dict or type(ticket_key) is not str:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel run state is not a ticket-keyed mapping",
+            )
+        run = runs.get(ticket_key)
+        if run is None:
+            return None
+        if type(run) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel Work Run state is not a mapping",
+            )
+        stored = run.get("candidate_receipt")
+        if stored is None:
+            return None
+        try:
+            receipt = CandidateReceipt.from_canonical(stored)
+        except CandidateGateError as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stored CandidateReceipt failed canonical readback",
+            ) from error
+        if (
+            receipt.repository != campaign_handle.repository
+            or receipt.campaign_key != campaign_handle.campaign_key
+            or receipt.campaign_handle != campaign_handle.campaign_key
+            or receipt.plan_revision_digest != state.get("plan_revision_digest")
+            or receipt.ticket_key != ticket_key
+            or receipt.work_run_key != run.get("work_run_key")
+        ):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stored CandidateReceipt is bound to another Campaign or Work Run",
+            )
+        return receipt
+
+    def read_candidate_receipts(
+        self,
+        campaign_handle: CampaignHandle,
+    ) -> tuple[tuple[str, CandidateReceipt], ...]:
+        state = self._load(campaign_handle)
+        if state is None:
+            return ()
+        runs = state.get("runs")
+        if type(runs) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel run state is not a mapping",
+            )
+        values: list[tuple[str, CandidateReceipt]] = []
+        for ticket_key in sorted(runs):
+            receipt = self.read_candidate_receipt(campaign_handle, ticket_key)
+            if receipt is not None:
+                values.append((ticket_key, receipt))
+        return tuple(values)
 
     @staticmethod
     def _run_summary(
@@ -2260,6 +2343,7 @@ class ExecutionKernel:
                     "exclusive_resources": list(work[key].get("exclusive_resources", [])),
                     "claim_state": "unclaimed",
                     "candidate_identity": None,
+                    "candidate_receipt": None,
                     "result_digest": None,
                     "evidence_digests": [],
                     "plan_invalidation": None,
@@ -2376,6 +2460,9 @@ class ExecutionKernel:
                 dirty = True
             if "candidate_identity" not in run:
                 run["candidate_identity"] = None
+                dirty = True
+            if "candidate_receipt" not in run:
+                run.setdefault("candidate_receipt", None)
                 dirty = True
             if "result_digest" not in run:
                 run["result_digest"] = None
@@ -3181,6 +3268,7 @@ class ExecutionKernel:
             "exclusive_resources": list(work_item.get("exclusive_resources", [])),
             "claim_state": "unclaimed",
             "candidate_identity": None,
+            "candidate_receipt": None,
             "result_digest": None,
             "evidence_digests": [],
             "plan_invalidation": None,
@@ -4316,6 +4404,53 @@ class ExecutionKernel:
                 "EFFECT_READBACK_INVALID",
                 "effect result does not bind its stable action identity",
             )
+        run.setdefault("candidate_receipt", None)
+        receipt = observation.candidate_receipt
+        if receipt is not None:
+            if (
+                receipt.repository != active.handle.repository
+                or receipt.campaign_key != active.handle.campaign_key
+                or receipt.campaign_handle != active.handle.campaign_key
+                or receipt.plan_revision_digest != active.current_revision_digest
+                or receipt.work_run_key != run["work_run_key"]
+                or receipt.ticket_key != ticket_key
+                or receipt.runtime_subject_digest != run["work_subject_digest"]
+            ):
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "CandidateReceipt is bound to another Campaign or Work Run",
+                )
+            run["candidate_receipt"] = receipt.canonical()
+            self._save(active.handle, state)
+            persisted_state = self._load(active.handle)
+            if persisted_state is None:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Campaign state disappeared after CandidateReceipt persistence",
+                )
+            persisted_run = persisted_state.get("runs", {}).get(ticket_key)
+            if type(persisted_run) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "CandidateReceipt Work Run disappeared during readback",
+                )
+            try:
+                persisted_receipt = CandidateReceipt.from_canonical(
+                    persisted_run.get("candidate_receipt")
+                )
+            except CandidateGateError as error:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "persisted CandidateReceipt failed canonical readback",
+                ) from error
+            if persisted_receipt != receipt:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "persisted CandidateReceipt changed during readback",
+                )
+            state.clear()
+            state.update(persisted_state)
+            run = state["runs"][ticket_key]
         run["phase"] = observation.phase
         run["reason"] = observation.reason
         run["next_check_at"] = observation.next_check_at
