@@ -368,7 +368,7 @@ class ExecutionKernelConfiguration:
         if stale_overrides is not None:
             copied: dict[str, int] = {}
             for repository, seconds in stale_overrides.items():
-                if type(repository) is not str or not repository:
+                if type(repository) is not str or not repository.strip():
                     raise ExecutionKernelError(
                         "STALE_CONFIGURATION_INVALID",
                         "repository stale threshold keys must be non-empty exact text",
@@ -405,7 +405,7 @@ class ExecutionKernelConfiguration:
         return configured
 
     def stale_after_seconds_for(self, repository: str) -> int:
-        if type(repository) is not str or not repository:
+        if type(repository) is not str or not repository.strip():
             raise ExecutionKernelError(
                 "STALE_CONFIGURATION_INVALID",
                 "repository must be non-empty exact text",
@@ -1170,7 +1170,7 @@ class ExecutionKernel:
             next_check_at=run.get("next_check_at"),
             plan_invalidation=diagnostic,
             work_run_key=run.get("work_run_key", ""),
-            runtime_binding_id=run.get("semantic_action_id"),
+            runtime_binding_id=run.get("runtime_binding_id") or run.get("semantic_action_id"),
             claim_state=run.get("claim_state", "unclaimed"),
             exclusive_resources=tuple(run.get("exclusive_resources", ())),
             work_subject_digest=run.get("work_subject_digest", ""),
@@ -2740,6 +2740,60 @@ class ExecutionKernel:
                 if field not in run:
                     run[field] = default.copy() if isinstance(default, list) else default
                     dirty = True
+            if run.get("phase") in _SLOT_PHASES:
+                last_progress = run.get("last_trusted_progress_at")
+                stale_due = run.get("stale_due_at")
+                if last_progress is None and stale_due is None:
+                    now = self._clock_value()
+                    run["last_trusted_progress_at"] = self._timestamp(now)
+                    run["stale_due_at"] = self._timestamp(
+                        now
+                        + timedelta(
+                            seconds=self._configuration.stale_after_seconds_for(
+                                active.handle.repository
+                            )
+                        )
+                    )
+                    dirty = True
+                elif (
+                    (last_progress is None) != (stale_due is None)
+                    and not (
+                        last_progress is not None
+                        and stale_due is None
+                        and run.get("stale_disposition") is not None
+                    )
+                ):
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "stale progress timestamp pair is incomplete",
+                    )
+                for timestamp, label in (
+                    (run.get("last_trusted_progress_at"), "last trusted progress time"),
+                    (run.get("stale_due_at"), "stale due time"),
+                ):
+                    if timestamp is None:
+                        continue
+                    if type(timestamp) is not str:
+                        raise ExecutionKernelError(
+                            "EXECUTION_STORE_INVALID",
+                            f"{label} is not canonical text",
+                        )
+                    try:
+                        parsed_timestamp = datetime.fromisoformat(timestamp)
+                    except ValueError as error:
+                        raise ExecutionKernelError(
+                            "EXECUTION_STORE_INVALID",
+                            f"{label} is unreadable",
+                        ) from error
+                    if (
+                        parsed_timestamp.tzinfo is None
+                        or parsed_timestamp.utcoffset() != timedelta(0)
+                        or parsed_timestamp.isoformat() != timestamp
+                    ):
+                        raise ExecutionKernelError(
+                            "EXECUTION_STORE_INVALID",
+                            f"{label} is not canonical UTC text",
+                        )
             if "result_digest" not in run:
                 run["result_digest"] = None
                 dirty = True
@@ -5185,10 +5239,11 @@ class ExecutionKernel:
                 "effect result does not bind its stable action identity",
             )
         if observation.runtime_binding_id is not None:
-            if (
+            binding_changed = (
                 run.get("runtime_binding_id") is not None
                 and run.get("runtime_binding_id") != observation.runtime_binding_id
-            ):
+            )
+            if binding_changed and action.kind != "semantic_resume":
                 raise ExecutionKernelError(
                     "EFFECT_READBACK_INVALID",
                     "Work Run observation changed its Runtime Binding",
@@ -5201,6 +5256,10 @@ class ExecutionKernel:
                     "EFFECT_READBACK_INVALID",
                     "Work Run observation is not bound to its action Runtime Binding",
                 )
+            if binding_changed:
+                run["stale_readback_action_id"] = None
+                run["stale_diagnosis_action_id"] = None
+                run["stale_disposition"] = None
             run["runtime_binding_id"] = observation.runtime_binding_id
         run.setdefault("candidate_receipt", None)
         receipt = observation.candidate_receipt
@@ -5611,11 +5670,14 @@ class ExecutionKernel:
                     "Campaign next_check_at is invalid",
                 )
             return value
-        values = [
-            run.get("next_check_at")
-            for run in state.get("runs", {}).values()
-            if type(run) is dict and run.get("next_check_at") is not None
-        ]
+        values: list[object] = []
+        for run in state.get("runs", {}).values():
+            if type(run) is not dict:
+                continue
+            if run.get("next_check_at") is not None:
+                values.append(run.get("next_check_at"))
+            if run.get("phase") in _SLOT_PHASES and run.get("stale_due_at") is not None:
+                values.append(run.get("stale_due_at"))
         if any(type(item) is not str or not item for item in values):
             raise ExecutionKernelError(
                 "EXECUTION_STORE_INVALID",

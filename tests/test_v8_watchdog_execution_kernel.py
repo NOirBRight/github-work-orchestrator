@@ -180,6 +180,24 @@ def test_stale_effects_have_no_transcript_or_daemon_restart_surface(stale_kernel
     assert not hasattr(stale_kernel.effects, "restart_daemon")
 
 
+@pytest.mark.parametrize("disposition", tuple(StaleDiagnosisDisposition))
+def test_stale_diagnosis_covers_all_closed_dispositions(stale_kernel, disposition):
+    stale_kernel.advance_clock(minutes=30)
+    stale_kernel.effects.diagnosis_disposition = disposition
+    stale_kernel.kernel.advance(stale_kernel.handle)
+    assert stale_kernel.effects.coordinator_diagnoses == 1
+    state = stale_kernel.kernel._load(stale_kernel.handle)
+    assert state is not None
+    run = next(iter(state["runs"].values()))
+    assert run["stale_disposition"] == disposition.value
+    if disposition is StaleDiagnosisDisposition.DECISION:
+        assert run["phase"] == "decision"
+        assert run["reason"] == "RuntimeBindingStale"
+    else:
+        assert run["phase"] == "running"
+        assert run["slot_held"] is True
+
+
 def test_watchdog_snapshot_does_not_create_or_migrate_kernel_state(
     kernel_with_one_ticket,
 ):
