@@ -16,7 +16,10 @@ from pathlib import Path
 import re
 import sqlite3
 import threading
-from typing import Any, Mapping, Protocol
+from typing import TYPE_CHECKING, Any, Mapping, Protocol
+
+if TYPE_CHECKING:
+    from .campaign_watchdog import WatchdogCampaignSnapshot
 
 from ._canonical import (
     CanonicalJsonError,
@@ -189,6 +192,7 @@ class WorkRunSummary:
     candidate_identity: str | None = None
     result_digest: str | None = None
     evidence_digests: tuple[str, ...] = ()
+    last_wake_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -826,6 +830,40 @@ class ExecutionKernel:
             invalidation_classification=classification,
             revision_lineage=self._revision_lineage_summaries(state),
             human_gate=self._human_gate_summary(state),
+        )
+
+    def active_campaigns(self) -> tuple[CampaignHandle, ...]:
+        """Return persisted non-terminal Campaigns without hydrating a Plan."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT repository, campaign_key
+                FROM v8_execution_kernel_campaigns
+                ORDER BY repository, campaign_key
+                """
+            ).fetchall()
+        active: list[CampaignHandle] = []
+        for row in rows:
+            handle = CampaignHandle(row["repository"], row["campaign_key"])
+            state = self._read_persisted_campaign_without_migration(handle)
+            if self._status_from_persisted_state(state) is not CampaignStatus.COMPLETE:
+                active.append(handle)
+        return tuple(active)
+
+    def watchdog_snapshot(self, handle: CampaignHandle) -> "WatchdogCampaignSnapshot":
+        state = self._read_persisted_campaign_without_migration(handle)
+        from .campaign_watchdog import WatchdogCampaignSnapshot
+
+        return WatchdogCampaignSnapshot(
+            campaign=handle,
+            status=self._status_from_persisted_state(state),
+            trusted_progress_digest=digest_value(state),
+            next_check_at=None,
+            active_binding_ids=(),
+            diagnosed_binding_ids=(),
+            candidate_receipt_digests=(),
+            last_wake_refs=(),
         )
 
     def read_candidate_receipt(
@@ -4614,6 +4652,38 @@ class ExecutionKernel:
         connection = sqlite3.connect(self._store_path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    def _read_persisted_campaign_without_migration(
+        self, handle: CampaignHandle
+    ) -> dict[str, Any]:
+        if type(handle) is not CampaignHandle:
+            raise ExecutionKernelError(
+                "CAMPAIGN_HANDLE_INVALID",
+                "Campaign handle must be an exact CampaignHandle",
+            )
+        state = self._load(handle)
+        if state is None:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign state does not exist",
+            )
+        return state
+
+    def _status_from_persisted_state(self, state: Mapping[str, Any]) -> CampaignStatus:
+        if type(state) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign state is not an object",
+            )
+        try:
+            return self._outcome(CampaignHandle("", ""), state).status
+        except ExecutionKernelError:
+            raise
+        except (KeyError, TypeError, ValueError) as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign state cannot derive its status",
+            ) from error
 
     def _campaign_lock(self, handle: CampaignHandle) -> threading.RLock:
         key = f"{self._store_path.resolve()}::{handle.repository}::{handle.campaign_key}"
