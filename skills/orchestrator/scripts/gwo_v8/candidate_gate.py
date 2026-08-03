@@ -756,17 +756,21 @@ class CandidateDiffRecordV1:
                 "exact CandidateDiffRecordV1 cannot contain legacy entries",
             )
 
-        def path_key(token: str | None, entry: CandidateDiffEntryV1) -> tuple[int, bytes]:
+        def path_key(token: str | None, entry: CandidateDiffEntryV1) -> bytes:
             if token is None:
-                return (0, b"")
+                token = entry.new_path if entry.old_path is None else entry.old_path
+                assert token is not None
             if self._legacy_mode:
-                return (1, token.encode("utf-8"))
-            return (1, _decode_candidate_path_token(token, "entry path"))
+                return token.encode("utf-8")
+            return _decode_candidate_path_token(token, "entry path")
 
         ordered = tuple(
             sorted(
                 self.entries,
                 key=lambda entry: (
+                    0 if entry.change_kind == "delete" else 1
+                    if entry.change_kind == "add"
+                    else 2,
                     path_key(entry.old_path, entry),
                     path_key(entry.new_path, entry),
                     entry.change_kind,
@@ -835,6 +839,19 @@ class CandidateDiffRecordV1:
                     new_oid=None if new is None else new[2],
                 )
             )
+        def entry_sort_key(entry: CandidateDiffEntryV1) -> tuple[int, bytes]:
+            token = entry.old_path if entry.old_path is not None else entry.new_path
+            assert token is not None
+            rank = (
+                0
+                if entry.change_kind == "delete"
+                else 1
+                if entry.change_kind == "add"
+                else 2
+            )
+            return rank, _decode_candidate_path_token(token, "entry path")
+
+        entries.sort(key=entry_sort_key)
         return cls(
             schema_version="CandidateDiffRecordV1",
             repository_object_format=repository_object_format,
@@ -847,12 +864,12 @@ class CandidateDiffRecordV1:
 
     @property
     def changed_path_tokens(self) -> tuple[str, ...]:
-        ordered: list[str] = []
+        tokens: set[str] = set()
         for entry in self.entries:
             for token in (entry.old_path, entry.new_path):
-                if token is not None and token not in ordered:
-                    ordered.append(token)
-        return tuple(ordered)
+                if token is not None:
+                    tokens.add(token)
+        return tuple(sorted(tokens))
 
     @property
     def digest(self) -> str:
@@ -1297,7 +1314,10 @@ class CandidateAuditReport:
                 "_legacy_compatibility",
                 self.diff_record._legacy_mode,
             )
-            if self.diff_record.changed_paths != self.candidate.changed_paths:
+            if (
+                self.diff_record.changed_path_tokens
+                != self.candidate.changed_path_tokens
+            ):
                 raise CandidateGateError(
                     "CANDIDATE_GATE_EVIDENCE_INVALID",
                     "Candidate audit diff paths do not bind the Candidate identity",
@@ -1667,7 +1687,7 @@ class RepairPacket:
             rejected_candidate_digest=candidate.digest,
             prior_review_subject_digest=request.digest,
             finding_digests=tuple(sorted(finding.digest for finding in hard)),
-            allowed_paths=tuple(sorted(candidate.changed_paths)),
+            allowed_paths=tuple(sorted(candidate.changed_path_tokens)),
             required_effects=effects,
         )
 
@@ -2421,7 +2441,7 @@ class CandidateGate:
         result = verifier.verify(request)
         self._validate_repair_result(request, result)
         allowed_paths = set(packet.allowed_paths)
-        candidate_paths = set(candidate.changed_paths)
+        candidate_paths = set(candidate.changed_path_tokens)
         reported_paths = set(result.scope_escape_paths)
         # The verifier is a read-only observer.  Its claim cannot enlarge the
         # repair boundary, and an allowed path is not a Campaign-level scope

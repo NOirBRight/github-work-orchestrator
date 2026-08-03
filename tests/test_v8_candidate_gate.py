@@ -1416,28 +1416,33 @@ def test_candidate_gate_uses_authoritative_candidate_readback_and_complete_diff_
     from gwo_v8.runtime_gateway import CapabilityPolicy, CapabilityPolicyProof
 
     parent = _parent()
+    path_token = "c3JjL3Byb3RvY29sLnB5"
     candidate = CandidateIdentity(
         reported_reference="refs/heads/candidate",
         base_commit_oid="1" * 40,
         base_tree_oid="2" * 40,
         candidate_commit_oid="3" * 40,
         candidate_tree_oid="4" * 40,
-        changed_paths=("src/protocol.py",),
+        changed_path_tokens=(path_token,),
     )
     diff = CandidateDiffRecordV1(
-        repository=parent.runtime_subject.repository,
-        object_format="sha1",
+        schema_version="CandidateDiffRecordV1",
+        repository_object_format="sha1",
         base_commit_oid=candidate.base_commit_oid,
         base_tree_oid=candidate.base_tree_oid,
         candidate_commit_oid=candidate.candidate_commit_oid,
         candidate_tree_oid=candidate.candidate_tree_oid,
         entries=(
             CandidateDiffEntryV1(
-                side="candidate",
-                path="src/protocol.py",
-                mode="100644",
-                object_type="blob",
-                object_oid="5" * 40,
+                old_path=None,
+                new_path=path_token,
+                change_kind="add",
+                old_mode=None,
+                new_mode="100644",
+                old_object_type=None,
+                new_object_type="blob",
+                old_oid=None,
+                new_oid="5" * 40,
             ),
         ),
     )
@@ -1464,7 +1469,7 @@ def test_candidate_gate_uses_authoritative_candidate_readback_and_complete_diff_
         def review(self, request):
             assert request.base_commit_oid == candidate.base_commit_oid
             assert request.candidate_tree_oid == candidate.candidate_tree_oid
-            assert request.diff_schema_version == "gwo.candidate-diff.v1"
+            assert request.diff_schema_version == "CandidateDiffRecordV1"
             assert request.diff_digest == diff.digest
             return FormalReviewResult(subject_digest=request.digest)
 
