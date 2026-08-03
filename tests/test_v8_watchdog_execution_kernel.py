@@ -1,6 +1,7 @@
 import json
 import sqlite3
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 
@@ -12,10 +13,116 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scr
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from gwo_v8.execution_kernel import ExecutionKernelError
-from gwo_v8._canonical import canonical_bytes, digest_bytes, load_canonical_json
+from gwo_v8.execution_kernel import (
+    ExecutionKernel,
+    ExecutionKernelError,
+    StaleBindingObservation,
+    StaleDiagnosisDisposition,
+    StaleDiagnosisObservation,
+    StaleReadbackState,
+    WorkRunAction,
+    WorkRunObservation,
+)
+from gwo_v8._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
 from v8_candidate_assurance_test_support import kernel_with_candidate_receipt
-from v8_successor_test_support import kernel_with_one_ticket
+from v8_successor_test_support import (
+    _StaticPlanReader,
+    _minimal_active_campaign,
+    kernel_with_one_ticket,
+)
+
+
+@dataclass
+class _MutableUtcClock:
+    value: datetime
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, *, minutes: int) -> None:
+        self.value += timedelta(minutes=minutes)
+
+
+class _StaleRecordingEffects:
+    def __init__(self) -> None:
+        self.readbacks: dict[str, object] = {}
+        self.stale_state = StaleReadbackState.AMBIGUOUS_RUNNING
+        self.diagnosis_disposition = StaleDiagnosisDisposition.CONTINUE
+        self.zero_llm_readbacks = 0
+        self.coordinator_diagnoses = 0
+
+    def readback(self, action: WorkRunAction) -> object | None:
+        return self.readbacks.get(action.stable_action_id)
+
+    def execute(self, action: WorkRunAction) -> object:
+        if action.kind in {"semantic_execution", "semantic_resume"}:
+            observation: object = WorkRunObservation(
+                phase="running",
+                stable_action_id=action.stable_action_id,
+                receipt_digest=digest_value({"action": action.stable_action_id}),
+                runtime_binding_id="binding:initial",
+            )
+        elif action.kind == "stale_readback":
+            self.zero_llm_readbacks += 1
+            observation = StaleBindingObservation(
+                stable_action_id=action.stable_action_id,
+                runtime_binding_id="binding:initial",
+                state=self.stale_state,
+                runtime_readback_digest="2" * 64,
+                process_readback_digest="3" * 64,
+                workspace_readback_digest="4" * 64,
+                campaign_readback_digest="5" * 64,
+                receipt_digest=digest_value(
+                    {
+                        "action": action.stable_action_id,
+                        "state": self.stale_state.value,
+                    }
+                ),
+            )
+        elif action.kind == "stale_diagnosis":
+            self.coordinator_diagnoses += 1
+            observation = StaleDiagnosisObservation(
+                stable_action_id=action.stable_action_id,
+                runtime_binding_id="binding:initial",
+                disposition=self.diagnosis_disposition,
+                receipt_digest=digest_value(
+                    {
+                        "action": action.stable_action_id,
+                        "disposition": self.diagnosis_disposition.value,
+                    }
+                ),
+            )
+        else:
+            raise AssertionError(f"unexpected WorkRunAction kind: {action.kind}")
+        self.readbacks[action.stable_action_id] = observation
+        return observation
+
+
+@dataclass
+class _StaleKernelHarness:
+    kernel: ExecutionKernel
+    effects: _StaleRecordingEffects
+    handle: object
+    clock: _MutableUtcClock
+
+    def advance_clock(self, *, minutes: int) -> None:
+        self.clock.advance(minutes=minutes)
+
+
+@pytest.fixture
+def stale_kernel(tmp_path):
+    active, campaign = _minimal_active_campaign(("issue:109",))
+    clock = _MutableUtcClock(datetime.fromisoformat("2026-08-03T09:30:00+00:00"))
+    effects = _StaleRecordingEffects()
+    kernel = ExecutionKernel(
+        store_path=tmp_path / "stale-kernel.db",
+        plan_control=_StaticPlanReader(active),
+        effects=effects,
+        _clock=clock,
+    )
+    _bind_successor_fixture_to_campaign(kernel, campaign)
+    kernel.advance(campaign)
+    return _StaleKernelHarness(kernel, effects, campaign, clock)
 
 
 def _bind_successor_fixture_to_campaign(kernel, campaign):
@@ -38,6 +145,16 @@ def _bind_successor_fixture_to_campaign(kernel, campaign):
             for proof in active.claim_proofs
         ),
     )
+
+
+def test_stale_binding_uses_zero_llm_readback_before_one_diagnosis(stale_kernel):
+    stale_kernel.advance_clock(minutes=30)
+    stale_kernel.effects.stale_state = StaleReadbackState.AMBIGUOUS_RUNNING
+    stale_kernel.kernel.advance(stale_kernel.handle)
+    assert stale_kernel.effects.zero_llm_readbacks == 1
+    assert stale_kernel.effects.coordinator_diagnoses == 1
+    stale_kernel.kernel.advance(stale_kernel.handle)
+    assert stale_kernel.effects.coordinator_diagnoses == 1
 
 
 def test_watchdog_snapshot_does_not_create_or_migrate_kernel_state(

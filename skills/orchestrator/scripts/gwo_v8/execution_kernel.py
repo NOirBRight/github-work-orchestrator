@@ -10,13 +10,15 @@ nor Runtime/provider policy.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import json
 from pathlib import Path
 import re
 import sqlite3
 import threading
-from typing import TYPE_CHECKING, Any, Mapping, Protocol
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol
 
 if TYPE_CHECKING:
     from .campaign_watchdog import WatchdogCampaignSnapshot
@@ -170,6 +172,102 @@ class CampaignStatus(str, Enum):
     BLOCKED = "Blocked"
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class StaleReadbackState(str, Enum):
+    TERMINAL = "terminal"
+    IDLE = "idle"
+    PERMISSION_WAITING = "permission_waiting"
+    CANDIDATE_RECEIVED = "candidate_received"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    AMBIGUOUS_RUNNING = "ambiguous_running"
+
+
+class StaleDiagnosisDisposition(str, Enum):
+    CONTINUE = "continue"
+    GUIDE_SAME_WORKER = "guide_same_worker"
+    RECOVER_SAME_BINDING = "recover_same_binding"
+    DECISION = "decision"
+
+
+_STALE_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _validate_stale_digest(value: object, label: str) -> None:
+    if type(value) is not str or _STALE_DIGEST_PATTERN.fullmatch(value) is None:
+        raise ExecutionKernelError(
+            "EFFECT_READBACK_INVALID",
+            f"{label} must be a SHA-256 digest",
+        )
+
+
+def _validate_binding_id(value: object, label: str) -> None:
+    if type(value) is not str or not value:
+        raise ExecutionKernelError(
+            "EFFECT_READBACK_INVALID",
+            f"{label} must be non-empty exact text",
+        )
+
+
+@dataclass(frozen=True)
+class StaleBindingObservation:
+    stable_action_id: str
+    runtime_binding_id: str
+    state: StaleReadbackState
+    runtime_readback_digest: str
+    process_readback_digest: str
+    workspace_readback_digest: str
+    campaign_readback_digest: str
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self) is not StaleBindingObservation:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale binding observations must be exact values",
+            )
+        _validate_binding_id(self.stable_action_id, "stale readback action identity")
+        _validate_binding_id(self.runtime_binding_id, "stale runtime binding identity")
+        if type(self.state) is not StaleReadbackState:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale readback state is not closed",
+            )
+        for value, label in (
+            (self.runtime_readback_digest, "runtime readback"),
+            (self.process_readback_digest, "process readback"),
+            (self.workspace_readback_digest, "workspace readback"),
+            (self.campaign_readback_digest, "Campaign readback"),
+            (self.receipt_digest, "stale readback receipt"),
+        ):
+            _validate_stale_digest(value, label)
+
+
+@dataclass(frozen=True)
+class StaleDiagnosisObservation:
+    stable_action_id: str
+    runtime_binding_id: str
+    disposition: StaleDiagnosisDisposition
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self) is not StaleDiagnosisObservation:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale diagnosis observations must be exact values",
+            )
+        _validate_binding_id(self.stable_action_id, "stale diagnosis action identity")
+        _validate_binding_id(self.runtime_binding_id, "stale diagnosis runtime binding identity")
+        if type(self.disposition) is not StaleDiagnosisDisposition:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale diagnosis disposition is not closed",
+            )
+        _validate_stale_digest(self.receipt_digest, "stale diagnosis receipt")
+
+
 @dataclass(frozen=True)
 class CampaignOutcome:
     status: CampaignStatus
@@ -236,6 +334,8 @@ class ExecutionKernelConfiguration:
 
     host_worker_slots: int = 4
     repository_worker_slots: dict[str, int] | None = None
+    host_stale_after_seconds: int = 1800
+    repository_stale_after_seconds: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         overrides = self.repository_worker_slots
@@ -250,6 +350,44 @@ class ExecutionKernelConfiguration:
             "repository_worker_slots",
             None if overrides is None else dict(overrides),
         )
+        if (
+            type(self.host_stale_after_seconds) is not int
+            or isinstance(self.host_stale_after_seconds, bool)
+            or self.host_stale_after_seconds <= 0
+        ):
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "host stale threshold must be a positive exact integer",
+            )
+        stale_overrides = self.repository_stale_after_seconds
+        if stale_overrides is not None and type(stale_overrides) is not dict:
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "repository stale thresholds must be an exact mapping",
+            )
+        if stale_overrides is not None:
+            copied: dict[str, int] = {}
+            for repository, seconds in stale_overrides.items():
+                if type(repository) is not str or not repository:
+                    raise ExecutionKernelError(
+                        "STALE_CONFIGURATION_INVALID",
+                        "repository stale threshold keys must be non-empty exact text",
+                    )
+                if (
+                    type(seconds) is not int
+                    or isinstance(seconds, bool)
+                    or seconds <= 0
+                ):
+                    raise ExecutionKernelError(
+                        "STALE_CONFIGURATION_INVALID",
+                        "repository stale thresholds must be positive exact integers",
+                    )
+                copied[repository] = seconds
+            object.__setattr__(
+                self,
+                "repository_stale_after_seconds",
+                MappingProxyType(copied),
+            )
 
     def worker_slots_for(self, repository: str) -> int:
         configured = (self.repository_worker_slots or {}).get(
@@ -263,6 +401,26 @@ class ExecutionKernelConfiguration:
             raise ExecutionKernelError(
                 "WORKER_SLOT_CONFIGURATION_INVALID",
                 "Worker Slot capacity must be a positive exact integer",
+            )
+        return configured
+
+    def stale_after_seconds_for(self, repository: str) -> int:
+        if type(repository) is not str or not repository:
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "repository must be non-empty exact text",
+            )
+        configured = (self.repository_stale_after_seconds or {}).get(
+            repository, self.host_stale_after_seconds
+        )
+        if (
+            type(configured) is not int
+            or isinstance(configured, bool)
+            or configured <= 0
+        ):
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "stale threshold must be a positive exact integer",
             )
         return configured
 
@@ -280,6 +438,7 @@ class WorkRunAction:
     semantic_action_id: str
     work_run_key: str = ""
     work_subject_digest: str = ""
+    runtime_binding_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -301,6 +460,7 @@ class WorkRunObservation:
     result_digest: str | None = None
     evidence_digests: tuple[str, ...] = ()
     candidate_receipt: CandidateReceipt | None = None
+    runtime_binding_id: str | None = None
 
     _PHASES = frozenset(
         {
@@ -328,6 +488,8 @@ class WorkRunObservation:
             raise ExecutionKernelError(
                 "WORK_RUN_OBSERVATION_INVALID", "Work Run action identity is missing"
             )
+        if self.runtime_binding_id is not None:
+            _validate_binding_id(self.runtime_binding_id, "runtime binding identity")
         if (
             type(self.receipt_digest) is not str
             or re.fullmatch(r"[0-9a-f]{64}", self.receipt_digest) is None
@@ -662,9 +824,13 @@ class PlanInvalidationClassifier(Protocol):
 class WorkRunEffects(Protocol):
     """The readback-first seam for RuntimeGateway/CandidateGate/BatchIntegrator."""
 
-    def readback(self, action: WorkRunAction) -> WorkRunObservation | None: ...
+    def readback(
+        self, action: WorkRunAction
+    ) -> WorkRunObservation | StaleBindingObservation | StaleDiagnosisObservation | None: ...
 
-    def execute(self, action: WorkRunAction) -> WorkRunObservation: ...
+    def execute(
+        self, action: WorkRunAction
+    ) -> WorkRunObservation | StaleBindingObservation | StaleDiagnosisObservation: ...
 
 
 class ExecutionKernel:
@@ -677,11 +843,18 @@ class ExecutionKernel:
         plan_control: ActivePlanReader,
         effects: WorkRunEffects,
         configuration: ExecutionKernelConfiguration | None = None,
+        _clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self._store_path = Path(store_path)
         self._plan_control = plan_control
         self._effects = effects
         self._configuration = configuration or ExecutionKernelConfiguration()
+        if not callable(_clock):
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "ExecutionKernel clock must be callable",
+            )
+        self._clock = _clock
         with self._connect() as connection:
             connection.execute(
                 """
@@ -2391,8 +2564,15 @@ class ExecutionKernel:
                     "reason": None,
                     "last_action_id": None,
                     "semantic_action_id": None,
+                    "runtime_binding_id": None,
                     "resume_ordinal": 0,
                     "next_check_at": None,
+                    "last_trusted_progress_at": None,
+                    "stale_due_at": None,
+                    "stale_readback_action_id": None,
+                    "stale_diagnosis_action_id": None,
+                    "stale_disposition": None,
+                    "diagnosed_binding_ids": [],
                     "work_subject_digest": subject_digest,
                     "work_run_key": (
                         work_run_key(key, subject_digest)
@@ -2419,6 +2599,7 @@ class ExecutionKernel:
                 "wake_refs": [],
                 "last_wake_refs": [],
                 "trusted_progress_revision": 0,
+                "diagnosed_binding_ids": [],
                 "normalized_permission_receipts": [],
                 "candidate_receipts": [],
                 "delivery_receipts": [],
@@ -2451,6 +2632,7 @@ class ExecutionKernel:
             ("revision_lineage", []),
             ("last_wake_refs", []),
             ("trusted_progress_revision", 0),
+            ("diagnosed_binding_ids", []),
             ("normalized_permission_receipts", []),
             ("candidate_receipts", []),
             ("delivery_receipts", []),
@@ -2546,6 +2728,18 @@ class ExecutionKernel:
             if "trusted_progress_revision" not in run:
                 run["trusted_progress_revision"] = 0
                 dirty = True
+            for field, default in (
+                ("runtime_binding_id", None),
+                ("last_trusted_progress_at", None),
+                ("stale_due_at", None),
+                ("stale_readback_action_id", None),
+                ("stale_diagnosis_action_id", None),
+                ("stale_disposition", None),
+                ("diagnosed_binding_ids", []),
+            ):
+                if field not in run:
+                    run[field] = default.copy() if isinstance(default, list) else default
+                    dirty = True
             if "result_digest" not in run:
                 run["result_digest"] = None
                 dirty = True
@@ -3311,6 +3505,7 @@ class ExecutionKernel:
             "wake_refs": [],
             "last_wake_refs": [],
             "trusted_progress_revision": 0,
+            "diagnosed_binding_ids": [],
             "normalized_permission_receipts": [],
             "candidate_receipts": [],
             "delivery_receipts": [],
@@ -3369,8 +3564,15 @@ class ExecutionKernel:
             "reason": None,
             "last_action_id": None,
             "semantic_action_id": None,
+            "runtime_binding_id": None,
             "resume_ordinal": 0,
             "next_check_at": None,
+            "last_trusted_progress_at": None,
+            "stale_due_at": None,
+            "stale_readback_action_id": None,
+            "stale_diagnosis_action_id": None,
+            "stale_disposition": None,
+            "diagnosed_binding_ids": [],
             "work_subject_digest": subject_digest,
             "work_run_key": _work_run_key_for_kernel(plan, work_item, subject_digest),
             "exclusive_resources": list(work_item.get("exclusive_resources", [])),
@@ -3550,11 +3752,47 @@ class ExecutionKernel:
             run.get("candidate_identity"),
             run.get("result_digest"),
             tuple(run.get("evidence_digests", ())),
+            run.get("runtime_binding_id"),
         )
 
+    def _clock_value(self) -> datetime:
+        try:
+            value = self._clock()
+        except Exception as error:
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "ExecutionKernel clock did not return a timestamp",
+            ) from error
+        if type(value) is not datetime or value.tzinfo is None or value.utcoffset() != timedelta(0):
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "ExecutionKernel clock must return an aware UTC datetime",
+            )
+        return value
+
     @staticmethod
+    def _timestamp(value: datetime) -> str:
+        rendered = value.isoformat()
+        try:
+            parsed = datetime.fromisoformat(rendered)
+        except ValueError as error:  # pragma: no cover - datetime.isoformat is valid
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "ExecutionKernel clock produced a noncanonical timestamp",
+            ) from error
+        if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0) or parsed.isoformat() != rendered:
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "ExecutionKernel clock produced a noncanonical UTC timestamp",
+            )
+        return rendered
+
     def _record_trusted_progress(
-        state: dict[str, Any], run: dict[str, Any]
+        self,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        *,
+        repository: str,
     ) -> None:
         state_revision = state.get("trusted_progress_revision", 0)
         run_revision = run.get("trusted_progress_revision", 0)
@@ -3572,6 +3810,331 @@ class ExecutionKernel:
             )
         state["trusted_progress_revision"] = state_revision + 1
         run["trusted_progress_revision"] = run_revision + 1
+        now = self._clock_value()
+        run["last_trusted_progress_at"] = self._timestamp(now)
+        run["stale_due_at"] = self._timestamp(
+            now + timedelta(seconds=self._configuration.stale_after_seconds_for(repository))
+        )
+
+    @staticmethod
+    def _stale_binding_id(run: Mapping[str, Any]) -> str:
+        binding = run.get("runtime_binding_id") or run.get("semantic_action_id")
+        _validate_binding_id(binding, "active runtime binding identity")
+        return binding
+
+    @staticmethod
+    def _stale_action_identity(
+        active: ActivePlanReadback,
+        ticket_key: str,
+        run: Mapping[str, Any],
+        *,
+        binding_id: str,
+        trusted_progress_digest: str,
+    ) -> str:
+        return (
+            f"stale-readback:{active.handle.campaign_key}:{run['work_run_key']}"
+            f":{binding_id}:{trusted_progress_digest}"
+        )
+
+    @staticmethod
+    def _stale_diagnosis_identity(
+        active: ActivePlanReadback,
+        run: Mapping[str, Any],
+        *,
+        binding_id: str,
+    ) -> str:
+        return f"stale-diagnosis:{active.handle.campaign_key}:{run['work_run_key']}:{binding_id}"
+
+    def _persist_action_intent(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        action: WorkRunAction,
+    ) -> None:
+        effect_identity = {
+            "kind": action.kind,
+            "ticket_key": action.ticket_key,
+            "runtime_binding_id": action.runtime_binding_id,
+            "plan_revision_digest": action.plan_revision_digest,
+            "work_run_key": action.work_run_key,
+            "work_subject_digest": action.work_subject_digest,
+        }
+        effects = state.setdefault("effects", {})
+        if type(effects) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel effects are not a mapping",
+            )
+        prior = effects.get(action.stable_action_id)
+        if prior is not None:
+            if type(prior) is not dict or any(
+                field in prior and prior[field] != value
+                for field, value in effect_identity.items()
+            ):
+                raise ExecutionKernelError(
+                    "EFFECT_READBACK_INVALID",
+                    "stale effect intent is not bound to its exact action identity",
+                )
+            if prior.get("state") not in {"intent", "read_back"}:
+                raise ExecutionKernelError(
+                    "EFFECT_READBACK_INVALID",
+                    "stale effect intent has an unknown durable state",
+                )
+            return
+        effects[action.stable_action_id] = {
+            "state": "intent",
+            **effect_identity,
+        }
+        self._save(active.handle, state)
+
+    def _persist_effect_readback(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        action: WorkRunAction,
+        observation: StaleBindingObservation | StaleDiagnosisObservation,
+    ) -> None:
+        effect = state["effects"].get(action.stable_action_id)
+        if type(effect) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stale effect intent disappeared before readback",
+            )
+        receipt_digest = observation.receipt_digest
+        if effect.get("state") == "read_back" and effect.get("receipt_digest") != receipt_digest:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale effect receipt changed during readback",
+            )
+        effect.update({"state": "read_back", "receipt_digest": receipt_digest})
+        self._save(active.handle, state)
+
+    def _read_or_execute_once(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        action: WorkRunAction,
+    ) -> object | None:
+        prior = state.get("effects", {}).get(action.stable_action_id)
+        self._persist_action_intent(active, state, action)
+        readback = self._effects.readback(action)
+        if readback is not None:
+            return readback
+        if type(prior) is dict and prior.get("state") == "read_back":
+            return None
+        return self._effects.execute(action)
+
+    @staticmethod
+    def _validate_stale_readback(
+        action: WorkRunAction,
+        observation: object,
+        binding_id: str,
+    ) -> StaleBindingObservation:
+        if (
+            type(observation) is not StaleBindingObservation
+            or observation.stable_action_id != action.stable_action_id
+            or observation.runtime_binding_id != binding_id
+            or action.runtime_binding_id != binding_id
+        ):
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale readback is not bound to its exact action and Runtime Binding",
+            )
+        return observation
+
+    @staticmethod
+    def _validate_stale_diagnosis(
+        action: WorkRunAction,
+        observation: object,
+        binding_id: str,
+    ) -> StaleDiagnosisObservation:
+        if (
+            type(observation) is not StaleDiagnosisObservation
+            or observation.stable_action_id != action.stable_action_id
+            or observation.runtime_binding_id != binding_id
+            or action.runtime_binding_id != binding_id
+            or type(observation.disposition) is not StaleDiagnosisDisposition
+        ):
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale diagnosis is not bound to its exact action and Runtime Binding",
+            )
+        return observation
+
+    @staticmethod
+    def _record_diagnosed_binding(
+        state: dict[str, Any],
+        run: dict[str, Any],
+        binding_id: str,
+    ) -> None:
+        for target in (state.setdefault("diagnosed_binding_ids", []), run.setdefault("diagnosed_binding_ids", [])):
+            if type(target) is not list:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "diagnosed Runtime Binding identities are not a list",
+                )
+            if binding_id not in target:
+                target.append(binding_id)
+                target.sort()
+
+    def _apply_mechanical_stale_readback(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        observation: StaleBindingObservation,
+    ) -> None:
+        phase_by_state = {
+            StaleReadbackState.TERMINAL: ("completed", "RuntimeTerminal"),
+            StaleReadbackState.IDLE: ("wait", "RuntimeIdle"),
+            StaleReadbackState.PERMISSION_WAITING: ("wait", "PermissionWaiting"),
+            StaleReadbackState.CANDIDATE_RECEIVED: ("candidate_checks", "CandidateReceiptReceived"),
+            StaleReadbackState.PROVIDER_UNAVAILABLE: ("runtime_unavailable", "ProviderUnavailable"),
+        }
+        if observation.state not in phase_by_state:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "unclassified stale readback must use the diagnosis path",
+            )
+        phase, reason = phase_by_state[observation.state]
+        run["phase"] = phase
+        run["reason"] = reason
+        run["slot_held"] = phase in _SLOT_PHASES
+        run["claim_state"] = "held" if run["slot_held"] else "released"
+        run["stale_due_at"] = None
+        run["stale_disposition"] = observation.state.value
+        self._record_trusted_progress(
+            state,
+            run,
+            repository=active.handle.repository,
+        )
+        run["stale_due_at"] = None
+        self._save(active.handle, state)
+
+    def _apply_stale_diagnosis(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        observation: StaleDiagnosisObservation,
+    ) -> None:
+        dispositions = {
+            StaleDiagnosisDisposition.CONTINUE: ("running", "StaleSuppressed", True),
+            StaleDiagnosisDisposition.GUIDE_SAME_WORKER: (
+                "running",
+                "StaleWorkerGuidance",
+                True,
+            ),
+            StaleDiagnosisDisposition.RECOVER_SAME_BINDING: (
+                "running",
+                "StaleBindingRecovery",
+                True,
+            ),
+            StaleDiagnosisDisposition.DECISION: ("decision", "RuntimeBindingStale", False),
+        }
+        if observation.disposition not in dispositions:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "unknown stale diagnosis disposition",
+            )
+        phase, reason, slot_held = dispositions[observation.disposition]
+        run["phase"] = phase
+        run["reason"] = reason
+        run["slot_held"] = slot_held
+        run["claim_state"] = "held" if slot_held else "released"
+        run["stale_due_at"] = None
+        run["stale_disposition"] = observation.disposition.value
+        self._record_trusted_progress(
+            state,
+            run,
+            repository=active.handle.repository,
+        )
+        run["stale_due_at"] = None
+        self._save(active.handle, state)
+
+    def _perform_stale_effect(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        ticket_key: str,
+    ) -> None:
+        run = state["runs"][ticket_key]
+        binding_id = self._stale_binding_id(run)
+        trusted_progress_digest = self._trusted_progress_digest(state, active.handle)
+        readback_id = run.get("stale_readback_action_id")
+        if readback_id is None:
+            readback_id = self._stale_action_identity(
+                active,
+                ticket_key,
+                run,
+                binding_id=binding_id,
+                trusted_progress_digest=trusted_progress_digest,
+            )
+            run["stale_readback_action_id"] = readback_id
+        action = WorkRunAction(
+            stable_action_id=readback_id,
+            repository=active.handle.repository,
+            campaign_key=active.handle.campaign_key,
+            plan_revision_digest=active.current_revision_digest,
+            ticket_key=ticket_key,
+            kind="stale_readback",
+            semantic_action_id=run.get("semantic_action_id") or binding_id,
+            work_run_key=run["work_run_key"],
+            work_subject_digest=run["work_subject_digest"],
+            runtime_binding_id=binding_id,
+        )
+        observation = self._read_or_execute_once(active, state, action)
+        if observation is None:
+            return
+        stale_readback = self._validate_stale_readback(action, observation, binding_id)
+        self._persist_effect_readback(active, state, action, stale_readback)
+        run["last_action_id"] = action.stable_action_id
+        if stale_readback.state in {
+            StaleReadbackState.TERMINAL,
+            StaleReadbackState.IDLE,
+            StaleReadbackState.PERMISSION_WAITING,
+            StaleReadbackState.CANDIDATE_RECEIVED,
+            StaleReadbackState.PROVIDER_UNAVAILABLE,
+        }:
+            self._apply_mechanical_stale_readback(active, state, run, stale_readback)
+            return
+        if stale_readback.state is not StaleReadbackState.AMBIGUOUS_RUNNING:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "unknown stale readback state",
+            )
+        diagnosis_id = run.get("stale_diagnosis_action_id")
+        if diagnosis_id is None:
+            diagnosis_id = self._stale_diagnosis_identity(
+                active,
+                run,
+                binding_id=binding_id,
+            )
+            run["stale_diagnosis_action_id"] = diagnosis_id
+        self._record_diagnosed_binding(state, run, binding_id)
+        diagnosis = WorkRunAction(
+            stable_action_id=diagnosis_id,
+            repository=active.handle.repository,
+            campaign_key=active.handle.campaign_key,
+            plan_revision_digest=active.current_revision_digest,
+            ticket_key=ticket_key,
+            kind="stale_diagnosis",
+            semantic_action_id=run.get("semantic_action_id") or binding_id,
+            work_run_key=run["work_run_key"],
+            work_subject_digest=run["work_subject_digest"],
+            runtime_binding_id=binding_id,
+        )
+        diagnosis_observation = self._read_or_execute_once(active, state, diagnosis)
+        if diagnosis_observation is None:
+            return
+        stale_diagnosis = self._validate_stale_diagnosis(
+            diagnosis,
+            diagnosis_observation,
+            binding_id,
+        )
+        self._persist_effect_readback(active, state, diagnosis, stale_diagnosis)
+        run["last_action_id"] = diagnosis.stable_action_id
+        self._apply_stale_diagnosis(active, state, run, stale_diagnosis)
 
     def _next_due_run(
         self,
@@ -3605,6 +4168,48 @@ class ExecutionKernel:
                     run["reason"] = "WorkerSlotCapacity"
                     continue
                 run["reason"] = None
+                return ticket_key
+        if wake_ref is None:
+            now = self._clock_value()
+            for ticket_key in sorted(work):
+                run = state["runs"][ticket_key]
+                if run["phase"] not in _SLOT_PHASES:
+                    continue
+                due_at = run.get("stale_due_at")
+                if due_at is None:
+                    continue
+                if type(due_at) is not str:
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "stale due time is not canonical text",
+                    )
+                try:
+                    due_value = datetime.fromisoformat(due_at)
+                except ValueError as error:
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "stale due time is unreadable",
+                    ) from error
+                if (
+                    due_value.tzinfo is None
+                    or due_value.utcoffset() != timedelta(0)
+                    or due_value.isoformat() != due_at
+                ):
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "stale due time is not canonical UTC text",
+                    )
+                if due_value > now:
+                    continue
+                binding_id = self._stale_binding_id(run)
+                diagnosed = state.get("diagnosed_binding_ids", [])
+                if type(diagnosed) is not list:
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "diagnosed Runtime Binding identities are not a list",
+                    )
+                if binding_id in diagnosed and run.get("stale_disposition") is not None:
+                    continue
                 return ticket_key
         for ticket_key in sorted(work):
             run = state["runs"][ticket_key]
@@ -4485,6 +5090,29 @@ class ExecutionKernel:
         wake_ref: str | None,
     ) -> None:
         run = state["runs"][ticket_key]
+        if (
+            wake_ref is None
+            and
+            run["phase"] in _SLOT_PHASES
+            and run.get("stale_due_at") is not None
+            and run.get("stale_disposition") is None
+        ):
+            due_at = run["stale_due_at"]
+            if type(due_at) is not str:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "stale due time is not canonical text",
+                )
+            try:
+                due_value = datetime.fromisoformat(due_at)
+            except ValueError as error:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "stale due time is unreadable",
+                ) from error
+            if due_value <= self._clock_value():
+                self._perform_stale_effect(active, state, ticket_key)
+                return
         trusted_before = self._trusted_lifecycle_projection(run)
         trusted_progress_recorded = False
         resuming = run["phase"] == "parked" or bool(
@@ -4505,6 +5133,7 @@ class ExecutionKernel:
             semantic_action_id=semantic_action_id,
             work_run_key=run["work_run_key"],
             work_subject_digest=run["work_subject_digest"],
+            runtime_binding_id=run.get("runtime_binding_id"),
         )
         # The intent becomes durable before the external boundary.  A restart
         # observes this same identity through the effect owner before retry.
@@ -4555,6 +5184,24 @@ class ExecutionKernel:
                 "EFFECT_READBACK_INVALID",
                 "effect result does not bind its stable action identity",
             )
+        if observation.runtime_binding_id is not None:
+            if (
+                run.get("runtime_binding_id") is not None
+                and run.get("runtime_binding_id") != observation.runtime_binding_id
+            ):
+                raise ExecutionKernelError(
+                    "EFFECT_READBACK_INVALID",
+                    "Work Run observation changed its Runtime Binding",
+                )
+            if (
+                action.runtime_binding_id is not None
+                and action.runtime_binding_id != observation.runtime_binding_id
+            ):
+                raise ExecutionKernelError(
+                    "EFFECT_READBACK_INVALID",
+                    "Work Run observation is not bound to its action Runtime Binding",
+                )
+            run["runtime_binding_id"] = observation.runtime_binding_id
         run.setdefault("candidate_receipt", None)
         receipt = observation.candidate_receipt
         if receipt is not None:
@@ -4581,7 +5228,11 @@ class ExecutionKernel:
                 if type(value) is dict and value.get("candidate_receipt") is not None
             ]
             if receipt_changed:
-                self._record_trusted_progress(state, run)
+                self._record_trusted_progress(
+                    state,
+                    run,
+                    repository=active.handle.repository,
+                )
                 trusted_progress_recorded = True
             self._save(active.handle, state)
             persisted_state = self._load(active.handle)
@@ -4670,7 +5321,11 @@ class ExecutionKernel:
             or self._trusted_lifecycle_projection(run) != trusted_before
             )
         ):
-            self._record_trusted_progress(state, run)
+            self._record_trusted_progress(
+                state,
+                run,
+                repository=active.handle.repository,
+            )
         self._save(active.handle, state)
 
     def _outcome(self, handle: CampaignHandle, state: dict[str, Any] | None) -> CampaignOutcome:
