@@ -3505,6 +3505,22 @@ class _RuntimeEventPage:
     next_cursor: str | None
 
 
+@dataclass(frozen=True)
+class _RuntimeCampaignWake:
+    cursor: str
+    repository: str
+    campaign_key: str
+    source: str
+    stable_action_id: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class _RuntimeCampaignWakePage:
+    events: tuple[_RuntimeCampaignWake, ...]
+    next_cursor: str | None
+
+
 def _runtime_event_cursor_value(value: object) -> int | None:
     """Parse only the closed external event-cursor scalar."""
 
@@ -10587,6 +10603,22 @@ class RuntimeGateway:
             ):
                 hints.append(f"{event.cursor}:{event.stable_action_id}:{event.kind}")
         return tuple(hints), page.next_cursor
+
+    def _read_watchdog_events(
+        self,
+        after_cursor: str | None,
+    ) -> _RuntimeCampaignWakePage:
+        self._refresh_before_adapter_io()
+        raw_page = self._adapter.events(after_cursor)
+        verdict = _RuntimeEventPageProtocol.validate(raw_page, after_cursor=after_cursor)
+        if verdict.kind != "page":
+            assert verdict.failure is not None
+            self._raise_failure(verdict.failure)
+        assert verdict.page is not None
+        return _RuntimeCampaignWakePage(
+            events=tuple(self._watchdog_wake_for_event(event) for event in verdict.page.events),
+            next_cursor=verdict.page.next_cursor,
+        )
 
     @staticmethod
     def _raise_failure(failure: _RuntimeFailure) -> None:
