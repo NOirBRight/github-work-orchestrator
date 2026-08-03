@@ -61,3 +61,16 @@ def test_active_campaigns_reads_existing_nonterminal_campaigns(
     before = kernel._store_path.read_bytes()
     assert kernel.active_campaigns() == (campaign,)
     assert kernel._store_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "hint", ["worker-report", "workspace-head", "raw-log", "duplicate-callback"]
+)
+def test_hint_does_not_change_trusted_progress_digest(kernel_with_one_ticket, hint):
+    kernel, _effects, campaign = kernel_with_one_ticket
+    _bind_successor_fixture_to_campaign(kernel, campaign)
+    kernel.advance(campaign)
+    before = kernel.watchdog_snapshot(campaign)
+    kernel.advance(campaign, f"hint:{hint}")
+    after = kernel.watchdog_snapshot(campaign)
+    assert after.trusted_progress_digest == before.trusted_progress_digest

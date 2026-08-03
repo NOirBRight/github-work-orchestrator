@@ -858,7 +858,7 @@ class ExecutionKernel:
         return WatchdogCampaignSnapshot(
             campaign=handle,
             status=self._status_from_persisted_state(state),
-            trusted_progress_digest=digest_value(state),
+            trusted_progress_digest=self._trusted_progress_digest(state),
             next_check_at=None,
             active_binding_ids=(),
             diagnosed_binding_ids=(),
@@ -2382,6 +2382,8 @@ class ExecutionKernel:
                     "claim_state": "unclaimed",
                     "candidate_identity": None,
                     "candidate_receipt": None,
+                    "candidate_receipt_digest": None,
+                    "trusted_progress_revision": 0,
                     "result_digest": None,
                     "evidence_digests": [],
                     "plan_invalidation": None,
@@ -2394,6 +2396,11 @@ class ExecutionKernel:
                 "runs": runs,
                 "effects": {},
                 "wake_refs": [],
+                "last_wake_refs": [],
+                "trusted_progress_revision": 0,
+                "normalized_permission_receipts": [],
+                "candidate_receipts": [],
+                "delivery_receipts": [],
                 "plan_invalidation": {},
                 "plan_invalidation_resolutions": {},
                 "plan_invalidation_classifications": {},
@@ -2419,6 +2426,11 @@ class ExecutionKernel:
         state.setdefault("plan_invalidation_classifications", {})
         state.setdefault("accepted_results", [])
         state.setdefault("revision_lineage", [])
+        state.setdefault("last_wake_refs", [])
+        state.setdefault("trusted_progress_revision", 0)
+        state.setdefault("normalized_permission_receipts", [])
+        state.setdefault("candidate_receipts", [])
+        state.setdefault("delivery_receipts", [])
         if type(state["revision_lineage"]) is not list:
             raise ExecutionKernelError(
                 "EXECUTION_STORE_INVALID",
@@ -2501,6 +2513,12 @@ class ExecutionKernel:
                 dirty = True
             if "candidate_receipt" not in run:
                 run.setdefault("candidate_receipt", None)
+                dirty = True
+            if "candidate_receipt_digest" not in run:
+                run["candidate_receipt_digest"] = None
+                dirty = True
+            if "trusted_progress_revision" not in run:
+                run["trusted_progress_revision"] = 0
                 dirty = True
             if "result_digest" not in run:
                 run["result_digest"] = None
@@ -3244,6 +3262,11 @@ class ExecutionKernel:
             "runs": successor_runs,
             "effects": {},
             "wake_refs": [],
+            "last_wake_refs": [],
+            "trusted_progress_revision": 0,
+            "normalized_permission_receipts": [],
+            "candidate_receipts": [],
+            "delivery_receipts": [],
             "plan_invalidation": {},
             "plan_invalidation_resolutions": {},
             "plan_invalidation_classifications": {},
@@ -3307,6 +3330,8 @@ class ExecutionKernel:
             "claim_state": "unclaimed",
             "candidate_identity": None,
             "candidate_receipt": None,
+            "candidate_receipt_digest": None,
+            "trusted_progress_revision": 0,
             "result_digest": None,
             "evidence_digests": [],
             "plan_invalidation": None,
@@ -3466,6 +3491,40 @@ class ExecutionKernel:
                 "ordinal": run["resume_ordinal"] if resuming else 0,
             }
         )
+
+    @staticmethod
+    def _trusted_lifecycle_projection(run: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (
+            run.get("phase"),
+            run.get("reason"),
+            run.get("next_check_at"),
+            run.get("slot_held"),
+            run.get("claim_state"),
+            run.get("candidate_identity"),
+            run.get("result_digest"),
+            tuple(run.get("evidence_digests", ())),
+        )
+
+    @staticmethod
+    def _record_trusted_progress(
+        state: dict[str, Any], run: dict[str, Any]
+    ) -> None:
+        state_revision = state.get("trusted_progress_revision", 0)
+        run_revision = run.get("trusted_progress_revision", 0)
+        if (
+            type(state_revision) is not int
+            or isinstance(state_revision, bool)
+            or state_revision < 0
+            or type(run_revision) is not int
+            or isinstance(run_revision, bool)
+            or run_revision < 0
+        ):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "trusted progress revision is not a non-negative integer",
+            )
+        state["trusted_progress_revision"] = state_revision + 1
+        run["trusted_progress_revision"] = run_revision + 1
 
     def _next_due_run(
         self,
@@ -4379,6 +4438,7 @@ class ExecutionKernel:
         wake_ref: str | None,
     ) -> None:
         run = state["runs"][ticket_key]
+        trusted_before = self._trusted_lifecycle_projection(run)
         resuming = run["phase"] == "parked" or bool(
             run.get("resume_after_invalidation")
         )
@@ -4533,6 +4593,12 @@ class ExecutionKernel:
             state["accepted_results"].sort(key=lambda value: value["ticket_key"])
             run["result_digest"] = binding.result_digest
             run["evidence_digests"] = list(binding.evidence_digests)
+        if (
+            prior_effect is None
+            or prior_effect.get("state") != "read_back"
+            or self._trusted_lifecycle_projection(run) != trusted_before
+        ):
+            self._record_trusted_progress(state, run)
         self._save(active.handle, state)
 
     def _outcome(self, handle: CampaignHandle, state: dict[str, Any] | None) -> CampaignOutcome:
@@ -4684,6 +4750,17 @@ class ExecutionKernel:
                 "EXECUTION_STORE_INVALID",
                 "Campaign state cannot derive its status",
             ) from error
+
+    @staticmethod
+    def _trusted_progress_digest(state: Mapping[str, Any]) -> str:
+        return digest_value(
+            {
+                "kernel_transition_revision": state.get("trusted_progress_revision", 0),
+                "permission_receipts": state.get("normalized_permission_receipts", []),
+                "candidate_receipts": state.get("candidate_receipts", []),
+                "delivery_receipts": state.get("delivery_receipts", []),
+            }
+        )
 
     def _campaign_lock(self, handle: CampaignHandle) -> threading.RLock:
         key = f"{self._store_path.resolve()}::{handle.repository}::{handle.campaign_key}"
