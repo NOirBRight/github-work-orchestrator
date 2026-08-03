@@ -59,6 +59,46 @@ _REQUIRED_SOURCE_KIND = {
     "authority": "policy",
     "replan_budget": "none",
 }
+_POLICY_WITNESS_FIELDS = frozenset(
+    {
+        "kind",
+        "replan",
+        "digest",
+        "schema_version",
+        "ref",
+        "authority_grants",
+        "allowed_capabilities",
+        "exclusive_resources",
+    }
+)
+
+
+def _human_planning_action_id(
+    decision_id: str,
+    source_readback_digest: str,
+    previous_revision_digest: str,
+) -> str:
+    """Derive the one human successor action from its complete predecessor."""
+
+    if type(decision_id) is not str or _DECISION_ID.fullmatch(decision_id) is None:
+        _fail("HUMAN_GATE_ATTEMPT_INVALID", "human Planning Decision ID is invalid")
+    _digest(
+        source_readback_digest,
+        "human Planning source_readback_digest",
+        code="HUMAN_GATE_ATTEMPT_INVALID",
+    )
+    _digest(
+        previous_revision_digest,
+        "human Planning predecessor revision digest",
+        code="HUMAN_GATE_ATTEMPT_INVALID",
+    )
+    return "replan:human:" + digest_value(
+        {
+            "decision_id": decision_id,
+            "source_readback_digest": source_readback_digest,
+            "previous_revision_digest": previous_revision_digest,
+        }
+    )[:24]
 
 
 class HumanGateError(RuntimeError):
@@ -148,6 +188,12 @@ class RequiredDurableSourceChange:
     predecessor_source_digest: str
     required_subject: str
     detail: str
+    # The invalidation snapshot and the tracker source projection are
+    # different Artifacts.  New Decisions carry both identities so a source
+    # adapter can detect a no-op/revert without comparing incompatible digest
+    # domains.  ``None`` keeps old durable records readable during migration;
+    # generated Decisions always populate it.
+    predecessor_snapshot_digest: str | None = None
 
     @classmethod
     def source_kind_for(cls, required_change: str) -> str:
@@ -162,6 +208,12 @@ class RequiredDurableSourceChange:
         if self.source_kind != expected:
             _fail("HUMAN_DECISION_RECORD_INVALID", "source_kind does not match required_change")
         _digest(self.predecessor_source_digest, "predecessor_source_digest", code="HUMAN_DECISION_RECORD_INVALID")
+        if self.predecessor_snapshot_digest is not None:
+            _digest(
+                self.predecessor_snapshot_digest,
+                "predecessor_snapshot_digest",
+                code="HUMAN_DECISION_RECORD_INVALID",
+            )
         _text(self.required_subject, "required_subject", code="HUMAN_DECISION_RECORD_INVALID")
         _text(self.detail, "source change detail", code="HUMAN_DECISION_RECORD_INVALID")
 
@@ -171,24 +223,41 @@ class RequiredDurableSourceChange:
             "required_change": self.required_change,
             "source_kind": self.source_kind,
             "predecessor_source_digest": self.predecessor_source_digest,
+            "predecessor_snapshot_digest": self.predecessor_snapshot_digest,
             "required_subject": self.required_subject,
             "detail": self.detail,
         }
 
     @classmethod
     def from_canonical(cls, value: Mapping[str, Any]) -> "RequiredDurableSourceChange":
-        raw = _closed(
-            value,
-            {"kind", "required_change", "source_kind", "predecessor_source_digest", "required_subject", "detail"},
-            "required source change",
-            code="HUMAN_DECISION_RECORD_INVALID",
-        )
+        expected = {
+            "kind",
+            "required_change",
+            "source_kind",
+            "predecessor_source_digest",
+            "required_subject",
+            "detail",
+        }
+        optional = expected | {"predecessor_snapshot_digest"}
+        if type(value) is not dict or set(value) not in (expected, optional):
+            _fail("HUMAN_DECISION_RECORD_INVALID", "required source change schema is not closed")
+        raw = value
         if raw["kind"] != "gwo.human-required-source-change.v1":
             _fail("HUMAN_DECISION_RECORD_INVALID", "required source change kind is invalid")
         try:
-            return cls(**{key: raw[key] for key in (
-                "required_change", "source_kind", "predecessor_source_digest", "required_subject", "detail"
-            )})
+            return cls(
+                **{
+                    key: raw[key]
+                    for key in (
+                        "required_change",
+                        "source_kind",
+                        "predecessor_source_digest",
+                        "required_subject",
+                        "detail",
+                    )
+                },
+                predecessor_snapshot_digest=raw.get("predecessor_snapshot_digest"),
+            )
         except HumanGateError:
             raise
         except (KeyError, TypeError, ValueError) as error:
@@ -347,6 +416,22 @@ class HumanSourceReadback:
             _digest(self.source_change_digest, "source_change_digest", code="HUMAN_SOURCE_READBACK_INVALID")
         elif self.source_change_digest is not None:
             _digest(self.source_change_digest, "source_change_digest", code="HUMAN_SOURCE_READBACK_INVALID")
+        expected_readback_digest = digest_value(
+            {
+                "decision_id": self.decision_id,
+                "state": self.state,
+                "approval_record_digest": self.approval_record_digest,
+                "tracker_source_digest": self.tracker_source_digest,
+                "policy_witness_digest": self.policy_witness_digest,
+                "source_change_digest": self.source_change_digest,
+                "code": self.code,
+            }
+        )
+        if self.readback_digest != expected_readback_digest:
+            _fail(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "readback_digest does not bind the complete source readback",
+            )
 
     @property
     def approved(self) -> bool:
@@ -413,7 +498,12 @@ class ReplanBudgetPolicy:
 
     @classmethod
     def from_policy(cls, policy: Mapping[str, Any]) -> "ReplanBudgetPolicy":
-        if type(policy) is not dict or "replan" not in policy or "digest" not in policy:
+        if (
+            type(policy) is not dict
+            or not {"kind", "replan", "digest"}.issubset(policy)
+            or set(policy) - _POLICY_WITNESS_FIELDS
+            or policy["kind"] != "gwo.policy-witness.v1"
+        ):
             _fail("REPLAN_BUDGET_POLICY_INVALID", "Policy Witness does not contain a replan budget")
         replan = policy["replan"]
         if type(replan) is not dict or set(replan) != {"successor_revision_limit", "repeated_invalidation_limit"}:
@@ -572,6 +662,15 @@ class HumanGateAttempt:
         ):
             _digest(value, label, code="HUMAN_GATE_ATTEMPT_INVALID")
         _text(self.planning_action_id, "planning_action_id", code="HUMAN_GATE_ATTEMPT_INVALID")
+        if self.planning_action_id != _human_planning_action_id(
+            self.decision_id,
+            self.source_readback_digest,
+            self.predecessor_revision_digest,
+        ):
+            _fail(
+                "HUMAN_GATE_ATTEMPT_INVALID",
+                "planning_action_id does not bind the Decision, source readback, and predecessor revision",
+            )
         if self.planning_protocol_id != REPLANNING_OUTPUT_PROTOCOL_ID:
             _fail("HUMAN_GATE_ATTEMPT_INVALID", "attempt must use the replanning output protocol")
         if type(self.state) is not str or self.state not in HUMAN_GATE_PHASES:
@@ -582,6 +681,34 @@ class HumanGateAttempt:
         ):
             if value is not None:
                 _digest(value, label, code="HUMAN_GATE_ATTEMPT_INVALID")
+        if self.state == "active_successor" and (
+            self.compilation_record_artifact_digest is None
+            or self.activation_receipt_digest is None
+        ):
+            _fail(
+                "HUMAN_GATE_ATTEMPT_INVALID",
+                "active human gate attempt requires compilation and activation readback",
+            )
+        if self.state == "planning_validated_successor" and (
+            self.activation_receipt_digest is not None
+        ):
+            _fail(
+                "HUMAN_GATE_ATTEMPT_INVALID",
+                "planning human gate attempt cannot claim an activation readback",
+            )
+        if self.state in {
+            "awaiting_human_choice",
+            "awaiting_durable_tracker_policy_readback",
+            "rejected_change",
+            "budget_exhausted",
+        } and (
+            self.compilation_record_artifact_digest is not None
+            or self.activation_receipt_digest is not None
+        ):
+            _fail(
+                "HUMAN_GATE_ATTEMPT_INVALID",
+                "human gate attempt phase cannot carry successor Artifacts",
+            )
 
     def canonical(self) -> dict[str, Any]:
         return {
@@ -598,6 +725,10 @@ class HumanGateAttempt:
             "compilation_record_artifact_digest": self.compilation_record_artifact_digest,
             "activation_receipt_digest": self.activation_receipt_digest,
         }
+
+    @property
+    def digest(self) -> str:
+        return digest_value(self.canonical())
 
     @classmethod
     def from_canonical(cls, value: Mapping[str, Any]) -> "HumanGateAttempt":
@@ -619,6 +750,67 @@ class HumanGateAttempt:
             state=raw["state"], compilation_record_artifact_digest=raw["compilation_record_artifact_digest"],
             activation_receipt_digest=raw["activation_receipt_digest"],
         )
+
+
+_HUMAN_GATE_ATTEMPT_TRANSITIONS = {
+    "awaiting_human_choice": frozenset(
+        {
+            "awaiting_human_choice",
+            "awaiting_durable_tracker_policy_readback",
+            "planning_validated_successor",
+            "rejected_change",
+            "budget_exhausted",
+        }
+    ),
+    "awaiting_durable_tracker_policy_readback": frozenset(
+        {
+            "awaiting_durable_tracker_policy_readback",
+            "planning_validated_successor",
+            "rejected_change",
+            "budget_exhausted",
+        }
+    ),
+    "planning_validated_successor": frozenset(
+        {"planning_validated_successor", "active_successor"}
+    ),
+    "active_successor": frozenset({"active_successor"}),
+    "rejected_change": frozenset({"rejected_change"}),
+    "budget_exhausted": frozenset({"budget_exhausted"}),
+}
+
+
+def _validate_human_gate_attempt_transition(
+    existing: HumanGateAttempt,
+    candidate: HumanGateAttempt,
+) -> None:
+    """Validate the monotonic durable lifecycle for one attempt key."""
+
+    if type(existing) is not HumanGateAttempt or type(candidate) is not HumanGateAttempt:
+        _fail(
+            "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+            "human gate attempt transition requires typed records",
+        )
+    if existing.state == "active_successor" and existing != candidate:
+        _fail(
+            "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+            "active human gate attempt cannot be rewritten",
+        )
+    if candidate.state not in _HUMAN_GATE_ATTEMPT_TRANSITIONS.get(existing.state, ()):
+        _fail(
+            "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+            "human gate attempt state transition is outside the closed lifecycle",
+        )
+    for field in (
+        "compilation_record_artifact_digest",
+        "activation_receipt_digest",
+    ):
+        prior = getattr(existing, field)
+        next_value = getattr(candidate, field)
+        if prior is not None and next_value != prior:
+            _fail(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                f"human gate attempt {field} cannot be rolled back or replaced",
+            )
 
 
 @dataclass(frozen=True)

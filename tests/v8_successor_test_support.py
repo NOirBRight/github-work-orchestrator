@@ -56,6 +56,10 @@ def _policy() -> dict[str, Any]:
     core: dict[str, Any] = {
         "schema_version": 1,
         "ref": "policy:successor",
+        "replan": {
+            "successor_revision_limit": 1,
+            "repeated_invalidation_limit": 1,
+        },
         "authority_grants": {
             "campaign": [
                 {
@@ -1270,6 +1274,28 @@ class _TestHost:
             campaign_key=handle.campaign_key,
             expected_previous_revision_digest=expected_previous_revision_digest,
         )
+
+    def require_human_decision(self, handle, classification):
+        return self.control.require_human_decision(handle, classification)
+
+    def advance_human_decision(self, handle, decision, choice):
+        return self.control.advance_human_decision(handle, decision, choice)
+
+    def read_human_decision_source(self, handle, decision, choice):
+        return self.control.read_human_decision_source(handle, decision, choice)
+
+    def read_replan_budget_policy(self, handle):
+        return self.control.read_replan_budget_policy(handle)
+
+    def read_human_gate_attempt(self, handle, decision_id, source_readback_digest):
+        return self.control.read_human_gate_attempt(
+            handle,
+            decision_id,
+            source_readback_digest,
+        )
+
+    def save_human_gate_attempt(self, attempt):
+        return self.control.save_human_gate_attempt(attempt)
 
     def classify_plan_invalidations(self, handle, invalidations, execution_snapshot):
         return self.control.classify_plan_invalidations(handle, invalidations, execution_snapshot)

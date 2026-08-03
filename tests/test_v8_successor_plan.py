@@ -82,6 +82,98 @@ def test_owner_without_plan_delta_is_not_a_successor():
     assert raised.value.code == "SUCCESSOR_PLAN_UNCHANGED"
 
 
+def test_exact_approved_source_projection_equal_to_active_revision_is_not_a_successor():
+    from gwo_v8._canonical import digest_value
+    from gwo_v8.successor_plan import SuccessorPlanError, derive_successor_plan_intent
+
+    snapshot = three_ticket_replanning_snapshot()
+    source_core = {
+        "kind": "gwo.human-tracker-source.v1",
+        "repository": snapshot["repository"],
+        "campaign_key": snapshot["campaign_key"],
+        "target_branch": snapshot["target_branch"],
+        "campaign_source": snapshot["campaign_source"],
+        "membership": {
+            "ticket_keys": [ticket["key"] for ticket in snapshot["tickets"]],
+            "digest": digest_value(
+                {"ticket_keys": [ticket["key"] for ticket in snapshot["tickets"]]}
+            ),
+        },
+        "tickets": snapshot["tickets"],
+        "product_release": None,
+    }
+    tracker_digest = digest_value(source_core)
+    snapshot.update(
+        {
+            "membership": source_core["membership"],
+            "product_release": None,
+            "source_change_digest": tracker_digest,
+        }
+    )
+    plan = snapshot["active_plan_revision"]["plan_spec"]
+    plan["campaign"]["source_change_digest"] = tracker_digest
+    snapshot["active_plan_revision"]["digest"] = digest_value(plan)
+    snapshot["plan_revision_digest"] = snapshot["active_plan_revision"]["digest"]
+    snapshot.pop("snapshot_digest", None)
+    snapshot["snapshot_digest"] = digest_value(snapshot)
+
+    with pytest.raises(SuccessorPlanError) as raised:
+        derive_successor_plan_intent(
+            snapshot,
+            _bound_successor_classification(snapshot, owners=("issue:110",)),
+        )
+
+    assert raised.value.code == "SUCCESSOR_PLAN_UNCHANGED"
+
+
+def test_compiler_rejects_an_unchanged_source_adoption_even_without_coordinator_delta():
+    from gwo_v8._canonical import digest_value
+    from gwo_v8.successor_plan import SuccessorPlanError, compile_successor_plan_spec
+
+    snapshot = three_ticket_replanning_snapshot()
+    keys = [ticket["key"] for ticket in snapshot["tickets"]]
+    source_core = {
+        "kind": "gwo.human-tracker-source.v1",
+        "repository": snapshot["repository"],
+        "campaign_key": snapshot["campaign_key"],
+        "target_branch": snapshot["target_branch"],
+        "campaign_source": snapshot["campaign_source"],
+        "membership": {"ticket_keys": keys, "digest": digest_value({"ticket_keys": keys})},
+        "tickets": snapshot["tickets"],
+        "product_release": None,
+    }
+    tracker_digest = digest_value(source_core)
+    snapshot.update(
+        membership=source_core["membership"],
+        product_release=None,
+        source_change_digest=tracker_digest,
+    )
+    plan = snapshot["active_plan_revision"]["plan_spec"]
+    plan["campaign"]["source_change_digest"] = tracker_digest
+    snapshot["active_plan_revision"]["digest"] = digest_value(plan)
+    snapshot["plan_revision_digest"] = snapshot["active_plan_revision"]["digest"]
+    snapshot.pop("snapshot_digest", None)
+    snapshot["snapshot_digest"] = digest_value(snapshot)
+    intent = {
+        "admitted_work": keys,
+        "dependency_additions": [],
+        "exclusive_resources": {
+            item["key"]: item["exclusive_resources"]
+            for item in plan["work"]
+        },
+        "capability_requirements": {
+            item["key"]: item["capabilities"]
+            for item in plan["work"]
+        },
+        "decision_requirements": [],
+    }
+
+    with pytest.raises(SuccessorPlanError) as raised:
+        compile_successor_plan_spec(snapshot, intent)
+
+    assert raised.value.code == "SUCCESSOR_PLAN_UNCHANGED"
+
+
 def test_justified_new_dependency_is_added_in_from_depends_on_to_direction():
     from gwo_v8.successor_plan import (
         compile_successor_plan_spec,

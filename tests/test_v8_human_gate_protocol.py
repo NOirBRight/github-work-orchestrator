@@ -79,7 +79,17 @@ def _approved_source(*, decision_id: str = "decision:" + "1" * 24):
         tracker_source_digest=digest_bytes(tracker),
         policy_witness_digest=digest_bytes(policy),
         source_change_digest="e" * 64,
-        readback_digest="f" * 64,
+        readback_digest=digest_value(
+            {
+                "decision_id": decision_id,
+                "state": "approved",
+                "approval_record_digest": digest_bytes(approval),
+                "tracker_source_digest": digest_bytes(tracker),
+                "policy_witness_digest": digest_bytes(policy),
+                "source_change_digest": "e" * 64,
+                "code": "HUMAN_SOURCE_APPROVED",
+            }
+        ),
         code="HUMAN_SOURCE_APPROVED",
     )
 
@@ -226,6 +236,28 @@ def test_approved_readback_requires_all_canonical_bytes_and_matching_digests():
     assert error.value.code == "HUMAN_SOURCE_READBACK_INVALID"
 
 
+def test_source_readback_recomputes_aggregate_digest_from_all_bound_fields():
+    from gwo_v8.human_gate import HumanSourceReadback
+
+    source = _approved_source()
+    expected = digest_value(
+        {
+            "decision_id": source.decision_id,
+            "state": source.state,
+            "approval_record_digest": source.approval_record_digest,
+            "tracker_source_digest": source.tracker_source_digest,
+            "policy_witness_digest": source.policy_witness_digest,
+            "source_change_digest": source.source_change_digest,
+            "code": source.code,
+        }
+    )
+    assert source.readback_digest == expected
+
+    with pytest.raises(Exception) as error:
+        HumanSourceReadback(**{**source.__dict__, "readback_digest": "0" * 64})
+    assert error.value.code == "HUMAN_SOURCE_READBACK_INVALID"
+
+
 def test_source_readback_maps_non_approved_states_without_approved_bytes():
     from gwo_v8.human_gate import HumanSourceReadback
 
@@ -247,7 +279,17 @@ def test_source_readback_maps_non_approved_states_without_approved_bytes():
             tracker_source_digest=None,
             policy_witness_digest=None,
             source_change_digest=None,
-            readback_digest="f" * 64,
+            readback_digest=digest_value(
+                {
+                    "decision_id": "decision:" + "1" * 24,
+                    "state": state,
+                    "approval_record_digest": None,
+                    "tracker_source_digest": None,
+                    "policy_witness_digest": None,
+                    "source_change_digest": None,
+                    "code": code,
+                }
+            ),
             code=code,
         )
         assert source.approved is False
@@ -282,6 +324,18 @@ def test_replan_budget_policy_accepts_only_positive_exact_limits():
         with pytest.raises(Exception) as error:
             ReplanBudgetPolicy.from_policy(invalid)
         assert error.value.code == "REPLAN_BUDGET_POLICY_INVALID"
+
+    unknown_core = {**policy_core, "unexpected": "not-policy"}
+    unknown = {**unknown_core, "digest": digest_value(unknown_core)}
+    with pytest.raises(Exception) as error:
+        ReplanBudgetPolicy.from_policy(unknown)
+    assert error.value.code == "REPLAN_BUDGET_POLICY_INVALID"
+
+    wrong_kind_core = {**policy_core, "kind": "gwo.other-policy.v1"}
+    wrong_kind = {**wrong_kind_core, "digest": digest_value(wrong_kind_core)}
+    with pytest.raises(Exception) as error:
+        ReplanBudgetPolicy.from_policy(wrong_kind)
+    assert error.value.code == "REPLAN_BUDGET_POLICY_INVALID"
 
 
 def test_human_gate_summary_accepts_only_closed_inspect_phases():
@@ -319,7 +373,7 @@ def test_attempt_binds_the_replanning_protocol_and_plan_readback_is_closed():
         source_readback_digest="c" * 64,
         tracker_source_digest="d" * 64,
         policy_witness_digest="e" * 64,
-        planning_action_id="replan:human:111111111111111111111111",
+        planning_action_id="replan:human:9687fdd123b5358a65c2e38f",
         planning_protocol_id=REPLANNING_OUTPUT_PROTOCOL_ID,
         state="planning_validated_successor",
         compilation_record_artifact_digest=None,
@@ -329,6 +383,220 @@ def test_attempt_binds_the_replanning_protocol_and_plan_readback_is_closed():
     with pytest.raises(HumanGateError) as error:
         replace(attempt, planning_protocol_id="campaign.planning-output.v1")
     assert error.value.code == "HUMAN_GATE_ATTEMPT_INVALID"
+    with pytest.raises(HumanGateError) as error:
+        replace(
+            attempt,
+            planning_action_id="replan:human:222222222222222222222222",
+        )
+    assert error.value.code == "HUMAN_GATE_ATTEMPT_INVALID"
 
     readback = HumanGatePlanReadback(summary=_summary("awaiting_human_choice"))
     assert HumanGatePlanReadback.from_canonical(readback.canonical()) == readback
+
+
+def test_active_human_gate_attempt_requires_compilation_and_activation_receipts():
+    from gwo_v8.human_gate import HumanGateAttempt
+    from gwo_v8.planning_protocol import REPLANNING_OUTPUT_PROTOCOL_ID
+
+    base = {
+        "decision_id": "decision:" + "1" * 24,
+        "campaign": CampaignHandle("owner/repository", "campaign:one"),
+        "predecessor_revision_digest": "b" * 64,
+        "source_readback_digest": "c" * 64,
+        "tracker_source_digest": "d" * 64,
+        "policy_witness_digest": "e" * 64,
+        "planning_action_id": "replan:human:" + "1" * 24,
+        "planning_protocol_id": REPLANNING_OUTPUT_PROTOCOL_ID,
+        "state": "active_successor",
+        "compilation_record_artifact_digest": "f" * 64,
+        "activation_receipt_digest": "0" * 64,
+    }
+    for field in (
+        "compilation_record_artifact_digest",
+        "activation_receipt_digest",
+    ):
+        with pytest.raises(Exception) as error:
+            HumanGateAttempt(**{**base, field: None})
+        assert error.value.code == "HUMAN_GATE_ATTEMPT_INVALID"
+
+
+def test_attempt_digest_binds_every_canonical_lineage_field():
+    from gwo_v8.human_gate import HumanGateAttempt
+    from gwo_v8.planning_protocol import REPLANNING_OUTPUT_PROTOCOL_ID
+
+    attempt = HumanGateAttempt(
+        decision_id="decision:" + "1" * 24,
+        campaign=CampaignHandle("owner/repository", "campaign:one"),
+        predecessor_revision_digest="b" * 64,
+        source_readback_digest="c" * 64,
+        tracker_source_digest="d" * 64,
+        policy_witness_digest="e" * 64,
+        planning_action_id="replan:human:9687fdd123b5358a65c2e38f",
+        planning_protocol_id=REPLANNING_OUTPUT_PROTOCOL_ID,
+        state="active_successor",
+        compilation_record_artifact_digest="f" * 64,
+        activation_receipt_digest="0" * 64,
+    )
+
+    assert attempt.digest == digest_value(attempt.canonical())
+    assert HumanGateAttempt.from_canonical(attempt.canonical()) == attempt
+    for field, value in (
+        ("decision_id", "decision:" + "2" * 24),
+        ("campaign", CampaignHandle("owner/repository", "campaign:two")),
+        ("predecessor_revision_digest", "1" * 64),
+        ("source_readback_digest", "2" * 64),
+        ("tracker_source_digest", "3" * 64),
+        ("policy_witness_digest", "4" * 64),
+        ("compilation_record_artifact_digest", "5" * 64),
+        ("activation_receipt_digest", "6" * 64),
+    ):
+        changes = {field: value}
+        if field in {
+            "decision_id",
+            "predecessor_revision_digest",
+            "source_readback_digest",
+        }:
+            changes["planning_action_id"] = "replan:human:" + digest_value(
+                {
+                    "decision_id": changes.get("decision_id", attempt.decision_id),
+                    "source_readback_digest": changes.get(
+                        "source_readback_digest", attempt.source_readback_digest
+                    ),
+                    "previous_revision_digest": changes.get(
+                        "predecessor_revision_digest",
+                        attempt.predecessor_revision_digest,
+                    ),
+                }
+            )[:24]
+        assert replace(attempt, **changes).digest != attempt.digest
+
+
+def test_inmemory_attempt_persistence_is_exact_and_separate_from_source_readback():
+    from gwo_v8.human_gate import HumanDecisionChoice, HumanGateAttempt
+    from gwo_v8.plan_control import InMemoryPlanRepository, PlanControlError
+    from gwo_v8.planning_protocol import REPLANNING_OUTPUT_PROTOCOL_ID
+
+    handle = CampaignHandle("owner/repository", "campaign:one")
+    decision = _decision()
+    source = _approved_source()
+    action_id = "replan:human:" + digest_value(
+        {
+            "decision_id": decision.decision_id,
+            "source_readback_digest": source.readback_digest,
+            "previous_revision_digest": decision.plan_revision_digest,
+        }
+    )[:24]
+    attempt = HumanGateAttempt(
+        decision_id=decision.decision_id,
+        campaign=handle,
+        predecessor_revision_digest=decision.plan_revision_digest,
+        source_readback_digest=source.readback_digest,
+        tracker_source_digest=source.tracker_source_digest,
+        policy_witness_digest=source.policy_witness_digest,
+        planning_action_id=action_id,
+        planning_protocol_id=REPLANNING_OUTPUT_PROTOCOL_ID,
+        state="awaiting_durable_tracker_policy_readback",
+        compilation_record_artifact_digest=None,
+        activation_receipt_digest=None,
+    )
+    repository = InMemoryPlanRepository(writer_generation="writer:one")
+    repository.save_human_decision(decision)
+    repository.save_human_gate_readback(
+        handle,
+        decision,
+        HumanDecisionChoice(decision.decision_id, "approve", "workflow://approval/one"),
+        source,
+    )
+
+    assert repository.save_human_gate_attempt(attempt) == attempt
+    assert repository.read_human_gate_attempt(
+        handle,
+        attempt.decision_id,
+        attempt.source_readback_digest,
+    ) == attempt
+    assert repository.save_human_gate_attempt(attempt) == attempt
+
+    from gwo_v8.plan_control import _PlanningAttempt, _handle_ref
+    from gwo_v8.runtime_gateway import CampaignPlanningSubject
+
+    generic_subject = CampaignPlanningSubject(
+        repository=handle.repository,
+        campaign_key=handle.campaign_key,
+        campaign_handle=_handle_ref(handle),
+        expected_previous_plan_revision_digest=decision.plan_revision_digest,
+        snapshot_artifact_digest="1" * 64,
+        policy_witness_digest=source.policy_witness_digest,
+        planning_request_artifact_digest="2" * 64,
+        stable_action_id=action_id,
+    )
+    repository.save_attempt(
+        _PlanningAttempt(
+            handle=handle,
+            ready_refs=("issue:108",),
+            ticket_keys=("issue:108",),
+            expected_previous_revision_digest=decision.plan_revision_digest,
+            snapshot_bytes=canonical_bytes({"tickets": ["issue:108"]}),
+            snapshot_artifact_digest="1" * 64,
+            policy_witness_digest=source.policy_witness_digest,
+            planning_request_artifact_digest="2" * 64,
+            subject=generic_subject,
+            planning_protocol_id=REPLANNING_OUTPUT_PROTOCOL_ID,
+            compilation_record_artifact_digest="f" * 64,
+        )
+    )
+
+    progressed = replace(
+        attempt,
+        state="planning_validated_successor",
+        compilation_record_artifact_digest="f" * 64,
+    )
+    assert repository.save_human_gate_attempt(progressed) == progressed
+    with pytest.raises(PlanControlError) as error:
+        repository.save_human_gate_attempt(
+            replace(
+                progressed,
+                state="awaiting_durable_tracker_policy_readback",
+                compilation_record_artifact_digest=None,
+            )
+        )
+    assert error.value.code == "HUMAN_GATE_ATTEMPT_READBACK_INVALID"
+    with pytest.raises(PlanControlError) as error:
+        repository.save_human_gate_attempt(
+            replace(progressed, tracker_source_digest="1" * 64)
+        )
+    assert error.value.code == "HUMAN_GATE_ATTEMPT_READBACK_INVALID"
+
+
+def test_attempt_persistence_requires_the_durable_decision_and_source_readback():
+    from gwo_v8.human_gate import HumanGateAttempt
+    from gwo_v8.plan_control import InMemoryPlanRepository, PlanControlError
+    from gwo_v8.planning_protocol import REPLANNING_OUTPUT_PROTOCOL_ID
+
+    decision_id = "decision:" + "1" * 24
+    source_digest = "c" * 64
+    predecessor_digest = "b" * 64
+    attempt = HumanGateAttempt(
+        decision_id=decision_id,
+        campaign=CampaignHandle("owner/repository", "campaign:one"),
+        predecessor_revision_digest=predecessor_digest,
+        source_readback_digest=source_digest,
+        tracker_source_digest="d" * 64,
+        policy_witness_digest="e" * 64,
+        planning_action_id="replan:human:"
+        + digest_value(
+            {
+                "decision_id": decision_id,
+                "source_readback_digest": source_digest,
+                "previous_revision_digest": predecessor_digest,
+            }
+        )[:24],
+        planning_protocol_id=REPLANNING_OUTPUT_PROTOCOL_ID,
+        state="planning_validated_successor",
+        compilation_record_artifact_digest=None,
+        activation_receipt_digest=None,
+    )
+    repository = InMemoryPlanRepository(writer_generation="writer:one")
+
+    with pytest.raises(PlanControlError) as error:
+        repository.save_human_gate_attempt(attempt)
+    assert error.value.code == "HUMAN_GATE_ATTEMPT_READBACK_INVALID"

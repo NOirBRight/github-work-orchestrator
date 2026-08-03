@@ -49,6 +49,16 @@ class GitHubIssueReadClient(Protocol):
     ) -> Mapping[str, str]: ...
 
 
+class GitHubHumanApprovalReadClient(Protocol):
+    """Read-only seam for the durable human-approval workflow record."""
+
+    def read_human_approval(
+        self,
+        repository: str,
+        readback_ref: str,
+    ) -> Mapping[str, Any] | None: ...
+
+
 class GitHubCliIssueReadClient:
     """Authenticated GitHub issue/dependency reads through ``gh api``."""
 
@@ -224,6 +234,99 @@ class GitHubCliIssueReadClient:
         """Compatibility read for unrelated callers; snapshots use full source."""
 
         return self.read_branch_source(repository, branch)["resolved_commit_oid"]
+
+
+class GitHubCliHumanApprovalReadClient:
+    """Authenticated, read-only reads of a durable approval API record."""
+
+    def __init__(
+        self,
+        executable: str = "gh",
+        *,
+        command_timeout_seconds: int = 30,
+    ):
+        if type(executable) is not str or not executable:
+            raise ValueError("GitHub executable must be exact text")
+        if (
+            type(command_timeout_seconds) is not int
+            or command_timeout_seconds < 1
+        ):
+            raise ValueError("GitHub command timeout must be positive")
+        self.executable = executable
+        self.command_timeout_seconds = command_timeout_seconds
+
+    def _run(self, endpoint: str) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                [self.executable, "api", endpoint],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=self.command_timeout_seconds,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise PlanControlError(
+                "GITHUB_HUMAN_APPROVAL_UNAVAILABLE",
+                "GitHub human-approval read is unavailable",
+            ) from error
+
+    @staticmethod
+    def _endpoint(repository: str, readback_ref: str) -> str:
+        if (
+            type(repository) is not str
+            or _REPOSITORY.fullmatch(repository) is None
+            or type(readback_ref) is not str
+            or not readback_ref
+        ):
+            raise PlanControlError(
+                "GITHUB_HUMAN_APPROVAL_INVALID",
+                "GitHub human-approval readback identity is invalid",
+            )
+        api_prefix = "https://api.github.com/"
+        if readback_ref.startswith(api_prefix):
+            endpoint = readback_ref.removeprefix(api_prefix)
+        elif readback_ref.startswith(f"repos/{repository}/"):
+            endpoint = readback_ref
+        else:
+            raise PlanControlError(
+                "GITHUB_HUMAN_APPROVAL_INVALID",
+                "Human approval readback must name an exact GitHub API record",
+            )
+        if "://" in endpoint or ".." in endpoint or "\\" in endpoint:
+            raise PlanControlError(
+                "GITHUB_HUMAN_APPROVAL_INVALID",
+                "Human approval readback contains an unsafe reference",
+            )
+        return endpoint
+
+    def read_human_approval(
+        self,
+        repository: str,
+        readback_ref: str,
+    ) -> Mapping[str, Any] | None:
+        endpoint = self._endpoint(repository, readback_ref)
+        result = self._run(endpoint)
+        if result.returncode != 0:
+            detail = f"{result.stdout}\n{result.stderr}".casefold()
+            if "404" in detail or "not found" in detail:
+                return None
+            raise PlanControlError(
+                "GITHUB_HUMAN_APPROVAL_UNAVAILABLE",
+                "GitHub human-approval API read failed",
+            )
+        try:
+            value = strict_json_loads(result.stdout)
+        except CanonicalJsonError as error:
+            raise PlanControlError(
+                "GITHUB_HUMAN_APPROVAL_INVALID",
+                "GitHub human-approval API returned malformed JSON",
+            ) from error
+        if type(value) is not dict:
+            raise PlanControlError(
+                "GITHUB_HUMAN_APPROVAL_INVALID",
+                "GitHub human-approval API returned a non-object",
+            )
+        return value
 
 
 def _issue_number(repository: str, ready_ref: str) -> int:

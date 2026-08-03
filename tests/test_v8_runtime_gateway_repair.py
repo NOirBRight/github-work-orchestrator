@@ -77,6 +77,13 @@ def _subject() -> CampaignPlanningSubject:
     )
 
 
+def test_plan_invalidation_store_schema_comparison_fails_closed_without_set_hashing():
+    with pytest.raises(RuntimeGatewayError) as rejected:
+        RuntimeGateway._validate_plan_invalidation_store({"0" * 64: {}})
+
+    assert rejected.value.code == "RUNTIME_STORE_INVALID"
+
+
 def _event_bound_observation(
     stable_action_id: str,
     *,
@@ -14332,3 +14339,37 @@ def test_r8_writer_effect_authorization_is_not_replayable_across_boundaries(
     assert adapter.prepare_calls == [subject.stable_action_id]
     assert adapter.created_agent_count == 0
     assert adapter.command_calls == []
+
+
+def test_coordinator_capability_digest_binds_every_forbidden_capability_flag():
+    from gwo_v8.runtime_gateway import CoordinatorCapabilityProof
+
+    proof = CoordinatorCapabilityProof(
+        subject_digest="a" * 64,
+        repository_read_only=True,
+        tracker_read_only=True,
+        can_activate_plan_revision=False,
+        can_edit_tracker=False,
+        can_expand_authority=False,
+        delegation_enabled=False,
+        can_edit_labels=False,
+        can_edit_campaign_membership=False,
+        can_grant_authority=False,
+        can_merge=False,
+        can_invoke_global_planning=False,
+    )
+
+    assert set(proof.canonical()) == {
+        "subject_digest",
+        "repository_read_only",
+        "tracker_read_only",
+        "can_activate_plan_revision",
+        "can_edit_tracker",
+        "can_expand_authority",
+        "delegation_enabled",
+        "can_edit_labels",
+        "can_edit_campaign_membership",
+        "can_grant_authority",
+        "can_merge",
+        "can_invoke_global_planning",
+    }

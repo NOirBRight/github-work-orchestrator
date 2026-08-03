@@ -640,6 +640,116 @@ class _PlanningAttempt:
             )
 
 
+def _validate_human_gate_attempt_identity(
+    attempt: Any,
+    decision: Any,
+    choice: Any,
+    source_readback: Any,
+    *,
+    error_code: str,
+) -> None:
+    """Validate the durable Decision/source/approval root of one attempt."""
+
+    from .human_gate import (
+        HumanDecisionChoice,
+        HumanDecisionRecord,
+        HumanGateAttempt,
+        HumanSourceReadback,
+        _human_planning_action_id,
+    )
+
+    if (
+        type(attempt) is not HumanGateAttempt
+        or type(decision) is not HumanDecisionRecord
+        or type(choice) is not HumanDecisionChoice
+        or type(source_readback) is not HumanSourceReadback
+        or decision.campaign != attempt.campaign
+        or decision.plan_revision_digest != attempt.predecessor_revision_digest
+        or choice.decision_id != decision.decision_id
+        or choice.choice != "approve"
+        or source_readback.decision_id != decision.decision_id
+        or not source_readback.approved
+        or source_readback.readback_digest != attempt.source_readback_digest
+        or source_readback.tracker_source_digest != attempt.tracker_source_digest
+        or source_readback.policy_witness_digest != attempt.policy_witness_digest
+    ):
+        raise PlanControlError(
+            error_code,
+            "human gate attempt is not bound to a durable approved Decision/source",
+        )
+    try:
+        expected_action_id = _human_planning_action_id(
+            decision.decision_id,
+            source_readback.readback_digest,
+            decision.plan_revision_digest,
+        )
+    except Exception as error:
+        raise PlanControlError(
+            error_code,
+            "human gate attempt planning action identity cannot be derived",
+        ) from error
+    if attempt.planning_action_id != expected_action_id:
+        raise PlanControlError(
+            error_code,
+            "human gate attempt planning action is not bound to its Decision/source",
+        )
+
+
+def _validate_human_gate_attempt_planning_binding(
+    attempt: Any,
+    planning: _PlanningAttempt | None,
+    *,
+    error_code: str,
+) -> None:
+    """Require a compiled human attempt to name the exact generic Planning attempt."""
+
+    from .human_gate import HumanGateAttempt
+
+    if type(attempt) is not HumanGateAttempt:
+        raise PlanControlError(
+            error_code,
+            "human gate Planning binding requires one exact attempt",
+        )
+    if planning is None:
+        if attempt.compilation_record_artifact_digest is not None:
+            raise PlanControlError(
+                error_code,
+                "compiled human gate attempt has no durable generic Planning attempt",
+            )
+        return
+    if type(planning) is not _PlanningAttempt or type(planning.subject) is not CampaignPlanningSubject:
+        raise PlanControlError(
+            error_code,
+            "human gate attempt is not bound to a typed generic Planning attempt",
+        )
+    subject = planning.subject
+    if (
+        planning.handle != attempt.campaign
+        or planning.expected_previous_revision_digest
+        != attempt.predecessor_revision_digest
+        or planning.planning_protocol_id != REPLANNING_OUTPUT_PROTOCOL_ID
+        or subject.repository != attempt.campaign.repository
+        or subject.campaign_key != attempt.campaign.campaign_key
+        or subject.campaign_handle != _handle_ref(attempt.campaign)
+        or subject.expected_previous_plan_revision_digest
+        != attempt.predecessor_revision_digest
+        or subject.snapshot_artifact_digest != planning.snapshot_artifact_digest
+        or subject.policy_witness_digest != planning.policy_witness_digest
+        or subject.planning_request_artifact_digest
+        != planning.planning_request_artifact_digest
+        or subject.stable_action_id != attempt.planning_action_id
+        or (
+            attempt.compilation_record_artifact_digest is not None
+            and planning.compilation_record_artifact_digest
+            != attempt.compilation_record_artifact_digest
+        )
+    ):
+        raise PlanControlError(
+            error_code,
+            "human gate attempt is not bound to the exact generic Planning action/Artifact",
+        )
+
+
 class CampaignSnapshotSource(Protocol):
     """The GitHub/Ticket adapter, deliberately outside PlanControl's policy."""
 
@@ -739,6 +849,53 @@ class PlanControlRepository(Protocol):
         classification: PlanInvalidationClassification,
     ) -> PlanInvalidationClassification: ...
 
+    # Human-gate control facts are immutable, separately keyed records.  The
+    # optional-looking methods are part of the V8 repository contract; older
+    # doubles can still compose the #135 path because PlanControl only calls
+    # them after the human gate has been requested.
+    def read_human_decision(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+    ) -> Any | None: ...
+
+    def read_human_decision_for_action(
+        self,
+        handle: CampaignHandle,
+        classification_action_id: str,
+    ) -> Any | None: ...
+
+    def save_human_decision(self, decision: Any) -> Any: ...
+
+    def read_human_gate_readback(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+    ) -> Any | None: ...
+
+    def read_human_gate_choice(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+    ) -> Any | None: ...
+
+    def save_human_gate_readback(
+        self,
+        handle: CampaignHandle,
+        decision: Any,
+        choice: Any,
+        readback: Any,
+    ) -> Any: ...
+
+    def read_human_gate_attempt(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+        source_readback_digest: str,
+    ) -> Any | None: ...
+
+    def save_human_gate_attempt(self, attempt: Any) -> Any: ...
+
 
 class InMemoryPlanRepository:
     """Deterministic repository double with the same CAS/readback semantics."""
@@ -769,6 +926,18 @@ class InMemoryPlanRepository:
         ] = {}
         self.invalidation_classifications: dict[
             tuple[str, str, str], PlanInvalidationClassification
+        ] = {}
+        # These stores intentionally contain typed immutable records rather
+        # than caller-provided JSON.  GitHubPlanRepository mirrors the same
+        # key/value contract in its durable categories.
+        self.human_decisions: dict[
+            tuple[str, str, str], Any
+        ] = {}
+        self.human_gate_readbacks: dict[
+            tuple[str, str, str], tuple[Any, Any]
+        ] = {}
+        self.human_gate_attempts: dict[
+            tuple[str, str, str, str], Any
         ] = {}
 
     @staticmethod
@@ -1336,6 +1505,273 @@ class InMemoryPlanRepository:
         self.invalidation_classifications[key] = classification
         return classification
 
+    @_repository_locked
+    def read_human_decision(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+    ) -> Any | None:
+        return self.human_decisions.get(
+            (handle.repository, handle.campaign_key, decision_id)
+        )
+
+    @_repository_locked
+    def read_human_decision_for_action(
+        self,
+        handle: CampaignHandle,
+        classification_action_id: str,
+    ) -> Any | None:
+        values = [
+            decision
+            for (repository, campaign_key, _decision_id), decision in self.human_decisions.items()
+            if repository == handle.repository
+            and campaign_key == handle.campaign_key
+            and decision.classification_action_id == classification_action_id
+        ]
+        if len(values) > 1:
+            raise PlanControlError(
+                "HUMAN_DECISION_READBACK_INVALID",
+                "multiple durable Decisions are bound to one classification action",
+            )
+        return values[0] if values else None
+
+    @_repository_locked
+    def save_human_decision(self, decision: Any) -> Any:
+        from .human_gate import HumanDecisionRecord
+
+        if type(decision) is not HumanDecisionRecord:
+            raise PlanControlError(
+                "HUMAN_DECISION_RECORD_INVALID",
+                "human Decision persistence requires one exact record",
+            )
+        key = (
+            decision.campaign.repository,
+            decision.campaign.campaign_key,
+            decision.decision_id,
+        )
+        existing = self.human_decisions.get(key)
+        if existing is not None and existing != decision:
+            raise PlanControlError(
+                "HUMAN_DECISION_CONFLICT",
+                "durable human Decision changed its immutable identity",
+            )
+        self.human_decisions[key] = decision
+        return decision
+
+    @_repository_locked
+    def read_human_gate_readback(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+    ) -> Any | None:
+        saved = self.human_gate_readbacks.get(
+            (handle.repository, handle.campaign_key, decision_id)
+        )
+        return None if saved is None else saved[1]
+
+    @_repository_locked
+    def read_human_gate_choice(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+    ) -> Any | None:
+        saved = self.human_gate_readbacks.get(
+            (handle.repository, handle.campaign_key, decision_id)
+        )
+        return None if saved is None else saved[0]
+
+    @_repository_locked
+    def save_human_gate_readback(
+        self,
+        handle: CampaignHandle,
+        decision: Any,
+        choice: Any,
+        readback: Any,
+    ) -> Any:
+        from .human_gate import (
+            HumanDecisionChoice,
+            HumanDecisionRecord,
+            HumanSourceReadback,
+        )
+
+        if (
+            type(decision) is not HumanDecisionRecord
+            or decision.campaign != handle
+            or type(choice) is not HumanDecisionChoice
+            or choice.decision_id != decision.decision_id
+            or type(readback) is not HumanSourceReadback
+            or readback.decision_id != decision.decision_id
+        ):
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "human source readback persistence is not exactly bound",
+            )
+        key = (handle.repository, handle.campaign_key, decision.decision_id)
+        existing = self.human_gate_readbacks.get(key)
+        if existing is not None and existing != (choice, readback):
+            raise PlanControlError(
+                "HUMAN_APPROVAL_INPUT_INVALID",
+                "human Decision already has a different durable choice",
+            )
+        self.human_gate_readbacks[key] = (choice, readback)
+        return readback
+
+    @staticmethod
+    def _human_gate_attempt_key(
+        handle: CampaignHandle,
+        decision_id: str,
+        source_readback_digest: str,
+    ) -> tuple[str, str, str, str]:
+        return (
+            handle.repository,
+            handle.campaign_key,
+            decision_id,
+            source_readback_digest,
+        )
+
+    @_repository_locked
+    def read_human_gate_attempt(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+        source_readback_digest: str,
+    ) -> Any | None:
+        if (
+            type(handle) is not CampaignHandle
+            or type(decision_id) is not str
+            or not decision_id
+            or type(source_readback_digest) is not str
+            or _DIGEST.fullmatch(source_readback_digest) is None
+        ):
+            raise PlanControlError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human gate attempt readback identity is invalid",
+            )
+        return self.human_gate_attempts.get(
+            self._human_gate_attempt_key(
+                handle,
+                decision_id,
+                source_readback_digest,
+            )
+        )
+
+    @_repository_locked
+    def save_human_gate_attempt(self, attempt: Any) -> Any:
+        from .human_gate import (
+            HumanGateAttempt,
+            HumanGateError,
+            HumanDecisionRecord,
+            _validate_human_gate_attempt_transition,
+        )
+
+        if type(attempt) is not HumanGateAttempt:
+            raise PlanControlError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human gate attempt persistence requires one exact record",
+            )
+        decision = self.human_decisions.get(
+            (
+                attempt.campaign.repository,
+                attempt.campaign.campaign_key,
+                attempt.decision_id,
+            )
+        )
+        if type(decision) is not HumanDecisionRecord or (
+            decision.campaign != attempt.campaign
+            or decision.plan_revision_digest != attempt.predecessor_revision_digest
+        ):
+            raise PlanControlError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human gate attempt has no exact durable Decision predecessor",
+            )
+        source_entry = self.human_gate_readbacks.get(
+            (
+                attempt.campaign.repository,
+                attempt.campaign.campaign_key,
+                attempt.decision_id,
+            )
+        )
+        choice = None if source_entry is None else source_entry[0]
+        source_readback = None if source_entry is None else source_entry[1]
+        _validate_human_gate_attempt_identity(
+            attempt,
+            decision,
+            choice,
+            source_readback,
+            error_code="HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+        )
+        _validate_human_gate_attempt_planning_binding(
+            attempt,
+            self.attempts.get(
+                self._attempt_key(
+                    attempt.campaign,
+                    attempt.predecessor_revision_digest,
+                )
+            ),
+            error_code="HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+        )
+        key = self._human_gate_attempt_key(
+            attempt.campaign,
+            attempt.decision_id,
+            attempt.source_readback_digest,
+        )
+        existing = self.human_gate_attempts.get(key)
+        if existing is not None:
+            immutable_fields = (
+                "decision_id",
+                "campaign",
+                "predecessor_revision_digest",
+                "source_readback_digest",
+                "tracker_source_digest",
+                "policy_witness_digest",
+                "planning_action_id",
+                "planning_protocol_id",
+            )
+            if any(
+                getattr(existing, field) != getattr(attempt, field)
+                for field in immutable_fields
+            ):
+                raise PlanControlError(
+                    "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                    "durable human gate attempt changed its immutable identity",
+                )
+            try:
+                _validate_human_gate_attempt_transition(existing, attempt)
+            except HumanGateError as error:
+                raise PlanControlError(error.code, error.detail) from error
+            if existing.state == "active_successor":
+                if existing != attempt:
+                    raise PlanControlError(
+                        "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                        "active human gate attempt cannot be rewritten",
+                    )
+                return existing
+            if (
+                existing.compilation_record_artifact_digest is not None
+                and attempt.compilation_record_artifact_digest is not None
+                and existing.compilation_record_artifact_digest
+                != attempt.compilation_record_artifact_digest
+            ) or (
+                existing.activation_receipt_digest is not None
+                and attempt.activation_receipt_digest is not None
+                and existing.activation_receipt_digest
+                != attempt.activation_receipt_digest
+            ):
+                raise PlanControlError(
+                    "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                    "durable human gate attempt changed an immutable Artifact digest",
+                )
+            if (
+                existing.activation_receipt_digest is not None
+                and attempt.activation_receipt_digest is None
+            ) or (
+                existing.compilation_record_artifact_digest is not None
+                and attempt.compilation_record_artifact_digest is None
+            ):
+                return existing
+        self.human_gate_attempts[key] = attempt
+        return attempt
+
 
 class PlanControl:
     """One bounded Planning Pass followed by deterministic PlanSpec activation."""
@@ -1348,6 +1784,1091 @@ class PlanControl:
         self._gateway = gateway
         self._repository = repository
         self._max_snapshot_bytes = max_snapshot_bytes
+        # The host may inject a read-only authoritative approval adapter.
+        # Keeping it optional preserves the #135 composition and gives
+        # ExecutionKernel a single typed continuation seam.
+        self._human_source = None
+
+    def require_human_decision(
+        self,
+        handle: CampaignHandle,
+        classification: PlanInvalidationClassification,
+    ):
+        """Create/read one durable Decision for an exact invalidation.
+
+        The Decision identity is derived here, rather than accepted from a
+        caller or model output.  This keeps the Kernel's quiescent projection
+        and a freshly composed PlanControl bound to the same immutable
+        classification action, predecessor revision, and complete Evidence
+        tuple.
+        """
+
+        from .human_gate import (
+            HumanDecisionRecord,
+            RequiredDurableSourceChange,
+        )
+
+        if (
+            type(handle) is not CampaignHandle
+            or type(classification) is not PlanInvalidationClassification
+            or classification.disposition
+            is not PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION
+            or classification.decision is None
+        ):
+            raise PlanControlError(
+                "HUMAN_DECISION_RECORD_INVALID",
+                "human Decision requires one exact human classification",
+            )
+        active = self.read_active(handle)
+        if classification.plan_revision_digest != active.current_revision_digest:
+            raise PlanControlError(
+                "HUMAN_DECISION_CONFLICT",
+                "human Decision classification is not bound to the active predecessor",
+            )
+        durable_reader = getattr(self._repository, "read_invalidation_classification", None)
+        durable = (
+            durable_reader(handle, classification.action_id)
+            if callable(durable_reader)
+            else classification
+        )
+        if durable != classification:
+            # A same-action record is the authoritative conflict detector: a
+            # caller cannot rotate the Decision ID by changing one immutable
+            # classification byte and thereby obtain a second approval slot.
+            existing_for_action = getattr(
+                self._repository,
+                "read_human_decision_for_action",
+                lambda *_args: None,
+            )(handle, classification.action_id)
+            if existing_for_action is not None:
+                raise PlanControlError(
+                    "HUMAN_DECISION_CONFLICT",
+                    "human Decision classification changed its immutable bytes",
+                )
+            raise PlanControlError(
+                "HUMAN_DECISION_READBACK_INVALID",
+                "human Decision classification did not read back exactly",
+            )
+        decision = classification.decision
+        try:
+            predecessor_snapshot = _read_artifact_json(
+                self._artifacts,
+                classification.snapshot_digest,
+                code="HUMAN_DECISION_READBACK_INVALID",
+            )
+            source_kind = RequiredDurableSourceChange.source_kind_for(
+                decision.required_change
+            )
+            if source_kind == "policy":
+                predecessor_source_digest = _human_policy_projection_digest(
+                    predecessor_snapshot
+                )
+            else:
+                predecessor_source_digest = _human_source_projection_digest(
+                    predecessor_snapshot,
+                    handle,
+                )
+        except PlanControlError:
+            raise
+        except Exception as error:
+            raise PlanControlError(
+                "HUMAN_DECISION_READBACK_INVALID",
+                "human Decision could not derive the predecessor source projection",
+            ) from error
+        identity = {
+            "kind": "gwo.human-decision-id.v1",
+            "repository": handle.repository,
+            "campaign_key": handle.campaign_key,
+            "classification_action_id": classification.action_id,
+            "plan_revision_digest": classification.plan_revision_digest,
+            "evidence_digests": list(classification.evidence_digests),
+            "decision": decision.canonical(),
+        }
+        record = HumanDecisionRecord(
+            decision_id="decision:" + digest_value(identity)[:24],
+            campaign=handle,
+            classification_action_id=classification.action_id,
+            plan_revision_digest=classification.plan_revision_digest,
+            evidence_digests=classification.evidence_digests,
+            required_change=decision.required_change,
+            detail=decision.detail,
+            required_source=RequiredDurableSourceChange(
+                required_change=decision.required_change,
+                source_kind=RequiredDurableSourceChange.source_kind_for(
+                    decision.required_change
+                ),
+                predecessor_source_digest=predecessor_source_digest,
+                required_subject=f"{handle.campaign_key}:{decision.required_change}",
+                detail=decision.detail,
+                predecessor_snapshot_digest=classification.snapshot_digest,
+            ),
+        )
+        saver = getattr(self._repository, "save_human_decision", None)
+        reader = getattr(self._repository, "read_human_decision", None)
+        if not callable(saver) or not callable(reader):
+            raise PlanControlError(
+                "HUMAN_DECISION_RECORD_INVALID",
+                "PlanControl repository omitted durable human Decision storage",
+            )
+        existing_for_action_reader = getattr(
+            self._repository,
+            "read_human_decision_for_action",
+            None,
+        )
+        if callable(existing_for_action_reader):
+            existing_for_action = existing_for_action_reader(
+                handle,
+                classification.action_id,
+            )
+            if existing_for_action is not None and existing_for_action != record:
+                raise PlanControlError(
+                    "HUMAN_DECISION_CONFLICT",
+                    "human Decision action is already bound to another record",
+                )
+        try:
+            saver(record)
+            saved = reader(handle, record.decision_id)
+        except PlanControlError:
+            raise
+        except Exception as error:
+            raise PlanControlError(
+                "HUMAN_DECISION_READBACK_INVALID",
+                "durable human Decision could not be saved",
+            ) from error
+        if saved != record:
+            raise PlanControlError(
+                "HUMAN_DECISION_READBACK_INVALID",
+                "durable human Decision did not read back exactly",
+            )
+        return saved
+
+    def read_replan_budget_policy(self, handle: CampaignHandle):
+        """Read the active Policy Witness's immutable replan budget.
+
+        The active PlanSpec contains only the ``{ref, digest}`` policy
+        projection.  The budget is therefore read from the digest-addressed
+        Policy Witness Artifact and normalized again at this boundary; a
+        caller cannot supply limits or use a stale in-memory snapshot.
+        """
+
+        from .human_gate import ReplanBudgetPolicy
+
+        if type(handle) is not CampaignHandle:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "replan budget readback requires the exact CampaignHandle",
+            )
+        active = self.read_active(handle)
+        try:
+            plan = load_canonical_json(active.plan_spec_bytes)
+        except Exception as error:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "active PlanSpec cannot be read back canonically",
+            ) from error
+        policy_projection = plan.get("policy") if type(plan) is dict else None
+        if (
+            type(policy_projection) is not dict
+            or set(policy_projection) != {"ref", "digest"}
+            or type(policy_projection.get("digest")) is not str
+            or _DIGEST.fullmatch(policy_projection["digest"]) is None
+        ):
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "active PlanSpec omitted its exact Policy Witness projection",
+            )
+        policy_digest = policy_projection["digest"]
+        try:
+            witness = _read_artifact_json(
+                self._artifacts,
+                policy_digest,
+                code="REPLAN_BUDGET_POLICY_INVALID",
+            )
+            normalized = _normalize_policy({**witness, "digest": policy_digest})
+        except PlanControlError as error:
+            if error.code == "POLICY_WITNESS_INVALID":
+                raise PlanControlError(
+                    "REPLAN_BUDGET_POLICY_INVALID",
+                    "active Policy Witness failed replan budget validation",
+                ) from error
+            raise
+        if normalized != {**witness, "digest": policy_digest}:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "active Policy Witness did not read back exactly",
+            )
+        replan = normalized.get("replan")
+        if type(replan) is not dict:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "active Policy Witness omitted its replan budget",
+            )
+        try:
+            return ReplanBudgetPolicy(
+                successor_revision_limit=replan["successor_revision_limit"],
+                repeated_invalidation_limit=replan["repeated_invalidation_limit"],
+                policy_witness_digest=policy_digest,
+            )
+        except Exception as error:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "active Policy Witness replan budget is invalid",
+            ) from error
+
+    def _save_human_gate_attempt(
+        self,
+        *,
+        handle: CampaignHandle,
+        decision: Any,
+        readback: Any,
+        predecessor_revision_digest: str,
+        planning_action_id: str,
+        state: str,
+        compilation_record_artifact_digest: str | None = None,
+        activation_receipt_digest: str | None = None,
+    ):
+        """Persist/read back the human Planning attempt at each commit point."""
+
+        from .human_gate import (
+            HumanDecisionRecord,
+            HumanGateAttempt,
+            HumanSourceReadback,
+        )
+
+        if (
+            type(handle) is not CampaignHandle
+            or type(decision) is not HumanDecisionRecord
+            or decision.campaign != handle
+            or type(readback) is not HumanSourceReadback
+            or not readback.approved
+        ):
+            raise PlanControlError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human Planning attempt is not bound to an approved source readback",
+            )
+        reader = getattr(self._repository, "read_human_gate_attempt", None)
+        saver = getattr(self._repository, "save_human_gate_attempt", None)
+        if not callable(reader) or not callable(saver):
+            raise PlanControlError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "PlanControl repository omitted human Planning attempt storage",
+            )
+        existing = reader(handle, decision.decision_id, readback.readback_digest)
+        if existing is not None:
+            if type(existing) is not HumanGateAttempt:
+                raise PlanControlError(
+                    "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                    "durable human Planning attempt is not typed",
+                )
+            immutable = (
+                existing.decision_id == decision.decision_id
+                and existing.campaign == handle
+                and existing.predecessor_revision_digest
+                == predecessor_revision_digest
+                and existing.source_readback_digest == readback.readback_digest
+                and existing.tracker_source_digest == readback.tracker_source_digest
+                and existing.policy_witness_digest == readback.policy_witness_digest
+                and existing.planning_action_id == planning_action_id
+                and existing.planning_protocol_id == REPLANNING_OUTPUT_PROTOCOL_ID
+            )
+            if not immutable:
+                raise PlanControlError(
+                    "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                    "human Planning attempt identity changed on readback",
+                )
+            if existing.state == "active_successor":
+                return existing
+            if compilation_record_artifact_digest is None:
+                compilation_record_artifact_digest = (
+                    existing.compilation_record_artifact_digest
+                )
+            if activation_receipt_digest is None:
+                activation_receipt_digest = existing.activation_receipt_digest
+        attempt = HumanGateAttempt(
+            decision_id=decision.decision_id,
+            campaign=handle,
+            predecessor_revision_digest=predecessor_revision_digest,
+            source_readback_digest=readback.readback_digest,
+            tracker_source_digest=readback.tracker_source_digest,
+            policy_witness_digest=readback.policy_witness_digest,
+            planning_action_id=planning_action_id,
+            planning_protocol_id=REPLANNING_OUTPUT_PROTOCOL_ID,
+            state=state,
+            compilation_record_artifact_digest=compilation_record_artifact_digest,
+            activation_receipt_digest=activation_receipt_digest,
+        )
+        try:
+            saved = saver(attempt)
+            observed = reader(handle, decision.decision_id, readback.readback_digest)
+        except PlanControlError:
+            raise
+        except Exception as error:
+            raise PlanControlError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human Planning attempt could not be saved",
+            ) from error
+        if observed != saved or observed != attempt:
+            raise PlanControlError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human Planning attempt did not read back exactly",
+            )
+        return observed
+
+    def read_human_gate_attempt(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+        source_readback_digest: str,
+    ):
+        reader = getattr(self._repository, "read_human_gate_attempt", None)
+        if not callable(reader):
+            raise PlanControlError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "PlanControl repository omitted human Planning attempt readback",
+            )
+        return reader(handle, decision_id, source_readback_digest)
+
+    def save_human_gate_attempt(self, attempt: Any):
+        saver = getattr(self._repository, "save_human_gate_attempt", None)
+        if not callable(saver):
+            raise PlanControlError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "PlanControl repository omitted human Planning attempt persistence",
+            )
+        return saver(attempt)
+
+    def read_human_decision_source(self, handle, decision, choice):
+        """Read/persist the authoritative source without planning or activation."""
+
+        return self.advance_human_decision(
+            handle,
+            decision,
+            choice,
+            _read_only=True,
+        )
+
+    def advance_human_decision(
+        self,
+        handle,
+        decision,
+        choice,
+        *,
+        _read_only: bool = False,
+    ):
+        """Read one durable human choice through the host-owned source port."""
+
+        from .human_gate import (
+            HumanDecisionChoice,
+            HumanDecisionRecord,
+            HumanSourceReadback,
+        )
+
+        if type(handle) is not CampaignHandle:
+            raise PlanControlError(
+                "HUMAN_APPROVAL_INPUT_INVALID",
+                "human approval requires the exact CampaignHandle",
+            )
+        if type(decision) is not HumanDecisionRecord:
+            raise PlanControlError(
+                "HUMAN_DECISION_READBACK_INVALID",
+                "human approval is not bound to a typed durable Decision",
+            )
+        if type(choice) is not HumanDecisionChoice:
+            raise PlanControlError(
+                "HUMAN_APPROVAL_INPUT_INVALID",
+                "human approval requires a typed choice",
+            )
+        if choice.decision_id != decision.decision_id:
+            raise PlanControlError(
+                "HUMAN_APPROVAL_INPUT_INVALID",
+                "human approval names another Decision",
+            )
+        durable_reader = getattr(self._repository, "read_human_decision", None)
+        durable = (
+            durable_reader(handle, decision.decision_id)
+            if callable(durable_reader)
+            else None
+        )
+        if durable != decision:
+            raise PlanControlError(
+                "HUMAN_DECISION_READBACK_INVALID",
+                "human approval names a Decision that is not durably saved",
+            )
+        readback_reader = getattr(self._repository, "read_human_gate_readback", None)
+        choice_reader = getattr(self._repository, "read_human_gate_choice", None)
+        existing_readback = (
+            readback_reader(handle, decision.decision_id)
+            if callable(readback_reader)
+            else None
+        )
+        if existing_readback is not None:
+            existing_choice = (
+                choice_reader(handle, decision.decision_id)
+                if callable(choice_reader)
+                else None
+            )
+            if existing_choice != choice:
+                raise PlanControlError(
+                    "HUMAN_APPROVAL_INPUT_INVALID",
+                    "human Decision already has another durable choice",
+                )
+            if existing_readback.approved and existing_choice.choice == "reject":
+                if _read_only:
+                    return self._rejected_human_choice_readback(
+                        decision,
+                        existing_readback,
+                    )
+                raise PlanControlError(
+                    "HUMAN_APPROVAL_INPUT_INVALID",
+                    "a rejected human choice cannot continue an approved source readback",
+                )
+            if existing_readback.approved and existing_choice.choice == "approve" and not _read_only:
+                reader = getattr(self._human_source, "read", None)
+                if not callable(reader):
+                    raise PlanControlError(
+                        "HUMAN_APPROVAL_UNAUTHORIZED",
+                        "authoritative human source is unavailable for approval replay",
+                    )
+                try:
+                    fresh = reader(handle, decision, choice.readback_ref)
+                except PlanControlError:
+                    raise
+                except Exception as error:
+                    code = getattr(error, "code", "HUMAN_SOURCE_READBACK_INVALID")
+                    detail = getattr(
+                        error,
+                        "detail",
+                        "authoritative human approval replay failed",
+                    )
+                    raise PlanControlError(code, detail) from error
+                if type(fresh) is not HumanSourceReadback or fresh != existing_readback:
+                    raise PlanControlError(
+                        "HUMAN_SOURCE_CHANGED_DURING_READBACK",
+                        "authoritative human source replay did not match the durable readback",
+                    )
+                return self._advance_approved_human_successor(
+                    handle,
+                    decision,
+                    existing_readback,
+                )
+            return existing_readback
+        reader = getattr(self._human_source, "read", None)
+        if not callable(reader):
+            raise PlanControlError(
+                "HUMAN_APPROVAL_UNAUTHORIZED",
+                "no authoritative human approval readback source is configured",
+            )
+        try:
+            readback = reader(handle, decision, choice.readback_ref)
+        except PlanControlError:
+            raise
+        except Exception as error:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "authoritative human source readback failed",
+            ) from error
+        if (
+            type(readback) is not HumanSourceReadback
+            or readback.decision_id != decision.decision_id
+        ):
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "authoritative human source returned an unbound readback",
+            )
+        # Validate an approved source completely before recording the durable
+        # gate readback.  A read-only test double or a locally edited
+        # HumanSourceReadback must not be able to create an approved durable
+        # state merely by satisfying the outer dataclass shape.
+        if readback.approved:
+            self._human_successor_snapshot(handle, decision, readback)
+        saver = getattr(self._repository, "save_human_gate_readback", None)
+        if not callable(saver):
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "PlanControl repository omitted durable source readback storage",
+            )
+        try:
+            saved = saver(handle, decision, choice, readback)
+        except PlanControlError:
+            raise
+        except Exception as error:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "human source readback could not be saved",
+            ) from error
+        if saved != readback:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "human source readback did not read back exactly",
+            )
+        if readback.approved and choice.choice == "reject":
+            if _read_only:
+                return self._rejected_human_choice_readback(
+                    decision,
+                    readback,
+                )
+            raise PlanControlError(
+                "HUMAN_APPROVAL_INPUT_INVALID",
+                "a rejected human choice cannot continue an approved source readback",
+            )
+        if readback.approved and choice.choice == "approve" and not _read_only:
+            return self._advance_approved_human_successor(
+                handle,
+                decision,
+                readback,
+            )
+        return saved
+
+    @staticmethod
+    def _rejected_human_choice_readback(decision: Any, readback: Any):
+        """Return one deterministic terminal gate readback for a rejected choice.
+
+        The authoritative source readback remains durably stored unchanged;
+        this derived non-approved view prevents an approved source artifact
+        from overriding the explicit human rejection on either replay path.
+        """
+
+        from .human_gate import HumanDecisionRecord, HumanSourceReadback
+
+        if (
+            type(decision) is not HumanDecisionRecord
+            or type(readback) is not HumanSourceReadback
+            or not readback.approved
+        ):
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "rejected human choice is not bound to an approved source readback",
+            )
+        state = "rejected"
+        code = "HUMAN_SOURCE_REJECTED"
+        return HumanSourceReadback(
+            decision_id=decision.decision_id,
+            state=state,
+            approval_record_bytes=None,
+            tracker_source_bytes=None,
+            policy_witness_bytes=None,
+            approval_record_digest=None,
+            tracker_source_digest=None,
+            policy_witness_digest=None,
+            source_change_digest=None,
+            readback_digest=digest_value(
+                {
+                    "decision_id": decision.decision_id,
+                    "state": state,
+                    "approval_record_digest": None,
+                    "tracker_source_digest": None,
+                    "policy_witness_digest": None,
+                    "source_change_digest": None,
+                    "code": code,
+                }
+            ),
+            code=code,
+        )
+
+    def _human_successor_snapshot(
+        self,
+        handle: CampaignHandle,
+        decision: Any,
+        readback: Any,
+    ) -> tuple[dict[str, Any], ActivePlanReadback]:
+        """Project only exact approved source bytes into the successor input."""
+
+        from .human_gate import (
+            HumanDecisionRecord,
+            HumanSourceReadback,
+        )
+
+        if (
+            type(decision) is not HumanDecisionRecord
+            or type(readback) is not HumanSourceReadback
+            or not readback.approved
+        ):
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "approved human successor requires one exact source readback",
+            )
+        active = self.read_active(handle)
+        try:
+            approval = load_canonical_json(readback.approval_record_bytes)
+            tracker = load_canonical_json(readback.tracker_source_bytes)
+            policy = load_canonical_json(readback.policy_witness_bytes)
+        except Exception as error:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "approved human source bytes are not canonical objects",
+            ) from error
+        if (
+            type(approval) is not dict
+            or approval.get("decision_id") != decision.decision_id
+            or approval.get("classification_action_id")
+            != decision.classification_action_id
+            or approval.get("predecessor_revision_digest")
+            != decision.plan_revision_digest
+            or approval.get("required_change") != decision.required_change
+            or approval.get("approval_state") != "approved"
+            or type(tracker) is not dict
+            or tracker.get("kind") != "gwo.human-tracker-source.v1"
+            or tracker.get("repository") != handle.repository
+            or tracker.get("campaign_key") != handle.campaign_key
+            or type(policy) is not dict
+        ):
+            raise PlanControlError(
+                "HUMAN_SOURCE_DIGEST_MISMATCH",
+                "approved source does not bind the durable Decision",
+            )
+        required_tracker_fields = {
+            "kind",
+            "repository",
+            "campaign_key",
+            "target_branch",
+            "campaign_source",
+            "membership",
+            "tickets",
+            "product_release",
+            "source_change_digest",
+        }
+        if set(tracker) != required_tracker_fields:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INCOMPLETE",
+                "approved tracker source is not the complete closed projection",
+            )
+        policy_domain = (
+            decision.required_source.source_kind == "policy"
+            and decision.required_source.predecessor_snapshot_digest is not None
+        )
+        tracker_source_change_digest = tracker["source_change_digest"]
+        expected_source_change_digest = (
+            policy.get("digest") if policy_domain else tracker_source_change_digest
+        )
+        if readback.source_change_digest != expected_source_change_digest:
+            raise PlanControlError(
+                "HUMAN_SOURCE_DIGEST_MISMATCH",
+                "approved source readback does not bind its required source digest",
+            )
+        if approval.get("source_change_digest") not in {
+            expected_source_change_digest,
+            digest_bytes(
+                canonical_bytes(policy if policy_domain else tracker)
+            ),
+        }:
+            raise PlanControlError(
+                "HUMAN_SOURCE_CHANGED_DURING_READBACK",
+                "approved source record does not bind its required source bytes",
+            )
+        membership = tracker["membership"]
+        if (
+            type(membership) is not dict
+            or set(membership) != {"ticket_keys", "digest"}
+            or type(membership["ticket_keys"]) is not list
+            or not membership["ticket_keys"]
+            or membership["ticket_keys"] != sorted(set(membership["ticket_keys"]))
+            or digest_value({"ticket_keys": membership["ticket_keys"]})
+            != membership["digest"]
+            or type(tracker["tickets"]) is not list
+            or [item.get("key") for item in tracker["tickets"] if type(item) is dict]
+            != membership["ticket_keys"]
+        ):
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INCOMPLETE",
+                "approved tracker source membership and Tickets are incomplete",
+            )
+        if type(tracker["target_branch"]) is not str or not tracker["target_branch"]:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INCOMPLETE",
+                "approved tracker source target branch is incomplete",
+            )
+        try:
+            normalized_campaign_source = _campaign_source(
+                tracker["campaign_source"],
+                handle.repository,
+            )
+        except PlanControlError as error:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INCOMPLETE",
+                "approved tracker source Campaign identity is incomplete",
+            ) from error
+        if normalized_campaign_source != tracker["campaign_source"]:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INCOMPLETE",
+                "approved tracker source Campaign identity is not exact",
+            )
+        if tracker["campaign_source"]["input_ref"] != (
+            "refs/heads/" + tracker["target_branch"]
+        ):
+            raise PlanControlError(
+                "HUMAN_SOURCE_DIGEST_MISMATCH",
+                "approved tracker source target and Campaign ref disagree",
+            )
+        try:
+            normalized_tickets = [
+                _normalize_ticket(ticket, repository=handle.repository)
+                for ticket in tracker["tickets"]
+            ]
+        except PlanControlError as error:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INCOMPLETE",
+                "approved tracker source contains a non-canonical Ticket contract",
+            ) from error
+        if normalized_tickets != tracker["tickets"]:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INCOMPLETE",
+                "approved tracker source Ticket contracts are not exact",
+            )
+        tracker_core = {
+            key: tracker[key]
+            for key in required_tracker_fields
+            if key != "source_change_digest"
+        }
+        if tracker["source_change_digest"] != digest_value(tracker_core):
+            raise PlanControlError(
+                "HUMAN_SOURCE_DIGEST_MISMATCH",
+                "approved tracker source change digest does not bind its projection",
+            )
+        source_digest = tracker["source_change_digest"]
+        if type(source_digest) is not str or not source_digest:
+            raise PlanControlError(
+                "HUMAN_SOURCE_DIGEST_MISMATCH",
+                "approved tracker source omitted its source-change digest",
+            )
+        try:
+            original = _read_artifact_json(
+                self._artifacts,
+                (
+                    decision.required_source.predecessor_snapshot_digest
+                    or decision.required_source.predecessor_source_digest
+                ),
+                code="HUMAN_SOURCE_READBACK_INVALID",
+            )
+        except PlanControlError:
+            # The Decision's predecessor source digest is the classification
+            # snapshot in the #134 path.  Recover it from the durable
+            # classification when the source digest is intentionally a
+            # separate tracker projection.
+            durable_classification = self._repository.read_invalidation_classification(
+                handle,
+                decision.classification_action_id,
+            )
+            if type(durable_classification) is not PlanInvalidationClassification:
+                raise PlanControlError(
+                    "HUMAN_DECISION_READBACK_INVALID",
+                    "human Decision lost its exact invalidation classification",
+                )
+            original = _read_artifact_json(
+                self._artifacts,
+                durable_classification.snapshot_digest,
+                code="HUMAN_SOURCE_READBACK_INVALID",
+            )
+        if type(original) is not dict:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "predecessor invalidation snapshot is not an object",
+            )
+        # The approved Policy Witness is the compiler authority.  Never
+        # substitute the predecessor policy when the approved source is only
+        # a budget projection or otherwise incomplete.
+        try:
+            compiler_policy = _normalize_policy(policy)
+        except Exception as error:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "approved Policy Witness has no complete compilable projection",
+            ) from error
+        if compiler_policy != policy:
+            raise PlanControlError(
+                "POLICY_WITNESS_INVALID",
+                "approved Policy Witness is not the exact canonical authority projection",
+            )
+        if expected_source_change_digest == decision.required_source.predecessor_source_digest:
+            raise PlanControlError(
+                "HUMAN_SOURCE_REVERTED",
+                "approved source is identical to the required predecessor source",
+            )
+        snapshot = dict(original)
+        snapshot["target_branch"] = tracker["target_branch"]
+        snapshot["campaign_source"] = tracker["campaign_source"]
+        snapshot["membership"] = membership
+        snapshot["tickets"] = tracker["tickets"]
+        snapshot["product_release"] = tracker["product_release"]
+        # The successor snapshot keeps the tracker projection digest for its
+        # Campaign source field.  The required-source/domain digest above is
+        # separately bound by the Policy Witness for authority Decisions.
+        snapshot["source_change_digest"] = tracker_source_change_digest
+        snapshot["policy_witness"] = compiler_policy
+        snapshot["policy"] = compiler_policy
+        snapshot.pop("snapshot_digest", None)
+        return snapshot, active
+
+    def _validate_human_source_cas(
+        self,
+        handle: CampaignHandle,
+        decision: Any,
+        readback: Any,
+    ) -> None:
+        """Re-read the approved source immediately before publication."""
+
+        from .human_gate import (
+            HumanDecisionChoice,
+            HumanDecisionRecord,
+            HumanSourceReadback,
+        )
+
+        reader = getattr(self._human_source, "read", None)
+        if not callable(reader):
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "authoritative human source is unavailable for activation CAS",
+            )
+        choice_reader = getattr(self._repository, "read_human_gate_choice", None)
+        choice = choice_reader(handle, decision.decision_id) if callable(choice_reader) else None
+        if type(choice) is not HumanDecisionChoice or choice.choice != "approve":
+            raise PlanControlError(
+                "HUMAN_APPROVAL_INPUT_INVALID",
+                "approved source activation CAS lost its durable approve choice",
+            )
+        try:
+            fresh = reader(handle, decision, choice.readback_ref)
+        except PlanControlError:
+            raise
+        except Exception as error:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "authoritative human source activation CAS read failed",
+            ) from error
+        if type(fresh) is not HumanSourceReadback or fresh.decision_id != decision.decision_id:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "activation CAS returned an unbound human source readback",
+            )
+        if not fresh.approved:
+            raise PlanControlError(
+                fresh.code,
+                "authoritative human source was no longer approved before activation",
+            )
+        if (
+            fresh.readback_digest != readback.readback_digest
+            or fresh.source_change_digest != readback.source_change_digest
+            or fresh.tracker_source_digest != readback.tracker_source_digest
+            or fresh.policy_witness_digest != readback.policy_witness_digest
+            or fresh.approval_record_digest != readback.approval_record_digest
+            or fresh != readback
+        ):
+            raise PlanControlError(
+                "HUMAN_SOURCE_CHANGED_DURING_READBACK",
+                "authoritative human source changed after Planning and before activation",
+            )
+        # Re-parse the exact approved bytes at the CAS boundary; this keeps a
+        # malformed or incomplete source from being treated as an equal
+        # digest-only witness by a narrow test/host double.
+        self._human_successor_snapshot(handle, decision, fresh)
+
+    def _advance_approved_human_successor(
+        self,
+        handle: CampaignHandle,
+        decision: Any,
+        readback: Any,
+    ):
+        """Run/recover exactly one tagged successor pass and activate it."""
+
+        from .human_gate import (
+            HumanDecisionRecord,
+            HumanSourceReadback,
+            _human_planning_action_id,
+        )
+
+        if type(decision) is not HumanDecisionRecord or type(readback) is not HumanSourceReadback:
+            raise PlanControlError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "human successor input is not typed",
+            )
+        snapshot, active = self._human_successor_snapshot(handle, decision, readback)
+        snapshot_bytes = canonical_bytes(snapshot)
+        if len(snapshot_bytes) > self._max_snapshot_bytes:
+            raise PlanControlError(
+                "HUMAN_SUCCESSOR_PLANNING_FAILED",
+                "approved human successor snapshot exceeds the Planning bound",
+            )
+        snapshot_digest = _put_canonical(self._artifacts, snapshot)
+        policy_value = snapshot.get("policy_witness")
+        if type(policy_value) is not dict or type(policy_value.get("digest")) is not str:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "approved successor omitted a bound Policy Witness digest",
+            )
+        policy_digest = policy_value["digest"]
+        policy_witness = {
+            key: value for key, value in policy_value.items() if key != "digest"
+        }
+        try:
+            stored_policy_digest = _put_canonical(self._artifacts, policy_witness)
+        except Exception as error:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "approved Policy Witness could not be durably stored",
+            ) from error
+        if stored_policy_digest != policy_digest:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "approved Policy Witness digest does not bind its exact compiler bytes",
+            )
+        action_id = _human_planning_action_id(
+            decision.decision_id,
+            readback.readback_digest,
+            active.current_revision_digest,
+        )
+        provisional = CampaignPlanningSubject(
+            repository=handle.repository,
+            campaign_key=handle.campaign_key,
+            campaign_handle=_handle_ref(handle),
+            expected_previous_plan_revision_digest=active.current_revision_digest,
+            snapshot_artifact_digest=snapshot_digest,
+            policy_witness_digest=policy_digest,
+            planning_request_artifact_digest="0" * 64,
+            stable_action_id=action_id,
+        )
+        request_digest = _put_canonical(
+            self._artifacts,
+            replanning_prompt(
+                subject_digest=provisional.prompt_binding_digest,
+                authority_digest=policy_digest,
+                snapshot_artifact_digest=snapshot_digest,
+                policy_witness_artifact_digest=policy_digest,
+            ),
+        )
+        subject = replace(provisional, planning_request_artifact_digest=request_digest)
+        self._save_human_gate_attempt(
+            handle=handle,
+            decision=decision,
+            readback=readback,
+            predecessor_revision_digest=active.current_revision_digest,
+            planning_action_id=action_id,
+            state="planning_validated_successor",
+        )
+        existing_attempt = self._repository.read_attempt(
+            handle,
+            active.current_revision_digest,
+        )
+        if existing_attempt is not None:
+            if (
+                existing_attempt.planning_protocol_id != REPLANNING_OUTPUT_PROTOCOL_ID
+                or existing_attempt.subject.stable_action_id != action_id
+                or existing_attempt.snapshot_artifact_digest != snapshot_digest
+            ):
+                raise PlanControlError(
+                    "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                    "human successor attempt is bound to another source or action",
+                )
+            attempt = existing_attempt
+        else:
+            reservation = PlanningReservation(
+                repository=handle.repository,
+                campaign_key=handle.campaign_key,
+                ticket_keys=tuple(sorted(item["key"] for item in snapshot["tickets"])),
+                subject_digest=subject.digest,
+                stable_action_id=action_id,
+                preflight_receipt_digest="0" * 64,
+                snapshot_artifact_digest=snapshot_digest,
+                policy_witness_digest=policy_digest,
+                planning_request_artifact_digest=request_digest,
+            )
+            preflight = self._gateway.planning_preflight(subject)
+            _validate_preflight(preflight, subject)
+            reservation = replace(
+                reservation,
+                preflight_receipt_digest=preflight.receipt_digest,
+            )
+            self._repository.reserve_planning(reservation)
+            proof = self._gateway._read_coordinator_capability(subject)
+            _validate_coordinator_capability(proof, subject)
+            receipt = self._gateway.progress(subject, preflight)
+            _validate_planning_receipt(receipt, subject)
+            if receipt.status != "completed":
+                raise PlanControlError(
+                    "HUMAN_SUCCESSOR_PLANNING_FAILED",
+                    "approved human successor Planning did not complete",
+                )
+            output_digest = receipt.planning_output_artifact_digest
+            assert output_digest is not None
+            payload = _planning_payload(self._artifacts, output_digest, subject)
+            classification = _normalize_replanning_intent(
+                payload,
+                snapshot=snapshot,
+                action_id=action_id,
+                snapshot_digest=snapshot_digest,
+                plan_revision_digest=active.current_revision_digest,
+                evidence_digests=decision.evidence_digests,
+                capability_proof_digest=proof.digest,
+            )
+            if classification.disposition is not PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR:
+                raise PlanControlError(
+                    "HUMAN_SUCCESSOR_PLANNING_FAILED",
+                    "approved human source Planning did not produce one successor",
+                )
+            attempt = self._save_completed_successor_attempt(
+                handle=handle,
+                active=active,
+                snapshot=snapshot,
+                snapshot_bytes=snapshot_bytes,
+                snapshot_digest=snapshot_digest,
+                subject=subject,
+                preflight=preflight,
+                receipt=receipt,
+                proof=proof,
+                classification=classification,
+                reservation=reservation,
+                output_digest=output_digest,
+            )
+            self._save_human_gate_attempt(
+                handle=handle,
+                decision=decision,
+                readback=readback,
+                predecessor_revision_digest=active.current_revision_digest,
+                planning_action_id=action_id,
+                state="planning_validated_successor",
+                compilation_record_artifact_digest=(
+                    attempt.compilation_record_artifact_digest
+                ),
+            )
+        if attempt.compilation_record_artifact_digest is not None:
+            self._save_human_gate_attempt(
+                handle=handle,
+                decision=decision,
+                readback=readback,
+                predecessor_revision_digest=active.current_revision_digest,
+                planning_action_id=action_id,
+                state="planning_validated_successor",
+                compilation_record_artifact_digest=(
+                    attempt.compilation_record_artifact_digest
+                ),
+            )
+        self._validate_human_source_cas(handle, decision, readback)
+        if attempt.revision is None:
+            intent_bytes = self._read_successor_compilation_record(attempt)
+            revision = self._compile_successor_revision(handle, attempt, intent_bytes)
+            attempt = self._repository.save_attempt(replace(attempt, revision=revision))
+        else:
+            revision = attempt.revision
+        receipt = self._successor_activation_receipt(attempt, revision)
+        # Do not route through #135 activate_successor: the approved source
+        # has its own exact source/readback boundary and a human stable action.
+        activated = self._publish_activate_readback(
+            handle=handle,
+            attempt=attempt,
+            revision=revision,
+            receipt=receipt,
+        )
+        self._save_human_gate_attempt(
+            handle=handle,
+            decision=decision,
+            readback=readback,
+            predecessor_revision_digest=active.current_revision_digest,
+            planning_action_id=action_id,
+            state="active_successor",
+            compilation_record_artifact_digest=attempt.compilation_record_artifact_digest,
+            activation_receipt_digest=digest_value(
+                activated.activation_receipt.__dict__
+            ),
+        )
+        return readback
 
     def start(self, repository: str, ready_refs: Sequence[str], options: object = None, *, campaign_key: str | None = None, expected_previous_revision_digest: str | None | object = _AUTO_PREVIOUS) -> CampaignHandle:
         """Create or recover one immutable PlanSpec v3 Campaign revision.
@@ -2412,8 +3933,12 @@ class PlanControl:
             )
         attempt = _PlanningAttempt(
             handle=handle,
-            ready_refs=active.activation_receipt.ready_refs,
-            ticket_keys=active.activation_receipt.ticket_keys,
+            ready_refs=tuple(
+                sorted(item["source"]["ref"] for item in snapshot["tickets"])
+            ),
+            ticket_keys=tuple(
+                sorted(item["key"] for item in snapshot["tickets"])
+            ),
             expected_previous_revision_digest=active.current_revision_digest,
             snapshot_bytes=snapshot_bytes,
             snapshot_artifact_digest=snapshot_digest,
@@ -3379,6 +4904,11 @@ class PlanControl:
                 "can_edit_tracker",
                 "can_expand_authority",
                 "delegation_enabled",
+                "can_edit_labels",
+                "can_edit_campaign_membership",
+                "can_grant_authority",
+                "can_merge",
+                "can_invoke_global_planning",
             }:
                 raise PlanControlError(
                     "COMPILATION_RECORD_INVALID",
@@ -3737,12 +5267,17 @@ def _campaign_source(value: Any, repository: str) -> dict[str, str]:
         "tree_oid",
         "digest",
     }
-    if type(value) is not dict or set(value) != expected:
+    human_expected = expected - {"repository"}
+    if type(value) is not dict or set(value) not in (expected, human_expected):
         raise PlanControlError(
             "SNAPSHOT_INVALID",
             "Campaign source must carry its complete immutable Git identity",
         )
-    source_repository = _text(value["repository"], "Campaign source repository")
+    source_repository = (
+        _text(value["repository"], "Campaign source repository")
+        if "repository" in value
+        else repository
+    )
     input_ref = _text(value["input_ref"], "Campaign source input ref")
     commit_oid = _text(value["resolved_commit_oid"], "Campaign source commit")
     tree_oid = _text(value["tree_oid"], "Campaign source tree")
@@ -3757,7 +5292,7 @@ def _campaign_source(value: Any, repository: str) -> dict[str, str]:
             "Campaign source identity is malformed or belongs to another repository",
         )
     source = {
-        "repository": source_repository,
+        **({"repository": source_repository} if "repository" in value else {}),
         "input_ref": input_ref,
         "resolved_commit_oid": commit_oid,
         "tree_oid": tree_oid,
@@ -3800,9 +5335,24 @@ def _facts(value: Any, *, label: str, validator) -> list[str]:
 
 
 def _normalize_policy(value: Any) -> dict[str, Any]:
-    expected = {"schema_version", "ref", "digest", "authority_grants", "allowed_capabilities", "exclusive_resources"}
-    if type(value) is not dict or set(value) != expected or value["schema_version"] != 1:
+    required = {
+        "schema_version",
+        "ref",
+        "digest",
+        "authority_grants",
+        "allowed_capabilities",
+        "exclusive_resources",
+    }
+    expected = required | {"replan"}
+    expected_with_kind = expected | {"kind"}
+    if (
+        type(value) is not dict
+        or (set(value) != required and set(value) not in (expected, expected_with_kind))
+        or value["schema_version"] != 1
+    ):
         raise PlanControlError("POLICY_WITNESS_INVALID", "Policy Witness schema is invalid")
+    if "kind" in value and value["kind"] != "gwo.policy-witness.v1":
+        raise PlanControlError("POLICY_WITNESS_INVALID", "Policy Witness kind is invalid")
     raw_grants = value["authority_grants"]
     if type(raw_grants) is not dict or set(raw_grants) != set(_POLICY_ROLES):
         raise PlanControlError("POLICY_WITNESS_INVALID", "Policy Witness must supply every authority role")
@@ -3832,6 +5382,32 @@ def _normalize_policy(value: Any) -> dict[str, Any]:
         "allowed_capabilities": _facts(value["allowed_capabilities"], label="allowed_capabilities", validator=lambda item: _capability(item, "allowed_capabilities")),
         "exclusive_resources": _facts(value["exclusive_resources"], label="exclusive_resources", validator=lambda item: _versioned(item, roots=_RESOURCE_ROOTS, label="exclusive_resources")),
     }
+    if "kind" in value:
+        core["kind"] = value["kind"]
+    if "replan" in value:
+        replan = value["replan"]
+        if (
+            type(replan) is not dict
+            or set(replan)
+            != {"successor_revision_limit", "repeated_invalidation_limit"}
+            or any(
+                type(replan[field]) is not int
+                or isinstance(replan[field], bool)
+                or replan[field] < 1
+                for field in (
+                    "successor_revision_limit",
+                    "repeated_invalidation_limit",
+                )
+            )
+        ):
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "Policy Witness replan budget must contain positive exact integers",
+            )
+        core["replan"] = {
+            "successor_revision_limit": replan["successor_revision_limit"],
+            "repeated_invalidation_limit": replan["repeated_invalidation_limit"],
+        }
     digest = _digest(value["digest"], "Policy Witness digest")
     if digest != digest_value(core):
         raise PlanControlError("POLICY_WITNESS_INVALID", "Policy Witness digest does not bind its exact facts")
@@ -4240,6 +5816,95 @@ def _normalize_snapshot(
     return normalized
 
 
+def _human_source_projection_digest(
+    snapshot: Mapping[str, Any],
+    handle: CampaignHandle,
+) -> str:
+    """Derive the predecessor digest in the tracker-source domain.
+
+    Plan Invalidation snapshots are larger Artifacts whose digest is used for
+    Planning idempotency.  Human approval records, however, bind the compact
+    tracker projection.  Keeping these domains separate prevents a tracker
+    source that reverted to its predecessor from being mistaken for a new
+    approved change (or vice versa).
+    """
+
+    if type(snapshot) is not dict:
+        raise PlanControlError(
+            "HUMAN_DECISION_READBACK_INVALID",
+            "predecessor source snapshot is not an object",
+        )
+    tickets = snapshot.get("tickets")
+    if type(tickets) is not list or any(type(ticket) is not dict for ticket in tickets):
+        raise PlanControlError(
+            "HUMAN_DECISION_READBACK_INVALID",
+            "predecessor source snapshot omits complete Tickets",
+        )
+    tickets = sorted(tickets, key=lambda ticket: ticket.get("key", ""))
+    ticket_keys = [ticket.get("key") for ticket in tickets]
+    if any(type(key) is not str or not key for key in ticket_keys):
+        raise PlanControlError(
+            "HUMAN_DECISION_READBACK_INVALID",
+            "predecessor source snapshot has an invalid Ticket key",
+        )
+    membership = {
+        "ticket_keys": ticket_keys,
+        "digest": digest_value({"ticket_keys": ticket_keys}),
+    }
+    source = {
+        "kind": "gwo.human-tracker-source.v1",
+        "repository": handle.repository,
+        "campaign_key": handle.campaign_key,
+        "target_branch": snapshot.get("target_branch"),
+        "campaign_source": snapshot.get("campaign_source"),
+        "membership": membership,
+        "tickets": tickets,
+        "product_release": snapshot.get("product_release"),
+    }
+    if type(source["target_branch"]) is not str or not source["target_branch"]:
+        raise PlanControlError(
+            "HUMAN_DECISION_READBACK_INVALID",
+            "predecessor source snapshot has no target branch",
+        )
+    try:
+        _campaign_source(source["campaign_source"], handle.repository)
+    except PlanControlError as error:
+        raise PlanControlError(
+            "HUMAN_DECISION_READBACK_INVALID",
+            "predecessor source snapshot has no exact Campaign source",
+        ) from error
+    return digest_value(source)
+
+
+def _human_policy_projection_digest(snapshot: Mapping[str, Any]) -> str:
+    """Return the predecessor Policy Witness digest in its own domain."""
+
+    if type(snapshot) is not dict:
+        raise PlanControlError(
+            "HUMAN_DECISION_READBACK_INVALID",
+            "predecessor policy snapshot is not an object",
+        )
+    policy = snapshot.get("policy_witness", snapshot.get("policy"))
+    if type(policy) is not dict:
+        raise PlanControlError(
+            "HUMAN_DECISION_READBACK_INVALID",
+            "predecessor snapshot omits its complete Policy Witness",
+        )
+    try:
+        normalized = _normalize_policy(policy)
+    except PlanControlError as error:
+        raise PlanControlError(
+            "HUMAN_DECISION_READBACK_INVALID",
+            "predecessor Policy Witness is not a valid authority projection",
+        ) from error
+    if normalized != policy:
+        raise PlanControlError(
+            "HUMAN_DECISION_READBACK_INVALID",
+            "predecessor Policy Witness is not canonical",
+        )
+    return policy["digest"]
+
+
 _INVALIDATION_OBSERVATION_FIELDS = {
     "kind",
     "repository",
@@ -4257,6 +5922,9 @@ _INVALIDATION_OBSERVATION_FIELDS = {
     "required_effects",
     "workspace_identity",
 }
+_INVALIDATION_OBSERVATION_FIELDS_WITH_SOURCE_LINEAGE = (
+    _INVALIDATION_OBSERVATION_FIELDS | {"source_evidence_digests"}
+)
 _REPLANNING_RUN_FIELDS = {
     "ticket_key",
     "work_run_key",
@@ -4324,17 +5992,26 @@ def _normalize_invalidation_observations(
                 "PLAN_INVALIDATION_SNAPSHOT_INVALID",
                 "pending invalidation is not a typed canonical observation",
             )
-        if set(raw_value) == _INVALIDATION_OBSERVATION_FIELDS | {"observation_digest"}:
+        if set(raw_value) in (
+            _INVALIDATION_OBSERVATION_FIELDS | {"observation_digest"},
+            _INVALIDATION_OBSERVATION_FIELDS_WITH_SOURCE_LINEAGE
+            | {"observation_digest"},
+        ):
             expected_observation_digest = raw_value.get("observation_digest")
             raw_value = {
-                key: raw_value[key] for key in _INVALIDATION_OBSERVATION_FIELDS
+                key: raw_value[key]
+                for key in raw_value
+                if key != "observation_digest"
             }
             if expected_observation_digest != digest_value(raw_value):
                 raise PlanControlError(
                     "PLAN_INVALIDATION_SNAPSHOT_INVALID",
                     "pending invalidation observation digest changed",
                 )
-        if set(raw_value) != _INVALIDATION_OBSERVATION_FIELDS or raw_value.get("kind") != "plan_invalidation_observation.v1":
+        if set(raw_value) not in (
+            _INVALIDATION_OBSERVATION_FIELDS,
+            _INVALIDATION_OBSERVATION_FIELDS_WITH_SOURCE_LINEAGE,
+        ) or raw_value.get("kind") != "plan_invalidation_observation.v1":
             raise PlanControlError(
                 "PLAN_INVALIDATION_SNAPSHOT_INVALID",
                 "pending invalidation observation schema is not closed",
@@ -4366,6 +6043,22 @@ def _normalize_invalidation_observations(
                 "PLAN_INVALIDATION_SNAPSHOT_INVALID",
                 "pending invalidation effects are not canonical",
             )
+        if "source_evidence_digests" in raw_value:
+            source_digests = raw_value["source_evidence_digests"]
+            if (
+                type(source_digests) is not list
+                or not source_digests
+                or any(
+                    type(digest) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                    for digest in source_digests
+                )
+                or source_digests != sorted(set(source_digests))
+            ):
+                raise PlanControlError(
+                    "PLAN_INVALIDATION_SNAPSHOT_INVALID",
+                    "pending invalidation source Evidence is not canonical",
+                )
         if raw_value["reporter_role"] not in {"worker", "recovery_worker", "review"}:
             raise PlanControlError(
                 "PLAN_INVALIDATION_SNAPSHOT_INVALID",
@@ -5206,9 +6899,12 @@ def _validate_plan_spec(payload: bytes) -> None:
         raise PlanControlError("PLANSPEC_V3_INVALID", "PlanSpec v3 top-level schema is invalid")
     campaign = plan["campaign"]
     policy = plan["policy"]
+    campaign_fields = {"key", "source", "authority"}
+    optional_campaign_fields = {"product_release", "source_change_digest"}
     if (
         type(campaign) is not dict
-        or set(campaign) != {"key", "source", "authority"}
+        or not set(campaign).issuperset(campaign_fields)
+        or not set(campaign).issubset(campaign_fields | optional_campaign_fields)
         or _campaign_source(campaign["source"], plan["repository"])
         != campaign["source"]
         or type(policy) is not dict
@@ -5217,6 +6913,8 @@ def _validate_plan_spec(payload: bytes) -> None:
         or _digest(policy["digest"], "PlanSpec policy digest") != policy["digest"]
     ):
         raise PlanControlError("PLANSPEC_V3_INVALID", "PlanSpec Campaign or Policy projection is invalid")
+    if "source_change_digest" in campaign:
+        _digest(campaign["source_change_digest"], "PlanSpec source change digest")
     if type(plan["work"]) is not list or not plan["work"]:
         raise PlanControlError("PLANSPEC_V3_INVALID", "PlanSpec v3 has no work manifest")
     forbidden = {"provider", "model", "cli", "profile", "session", "binding", "capacity", "permission", "check", "review", "recovery", "integration"}

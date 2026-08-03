@@ -29,13 +29,26 @@ from .plan_control import (
     ActivePlanReadback,
     ActivationReceipt,
     CampaignHandle,
+    PlanInvalidationDecision,
     PlanInvalidationClassification,
     PlanInvalidationDisposition,
     TicketClaimProof,
 )
+from .human_gate import (
+    HumanDecisionChoice,
+    HumanDecisionRecord,
+    HumanGateSummary,
+    HumanSourceReadback,
+    RequiredDurableSourceChange,
+    _human_planning_action_id as _derive_human_planning_action_id,
+)
+from .planning_protocol import REPLANNING_OUTPUT_PROTOCOL_ID
 
 
 _DIGEST_LENGTH = 64
+_DEFAULT_SUCCESSOR_REVISION_LIMIT = 1
+_DEFAULT_REPEATED_INVALIDATION_LIMIT = 1
+_HUMAN_SUCCESSOR_ACTION_PREFIX = "replan:human:"
 _TERMINAL_PHASES = frozenset({"completed"})
 _SLOT_PHASES = frozenset({"running", "candidate_checks", "formal_review", "repair"})
 # A quiescent Work Run has been authoritatively stopped by Plan Invalidation.
@@ -189,6 +202,7 @@ class RevisionLineageSummary:
     candidate_identities: tuple[str, ...]
     result_digests: tuple[str, ...]
     evidence_digests: tuple[str, ...]
+    source_evidence_digests: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -202,6 +216,7 @@ class Diagnostics:
     outstanding_effect_ids: tuple[str, ...]
     invalidation_classification: PlanInvalidationClassification | None = None
     revision_lineage: tuple[RevisionLineageSummary, ...] = ()
+    human_gate: HumanGateSummary | None = None
 
     @property
     def plan_invalidation_classification(self) -> PlanInvalidationClassification | None:
@@ -383,6 +398,7 @@ class PlanInvalidationObservation:
     invalidated_obligation: str
     required_effects: tuple[str, ...]
     workspace_identity: str
+    source_evidence_digests: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -420,6 +436,26 @@ class PlanInvalidationObservation:
                 "PLAN_INVALIDATION_OBSERVATION_INVALID",
                 "Plan Invalidation required effects must be a tuple of non-empty strings",
             )
+        if self.source_evidence_digests is not None:
+            if type(self.source_evidence_digests) is not tuple:
+                raise ExecutionKernelError(
+                    "PLAN_INVALIDATION_OBSERVATION_INVALID",
+                    "Plan Invalidation source Evidence must be a tuple",
+                )
+            if (
+                not self.source_evidence_digests
+                or any(
+                    type(digest) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                    for digest in self.source_evidence_digests
+                )
+                or self.source_evidence_digests
+                != tuple(sorted(set(self.source_evidence_digests)))
+            ):
+                raise ExecutionKernelError(
+                    "PLAN_INVALIDATION_OBSERVATION_INVALID",
+                    "Plan Invalidation source Evidence is not canonical",
+                )
         if self.reporter_role not in {"worker", "recovery_worker", "review"}:
             raise ExecutionKernelError(
                 "PLAN_INVALIDATION_OBSERVATION_INVALID",
@@ -431,7 +467,7 @@ class PlanInvalidationObservation:
         return digest_value(self.canonical())
 
     def canonical(self) -> dict[str, Any]:
-        return {
+        value = {
             "kind": "plan_invalidation_observation.v1",
             "repository": self.repository,
             "campaign_key": self.campaign_key,
@@ -448,12 +484,15 @@ class PlanInvalidationObservation:
             "required_effects": list(self.required_effects),
             "workspace_identity": self.workspace_identity,
         }
+        if self.source_evidence_digests is not None:
+            value["source_evidence_digests"] = list(self.source_evidence_digests)
+        return value
 
     @classmethod
     def from_canonical(cls, value: Mapping[str, Any]) -> "PlanInvalidationObservation":
         """Decode the Gateway receipt's closed observation projection."""
 
-        expected = {
+        legacy_expected = {
             "kind",
             "repository",
             "campaign_key",
@@ -470,9 +509,12 @@ class PlanInvalidationObservation:
             "required_effects",
             "workspace_identity",
         }
+        expected_with_source_lineage = legacy_expected | {
+            "source_evidence_digests"
+        }
         if (
             not isinstance(value, Mapping)
-            or set(value) != expected
+            or set(value) not in (legacy_expected, expected_with_source_lineage)
             or value.get("kind") != "plan_invalidation_observation.v1"
         ):
             raise ExecutionKernelError(
@@ -484,6 +526,13 @@ class PlanInvalidationObservation:
             raise ExecutionKernelError(
                 "PLAN_INVALIDATION_OBSERVATION_INVALID",
                 "Gateway Plan Invalidation receipt effects are not a list",
+            )
+        has_source_lineage = "source_evidence_digests" in value
+        source_digests = value.get("source_evidence_digests")
+        if has_source_lineage and type(source_digests) is not list:
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_OBSERVATION_INVALID",
+                "Gateway Plan Invalidation receipt source Evidence is not a list",
             )
         try:
             return cls(
@@ -501,6 +550,9 @@ class PlanInvalidationObservation:
                 invalidated_obligation=value["invalidated_obligation"],
                 required_effects=tuple(effects),
                 workspace_identity=value["workspace_identity"],
+                source_evidence_digests=(
+                    None if not has_source_lineage else tuple(source_digests)
+                ),
             )
         except KeyError as error:
             raise ExecutionKernelError(
@@ -558,6 +610,7 @@ class PlanInvalidationDiagnostic:
     exclusive_resources: tuple[str, ...] = ()
     classification_action_id: str | None = None
     classification_disposition: str | None = None
+    source_evidence_digests: tuple[str, ...] | None = None
 
 
 class ActivePlanReader(Protocol):
@@ -626,6 +679,7 @@ class ExecutionKernel:
         wake_ref: str | None = None,
         *,
         plan_invalidation: object | None = None,
+        human_decision: HumanDecisionChoice | None = None,
     ) -> CampaignOutcome:
         """Read back authority, perform all currently due effects, derive one status."""
 
@@ -635,8 +689,31 @@ class ExecutionKernel:
             self._reconcile_plan_invalidations(active, state, work)
             if plan_invalidation is not None:
                 observation = self._coerce_plan_invalidation(plan_invalidation)
+                if self._is_historical_plan_invalidation_replay(
+                    active,
+                    state,
+                    observation,
+                ):
+                    # A receipt from an archived predecessor is accepted only
+                    # when the complete observation is already present in
+                    # revision lineage.  Returning before classification,
+                    # successor activation, wake handling, or effect admission
+                    # makes an exact replay observationally idempotent.
+                    return self._outcome(active.handle, state)
                 self._apply_plan_invalidation(active, state, work, observation)
             self._classify_plan_invalidations_if_needed(active, state, work)
+            if self._human_successor_requires_resume(active, state):
+                active, work, state = self._resume_human_successor(
+                    active,
+                    work,
+                    state,
+                )
+            elif human_decision is not None:
+                active, work, state = self._advance_human_gate(
+                    active,
+                    state,
+                    human_decision,
+                )
             classification = self._current_classification(
                 state,
                 active.current_revision_digest,
@@ -697,7 +774,8 @@ class ExecutionKernel:
             )
         migration_due = state.get("plan_revision_digest") != active.current_revision_digest
         if migration_due:
-            self._validate_successor_state_match(active, state)
+            if not self._human_successor_activation_crossed(active, state):
+                self._validate_successor_state_match(active, state)
             outcome = CampaignOutcome(CampaignStatus.WAIT, "SuccessorMigrationDue")
         else:
             # Reuse the same identity backfill as advance, but do not admit or
@@ -730,6 +808,7 @@ class ExecutionKernel:
             outstanding_effect_ids=outstanding,
             invalidation_classification=classification,
             revision_lineage=self._revision_lineage_summaries(state),
+            human_gate=self._human_gate_summary(state),
         )
 
     @staticmethod
@@ -763,6 +842,11 @@ class ExecutionKernel:
                     if type(run.get("plan_invalidation_resolution")) is dict
                     else None
                 ),
+                source_evidence_digests=(
+                    tuple(invalidation_record["source_evidence_digests"])
+                    if type(invalidation_record.get("source_evidence_digests")) is list
+                    else None
+                ),
             )
         return WorkRunSummary(
             ticket_key=ticket_key,
@@ -779,6 +863,1279 @@ class ExecutionKernel:
             candidate_identity=run.get("candidate_identity"),
             result_digest=run.get("result_digest"),
             evidence_digests=tuple(run.get("evidence_digests", ())),
+        )
+
+    def _replan_budget_defaults(
+        self,
+        active: ActivePlanReadback,
+        plan: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Build the durable budget envelope from the Policy Witness seam."""
+
+        policy = plan.get("policy")
+        if policy is None:
+            # The pre-#136 execution fixtures (and persisted campaigns made
+            # by them) deliberately contain no Policy Witness projection.
+            # They predate the human gate and therefore have no budget
+            # contract to initialize.  Do not invent a digest or limits for
+            # that legacy state; the human-gate path below still fails closed
+            # if it is ever asked to persist a Decision without this envelope.
+            return None
+        if type(policy) is not dict:
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "active PlanSpec omitted its Policy Witness projection",
+            )
+        policy_digest = policy.get("digest")
+        if (
+            type(policy_digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", policy_digest) is None
+        ):
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "active PlanSpec Policy Witness digest is invalid",
+            )
+        reader = getattr(self._plan_control, "read_replan_budget_policy", None)
+        if not callable(reader):
+            # #135 hosts do not expose the #136 read-only policy seam.  Keep
+            # those already-supported campaigns free of a synthetic budget;
+            # any human-gate writer later fails closed when it needs one.
+            return None
+        try:
+            from .human_gate import ReplanBudgetPolicy
+
+            budget = reader(active.handle)
+        except ExecutionKernelError:
+            raise
+        except Exception as error:
+            # A PlanSpec produced before #136 may carry the historical
+            # ``{ref, digest}`` Policy Witness projection while its witness
+            # has no ``replan`` object.  Keep that #135/#134 execution path
+            # compatible: it must not receive a synthetic budget, but a later
+            # human-gate transition will still fail closed because it requires
+            # the budget-bearing seam.  A malformed present budget remains a
+            # hard failure.
+            if (
+                getattr(error, "code", None) == "REPLAN_BUDGET_POLICY_INVALID"
+                and "omitted its replan budget" in getattr(error, "detail", "")
+            ):
+                return None
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "PolicyControl replan budget readback failed",
+            ) from error
+        if type(budget) is not ReplanBudgetPolicy:
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "PlanControl returned an untyped replan budget policy",
+            )
+        if budget.policy_witness_digest != policy_digest:
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_READBACK_INVALID",
+                "replan budget policy is bound to another active Policy Witness",
+            )
+        return {
+            "policy_witness_digest": policy_digest,
+            "successor_revisions_used": 0,
+            "successor_revision_limit": budget.successor_revision_limit,
+            "invalidation_limit": budget.repeated_invalidation_limit,
+            "obligations": {},
+        }
+
+    @staticmethod
+    def _validate_replan_budgets(
+        value: object,
+        expected: Mapping[str, Any],
+    ) -> None:
+        if type(value) is not dict or set(value) != {
+            "policy_witness_digest",
+            "successor_revisions_used",
+            "successor_revision_limit",
+            "invalidation_limit",
+            "obligations",
+        }:
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_READBACK_INVALID",
+                "persisted replan budget schema is not closed",
+            )
+        if (
+            value["policy_witness_digest"]
+            != expected["policy_witness_digest"]
+            or type(value["successor_revisions_used"]) is not int
+            or isinstance(value["successor_revisions_used"], bool)
+            or value["successor_revisions_used"] < 0
+            or value["successor_revision_limit"]
+            != expected["successor_revision_limit"]
+            or value["invalidation_limit"] != expected["invalidation_limit"]
+            or type(value["obligations"]) is not dict
+        ):
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_READBACK_INVALID",
+                "persisted replan budget facts changed",
+            )
+        for obligation_key, record in value["obligations"].items():
+            if (
+                type(obligation_key) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", obligation_key) is None
+                or type(record) is not dict
+                or set(record) != {"evidence_digests"}
+                or type(record["evidence_digests"]) is not list
+                or tuple(record["evidence_digests"])
+                != tuple(sorted(set(record["evidence_digests"])))
+                or any(
+                    type(digest) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                    for digest in record["evidence_digests"]
+                )
+            ):
+                raise ExecutionKernelError(
+                    "REPLAN_BUDGET_READBACK_INVALID",
+                    "persisted replan obligation evidence is invalid",
+                )
+
+    @staticmethod
+    def _obligation_key(
+        observation: PlanInvalidationObservation,
+        run: Mapping[str, Any],
+    ) -> str:
+        return digest_value(
+            {
+                "ticket_key": observation.ticket_key,
+                "invalidated_obligation": observation.invalidated_obligation,
+                "work_subject_digest": run["work_subject_digest"],
+            }
+        )
+
+    def _record_replan_budget_evidence(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        observation: PlanInvalidationObservation,
+        run: Mapping[str, Any],
+    ) -> None:
+        budgets = state.get("replan_budgets")
+        if budgets is None:
+            # Legacy #135/#110 PlanSpecs have no Policy Witness projection
+            # and consequently no human-gate budget contract.  Preserve
+            # their existing invalidation behavior; a human Decision can only
+            # be persisted by the budget-bearing path above.
+            return
+        if type(budgets) is not dict or type(budgets.get("obligations")) is not dict:
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_READBACK_INVALID",
+                "Plan Invalidation has no durable obligation budget",
+            )
+        obligation_key = self._obligation_key(observation, run)
+        entry = budgets["obligations"].setdefault(
+            obligation_key,
+            {"evidence_digests": []},
+        )
+        if type(entry) is not dict or set(entry) != {"evidence_digests"}:
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_READBACK_INVALID",
+                "Plan Invalidation obligation budget is malformed",
+            )
+        evidence_digests = entry["evidence_digests"]
+        if type(evidence_digests) is not list:
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_READBACK_INVALID",
+                "Plan Invalidation obligation Evidence is malformed",
+            )
+        if observation.evidence_digest in evidence_digests:
+            return
+        evidence_digests.append(observation.evidence_digest)
+        evidence_digests.sort()
+        limit = budgets.get("invalidation_limit")
+        if type(limit) is not int or len(evidence_digests) <= limit:
+            return
+        self._persist_budget_exhaustion(
+            active,
+            state,
+            self._current_classification(
+                state,
+                active.current_revision_digest,
+            ),
+            obligation_key,
+            tuple(evidence_digests),
+        )
+
+    def _persist_budget_exhaustion(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        classification: PlanInvalidationClassification | None,
+        obligation_key: str,
+        evidence_digests: tuple[str, ...],
+        *,
+        detail: str | None = None,
+        repeated_invalidations: int | None = None,
+    ) -> None:
+        existing = self._human_gate_summary(state)
+        if existing is not None and existing.phase == "budget_exhausted":
+            return
+        evidence_digests = tuple(sorted(set(evidence_digests)))
+        if not evidence_digests:
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_READBACK_INVALID",
+                "budget exhaustion omitted its Evidence lineage",
+            )
+        if classification is None:
+            classification_action_id = self._replanning_action_id(
+                active,
+                evidence_digests,
+            )
+            snapshot_digest = digest_value(
+                {
+                    "kind": "gwo.replan-budget-snapshot.v1",
+                    "repository": active.handle.repository,
+                    "campaign_key": active.handle.campaign_key,
+                    "plan_revision_digest": active.current_revision_digest,
+                    "evidence_digests": list(evidence_digests),
+                    "obligation_key": obligation_key,
+                }
+            )
+        else:
+            classification_action_id = classification.action_id
+            snapshot_digest = classification.snapshot_digest
+        if detail is None:
+            detail = (
+                "Repeated Plan Invalidation Evidence exhausted the bound for "
+                + obligation_key
+            )
+        identity = {
+            "kind": "gwo.replan-budget-decision-id.v1",
+            "repository": active.handle.repository,
+            "campaign_key": active.handle.campaign_key,
+            "plan_revision_digest": active.current_revision_digest,
+            "classification_action_id": classification_action_id,
+            "snapshot_digest": snapshot_digest,
+            "obligation_key": obligation_key,
+            "evidence_digests": list(evidence_digests),
+        }
+        decision_id = "decision:" + digest_value(identity)[:24]
+        action_id = "replan:budget:" + digest_value(identity)
+        decision = PlanInvalidationDecision(
+            code="REPLAN_BUDGET_EXHAUSTED",
+            detail=detail,
+            required_change="replan_budget",
+        )
+        record = HumanDecisionRecord(
+            decision_id=decision_id,
+            campaign=active.handle,
+            classification_action_id=action_id,
+            plan_revision_digest=active.current_revision_digest,
+            evidence_digests=evidence_digests,
+            required_change=decision.required_change,
+            detail=decision.detail,
+            required_source=RequiredDurableSourceChange(
+                required_change=decision.required_change,
+                source_kind=RequiredDurableSourceChange.source_kind_for(
+                    decision.required_change
+                ),
+                predecessor_source_digest=snapshot_digest,
+                required_subject=obligation_key,
+                detail=decision.detail,
+            ),
+        )
+        self._persist_human_gate_state(
+            active,
+            state,
+            record,
+            phase="budget_exhausted",
+            reason_code=decision.code,
+            repeated_invalidations=(
+                len(evidence_digests)
+                if repeated_invalidations is None
+                else repeated_invalidations
+            ),
+        )
+
+    @staticmethod
+    def _successor_budget_obligation_key(
+        active: ActivePlanReadback,
+        classification: PlanInvalidationClassification | None = None,
+        *,
+        evidence_digests: tuple[str, ...] = (),
+    ) -> str:
+        if classification is None:
+            evidence_digests = tuple(sorted(set(evidence_digests)))
+            if not evidence_digests:
+                raise ExecutionKernelError(
+                    "REPLAN_BUDGET_READBACK_INVALID",
+                    "successor budget exhaustion omitted its Evidence lineage",
+                )
+            classification_action_id = ExecutionKernel._replanning_action_id(
+                active,
+                evidence_digests,
+            )
+        else:
+            classification_action_id = classification.action_id
+            evidence_digests = classification.evidence_digests
+        return digest_value(
+            {
+                "kind": "gwo.replan-successor-budget-obligation.v1",
+                "plan_revision_digest": active.current_revision_digest,
+                "classification_action_id": classification_action_id,
+                "evidence_digests": list(evidence_digests),
+            }
+        )
+
+    @staticmethod
+    def _successor_revision_budget_exhausted(
+        state: Mapping[str, Any],
+    ) -> bool:
+        budgets = state.get("replan_budgets")
+        if budgets is None:
+            # Historical #135 state has no #136 Policy Witness budget and must
+            # retain its pre-budget successor behavior.
+            return False
+        if type(budgets) is not dict:
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_READBACK_INVALID",
+                "successor activation has no durable replan budget envelope",
+            )
+        used = budgets.get("successor_revisions_used")
+        limit = budgets.get("successor_revision_limit")
+        if (
+            type(used) is not int
+            or isinstance(used, bool)
+            or type(limit) is not int
+            or isinstance(limit, bool)
+            or used < 0
+            or limit < 1
+        ):
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_READBACK_INVALID",
+                "successor activation budget counters are invalid",
+            )
+        return used >= limit
+
+    def _persist_budget_exhaustion_readback(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+    ) -> None:
+        self._save(active.handle, state)
+        persisted = self._load(active.handle)
+        if persisted is None or persisted.get("human_gate") != state.get("human_gate"):
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "budget exhaustion Decision did not read back exactly",
+            )
+        state.clear()
+        state.update(persisted)
+
+    def _exhaust_successor_revision_budget(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        classification: PlanInvalidationClassification,
+    ) -> None:
+        budgets = state.get("replan_budgets")
+        if type(budgets) is not dict:
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_READBACK_INVALID",
+                "successor activation has no durable replan budget envelope",
+            )
+        self._persist_budget_exhaustion(
+            active,
+            state,
+            classification,
+            self._successor_budget_obligation_key(active, classification),
+            classification.evidence_digests,
+            detail=(
+                "Successor Plan Revision limit exhausted before activation: "
+                f"{budgets['successor_revisions_used']} of "
+                f"{budgets['successor_revision_limit']} revisions used"
+            ),
+            repeated_invalidations=0,
+        )
+        self._persist_budget_exhaustion_readback(active, state)
+
+    @staticmethod
+    def _human_planning_action_id(
+        decision_id: str,
+        source_readback_digest: str,
+        predecessor_revision_digest: str,
+    ) -> str:
+        try:
+            return _derive_human_planning_action_id(
+                decision_id,
+                source_readback_digest,
+                predecessor_revision_digest,
+            )
+        except Exception as error:
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human Decision cannot bind a complete successor action",
+            ) from error
+
+    @staticmethod
+    def _human_gate_summary(
+        state: Mapping[str, Any],
+    ) -> HumanGateSummary | None:
+        raw = state.get("human_gate")
+        if raw is None:
+            return None
+        if type(raw) is not dict or type(raw.get("summary")) is not dict:
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human gate state omitted its exact inspect summary",
+            )
+        try:
+            return HumanGateSummary.from_canonical(raw["summary"])
+        except Exception as error:
+            if isinstance(error, ExecutionKernelError):
+                raise
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human gate inspect summary did not read back",
+            ) from error
+
+    def _persist_human_gate_state(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        record: HumanDecisionRecord,
+        *,
+        phase: str,
+        reason_code: str,
+        choice: HumanDecisionChoice | None = None,
+        source_readback: HumanSourceReadback | None = None,
+        planning_action_id: str | None = None,
+        successor_revision_digest: str | None = None,
+        repeated_invalidations: int = 0,
+    ) -> None:
+        budgets = state.get("replan_budgets")
+        if budgets is None:
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "human gate requires a durable replan budget policy",
+            )
+        if type(budgets) is not dict:
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_READBACK_INVALID",
+                "human gate budget envelope is malformed",
+            )
+        successor_used = budgets.get("successor_revisions_used")
+        successor_limit = budgets.get("successor_revision_limit")
+        invalidation_limit = budgets.get("invalidation_limit")
+        if (
+            type(successor_used) is not int
+            or type(successor_limit) is not int
+            or type(invalidation_limit) is not int
+        ):
+            raise ExecutionKernelError(
+                "REPLAN_BUDGET_READBACK_INVALID",
+                "human gate budget counters are invalid",
+            )
+        summary = HumanGateSummary(
+            phase=phase,
+            decision_id=record.decision_id,
+            classification_action_id=record.classification_action_id,
+            required_change=record.required_change,
+            evidence_digests=record.evidence_digests,
+            required_source_kind=record.required_source.source_kind,
+            reason_code=reason_code,
+            source_readback_digest=(
+                None if source_readback is None else source_readback.readback_digest
+            ),
+            planning_action_id=planning_action_id,
+            predecessor_revision_digest=record.plan_revision_digest,
+            successor_revision_digest=successor_revision_digest,
+            successor_revisions_used=successor_used,
+            successor_revision_limit=successor_limit,
+            repeated_invalidations=repeated_invalidations,
+            repeated_invalidation_limit=invalidation_limit,
+        )
+        state["human_gate"] = {
+            "decision": record.canonical(),
+            "decision_digest": record.digest,
+            "choice": None if choice is None else choice.canonical(),
+            "source_readback": (
+                None
+                if source_readback is None
+                else source_readback.canonical()
+            ),
+            "summary": summary.canonical(),
+        }
+        from ._canonical import canonical_bytes
+
+        if canonical_bytes(record.canonical()) != canonical_bytes(
+            HumanDecisionRecord.from_canonical(record.canonical()).canonical()
+        ):
+            raise ExecutionKernelError(
+                "HUMAN_DECISION_RECORD_INVALID",
+                "human Decision did not round-trip canonically",
+            )
+
+    def _persist_human_gate_attempt(
+        self,
+        *,
+        campaign: CampaignHandle,
+        decision: HumanDecisionRecord,
+        source_readback: HumanSourceReadback,
+        predecessor_revision_digest: str,
+        state: str,
+        compilation_record_artifact_digest: str | None = None,
+        activation_receipt_digest: str | None = None,
+    ) -> None:
+        """Persist the human attempt before/after each external commit point."""
+
+        from .human_gate import HumanGateAttempt
+
+        if (
+            type(decision) is not HumanDecisionRecord
+            or decision.campaign != campaign
+            or type(source_readback) is not HumanSourceReadback
+            or not source_readback.approved
+        ):
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human attempt is not bound to an approved source readback",
+            )
+        reader = getattr(self._plan_control, "read_human_gate_attempt", None)
+        saver = getattr(self._plan_control, "save_human_gate_attempt", None)
+        if not callable(reader) or not callable(saver):
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "PlanControl omitted durable human attempt readback",
+            )
+        planning_action_id = self._human_planning_action_id(
+            decision.decision_id,
+            source_readback.readback_digest,
+            predecessor_revision_digest,
+        )
+        existing = reader(
+            campaign,
+            decision.decision_id,
+            source_readback.readback_digest,
+        )
+        if existing is not None:
+            if type(existing) is not HumanGateAttempt:
+                raise ExecutionKernelError(
+                    "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                    "durable human attempt is not typed",
+                )
+            if (
+                existing.decision_id != decision.decision_id
+                or existing.campaign != campaign
+                or existing.predecessor_revision_digest
+                != predecessor_revision_digest
+                or existing.source_readback_digest
+                != source_readback.readback_digest
+                or existing.tracker_source_digest
+                != source_readback.tracker_source_digest
+                or existing.policy_witness_digest
+                != source_readback.policy_witness_digest
+                or existing.planning_action_id != planning_action_id
+                or existing.planning_protocol_id != REPLANNING_OUTPUT_PROTOCOL_ID
+            ):
+                raise ExecutionKernelError(
+                    "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                    "durable human attempt identity changed",
+                )
+            if existing.state == "active_successor":
+                return
+            if compilation_record_artifact_digest is None:
+                compilation_record_artifact_digest = (
+                    existing.compilation_record_artifact_digest
+                )
+            if activation_receipt_digest is None:
+                activation_receipt_digest = existing.activation_receipt_digest
+        attempt = HumanGateAttempt(
+            decision_id=decision.decision_id,
+            campaign=campaign,
+            predecessor_revision_digest=predecessor_revision_digest,
+            source_readback_digest=source_readback.readback_digest,
+            tracker_source_digest=source_readback.tracker_source_digest,
+            policy_witness_digest=source_readback.policy_witness_digest,
+            planning_action_id=planning_action_id,
+            planning_protocol_id=REPLANNING_OUTPUT_PROTOCOL_ID,
+            state=state,
+            compilation_record_artifact_digest=compilation_record_artifact_digest,
+            activation_receipt_digest=activation_receipt_digest,
+        )
+        try:
+            saved = saver(attempt)
+            observed = reader(
+                campaign,
+                decision.decision_id,
+                source_readback.readback_digest,
+            )
+        except ExecutionKernelError:
+            raise
+        except Exception as error:
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human attempt could not be persisted",
+            ) from error
+        if observed != saved or observed != attempt:
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human attempt did not read back exactly",
+            )
+
+    def _ensure_human_gate(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        classification: PlanInvalidationClassification,
+    ) -> None:
+        """Persist one stable Decision and its quiescent inspect projection."""
+
+        existing = state.get("human_gate")
+        if existing is not None:
+            if type(existing) is not dict:
+                raise ExecutionKernelError(
+                    "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                    "human gate state is not an object",
+                )
+            summary = self._human_gate_summary(state)
+            if (
+                summary is None
+                or summary.classification_action_id != classification.action_id
+                or summary.predecessor_revision_digest
+                != active.current_revision_digest
+                or summary.evidence_digests != classification.evidence_digests
+            ):
+                raise ExecutionKernelError(
+                    "HUMAN_DECISION_CONFLICT",
+                    "persisted human Decision is bound to another invalidation",
+                )
+            return
+        decision = classification.decision
+        if decision is None:
+            raise ExecutionKernelError(
+                "PLAN_INVALIDATION_DECISION_INVALID",
+                "human classification omitted its named Decision",
+            )
+        require = getattr(self._plan_control, "require_human_decision", None)
+        if callable(require):
+            try:
+                record = require(active.handle, classification)
+            except ExecutionKernelError:
+                raise
+            except Exception as error:
+                raise ExecutionKernelError(
+                    "HUMAN_DECISION_READBACK_INVALID",
+                    "PlanControl did not durably save the human Decision",
+                ) from error
+            if type(record) is not HumanDecisionRecord:
+                raise ExecutionKernelError(
+                    "HUMAN_DECISION_READBACK_INVALID",
+                    "PlanControl returned an untyped human Decision",
+                )
+        else:
+            # Compatibility for the narrow #134 reader double.  Production
+            # host composition always exposes the durable PlanControl seam;
+            # this fallback is deliberately never used by a writer.
+            identity = {
+                "kind": "gwo.human-decision-id.v1",
+                "repository": active.handle.repository,
+                "campaign_key": active.handle.campaign_key,
+                "classification_action_id": classification.action_id,
+                "plan_revision_digest": active.current_revision_digest,
+                "evidence_digests": list(classification.evidence_digests),
+                "decision": decision.canonical(),
+            }
+            decision_id = "decision:" + digest_value(identity)[:24]
+            source_kind = RequiredDurableSourceChange.source_kind_for(
+                decision.required_change
+            )
+            required_source = RequiredDurableSourceChange(
+                required_change=decision.required_change,
+                source_kind=source_kind,
+                predecessor_source_digest=classification.snapshot_digest,
+                required_subject=(
+                    f"{active.handle.campaign_key}:{decision.required_change}"
+                ),
+                detail=decision.detail,
+            )
+            record = HumanDecisionRecord(
+                decision_id=decision_id,
+                campaign=active.handle,
+                classification_action_id=classification.action_id,
+                plan_revision_digest=active.current_revision_digest,
+                evidence_digests=classification.evidence_digests,
+                required_change=decision.required_change,
+                detail=decision.detail,
+                required_source=required_source,
+            )
+        self._persist_human_gate_state(
+            active,
+            state,
+            record,
+            phase="awaiting_human_choice",
+            reason_code=decision.code,
+        )
+
+    def _advance_human_gate(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        choice: HumanDecisionChoice,
+    ) -> tuple[
+        ActivePlanReadback,
+        dict[str, dict[str, Any]],
+        dict[str, Any],
+    ]:
+        if type(choice) is not HumanDecisionChoice:
+            raise ExecutionKernelError(
+                "HUMAN_APPROVAL_INPUT_INVALID",
+                "advance requires a typed HumanDecisionChoice",
+            )
+        gate = state.get("human_gate")
+        if type(gate) is not dict or type(gate.get("decision")) is not dict:
+            raise ExecutionKernelError(
+                "HUMAN_DECISION_READBACK_INVALID",
+                "human approval has no durable Decision to continue",
+            )
+        try:
+            decision = HumanDecisionRecord.from_canonical(gate["decision"])
+        except Exception as error:
+            raise ExecutionKernelError(
+                "HUMAN_DECISION_READBACK_INVALID",
+                "persisted human Decision cannot be hydrated",
+            ) from error
+        if decision.campaign != active.handle or choice.decision_id != decision.decision_id:
+            raise ExecutionKernelError(
+                "HUMAN_APPROVAL_INPUT_INVALID",
+                "human approval is bound to another Campaign Decision",
+            )
+
+        summary = self._human_gate_summary(state)
+        if summary is None:
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human approval has no inspect summary",
+            )
+        if summary.phase in {"active_successor", "budget_exhausted", "rejected_change"}:
+            return active, self._authoritative_active(active.handle)[1], state
+
+        if self._successor_revision_budget_exhausted(state):
+            classification = self._current_classification(
+                state,
+                active.current_revision_digest,
+            )
+            if (
+                classification is None
+                or classification.disposition
+                is not PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION
+            ):
+                raise ExecutionKernelError(
+                    "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                    "human successor budget lost its human classification",
+                )
+            self._exhaust_successor_revision_budget(active, state, classification)
+            return active, self._authoritative_active(active.handle)[1], state
+
+        readback = self._read_human_decision_source(active, decision, choice)
+        if type(readback) is not HumanSourceReadback:
+            raise ExecutionKernelError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "PlanControl returned an untyped human source readback",
+            )
+        if readback.decision_id != decision.decision_id:
+            raise ExecutionKernelError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "human source readback names another Decision",
+            )
+
+        if readback.state == "pending":
+            phase = "awaiting_durable_tracker_policy_readback"
+        elif readback.state == "approved":
+            phase = "planning_validated_successor"
+        elif readback.state == "rejected":
+            phase = "rejected_change"
+        else:
+            phase = "awaiting_durable_tracker_policy_readback"
+
+        if readback.approved:
+            classification = self._current_classification(
+                state,
+                active.current_revision_digest,
+            )
+            if (
+                classification is None
+                or classification.disposition
+                is not PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION
+                or classification.decision is None
+                or classification.decision.required_change != decision.required_change
+            ):
+                raise ExecutionKernelError(
+                    "HUMAN_SUCCESSOR_TRANSITION_READBACK_INVALID",
+                    "approved human source lost its original human classification",
+                )
+            intent = self._human_successor_transition_intent(
+                active,
+                classification,
+                decision,
+                readback,
+            )
+            state["human_successor_transition"] = intent
+            self._persist_human_gate_state(
+                active,
+                state,
+                decision,
+                phase="planning_validated_successor",
+                reason_code=readback.reason_code,
+                choice=choice,
+                source_readback=readback,
+                planning_action_id=intent["classification_action_id"],
+                repeated_invalidations=summary.repeated_invalidations,
+            )
+            self._persist_human_gate_attempt(
+                campaign=active.handle,
+                decision=decision,
+                source_readback=readback,
+                predecessor_revision_digest=active.current_revision_digest,
+                state="planning_validated_successor",
+            )
+        else:
+            self._persist_human_gate_state(
+                active,
+                state,
+                decision,
+                phase=phase,
+                reason_code=readback.reason_code,
+                choice=choice,
+                source_readback=readback,
+                repeated_invalidations=summary.repeated_invalidations,
+            )
+        self._save(active.handle, state)
+        persisted = self._load(active.handle)
+        if persisted is None or persisted.get("human_gate") != state.get("human_gate"):
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human source readback did not persist exactly",
+        )
+        state.clear()
+        state.update(persisted)
+
+        if not readback.approved:
+            return active, self._authoritative_active(active.handle)[1], state
+
+        continuation = getattr(self._plan_control, "advance_human_decision", None)
+        if not callable(continuation):
+            raise ExecutionKernelError(
+                "HUMAN_APPROVAL_UNAUTHORIZED",
+                "PlanControl omitted the approved human activation seam",
+            )
+        try:
+            activated_readback = continuation(active.handle, decision, choice)
+        except ExecutionKernelError:
+            raise
+        except Exception as error:
+            raise ExecutionKernelError(
+                "HUMAN_SUCCESSOR_ACTIVATION_FAILED",
+                "PlanControl approved human successor activation did not complete",
+            ) from error
+        if type(activated_readback) is not HumanSourceReadback or activated_readback != readback:
+            raise ExecutionKernelError(
+                "HUMAN_SUCCESSOR_ACTIVATION_READBACK_INVALID",
+                "approved human activation did not return the durable source readback",
+            )
+        return self._finish_human_successor(active, state)
+
+    def _read_human_decision_source(
+        self,
+        active: ActivePlanReadback,
+        decision: HumanDecisionRecord,
+        choice: HumanDecisionChoice,
+    ) -> HumanSourceReadback:
+        reader = getattr(self._plan_control, "read_human_decision_source", None)
+        try:
+            if callable(reader):
+                readback = reader(active.handle, decision, choice)
+            else:
+                continuation = getattr(
+                    self._plan_control,
+                    "advance_human_decision",
+                    None,
+                )
+                if not callable(continuation):
+                    raise ExecutionKernelError(
+                        "HUMAN_APPROVAL_UNAUTHORIZED",
+                        "PlanControl omitted the read-only human source seam",
+                    )
+                try:
+                    readback = continuation(
+                        active.handle,
+                        decision,
+                        choice,
+                        _read_only=True,
+                    )
+                except TypeError as error:
+                    raise ExecutionKernelError(
+                        "HUMAN_APPROVAL_UNAUTHORIZED",
+                        "PlanControl host must expose read_human_decision_source",
+                    ) from error
+        except ExecutionKernelError:
+            raise
+        except Exception as error:
+            raise ExecutionKernelError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "PlanControl human source readback did not complete",
+            ) from error
+        if type(readback) is not HumanSourceReadback:
+            raise ExecutionKernelError(
+                "HUMAN_SOURCE_READBACK_INVALID",
+                "PlanControl returned an untyped human source readback",
+            )
+        return readback
+
+    @staticmethod
+    def _human_successor_transition_intent(
+        active: ActivePlanReadback,
+        classification: PlanInvalidationClassification,
+        decision: HumanDecisionRecord,
+        readback: HumanSourceReadback,
+    ) -> dict[str, Any]:
+        return {
+            "kind": "human_successor_transition.v1",
+            "decision_id": decision.decision_id,
+            "classification_action_id": ExecutionKernel._human_planning_action_id(
+                decision.decision_id,
+                readback.readback_digest,
+                active.current_revision_digest,
+            ),
+            "classification_digest": None,
+            "snapshot_digest": classification.snapshot_digest,
+            "previous_revision_digest": active.current_revision_digest,
+            "evidence_digests": list(decision.evidence_digests),
+            "source_readback_digest": readback.readback_digest,
+            "state": "activation_due",
+        }
+
+    def _finish_human_successor(
+        self,
+        predecessor: ActivePlanReadback,
+        state: dict[str, Any],
+        *,
+        predecessor_revision_digest: str | None = None,
+    ) -> tuple[
+        ActivePlanReadback,
+        dict[str, dict[str, Any]],
+        dict[str, Any],
+    ]:
+        """Read back the human activation and commit its Kernel transition."""
+
+        previous_digest = (
+            predecessor.current_revision_digest
+            if predecessor_revision_digest is None
+            else predecessor_revision_digest
+        )
+        fresh, successor_work = self._authoritative_active(predecessor.handle)
+        transition = state.get("human_successor_transition")
+        if type(transition) is not dict:
+            raise ExecutionKernelError(
+                "HUMAN_SUCCESSOR_TRANSITION_READBACK_INVALID",
+                "approved human successor omitted its durable transition intent",
+            )
+        if (
+            fresh.current_revision_digest == previous_digest
+            or fresh.activation_receipt.expected_previous_revision_digest
+            != previous_digest
+            or fresh.activation_receipt.planning_stable_action_id
+            != transition.get("classification_action_id")
+        ):
+            raise ExecutionKernelError(
+                "HUMAN_SUCCESSOR_ACTIVATION_READBACK_INVALID",
+                "approved human successor Activation Receipt is not human-bound",
+            )
+        decision = HumanDecisionRecord.from_canonical(
+            state["human_gate"]["decision"]
+        )
+        source = HumanSourceReadback.from_canonical(
+            state["human_gate"]["source_readback"]
+        )
+        classification = self._human_successor_classification(
+            state,
+            transition,
+            decision,
+            source,
+            fresh,
+        )
+        transition = {
+            **transition,
+            "classification_digest": classification.digest,
+            "state": "activated",
+        }
+        state["human_successor_transition"] = transition
+        state["human_successor_classification"] = classification.canonical()
+        choice = HumanDecisionChoice.from_canonical(state["human_gate"]["choice"])
+        summary = self._human_gate_summary(state)
+        assert summary is not None  # guarded by the durable gate write
+        self._persist_human_gate_state(
+            predecessor,
+            state,
+            decision,
+            phase="active_successor",
+            reason_code=source.reason_code,
+            choice=choice,
+            source_readback=source,
+            planning_action_id=transition["classification_action_id"],
+            successor_revision_digest=fresh.current_revision_digest,
+            repeated_invalidations=summary.repeated_invalidations,
+        )
+        self._save(predecessor.handle, state)
+        persisted = self._load(predecessor.handle)
+        if persisted is None or persisted.get("human_successor_transition") != transition:
+            raise ExecutionKernelError(
+                "HUMAN_SUCCESSOR_TRANSITION_READBACK_INVALID",
+                "human successor transition did not read back exactly",
+            )
+        state.clear()
+        state.update(persisted)
+        try:
+            plan = load_canonical_json(fresh.plan_spec_bytes)
+        except CanonicalJsonError as error:
+            raise ExecutionKernelError(
+                "SUCCESSOR_ACTIVATION_READBACK_INVALID",
+                "human successor PlanSpec is not canonical",
+            ) from error
+        reconciled = self._reconcile_successor_revision(
+            fresh,
+            state,
+            successor_work,
+            plan,
+        )
+        self._persist_human_gate_attempt(
+            campaign=predecessor.handle,
+            decision=decision,
+            source_readback=source,
+            predecessor_revision_digest=previous_digest,
+            state="active_successor",
+            compilation_record_artifact_digest=(
+                fresh.activation_receipt.compilation_record_artifact_digest
+            ),
+            activation_receipt_digest=digest_value(
+                fresh.activation_receipt.__dict__
+            ),
+        )
+        return (
+            fresh,
+            successor_work,
+            reconciled,
+        )
+
+    @staticmethod
+    def _human_successor_requires_resume(
+        active: ActivePlanReadback,
+        state: Mapping[str, Any],
+    ) -> bool:
+        transition = state.get("human_successor_transition")
+        if type(transition) is not dict:
+            return False
+        if transition.get("state") not in {"activation_due", "activated"}:
+            return False
+        return (
+            transition.get("state") == "activation_due"
+            or state.get("plan_revision_digest") != active.current_revision_digest
+        )
+
+    @staticmethod
+    def _human_successor_activation_crossed(
+        active: ActivePlanReadback,
+        state: Mapping[str, Any],
+    ) -> bool:
+        """Recognize the recoverable receipt window before human finalization."""
+
+        transition = state.get("human_successor_transition")
+        if type(transition) is not dict or transition.get("state") != "activation_due":
+            return False
+        previous_digest = transition.get("previous_revision_digest")
+        action_id = transition.get("classification_action_id")
+        return (
+            type(previous_digest) is str
+            and state.get("plan_revision_digest") == previous_digest
+            and active.current_revision_digest != previous_digest
+            and active.activation_receipt.expected_previous_revision_digest
+            == previous_digest
+            and active.activation_receipt.planning_stable_action_id == action_id
+        )
+
+    def _resume_human_successor(
+        self,
+        active: ActivePlanReadback,
+        work: dict[str, dict[str, Any]],
+        state: dict[str, Any],
+    ) -> tuple[
+        ActivePlanReadback,
+        dict[str, dict[str, Any]],
+        dict[str, Any],
+    ]:
+        transition = state.get("human_successor_transition")
+        if type(transition) is not dict:
+            raise ExecutionKernelError(
+                "HUMAN_SUCCESSOR_TRANSITION_READBACK_INVALID",
+                "human successor restart omitted its transition intent",
+            )
+        previous_digest = transition.get("previous_revision_digest")
+        if type(previous_digest) is not str:
+            raise ExecutionKernelError(
+                "HUMAN_SUCCESSOR_TRANSITION_READBACK_INVALID",
+                "human successor transition omitted its predecessor revision",
+            )
+        try:
+            decision = HumanDecisionRecord.from_canonical(
+                state["human_gate"]["decision"]
+            )
+            source = HumanSourceReadback.from_canonical(
+                state["human_gate"]["source_readback"]
+            )
+        except Exception as error:
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human successor restart cannot hydrate its durable source lineage",
+            ) from error
+        reader = getattr(self._plan_control, "read_human_gate_attempt", None)
+        if not callable(reader):
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "PlanControl omitted durable human attempt readback",
+            )
+        try:
+            durable_attempt = reader(
+                active.handle,
+                decision.decision_id,
+                source.readback_digest,
+            )
+        except ExecutionKernelError:
+            raise
+        except Exception as error:
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "durable human attempt could not be read during restart",
+            ) from error
+        from .human_gate import HumanGateAttempt
+
+        expected_action_id = self._human_planning_action_id(
+            decision.decision_id,
+            source.readback_digest,
+            previous_digest,
+        )
+        if type(durable_attempt) is not HumanGateAttempt or (
+            durable_attempt.campaign != active.handle
+            or durable_attempt.predecessor_revision_digest != previous_digest
+            or durable_attempt.source_readback_digest != source.readback_digest
+            or durable_attempt.tracker_source_digest != source.tracker_source_digest
+            or durable_attempt.policy_witness_digest != source.policy_witness_digest
+            or durable_attempt.planning_action_id != expected_action_id
+            or durable_attempt.state
+            not in {"planning_validated_successor", "active_successor"}
+        ):
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human successor restart lacks the exact durable attempt lineage",
+            )
+        if active.current_revision_digest != previous_digest:
+            return self._finish_human_successor(
+                active,
+                state,
+                predecessor_revision_digest=previous_digest,
+            )
+        try:
+            choice = HumanDecisionChoice.from_canonical(
+                state["human_gate"]["choice"]
+            )
+        except Exception as error:
+            raise ExecutionKernelError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human successor restart cannot hydrate its durable choice",
+            ) from error
+        if self._successor_revision_budget_exhausted(state):
+            classification = self._current_classification(
+                state,
+                previous_digest,
+            )
+            if (
+                classification is None
+                or classification.disposition
+                is not PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION
+            ):
+                raise ExecutionKernelError(
+                    "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                    "human successor restart lost its human classification",
+                )
+            self._exhaust_successor_revision_budget(active, state, classification)
+            return active, work, state
+        continuation = getattr(self._plan_control, "advance_human_decision", None)
+        if not callable(continuation):
+            raise ExecutionKernelError(
+                "HUMAN_APPROVAL_UNAUTHORIZED",
+                "PlanControl omitted the approved human activation seam",
+            )
+        try:
+            readback = continuation(active.handle, decision, choice)
+        except ExecutionKernelError:
+            raise
+        except Exception as error:
+            raise ExecutionKernelError(
+                "HUMAN_SUCCESSOR_ACTIVATION_FAILED",
+                "human successor restart activation did not complete",
+            ) from error
+        expected = HumanSourceReadback.from_canonical(
+            state["human_gate"]["source_readback"]
+        )
+        if type(readback) is not HumanSourceReadback or readback != expected:
+            raise ExecutionKernelError(
+                "HUMAN_SUCCESSOR_ACTIVATION_READBACK_INVALID",
+                "human successor restart returned a different source readback",
+            )
+        return self._finish_human_successor(active, state)
+
+    def _human_successor_classification(
+        self,
+        state: Mapping[str, Any],
+        transition: Mapping[str, Any],
+        decision: HumanDecisionRecord,
+        source: HumanSourceReadback,
+        fresh: ActivePlanReadback,
+    ) -> PlanInvalidationClassification:
+        raw = state.get("human_successor_classification")
+        if raw is not None:
+            classification = self._decode_classification(raw)
+            if (
+                classification.action_id != transition.get("classification_action_id")
+                or classification.disposition
+                is not PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR
+            ):
+                raise ExecutionKernelError(
+                    "HUMAN_SUCCESSOR_TRANSITION_READBACK_INVALID",
+                    "human successor classification is not an approved human action",
+                )
+            return classification
+        original = self._current_classification(
+            state,
+            transition["previous_revision_digest"],
+        )
+        if (
+            original is None
+            or original.disposition
+            is not PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION
+            or original.decision is None
+            or original.decision.required_change != decision.required_change
+        ):
+            raise ExecutionKernelError(
+                "HUMAN_SUCCESSOR_TRANSITION_READBACK_INVALID",
+                "human successor lost its original human Decision classification",
+            )
+        return PlanInvalidationClassification(
+            action_id=transition["classification_action_id"],
+            snapshot_digest=transition["snapshot_digest"],
+            plan_revision_digest=transition["previous_revision_digest"],
+            evidence_digests=decision.evidence_digests,
+            disposition=PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR,
+            reason=(
+                "approved human source "
+                + source.source_change_digest
+                if source.source_change_digest is not None
+                else "approved human source"
+            ),
+            capability_proof_digest=original.capability_proof_digest,
+            successor_ticket_keys=tuple(sorted(item.ticket_key for item in fresh.claim_proofs)),
         )
 
     @staticmethod
@@ -880,6 +2237,7 @@ class ExecutionKernel:
             ) from error
         if type(plan) is not dict:
             raise ExecutionKernelError("ACTIVE_PLAN_INVALID", "active PlanSpec is not an object")
+        budget_defaults = self._replan_budget_defaults(active, plan)
         state = self._load(active.handle)
         if state is None:
             runs: dict[str, dict[str, Any]] = {}
@@ -920,6 +2278,8 @@ class ExecutionKernel:
                 "accepted_results": [],
                 "revision_lineage": [],
             }
+            if budget_defaults is not None:
+                state["replan_budgets"] = budget_defaults
             self._save(active.handle, state)
             return state
         if (
@@ -948,6 +2308,20 @@ class ExecutionKernel:
                 "EXECUTION_STORE_INVALID", "ExecutionKernel effects are not a mapping"
             )
         dirty = False
+        if budget_defaults is None:
+            if "replan_budgets" in state:
+                raise ExecutionKernelError(
+                    "REPLAN_BUDGET_READBACK_INVALID",
+                    "persisted replan budgets have no active Policy Witness",
+                )
+        elif "replan_budgets" not in state:
+            state["replan_budgets"] = budget_defaults
+            dirty = True
+        else:
+            self._validate_replan_budgets(
+                state["replan_budgets"],
+                budget_defaults,
+            )
         # Backfill only a missing historical Work Run identity.  An existing
         # key is already bound state: preserve the legacy Ticket-shaped key so
         # same-revision invalidation records remain exact.  Only successor
@@ -1088,6 +2462,14 @@ class ExecutionKernel:
         if state.get("plan_revision_digest") == active.current_revision_digest:
             return self._load_or_initialize(active, work)
 
+        if self._human_successor_activation_crossed(active, state):
+            # PlanControl may have crossed its durable activation receipt just
+            # before the Kernel could persist the human-bound classification.
+            # Leave the predecessor row intact so advance() can finish the
+            # transition from this intent without treating REQUIRE_HUMAN as a
+            # normal approved-successor classification.
+            return state
+
         classification = self._validate_successor_state_match(active, state)
         transition = state["successor_transition"]
         previous_writer_generation = state.get(
@@ -1134,6 +2516,8 @@ class ExecutionKernel:
         """Prove that an active revision is the one recorded successor."""
 
         try:
+            if state.get("human_successor_transition") is not None:
+                return self._validate_human_successor_state_match(active, state)
             transition = state.get("successor_transition")
             previous_digest = state.get("plan_revision_digest")
             if (
@@ -1196,6 +2580,78 @@ class ExecutionKernel:
                 "active revision changed without one exact durable successor transition",
             ) from error
 
+    def _validate_human_successor_state_match(
+        self,
+        active: ActivePlanReadback,
+        state: Mapping[str, Any],
+    ) -> PlanInvalidationClassification:
+        transition = state.get("human_successor_transition")
+        try:
+            if (
+                type(transition) is not dict
+                or set(transition)
+                != {
+                    "kind",
+                    "decision_id",
+                    "classification_action_id",
+                    "classification_digest",
+                    "snapshot_digest",
+                    "previous_revision_digest",
+                    "evidence_digests",
+                    "source_readback_digest",
+                    "state",
+                }
+                or transition["kind"] != "human_successor_transition.v1"
+                or transition["state"] not in {"activation_due", "activated"}
+                or transition["previous_revision_digest"]
+                != state.get("plan_revision_digest")
+                or active.current_revision_digest
+                == transition["previous_revision_digest"]
+                or active.activation_receipt.expected_previous_revision_digest
+                != transition["previous_revision_digest"]
+                or active.activation_receipt.planning_stable_action_id
+                != transition["classification_action_id"]
+                or not transition["classification_action_id"].startswith(
+                    _HUMAN_SUCCESSOR_ACTION_PREFIX
+                )
+                or type(transition["classification_digest"]) is not str
+            ):
+                raise ValueError("human successor transition does not match receipt")
+            classification = self._decode_classification(
+                state.get("human_successor_classification")
+            )
+            if (
+                classification.action_id != transition["classification_action_id"]
+                or classification.digest != transition["classification_digest"]
+                or classification.snapshot_digest != transition["snapshot_digest"]
+                or classification.plan_revision_digest
+                != transition["previous_revision_digest"]
+                or list(classification.evidence_digests)
+                != transition["evidence_digests"]
+                or classification.disposition
+                is not PlanInvalidationDisposition.USE_APPROVED_SUCCESSOR
+                or classification.decision is not None
+            ):
+                raise ValueError("human successor classification does not match transition")
+            gate = self._human_gate_summary(state)
+            if (
+                gate is None
+                or gate.phase not in {"planning_validated_successor", "active_successor"}
+                or gate.decision_id != transition["decision_id"]
+                or gate.planning_action_id != transition["classification_action_id"]
+                or gate.source_readback_digest
+                != transition["source_readback_digest"]
+            ):
+                raise ValueError("human successor gate summary does not match transition")
+            return classification
+        except Exception as error:
+            if isinstance(error, ExecutionKernelError) and error.code == "CAMPAIGN_REVISION_CHANGED":
+                raise
+            raise ExecutionKernelError(
+                "CAMPAIGN_REVISION_CHANGED",
+                "active revision changed without one exact durable human successor transition",
+            ) from error
+
     def _activate_successor_if_due(
         self,
         active: ActivePlanReadback,
@@ -1224,6 +2680,14 @@ class ExecutionKernel:
         if not callable(activator):
             # The #134 classifier double intentionally has no successor port;
             # it remains quiescent rather than gaining a second public route.
+            return active, work, state
+
+        if self._successor_revision_budget_exhausted(state):
+            self._exhaust_successor_revision_budget(
+                active,
+                state,
+                classification,
+            )
             return active, work, state
 
         transition = {
@@ -1574,9 +3038,57 @@ class ExecutionKernel:
                 successor_accepted.append(binding.canonical())
             successor_runs[ticket_key] = run
 
-        transition = load_canonical_json(
-            canonical_bytes(state["successor_transition"])
+        transition_key = (
+            "human_successor_transition"
+            if "human_successor_transition" in state
+            else "successor_transition"
         )
+        transition = load_canonical_json(
+            canonical_bytes(state[transition_key])
+        )
+        budgets = state.get("replan_budgets")
+        if budgets is None:
+            # Historical #135 campaigns have no #136 Policy Witness budget.
+            # Preserve their successor behavior without manufacturing a
+            # counter; any human-gated successor is initialized only from the
+            # exact budget-bearing policy seam above.
+            next_budgets = None
+        else:
+            if type(budgets) is not dict:
+                raise ExecutionKernelError(
+                    "REPLAN_BUDGET_READBACK_INVALID",
+                    "successor migration omitted its replan budget envelope",
+                )
+            successor_budget_defaults = self._replan_budget_defaults(active, plan)
+            if successor_budget_defaults is None:
+                raise ExecutionKernelError(
+                    "REPLAN_BUDGET_READBACK_INVALID",
+                    "successor migration omitted its active Policy Witness budget",
+                )
+            next_budgets = load_canonical_json(canonical_bytes(budgets))
+            # The approved successor may carry a new authoritative Policy
+            # Witness (the human-gate authority-change path).  The Campaign
+            # counters and obligation Evidence remain durable across the
+            # revision, while the successor's exact policy supplies the new
+            # finite bounds and witness identity.
+            next_budgets["policy_witness_digest"] = successor_budget_defaults[
+                "policy_witness_digest"
+            ]
+            next_budgets["successor_revision_limit"] = successor_budget_defaults[
+                "successor_revision_limit"
+            ]
+            next_budgets["invalidation_limit"] = successor_budget_defaults[
+                "invalidation_limit"
+            ]
+            next_budgets["successor_revisions_used"] += 1
+            if (
+                next_budgets["successor_revisions_used"]
+                > next_budgets["successor_revision_limit"]
+            ):
+                raise ExecutionKernelError(
+                    "REPLAN_BUDGET_READBACK_INVALID",
+                    "successor revision budget was exceeded before migration",
+                )
         new_state: dict[str, Any] = {
             "plan_revision_digest": active.current_revision_digest,
             "activation_receipt_digest": digest_value(
@@ -1593,8 +3105,29 @@ class ExecutionKernel:
                 key=lambda value: value["ticket_key"],
             ),
             "revision_lineage": [*old_lineage, lineage],
-            "successor_transition": transition,
         }
+        if next_budgets is not None:
+            new_state["replan_budgets"] = next_budgets
+        new_state[transition_key] = transition
+        if transition_key == "human_successor_transition":
+            new_state["human_successor_classification"] = state.get(
+                "human_successor_classification"
+            )
+            gate = state.get("human_gate")
+            if type(gate) is not dict:
+                raise ExecutionKernelError(
+                    "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                    "human successor migration omitted its gate state",
+                )
+            summary = HumanGateSummary.from_canonical(gate["summary"])
+            new_gate = dict(gate)
+            new_gate["summary"] = replace(
+                summary,
+                successor_revisions_used=next_budgets["successor_revisions_used"],
+                successor_revision_digest=active.current_revision_digest,
+                phase="active_successor",
+            ).canonical()
+            new_state["human_gate"] = new_gate
         self._save(active.handle, new_state)
         readback = self._load(active.handle)
         if readback != new_state:
@@ -1664,6 +3197,7 @@ class ExecutionKernel:
             candidate_identities: set[str] = set()
             result_digests: set[str] = set()
             evidence_digests: set[str] = set()
+            source_evidence_digests: set[str] = set()
             runs = record["runs"]
             if type(runs) is not dict:
                 raise ExecutionKernelError(
@@ -1694,6 +3228,12 @@ class ExecutionKernel:
                     workspace = invalidation.get("workspace_identity")
                     if type(workspace) is str and workspace:
                         workspace_identities.add(workspace)
+                    source = invalidation.get("source_evidence_digests")
+                    if type(source) is list:
+                        source_evidence_digests.update(
+                            value for value in source
+                            if type(value) is str and value
+                        )
             invalidations = record["plan_invalidation"]
             if type(invalidations) is not dict:
                 raise ExecutionKernelError(
@@ -1705,6 +3245,12 @@ class ExecutionKernel:
                     workspace = invalidation.get("workspace_identity")
                     if type(workspace) is str and workspace:
                         workspace_identities.add(workspace)
+                    source = invalidation.get("source_evidence_digests")
+                    if type(source) is list:
+                        source_evidence_digests.update(
+                            value for value in source
+                            if type(value) is str and value
+                        )
             accepted = record["accepted_results"]
             if type(accepted) is not list:
                 raise ExecutionKernelError(
@@ -1737,6 +3283,7 @@ class ExecutionKernel:
                     candidate_identities=tuple(sorted(candidate_identities)),
                     result_digests=tuple(sorted(result_digests)),
                     evidence_digests=tuple(sorted(evidence_digests)),
+                    source_evidence_digests=tuple(sorted(source_evidence_digests)),
                 )
             )
         return tuple(
@@ -1844,6 +3391,62 @@ class ExecutionKernel:
         self._save(active.handle, state)
         return None
 
+    @staticmethod
+    def _plan_invalidation_record(
+        observation: PlanInvalidationObservation,
+    ) -> dict[str, Any]:
+        record = {
+            "repository": observation.repository,
+            "campaign_key": observation.campaign_key,
+            "plan_revision_digest": observation.plan_revision_digest,
+            "ticket_key": observation.ticket_key,
+            "work_run_key": observation.work_run_key,
+            "runtime_binding_id": observation.runtime_binding_id,
+            "authority_subtree_digest": observation.authority_subtree_digest,
+            "reporter_role": observation.reporter_role,
+            "report_digest": observation.report_digest,
+            "evidence_digest": observation.evidence_digest,
+            "dedup_identity": observation.dedup_identity,
+            "invalidated_obligation": observation.invalidated_obligation,
+            "required_effects": list(observation.required_effects),
+            "workspace_identity": observation.workspace_identity,
+            "observation_digest": observation.digest,
+        }
+        if observation.source_evidence_digests is not None:
+            record["source_evidence_digests"] = list(
+                observation.source_evidence_digests
+            )
+        return record
+
+    def _is_historical_plan_invalidation_replay(
+        self,
+        active: ActivePlanReadback,
+        state: Mapping[str, Any],
+        observation: PlanInvalidationObservation,
+    ) -> bool:
+        """Recognize only an exact receipt archived by successor migration."""
+
+        if observation.plan_revision_digest == active.current_revision_digest:
+            return False
+        lineage = state.get("revision_lineage", [])
+        if type(lineage) is not list:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel revision lineage is not a list",
+            )
+        expected = self._plan_invalidation_record(observation)
+        for predecessor in lineage:
+            if type(predecessor) is not dict:
+                continue
+            if predecessor.get("plan_revision_digest") != observation.plan_revision_digest:
+                continue
+            invalidations = predecessor.get("plan_invalidation")
+            if type(invalidations) is not dict:
+                continue
+            if any(record == expected for record in invalidations.values()):
+                return True
+        return False
+
     def _apply_plan_invalidation(
         self,
         active: ActivePlanReadback,
@@ -1941,23 +3544,7 @@ class ExecutionKernel:
             )
         invalidations = state.setdefault("plan_invalidation", {})
         dedup_key = self._scoped_dedup_key(observation)
-        record = {
-            "repository": observation.repository,
-            "campaign_key": observation.campaign_key,
-            "plan_revision_digest": observation.plan_revision_digest,
-            "ticket_key": observation.ticket_key,
-            "work_run_key": observation.work_run_key,
-            "runtime_binding_id": observation.runtime_binding_id,
-            "authority_subtree_digest": observation.authority_subtree_digest,
-            "reporter_role": observation.reporter_role,
-            "report_digest": observation.report_digest,
-            "evidence_digest": observation.evidence_digest,
-            "dedup_identity": observation.dedup_identity,
-            "invalidated_obligation": observation.invalidated_obligation,
-            "required_effects": list(observation.required_effects),
-            "workspace_identity": observation.workspace_identity,
-            "observation_digest": observation.digest,
-        }
+        record = self._plan_invalidation_record(observation)
         existing = invalidations.get(dedup_key)
         if existing is not None:
             if existing != record:
@@ -1979,6 +3566,12 @@ class ExecutionKernel:
                 "Plan Invalidation may only stop an active bound Work Run",
             )
         invalidations[dedup_key] = record
+        self._record_replan_budget_evidence(
+            active,
+            state,
+            observation,
+            run,
+        )
         # Persist the observation before changing any Work Run field.
         self._save(active.handle, state)
         self._reconcile_plan_invalidations(active, state, work)
@@ -2175,11 +3768,34 @@ class ExecutionKernel:
         state: dict[str, Any],
         work: Mapping[str, Mapping[str, Any]],
     ) -> None:
+        gate = self._human_gate_summary(state)
+        if gate is not None and gate.phase == "budget_exhausted":
+            return
         classifier = getattr(self._plan_control, "classify_plan_invalidations", None)
         if not callable(classifier):
             return
         observations, evidence_digests = self._pending_invalidation_observations(state)
         if not observations:
+            return
+        if self._successor_revision_budget_exhausted(state):
+            budgets = state["replan_budgets"]
+            self._persist_budget_exhaustion(
+                active,
+                state,
+                None,
+                self._successor_budget_obligation_key(
+                    active,
+                    evidence_digests=evidence_digests,
+                ),
+                evidence_digests,
+                detail=(
+                    "Successor Plan Revision limit exhausted before classification: "
+                    f"{budgets['successor_revisions_used']} of "
+                    f"{budgets['successor_revision_limit']} revisions used"
+                ),
+                repeated_invalidations=0,
+            )
+            self._persist_budget_exhaustion_readback(active, state)
             return
         expected_action_id = self._replanning_action_id(active, evidence_digests)
         existing = self._current_classification(state, active.current_revision_digest)
@@ -2295,6 +3911,12 @@ class ExecutionKernel:
         }:
             # The affected Work Runs remain quiescent.  #135/#136 own the
             # later successor activation or tracker/authority gate.
+            if (
+                classification.disposition
+                is PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION
+            ):
+                self._ensure_human_gate(active, state, classification)
+                self._save(active.handle, state)
             return
         records = state.get("plan_invalidation", {})
         resolutions = state.setdefault("plan_invalidation_resolutions", {})
@@ -2432,7 +4054,7 @@ class ExecutionKernel:
                     "EXECUTION_STORE_INVALID",
                     "Campaign Plan Invalidation record is invalid",
                 )
-            required = {
+            legacy_required = {
                 "repository",
                 "campaign_key",
                 "plan_revision_digest",
@@ -2449,10 +4071,19 @@ class ExecutionKernel:
                 "workspace_identity",
                 "observation_digest",
             }
-            if set(record) != required:
+            required_with_source_lineage = legacy_required | {
+                "source_evidence_digests"
+            }
+            if set(record) not in (legacy_required, required_with_source_lineage):
                 raise ExecutionKernelError(
                     "EXECUTION_STORE_INVALID",
                     "Campaign Plan Invalidation record schema is not closed",
+                )
+            source_evidence_digests = record.get("source_evidence_digests")
+            if source_evidence_digests is not None and type(source_evidence_digests) is not list:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Campaign Plan Invalidation source Evidence is not a list",
                 )
             try:
                 observation = PlanInvalidationObservation(
@@ -2470,6 +4101,11 @@ class ExecutionKernel:
                     invalidated_obligation=record["invalidated_obligation"],
                     required_effects=tuple(record["required_effects"]),
                     workspace_identity=record["workspace_identity"],
+                    source_evidence_digests=(
+                        None
+                        if source_evidence_digests is None
+                        else tuple(source_evidence_digests)
+                    ),
                 )
             except (KeyError, TypeError, ExecutionKernelError) as error:
                 raise ExecutionKernelError(
@@ -2707,6 +4343,18 @@ class ExecutionKernel:
     def _outcome(self, handle: CampaignHandle, state: dict[str, Any] | None) -> CampaignOutcome:
         if state is None:
             return CampaignOutcome(CampaignStatus.BLOCKED, "CampaignNotAdvanced")
+        gate = self._human_gate_summary(state)
+        if gate is not None:
+            if gate.phase in {
+                "awaiting_human_choice",
+                "rejected_change",
+                "budget_exhausted",
+            }:
+                return CampaignOutcome(CampaignStatus.DECISION, gate.reason_code)
+            if gate.phase == "awaiting_durable_tracker_policy_readback":
+                return CampaignOutcome(CampaignStatus.WAIT, gate.reason_code)
+            if gate.phase == "planning_validated_successor":
+                return CampaignOutcome(CampaignStatus.RUNNING, gate.reason_code)
         runs = state["runs"].values()
         if runs and all(run["phase"] in _TERMINAL_PHASES for run in runs):
             return CampaignOutcome(CampaignStatus.COMPLETE, "AllRequiredWorkComplete")
@@ -2888,6 +4536,7 @@ def advance(
     wake_ref: str | None = None,
     *,
     plan_invalidation: object | None = None,
+    human_decision: HumanDecisionChoice | None = None,
 ) -> CampaignOutcome:
     """Advance the installed V3 Campaign state machine once."""
 
@@ -2895,6 +4544,7 @@ def advance(
         campaign_handle,
         wake_ref,
         plan_invalidation=plan_invalidation,
+        human_decision=human_decision,
     )
 
 

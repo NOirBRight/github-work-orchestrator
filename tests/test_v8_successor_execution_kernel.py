@@ -375,6 +375,144 @@ def test_historical_invalidation_record_keeps_legacy_work_run_key_on_advance(tmp
     assert effects.executed == []
 
 
+def test_legacy_135_plan_without_budget_preserves_advance_and_successor_but_gates_human_path(
+    tmp_path,
+):
+    from gwo_v8.execution_kernel import (
+        ExecutionKernel,
+        ExecutionKernelError,
+        PlanInvalidationObservation,
+    )
+    from gwo_v8.plan_control import (
+        PlanInvalidationClassification,
+        PlanInvalidationDecision,
+        PlanInvalidationDisposition,
+    )
+    from gwo_v8.human_gate import HumanDecisionRecord, RequiredDurableSourceChange
+
+    # This is the fixed #135 fixture: its PlanSpec has only the historical
+    # {ref, digest} Policy Witness projection and its persisted state has no
+    # replan_budgets envelope.
+    active, handle = _active_campaign(("issue:109",))
+    ordinary_effects = _Effects()
+    ordinary = ExecutionKernel(
+        store_path=tmp_path / "legacy-ordinary.sqlite3",
+        plan_control=_Plans(active),
+        effects=ordinary_effects,
+    )
+
+    outcome = ordinary.advance(handle)
+
+    assert outcome.status.value == "Running"
+    assert ordinary_effects.executed
+    assert "replan_budgets" not in ordinary._load(handle)
+
+    # The existing #135 successor migration must likewise keep its old state
+    # shape; it must not manufacture or validate a #136 budget envelope.
+    successor, successor_plans, _successor_effects, successor_handle, invalidation = (
+        _successor_fixture(tmp_path)
+    )
+    successor.advance(successor_handle, plan_invalidation=invalidation)
+
+    assert successor_plans.activate_calls == 1
+    assert "replan_budgets" not in successor._load(successor_handle)
+
+    # A human Decision is the one path that must not run on this legacy state.
+    human_active, human_handle = _active_campaign(("issue:109",))
+    evidence_digests = ("b" * 64,)
+    classification = PlanInvalidationClassification(
+        action_id=ExecutionKernel._replanning_action_id(
+            human_active,
+            evidence_digests,
+        ),
+        snapshot_digest="c" * 64,
+        plan_revision_digest=human_active.current_revision_digest,
+        evidence_digests=evidence_digests,
+        disposition=PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION,
+        reason="legacy campaign requests a human authority change",
+        capability_proof_digest="d" * 64,
+        decision=PlanInvalidationDecision(
+            code="HUMAN_DECISION_REQUIRED",
+            detail="The legacy Policy Witness cannot authorize this change.",
+            required_change="authority",
+        ),
+    )
+
+    class LegacyHumanPlans:
+        def __init__(self):
+            self.active = human_active
+
+        def read_active(self, campaign_handle):
+            assert campaign_handle == human_handle
+            return self.active
+
+        def classify_plan_invalidations(
+            self,
+            campaign_handle,
+            invalidations,
+            execution_snapshot,
+        ):
+            assert campaign_handle == human_handle
+            assert invalidations
+            assert execution_snapshot["runs"]
+            return classification
+
+        def require_human_decision(self, campaign_handle, received):
+            assert campaign_handle == human_handle
+            assert received == classification
+            return HumanDecisionRecord(
+                decision_id="decision:" + "1" * 24,
+                campaign=human_handle,
+                classification_action_id=classification.action_id,
+                plan_revision_digest=human_active.current_revision_digest,
+                evidence_digests=evidence_digests,
+                required_change="authority",
+                detail=classification.decision.detail,
+                required_source=RequiredDurableSourceChange(
+                    required_change="authority",
+                    source_kind="policy",
+                    predecessor_source_digest=classification.snapshot_digest,
+                    required_subject="campaign:authority",
+                    detail="Read the approved Policy Witness.",
+                ),
+            )
+
+    human_effects = _Effects()
+    human = ExecutionKernel(
+        store_path=tmp_path / "legacy-human.sqlite3",
+        plan_control=LegacyHumanPlans(),
+        effects=human_effects,
+    )
+    human.advance(human_handle)
+    human_state = human._load(human_handle)
+    human_work = human._authoritative_active(human_handle)[1]
+    human_run = human_state["runs"]["issue:109"]
+    human_invalidation = PlanInvalidationObservation(
+        repository=human_handle.repository,
+        campaign_key=human_handle.campaign_key,
+        plan_revision_digest=human_active.current_revision_digest,
+        ticket_key="issue:109",
+        work_run_key=human_run["work_run_key"],
+        runtime_binding_id=human_run["semantic_action_id"],
+        authority_subtree_digest=human_work["issue:109"]["authority"]["worker"][
+            "subtree_digest"
+        ],
+        reporter_role="worker",
+        report_digest="a" * 64,
+        evidence_digest="b" * 64,
+        dedup_identity="legacy-human:issue-109",
+        invalidated_obligation="legacy human-gate compatibility",
+        required_effects=("workspace.write.v1",),
+        workspace_identity="workspace:legacy",
+    )
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        human.advance(human_handle, plan_invalidation=human_invalidation)
+
+    assert raised.value.code == "REPLAN_BUDGET_POLICY_INVALID"
+    assert len(human_effects.executed) == 1
+
+
 def test_successor_transition_is_durable_before_activation(tmp_path):
     from gwo_v8.execution_kernel import ExecutionKernel
 
