@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -34,6 +35,9 @@ from gwo_v8.runtime_gateway import (  # noqa: E402
 from gwo_v8.execution_kernel import (  # noqa: E402
     StaleBindingObservation,
     StaleReadbackState,
+)
+from gwo_v8.plan_control_host import (  # noqa: E402
+    RuntimeGatewayWatchdogEventSource,
 )
 from gwo_v8.runtime_profile import RuntimeProfile  # noqa: E402
 from v8_watchdog_test_support import (  # noqa: E402
@@ -205,6 +209,30 @@ def test_read_watchdog_events_rejects_bad_cursor_without_publication(
     adapter.events.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "bad_cursor",
+    (
+        pytest.param(str(2**63), id="overflow"),
+        pytest.param("9" * 5000, id="overlong-decimal"),
+        pytest.param("１２", id="non-ascii-decimal"),
+    ),
+)
+def test_read_watchdog_events_rejects_cursor_contract_values_before_adapter_io(
+    tmp_path,
+    bad_cursor,
+):
+    gateway, _store, adapter = _gateway(tmp_path)
+    refresh = Mock(wraps=gateway._refresh_before_adapter_io)
+    gateway._refresh_before_adapter_io = refresh
+
+    with pytest.raises(RuntimeGatewayError) as raised:
+        gateway._read_watchdog_events(bad_cursor)
+
+    assert raised.value.code == "RUNTIME_EVENT_CURSOR_INVALID"
+    adapter.events.assert_not_called()
+    refresh.assert_not_called()
+
+
 def test_read_watchdog_events_rejects_tampered_subject(tmp_path):
     gateway, store, adapter = _gateway(tmp_path)
     subject = _put_subject_artifacts(store, _subject())
@@ -251,16 +279,81 @@ def test_host_runtime_event_wakes_the_same_installed_advance(
             )
         ]
     )
+    wake_ref = "watchdog:runtime:1:implementation:issue:113"
     watchdog = public_successor.host.install_campaign_watchdog(
         store_path=tmp_path / "watchdog.db",
         execution_kernel=kernel,
         _runtime_event_source=source,
     )
-    watchdog.run_once(NOW)
+    with patch.object(kernel, "advance", wraps=kernel.advance) as advance_spy:
+        watchdog.run_once(NOW)
+    advance_spy.assert_called_once_with(public_successor.handle, wake_ref)
     assert any(
-        run.last_wake_ref == "watchdog:runtime:1:implementation:issue:113"
+        run.last_wake_ref == wake_ref
         for run in kernel.inspect(public_successor.handle).work_runs
     )
+
+
+def test_host_default_runtime_gateway_source_wakes_the_same_installed_advance(
+    tmp_path,
+    public_successor,
+):
+    kernel = public_successor._kernel
+    identity = "implementation:issue:113"
+
+    class StrictRuntimeGateway:
+        def __init__(self):
+            self.reads = []
+
+        def _read_watchdog_events(self, after_cursor):
+            self.reads.append(after_cursor)
+            return SimpleNamespace(
+                events=(
+                    SimpleNamespace(
+                        cursor="1",
+                        repository=public_successor.handle.repository,
+                        campaign_key=public_successor.handle.campaign_key,
+                        source="runtime",
+                        stable_action_id=identity,
+                    ),
+                ),
+                next_cursor="1",
+            )
+
+    gateway = StrictRuntimeGateway()
+    builder_calls = []
+
+    def gateway_builder(**kwargs):
+        builder_calls.append(kwargs)
+        return gateway
+
+    public_successor.host._gateway_builder = gateway_builder
+    read_calls = []
+    original_read = RuntimeGatewayWatchdogEventSource.read
+
+    def read_spy(source, after_cursor):
+        read_calls.append(after_cursor)
+        return original_read(source, after_cursor)
+
+    with patch.object(RuntimeGatewayWatchdogEventSource, "read", read_spy):
+        watchdog = public_successor.host.install_campaign_watchdog(
+            store_path=tmp_path / "default-watchdog.db",
+            execution_kernel=kernel,
+        )
+        with patch.object(kernel, "advance", wraps=kernel.advance) as advance_spy:
+            watchdog.run_once(NOW)
+
+    wake_ref = f"watchdog:runtime:1:{identity}"
+    assert builder_calls
+    assert (
+        builder_calls[0]["gateway_store_path"]
+        == public_successor.host._gateway_store_path
+    )
+    assert gateway.reads == [None]
+    assert read_calls == [None]
+    assert watchdog._campaign_source is kernel
+    assert watchdog._advancer is kernel
+    advance_spy.assert_called_once_with(public_successor.handle, wake_ref)
 
 
 def _watchdog_due_row(store_path, handle):

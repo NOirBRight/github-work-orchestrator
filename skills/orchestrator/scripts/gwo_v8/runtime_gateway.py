@@ -10609,12 +10609,7 @@ class RuntimeGateway:
         self,
         after_cursor: str | None,
     ) -> _RuntimeCampaignWakePage:
-        if after_cursor is not None and (
-            type(after_cursor) is not str
-            or not after_cursor.isdecimal()
-            or int(after_cursor) <= 0
-            or str(int(after_cursor)) != after_cursor
-        ):
+        if _runtime_event_cursor_value(after_cursor) is None:
             raise RuntimeGatewayError(
                 "RUNTIME_EVENT_CURSOR_INVALID",
                 "after_cursor must be one canonical positive decimal cursor",
