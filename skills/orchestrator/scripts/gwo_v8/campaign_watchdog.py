@@ -600,7 +600,8 @@ class CampaignWatchdog:
             connection = sqlite3.connect(self._store_path)
             due = connection.execute(
                 "SELECT repository, campaign_key FROM v8_watchdog_due "
-                "WHERE next_check_at <= ?",
+                "WHERE next_check_at <= ? "
+                "ORDER BY next_check_at, repository, campaign_key",
                 (now,),
             ).fetchall()
         except (OSError, sqlite3.Error) as error:
@@ -612,18 +613,49 @@ class CampaignWatchdog:
             if connection is not None:
                 connection.close()
 
+        advanced_due_work = False
         for repository, campaign_key in due:
             handle = CampaignHandle(repository, campaign_key)
-            snapshot = _validate_snapshot_for_handle(
+            before = _validate_snapshot_for_handle(
                 handle,
                 self._campaign_source.watchdog_snapshot(handle),
             )
             if (
-                snapshot.status is not CampaignStatus.COMPLETE
-                and snapshot.next_check_at is not None
-                and snapshot.next_check_at <= now
+                before.status is not CampaignStatus.COMPLETE
+                and before.next_check_at is not None
+                and before.next_check_at <= now
             ):
                 outcomes.append(self._advancer.advance(handle, None))
+                advanced_due_work = True
+                after = _validate_snapshot_for_handle(
+                    handle,
+                    self._campaign_source.watchdog_snapshot(handle),
+                )
+                if (
+                    after.status is CampaignStatus.COMPLETE
+                    or after.next_check_at != before.next_check_at
+                ):
+                    connection = None
+                    try:
+                        connection = sqlite3.connect(self._store_path)
+                        connection.execute(
+                            "DELETE FROM v8_watchdog_due "
+                            "WHERE repository=? AND campaign_key=?",
+                            (handle.repository, handle.campaign_key),
+                        )
+                        connection.commit()
+                    except (OSError, sqlite3.Error) as error:
+                        self._rollback(connection)
+                        raise CampaignWatchdogError(
+                            WATCHDOG_STORE_INVALID,
+                            "Watchdog due work could not be updated",
+                        ) from error
+                    finally:
+                        if connection is not None:
+                            connection.close()
+
+        if advanced_due_work:
+            self.rebuild_due_queue()
         return tuple(outcomes)
 
     def read_cursor(self, stream: str) -> str | None:

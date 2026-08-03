@@ -290,3 +290,56 @@ def test_restart_rebuilds_overdue_campaign_and_calls_advance_once(tmp_path):
 
     assert len(outcomes) == 1
     assert advancer.calls == [(handle(), None)]
+
+
+def test_due_work_orders_by_timestamp_then_campaign_and_rebuilds_after_advance(tmp_path):
+    first = CampaignHandle("owner/repo", "campaign:a")
+    second = CampaignHandle("owner/repo", "campaign:b")
+    campaigns = RecordingCampaignSource(
+        {
+            first: make_snapshot(
+                campaign=first,
+                next_check_at="2026-08-03T09:58:00+00:00",
+            ),
+            second: make_snapshot(
+                campaign=second,
+                next_check_at="2026-08-03T09:59:00+00:00",
+            ),
+        }
+    )
+
+    class SnapshotUpdatingAdvancer(RecordingAdvancer):
+        def advance(self, campaign, wake_ref=None):
+            outcome = super().advance(campaign, wake_ref)
+            if campaign == first:
+                campaigns.snapshots[campaign] = make_snapshot(
+                    campaign=campaign,
+                    next_check_at="2026-08-03T10:05:00+00:00",
+                )
+            else:
+                campaigns.snapshots[campaign] = make_snapshot(
+                    campaign=campaign,
+                    status=CampaignStatus.COMPLETE,
+                )
+            return outcome
+
+    advancer = SnapshotUpdatingAdvancer()
+
+    make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+        advancer=advancer,
+    ).run_once(NOW)
+
+    assert [call[0].campaign_key for call in advancer.calls] == [
+        "campaign:a",
+        "campaign:b",
+    ]
+    with sqlite3.connect(tmp_path / "watchdog.db") as connection:
+        assert connection.execute(
+            "SELECT repository, campaign_key, next_check_at "
+            "FROM v8_watchdog_due ORDER BY repository, campaign_key"
+        ).fetchall() == [
+            ("owner/repo", "campaign:a", "2026-08-03T10:05:00+00:00")
+        ]
