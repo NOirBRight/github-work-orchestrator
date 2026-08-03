@@ -489,6 +489,9 @@ def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
     import gwo_v8
     from gwo_v8.candidate_gate import (
         CandidateGate,
+        CandidateDiffEntryV1,
+        CandidateDiffRecordV1,
+        CandidateReadback,
         FormalReviewFinding,
         FormalReviewResult,
         RepairVerificationResult,
@@ -541,25 +544,117 @@ def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
                 required_effects=("owner.persist.v1",),
             )
 
-    reporter = _ReceiptReporter()
-    gate = CandidateGate(
-        invalidation_reporter=reporter,
-        formal_reviewer=Reviewer(),
-        repair_verifier=Verifier(),
-    )
     repaired = type(audit.candidate)(
         reported_reference="refs/heads/repaired",
         base_commit_oid=audit.candidate.base_commit_oid,
         base_tree_oid=audit.candidate.base_tree_oid,
         candidate_commit_oid="5" * 40,
         candidate_tree_oid="6" * 40,
-        changed_paths=("src/outside.py", "src/protocol.py"),
+        # The caller deliberately omits the out-of-scope path.
+        changed_paths=("src/protocol.py",),
+    )
+
+    class Reader:
+        def __init__(self):
+            self.calls = []
+
+        def read_candidate(self, repository, reference):
+            self.calls.append((repository, reference))
+            candidate = audit.candidate if reference.endswith("candidate") else repaired
+            paths = candidate.changed_paths
+            diff = CandidateDiffRecordV1(
+                repository=repository,
+                object_format="sha1",
+                base_commit_oid=candidate.base_commit_oid,
+                base_tree_oid=candidate.base_tree_oid,
+                candidate_commit_oid=candidate.candidate_commit_oid,
+                candidate_tree_oid=candidate.candidate_tree_oid,
+                entries=tuple(
+                    CandidateDiffEntryV1(
+                        side="candidate",
+                        path=path,
+                        mode="100644",
+                        object_type="blob",
+                        object_oid=("7" if path == "src/protocol.py" else "8") * 40,
+                    )
+                    for path in paths
+                ),
+            )
+            if reference.endswith("repaired"):
+                candidate = type(candidate)(
+                    reported_reference=candidate.reported_reference,
+                    base_commit_oid=candidate.base_commit_oid,
+                    base_tree_oid=candidate.base_tree_oid,
+                    candidate_commit_oid=candidate.candidate_commit_oid,
+                    candidate_tree_oid=candidate.candidate_tree_oid,
+                    changed_paths=("src/outside.py", "src/protocol.py"),
+                )
+                diff = CandidateDiffRecordV1(
+                    repository=repository,
+                    object_format="sha1",
+                    base_commit_oid=candidate.base_commit_oid,
+                    base_tree_oid=candidate.base_tree_oid,
+                    candidate_commit_oid=candidate.candidate_commit_oid,
+                    candidate_tree_oid=candidate.candidate_tree_oid,
+                    entries=(
+                        CandidateDiffEntryV1(
+                            side="candidate",
+                            path="src/outside.py",
+                            mode="100644",
+                            object_type="blob",
+                            object_oid="8" * 40,
+                        ),
+                        CandidateDiffEntryV1(
+                            side="candidate",
+                            path="src/protocol.py",
+                            mode="100644",
+                            object_type="blob",
+                            object_oid="7" * 40,
+                        ),
+                    ),
+                )
+            return CandidateReadback(
+                repository=repository,
+                candidate=candidate,
+                diff_record=diff,
+            )
+
+    reporter = _ReceiptReporter()
+    reader = Reader()
+    gate = CandidateGate(
+        invalidation_reporter=reporter,
+        candidate_reader=reader,
+        formal_reviewer=Reviewer(),
+        repair_verifier=Verifier(),
     )
     reviewed = gate.audit_candidate(parent, audit)
     result = gate.verify_repair(parent, reviewed.repair_packet, repaired)
 
     assert result.status.value == "plan_invalidation_reported"
     assert result.plan_invalidation_receipt is not None
+    verification_evidence = result.evidence[0]
+    plan_evidence = result.evidence[-1]
+    assert verification_evidence.kind == "repair_scope_escape"
+    assert verification_evidence.scope_escape_paths == ("src/outside.py",)
+    assert plan_evidence.source_kind == "repair_verification"
+    assert plan_evidence.invalidated_obligation == "repair packet allowed scope"
+    assert plan_evidence.required_effects == ("owner.persist.v1",)
+    assert plan_evidence.source_evidence_digest == verification_evidence.digest
+    assert {
+        item.get("kind") for item in plan_evidence.lineage_artifacts
+    } >= {
+        "candidate_identity.v1",
+        "repair_packet.v1",
+        "repair_verification_subject.v1",
+        "repair_verification_result.v1",
+        "repair_scope_escape.v1",
+        "candidate_diff_record.v1",
+    }
+    assert reader.calls == [
+        (parent.runtime_subject.repository, "refs/heads/candidate"),
+        (parent.runtime_subject.repository, "refs/heads/repaired"),
+    ]
+    assert reporter.calls == 1
     gateway.payload = _payload_with_evidence(
         _successor_payload(), result.plan_invalidation_report.evidence_digest
     )

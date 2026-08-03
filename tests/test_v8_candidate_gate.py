@@ -173,6 +173,45 @@ def _clean_audit(parent):
     )
 
 
+def _repair_reader(parent, candidate):
+    from gwo_v8.candidate_gate import (
+        CandidateDiffEntryV1,
+        CandidateDiffRecordV1,
+        CandidateReadback,
+    )
+
+    diff = CandidateDiffRecordV1(
+        repository=parent.runtime_subject.repository,
+        object_format="sha1",
+        base_commit_oid=candidate.base_commit_oid,
+        base_tree_oid=candidate.base_tree_oid,
+        candidate_commit_oid=candidate.candidate_commit_oid,
+        candidate_tree_oid=candidate.candidate_tree_oid,
+        entries=tuple(
+            CandidateDiffEntryV1(
+                side="candidate",
+                path=path,
+                mode="100644",
+                object_type="blob",
+                object_oid=("a" if index % 2 else "b") * 40,
+            )
+            for index, path in enumerate(candidate.changed_paths)
+        ),
+    )
+    readback = CandidateReadback(
+        repository=parent.runtime_subject.repository,
+        candidate=candidate,
+        diff_record=diff,
+    )
+
+    class Reader:
+        def read_candidate(self, _repository, reference):
+            assert reference == candidate.reported_reference
+            return readback
+
+    return Reader()
+
+
 class _RecordingPort:
     def __init__(self):
         self.calls = 0
@@ -426,6 +465,7 @@ def test_repair_scope_escape_is_evidence_and_never_reopens_formal_review():
     result = CandidateGate(
         invalidation_reporter=port,
         formal_reviewer=Reviewer(),
+        candidate_reader=_repair_reader(parent, repaired),
         repair_verifier=verifier,
     ).verify_repair(parent, packet, repaired)
 
@@ -1029,6 +1069,7 @@ def test_candidate_source_evidence_has_complete_lineage_to_report_and_receipt(so
 
         result = CandidateGate(
             invalidation_reporter=port,
+            candidate_reader=_repair_reader(parent, repaired),
             repair_verifier=Verifier(),
         ).verify_repair(parent, packet, repaired)
         source_digests = (result.evidence[0].digest,)
@@ -1096,6 +1137,7 @@ def test_repair_verification_does_not_route_an_allowed_path_as_scope_escape():
     with pytest.raises(Exception) as error:
         CandidateGate(
             invalidation_reporter=reporter,
+            candidate_reader=_repair_reader(parent, candidate),
             repair_verifier=Verifier(),
         ).verify_repair(parent, packet, candidate)
 
@@ -1150,6 +1192,7 @@ def test_repair_verification_detects_candidate_path_outside_packet_even_without_
     reporter = _RecordingPort()
     result = CandidateGate(
         invalidation_reporter=reporter,
+        candidate_reader=_repair_reader(parent, candidate),
         repair_verifier=Verifier(),
     ).verify_repair(parent, packet, candidate)
 
@@ -1157,6 +1200,206 @@ def test_repair_verification_detects_candidate_path_outside_packet_even_without_
     assert result.plan_invalidation_receipt is not None
     assert reporter.calls == 1
     assert "escaped_path=src/new_owner.py" in result.evidence[-1].discovered_facts
+
+
+def test_repair_verification_reads_authoritative_candidate_before_scope_calculation():
+    """A caller cannot hide a repaired path from the exact-reference readback."""
+
+    from gwo_v8.candidate_gate import (
+        CandidateDiffEntryV1,
+        CandidateDiffRecordV1,
+        CandidateGate,
+        CandidateGateStatus,
+        CandidateIdentity,
+        CandidateReadback,
+        RepairPacket,
+        RepairVerificationResult,
+    )
+    from gwo_v8.runtime_gateway import CapabilityPolicy, CapabilityPolicyProof
+
+    parent = _parent()
+    packet = RepairPacket(
+        parent_digest=parent.digest,
+        rejected_candidate_digest="1" * 64,
+        prior_review_subject_digest="2" * 64,
+        finding_digests=("3" * 64,),
+        allowed_paths=("src/protocol.py",),
+    )
+    # The caller reports only the allowed path.  The authoritative reference
+    # contains one additional path outside the Repair Packet boundary.
+    reported = CandidateIdentity(
+        reported_reference="refs/heads/repaired",
+        base_commit_oid="4" * 40,
+        base_tree_oid="5" * 40,
+        candidate_commit_oid="6" * 40,
+        candidate_tree_oid="7" * 40,
+        changed_paths=("src/protocol.py",),
+    )
+    authoritative = CandidateIdentity(
+        reported_reference=reported.reported_reference,
+        base_commit_oid=reported.base_commit_oid,
+        base_tree_oid=reported.base_tree_oid,
+        candidate_commit_oid=reported.candidate_commit_oid,
+        candidate_tree_oid=reported.candidate_tree_oid,
+        changed_paths=("src/new_owner.py", "src/protocol.py"),
+    )
+    diff = CandidateDiffRecordV1(
+        repository=parent.runtime_subject.repository,
+        object_format="sha1",
+        base_commit_oid=authoritative.base_commit_oid,
+        base_tree_oid=authoritative.base_tree_oid,
+        candidate_commit_oid=authoritative.candidate_commit_oid,
+        candidate_tree_oid=authoritative.candidate_tree_oid,
+        entries=(
+            CandidateDiffEntryV1(
+                side="candidate",
+                path="src/new_owner.py",
+                mode="100644",
+                object_type="blob",
+                object_oid="8" * 40,
+            ),
+            CandidateDiffEntryV1(
+                side="candidate",
+                path="src/protocol.py",
+                mode="100644",
+                object_type="blob",
+                object_oid="9" * 40,
+            ),
+        ),
+    )
+    readback = CandidateReadback(
+        repository=parent.runtime_subject.repository,
+        candidate=authoritative,
+        diff_record=diff,
+    )
+
+    class Reader:
+        def __init__(self):
+            self.calls = 0
+
+        def read_candidate(self, repository, reference):
+            self.calls += 1
+            assert repository == parent.runtime_subject.repository
+            assert reference == reported.reported_reference
+            return readback
+
+    class Verifier:
+        capability_policy_proof = CapabilityPolicyProof(
+            capability_policy=CapabilityPolicy(worker_can_edit_issues=False),
+            authority_record_digest="a" * 64,
+        )
+
+        def verify(self, request):
+            assert request.candidate == authoritative
+            return RepairVerificationResult(
+                request_digest=request.digest,
+                accepted=True,
+                details=("repair verifier did not classify the extra path",),
+                invalidated_obligation="repair packet allowed scope",
+                required_effects=("protocol.persist.v1",),
+            )
+
+    reader = Reader()
+    result = CandidateGate(
+        invalidation_reporter=_RecordingPort(),
+        candidate_reader=reader,
+        repair_verifier=Verifier(),
+    ).verify_repair(parent, packet, reported)
+
+    assert result.status is CandidateGateStatus.PLAN_INVALIDATION_REPORTED
+    assert reader.calls == 1
+    assert result.evidence[-1].source_kind == "repair_verification"
+    assert any(
+        item.get("kind") == "candidate_diff_record.v1"
+        for item in result.evidence[-1].lineage_artifacts
+    )
+
+
+def test_repair_verification_fails_closed_when_authoritative_immutable_identity_differs():
+    from gwo_v8.candidate_gate import (
+        CandidateDiffEntryV1,
+        CandidateDiffRecordV1,
+        CandidateGate,
+        CandidateGateError,
+        CandidateIdentity,
+        CandidateReadback,
+        RepairPacket,
+        RepairVerificationResult,
+    )
+    from gwo_v8.runtime_gateway import CapabilityPolicy, CapabilityPolicyProof
+
+    parent = _parent()
+    packet = RepairPacket(
+        parent_digest=parent.digest,
+        rejected_candidate_digest="1" * 64,
+        prior_review_subject_digest="2" * 64,
+        finding_digests=("3" * 64,),
+        allowed_paths=("src/protocol.py",),
+    )
+    reported = CandidateIdentity(
+        reported_reference="refs/heads/repaired",
+        base_commit_oid="4" * 40,
+        base_tree_oid="5" * 40,
+        candidate_commit_oid="6" * 40,
+        candidate_tree_oid="7" * 40,
+        changed_paths=("src/protocol.py",),
+    )
+    authoritative = CandidateIdentity(
+        reported_reference=reported.reported_reference,
+        base_commit_oid=reported.base_commit_oid,
+        base_tree_oid=reported.base_tree_oid,
+        candidate_commit_oid="8" * 40,
+        candidate_tree_oid=reported.candidate_tree_oid,
+        changed_paths=("src/protocol.py",),
+    )
+    readback = CandidateReadback(
+        repository=parent.runtime_subject.repository,
+        candidate=authoritative,
+        diff_record=CandidateDiffRecordV1(
+            repository=parent.runtime_subject.repository,
+            object_format="sha1",
+            base_commit_oid=authoritative.base_commit_oid,
+            base_tree_oid=authoritative.base_tree_oid,
+            candidate_commit_oid=authoritative.candidate_commit_oid,
+            candidate_tree_oid=authoritative.candidate_tree_oid,
+            entries=(
+                CandidateDiffEntryV1(
+                    side="candidate",
+                    path="src/protocol.py",
+                    mode="100644",
+                    object_type="blob",
+                    object_oid="9" * 40,
+                ),
+            ),
+        ),
+    )
+
+    class Reader:
+        def read_candidate(self, _repository, _reference):
+            return readback
+
+    class Verifier:
+        capability_policy_proof = CapabilityPolicyProof(
+            capability_policy=CapabilityPolicy(worker_can_edit_issues=False),
+            authority_record_digest="a" * 64,
+        )
+
+        def verify(self, _request):
+            return RepairVerificationResult(
+                request_digest="b" * 64,
+                accepted=True,
+            )
+
+    reporter = _RecordingPort()
+    with pytest.raises(CandidateGateError) as error:
+        CandidateGate(
+            invalidation_reporter=reporter,
+            candidate_reader=Reader(),
+            repair_verifier=Verifier(),
+        ).verify_repair(parent, packet, reported)
+
+    assert error.value.code == "CANDIDATE_GATE_EVIDENCE_STALE"
+    assert reporter.calls == 0
 
 
 def test_candidate_gate_uses_authoritative_candidate_readback_and_complete_diff_subject():

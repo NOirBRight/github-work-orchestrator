@@ -3065,20 +3065,42 @@ class ExecutionKernel:
                     "REPLAN_BUDGET_READBACK_INVALID",
                     "successor migration omitted its active Policy Witness budget",
                 )
+            if set(budgets) != {
+                "policy_witness_digest",
+                "successor_revisions_used",
+                "successor_revision_limit",
+                "invalidation_limit",
+                "obligations",
+            }:
+                raise ExecutionKernelError(
+                    "REPLAN_BUDGET_READBACK_INVALID",
+                    "successor migration budget schema is not closed",
+                )
+            self._validate_replan_budgets(
+                budgets,
+                {
+                    "policy_witness_digest": budgets["policy_witness_digest"],
+                    "successor_revision_limit": budgets["successor_revision_limit"],
+                    "invalidation_limit": budgets["invalidation_limit"],
+                },
+            )
+            if (
+                budgets["successor_revision_limit"]
+                != successor_budget_defaults["successor_revision_limit"]
+                or budgets["invalidation_limit"]
+                != successor_budget_defaults["invalidation_limit"]
+            ):
+                raise ExecutionKernelError(
+                    "REPLAN_BUDGET_READBACK_INVALID",
+                    "successor Policy Witness changed the Campaign replan budget",
+                )
             next_budgets = load_canonical_json(canonical_bytes(budgets))
             # The approved successor may carry a new authoritative Policy
-            # Witness (the human-gate authority-change path).  The Campaign
-            # counters and obligation Evidence remain durable across the
-            # revision, while the successor's exact policy supplies the new
-            # finite bounds and witness identity.
+            # Witness (the human-gate authority-change path), but only its
+            # digest may change.  The original Campaign limits, counters, and
+            # obligation Evidence remain durable across the revision.
             next_budgets["policy_witness_digest"] = successor_budget_defaults[
                 "policy_witness_digest"
-            ]
-            next_budgets["successor_revision_limit"] = successor_budget_defaults[
-                "successor_revision_limit"
-            ]
-            next_budgets["invalidation_limit"] = successor_budget_defaults[
-                "invalidation_limit"
             ]
             next_budgets["successor_revisions_used"] += 1
             if (

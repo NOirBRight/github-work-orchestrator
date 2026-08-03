@@ -2015,6 +2015,98 @@ class PlanControl:
                 "active Policy Witness replan budget is invalid",
             ) from error
 
+    def _validated_policy_witness_for_budget(
+        self,
+        value: Any,
+    ) -> dict[str, Any]:
+        """Read and normalize one exact Policy Witness before successor CAS."""
+
+        if type(value) is not dict:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "successor Policy Witness projection is not an object",
+            )
+        if set(value) == {"ref", "digest"}:
+            expected_ref = value.get("ref")
+            digest = value.get("digest")
+            if type(digest) is not str or _DIGEST.fullmatch(digest) is None:
+                raise PlanControlError(
+                    "REPLAN_BUDGET_POLICY_INVALID",
+                    "successor Policy Witness digest is invalid",
+                )
+            witness = _read_artifact_json(
+                self._artifacts,
+                digest,
+                code="REPLAN_BUDGET_POLICY_INVALID",
+            )
+            if type(witness) is not dict:
+                raise PlanControlError(
+                    "REPLAN_BUDGET_POLICY_INVALID",
+                    "successor Policy Witness Artifact is not an object",
+                )
+            value = {**witness, "digest": digest}
+            if value.get("ref") != expected_ref:
+                raise PlanControlError(
+                    "REPLAN_BUDGET_POLICY_INVALID",
+                    "successor Policy Witness reference did not read back",
+                )
+        try:
+            normalized = _normalize_policy(value)
+        except PlanControlError as error:
+            if error.code == "REPLAN_BUDGET_POLICY_INVALID":
+                raise
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "Policy Witness failed exact successor budget validation",
+            ) from error
+        if normalized != value:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "Policy Witness did not read back as its exact canonical projection",
+            )
+        return normalized
+
+    def _validate_successor_budget_compatibility(
+        self,
+        predecessor_plan: Mapping[str, Any],
+        successor_policy: Mapping[str, Any],
+    ) -> None:
+        """Reject Policy Witness budget changes before successor publication."""
+
+        predecessor_projection = predecessor_plan.get("policy")
+        if type(predecessor_projection) is not dict:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "predecessor PlanSpec omitted its Policy Witness projection",
+            )
+        predecessor = self._validated_policy_witness_for_budget(
+            predecessor_projection
+        )
+        successor = self._validated_policy_witness_for_budget(successor_policy)
+        predecessor_replan = predecessor.get("replan")
+        successor_replan = successor.get("replan")
+        predecessor_limits = (
+            None
+            if predecessor_replan is None
+            else (
+                predecessor_replan["successor_revision_limit"],
+                predecessor_replan["repeated_invalidation_limit"],
+            )
+        )
+        successor_limits = (
+            None
+            if successor_replan is None
+            else (
+                successor_replan["successor_revision_limit"],
+                successor_replan["repeated_invalidation_limit"],
+            )
+        )
+        if predecessor_limits != successor_limits:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "approved successor Policy Witness cannot change the Campaign replan budget",
+            )
+
     def _save_human_gate_attempt(
         self,
         *,
@@ -2578,6 +2670,16 @@ class PlanControl:
                 "POLICY_WITNESS_INVALID",
                 "approved Policy Witness is not the exact canonical authority projection",
             )
+        predecessor_plan = load_canonical_json(active.plan_spec_bytes)
+        if type(predecessor_plan) is not dict:
+            raise PlanControlError(
+                "REPLAN_BUDGET_POLICY_INVALID",
+                "predecessor PlanSpec is not an object",
+            )
+        self._validate_successor_budget_compatibility(
+            predecessor_plan,
+            compiler_policy,
+        )
         if expected_source_change_digest == decision.required_source.predecessor_source_digest:
             raise PlanControlError(
                 "HUMAN_SOURCE_REVERTED",
@@ -3383,6 +3485,25 @@ class PlanControl:
             )
             self._repository.finalize_claims(current)
             return self.read_active(handle)
+        if (
+            current is not None
+            and current.revision_digest == receipt.expected_previous_revision_digest
+        ):
+            predecessor = self._validate_active_receipt(
+                handle,
+                receipt=current,
+                require_claims=False,
+            )
+            predecessor_plan = load_canonical_json(predecessor.plan_spec_bytes)
+            if type(predecessor_plan) is not dict:
+                raise PlanControlError(
+                    "REPLAN_BUDGET_POLICY_INVALID",
+                    "predecessor PlanSpec is not an object",
+                )
+            self._validate_successor_budget_compatibility(
+                predecessor_plan,
+                revision.plan_spec.get("policy"),
+            )
         pending_reservation = self._repository.read_pending_reservation(receipt)
         if pending_reservation != receipt:
             planning_reservation = self._repository.read_planning_reservation(

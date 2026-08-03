@@ -1630,6 +1630,63 @@ class CandidateGate:
             )
         return replace(audit, diff_record=readback.diff_record, report_digest=None)
 
+    def _read_authoritative_repair_candidate(
+        self,
+        parent: CandidateGateParent,
+        candidate: CandidateIdentity,
+    ) -> CandidateReadback:
+        """Read the repaired Candidate before trusting any changed-path claim."""
+
+        reader = self._candidate_reader
+        if reader is None:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_READBACK_INVALID",
+                "Repair Verification requires authoritative Candidate readback",
+            )
+        try:
+            readback = reader.read_candidate(
+                parent.runtime_subject.repository,
+                candidate.reported_reference,
+            )
+        except CandidateGateError:
+            raise
+        except Exception as error:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_READBACK_INVALID",
+                "authoritative repaired Candidate reference readback failed",
+            ) from error
+        if type(readback) is not CandidateReadback:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_READBACK_INVALID",
+                "authoritative repaired Candidate readback is not typed",
+            )
+        if readback.repository != parent.runtime_subject.repository:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_EVIDENCE_STALE",
+                "authoritative repaired Candidate belongs to another repository",
+            )
+        authoritative = readback.candidate
+        if authoritative.reported_reference != candidate.reported_reference:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_EVIDENCE_STALE",
+                "authoritative repaired Candidate reference changed during readback",
+            )
+        immutable_fields = (
+            "base_commit_oid",
+            "base_tree_oid",
+            "candidate_commit_oid",
+            "candidate_tree_oid",
+        )
+        if any(
+            getattr(authoritative, field) != getattr(candidate, field)
+            for field in immutable_fields
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_EVIDENCE_STALE",
+                "authoritative repaired Candidate immutable identity changed",
+            )
+        return readback
+
     def verify_repair(
         self,
         parent: CandidateGateParent,
@@ -1645,6 +1702,8 @@ class CandidateGate:
                 "CANDIDATE_GATE_EVIDENCE_INVALID",
                 "Repair Verification requires an exact CandidateIdentity",
             )
+        readback = self._read_authoritative_repair_candidate(parent, candidate)
+        candidate = readback.candidate
         request = RepairVerificationRequest(
             parent_digest=parent.digest,
             repair_packet_digest=packet.digest,
@@ -1720,6 +1779,7 @@ class CandidateGate:
                     request.canonical(),
                     result.canonical(),
                     verification_evidence.canonical(),
+                    readback.diff_record.canonical(),
                 ),
             )
             receipt, report = self._report_invalidation(parent, plan_evidence)

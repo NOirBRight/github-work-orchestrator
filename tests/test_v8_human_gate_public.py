@@ -187,4 +187,6 @@ def test_public_approved_choice_activates_one_active_successor(tmp_path):
     assert successor.plan_revision_digest != predecessor.plan_revision_digest
     assert successor.human_gate is not None
     assert successor.human_gate.phase == "active_successor"
+    assert successor.human_gate.successor_revision_limit == 1
+    assert successor.human_gate.repeated_invalidation_limit == 1
     assert gateway.replan_progresses == 2

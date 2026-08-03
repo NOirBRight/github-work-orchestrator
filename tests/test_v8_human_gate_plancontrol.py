@@ -136,8 +136,8 @@ def _approved_readback(control, handle, decision):
     # than an accidental no-op of the active Policy Witness.
     policy["ref"] = "policy:human-approved"
     policy["replan"] = {
-        "successor_revision_limit": 2,
-        "repeated_invalidation_limit": 2,
+        "successor_revision_limit": 1,
+        "repeated_invalidation_limit": 1,
     }
     policy["digest"] = digest_value(
         {key: value for key, value in policy.items() if key != "digest"}
@@ -260,7 +260,7 @@ def _rebind_tracker_projection(tracker):
 
 
 def test_require_human_decision_derives_one_stable_record_and_exact_repository_readback():
-    control, repository, _gateway, _artifacts, _source, host, handle, _harness, classification = (
+    control, repository, gateway, _artifacts, _source, host, handle, _harness, classification = (
         _decision_setup()
     )
 
@@ -753,8 +753,8 @@ def test_approved_source_adoption_compiles_authority_from_changed_policy_witness
     policy["ref"] = "policy:approved-authority"
     policy["kind"] = "gwo.policy-witness.v1"
     policy["replan"] = {
-        "successor_revision_limit": 2,
-        "repeated_invalidation_limit": 4,
+        "successor_revision_limit": 1,
+        "repeated_invalidation_limit": 1,
     }
     policy["digest"] = digest_value(
         {key: value for key, value in policy.items() if key != "digest"}
@@ -778,6 +778,143 @@ def test_approved_source_adoption_compiles_authority_from_changed_policy_witness
         and item["authority"]["policy_witness_digest"] == policy["digest"]
         for item in plan["work"]
     )
+
+
+@pytest.mark.parametrize(
+    ("successor_revision_limit", "repeated_invalidation_limit"),
+    ((2, 2), (2, 4)),
+)
+def test_approved_successor_policy_cannot_change_original_replan_budget(
+    successor_revision_limit,
+    repeated_invalidation_limit,
+):
+    """Authority may change the witness identity, but never its Campaign budget."""
+
+    from gwo_v8.human_gate import HumanDecisionChoice
+    from gwo_v8.plan_control import PlanControlError
+
+    control, repository, gateway, _artifacts, _source, host, handle, _harness, classification = (
+        _decision_setup()
+    )
+    decision = control.require_human_decision(handle, classification)
+    readback = _approved_readback(control, handle, decision)
+    policy = load_canonical_json(readback.policy_witness_bytes)
+    policy["ref"] = "policy:approved-budget-change"
+    policy["replan"] = {
+        "successor_revision_limit": successor_revision_limit,
+        "repeated_invalidation_limit": repeated_invalidation_limit,
+    }
+    policy["digest"] = digest_value(
+        {key: value for key, value in policy.items() if key != "digest"}
+    )
+    control._human_source = _ApprovedSource(
+        _approved_readback_with_sources(readback, policy=policy)
+    )
+    from v8_successor_test_support import successor_payload
+
+    gateway.payload = successor_payload(
+        dependencies=(
+            (
+                "issue:109",
+                "issue:110",
+                "The invalidated work consumes the existing owner's result.",
+            ),
+        )
+    )
+    predecessor = host.read_active(handle)
+
+    with pytest.raises(PlanControlError) as error:
+        control.advance_human_decision(
+            handle,
+            decision,
+            HumanDecisionChoice(
+                decision.decision_id,
+                "approve",
+                "workflow://approval/one",
+            ),
+        )
+
+    assert error.value.code == "REPLAN_BUDGET_POLICY_INVALID"
+    assert host.read_active(handle) == predecessor
+    assert repository.read_human_gate_readback(handle, decision.decision_id) is None
+
+
+def test_automatic_successor_rejects_changed_budget_before_activation():
+    """The automatic successor publication path validates budget before CAS."""
+
+    from gwo_v8._canonical import canonical_bytes, digest_bytes
+    from gwo_v8.plan_control import PlanRevision, PlanControlError, _authority
+    from v8_successor_test_support import successor_payload
+
+    control, repository, gateway, artifacts, _source, host, handle, harness = _direct_setup(
+        successor_payload(
+            dependencies=(
+                (
+                    "issue:109",
+                    "issue:110",
+                    "The invalidated work consumes the existing owner's result.",
+                ),
+            )
+        )
+    )
+    active = host.read_active(handle)
+    classification = control.classify_plan_invalidations(
+        handle,
+        (harness.invalidation_for("issue:109"),),
+        _execution_snapshot(active),
+    )
+    assert classification is not None
+    predecessor = host.read_active(handle)
+    compile_successor = control._compile_successor_revision
+
+    def changed_budget_compile(campaign_handle, attempt, intent_bytes):
+        revision = compile_successor(campaign_handle, attempt, intent_bytes)
+        plan = deepcopy(revision.plan_spec)
+        predecessor_plan = load_canonical_json(predecessor.plan_spec_bytes)
+        policy = deepcopy(artifacts.read_json(predecessor_plan["policy"]["digest"]))
+        policy["ref"] = "policy:automatic-budget-change"
+        policy["replan"] = {
+            "successor_revision_limit": 2,
+            "repeated_invalidation_limit": 2,
+        }
+        policy_without_digest = {
+            key: value for key, value in policy.items() if key != "digest"
+        }
+        policy["digest"] = digest_value(policy_without_digest)
+        policy_without_digest = {
+            key: value for key, value in policy.items() if key != "digest"
+        }
+        artifacts.put_canonical(policy_without_digest)
+        policy_digest = policy["digest"]
+        plan["policy"] = {"ref": policy["ref"], "digest": policy_digest}
+        plan["campaign"]["authority"] = _authority(
+            policy_digest,
+            plan["campaign"]["authority"]["grants"],
+        )
+        for item in plan["work"]:
+            item["authority"]["policy_witness_digest"] = policy_digest
+            for role in ("worker", "recovery_worker", "review"):
+                item["authority"][role] = _authority(
+                    policy_digest,
+                    item["authority"][role]["grants"],
+                )
+        payload = canonical_bytes(plan)
+        return PlanRevision(
+            repository=revision.repository,
+            campaign_key=revision.campaign_key,
+            snapshot_digest=revision.snapshot_digest,
+            canonical_bytes=payload,
+            digest=digest_bytes(payload),
+        )
+
+    control._compile_successor_revision = changed_budget_compile
+    with pytest.raises(PlanControlError) as error:
+        control.activate_successor(handle, classification)
+
+    assert error.value.code == "REPLAN_BUDGET_POLICY_INVALID"
+    assert host.read_active(handle) == predecessor
+    assert len(repository.revisions) == 1
+    assert gateway.replan_progresses == 1
 
 
 def test_invalid_policy_witness_is_rejected_before_human_readback_persistence():
