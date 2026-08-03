@@ -30,6 +30,8 @@ from .plan_control import (
     _normalize_intent,
     _normalize_replanning_intent,
     _snapshot_from_bytes,
+    _validate_human_gate_attempt_identity,
+    _validate_human_gate_attempt_planning_binding,
 )
 from .planning_protocol import (
     PLANNING_OUTPUT_PROTOCOL_ID,
@@ -53,8 +55,10 @@ from .transition import (
 
 _LEGACY_STATE_SCHEMA = "gwo.plan.github-state.v3"
 _STATE_SCHEMA = "gwo.plan.github-state.v4"
+_HUMAN_STATE_SCHEMA = "gwo.plan.github-state.v5"
 _LEGACY_INDEX_SCHEMA = "gwo.plan.github-index.v5"
 _INDEX_SCHEMA = "gwo.plan.github-index.v6"
+_HUMAN_INDEX_SCHEMA = "gwo.plan.github-index.v7"
 _OBJECT_SCHEMA = "gwo.plan.github-object.v1"
 _OBJECT_MANIFEST_SCHEMA = "gwo.plan.github-object-manifest.v1"
 _DEFAULT_PATH = ".gwo-v8/plan-control-v3.json"
@@ -80,6 +84,10 @@ _CATEGORY_NAMES = (
     "activations",
     "activation_receipts",
     "invalidation_classifications",
+)
+_HUMAN_CATEGORY_NAMES = _CATEGORY_NAMES + (
+    "human_decisions",
+    "human_gate_attempts",
 )
 
 
@@ -841,6 +849,11 @@ def _validate_compilation_record(
             "can_edit_tracker",
             "can_expand_authority",
             "delegation_enabled",
+            "can_edit_labels",
+            "can_edit_campaign_membership",
+            "can_grant_authority",
+            "can_merge",
+            "can_invoke_global_planning",
         },
         "Coordinator capability proof",
     )
@@ -852,12 +865,22 @@ def _validate_compilation_record(
         or type(proof["can_edit_tracker"]) is not bool
         or type(proof["can_expand_authority"]) is not bool
         or type(proof["delegation_enabled"]) is not bool
+        or type(proof["can_edit_labels"]) is not bool
+        or type(proof["can_edit_campaign_membership"]) is not bool
+        or type(proof["can_grant_authority"]) is not bool
+        or type(proof["can_merge"]) is not bool
+        or type(proof["can_invoke_global_planning"]) is not bool
         or not proof["repository_read_only"]
         or not proof["tracker_read_only"]
         or proof["can_activate_plan_revision"]
         or proof["can_edit_tracker"]
         or proof["can_expand_authority"]
         or proof["delegation_enabled"]
+        or proof["can_edit_labels"]
+        or proof["can_edit_campaign_membership"]
+        or proof["can_grant_authority"]
+        or proof["can_merge"]
+        or proof["can_invoke_global_planning"]
         or digest_value(proof) != value["coordinator_capability_proof_digest"]
     ):
         raise PlanControlError(
@@ -1127,6 +1150,179 @@ def _classification_from(value: object) -> PlanInvalidationClassification:
         ) from error
 
 
+def _human_decision_value(decision: Any) -> dict[str, Any]:
+    from .human_gate import HumanDecisionRecord
+
+    if type(decision) is not HumanDecisionRecord:
+        raise PlanControlError(
+            "HUMAN_DECISION_RECORD_INVALID",
+            "durable human Decision is not typed",
+        )
+    return decision.canonical()
+
+
+def _human_decision_from(value: object) -> Any:
+    from .human_gate import HumanDecisionRecord
+
+    try:
+        return HumanDecisionRecord.from_canonical(value)
+    except Exception as error:
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "durable human Decision is malformed",
+        ) from error
+
+
+def _human_decision_entry(decision: Any) -> dict[str, Any]:
+    return {
+        "campaign_key": decision.campaign.campaign_key,
+        "decision_id": decision.decision_id,
+        "decision": _human_decision_value(decision),
+    }
+
+
+def _human_decision_entry_from(value: object, repository: str) -> Any:
+    item = _exact(
+        value,
+        {"campaign_key", "decision_id", "decision"},
+        "human Decision",
+    )
+    decision = _human_decision_from(item["decision"])
+    if (
+        decision.campaign.repository != repository
+        or decision.campaign.campaign_key != item["campaign_key"]
+        or decision.decision_id != item["decision_id"]
+    ):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "durable human Decision key is not bound to its record",
+        )
+    return decision
+
+
+def _human_gate_entry(
+    handle: CampaignHandle,
+    choice: Any,
+    readback: Any,
+) -> dict[str, Any]:
+    from .human_gate import HumanDecisionChoice, HumanSourceReadback
+
+    if (
+        type(choice) is not HumanDecisionChoice
+        or type(readback) is not HumanSourceReadback
+        or choice.decision_id != readback.decision_id
+    ):
+        raise PlanControlError(
+            "HUMAN_SOURCE_READBACK_INVALID",
+            "human gate attempt is not typed and mutually bound",
+        )
+    return {
+        "campaign_key": handle.campaign_key,
+        "decision_id": choice.decision_id,
+        "choice": choice.canonical(),
+        "readback": readback.canonical(),
+    }
+
+
+def _human_gate_entry_from(value: object, repository: str) -> tuple[Any, Any, Any]:
+    from .human_gate import HumanDecisionChoice, HumanSourceReadback
+
+    item = _exact(
+        value,
+        {"campaign_key", "decision_id", "choice", "readback"},
+        "human gate attempt",
+    )
+    try:
+        choice = HumanDecisionChoice.from_canonical(item["choice"])
+        readback = HumanSourceReadback.from_canonical(item["readback"])
+    except Exception as error:
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "durable human gate attempt is malformed",
+        ) from error
+    if (
+        choice.decision_id != item["decision_id"]
+        or readback.decision_id != item["decision_id"]
+    ):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "durable human gate attempt key is not bound to its records",
+        )
+    return (
+        CampaignHandle(repository, _text(item["campaign_key"], "human gate Campaign")),
+        choice,
+        readback,
+    )
+
+
+_HUMAN_GATE_ATTEMPT_ENTRY_KIND = "gwo.human-gate-attempt-entry.v1"
+
+
+def _human_gate_attempt_entry(attempt: Any) -> dict[str, Any]:
+    from .human_gate import HumanGateAttempt
+
+    if type(attempt) is not HumanGateAttempt:
+        raise PlanControlError(
+            "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+            "human gate attempt is not typed",
+        )
+    return {
+        "kind": _HUMAN_GATE_ATTEMPT_ENTRY_KIND,
+        "campaign_key": attempt.campaign.campaign_key,
+        "decision_id": attempt.decision_id,
+        "source_readback_digest": attempt.source_readback_digest,
+        "attempt": attempt.canonical(),
+    }
+
+
+def _human_gate_attempt_entry_from(value: object, repository: str) -> Any:
+    from .human_gate import HumanGateAttempt
+
+    item = _exact(
+        value,
+        {
+            "kind",
+            "campaign_key",
+            "decision_id",
+            "source_readback_digest",
+            "attempt",
+        },
+        "human gate attempt",
+    )
+    if item["kind"] != _HUMAN_GATE_ATTEMPT_ENTRY_KIND:
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "durable human gate attempt kind is invalid",
+        )
+    try:
+        attempt = HumanGateAttempt.from_canonical(item["attempt"])
+    except Exception as error:
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "durable human gate attempt is malformed",
+        ) from error
+    if (
+        attempt.campaign.repository != repository
+        or attempt.campaign.campaign_key != _text(
+            item["campaign_key"],
+            "human gate attempt Campaign",
+        )
+        or attempt.decision_id != _text(
+            item["decision_id"],
+            "human gate attempt Decision ID",
+        )
+        or attempt.source_readback_digest != _text(
+            item["source_readback_digest"],
+            "human gate attempt source readback digest",
+        )
+    ):
+        raise PlanControlError(
+            "DURABLE_STATE_INVALID",
+            "durable human gate attempt key is not bound to its record",
+        )
+    return attempt
+
+
 def _split_value(record: _SplitCampaignDecisionRecord) -> dict[str, Any]:
     return {
         "handle": asdict(record.handle),
@@ -1176,9 +1372,14 @@ def _split_from(value: object) -> _SplitCampaignDecisionRecord:
     )
 
 
-def _empty_state(repository: str, writer_generation: str) -> dict[str, Any]:
-    return {
-        "schema_version": _STATE_SCHEMA,
+def _empty_state(
+    repository: str,
+    writer_generation: str,
+    *,
+    human: bool = False,
+) -> dict[str, Any]:
+    state = {
+        "schema_version": _HUMAN_STATE_SCHEMA if human else _STATE_SCHEMA,
         "repository": repository,
         "writer_generation": writer_generation,
         "writer_fence": {
@@ -1195,6 +1396,9 @@ def _empty_state(repository: str, writer_generation: str) -> dict[str, Any]:
         "activation_receipts": [],
         "invalidation_classifications": [],
     }
+    if human:
+        state.update({"human_decisions": [], "human_gate_attempts": []})
+    return state
 
 
 def _repo_value(
@@ -1202,8 +1406,14 @@ def _repo_value(
     writer_generation: str,
     repo: InMemoryPlanRepository,
 ) -> dict[str, Any]:
-    return {
-        "schema_version": _STATE_SCHEMA,
+    human = bool(
+        getattr(repo, "human_decisions", {})
+        or getattr(repo, "human_gate_readbacks", {})
+        or getattr(repo, "human_gate_attempts", {})
+        or getattr(repo, "_github_index_schema", None) == _HUMAN_INDEX_SCHEMA
+    )
+    state = {
+        "schema_version": _HUMAN_STATE_SCHEMA if human else _STATE_SCHEMA,
         "repository": repository,
         "writer_generation": writer_generation,
         "writer_fence": {
@@ -1289,6 +1499,45 @@ def _repo_value(
             key=lambda item: (item["campaign_key"], item["action_id"]),
         ),
     }
+    if human:
+        state["human_decisions"] = sorted(
+            (
+                _human_decision_entry(decision)
+                for (claim_repository, _campaign_key, _decision_id), decision
+                in repo.human_decisions.items()
+                if claim_repository == repository
+            ),
+            key=lambda item: (item["campaign_key"], item["decision_id"]),
+        )
+        state["human_gate_attempts"] = sorted(
+            [
+                _human_gate_entry(
+                    CampaignHandle(repository, campaign_key),
+                    values[0],
+                    values[1],
+                )
+                for (claim_repository, campaign_key, _decision_id), values
+                in repo.human_gate_readbacks.items()
+                if claim_repository == repository
+            ]
+            + [
+                _human_gate_attempt_entry(attempt)
+                for (
+                    claim_repository,
+                    _campaign_key,
+                    _decision_id,
+                    _source_readback_digest,
+                ), attempt in repo.human_gate_attempts.items()
+                if claim_repository == repository
+            ],
+            key=lambda item: (
+                item["campaign_key"],
+                item["decision_id"],
+                item.get("source_readback_digest", ""),
+                item.get("kind", ""),
+            ),
+        )
+    return state
 
 
 def _repo_from_state(
@@ -1299,13 +1548,25 @@ def _repo_from_state(
     allow_legacy_protocol: bool = False,
 ) -> InMemoryPlanRepository:
     current_fields = set(_empty_state(repository, writer_generation))
+    human_fields = set(_empty_state(repository, writer_generation, human=True))
     legacy_fields = current_fields - {"invalidation_classifications"}
     legacy = (
         type(value) is dict
         and set(value) == legacy_fields
         and value.get("schema_version") == _LEGACY_STATE_SCHEMA
     )
-    state = _exact(value, legacy_fields if legacy else current_fields, "PlanControl state")
+    human = (
+        type(value) is dict
+        and value.get("schema_version") == _HUMAN_STATE_SCHEMA
+    )
+    expected_fields = (
+        legacy_fields
+        if legacy
+        else human_fields
+        if human
+        else current_fields
+    )
+    state = _exact(value, expected_fields, "PlanControl state")
     allow_legacy_attempts = legacy or allow_legacy_protocol
     if legacy:
         state = {
@@ -1316,6 +1577,7 @@ def _repo_from_state(
     if (
         state["schema_version"] != _STATE_SCHEMA
         and state["schema_version"] != _LEGACY_STATE_SCHEMA
+        and state["schema_version"] != _HUMAN_STATE_SCHEMA
         or state["repository"] != repository
         or state["writer_generation"] != writer_generation
     ):
@@ -1347,6 +1609,8 @@ def _repo_from_state(
         "activation_receipts",
         "invalidation_classifications",
     }
+    if human:
+        list_fields.update({"human_decisions", "human_gate_attempts"})
     if any(type(state[field]) is not list for field in list_fields):
         raise PlanControlError(
             "DURABLE_STATE_INVALID",
@@ -1364,6 +1628,8 @@ def _repo_from_state(
             for raw in state["attempts"]
         ]
     repo = InMemoryPlanRepository(writer_generation=writer_generation)
+    if human:
+        repo._github_index_schema = _HUMAN_INDEX_SCHEMA
     try:
         for raw in state["attempts"]:
             attempt = _attempt_from(
@@ -1497,6 +1763,62 @@ def _repo_from_state(
                     "Durable invalidation classifications repeat an identity",
                 )
             repo.invalidation_classifications[key] = classification
+        if human:
+            for raw in state["human_decisions"]:
+                decision = _human_decision_entry_from(raw, repository)
+                key = (
+                    repository,
+                    decision.campaign.campaign_key,
+                    decision.decision_id,
+                )
+                if key in repo.human_decisions:
+                    raise PlanControlError(
+                        "DURABLE_STATE_INVALID",
+                        "Durable human Decisions repeat an identity",
+                    )
+                repo.human_decisions[key] = decision
+            for raw in state["human_gate_attempts"]:
+                if (
+                    type(raw) is dict
+                    and raw.get("kind") == _HUMAN_GATE_ATTEMPT_ENTRY_KIND
+                ):
+                    attempt = _human_gate_attempt_entry_from(raw, repository)
+                    key = (
+                        repository,
+                        attempt.campaign.campaign_key,
+                        attempt.decision_id,
+                        attempt.source_readback_digest,
+                    )
+                    if key in repo.human_gate_attempts:
+                        raise PlanControlError(
+                            "DURABLE_STATE_INVALID",
+                            "Durable human gate attempts repeat an identity",
+                        )
+                    repo.human_gate_attempts[key] = attempt
+                    continue
+                gate_handle, choice, readback = _human_gate_entry_from(
+                    raw,
+                    repository,
+                )
+                key = (
+                    repository,
+                    gate_handle.campaign_key,
+                    choice.decision_id,
+                )
+                if key in repo.human_gate_readbacks:
+                    raise PlanControlError(
+                        "DURABLE_STATE_INVALID",
+                        "Durable human gate attempts repeat an identity",
+                    )
+                if (
+                    key not in repo.human_decisions
+                    or repo.human_decisions[key].campaign != gate_handle
+                ):
+                    raise PlanControlError(
+                        "DURABLE_STATE_INVALID",
+                        "Human gate attempt has no exact durable Decision",
+                    )
+                repo.human_gate_readbacks[key] = (choice, readback)
     except PlanControlError:
         raise
     except Exception as error:
@@ -1504,6 +1826,34 @@ def _repo_from_state(
             "DURABLE_STATE_INVALID",
             "Durable PlanControl state cannot be reconstructed",
         ) from error
+    if human:
+        for attempt in repo.human_gate_attempts.values():
+            decision_key = (
+                repository,
+                attempt.campaign.campaign_key,
+                attempt.decision_id,
+            )
+            decision = repo.human_decisions.get(decision_key)
+            source_entry = repo.human_gate_readbacks.get(decision_key)
+            choice = None if source_entry is None else source_entry[0]
+            source = None if source_entry is None else source_entry[1]
+            _validate_human_gate_attempt_identity(
+                attempt,
+                decision,
+                choice,
+                source,
+                error_code="DURABLE_STATE_INVALID",
+            )
+            _validate_human_gate_attempt_planning_binding(
+                attempt,
+                repo.attempts.get(
+                    repo._attempt_key(
+                        attempt.campaign,
+                        attempt.predecessor_revision_digest,
+                    )
+                ),
+                error_code="DURABLE_STATE_INVALID",
+            )
     _validate_activation_receipt_chains(repo)
     if _repo_value(repository, writer_generation, repo) != state:
         raise PlanControlError(
@@ -1602,7 +1952,12 @@ def _category_values_for(
     repo: InMemoryPlanRepository,
 ) -> dict[str, list[Any]]:
     state = _repo_value(repository, writer_generation, repo)
-    return {name: state[name] for name in _CATEGORY_NAMES}
+    names = (
+        _HUMAN_CATEGORY_NAMES
+        if state.get("schema_version") == _HUMAN_STATE_SCHEMA
+        else _CATEGORY_NAMES
+    )
+    return {name: state[name] for name in names}
 
 
 def _repo_from_categories(
@@ -1612,12 +1967,16 @@ def _repo_from_categories(
     *,
     allow_legacy_protocol: bool = False,
 ) -> InMemoryPlanRepository:
-    if type(categories) is not dict or set(categories) != set(_CATEGORY_NAMES):
+    if type(categories) is not dict or set(categories) not in (
+        set(_CATEGORY_NAMES),
+        set(_HUMAN_CATEGORY_NAMES),
+    ):
         raise PlanControlError(
             "DURABLE_STATE_INVALID",
             "Durable PlanControl category index is incomplete",
         )
-    state = _empty_state(repository, writer_generation)
+    human = set(categories) == set(_HUMAN_CATEGORY_NAMES)
+    state = _empty_state(repository, writer_generation, human=human)
     state.update(categories)
     return _repo_from_state(
         state,
@@ -1698,7 +2057,9 @@ def _index_value(
     legacy_category_names = set(_CATEGORY_NAMES) - {
         "invalidation_classifications"
     }
-    if category_names == set(_CATEGORY_NAMES):
+    if category_names == set(_HUMAN_CATEGORY_NAMES):
+        schema_version = _HUMAN_INDEX_SCHEMA
+    elif category_names == set(_CATEGORY_NAMES):
         schema_version = _INDEX_SCHEMA
     elif category_names == legacy_category_names:
         # Keep the pre-classification index readable for an existing Campaign
@@ -2501,6 +2862,7 @@ class GitHubPlanRepository:
                 "GitHub PlanControl index is not canonical JSON",
             ) from error
         category_names = set(_CATEGORY_NAMES)
+        human_category_names = set(_HUMAN_CATEGORY_NAMES)
         legacy_category_names = category_names - {
             "invalidation_classifications"
         }
@@ -2515,8 +2877,13 @@ class GitHubPlanRepository:
             and type(categories) is dict
             and set(categories) == category_names
         )
+        human_index = (
+            value["schema_version"] == _HUMAN_INDEX_SCHEMA
+            and type(categories) is dict
+            and set(categories) == human_category_names
+        )
         if (
-            not (legacy_index or current_index)
+            not (legacy_index or current_index or human_index)
             or value["repository"] != self.repository
             or value["writer_authority"] != _writer_index_authority(authority)
             or any(
@@ -2597,7 +2964,8 @@ class GitHubPlanRepository:
         )
         if (
             not repo.invalidation_classifications
-            and getattr(repo, "_github_index_schema", None) != _INDEX_SCHEMA
+            and getattr(repo, "_github_index_schema", None)
+            not in {_INDEX_SCHEMA, _HUMAN_INDEX_SCHEMA}
         ):
             category_values.pop("invalidation_classifications")
         for name, items in category_values.items():
@@ -3327,6 +3695,143 @@ class GitHubPlanRepository:
                     classification.action_id,
                 )
                 == classification
+                else _WriterOperation.NEW_ATTEMPT
+            ),
+        )
+
+    def read_human_decision(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+    ) -> Any | None:
+        self._assert_repository(handle.repository)
+        return self._read_repo().read_human_decision(handle, decision_id)
+
+    def read_human_decision_for_action(
+        self,
+        handle: CampaignHandle,
+        classification_action_id: str,
+    ) -> Any | None:
+        self._assert_repository(handle.repository)
+        return self._read_repo().read_human_decision_for_action(
+            handle,
+            classification_action_id,
+        )
+
+    def save_human_decision(self, decision: Any) -> Any:
+        from .human_gate import HumanDecisionRecord
+
+        if type(decision) is not HumanDecisionRecord:
+            raise PlanControlError(
+                "HUMAN_DECISION_RECORD_INVALID",
+                "human Decision caller value is not typed",
+            )
+        self._assert_repository(decision.campaign.repository)
+
+        def save(repo: InMemoryPlanRepository) -> Any:
+            repo._github_index_schema = _HUMAN_INDEX_SCHEMA
+            return repo.save_human_decision(decision)
+
+        return self._mutate(
+            "save human Decision",
+            save,
+            classify=lambda repo: (
+                _WriterOperation.RECOVER_ATTEMPT
+                if repo.read_human_decision(
+                    decision.campaign,
+                    decision.decision_id,
+                )
+                == decision
+                else _WriterOperation.NEW_ATTEMPT
+            ),
+        )
+
+    def read_human_gate_readback(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+    ) -> Any | None:
+        self._assert_repository(handle.repository)
+        return self._read_repo().read_human_gate_readback(handle, decision_id)
+
+    def read_human_gate_choice(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+    ) -> Any | None:
+        self._assert_repository(handle.repository)
+        return self._read_repo().read_human_gate_choice(handle, decision_id)
+
+    def save_human_gate_readback(
+        self,
+        handle: CampaignHandle,
+        decision: Any,
+        choice: Any,
+        readback: Any,
+    ) -> Any:
+        self._assert_repository(handle.repository)
+
+        def save(repo: InMemoryPlanRepository) -> Any:
+            repo._github_index_schema = _HUMAN_INDEX_SCHEMA
+            return repo.save_human_gate_readback(
+                handle,
+                decision,
+                choice,
+                readback,
+            )
+
+        return self._mutate(
+            "save human gate readback",
+            save,
+            classify=lambda repo: (
+                _WriterOperation.RECOVER_ATTEMPT
+                if repo.read_human_gate_readback(
+                    handle,
+                    decision.decision_id,
+                )
+                is not None
+                else _WriterOperation.NEW_ATTEMPT
+            ),
+        )
+
+    def read_human_gate_attempt(
+        self,
+        handle: CampaignHandle,
+        decision_id: str,
+        source_readback_digest: str,
+    ) -> Any | None:
+        self._assert_repository(handle.repository)
+        return self._read_repo().read_human_gate_attempt(
+            handle,
+            decision_id,
+            source_readback_digest,
+        )
+
+    def save_human_gate_attempt(self, attempt: Any) -> Any:
+        from .human_gate import HumanGateAttempt
+
+        if type(attempt) is not HumanGateAttempt:
+            raise PlanControlError(
+                "HUMAN_GATE_ATTEMPT_READBACK_INVALID",
+                "human gate attempt caller value is not typed",
+            )
+        self._assert_repository(attempt.campaign.repository)
+
+        def save(repo: InMemoryPlanRepository) -> Any:
+            repo._github_index_schema = _HUMAN_INDEX_SCHEMA
+            return repo.save_human_gate_attempt(attempt)
+
+        return self._mutate(
+            "save human gate attempt",
+            save,
+            classify=lambda repo: (
+                _WriterOperation.RECOVER_ATTEMPT
+                if repo.read_human_gate_attempt(
+                    attempt.campaign,
+                    attempt.decision_id,
+                    attempt.source_readback_digest,
+                )
+                is not None
                 else _WriterOperation.NEW_ATTEMPT
             ),
         )

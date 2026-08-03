@@ -38,9 +38,12 @@ from ._canonical import digest_value
 from .activation import GitHubCliContentClient, GitHubContentClient
 from .github_snapshot import (
     GitHubCliIssueReadClient,
+    GitHubCliHumanApprovalReadClient,
+    GitHubHumanApprovalReadClient,
     GitHubIssueReadClient,
     GitHubReadySnapshotSource,
 )
+from .human_source import GitHubHumanApprovalSource
 from .plan_control_github import (
     GitHubPlanRepository,
     WriterGenerationReadback,
@@ -220,6 +223,7 @@ class ProductionPlanControlStartHost:
         artifact_root: Path,
         maximum_artifact_bytes: int = 1_048_576,
         max_snapshot_bytes: int = 1_048_576,
+        human_source: object | None = None,
         _gateway_builder: _GatewayBuilder | None = None,
     ):
         if type(runtime_configuration) is not RuntimeConfiguration:
@@ -237,6 +241,14 @@ class ProductionPlanControlStartHost:
             maximum_bytes=maximum_artifact_bytes,
         )
         self._max_snapshot_bytes = max_snapshot_bytes
+        if human_source is not None and not callable(
+            getattr(human_source, "read", None)
+        ):
+            raise PlanControlError(
+                "PLAN_CONTROL_COMPOSITION_INVALID",
+                "human_source must expose the read-only human approval source",
+            )
+        self._human_source = human_source
         self._gateway_builder = _gateway_builder or _production_gateway_builder
 
     def _control_for(
@@ -270,7 +282,7 @@ class ProductionPlanControlStartHost:
                 "PLAN_CONTROL_COMPOSITION_INVALID",
                 "RuntimeGateway host composition rejected the Campaign assertion",
             ) from error
-        return PlanControl(
+        control = PlanControl(
             source=self._source,
             artifacts=self._artifacts,
             gateway=_PlanControlGateway(
@@ -279,6 +291,11 @@ class ProductionPlanControlStartHost:
             repository=self._repository,
             max_snapshot_bytes=self._max_snapshot_bytes,
         )
+        if self._human_source is not None:
+            # Keep the source as a host-owned read-only adapter.  PlanControl
+            # never receives a writer or a mutable source callback.
+            control._human_source = self._human_source
+        return control
 
     def _runtime_configuration_for(
         self,
@@ -505,6 +522,49 @@ class ProductionPlanControlStartHost:
             execution_snapshot,
         )
 
+    def require_human_decision(self, handle, classification):
+        return self._existing_control(handle).require_human_decision(
+            handle,
+            classification,
+        )
+
+    def advance_human_decision(self, handle, decision, choice):
+        return self._existing_control(handle).advance_human_decision(
+            handle,
+            decision,
+            choice,
+        )
+
+    def read_human_decision_source(self, handle, decision, choice):
+        """Read the authoritative human source without performing a mutation.
+
+        ExecutionKernel uses this explicit host seam before it persists any
+        approved successor intent.  Keeping the read operation separate from
+        ``advance_human_decision`` prevents a caller from accidentally
+        treating an unverified approval as permission to plan or activate.
+        """
+
+        return self._existing_control(handle).read_human_decision_source(
+            handle,
+            decision,
+            choice,
+        )
+
+    def read_replan_budget_policy(self, handle):
+        """Read the active Policy Witness replan budget without mutation."""
+
+        return self._existing_control(handle).read_replan_budget_policy(handle)
+
+    def read_human_gate_attempt(self, handle, decision_id, source_readback_digest):
+        return self._existing_control(handle).read_human_gate_attempt(
+            handle,
+            decision_id,
+            source_readback_digest,
+        )
+
+    def save_human_gate_attempt(self, attempt):
+        return self._existing_control(attempt.campaign).save_human_gate_attempt(attempt)
+
     def activate_successor(
         self,
         handle: CampaignHandle,
@@ -549,6 +609,7 @@ def install_plan_control_start(
     artifact_root: Path,
     maximum_artifact_bytes: int = 1_048_576,
     max_snapshot_bytes: int = 1_048_576,
+    human_source: object | None = None,
     _gateway_builder: _GatewayBuilder | None = None,
 ) -> ProductionPlanControlStartHost:
     """Install the concrete public Campaign-start composition."""
@@ -562,6 +623,7 @@ def install_plan_control_start(
         artifact_root=artifact_root,
         maximum_artifact_bytes=maximum_artifact_bytes,
         max_snapshot_bytes=max_snapshot_bytes,
+        human_source=human_source,
         _gateway_builder=_gateway_builder,
     )
     _install_start_host(host)
@@ -585,6 +647,7 @@ def install_github_plan_control_start(
     max_snapshot_bytes: int = 1_048_576,
     _content_client: GitHubContentClient | None = None,
     _issue_client: GitHubIssueReadClient | None = None,
+    _human_approval_client: GitHubHumanApprovalReadClient | None = None,
     _writer_control: WriterGenerationReadback | None = None,
     _gateway_builder: _GatewayBuilder | None = None,
 ) -> ProductionPlanControlStartHost:
@@ -609,6 +672,9 @@ def install_github_plan_control_start(
     )
     content_client = _content_client or GitHubCliContentClient()
     issue_client = _issue_client or GitHubCliIssueReadClient()
+    approval_client = (
+        _human_approval_client or GitHubCliHumanApprovalReadClient()
+    )
     # A production writer must already be represented by an exact durable
     # Writer Record on the control ref.  Do not manufacture ``initial-writer``
     # from host configuration: that would make PlanControl authority a local
@@ -625,6 +691,13 @@ def install_github_plan_control_start(
     source = GitHubReadySnapshotSource(
         content_client=content_client,
         issue_client=issue_client,
+        control_branch=control_branch,
+        target_branch=target_branch,
+        policy_path=policy_path,
+    )
+    human_source = GitHubHumanApprovalSource(
+        approval_client=approval_client,
+        content_client=content_client,
         control_branch=control_branch,
         target_branch=target_branch,
         policy_path=policy_path,
@@ -647,5 +720,6 @@ def install_github_plan_control_start(
         artifact_root=artifact_root,
         maximum_artifact_bytes=maximum_artifact_bytes,
         max_snapshot_bytes=max_snapshot_bytes,
+        human_source=human_source,
         _gateway_builder=_gateway_builder,
     )

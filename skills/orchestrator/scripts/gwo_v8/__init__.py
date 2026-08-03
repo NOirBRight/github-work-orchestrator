@@ -33,6 +33,10 @@ from .plan_control import (
 from .plan_control_host import (
     install_github_plan_control_start,
 )
+from .human_gate import (
+    HumanDecisionChoice,
+    HumanGateSummary,
+)
 from .execution_kernel import (
     CampaignOutcome,
     CampaignStatus,
@@ -217,6 +221,8 @@ __all__ = [
     "DeliveryControl",
     "DeliveryControlError",
     "Diagnostics",
+    "HumanDecisionChoice",
+    "HumanGateSummary",
     "EvidenceVerifier",
     "ExecutionBudgetReadback",
     "ExecutionKernel",

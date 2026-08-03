@@ -31,9 +31,12 @@ _SNAPSHOT_FIELDS = {
     "campaign_key",
     "target_branch",
     "campaign_source",
+    "membership",
     "policy",
     "policy_witness",
     "tickets",
+    "product_release",
+    "source_change_digest",
     "native_blocker_graph",
     "external_dependencies",
     "work_runs",
@@ -106,13 +109,53 @@ def _require_policy(policy: Any) -> dict[str, Any]:
     if type(policy) is not dict:
         _fail("SUCCESSOR_PLAN_INVALID", "replanning snapshot omitted its Policy Witness")
     required = {"schema_version", "ref", "digest", "authority_grants", "allowed_capabilities", "exclusive_resources"}
-    if set(policy) != required:
+    optional = {"replan", "kind"}
+    if set(policy) != required and set(policy) not in (
+        required | {"replan"},
+        required | {"kind"},
+        required | optional,
+    ):
         _fail("SUCCESSOR_PLAN_INVALID", "Policy Witness schema is not closed")
+    if policy.get("schema_version") != 1:
+        _fail("SUCCESSOR_PLAN_INVALID", "Policy Witness schema version is invalid")
+    if "kind" in policy and policy["kind"] != "gwo.policy-witness.v1":
+        _fail("SUCCESSOR_PLAN_INVALID", "Policy Witness kind is invalid")
     _digest(policy["digest"], "Policy Witness digest")
     _text(policy["ref"], "Policy Witness ref")
     _sorted_unique_texts(policy["allowed_capabilities"], "Policy capabilities")
     _sorted_unique_texts(policy["exclusive_resources"], "Policy Exclusive Resources")
-    if type(policy["authority_grants"]) is not dict:
+    if "replan" in policy:
+        replan = policy["replan"]
+        if (
+            type(replan) is not dict
+            or set(replan)
+            != {"successor_revision_limit", "repeated_invalidation_limit"}
+            or any(
+                type(replan[field]) is not int
+                or isinstance(replan[field], bool)
+                or replan[field] < 1
+                for field in (
+                    "successor_revision_limit",
+                    "repeated_invalidation_limit",
+                )
+            )
+        ):
+            _fail("SUCCESSOR_PLAN_INVALID", "Policy Witness replan budget is invalid")
+    if (
+        type(policy["authority_grants"]) is not dict
+        or set(policy["authority_grants"])
+        != {"campaign", "worker", "recovery_worker", "review"}
+        or any(
+            type(grants) is not list
+            or any(
+                type(grant) is not dict
+                or set(grant) != {"operation_id", "resource_id"}
+                or any(type(value) is not str or not value for value in grant.values())
+                for grant in grants
+            )
+            for grants in policy["authority_grants"].values()
+        )
+    ):
         _fail("SUCCESSOR_PLAN_INVALID", "Policy Witness authority grants are invalid")
     core = {key: value for key, value in policy.items() if key != "digest"}
     if digest_value(core) != policy["digest"]:
@@ -206,11 +249,32 @@ def _require_snapshot(value: Any) -> dict[str, Any]:
     ticket_keys = [item.get("key") for item in tickets]
     if any(type(key) is not str or not key for key in ticket_keys) or ticket_keys != sorted(set(ticket_keys)):
         _fail("SUCCESSOR_PLAN_INVALID", "snapshot Ticket membership is not canonical")
+    adoption_fields = {"membership", "product_release", "source_change_digest"}
+    present_adoption_fields = adoption_fields.intersection(snapshot)
+    if present_adoption_fields and present_adoption_fields != adoption_fields:
+        _fail("SUCCESSOR_PLAN_INVALID", "approved source projection is incomplete")
+    if present_adoption_fields:
+        membership = _exact_mapping(
+            snapshot["membership"],
+            {"ticket_keys", "digest"},
+            code="SUCCESSOR_PLAN_INVALID",
+            label="approved source membership",
+        )
+        _sorted_unique_texts(membership["ticket_keys"], "approved source membership keys")
+        if membership["ticket_keys"] != ticket_keys:
+            _fail("SUCCESSOR_PLAN_INVALID", "approved source membership does not equal its Tickets")
+        _digest(membership["digest"], "approved source membership digest")
+        if membership["digest"] != digest_value({"ticket_keys": ticket_keys}):
+            _fail("SUCCESSOR_PLAN_INVALID", "approved source membership digest changed")
+        _digest(snapshot["source_change_digest"], "approved source change digest")
+        if type(snapshot["product_release"]) not in (dict, list, str, int, float, bool, type(None)):
+            _fail("SUCCESSOR_PLAN_INVALID", "approved product/release projection is not canonical")
     plan, work = _require_active_plan(snapshot)
     work_keys = [item["key"] for item in work]
-    if ticket_keys != work_keys:
+    source_adoption = "source_change_digest" in snapshot
+    if not source_adoption and ticket_keys != work_keys:
         _fail("SUCCESSOR_PLAN_INVALID", "snapshot Tickets do not equal complete active membership")
-    if plan["policy"]["digest"] != policy["digest"]:
+    if not source_adoption and plan["policy"]["digest"] != policy["digest"]:
         _fail("SUCCESSOR_PLAN_INVALID", "active PlanSpec is bound to another Policy Witness")
     if (
         "plan_revision_digest" in snapshot
@@ -384,11 +448,62 @@ def _active_edges(work: list[dict[str, Any]]) -> set[tuple[str, str]]:
     }
 
 
+def _source_adoption_is_unchanged(
+    snapshot: dict[str, Any],
+    plan: dict[str, Any],
+    work: list[dict[str, Any]],
+) -> bool:
+    """Tell both compiler entry points when source adoption is a no-op."""
+
+    if "source_change_digest" not in snapshot:
+        return False
+    active_campaign = plan["campaign"]
+    active_source_digest = active_campaign.get("source_change_digest")
+    same_tracker_projection = (
+        type(active_source_digest) is str
+        and active_source_digest == snapshot["source_change_digest"]
+    )
+    same_policy_projection = (
+        plan["policy"].get("digest") == snapshot["policy_witness"]["digest"]
+    )
+    source_tickets = {item["key"]: item for item in snapshot["tickets"]}
+    current_by_key = {item["key"]: item for item in work}
+    same_frozen_work = (
+        set(source_tickets) == set(current_by_key)
+        and all(
+            source_tickets[key].get("source") == current_by_key[key].get("source")
+            and source_tickets[key].get("contract")
+            == current_by_key[key].get("contract")
+            for key in source_tickets
+        )
+    )
+    same_campaign_projection = (
+        snapshot["target_branch"] == plan["target_branch"]
+        and snapshot["campaign_source"] == active_campaign["source"]
+        and snapshot.get("product_release") == active_campaign.get("product_release")
+    )
+    return (
+        same_tracker_projection
+        and same_policy_projection
+        and same_frozen_work
+        and same_campaign_projection
+    )
+
+
 def _derive_values(
     snapshot: dict[str, Any], classification: dict[str, Any]
 ) -> tuple[dict[str, Any], bool]:
     plan, work = _require_active_plan(snapshot)
-    selected = tuple(item["key"] for item in work)
+    source_adoption = "source_change_digest" in snapshot
+    source_tickets = {
+        item["key"]: item for item in snapshot["tickets"]
+    }
+    if _source_adoption_is_unchanged(snapshot, plan, work):
+        _fail(
+            "SUCCESSOR_PLAN_UNCHANGED",
+            "approved source projection is identical to the active Plan Revision",
+        )
+    selected = tuple(source_tickets) if source_adoption else tuple(item["key"] for item in work)
     selected_set = set(selected)
     successor = classification["successor"]
     owners = successor["approved_ticket_keys"]
@@ -399,7 +514,28 @@ def _derive_values(
         )
 
     current_edges = _active_edges(work)
-    graph = {item["key"]: set(item["depends_on"]) for item in work}
+    current_by_key = {item["key"]: item for item in work}
+    graph = {
+        key: {
+            dependency
+            for dependency in current_by_key[key]["depends_on"]
+            if dependency in selected_set
+        }
+        for key in selected
+        if key in current_by_key
+    }
+    if source_adoption:
+        for key, ticket in source_tickets.items():
+            graph.setdefault(key, set())
+            graph[key].update(
+                blocker["key"]
+                for blocker in ticket.get("native_blockers", [])
+                if (
+                    type(blocker) is dict
+                    and blocker.get("state") == "open"
+                    and blocker.get("key") in selected_set
+                )
+            )
     additions: list[dict[str, str]] = []
     seen_edges: set[tuple[str, str]] = set()
     for raw in successor["dependency_additions"]:
@@ -424,10 +560,21 @@ def _derive_values(
 
     policy = _require_policy(snapshot.get("policy_witness", snapshot.get("policy")))
     allowed_resources = set(policy["exclusive_resources"])
-    resources = {
-        item["key"]: list(item["exclusive_resources"])
-        for item in work
-    }
+    resources = {}
+    capabilities = {}
+    for key in selected:
+        current = current_by_key.get(key)
+        resources[key] = (
+            [value for value in current["exclusive_resources"] if value in allowed_resources]
+            if current is not None
+            else []
+        )
+        allowed_capabilities = set(policy["allowed_capabilities"])
+        capabilities[key] = (
+            [value for value in current["capabilities"] if value in allowed_capabilities]
+            if current is not None
+            else []
+        )
     active_resources = {
         (item["key"], resource)
         for item in work
@@ -451,10 +598,6 @@ def _derive_values(
     for ticket in resources:
         resources[ticket] = sorted(set(resources[ticket]))
 
-    capabilities = {
-        item["key"]: list(item["capabilities"])
-        for item in work
-    }
     intent = {
         "admitted_work": list(selected),
         "dependency_additions": additions,
@@ -466,7 +609,7 @@ def _derive_values(
         },
         "decision_requirements": [],
     }
-    changed = bool(additions or seen_resources)
+    changed = source_adoption or bool(additions or seen_resources)
     return intent, changed
 
 
@@ -509,14 +652,46 @@ def _require_normalized_intent(
         label="successor normalized intent",
     )
     plan, work = _require_active_plan(snapshot)
-    selected = [item["key"] for item in work]
+    source_adoption = "source_change_digest" in snapshot
+    if _source_adoption_is_unchanged(snapshot, plan, work):
+        _fail(
+            "SUCCESSOR_PLAN_UNCHANGED",
+            "approved source projection is identical to the active Plan Revision",
+        )
+    selected = [
+        item["key"] for item in snapshot["tickets"]
+    ] if source_adoption else [item["key"] for item in work]
     if intent["admitted_work"] != selected:
         _fail("PLAN_INVALIDATION_TICKET_INVALID", "successor intent must retain complete Campaign membership")
     if intent["decision_requirements"] != []:
         _fail("PLAN_INVALIDATION_DECISION_INVALID", "successor intent cannot carry a Decision")
 
+    current_by_key = {item["key"]: item for item in work}
+    source_by_key = {
+        item["key"]: item for item in snapshot["tickets"]
+    }
     current_edges = _active_edges(work)
-    graph = {item["key"]: set(item["depends_on"]) for item in work}
+    graph = {
+        key: {
+            dependency
+            for dependency in current_by_key[key]["depends_on"]
+            if dependency in set(selected)
+        }
+        for key in selected
+        if key in current_by_key
+    }
+    if source_adoption:
+        for key, ticket in source_by_key.items():
+            graph.setdefault(key, set())
+            graph[key].update(
+                blocker["key"]
+                for blocker in ticket.get("native_blockers", [])
+                if (
+                    type(blocker) is dict
+                    and blocker.get("state") == "open"
+                    and blocker.get("key") in set(selected)
+                )
+            )
     seen_edges: set[tuple[str, str]] = set()
     additions = intent["dependency_additions"]
     if type(additions) is not list:
@@ -553,28 +728,38 @@ def _require_normalized_intent(
     if type(resources) is not dict or set(resources) != selected_set:
         _fail("PLAN_INVALIDATION_RESOURCE_INVALID", "successor intent must account for every Ticket resource set")
     changed = False
-    for item in work:
-        values = _sorted_unique_texts(resources[item["key"]], "successor intent Exclusive Resources")
-        if not set(item["exclusive_resources"]).issubset(values):
+    for key in selected:
+        item = current_by_key.get(key)
+        values = _sorted_unique_texts(resources[key], "successor intent Exclusive Resources")
+        if item is not None and not source_adoption and not set(item["exclusive_resources"]).issubset(values):
             _fail("EXCLUSIVE_RESOURCE_INVALID", "successor intent cannot remove an active Exclusive Resource")
         if any(value not in policy["exclusive_resources"] for value in values):
             _fail("EXCLUSIVE_RESOURCE_INVALID", "successor intent names a policy-unknown Exclusive Resource")
-        if values != item["exclusive_resources"]:
+        if item is None or values != item["exclusive_resources"]:
             changed = True
     capabilities = intent["capability_requirements"]
     if type(capabilities) is not dict or set(capabilities) != selected_set:
         _fail("CAPABILITY_INVALID", "successor intent must account for every Ticket capability set")
-    for item in work:
-        values = _sorted_unique_texts(capabilities[item["key"]], "successor intent capabilities")
-        if values != item["capabilities"]:
+    for key in selected:
+        item = current_by_key.get(key)
+        values = _sorted_unique_texts(capabilities[key], "successor intent capabilities")
+        if item is not None and not source_adoption and values != item["capabilities"]:
             _fail("CAPABILITY_INVALID", "successor cannot change Ticket capabilities")
         if any(value not in policy["allowed_capabilities"] for value in values):
             _fail("CAPABILITY_INVALID", "successor intent names a policy-unknown capability")
     if seen_edges:
         changed = True
-    if not changed:
+    if not changed and not source_adoption:
         _fail("SUCCESSOR_PLAN_UNCHANGED", "successor intent has no dependency or resource delta")
     return intent
+
+
+def _authority(policy_digest: str, grants: list[dict[str, Any]]) -> dict[str, Any]:
+    core = {
+        "policy_witness_digest": policy_digest,
+        "grants": deepcopy(grants),
+    }
+    return {**core, "subtree_digest": digest_value(core)}
 
 
 def compile_successor_plan_spec(
@@ -586,38 +771,94 @@ def compile_successor_plan_spec(
     frozen = _require_snapshot(snapshot)
     intent = _require_normalized_intent(frozen, normalized_intent)
     active, work = _require_active_plan(frozen)
+    source_adoption = "source_change_digest" in frozen
     additions = {
         (item["from"], item["to"])
         for item in intent["dependency_additions"]
     }
+    source_by_key = {
+        item["key"]: item for item in frozen["tickets"]
+    }
+    current_by_key = {item["key"]: item for item in work}
+    policy = _require_policy(frozen.get("policy_witness", frozen.get("policy")))
     compiled_work: list[dict[str, Any]] = []
-    for current in work:
-        key = current["key"]
-        dependencies = set(current["depends_on"])
+    work_keys = intent["admitted_work"] if source_adoption else [item["key"] for item in work]
+    for key in work_keys:
+        current = current_by_key.get(key)
+        source_ticket = source_by_key.get(key)
+        if source_adoption and source_ticket is None:
+            _fail("PLAN_INVALIDATION_TICKET_INVALID", "successor intent names a Ticket outside approved source membership")
+        if current is None and not source_adoption:
+            _fail("PLAN_INVALIDATION_TICKET_INVALID", "successor intent names a Ticket outside active membership")
+        dependencies = {
+            dependency
+            for dependency in (current["depends_on"] if current is not None else ())
+            if dependency in set(work_keys)
+        }
+        if source_adoption and source_ticket is not None:
+            dependencies.update(
+                blocker["key"]
+                for blocker in source_ticket.get("native_blockers", [])
+                if (
+                    type(blocker) is dict
+                    and blocker.get("state") == "open"
+                    and blocker.get("key") in set(work_keys)
+                )
+            )
         dependencies.update(
             target for source, target in additions if source == key
         )
+        if source_adoption:
+            capabilities = deepcopy(intent["capability_requirements"][key])
+            authority = {
+                "policy_witness_digest": policy["digest"],
+                "worker": _authority(policy["digest"], policy["authority_grants"]["worker"]),
+                "recovery_worker": _authority(policy["digest"], policy["authority_grants"]["recovery_worker"]),
+                "review": _authority(policy["digest"], policy["authority_grants"]["review"]),
+            }
+            source = deepcopy(source_ticket["source"])
+            contract = deepcopy(source_ticket["contract"])
+        else:
+            capabilities = deepcopy(current["capabilities"])
+            authority = deepcopy(current["authority"])
+            source = deepcopy(current["source"])
+            contract = deepcopy(current["contract"])
         compiled_work.append(
             {
                 "key": key,
-                "source": deepcopy(current["source"]),
-                "contract": deepcopy(current["contract"]),
+                "source": source,
+                "contract": contract,
                 "depends_on": sorted(dependencies),
                 "exclusive_resources": deepcopy(intent["exclusive_resources"][key]),
-                "capabilities": deepcopy(current["capabilities"]),
-                "authority": deepcopy(current["authority"]),
+                "capabilities": capabilities,
+                "authority": authority,
             }
         )
     graph = {
         item["key"]: set(item["depends_on"]) for item in compiled_work
     }
     _assert_acyclic(graph)
+    if source_adoption:
+        campaign = {
+            "key": active["campaign"]["key"],
+            "source": deepcopy(frozen["campaign_source"]),
+            "authority": _authority(
+                policy["digest"],
+                policy["authority_grants"]["campaign"],
+            ),
+            "product_release": deepcopy(frozen["product_release"]),
+            "source_change_digest": frozen["source_change_digest"],
+        }
+        plan_policy = {"ref": policy["ref"], "digest": policy["digest"]}
+    else:
+        campaign = deepcopy(active["campaign"])
+        plan_policy = deepcopy(active["policy"])
     result = {
         "schema_version": active["schema_version"],
         "repository": active["repository"],
-        "target_branch": deepcopy(active["target_branch"]),
-        "campaign": deepcopy(active["campaign"]),
-        "policy": deepcopy(active["policy"]),
+        "target_branch": deepcopy(frozen["target_branch"] if source_adoption else active["target_branch"]),
+        "campaign": campaign,
+        "policy": plan_policy,
         "work": compiled_work,
     }
     return _canonical(result)
@@ -629,7 +870,10 @@ def _source_projection(
     return {
         "target_branch": snapshot.get("target_branch"),
         "campaign_source": snapshot.get("campaign_source"),
+        "membership": snapshot.get("membership"),
         "tickets": snapshot.get("tickets"),
+        "product_release": snapshot.get("product_release"),
+        "source_change_digest": snapshot.get("source_change_digest"),
         "external_dependencies": snapshot.get("external_dependencies", []),
         "policy": snapshot.get("policy") if observed else snapshot["policy_witness"],
     }
@@ -649,7 +893,10 @@ def validate_fresh_successor_source(
     source_fields = (
         "target_branch",
         "campaign_source",
+        "membership",
         "tickets",
+        "product_release",
+        "source_change_digest",
         "external_dependencies",
     )
     if any(

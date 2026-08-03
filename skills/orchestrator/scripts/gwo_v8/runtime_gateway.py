@@ -1362,6 +1362,11 @@ class CoordinatorCapabilityProof:
     can_edit_tracker: bool
     can_expand_authority: bool
     delegation_enabled: bool
+    can_edit_labels: bool = False
+    can_edit_campaign_membership: bool = False
+    can_grant_authority: bool = False
+    can_merge: bool = False
+    can_invoke_global_planning: bool = False
 
     def __post_init__(self) -> None:
         _require_digest(self.subject_digest, "Coordinator subject digest")
@@ -1372,6 +1377,11 @@ class CoordinatorCapabilityProof:
             "can_edit_tracker",
             "can_expand_authority",
             "delegation_enabled",
+            "can_edit_labels",
+            "can_edit_campaign_membership",
+            "can_grant_authority",
+            "can_merge",
+            "can_invoke_global_planning",
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise RuntimeGatewayError(
@@ -1393,6 +1403,11 @@ class CoordinatorCapabilityProof:
             and not self.can_edit_tracker
             and not self.can_expand_authority
             and not self.delegation_enabled
+            and not self.can_edit_labels
+            and not self.can_edit_campaign_membership
+            and not self.can_grant_authority
+            and not self.can_merge
+            and not self.can_invoke_global_planning
         )
 
     def canonical(self) -> dict[str, Any]:
@@ -1404,6 +1419,11 @@ class CoordinatorCapabilityProof:
             "can_edit_tracker": self.can_edit_tracker,
             "can_expand_authority": self.can_expand_authority,
             "delegation_enabled": self.delegation_enabled,
+            "can_edit_labels": self.can_edit_labels,
+            "can_edit_campaign_membership": self.can_edit_campaign_membership,
+            "can_grant_authority": self.can_grant_authority,
+            "can_merge": self.can_merge,
+            "can_invoke_global_planning": self.can_invoke_global_planning,
         }
 
     @property
@@ -1430,6 +1450,130 @@ class CapabilityPolicyProof:
                 "capability policy proof requires an exact CapabilityPolicy",
             )
         _require_digest(self.authority_record_digest, "authority_record_digest")
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "kind": "gwo.capability-policy-proof.v1",
+            "capability_policy": self.capability_policy.canonical(),
+            "authority_record_digest": self.authority_record_digest,
+        }
+
+    @property
+    def digest(self) -> str:
+        return digest_value(self.canonical())
+
+
+@dataclass(frozen=True)
+class HumanGateCapabilityProof:
+    """The immutable, read-backed capability boundary for the human gate."""
+
+    subject_digest: str
+    policy_witness_digest: str
+    gateway_configuration_digest: str
+    worker_capability_policy_proof: CapabilityPolicyProof
+    reviewer_capability_policy_proof: CapabilityPolicyProof
+    coordinator_capability_proof: CoordinatorCapabilityProof
+    proof_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.subject_digest, "human-gate subject digest"),
+            (self.policy_witness_digest, "human-gate Policy Witness digest"),
+            (self.gateway_configuration_digest, "human-gate Gateway configuration digest"),
+        ):
+            _require_digest(value, label)
+        if type(self.worker_capability_policy_proof) is not CapabilityPolicyProof:
+            raise RuntimeGatewayError(
+                "PLAN_INVALIDATION_CAPABILITY_PROOF_FAIL_CLOSED",
+                "human-gate Worker capability proof is missing or malformed",
+            )
+        if type(self.reviewer_capability_policy_proof) is not CapabilityPolicyProof:
+            raise RuntimeGatewayError(
+                "PLAN_INVALIDATION_CAPABILITY_PROOF_FAIL_CLOSED",
+                "human-gate Reviewer capability proof is missing or malformed",
+            )
+        if type(self.coordinator_capability_proof) is not CoordinatorCapabilityProof:
+            raise RuntimeGatewayError(
+                "PLAN_INVALIDATION_CAPABILITY_PROOF_FAIL_CLOSED",
+                "human-gate Coordinator capability proof is missing or malformed",
+            )
+        if self.proof_digest is None:
+            object.__setattr__(self, "proof_digest", self.digest)
+        else:
+            _require_digest(self.proof_digest, "human-gate capability proof digest")
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "kind": "gwo.human-gate-capability-proof.v1",
+            "subject_digest": self.subject_digest,
+            "policy_witness_digest": self.policy_witness_digest,
+            "gateway_configuration_digest": self.gateway_configuration_digest,
+            "worker_capability_policy_proof": self.worker_capability_policy_proof.canonical(),
+            "reviewer_capability_policy_proof": self.reviewer_capability_policy_proof.canonical(),
+            "coordinator_capability_proof": self.coordinator_capability_proof.canonical(),
+        }
+
+    @property
+    def digest(self) -> str:
+        return digest_value(self.canonical())
+
+
+def validate_human_gate_capability(
+    proof: object,
+    *,
+    expected_subject_digest: str | None = None,
+    expected_policy_witness_digest: str | None = None,
+    expected_gateway_configuration_digest: str | None = None,
+) -> HumanGateCapabilityProof:
+    """Validate one complete human-gate capability proof without mutation."""
+
+    code = "PLAN_INVALIDATION_CAPABILITY_PROOF_FAIL_CLOSED"
+    if type(proof) is not HumanGateCapabilityProof:
+        raise RuntimeGatewayError(code, "human-gate capability proof is missing or malformed")
+    try:
+        if proof.proof_digest != proof.digest:
+            raise RuntimeGatewayError(code, "human-gate capability proof digest changed")
+        if expected_subject_digest is not None and proof.subject_digest != expected_subject_digest:
+            raise RuntimeGatewayError(code, "human-gate capability proof subject changed")
+        if (
+            expected_policy_witness_digest is not None
+            and proof.policy_witness_digest != expected_policy_witness_digest
+        ):
+            raise RuntimeGatewayError(code, "human-gate Policy Witness digest changed")
+        if (
+            expected_gateway_configuration_digest is not None
+            and proof.gateway_configuration_digest != expected_gateway_configuration_digest
+        ):
+            raise RuntimeGatewayError(code, "human-gate Gateway configuration digest changed")
+        for role, policy_proof in (
+            ("Worker", proof.worker_capability_policy_proof),
+            ("Reviewer", proof.reviewer_capability_policy_proof),
+        ):
+            if (
+                type(policy_proof) is not CapabilityPolicyProof
+                or type(policy_proof.capability_policy) is not CapabilityPolicy
+                or not policy_proof.capability_policy.is_proven
+            ):
+                raise RuntimeGatewayError(
+                    code,
+                    f"human-gate {role} capability policy permits a forbidden effect",
+                )
+            _require_digest(policy_proof.authority_record_digest, f"{role} authority record digest")
+        coordinator = proof.coordinator_capability_proof
+        if (
+            type(coordinator) is not CoordinatorCapabilityProof
+            or coordinator.subject_digest != proof.subject_digest
+            or not coordinator.is_proven
+        ):
+            raise RuntimeGatewayError(
+                code,
+                "human-gate Coordinator capability proof permits a forbidden effect",
+            )
+    except RuntimeGatewayError:
+        raise
+    except Exception as error:
+        raise RuntimeGatewayError(code, "human-gate capability proof is not closed") from error
+    return proof
 
 
 @dataclass(frozen=True, init=False)
@@ -1656,7 +1800,7 @@ class PlanInvalidationReceipt:
                 "capability policy proof must be an exact CapabilityPolicyProof",
             )
         if self.observation is not None:
-            expected = {
+            legacy_expected = {
                 "kind",
                 "repository",
                 "campaign_key",
@@ -1673,13 +1817,40 @@ class PlanInvalidationReceipt:
                 "required_effects",
                 "workspace_identity",
             }
+            expected_with_source_lineage = legacy_expected | {
+                "source_evidence_digests"
+            }
+            observation_keys = (
+                set(self.observation) if isinstance(self.observation, Mapping) else set()
+            )
+            source_digests = (
+                self.observation.get("source_evidence_digests")
+                if isinstance(self.observation, Mapping)
+                and "source_evidence_digests" in self.observation
+                else None
+            )
+            source_lineage_valid = (
+                "source_evidence_digests" not in observation_keys
+                or (
+                    type(source_digests) is list
+                    and bool(source_digests)
+                    and all(
+                        type(digest) is str
+                        and _DIGEST_RE.fullmatch(digest) is not None
+                        for digest in source_digests
+                    )
+                    and source_digests == sorted(set(source_digests))
+                )
+            )
             if (
                 not isinstance(self.observation, Mapping)
-                or set(self.observation) != expected
+                or observation_keys
+                not in (legacy_expected, expected_with_source_lineage)
                 or self.observation.get("kind")
                 != "plan_invalidation_observation.v1"
                 or self.observation.get("report_digest") != self.report_digest
                 or type(self.observation.get("required_effects")) is not list
+                or not source_lineage_valid
             ):
                 raise RuntimeGatewayError(
                     "PLAN_INVALIDATION_RECEIPT_INVALID",
@@ -5049,6 +5220,76 @@ class _PaseoCliTransport:
         except CanonicalJsonError as error:
             raise ValueError("Paseo JSON response is invalid") from error
 
+    @staticmethod
+    def _configure_pipe(stream: Any) -> None:
+        """Put a subprocess pipe in the polling mode available on this host.
+
+        Some supported Windows Python builds do not expose ``os.set_blocking``
+        for anonymous subprocess pipes.  Windows named-pipe polling is handled
+        by ``_read_pipe_chunk`` below; no blocking mode toggle is required in
+        that case.  POSIX keeps the existing native non-blocking path.
+        """
+
+        if hasattr(os, "set_blocking"):
+            os.set_blocking(stream.fileno(), False)
+            return
+        if os.name != "nt":
+            raise OSError("the host cannot configure non-blocking subprocess pipes")
+
+    @staticmethod
+    def _read_pipe_chunk(
+        stream: Any,
+        process: Any,
+        maximum_bytes: int,
+    ) -> bytes | None:
+        """Read one bounded chunk, returning ``None`` when Windows has no data."""
+
+        if hasattr(os, "set_blocking") or os.name != "nt":
+            return os.read(stream.fileno(), maximum_bytes)
+
+        # ``select`` and ``os.set_blocking`` are not available for anonymous
+        # Windows pipes in this Python runtime.  PeekNamedPipe gives the same
+        # non-consuming readiness check while retaining the transport caps.
+        import ctypes
+        import ctypes.wintypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        peek = kernel32.PeekNamedPipe
+        peek.argtypes = [
+            ctypes.wintypes.HANDLE,
+            ctypes.c_void_p,
+            ctypes.wintypes.DWORD,
+            ctypes.POINTER(ctypes.wintypes.DWORD),
+            ctypes.POINTER(ctypes.wintypes.DWORD),
+            ctypes.POINTER(ctypes.wintypes.DWORD),
+        ]
+        peek.restype = ctypes.wintypes.BOOL
+        available = ctypes.wintypes.DWORD()
+        bytes_read = ctypes.wintypes.DWORD()
+        message_bytes = ctypes.wintypes.DWORD()
+        handle = ctypes.wintypes.HANDLE(msvcrt.get_osfhandle(stream.fileno()))
+        if not peek(
+            handle,
+            None,
+            0,
+            ctypes.byref(bytes_read),
+            ctypes.byref(available),
+            ctypes.byref(message_bytes),
+        ):
+            error = ctypes.get_last_error()
+            # ERROR_BROKEN_PIPE / ERROR_NO_DATA mean the producer closed the
+            # pipe.  Returning EOF lets the normal drain/cleanup path run.
+            if error in {109, 232}:
+                return b""
+            raise OSError(error, "PeekNamedPipe failed")
+        if available.value == 0:
+            # Never perform a potentially blocking read merely because the
+            # parent process exited: an inherited grandchild may still own
+            # the pipe, and the bounded post-exit drain must remain in charge.
+            return None
+        return os.read(stream.fileno(), min(maximum_bytes, available.value))
+
     def _run(self, args: list[str], *, allow_empty: bool = False) -> Any:
         self.validate_arguments(args, executable=self._executable)
         started = time.monotonic()
@@ -5093,18 +5334,24 @@ class _PaseoCliTransport:
 
         try:
             for stream in streams.values():
-                os.set_blocking(stream.fileno(), False)
+                self._configure_pipe(stream)
             while True:
                 made_progress = False
                 for name in tuple(open_streams):
                     stream = streams[name]
                     try:
-                        chunk = os.read(stream.fileno(), _PASEO_PIPE_CHUNK_BYTES)
+                        chunk = self._read_pipe_chunk(
+                            stream,
+                            process,
+                            _PASEO_PIPE_CHUNK_BYTES,
+                        )
                     except BlockingIOError:
                         continue
                     except OSError:
                         stop_reason = "read_failed"
                         break
+                    if chunk is None:
+                        continue
                     if not chunk:
                         open_streams.remove(name)
                         continue
@@ -8844,6 +9091,83 @@ class RuntimeGateway:
             delegation_enabled=False,
         )
 
+    def _read_human_gate_capability(
+        self,
+        subject: RuntimeSubject,
+    ) -> HumanGateCapabilityProof:
+        """Read back the complete, non-writing human-gate capability boundary."""
+
+        code = "PLAN_INVALIDATION_CAPABILITY_PROOF_FAIL_CLOSED"
+        if type(subject) not in {CampaignPlanningSubject, WorkRunSubject}:
+            raise RuntimeGatewayError(
+                code,
+                "human-gate capability readback accepts an exact Runtime subject only",
+            )
+        self._assert_configuration_identity()
+        self._refresh()
+        reader = getattr(self._authority_readback, "read_human_gate_capability", None)
+        if not callable(reader):
+            raise RuntimeGatewayError(
+                code,
+                "human-gate capability readback is unavailable",
+            )
+        try:
+            proof = reader(subject)
+        except RuntimeGatewayError:
+            raise
+        except Exception as error:
+            raise RuntimeGatewayError(
+                code,
+                "human-gate capability readback failed closed",
+            ) from error
+        return validate_human_gate_capability(
+            proof,
+            expected_subject_digest=subject.digest,
+            expected_policy_witness_digest=subject.authority_digest,
+            expected_gateway_configuration_digest=self._configuration_identity,
+        )
+
+    def _validate_human_gate_capability(
+        self,
+        proof: object,
+        subject: RuntimeSubject | None = None,
+    ) -> HumanGateCapabilityProof:
+        """Validate a previously read proof against this Gateway identity."""
+
+        if subject is not None and type(subject) not in {
+            CampaignPlanningSubject,
+            WorkRunSubject,
+        }:
+            raise RuntimeGatewayError(
+                "PLAN_INVALIDATION_CAPABILITY_PROOF_FAIL_CLOSED",
+                "human-gate capability validation subject is invalid",
+            )
+        self._assert_configuration_identity()
+        return validate_human_gate_capability(
+            proof,
+            expected_subject_digest=None if subject is None else subject.digest,
+            expected_policy_witness_digest=(
+                None if subject is None else subject.authority_digest
+            ),
+            expected_gateway_configuration_digest=self._configuration_identity,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        """Expose private capability seams without adding workflow operations.
+
+        The Gateway's public class surface remains the three workflow
+        operations (``planning_preflight``, ``progress``, ``transition``).
+        Human-gate capability reads are private semantic seams; the dynamic
+        aliases preserve the narrow test/host adapter without advertising a
+        fourth public operation to callers or package introspection.
+        """
+
+        if name == "read_human_gate_capability":
+            return self._read_human_gate_capability
+        if name == "validate_human_gate_capability":
+            return self._validate_human_gate_capability
+        raise AttributeError(name)
+
     # Caller interface operation 2.  This owns the entire readback-first
     # prepare/observe/start-or-resume loop; callers cannot issue provider
     # commands or inspect a Runtime Binding.
@@ -9366,7 +9690,7 @@ class RuntimeGateway:
                 "PLAN_INVALIDATION_REPORT_INVALID",
                 "Plan Invalidation Evidence Artifact is not readable",
             ) from error
-        expected_evidence_keys = {
+        legacy_evidence_keys = {
             "schema_version",
             "kind",
             "subject",
@@ -9376,9 +9700,57 @@ class RuntimeGateway:
             "required_effects",
             "workspace_identity",
         }
+        evidence_keys_with_source_lineage = legacy_evidence_keys | {
+            "source_evidence_digests"
+        }
+        evidence_keys_with_complete_lineage = evidence_keys_with_source_lineage | {
+            "lineage_artifacts"
+        }
+        evidence_keys = set(evidence) if type(evidence) is dict else set()
+        has_source_lineage = (
+            type(evidence) is dict and "source_evidence_digests" in evidence
+        )
+        source_digests = (
+            evidence.get("source_evidence_digests")
+            if has_source_lineage
+            else None
+        )
+        source_lineage_valid = (
+            not has_source_lineage
+            or (
+                type(source_digests) is list
+                and bool(source_digests)
+                and all(
+                    type(digest) is str and _DIGEST_RE.fullmatch(digest) is not None
+                    for digest in source_digests
+                )
+                and source_digests == sorted(set(source_digests))
+            )
+        )
+        lineage_artifacts = (
+            evidence.get("lineage_artifacts")
+            if type(evidence) is dict and "lineage_artifacts" in evidence
+            else None
+        )
+        lineage_valid = (
+            lineage_artifacts is None
+            or (
+                type(lineage_artifacts) is list
+                and all(
+                    type(artifact) is dict
+                    and load_canonical_json(canonical_bytes(artifact)) == artifact
+                    for artifact in lineage_artifacts
+                )
+            )
+        )
         if (
             type(evidence) is not dict
-            or set(evidence) != expected_evidence_keys
+            or evidence_keys
+            not in (
+                legacy_evidence_keys,
+                evidence_keys_with_source_lineage,
+                evidence_keys_with_complete_lineage,
+            )
             or evidence.get("schema_version") != "gwo.evidence.v1"
             or evidence.get("kind") != "plan_invalidation"
             or evidence.get("subject") != subject.canonical()
@@ -9390,11 +9762,16 @@ class RuntimeGateway:
             or evidence.get("invalidated_obligation") != report.invalidated_obligation
             or evidence.get("required_effects") != list(report.required_effects)
             or evidence.get("workspace_identity") != report.workspace_identity
+            or not source_lineage_valid
+            or not lineage_valid
         ):
             raise RuntimeGatewayError(
                 "PLAN_INVALIDATION_REPORT_INVALID",
                 "Plan Invalidation Evidence Artifact does not prove the exact report",
             )
+        source_evidence_digests = (
+            list(source_digests) if has_source_lineage else None
+        )
         # Effective capability-policy readback must prove the reporting role
         # cannot edit Issues, blockers, Campaign membership, activate a Plan
         # Revision, merge, expand authority, or invoke global planning.
@@ -9468,6 +9845,8 @@ class RuntimeGateway:
             "required_effects": list(report.required_effects),
             "workspace_identity": report.workspace_identity,
         }
+        if source_evidence_digests is not None:
+            observation["source_evidence_digests"] = source_evidence_digests
 
         def commit(data: dict[str, Any]) -> None:
             invalidations = data.setdefault("plan_invalidation", {})
@@ -9499,6 +9878,8 @@ class RuntimeGateway:
                 "authority_record_digest": authority_record_digest,
                 "policy_witness_digest": authority.policy_witness_digest,
             }
+            if source_evidence_digests is not None:
+                candidate["source_evidence_digests"] = source_evidence_digests
             existing = invalidations.get(dedup_key)
             if existing is not None:
                 # Duplicate callbacks compare the complete identity, not only
@@ -11525,7 +11906,7 @@ class RuntimeGateway:
                 "RUNTIME_STORE_INVALID",
                 "RuntimeGateway Plan Invalidation collection is invalid",
             )
-        expected_record = {
+        legacy_record = {
             "report_digest",
             "receipt_digest",
             "subject_digest",
@@ -11547,7 +11928,8 @@ class RuntimeGateway:
             "authority_record_digest",
             "policy_witness_digest",
         }
-        expected_observation = {
+        record_with_source_lineage = legacy_record | {"source_evidence_digests"}
+        legacy_observation = {
             "kind",
             "repository",
             "campaign_key",
@@ -11564,6 +11946,9 @@ class RuntimeGateway:
             "required_effects",
             "workspace_identity",
         }
+        observation_with_source_lineage = legacy_observation | {
+            "source_evidence_digests"
+        }
         expected_policy = {
             "worker_can_edit_issues",
             "worker_can_edit_blockers",
@@ -11578,7 +11963,7 @@ class RuntimeGateway:
                 type(dedup_key) is not str
                 or _DIGEST_RE.fullmatch(dedup_key) is None
                 or type(record) is not dict
-                or set(record) != expected_record
+                or set(record) not in (legacy_record, record_with_source_lineage)
             ):
                 raise RuntimeGatewayError(
                     "RUNTIME_STORE_INVALID",
@@ -11624,17 +12009,40 @@ class RuntimeGateway:
                     "RuntimeGateway Plan Invalidation effects are invalid",
                 )
             observation = record["observation"]
+            has_source_lineage = "source_evidence_digests" in record
+            source_digests = record.get("source_evidence_digests")
+            source_lineage_valid = (
+                not has_source_lineage
+                or (
+                    type(source_digests) is list
+                    and bool(source_digests)
+                    and all(
+                        type(digest) is str
+                        and _DIGEST_RE.fullmatch(digest) is not None
+                        for digest in source_digests
+                    )
+                    and source_digests == sorted(set(source_digests))
+                )
+            )
+            observation_keys = (
+                set(observation) if type(observation) is dict else set()
+            )
             if (
                 type(observation) is not dict
-                or set(observation) != expected_observation
+                or observation_keys
+                not in (legacy_observation, observation_with_source_lineage)
                 or observation.get("kind") != "plan_invalidation_observation.v1"
                 or observation.get("required_effects") != effects
+                or ("source_evidence_digests" in observation_keys)
+                != has_source_lineage
+                or not source_lineage_valid
+                or observation.get("source_evidence_digests") != source_digests
             ):
                 raise RuntimeGatewayError(
                     "RUNTIME_STORE_INVALID",
                     "RuntimeGateway Plan Invalidation observation is invalid",
                 )
-            for name in expected_observation - {"kind", "required_effects"}:
+            for name in legacy_observation - {"kind", "required_effects"}:
                 if observation.get(name) != record.get(name):
                     raise RuntimeGatewayError(
                         "RUNTIME_STORE_INVALID",

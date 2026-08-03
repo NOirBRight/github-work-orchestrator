@@ -46,6 +46,7 @@ class _ControlDouble:
         self.active_result = object()
         self.classification_result = object()
         self.activation_result = object()
+        self.human_source_result = object()
         self.calls = []
         type(self).instances.append(self)
 
@@ -62,6 +63,10 @@ class _ControlDouble:
     def activate_successor(self, handle, classification):
         self.calls.append(("activate_successor", handle, classification))
         return self.activation_result
+
+    def read_human_decision_source(self, handle, decision, choice):
+        self.calls.append(("read_human_decision_source", handle, decision, choice))
+        return self.human_source_result
 
 
 class _ProductionPlanningAdapter:
@@ -444,6 +449,49 @@ def test_host_reuses_existing_campaign_runtime_assertion_and_artifact_store(
     subject = object()
     assert controls[1].gateway._read_coordinator_capability(subject) is raw_gateway.capability
     assert raw_gateway.subjects == [subject]
+
+
+def test_host_forwards_authoritative_human_source_readback_through_existing_control(
+    host_context,
+):
+    host, handle, _assertion, _raw_gateway, _builder_calls = host_context
+    decision = object()
+    choice = object()
+
+    result = host.read_human_decision_source(handle, decision, choice)
+
+    assert len(_ControlDouble.instances) == 1
+    composed = _ControlDouble.instances[0]
+    assert result is composed.human_source_result
+    assert composed.calls == [
+        ("read_human_decision_source", handle, decision, choice)
+    ]
+
+
+def test_host_injects_read_only_human_source_into_each_recomposed_control(
+    host_context,
+):
+    from gwo_v8.plan_control_host import ProductionPlanControlStartHost
+
+    host, handle, _assertion, _raw_gateway, _builder_calls = host_context
+    source = type("Source", (), {"read": lambda *_args: None})()
+    composed_host = ProductionPlanControlStartHost(
+        source=host._source,
+        repository=host._repository,
+        runtime_configuration=host._configuration,
+        repository_contexts=host._repository_contexts,
+        gateway_store_path=host._gateway_store_path,
+        artifact_root=host._artifacts._root,
+        max_snapshot_bytes=host._max_snapshot_bytes,
+        human_source=source,
+        _gateway_builder=host._gateway_builder,
+    )
+
+    composed_host.read_active(handle)
+
+    composed = _ControlDouble.instances[-1]
+    assert composed_host._human_source is source
+    assert composed._human_source is source
 
 
 def test_production_host_classifies_and_activates_through_real_runtime_gateway(
