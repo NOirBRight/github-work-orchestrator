@@ -858,12 +858,19 @@ class ExecutionKernel:
         return WatchdogCampaignSnapshot(
             campaign=handle,
             status=self._status_from_persisted_state(state),
-            trusted_progress_digest=self._trusted_progress_digest(state),
-            next_check_at=None,
-            active_binding_ids=(),
-            diagnosed_binding_ids=(),
-            candidate_receipt_digests=(),
-            last_wake_refs=(),
+            trusted_progress_digest=self._trusted_progress_digest(state, handle),
+            next_check_at=self._snapshot_next_check_at(state),
+            active_binding_ids=self._snapshot_active_binding_ids(state),
+            diagnosed_binding_ids=self._snapshot_diagnosed_binding_ids(state),
+            candidate_receipt_digests=tuple(
+                sorted(
+                    receipt.digest
+                    for _ticket_key, receipt in self._candidate_receipt_records(
+                        state, handle
+                    )
+                )
+            ),
+            last_wake_refs=tuple(sorted(state.get("last_wake_refs", ()))),
         )
 
     def read_candidate_receipt(
@@ -984,6 +991,7 @@ class ExecutionKernel:
             candidate_identity=run.get("candidate_identity"),
             result_digest=run.get("result_digest"),
             evidence_digests=tuple(run.get("evidence_digests", ())),
+            last_wake_ref=run.get("last_wake_ref"),
         )
 
     def _replan_budget_defaults(
@@ -2421,16 +2429,22 @@ class ExecutionKernel:
                 "CAMPAIGN_REVISION_CHANGED",
                 "a successor Plan Revision requires its own durable execution state",
             )
-        state.setdefault("plan_invalidation", {})
-        state.setdefault("plan_invalidation_resolutions", {})
-        state.setdefault("plan_invalidation_classifications", {})
-        state.setdefault("accepted_results", [])
-        state.setdefault("revision_lineage", [])
-        state.setdefault("last_wake_refs", [])
-        state.setdefault("trusted_progress_revision", 0)
-        state.setdefault("normalized_permission_receipts", [])
-        state.setdefault("candidate_receipts", [])
-        state.setdefault("delivery_receipts", [])
+        dirty = False
+        for field, default in (
+            ("plan_invalidation", {}),
+            ("plan_invalidation_resolutions", {}),
+            ("plan_invalidation_classifications", {}),
+            ("accepted_results", []),
+            ("revision_lineage", []),
+            ("last_wake_refs", []),
+            ("trusted_progress_revision", 0),
+            ("normalized_permission_receipts", []),
+            ("candidate_receipts", []),
+            ("delivery_receipts", []),
+        ):
+            if field not in state:
+                state[field] = default
+                dirty = True
         if type(state["revision_lineage"]) is not list:
             raise ExecutionKernelError(
                 "EXECUTION_STORE_INVALID",
@@ -2441,7 +2455,6 @@ class ExecutionKernel:
             raise ExecutionKernelError(
                 "EXECUTION_STORE_INVALID", "ExecutionKernel effects are not a mapping"
             )
-        dirty = False
         if budget_defaults is None:
             if "replan_budgets" in state:
                 raise ExecutionKernelError(
@@ -2531,6 +2544,27 @@ class ExecutionKernel:
                 dirty = True
             if "resume_after_invalidation" not in run:
                 run["resume_after_invalidation"] = False
+                dirty = True
+
+        if state["candidate_receipts"] == []:
+            existing_receipts = [
+                run["candidate_receipt"]
+                for _ticket_key, run in sorted(state["runs"].items())
+                if type(run) is dict and run.get("candidate_receipt") is not None
+            ]
+            if existing_receipts:
+                state["candidate_receipts"] = existing_receipts
+                dirty = True
+        if state["last_wake_refs"] == []:
+            existing_wakes = sorted(
+                {
+                    run.get("last_wake_ref")
+                    for run in state["runs"].values()
+                    if type(run) is dict and run.get("last_wake_ref") is not None
+                }
+            )
+            if existing_wakes:
+                state["last_wake_refs"] = existing_wakes
                 dirty = True
 
         # Re-key any historical effect referenced by the Work Run's last
@@ -4439,6 +4473,7 @@ class ExecutionKernel:
     ) -> None:
         run = state["runs"][ticket_key]
         trusted_before = self._trusted_lifecycle_projection(run)
+        trusted_progress_recorded = False
         resuming = run["phase"] == "parked" or bool(
             run.get("resume_after_invalidation")
         )
@@ -4494,6 +4529,11 @@ class ExecutionKernel:
                 # Reissuing the semantic effect here would create polling and
                 # would undermine the stable-action recovery contract.
                 run["last_wake_ref"] = wake_ref
+                if wake_ref is not None:
+                    state.setdefault("last_wake_refs", [])
+                    if wake_ref not in state["last_wake_refs"]:
+                        state["last_wake_refs"].append(wake_ref)
+                        state["last_wake_refs"].sort()
                 self._save(active.handle, state)
                 return
             observation = self._effects.execute(action)
@@ -4518,7 +4558,18 @@ class ExecutionKernel:
                     "EXECUTION_STORE_INVALID",
                     "CandidateReceipt is bound to another Campaign or Work Run",
                 )
-            run["candidate_receipt"] = receipt.canonical()
+            receipt_canonical = receipt.canonical()
+            receipt_changed = run.get("candidate_receipt") != receipt_canonical
+            run["candidate_receipt"] = receipt_canonical
+            run["candidate_receipt_digest"] = receipt.digest
+            state["candidate_receipts"] = [
+                value["candidate_receipt"]
+                for _key, value in sorted(state["runs"].items())
+                if type(value) is dict and value.get("candidate_receipt") is not None
+            ]
+            if receipt_changed:
+                self._record_trusted_progress(state, run)
+                trusted_progress_recorded = True
             self._save(active.handle, state)
             persisted_state = self._load(active.handle)
             if persisted_state is None:
@@ -4555,6 +4606,11 @@ class ExecutionKernel:
         run["slot_held"] = observation.phase in _SLOT_PHASES
         run["claim_state"] = "held" if run["slot_held"] else "released"
         run["last_wake_ref"] = wake_ref
+        if wake_ref is not None:
+            state.setdefault("last_wake_refs", [])
+            if wake_ref not in state["last_wake_refs"]:
+                state["last_wake_refs"].append(wake_ref)
+                state["last_wake_refs"].sort()
         run["resume_after_invalidation"] = False
         if observation.candidate_identity is not None:
             run["candidate_identity"] = observation.candidate_identity
@@ -4594,9 +4650,12 @@ class ExecutionKernel:
             run["result_digest"] = binding.result_digest
             run["evidence_digests"] = list(binding.evidence_digests)
         if (
+            not trusted_progress_recorded
+            and (
             prior_effect is None
             or prior_effect.get("state") != "read_back"
             or self._trusted_lifecycle_projection(run) != trusted_before
+            )
         ):
             self._record_trusted_progress(state, run)
         self._save(active.handle, state)
@@ -4751,16 +4810,155 @@ class ExecutionKernel:
                 "Campaign state cannot derive its status",
             ) from error
 
-    @staticmethod
-    def _trusted_progress_digest(state: Mapping[str, Any]) -> str:
+    def _trusted_progress_digest(
+        self,
+        state: Mapping[str, Any],
+        handle: CampaignHandle | None = None,
+    ) -> str:
+        if handle is None:
+            candidate_receipts: object = state.get("candidate_receipts", [])
+        else:
+            candidate_receipts = [
+                receipt.canonical()
+                for _ticket_key, receipt in self._candidate_receipt_records(state, handle)
+            ]
         return digest_value(
             {
                 "kernel_transition_revision": state.get("trusted_progress_revision", 0),
                 "permission_receipts": state.get("normalized_permission_receipts", []),
-                "candidate_receipts": state.get("candidate_receipts", []),
+                "candidate_receipts": candidate_receipts,
                 "delivery_receipts": state.get("delivery_receipts", []),
             }
         )
+
+    def _candidate_receipt_records(
+        self,
+        state: Mapping[str, Any],
+        handle: CampaignHandle,
+    ) -> tuple[tuple[str, CandidateReceipt], ...]:
+        runs = state.get("runs")
+        if type(runs) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel Work Runs are not a mapping",
+            )
+        records: list[tuple[str, CandidateReceipt]] = []
+        for ticket_key in sorted(runs):
+            run = runs[ticket_key]
+            if type(run) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "ExecutionKernel Work Run is not a mapping",
+                )
+            stored = run.get("candidate_receipt")
+            if stored is None:
+                continue
+            try:
+                receipt = CandidateReceipt.from_canonical(stored)
+            except Exception as error:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "persisted CandidateReceipt failed canonical readback",
+                ) from error
+            if (
+                receipt.repository != handle.repository
+                or receipt.campaign_key != handle.campaign_key
+                or receipt.campaign_handle != handle.campaign_key
+                or receipt.plan_revision_digest != state.get("plan_revision_digest")
+                or receipt.ticket_key != ticket_key
+                or receipt.work_run_key != run.get("work_run_key")
+                or receipt.runtime_subject_digest != run.get("work_subject_digest")
+            ):
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "CandidateReceipt is bound to another Campaign or Work Run",
+                )
+            stored_digest = run.get("candidate_receipt_digest")
+            if stored_digest is not None and stored_digest != receipt.digest:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "CandidateReceipt digest changed during readback",
+                )
+            records.append((ticket_key, receipt))
+        canonical_records = [receipt.canonical() for _ticket_key, receipt in records]
+        if "candidate_receipts" in state:
+            stored_records = state["candidate_receipts"]
+            if type(stored_records) is not list or stored_records != canonical_records:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "CandidateReceipt projection changed during readback",
+                )
+        return tuple(records)
+
+    @staticmethod
+    def _snapshot_next_check_at(state: Mapping[str, Any]) -> str | None:
+        value = state.get("next_check_at")
+        if value is not None:
+            if type(value) is not str or not value:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Campaign next_check_at is invalid",
+                )
+            return value
+        values = [
+            run.get("next_check_at")
+            for run in state.get("runs", {}).values()
+            if type(run) is dict and run.get("next_check_at") is not None
+        ]
+        if any(type(item) is not str or not item for item in values):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Work Run next_check_at is invalid",
+            )
+        return min(values) if values else None
+
+    @staticmethod
+    def _snapshot_text_tuple(
+        value: object,
+        label: str,
+    ) -> tuple[str, ...]:
+        if type(value) not in {list, tuple}:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                f"{label} is not a string collection",
+            )
+        if any(type(item) is not str or not item for item in value):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                f"{label} contains invalid text",
+            )
+        return tuple(sorted(set(value)))
+
+    def _snapshot_active_binding_ids(
+        self, state: Mapping[str, Any]
+    ) -> tuple[str, ...]:
+        if "active_binding_ids" in state:
+            return self._snapshot_text_tuple(
+                state["active_binding_ids"], "active binding identities"
+            )
+        values: list[str] = []
+        for run in state.get("runs", {}).values():
+            if type(run) is not dict:
+                continue
+            if not (run.get("slot_held") or run.get("phase") in _SLOT_PHASES):
+                continue
+            binding = run.get("runtime_binding_id") or run.get("semantic_action_id")
+            if binding is not None:
+                values.append(binding)
+        return self._snapshot_text_tuple(values, "active binding identities")
+
+    def _snapshot_diagnosed_binding_ids(
+        self, state: Mapping[str, Any]
+    ) -> tuple[str, ...]:
+        if "diagnosed_binding_ids" in state:
+            return self._snapshot_text_tuple(
+                state["diagnosed_binding_ids"], "diagnosed binding identities"
+            )
+        values: list[str] = []
+        for run in state.get("runs", {}).values():
+            if type(run) is dict and type(run.get("diagnosed_binding_ids")) is list:
+                values.extend(run["diagnosed_binding_ids"])
+        return self._snapshot_text_tuple(values, "diagnosed binding identities")
 
     def _campaign_lock(self, handle: CampaignHandle) -> threading.RLock:
         key = f"{self._store_path.resolve()}::{handle.repository}::{handle.campaign_key}"

@@ -14,6 +14,7 @@ if str(SCRIPTS) not in sys.path:
 
 from gwo_v8.execution_kernel import ExecutionKernelError
 from gwo_v8._canonical import canonical_bytes, digest_bytes, load_canonical_json
+from v8_candidate_assurance_test_support import kernel_with_candidate_receipt
 from v8_successor_test_support import kernel_with_one_ticket
 
 
@@ -74,3 +75,70 @@ def test_hint_does_not_change_trusted_progress_digest(kernel_with_one_ticket, hi
     kernel.advance(campaign, f"hint:{hint}")
     after = kernel.watchdog_snapshot(campaign)
     assert after.trusted_progress_digest == before.trusted_progress_digest
+
+
+def test_exact_persisted_candidate_receipt_is_a_trusted_progress_input(
+    kernel_with_candidate_receipt,
+):
+    kernel, _effects, campaign, receipt = kernel_with_candidate_receipt
+    snapshot = kernel.watchdog_snapshot(campaign)
+    assert snapshot.candidate_receipt_digests == (receipt.digest,)
+
+
+def test_changed_persisted_candidate_receipt_fails_closed(
+    kernel_with_candidate_receipt,
+):
+    kernel, _effects, campaign, _receipt = kernel_with_candidate_receipt
+    with sqlite3.connect(kernel._store_path) as connection:
+        row = connection.execute(
+            "SELECT state_json FROM v8_execution_kernel_campaigns WHERE repository=? AND campaign_key=?",
+            (campaign.repository, campaign.campaign_key),
+        ).fetchone()
+        state = json.loads(row[0])
+        run = next(iter(state["runs"].values()))
+        run["candidate_receipt"]["candidate_tree_oid"] = "f" * 40
+        connection.execute(
+            "UPDATE v8_execution_kernel_campaigns SET state_json=? WHERE repository=? AND campaign_key=?",
+            (
+                json.dumps(state, separators=(",", ":"), sort_keys=True),
+                campaign.repository,
+                campaign.campaign_key,
+            ),
+        )
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.watchdog_snapshot(campaign)
+    assert raised.value.code == "EXECUTION_STORE_INVALID"
+
+
+def test_last_wake_ref_is_diagnostic_but_not_trusted_progress(kernel_with_one_ticket):
+    kernel, _effects, campaign = kernel_with_one_ticket
+    _bind_successor_fixture_to_campaign(kernel, campaign)
+    kernel.advance(campaign)
+    before = kernel.watchdog_snapshot(campaign)
+    kernel.advance(campaign, "watchdog:runtime:7:semantic:issue:113")
+    after = kernel.watchdog_snapshot(campaign)
+    run = kernel.inspect(campaign).work_runs[0]
+    assert run.last_wake_ref == "watchdog:runtime:7:semantic:issue:113"
+    assert after.last_wake_refs == (run.last_wake_ref,)
+    assert after.trusted_progress_digest == before.trusted_progress_digest
+
+
+def test_watchdog_snapshot_projects_binding_due_and_diagnosis_state(
+    kernel_with_one_ticket,
+):
+    kernel, _effects, campaign = kernel_with_one_ticket
+    _bind_successor_fixture_to_campaign(kernel, campaign)
+    kernel.advance(campaign)
+    state = kernel._load(campaign)
+    assert state is not None
+    run = next(iter(state["runs"].values()))
+    run["semantic_action_id"] = "binding:active"
+    run["next_check_at"] = "2026-08-03T10:00:00+00:00"
+    state["diagnosed_binding_ids"] = ["binding:diagnosed"]
+    kernel._save(campaign, state)
+
+    snapshot = kernel.watchdog_snapshot(campaign)
+
+    assert snapshot.next_check_at == "2026-08-03T10:00:00+00:00"
+    assert snapshot.active_binding_ids == ("binding:active",)
+    assert snapshot.diagnosed_binding_ids == ("binding:diagnosed",)
