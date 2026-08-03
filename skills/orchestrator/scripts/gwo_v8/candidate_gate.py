@@ -95,6 +95,37 @@ def _require_object_id(value: object, field_name: str) -> str:
     return value
 
 
+def _require_object_id_for_format(
+    value: object,
+    field_name: str,
+    object_format: str,
+) -> str:
+    expected_length = 40 if object_format == "sha1" else 64
+    if (
+        type(value) is not str
+        or len(value) != expected_length
+        or re.fullmatch(r"[0-9a-f]+", value) is None
+    ):
+        raise CandidateGateError(
+            "CANDIDATE_GATE_DIFF_INVALID",
+            f"{field_name} is not an exact {object_format} object ID",
+        )
+    return value
+
+
+def _git_file_type(mode: str) -> str:
+    if mode in {"100644", "100755"}:
+        return "regular"
+    if mode == "120000":
+        return "symlink"
+    if mode == "160000":
+        return "gitlink"
+    raise CandidateGateError(
+        "CANDIDATE_GATE_DIFF_INVALID",
+        "Candidate diff mode is not a supported Git file type",
+    )
+
+
 def _require_text_tuple(
     value: object,
     field_name: str,
@@ -283,6 +314,12 @@ def _validate_diff_side(
         raise CandidateGateError(
             "CANDIDATE_GATE_DIFF_INVALID",
             f"Candidate diff {side} object type is invalid",
+        )
+    file_type = _git_file_type(mode)
+    if (file_type == "gitlink") != (object_type == "gitlink"):
+        raise CandidateGateError(
+            "CANDIDATE_GATE_DIFF_INVALID",
+            f"Candidate diff {side} mode and object type are inconsistent",
         )
     _require_object_id(oid, f"{side}_oid")
 
@@ -530,6 +567,7 @@ class CandidateDiffEntryV1:
             )
         if self.change_kind == "type-change" and (
             self.old_object_type == self.new_object_type
+            and _git_file_type(self.old_mode) == _git_file_type(self.new_mode)
         ):
             raise CandidateGateError(
                 "CANDIDATE_GATE_DIFF_INVALID",
@@ -736,7 +774,11 @@ class CandidateDiffRecordV1:
             "candidate_commit_oid",
             "candidate_tree_oid",
         ):
-            _require_object_id(getattr(self, field_name), field_name)
+            _require_object_id_for_format(
+                getattr(self, field_name),
+                field_name,
+                self.repository_object_format,
+            )
         if type(self.entries) is not tuple or any(
             type(entry) is not CandidateDiffEntryV1 for entry in self.entries
         ):
@@ -756,10 +798,19 @@ class CandidateDiffRecordV1:
                 "exact CandidateDiffRecordV1 cannot contain legacy entries",
             )
 
+        for entry in self.entries:
+            for field_name in ("old_oid", "new_oid"):
+                value = getattr(entry, field_name)
+                if value is not None:
+                    _require_object_id_for_format(
+                        value,
+                        f"entry {field_name}",
+                        self.repository_object_format,
+                    )
+
         def path_key(token: str | None, entry: CandidateDiffEntryV1) -> bytes:
             if token is None:
-                token = entry.new_path if entry.old_path is None else entry.old_path
-                assert token is not None
+                return b""
             if self._legacy_mode:
                 return token.encode("utf-8")
             return _decode_candidate_path_token(token, "entry path")
@@ -768,9 +819,6 @@ class CandidateDiffRecordV1:
             sorted(
                 self.entries,
                 key=lambda entry: (
-                    0 if entry.change_kind == "delete" else 1
-                    if entry.change_kind == "add"
-                    else 2,
                     path_key(entry.old_path, entry),
                     path_key(entry.new_path, entry),
                     entry.change_kind,
@@ -820,7 +868,7 @@ class CandidateDiffRecordV1:
                 change_kind = "add"
             elif new is None:
                 change_kind = "delete"
-            elif old[1] != new[1]:
+            elif old[1] != new[1] or _git_file_type(old[0]) != _git_file_type(new[0]):
                 change_kind = "type-change"
             elif old != new:
                 change_kind = "modify"
@@ -839,17 +887,17 @@ class CandidateDiffRecordV1:
                     new_oid=None if new is None else new[2],
                 )
             )
-        def entry_sort_key(entry: CandidateDiffEntryV1) -> tuple[int, bytes]:
-            token = entry.old_path if entry.old_path is not None else entry.new_path
-            assert token is not None
-            rank = (
-                0
-                if entry.change_kind == "delete"
-                else 1
-                if entry.change_kind == "add"
-                else 2
+        def entry_sort_key(entry: CandidateDiffEntryV1) -> tuple[bytes, bytes, str]:
+            def path_key(token: str | None) -> bytes:
+                if token is None:
+                    return b""
+                return _decode_candidate_path_token(token, "entry path")
+
+            return (
+                path_key(entry.old_path),
+                path_key(entry.new_path),
+                entry.change_kind,
             )
-            return rank, _decode_candidate_path_token(token, "entry path")
 
         entries.sort(key=entry_sort_key)
         return cls(

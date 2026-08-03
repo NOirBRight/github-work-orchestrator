@@ -160,6 +160,68 @@ def make_non_utf8_path_repository(tmp_path: Path) -> GitRepositoryFixture:
     )
 
 
+def write_tree_with_modes(
+    repository: Path,
+    entries: tuple[tuple[bytes, bytes, bytes], ...],
+) -> str:
+    records: list[bytes] = []
+    for raw_path, content, mode in sorted(entries):
+        blob_oid = run_git_input(
+            repository,
+            "hash-object",
+            "-w",
+            "--stdin",
+            input_bytes=content,
+        ).stdout.strip()
+        records.append(mode + b" blob " + blob_oid + b"\t" + raw_path + b"\x00")
+    return run_git_input(
+        repository,
+        "mktree",
+        "-z",
+        input_bytes=b"".join(records),
+    ).stdout.decode("ascii").strip()
+
+
+def make_mode_change_repository(
+    tmp_path: Path,
+    candidate_mode: bytes,
+) -> GitRepositoryFixture:
+    path = tmp_path / f"mode-{candidate_mode.decode('ascii')}"
+    path.mkdir()
+    run_git(path, "init", "-q")
+    run_git(path, "config", "user.name", "GWO Test")
+    run_git(path, "config", "user.email", "gwo@example.invalid")
+    base_tree_oid = write_tree_with_modes(
+        path,
+        ((b"entry", b"base\n", b"100644"),),
+    )
+    base_commit_oid = commit_tree(
+        path,
+        base_tree_oid,
+        parent_oid=None,
+        message=b"base\n",
+    )
+    candidate_tree_oid = write_tree_with_modes(
+        path,
+        ((b"entry", b"candidate\n", candidate_mode),),
+    )
+    candidate_commit_oid = commit_tree(
+        path,
+        candidate_tree_oid,
+        parent_oid=base_commit_oid,
+        message=b"candidate\n",
+    )
+    run_git(path, "update-ref", "refs/heads/candidate", candidate_commit_oid)
+    return GitRepositoryFixture(
+        path=path,
+        name="owner/repository",
+        base_commit_oid=base_commit_oid,
+        base_tree_oid=base_tree_oid,
+        candidate_commit_oid=candidate_commit_oid,
+        candidate_tree_oid=candidate_tree_oid,
+    )
+
+
 def test_git_candidate_reader_reads_exact_commit_and_tree_from_reference(tmp_path):
     repository = make_git_repository(tmp_path)
     readback = GitCandidateReader(
@@ -217,13 +279,13 @@ def test_git_candidate_reader_represents_rename_as_delete_and_add(tmp_path):
     ).read_candidate(repository.name, "refs/heads/candidate")
 
     assert [entry.change_kind for entry in readback.diff_record.entries] == [
-        "delete",
         "add",
+        "delete",
     ]
-    assert readback.diff_record.entries[0].old_path == encode_raw_path(b"old.py")
-    assert readback.diff_record.entries[0].new_path is None
-    assert readback.diff_record.entries[1].old_path is None
-    assert readback.diff_record.entries[1].new_path == encode_raw_path(b"new.py")
+    assert readback.diff_record.entries[0].old_path is None
+    assert readback.diff_record.entries[0].new_path == encode_raw_path(b"new.py")
+    assert readback.diff_record.entries[1].old_path == encode_raw_path(b"old.py")
+    assert readback.diff_record.entries[1].new_path is None
 
 
 def test_git_candidate_reader_preserves_raw_non_utf8_path_bytes(tmp_path):
@@ -235,6 +297,44 @@ def test_git_candidate_reader_preserves_raw_non_utf8_path_bytes(tmp_path):
 
     assert encode_raw_path(b"old-\xff.txt") in readback.diff_record.changed_path_tokens
     assert readback.diff_record.entries[0].old_path == encode_raw_path(b"old-\xff.txt")
+
+
+def test_git_candidate_reader_preserves_raw_tab_path_bytes(tmp_path):
+    repository = make_repository(
+        tmp_path,
+        directory="tab-path",
+        base_entries=((b"tab\tname.txt", b"base\n"),),
+        candidate_entries=((b"tab\tname.txt", b"candidate\n"),),
+    )
+    readback = GitCandidateReader(
+        repository_path=repository.path,
+        base_reader=repository,
+    ).read_candidate(repository.name, "refs/heads/candidate")
+
+    token = encode_raw_path(b"tab\tname.txt")
+    assert token in readback.diff_record.changed_path_tokens
+    assert readback.diff_record.entries[0].old_path == token
+    assert readback.diff_record.entries[0].new_path == token
+
+
+@pytest.mark.parametrize(
+    ("candidate_mode", "expected_change_kind"),
+    [(b"120000", "type-change"), (b"100755", "modify")],
+)
+def test_git_candidate_reader_classifies_git_file_type_mode_changes(
+    tmp_path,
+    candidate_mode,
+    expected_change_kind,
+):
+    repository = make_mode_change_repository(tmp_path, candidate_mode)
+    readback = GitCandidateReader(
+        repository_path=repository.path,
+        base_reader=repository,
+    ).read_candidate(repository.name, "refs/heads/candidate")
+
+    assert [entry.change_kind for entry in readback.diff_record.entries] == [
+        expected_change_kind
+    ]
 
 
 @pytest.mark.parametrize("reported_reference", ["refs/heads/missing", "\x00"])

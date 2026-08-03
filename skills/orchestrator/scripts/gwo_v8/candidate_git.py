@@ -157,7 +157,7 @@ class GitCandidateReader(CandidateReadbackPort):
                     "CANDIDATE_GATE_DIFF_INVALID",
                     "Git tree readback contains an empty record",
                 )
-            if record.count(b"\t") != 1:
+            if b"\t" not in record:
                 _fail(
                     "CANDIDATE_GATE_DIFF_INVALID",
                     "Git tree readback record has malformed path framing",
