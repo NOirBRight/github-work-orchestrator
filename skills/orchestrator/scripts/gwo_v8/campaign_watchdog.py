@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 import sqlite3
 from typing import Mapping, NoReturn, Protocol
+import uuid
 
 from ._canonical import digest_value
 from .execution_kernel import CampaignOutcome, CampaignStatus
@@ -28,6 +29,7 @@ _ALLOWED_SOURCES = frozenset({"runtime", "candidate", "review", "hosted_check"})
 _CURSOR_PATTERN = re.compile(r"[1-9][0-9]{0,18}\Z")
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_CURSOR = 2**63 - 1
+_DUE_CLAIM_LEASE = timedelta(minutes=5)
 _PATH_TYPE = type(Path())
 
 
@@ -278,6 +280,12 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS v8_watchdog_wakes "
     "(wake_ref TEXT PRIMARY KEY, stream TEXT NOT NULL, cursor TEXT NOT NULL, repository TEXT NOT NULL, "
     "campaign_key TEXT NOT NULL, source TEXT NOT NULL, source_identity TEXT NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS v8_watchdog_pending_wakes "
+    "(wake_ref TEXT PRIMARY KEY, stream TEXT NOT NULL, cursor TEXT NOT NULL, repository TEXT NOT NULL, "
+    "campaign_key TEXT NOT NULL, source TEXT NOT NULL, source_identity TEXT NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS v8_watchdog_due_claims "
+    "(repository TEXT NOT NULL, campaign_key TEXT NOT NULL, claim_token TEXT NOT NULL, "
+    "claimed_until TEXT NOT NULL, PRIMARY KEY(repository, campaign_key));"
 )
 
 _SCHEMA_COLUMNS = {
@@ -296,6 +304,21 @@ _SCHEMA_COLUMNS = {
         "campaign_key",
         "source",
         "source_identity",
+    ),
+    "v8_watchdog_pending_wakes": (
+        "wake_ref",
+        "stream",
+        "cursor",
+        "repository",
+        "campaign_key",
+        "source",
+        "source_identity",
+    ),
+    "v8_watchdog_due_claims": (
+        "repository",
+        "campaign_key",
+        "claim_token",
+        "claimed_until",
     ),
 }
 
@@ -391,19 +414,188 @@ class CampaignWatchdog:
         _validate_digest(row[1], "saved page digest", code=WATCHDOG_STORE_INVALID)
         return row[0], row[1]
 
-    @staticmethod
-    def _persisted_wake_refs(
-        connection: sqlite3.Connection,
-        campaign: CampaignHandle,
-    ) -> frozenset[str]:
-        return frozenset(
-            row[0]
-            for row in connection.execute(
-                "SELECT wake_ref FROM v8_watchdog_wakes "
-                "WHERE repository=? AND campaign_key=?",
-                (campaign.repository, campaign.campaign_key),
+    def _read_pending_wakes(self) -> tuple[WatchdogWake, ...]:
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(self._store_path)
+            rows = connection.execute(
+                "SELECT wake_ref, stream, cursor, repository, campaign_key, source, "
+                "source_identity FROM v8_watchdog_pending_wakes "
+                "ORDER BY stream, CAST(cursor AS INTEGER), wake_ref"
             ).fetchall()
-        )
+            pending: list[WatchdogWake] = []
+            for wake_ref, _stream, cursor, repository, campaign_key, source, source_identity in rows:
+                wake = WatchdogWake(
+                    cursor,
+                    CampaignHandle(repository, campaign_key),
+                    source,
+                    source_identity,
+                )
+                if wake.wake_ref != wake_ref:
+                    _fail(
+                        WATCHDOG_STORE_INVALID,
+                        "pending Watchdog wake reference does not match its payload",
+                    )
+                pending.append(wake)
+            return tuple(pending)
+        except CampaignWatchdogError:
+            raise
+        except (OSError, sqlite3.Error) as error:
+            raise CampaignWatchdogError(
+                WATCHDOG_STORE_INVALID,
+                "pending Watchdog wakes could not be read",
+            ) from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _ack_pending_wake(self, wake_ref: str) -> None:
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(self._store_path)
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM v8_watchdog_pending_wakes WHERE wake_ref=?",
+                (wake_ref,),
+            )
+            connection.commit()
+        except (OSError, sqlite3.Error) as error:
+            self._rollback(connection)
+            raise CampaignWatchdogError(
+                WATCHDOG_STORE_INVALID,
+                "pending Watchdog wake could not be acknowledged",
+            ) from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _drain_pending_wakes(self, outcomes: list[CampaignOutcome]) -> None:
+        for wake in self._read_pending_wakes():
+            outcome = self._advancer.advance(wake.campaign, wake.wake_ref)
+            self._ack_pending_wake(wake.wake_ref)
+            outcomes.append(outcome)
+
+    def _claim_due_work(
+        self,
+        now: str,
+    ) -> tuple[tuple[CampaignHandle, str], ...]:
+        now_at = datetime.fromisoformat(now)
+        claimed_until = (now_at + _DUE_CLAIM_LEASE).isoformat()
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(self._store_path)
+            connection.execute("BEGIN IMMEDIATE")
+            due = connection.execute(
+                "SELECT repository, campaign_key, next_check_at "
+                "FROM v8_watchdog_due WHERE next_check_at <= ? "
+                "ORDER BY next_check_at, repository, campaign_key",
+                (now,),
+            ).fetchall()
+            claims: list[tuple[CampaignHandle, str]] = []
+            for repository, campaign_key, next_check_at in due:
+                _validate_utc_timestamp(
+                    next_check_at,
+                    "saved due timestamp",
+                    code=WATCHDOG_STORE_INVALID,
+                )
+                existing = connection.execute(
+                    "SELECT claim_token, claimed_until FROM v8_watchdog_due_claims "
+                    "WHERE repository=? AND campaign_key=?",
+                    (repository, campaign_key),
+                ).fetchone()
+                if existing is not None:
+                    _validate_text(
+                        existing[0],
+                        "saved due claim token",
+                        code=WATCHDOG_STORE_INVALID,
+                        identity=True,
+                    )
+                    _validate_utc_timestamp(
+                        existing[1],
+                        "saved due claim expiry",
+                        code=WATCHDOG_STORE_INVALID,
+                    )
+                    if datetime.fromisoformat(existing[1]) > now_at:
+                        continue
+                claim_token = uuid.uuid4().hex
+                connection.execute(
+                    "INSERT INTO v8_watchdog_due_claims "
+                    "(repository, campaign_key, claim_token, claimed_until) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(repository, campaign_key) DO UPDATE SET "
+                    "claim_token=excluded.claim_token, claimed_until=excluded.claimed_until",
+                    (repository, campaign_key, claim_token, claimed_until),
+                )
+                claims.append((CampaignHandle(repository, campaign_key), claim_token))
+            connection.commit()
+            return tuple(claims)
+        except CampaignWatchdogError:
+            self._rollback(connection)
+            raise
+        except (OSError, sqlite3.Error) as error:
+            self._rollback(connection)
+            raise CampaignWatchdogError(
+                WATCHDOG_STORE_INVALID,
+                "Watchdog due claims could not be acquired",
+            ) from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _release_due_claim(self, handle: CampaignHandle, claim_token: str) -> None:
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(self._store_path)
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM v8_watchdog_due_claims "
+                "WHERE repository=? AND campaign_key=? AND claim_token=?",
+                (handle.repository, handle.campaign_key, claim_token),
+            )
+            connection.commit()
+        except (OSError, sqlite3.Error) as error:
+            self._rollback(connection)
+            raise CampaignWatchdogError(
+                WATCHDOG_STORE_INVALID,
+                "Watchdog due claim could not be released",
+            ) from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _ack_due_claim(self, handle: CampaignHandle, claim_token: str) -> None:
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(self._store_path)
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM v8_watchdog_due "
+                "WHERE repository=? AND campaign_key=? "
+                "AND EXISTS (SELECT 1 FROM v8_watchdog_due_claims "
+                "WHERE repository=? AND campaign_key=? AND claim_token=?)",
+                (
+                    handle.repository,
+                    handle.campaign_key,
+                    handle.repository,
+                    handle.campaign_key,
+                    claim_token,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM v8_watchdog_due_claims "
+                "WHERE repository=? AND campaign_key=? AND claim_token=?",
+                (handle.repository, handle.campaign_key, claim_token),
+            )
+            connection.commit()
+        except (OSError, sqlite3.Error) as error:
+            self._rollback(connection)
+            raise CampaignWatchdogError(
+                WATCHDOG_STORE_INVALID,
+                "Watchdog due claim could not be acknowledged",
+            ) from error
+        finally:
+            if connection is not None:
+                connection.close()
 
     @staticmethod
     def _rollback(connection: sqlite3.Connection | None) -> None:
@@ -518,6 +710,7 @@ class CampaignWatchdog:
     def run_once(self, now: str) -> tuple[CampaignOutcome, ...]:
         _validate_utc_timestamp(now, "now")
         outcomes: list[CampaignOutcome] = []
+        self._drain_pending_wakes(outcomes)
         for stream, source in sorted(self._event_sources.items()):
             after_cursor = self.read_cursor(stream)
             page = self._read_page(source, after_cursor)
@@ -527,13 +720,6 @@ class CampaignWatchdog:
                 connection = sqlite3.connect(self._store_path)
                 connection.execute("BEGIN IMMEDIATE")
                 saved = self._read_saved_source(connection, stream)
-                persisted_wake_refs: dict[CampaignHandle, frozenset[str]] = {}
-                for wake in page.events:
-                    if wake.campaign not in persisted_wake_refs:
-                        persisted_wake_refs[wake.campaign] = self._persisted_wake_refs(
-                            connection,
-                            wake.campaign,
-                        )
 
                 if saved == (page.next_cursor, page_digest):
                     self._rollback(connection)
@@ -559,7 +745,7 @@ class CampaignWatchdog:
                 self._validate_page_after_cursor(page, after_cursor)
 
                 for wake in page.events:
-                    connection.execute(
+                    accepted = connection.execute(
                         "INSERT OR IGNORE INTO v8_watchdog_wakes "
                         "(wake_ref, stream, cursor, repository, campaign_key, source, source_identity) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -573,6 +759,21 @@ class CampaignWatchdog:
                             wake.source_identity,
                         ),
                     )
+                    if accepted.rowcount == 1:
+                        connection.execute(
+                            "INSERT INTO v8_watchdog_pending_wakes "
+                            "(wake_ref, stream, cursor, repository, campaign_key, source, source_identity) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                wake.wake_ref,
+                                stream,
+                                wake.cursor,
+                                wake.campaign.repository,
+                                wake.campaign.campaign_key,
+                                wake.source,
+                                wake.source_identity,
+                            ),
+                        )
 
                 if saved is None:
                     connection.execute(
@@ -612,43 +813,25 @@ class CampaignWatchdog:
                 if connection is not None:
                     connection.close()
 
-            for wake in page.events:
-                if wake.wake_ref in persisted_wake_refs[wake.campaign]:
-                    continue
-                outcomes.append(self._advancer.advance(wake.campaign, wake.wake_ref))
+            self._drain_pending_wakes(outcomes)
 
         self.rebuild_due_queue()
-        connection: sqlite3.Connection | None = None
-        try:
-            connection = sqlite3.connect(self._store_path)
-            due = connection.execute(
-                "SELECT repository, campaign_key FROM v8_watchdog_due "
-                "WHERE next_check_at <= ? "
-                "ORDER BY next_check_at, repository, campaign_key",
-                (now,),
-            ).fetchall()
-        except (OSError, sqlite3.Error) as error:
-            raise CampaignWatchdogError(
-                WATCHDOG_STORE_INVALID,
-                "Watchdog due work could not be read",
-            ) from error
-        finally:
-            if connection is not None:
-                connection.close()
-
+        due_claims = self._claim_due_work(now)
         advanced_due_work = False
-        for repository, campaign_key in due:
-            handle = CampaignHandle(repository, campaign_key)
-            before = _validate_snapshot_for_handle(
-                handle,
-                self._campaign_source.watchdog_snapshot(handle),
-            )
-            if (
-                before.status is not CampaignStatus.COMPLETE
-                and before.next_check_at is not None
-                and before.next_check_at <= now
-            ):
-                outcomes.append(self._advancer.advance(handle, None))
+        for handle, claim_token in due_claims:
+            try:
+                before = _validate_snapshot_for_handle(
+                    handle,
+                    self._campaign_source.watchdog_snapshot(handle),
+                )
+                if (
+                    before.status is CampaignStatus.COMPLETE
+                    or before.next_check_at is None
+                    or before.next_check_at > now
+                ):
+                    self._release_due_claim(handle, claim_token)
+                    continue
+                outcome = self._advancer.advance(handle, None)
                 advanced_due_work = True
                 after = _validate_snapshot_for_handle(
                     handle,
@@ -658,24 +841,13 @@ class CampaignWatchdog:
                     after.status is CampaignStatus.COMPLETE
                     or after.next_check_at != before.next_check_at
                 ):
-                    connection = None
-                    try:
-                        connection = sqlite3.connect(self._store_path)
-                        connection.execute(
-                            "DELETE FROM v8_watchdog_due "
-                            "WHERE repository=? AND campaign_key=?",
-                            (handle.repository, handle.campaign_key),
-                        )
-                        connection.commit()
-                    except (OSError, sqlite3.Error) as error:
-                        self._rollback(connection)
-                        raise CampaignWatchdogError(
-                            WATCHDOG_STORE_INVALID,
-                            "Watchdog due work could not be updated",
-                        ) from error
-                    finally:
-                        if connection is not None:
-                            connection.close()
+                    self._ack_due_claim(handle, claim_token)
+                else:
+                    self._release_due_claim(handle, claim_token)
+                outcomes.append(outcome)
+            except Exception:
+                self._release_due_claim(handle, claim_token)
+                raise
 
         if advanced_due_work:
             self.rebuild_due_queue()

@@ -1,6 +1,7 @@
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 
 import pytest
 
@@ -361,3 +362,96 @@ def test_exact_event_replay_reuses_wake_ref_and_advances_cursor_once(tmp_path):
     expected = "watchdog:runtime:9:semantic:issue:113"
     assert advancer.calls == [(handle(), expected)]
     assert watchdog.read_cursor("runtime_gateway") == "9"
+
+
+def test_failed_event_dispatch_remains_pending_for_restart_retry(tmp_path):
+    replay = page(wake("9"))
+    source = RecordingWakeSource([replay])
+
+    class FailingAdvancer(RecordingAdvancer):
+        def advance(self, campaign, wake_ref=None):
+            super().advance(campaign, wake_ref)
+            raise RuntimeError("dispatch failed")
+
+    failing = FailingAdvancer()
+    first = make_watchdog(tmp_path, source=source, advancer=failing)
+
+    with pytest.raises(RuntimeError, match="dispatch failed"):
+        first.run_once(NOW)
+
+    retry_advancer = RecordingAdvancer()
+    restarted = make_watchdog(
+        tmp_path,
+        source=source,
+        advancer=retry_advancer,
+    )
+
+    restarted.run_once(NOW)
+
+    assert retry_advancer.calls == [
+        (handle(), "watchdog:runtime:9:semantic:issue:113")
+    ]
+
+
+def test_concurrent_watchdogs_claim_overdue_campaign_once(tmp_path):
+    campaigns = RecordingCampaignSource(
+        {
+            handle(): make_snapshot(
+                next_check_at="2026-08-03T09:59:00+00:00"
+            )
+        }
+    )
+
+    class BlockingAdvancer(RecordingAdvancer):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def advance(self, campaign, wake_ref=None):
+            outcome = super().advance(campaign, wake_ref)
+            self.started.set()
+            if not self.release.wait(timeout=5):
+                raise AssertionError("timed out waiting for the competing watchdog")
+            return outcome
+
+    first_advancer = BlockingAdvancer()
+    second_advancer = RecordingAdvancer()
+    first = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+        advancer=first_advancer,
+    )
+    second = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+        advancer=second_advancer,
+    )
+    first.rebuild_due_queue()
+
+    first_outcomes = []
+    first_errors = []
+
+    def run_first():
+        try:
+            first_outcomes.append(first.run_once(NOW))
+        except BaseException as error:
+            first_errors.append(error)
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert first_advancer.started.wait(timeout=5)
+    try:
+        second_outcomes = second.run_once(NOW)
+    finally:
+        first_advancer.release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert first_errors == []
+    assert len(first_outcomes) == 1
+    assert second_outcomes == ()
+    assert first_advancer.calls == [(handle(), None)]
+    assert second_advancer.calls == []
