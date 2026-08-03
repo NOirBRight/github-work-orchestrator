@@ -835,14 +835,22 @@ class ExecutionKernel:
     def active_campaigns(self) -> tuple[CampaignHandle, ...]:
         """Return persisted non-terminal Campaigns without hydrating a Plan."""
 
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT repository, campaign_key
-                FROM v8_execution_kernel_campaigns
-                ORDER BY repository, campaign_key
-                """
-            ).fetchall()
+        try:
+            with self._connect_read_only() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT repository, campaign_key
+                    FROM v8_execution_kernel_campaigns
+                    ORDER BY repository, campaign_key
+                    """
+                ).fetchall()
+        except ExecutionKernelError:
+            raise
+        except sqlite3.Error as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Execution store schema is unreadable",
+            ) from error
         active: list[CampaignHandle] = []
         for row in rows:
             handle = CampaignHandle(row["repository"], row["campaign_key"])
@@ -916,6 +924,11 @@ class ExecutionKernel:
             raise ExecutionKernelError(
                 "EXECUTION_STORE_INVALID",
                 "stored CandidateReceipt is bound to another Campaign or Work Run",
+            )
+        if run.get("candidate_receipt_digest") != receipt.digest:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stored CandidateReceipt digest changed during readback",
             )
         return receipt
 
@@ -4778,6 +4791,20 @@ class ExecutionKernel:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def _connect_read_only(self) -> sqlite3.Connection:
+        try:
+            connection = sqlite3.connect(
+                f"{self._store_path.resolve().as_uri()}?mode=ro",
+                uri=True,
+            )
+        except sqlite3.Error as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Execution store is not readable",
+            ) from error
+        connection.row_factory = sqlite3.Row
+        return connection
+
     def _read_persisted_campaign_without_migration(
         self, handle: CampaignHandle
     ) -> dict[str, Any]:
@@ -4786,13 +4813,42 @@ class ExecutionKernel:
                 "CAMPAIGN_HANDLE_INVALID",
                 "Campaign handle must be an exact CampaignHandle",
             )
-        state = self._load(handle)
+        state = self._load_read_only(handle)
         if state is None:
             raise ExecutionKernelError(
                 "EXECUTION_STORE_INVALID",
                 "Campaign state does not exist",
             )
         return state
+
+    def _load_read_only(self, handle: CampaignHandle) -> dict[str, Any] | None:
+        try:
+            with self._connect_read_only() as connection:
+                row = connection.execute(
+                    """
+                    SELECT state_json FROM v8_execution_kernel_campaigns
+                    WHERE repository = ? AND campaign_key = ?
+                    """,
+                    (handle.repository, handle.campaign_key),
+                ).fetchone()
+        except ExecutionKernelError:
+            raise
+        except sqlite3.Error as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Execution store schema is unreadable",
+            ) from error
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["state_json"])
+        except json.JSONDecodeError as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID", "Campaign state is unreadable"
+            ) from error
+        if type(value) is not dict:
+            raise ExecutionKernelError("EXECUTION_STORE_INVALID", "Campaign state is invalid")
+        return value
 
     def _status_from_persisted_state(self, state: Mapping[str, Any]) -> CampaignStatus:
         if type(state) is not dict:
@@ -4874,7 +4930,7 @@ class ExecutionKernel:
                     "CandidateReceipt is bound to another Campaign or Work Run",
                 )
             stored_digest = run.get("candidate_receipt_digest")
-            if stored_digest is not None and stored_digest != receipt.digest:
+            if stored_digest != receipt.digest:
                 raise ExecutionKernelError(
                     "EXECUTION_STORE_INVALID",
                     "CandidateReceipt digest changed during readback",

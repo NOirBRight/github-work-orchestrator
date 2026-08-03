@@ -110,6 +110,120 @@ def test_changed_persisted_candidate_receipt_fails_closed(
     assert raised.value.code == "EXECUTION_STORE_INVALID"
 
 
+@pytest.mark.parametrize(
+    ("binding_field", "replacement"),
+    (
+        ("repository", "owner/other-repository"),
+        ("campaign_key", "campaign:other"),
+        ("campaign_handle", "campaign:other"),
+        ("plan_revision_digest", "f" * 64),
+        ("work_run_key", "work-run:other"),
+        ("ticket_key", "issue:other"),
+        ("runtime_subject_digest", "e" * 64),
+    ),
+)
+def test_candidate_receipt_binding_tamper_fails_closed(
+    kernel_with_candidate_receipt,
+    binding_field,
+    replacement,
+):
+    kernel, _effects, campaign, receipt = kernel_with_candidate_receipt
+    with sqlite3.connect(kernel._store_path) as connection:
+        row = connection.execute(
+            "SELECT state_json FROM v8_execution_kernel_campaigns WHERE repository=? AND campaign_key=?",
+            (campaign.repository, campaign.campaign_key),
+        ).fetchone()
+        state = json.loads(row[0])
+        run = state["runs"][receipt.ticket_key]
+        tampered = replace(
+            receipt,
+            **{binding_field: replacement, "receipt_digest": None},
+        )
+        run["candidate_receipt"] = tampered.canonical()
+        run["candidate_receipt_digest"] = tampered.digest
+        state["candidate_receipts"] = [tampered.canonical()]
+        connection.execute(
+            "UPDATE v8_execution_kernel_campaigns SET state_json=? WHERE repository=? AND campaign_key=?",
+            (
+                json.dumps(state, separators=(",", ":"), sort_keys=True),
+                campaign.repository,
+                campaign.campaign_key,
+            ),
+        )
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.watchdog_snapshot(campaign)
+    assert raised.value.code == "EXECUTION_STORE_INVALID"
+
+
+def test_missing_persisted_candidate_receipt_digest_fails_closed(
+    kernel_with_candidate_receipt,
+):
+    kernel, _effects, campaign, _receipt = kernel_with_candidate_receipt
+    with sqlite3.connect(kernel._store_path) as connection:
+        row = connection.execute(
+            "SELECT state_json FROM v8_execution_kernel_campaigns WHERE repository=? AND campaign_key=?",
+            (campaign.repository, campaign.campaign_key),
+        ).fetchone()
+        state = json.loads(row[0])
+        run = next(iter(state["runs"].values()))
+        del run["candidate_receipt_digest"]
+        connection.execute(
+            "UPDATE v8_execution_kernel_campaigns SET state_json=? WHERE repository=? AND campaign_key=?",
+            (
+                json.dumps(state, separators=(",", ":"), sort_keys=True),
+                campaign.repository,
+                campaign.campaign_key,
+            ),
+        )
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.watchdog_snapshot(campaign)
+    assert raised.value.code == "EXECUTION_STORE_INVALID"
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.read_candidate_receipt(campaign, "issue:114")
+    assert raised.value.code == "EXECUTION_STORE_INVALID"
+
+
+def test_watchdog_projections_do_not_create_missing_kernel_store(
+    tmp_path,
+    kernel_with_one_ticket,
+):
+    kernel, effects, campaign = kernel_with_one_ticket
+    original_store = kernel._store_path
+    original_bytes = original_store.read_bytes()
+    missing_store = tmp_path / "never-created.sqlite3"
+    kernel._store_path = missing_store
+    assert not missing_store.exists()
+
+    with pytest.raises(ExecutionKernelError) as active_error:
+        kernel.active_campaigns()
+    assert active_error.value.code == "EXECUTION_STORE_INVALID"
+    assert not missing_store.exists()
+
+    with pytest.raises(ExecutionKernelError) as snapshot_error:
+        kernel.watchdog_snapshot(campaign)
+    assert snapshot_error.value.code == "EXECUTION_STORE_INVALID"
+    assert not missing_store.exists()
+    assert original_store.read_bytes() == original_bytes
+    assert effects.executed == []
+
+
+def test_watchdog_projections_do_not_invoke_real_effects(
+    kernel_with_one_ticket,
+):
+    kernel, effects, campaign = kernel_with_one_ticket
+    _bind_successor_fixture_to_campaign(kernel, campaign)
+    kernel.advance(campaign)
+    executed_before = tuple(effects.executed)
+    store_before = kernel._store_path.read_bytes()
+
+    assert kernel.active_campaigns() == (campaign,)
+    snapshot = kernel.watchdog_snapshot(campaign)
+
+    assert snapshot.campaign == campaign
+    assert tuple(effects.executed) == executed_before
+    assert kernel._store_path.read_bytes() == store_before
+
+
 def test_last_wake_ref_is_diagnostic_but_not_trusted_progress(kernel_with_one_ticket):
     kernel, _effects, campaign = kernel_with_one_ticket
     _bind_successor_fixture_to_campaign(kernel, campaign)
@@ -121,6 +235,36 @@ def test_last_wake_ref_is_diagnostic_but_not_trusted_progress(kernel_with_one_ti
     assert run.last_wake_ref == "watchdog:runtime:7:semantic:issue:113"
     assert after.last_wake_refs == (run.last_wake_ref,)
     assert after.trusted_progress_digest == before.trusted_progress_digest
+
+
+def test_raw_wake_preserves_stale_progress_fields_and_state_version(
+    kernel_with_one_ticket,
+):
+    kernel, effects, campaign = kernel_with_one_ticket
+    _bind_successor_fixture_to_campaign(kernel, campaign)
+    kernel.advance(campaign)
+    state = kernel._load(campaign)
+    assert state is not None
+    run = next(iter(state["runs"].values()))
+    run["last_trusted_progress_at"] = "2026-08-03T09:00:00+00:00"
+    run["stale_due_at"] = "2026-08-03T10:00:00+00:00"
+    state["state_version"] = 7
+    kernel._save(campaign, state)
+    before = kernel._load(campaign)
+    assert before is not None
+    before_run = next(iter(before["runs"].values()))
+    executed_before = tuple(effects.executed)
+
+    kernel.advance(campaign, "watchdog:runtime:8:semantic:issue:113")
+
+    after = kernel._load(campaign)
+    assert after is not None
+    after_run = next(iter(after["runs"].values()))
+    assert after_run["last_trusted_progress_at"] == before_run["last_trusted_progress_at"]
+    assert after_run["stale_due_at"] == before_run["stale_due_at"]
+    assert after["state_version"] == before["state_version"]
+    assert after["trusted_progress_revision"] == before["trusted_progress_revision"]
+    assert tuple(effects.executed) == executed_before
 
 
 def test_watchdog_snapshot_projects_binding_due_and_diagnosis_state(
