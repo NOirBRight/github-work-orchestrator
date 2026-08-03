@@ -29,6 +29,7 @@ from gwo_v8.runtime_gateway import (  # noqa: E402
     WorkRunPurpose,
     WorkRunSubject,
 )
+from gwo_v8._canonical import digest_value  # noqa: E402
 
 
 class _Reporter:
@@ -61,10 +62,21 @@ class _Reviewer:
 
 
 class _Checks:
-    def __init__(self, failed=False):
+    def __init__(
+        self,
+        failed=False,
+        check_ids=("check:unit",),
+        empty=False,
+        tampered_observation=False,
+    ):
         self.failed = failed
+        self.check_ids = check_ids
+        self.empty = empty
+        self.tampered_observation = tampered_observation
 
     def run(self, _parent, readback):
+        if self.empty:
+            return ()
         failure = None
         outcome = "passed"
         if self.failed:
@@ -77,21 +89,39 @@ class _Checks:
             )
         from gwo_v8.candidate_gate import CandidateCheckEvidence
 
-        return (
-            CandidateCheckEvidence(
-                check_id="check:unit",
-                candidate_tree_oid=readback.candidate.candidate_tree_oid,
-                outcome=outcome,
-                definition_digest="a" * 64,
-                observation_digest="b" * 64,
-                failure=failure,
-            ),
-        )
+        values = []
+        for check_id in self.check_ids:
+            observation_digest = digest_value(
+                {
+                    "kind": "candidate_check_observation.v1",
+                    "check_id": check_id,
+                    "candidate_tree_oid": readback.candidate.candidate_tree_oid,
+                    "diff_record_digest": readback.diff_record.digest,
+                    "outcome": outcome,
+                    "failure_digest": None if failure is None else failure.digest,
+                }
+            )
+            values.append(
+                CandidateCheckEvidence(
+                    check_id=check_id,
+                    candidate_tree_oid=readback.candidate.candidate_tree_oid,
+                    outcome=outcome,
+                    definition_digest="a" * 64,
+                    observation_digest=(
+                        "f" * 64
+                        if self.tampered_observation
+                        else observation_digest
+                    ),
+                    failure=failure,
+                )
+            )
+        return tuple(values)
 
 
 class _Policy:
-    def __init__(self, mode):
+    def __init__(self, mode, required_check_ids=("check:unit",)):
         self.mode = mode
+        self.required_check_ids = required_check_ids
 
     def derive(self, _parent, _readback, _checks):
         from gwo_v8.candidate_gate import AssuranceRequirement
@@ -100,7 +130,7 @@ class _Policy:
             policy_id="policy:candidate-assurance",
             policy_version="1",
             mode=self.mode,
-            required_check_ids=("check:unit",),
+            required_check_ids=self.required_check_ids,
             standards=("standard:repository",),
         )
 
@@ -160,7 +190,16 @@ def _parent_and_readback():
     )
 
 
-def _gate(*, mode, failed=False, reviewer=None):
+def _gate(
+    *,
+    mode,
+    failed=False,
+    reviewer=None,
+    required_check_ids=("check:unit",),
+    check_ids=("check:unit",),
+    empty_checks=False,
+    tampered_observation=False,
+):
     parent, readback = _parent_and_readback()
     reader = _Reader(readback)
     reviewer = _Reviewer() if reviewer is None else reviewer
@@ -178,8 +217,13 @@ def _gate(*, mode, failed=False, reviewer=None):
         invalidation_reporter=_Reporter(),
         candidate_reader=reader,
         formal_reviewer=reviewer,
-        check_runner=_Checks(failed=failed),
-        assurance_policy=_Policy(mode),
+        check_runner=_Checks(
+            failed=failed,
+            check_ids=check_ids,
+            empty=empty_checks,
+            tampered_observation=tampered_observation,
+        ),
+        assurance_policy=_Policy(mode, required_check_ids),
         acceptance_facts=facts,
     )
     return gate, reader, reviewer, parent
@@ -240,6 +284,103 @@ def test_no_review_allowlist_uses_zero_calls(no_review_gate):
     gate, reviewer, parent = no_review_gate
     result = gate.gate_candidate(parent, "refs/heads/candidate")
     assert result.status == CandidateGateStatus.REVIEW_ACCEPTED
+    assert reviewer.actions == []
+    assert result.accepted_candidate_receipt.assurance == "no_review"
+
+
+def test_missing_required_check_fails_before_reviewer():
+    from gwo_v8.candidate_gate import AssuranceMode
+
+    gate, _reader, reviewer, parent = _gate(
+        mode=AssuranceMode.STANDARD,
+        required_check_ids=("check:unit", "check:required"),
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        gate.gate_candidate(parent, "refs/heads/candidate")
+    assert raised.value.code in {
+        "CANDIDATE_GATE_CHECK_INVALID",
+        "CANDIDATE_GATE_ASSURANCE_INVALID",
+    }
+    assert reviewer.actions == []
+
+
+def test_duplicate_check_id_fails_before_reviewer():
+    from gwo_v8.candidate_gate import AssuranceMode
+
+    gate, _reader, reviewer, parent = _gate(
+        mode=AssuranceMode.STANDARD,
+        check_ids=("check:unit", "check:unit"),
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        gate.gate_candidate(parent, "refs/heads/candidate")
+    assert raised.value.code in {
+        "CANDIDATE_GATE_CHECK_INVALID",
+        "CANDIDATE_GATE_ASSURANCE_INVALID",
+    }
+    assert reviewer.actions == []
+
+
+def test_unexpected_check_id_fails_before_reviewer():
+    from gwo_v8.candidate_gate import AssuranceMode
+
+    gate, _reader, reviewer, parent = _gate(
+        mode=AssuranceMode.STANDARD,
+        check_ids=("check:unexpected",),
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        gate.gate_candidate(parent, "refs/heads/candidate")
+    assert raised.value.code in {
+        "CANDIDATE_GATE_CHECK_INVALID",
+        "CANDIDATE_GATE_ASSURANCE_INVALID",
+    }
+    assert reviewer.actions == []
+
+
+def test_no_required_check_evidence_fails_before_reviewer():
+    from gwo_v8.candidate_gate import AssuranceMode
+
+    gate, _reader, reviewer, parent = _gate(
+        mode=AssuranceMode.STANDARD,
+        empty_checks=True,
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        gate.gate_candidate(parent, "refs/heads/candidate")
+    assert raised.value.code in {
+        "CANDIDATE_GATE_CHECK_INVALID",
+        "CANDIDATE_GATE_ASSURANCE_INVALID",
+    }
+    assert reviewer.actions == []
+
+
+@pytest.mark.parametrize(
+    "required_check_ids",
+    [(), ("check:unit", "check:unit"), ("check:unit", "check:required")],
+)
+def test_assurance_requirement_rejects_noncanonical_required_checks(
+    required_check_ids,
+):
+    from gwo_v8.candidate_gate import AssuranceMode
+
+    gate, _reader, reviewer, parent = _gate(
+        mode=AssuranceMode.STANDARD,
+        required_check_ids=required_check_ids,
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        gate.gate_candidate(parent, "refs/heads/candidate")
+    assert raised.value.code == "CANDIDATE_GATE_ASSURANCE_INVALID"
+    assert reviewer.actions == []
+
+
+def test_tampered_check_observation_digest_fails_before_reviewer():
+    from gwo_v8.candidate_gate import AssuranceMode
+
+    gate, _reader, reviewer, parent = _gate(
+        mode=AssuranceMode.STANDARD,
+        tampered_observation=True,
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        gate.gate_candidate(parent, "refs/heads/candidate")
+    assert raised.value.code == "CANDIDATE_GATE_CHECK_INVALID"
     assert reviewer.actions == []
 
 

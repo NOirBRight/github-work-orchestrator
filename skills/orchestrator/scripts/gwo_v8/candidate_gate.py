@@ -1344,7 +1344,22 @@ class AssuranceRequirement:
                 "CANDIDATE_GATE_ASSURANCE_INVALID",
                 "AssuranceRequirement mode is not an exact AssuranceMode",
             )
-        _require_text_tuple(self.required_check_ids, "required_check_ids")
+        try:
+            required_check_ids = _require_text_tuple(
+                self.required_check_ids,
+                "required_check_ids",
+                allow_empty=False,
+            )
+        except CandidateGateError as error:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_ASSURANCE_INVALID",
+                error.detail,
+            ) from error
+        if required_check_ids != tuple(sorted(set(required_check_ids))):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_ASSURANCE_INVALID",
+                "required_check_ids must be sorted and unique",
+            )
         _require_text_tuple(self.standards, "standards")
         if self.specialist_policy_id is not None:
             _require_text(self.specialist_policy_id, "specialist_policy_id")
@@ -1376,6 +1391,26 @@ class AssuranceRequirement:
 
     def canonical(self) -> dict[str, object]:
         return {**self._body(), "requirement_digest": self.digest}
+
+
+def _candidate_check_observation_digest(
+    *,
+    check_id: str,
+    candidate_tree_oid: str,
+    diff_record_digest: str,
+    outcome: str,
+    failure_digest: str | None,
+) -> str:
+    return digest_value(
+        {
+            "kind": "candidate_check_observation.v1",
+            "check_id": check_id,
+            "candidate_tree_oid": candidate_tree_oid,
+            "diff_record_digest": diff_record_digest,
+            "outcome": outcome,
+            "failure_digest": failure_digest,
+        }
+    )
 
 
 class CandidateCheckRunner(Protocol):
@@ -1564,7 +1599,7 @@ class AcceptedCandidateReceipt:
                 "CANDIDATE_GATE_ACCEPTANCE_INVALID",
                 "AcceptedCandidateReceipt diff schema is invalid",
             )
-        if self.assurance not in {"standard", "strict"}:
+        if self.assurance not in {"no_review", "standard", "strict"}:
             raise CandidateGateError(
                 "CANDIDATE_GATE_ACCEPTANCE_INVALID",
                 "assurance must be standard or strict",
@@ -2957,11 +2992,7 @@ class CandidateGate:
             authority_subtree_digest=candidate_receipt.authority_subtree_digest,
             policy_witness_digest=parent.policy_witness_digest,
             review_subject_digest=review_subject.digest,
-            assurance=(
-                "strict"
-                if assurance_requirement.mode is AssuranceMode.STRICT
-                else "standard"
-            ),
+            assurance=assurance_requirement.mode.value,
             assurance_requirement_digest=assurance_requirement.digest,
             check_environment_digest=facts.check_environment_digest,
             delivery_identity_digest=facts.delivery_identity_digest,
@@ -2982,14 +3013,51 @@ class CandidateGate:
         checks: tuple[CandidateCheckEvidence, ...],
         requirement: AssuranceRequirement,
     ) -> CandidateAuditReport:
-        if any(
-            check.candidate_tree_oid != readback.candidate.candidate_tree_oid
-            for check in checks
+        if type(checks) is not tuple or any(
+            type(check) is not CandidateCheckEvidence for check in checks
         ):
             raise CandidateGateError(
-                "CANDIDATE_GATE_EVIDENCE_STALE",
-                "Candidate check Evidence is bound to another Candidate tree",
+                "CANDIDATE_GATE_CHECK_INVALID",
+                "Candidate check Evidence is not an exact immutable tuple",
             )
+        check_ids = tuple(check.check_id for check in checks)
+        if len(set(check_ids)) != len(check_ids):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_CHECK_INVALID",
+                "Candidate check Evidence contains duplicate check IDs",
+            )
+        if tuple(sorted(check_ids)) != requirement.required_check_ids:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_CHECK_INVALID",
+                "Candidate check Evidence does not exactly satisfy the Assurance requirement",
+            )
+        for check in checks:
+            if check.candidate_tree_oid != readback.candidate.candidate_tree_oid:
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_EVIDENCE_STALE",
+                    "Candidate check Evidence is bound to another Candidate tree",
+                )
+            if check.failure is not None:
+                _validate_stored_digest(
+                    check.failure.failure_digest,
+                    check.failure._body(),
+                    code="CANDIDATE_GATE_CHECK_INVALID",
+                    detail="Candidate check failure Evidence digest changed",
+                )
+            expected_observation_digest = _candidate_check_observation_digest(
+                check_id=check.check_id,
+                candidate_tree_oid=check.candidate_tree_oid,
+                diff_record_digest=readback.diff_record.digest,
+                outcome=check.outcome,
+                failure_digest=(
+                    None if check.failure is None else check.failure.digest
+                ),
+            )
+            if check.observation_digest != expected_observation_digest:
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_CHECK_INVALID",
+                    "Candidate check observation is not bound to the complete diff",
+                )
         failures = tuple(
             sorted(
                 (check.failure for check in checks if check.failure is not None),
