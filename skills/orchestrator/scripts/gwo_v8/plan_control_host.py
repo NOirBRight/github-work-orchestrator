@@ -688,12 +688,14 @@ class ProductionPlanControlStartHost:
         }
         if hosted_check_source is not None:
             sources["hosted_check"] = hosted_check_source
-        return CampaignWatchdog(
+        watchdog = CampaignWatchdog(
             store_path=store_path,
             event_sources=sources,
             campaign_source=execution_kernel,
             advancer=execution_kernel,
         )
+        watchdog.rebuild_due_queue()
+        return watchdog
 
 
 def install_plan_control_start(

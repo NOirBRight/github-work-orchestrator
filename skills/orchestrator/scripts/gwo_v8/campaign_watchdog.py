@@ -742,6 +742,14 @@ class CampaignWatchdog:
                         WATCHDOG_CURSOR_CONFLICT,
                         "source cursor disappeared before page publication",
                     )
+                if (
+                    saved is not None
+                    and saved[0] is not None
+                    and page.next_cursor is not None
+                    and int(page.next_cursor) < int(saved[0])
+                ):
+                    connection.rollback()
+                    continue
                 self._validate_page_after_cursor(page, after_cursor)
 
                 for wake in page.events:
