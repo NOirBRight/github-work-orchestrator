@@ -10609,6 +10609,37 @@ class RuntimeGateway:
         self,
         after_cursor: str | None,
     ) -> _RuntimeCampaignWakePage:
+        if after_cursor is not None and (
+            type(after_cursor) is not str
+            or not after_cursor.isdecimal()
+            or int(after_cursor) <= 0
+            or str(int(after_cursor)) != after_cursor
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_EVENT_CURSOR_INVALID",
+                "after_cursor must be one canonical positive decimal cursor",
+            )
+        for stable_action_id, record in self._data["actions"].items():
+            if type(record) is not dict:
+                raise RuntimeGatewayError(
+                    "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+                    "event action has no persisted record",
+                )
+            try:
+                subject = _subject_from_canonical(record.get("subject"))
+            except RuntimeGatewayError as error:
+                raise RuntimeGatewayError(
+                    "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+                    "event action has an invalid persisted Subject",
+                ) from error
+            if (
+                subject.stable_action_id != stable_action_id
+                or record.get("subject_digest") != subject.digest
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+                    "event action and exact persisted Subject differ",
+                )
         self._refresh_before_adapter_io()
         raw_page = self._adapter.events(after_cursor)
         verdict = _RuntimeEventPageProtocol.validate(raw_page, after_cursor=after_cursor)
@@ -10632,10 +10663,13 @@ class RuntimeGateway:
                 "event action has no persisted record",
             )
         subject = _subject_from_canonical(record.get("subject"))
-        if subject.stable_action_id != event.stable_action_id:
+        if (
+            record.get("subject_digest") != subject.digest
+            or subject.stable_action_id != event.stable_action_id
+        ):
             raise RuntimeGatewayError(
                 "RUNTIME_PROVIDER_PROTOCOL_INVALID",
-                "event action and Subject differ",
+                "event action and exact persisted Subject differ",
             )
         if (
             event.kind == "candidate:reference"

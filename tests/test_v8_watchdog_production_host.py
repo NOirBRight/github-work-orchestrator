@@ -59,6 +59,7 @@ def _gateway(tmp_path: Path):
         ),
         _artifacts=store,
     )
+    adapter.events = Mock(wraps=adapter.events)
     return gateway, store, adapter
 
 
@@ -175,3 +176,45 @@ def test_read_watchdog_events_maps_source_from_subject_and_event(
         subject.campaign_key,
     )
     assert wake.stable_action_id == subject.stable_action_id
+
+
+@pytest.mark.parametrize("bad_cursor", ("0", "01", "-1", 1, True))
+def test_read_watchdog_events_rejects_bad_cursor_without_publication(
+    tmp_path,
+    bad_cursor,
+):
+    gateway, _store, adapter = _gateway(tmp_path)
+    with pytest.raises(RuntimeGatewayError) as raised:
+        gateway._read_watchdog_events(bad_cursor)
+    assert raised.value.code == "RUNTIME_EVENT_CURSOR_INVALID"
+    adapter.events.assert_not_called()
+
+
+def test_read_watchdog_events_rejects_tampered_subject(tmp_path):
+    gateway, store, adapter = _gateway(tmp_path)
+    subject = _put_subject_artifacts(store, _subject())
+    _prepare_and_start(gateway, subject)
+    gateway._data["actions"][subject.stable_action_id]["subject"][
+        "campaign_key"
+    ] = "campaign:tampered"
+    adapter.events = Mock(
+        return_value=_RuntimeEventPage(
+            events=(_RuntimeEvent("14", subject.stable_action_id, "state:running"),),
+            next_cursor="14",
+        )
+    )
+    with pytest.raises(RuntimeGatewayError):
+        gateway._read_watchdog_events("13")
+
+
+def test_read_watchdog_events_rejects_missing_persisted_action(tmp_path):
+    gateway, _store, adapter = _gateway(tmp_path)
+    adapter.events = Mock(
+        return_value=_RuntimeEventPage(
+            events=(_RuntimeEvent("15", "action:missing", "state:running"),),
+            next_cursor="15",
+        )
+    )
+    with pytest.raises(RuntimeGatewayError) as raised:
+        gateway._read_watchdog_events("14")
+    assert raised.value.code == "RUNTIME_PROVIDER_PROTOCOL_INVALID"
