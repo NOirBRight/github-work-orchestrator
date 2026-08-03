@@ -273,16 +273,70 @@ def test_v8_release_train_names_exact_gates():
         assert required in text
 
 
+def test_beta1_tracker_and_publication_gates_require_pending_owner_readback():
+    note = (ROOT / "docs" / "releases" / "v8.0.0-beta.1.md").read_text("utf-8")
+    train = (ROOT / "docs" / "releases" / "gwo-v8-release-train.md").read_text(
+        "utf-8"
+    )
+    compact_note = " ".join(note.split())
+    publication = " ".join(
+        train.split("## Immutable tags and publication boundary", 1)[1].split()
+    ).casefold()
+
+    assert "pending explicit owner approval/readback" in compact_note
+    assert "owner-approved #137" not in compact_note
+    assert "same explicit owner approval/readback gate" in publication
+    assert "before any remote publication or mutation" in publication
+    assert "this lane does not perform it" in publication
+
+
+def test_release_train_blocker_graph_contains_native_prerequisite_edges():
+    text = (ROOT / "docs" / "releases" / "gwo-v8-release-train.md").read_text(
+        "utf-8"
+    )
+    for required_edge in (
+        'T108["#108 Contract"] --> T111["#111 RuntimeGateway"]',
+        'T126["#126 CI headroom"] --> T111',
+        'T111 --> T109["#109 PlanControl"]',
+        'T109 --> T110["#110 ExecutionKernel"]',
+        'T111 --> T112["#112 Runtime recovery"]',
+        'T136 --> T118',
+        'T137 --> T118',
+        'T118 --> T119["#119 root Canary"]',
+        'T123["#123 Canary prerequisite"] --> T119',
+    ):
+        assert required_edge in text
+
+
 def test_beta1_release_contract_has_structured_baseline_ci_dynamic_issue_and_nongoal():
     note = (ROOT / "docs" / "releases" / "v8.0.0-beta.1.md").read_text("utf-8")
-    match = re.search(r"```json\n(\{.*?\})\n```", note, re.DOTALL)
-    assert match is not None
-    evidence = json.loads(match.group(1))
+    blocks = re.findall(r"```json\n(\{.*?\})\n```", note, re.DOTALL)
+    assert len(blocks) == 1
+    evidence = json.loads(blocks[0])
+    assert set(evidence) == {
+        "core_baseline_sha",
+        "ci_url",
+        "dynamic_pass_summary",
+        "issues",
+        "non_goal",
+    }
     assert re.fullmatch(r"[0-9a-f]{40}", evidence["core_baseline_sha"])
-    assert re.fullmatch(
-        r"https://github\.com/.+/actions/runs/[0-9]+", evidence["ci_url"]
+    ci_match = re.fullmatch(
+        r"https://github\.com/.+/actions/runs/(?P<run_id>[1-9][0-9]*)",
+        evidence["ci_url"],
     )
-    assert re.search(r"[0-9]+ passed", evidence["dynamic_pass_summary"])
+    assert ci_match is not None
+    summary_match = re.fullmatch(
+        r"(?P<passed>[1-9][0-9]*) passed in [0-9]+\.[0-9]{2}s \([0-9]+:[0-9]{2}:[0-9]{2}\)",
+        evidence["dynamic_pass_summary"],
+    )
+    assert summary_match is not None
+    assert int(summary_match["passed"]) > 0
+    compact_note = " ".join(note.split()).casefold()
+    assert (
+        "one exact-sha ci readback binds the baseline sha, ci run, and dynamic pass summary"
+        in compact_note
+    )
     assert set(evidence["issues"]) == {"113", "114", "115", "116", "117", "118", "119"}
     assert all(value in {"OPEN", "CLOSED"} for value in evidence["issues"].values())
     assert evidence["non_goal"] == "Lean V8 production cutover"

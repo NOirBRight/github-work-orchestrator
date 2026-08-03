@@ -10,7 +10,7 @@ lean roadmap.
 
 | Release | Immutable tag | Required merged state | Production authority |
 | --- | --- | --- | --- |
-| Beta1 / Core Preview | `v8.0.0-beta.1` | The green `origin/main` Core baseline, this metadata, and the owner-approved tracker repair/readback | **no production admission**; no V8 writer activation |
+| Beta1 / Core Preview | `v8.0.0-beta.1` | The green `origin/main` Core baseline, this metadata, and pending explicit owner approval/readback for tracker repair | **no production admission**; no V8 writer activation |
 | Beta2 / Feature Complete Preview | `v8.0.0-beta.2` | #113–#117 complete, #137 revalidated, and isolated Production V3 composition acceptance | No writer cutover |
 | Beta3 / Cutover Candidate | `v8.0.0-beta.3` | #118 Cutover Guard and activation contract pass; every legacy writer path is absent or unreachable | Guarded rehearsal only; no default change |
 | GA | `v8.0.0` | #119 root Canary accepted with #123, activation, and default-writer readback | Lean V8 is the default for new Campaigns |
@@ -29,11 +29,14 @@ before the immutable Beta1 tag or GitHub Release is created.
   come from one successful CI readback for the same `origin/main` SHA.
 - Issues #113–#119 are read back with canonical `OPEN` or `CLOSED` states;
   plan text is never used as Issue-state evidence.
-- The #137 tracker-semantic checkpoint is resolved only through the explicit
-  owner approval/readback gate. Its native blockers and the full body/comments
-  readback are preserved; this metadata lane does not perform that mutation.
+- The #137 tracker-semantic checkpoint remains pending explicit owner
+  approval/readback. Its native blockers and the full body/comments readback
+  are preserved; this metadata lane does not perform that mutation.
 - The Beta1 tag gate is a merged-main SHA and post-merge successful main CI
   readback, not the feature-branch SHA or self-referential text in the commit.
+- The same explicit owner approval/readback gate is required before any remote
+  publication or mutation, including tag or GitHub Release creation; this lane
+  does not perform it.
 
 ### Beta2 — Feature Complete Preview
 
@@ -77,6 +80,12 @@ replaced by milestone labels.
 
 ```mermaid
 flowchart LR
+    T108["#108 Contract"] --> T111["#111 RuntimeGateway"]
+    T126["#126 CI headroom"] --> T111
+    T111 --> T109["#109 PlanControl"]
+    T109 --> T110["#110 ExecutionKernel"]
+    T111 --> T112["#112 Runtime recovery"]
+
     T132["#132 replanning contract"] --> T133["#133 quiesce"]
     T110["#110 ExecutionKernel"] --> T133
     T112["#112 Runtime recovery"] --> T133
@@ -90,7 +99,7 @@ flowchart LR
     T110 --> T113["#113 watchdog"]
     T112 --> T113
     T110 --> T114
-    T111["#111 RuntimeGateway"] --> T114
+    T111 --> T114
     T112 --> T115
     T110 --> T116["#116 exact Batch"]
     T114 --> T116
@@ -125,6 +134,11 @@ GitHub Release cannot transfer writer authority. The only authority-transfer
 commit is the durable writer-generation plus Activation Receipt after the
 Cutover Guard. Beta1 and Beta2 therefore never admit production work, and
 Beta3 never changes the default.
+
+The same explicit owner approval/readback gate is required before any remote
+publication or mutation, including creating or pushing an immutable tag and
+publishing its GitHub Release. This lane does not perform it; an absent gate
+must stop before the remote action.
 
 ## Rollback ownership
 

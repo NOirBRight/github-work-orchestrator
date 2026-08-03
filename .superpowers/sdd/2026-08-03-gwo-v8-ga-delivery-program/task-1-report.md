@@ -149,3 +149,58 @@ docs: define the GWO V8 release train
 
 The final commit SHA is reported in the task response; this report is included
 in that commit.
+
+## Fix round 1
+
+### Reviewer findings addressed
+
+- Beta1 wording now says the #137 tracker repair is **pending explicit owner
+  approval/readback** and cannot infer that approval occurred.
+- The release-train publication boundary now requires the same explicit owner
+  approval/readback gate before any remote publication or mutation, including
+  tag and GitHub Release creation, and records that this lane did not perform
+  it.
+- The executable blocker graph now includes #108 and #126 into #111, #111 into
+  #109 and #112, and #109 into #110 while retaining the #118/#119/#123/#136/#137
+  gates.
+- The contract test now requires exactly one fenced JSON block, exactly five
+  top-level keys, canonical SHA/CI-run/pass-summary formats, and an explicit
+  exact-SHA readback provenance statement.
+
+### Fix-round TDD evidence
+
+RED before the documentation/test changes:
+
+```text
+py -3.13 -m pytest tests/test_orchestrator_package.py::test_beta1_tracker_and_publication_gates_require_pending_owner_readback tests/test_orchestrator_package.py::test_release_train_blocker_graph_contains_native_prerequisite_edges tests/test_orchestrator_package.py::test_beta1_release_contract_has_structured_baseline_ci_dynamic_issue_and_nongoal -q
+3 failed in 0.79s
+```
+
+GREEN after the minimal changes and whitespace-normalizing test refactor:
+
+```text
+py -3.13 -m pytest tests/test_orchestrator_package.py::test_beta1_tracker_and_publication_gates_require_pending_owner_readback tests/test_orchestrator_package.py::test_release_train_blocker_graph_contains_native_prerequisite_edges tests/test_orchestrator_package.py::test_beta1_release_contract_has_structured_baseline_ci_dynamic_issue_and_nongoal -q
+3 passed in 0.33s
+```
+
+### Fix-round validation
+
+```text
+py -3.13 -m pytest tests/test_orchestrator_package.py -q
+2 failed, 13 passed in 1.61s
+
+py -3.13 scripts/quick_validate.py
+error: stale manifest: D:\Workstation\gwo-worktrees\issue-136\skills\orchestrator\.skill-package.json
+
+py -3.13 scripts/sync_orchestrator.py --check
+error: stale manifest: D:\Workstation\gwo-worktrees\issue-136\skills\orchestrator\.skill-package.json
+```
+
+The package/quick/sync failures are caused by the unrelated uncommitted
+CandidateReceipt-lane edits and generated-manifest drift. Those files remain
+outside this task's write set and were not staged, regenerated, reverted, or
+discarded. `git diff --check` passed for the fix-round changes. No remote state
+or approval/mutation gate was touched.
+
+The fix commit uses `docs: tighten Beta1 release gates`; its final SHA is
+reported in the task response.
