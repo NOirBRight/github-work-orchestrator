@@ -157,6 +157,29 @@ def test_stale_binding_uses_zero_llm_readback_before_one_diagnosis(stale_kernel)
     assert stale_kernel.effects.coordinator_diagnoses == 1
 
 
+@pytest.mark.parametrize(
+    "state",
+    (
+        StaleReadbackState.TERMINAL,
+        StaleReadbackState.IDLE,
+        StaleReadbackState.PERMISSION_WAITING,
+        StaleReadbackState.CANDIDATE_RECEIVED,
+        StaleReadbackState.PROVIDER_UNAVAILABLE,
+    ),
+)
+def test_classified_stale_readback_uses_no_coordinator(stale_kernel, state):
+    stale_kernel.advance_clock(minutes=30)
+    stale_kernel.effects.stale_state = state
+    stale_kernel.kernel.advance(stale_kernel.handle)
+    assert stale_kernel.effects.zero_llm_readbacks == 1
+    assert stale_kernel.effects.coordinator_diagnoses == 0
+
+
+def test_stale_effects_have_no_transcript_or_daemon_restart_surface(stale_kernel):
+    assert not hasattr(stale_kernel.effects, "read_transcript")
+    assert not hasattr(stale_kernel.effects, "restart_daemon")
+
+
 def test_watchdog_snapshot_does_not_create_or_migrate_kernel_state(
     kernel_with_one_ticket,
 ):
