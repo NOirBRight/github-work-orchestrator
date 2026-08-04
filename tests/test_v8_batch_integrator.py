@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 import sys
 
@@ -13,8 +13,12 @@ if str(SCRIPTS) not in sys.path:
 from gwo_v8.batch_integrator import (
     BatchIntegrator,
     BatchIntegratorConfiguration,
+    BatchDeliveryObservation,
+    BatchDeliveryProof,
     BatchIntegratorError,
+    MemberDeliveryObservation,
 )
+from gwo_v8._canonical import digest_value
 from v8_batch_test_support import (
     make_accepted_candidate_receipt,
     make_batch_request,
@@ -86,3 +90,57 @@ def test_batch_action_preserves_oldest_first_member_order():
     action = integrator.prepare(request)
 
     assert action.member_ticket_keys == ("issue:z", "issue:a")
+
+
+def test_batch_observation_preserves_exact_delivery_proof_partition():
+    proof = BatchDeliveryProof.create(
+        delivery_stable_action_id="delivery-action:1",
+        delivery_request_digest="1" * 64,
+        batch_id="2" * 64,
+        batch_sha="a" * 40,
+        member_ticket_keys=("issue:1",),
+        local_check_receipt_digest="3" * 64,
+        publication_receipt_digest="4" * 64,
+        pull_request_number=1,
+        pull_request_head_sha="a" * 40,
+        hosted_result_receipt_digest="5" * 64,
+        integration_lease_digest="6" * 64,
+        target_branch="main",
+        target_head_sha="b" * 40,
+        target_readback_digest="7" * 64,
+        target_contains_batch_sha=True,
+        pull_request_merge_target_sha="b" * 40,
+        merge_method="merge",
+    )
+    member = MemberDeliveryObservation(
+        ticket_key="issue:1",
+        work_run_key="work-run:1",
+        candidate_sha="a" * 40,
+        status="integrated",
+        evidence_digests=("8" * 64,),
+    )
+    body = {
+        "stable_action_id": "delivery-action:1",
+        "batch_id": "2" * 64,
+        "batch_sha": "a" * 40,
+        "phase": "complete",
+        "reason": "integrated",
+        "retry_count": 0,
+        "fallback_generation": 0,
+        "members": [asdict(member)],
+        "delivery_proofs": [proof.canonical()],
+    }
+    observation = BatchDeliveryObservation(
+        stable_action_id="delivery-action:1",
+        batch_id="2" * 64,
+        batch_sha="a" * 40,
+        phase="complete",
+        reason="integrated",
+        receipt_digest=digest_value({"kind": "batch-observation.v1", **body}),
+        retry_count=0,
+        fallback_generation=0,
+        members=(member,),
+        delivery_proofs=(proof,),
+    )
+
+    assert observation.canonical()["delivery_proofs"] == [proof.canonical()]

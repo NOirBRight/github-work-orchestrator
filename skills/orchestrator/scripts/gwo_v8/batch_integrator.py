@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Literal
 
@@ -313,6 +313,250 @@ class BatchDeliveryAction:
                 "member_ticket_keys must be non-empty and unique",
             )
         object.__setattr__(self, "member_ticket_keys", member_ticket_keys)
+
+
+@dataclass(frozen=True)
+class MemberDeliveryObservation:
+    ticket_key: str
+    work_run_key: str
+    candidate_sha: str
+    status: Literal["integrated", "preserved", "resume_required", "blocked"]
+    evidence_digests: tuple[str, ...]
+    resume_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class BatchDeliveryProof:
+    delivery_stable_action_id: str
+    delivery_request_digest: str
+    batch_id: str
+    batch_sha: str
+    member_ticket_keys: tuple[str, ...]
+    local_check_receipt_digest: str
+    publication_receipt_digest: str
+    pull_request_number: int
+    pull_request_head_sha: str
+    hosted_result_receipt_digest: str
+    integration_lease_digest: str
+    target_branch: str
+    target_head_sha: str
+    target_readback_digest: str
+    target_contains_batch_sha: bool
+    pull_request_merge_target_sha: str
+    merge_method: Literal["merge"]
+    proof_digest: str
+
+    def body(self) -> dict[str, object]:
+        return {
+            "delivery_stable_action_id": self.delivery_stable_action_id,
+            "delivery_request_digest": self.delivery_request_digest,
+            "batch_id": self.batch_id,
+            "batch_sha": self.batch_sha,
+            "member_ticket_keys": list(self.member_ticket_keys),
+            "local_check_receipt_digest": self.local_check_receipt_digest,
+            "publication_receipt_digest": self.publication_receipt_digest,
+            "pull_request_number": self.pull_request_number,
+            "pull_request_head_sha": self.pull_request_head_sha,
+            "hosted_result_receipt_digest": self.hosted_result_receipt_digest,
+            "integration_lease_digest": self.integration_lease_digest,
+            "target_branch": self.target_branch,
+            "target_head_sha": self.target_head_sha,
+            "target_readback_digest": self.target_readback_digest,
+            "target_contains_batch_sha": self.target_contains_batch_sha,
+            "pull_request_merge_target_sha": self.pull_request_merge_target_sha,
+            "merge_method": self.merge_method,
+        }
+
+    @classmethod
+    def create(cls, **facts: object) -> "BatchDeliveryProof":
+        body = dict(facts)
+        return cls(
+            **body,
+            proof_digest=digest_value(
+                {"kind": "batch-delivery-proof.v1", **body}
+            ),
+        )
+
+    def canonical(self) -> dict[str, object]:
+        digest_values = (
+            self.delivery_request_digest,
+            self.batch_id,
+            self.local_check_receipt_digest,
+            self.publication_receipt_digest,
+            self.hosted_result_receipt_digest,
+            self.integration_lease_digest,
+            self.target_readback_digest,
+            self.proof_digest,
+        )
+        object_ids = (
+            self.batch_sha,
+            self.pull_request_head_sha,
+            self.target_head_sha,
+            self.pull_request_merge_target_sha,
+        )
+        if (
+            not isinstance(self.delivery_stable_action_id, str)
+            or not self.delivery_stable_action_id
+            or not isinstance(self.target_branch, str)
+            or not self.target_branch
+            or type(self.member_ticket_keys) is not tuple
+            or not self.member_ticket_keys
+            or any(
+                not isinstance(ticket_key, str) or not ticket_key
+                for ticket_key in self.member_ticket_keys
+            )
+            or len(set(self.member_ticket_keys)) != len(self.member_ticket_keys)
+            or type(self.pull_request_number) is not int
+            or self.pull_request_number <= 0
+            or any(
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in digest_values
+            )
+            or any(
+                not isinstance(value, str)
+                or len(value) not in {40, 64}
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in object_ids
+            )
+        ):
+            raise DeliveryIdentityMismatch(
+                "Batch delivery proof has an invalid action, digest, object, PR, or member identity"
+            )
+        expected = digest_value(
+            {"kind": "batch-delivery-proof.v1", **self.body()}
+        )
+        if self.proof_digest != expected:
+            raise DeliveryIdentityMismatch(
+                "Batch delivery proof digest changed after readback"
+            )
+        if (
+            self.pull_request_head_sha != self.batch_sha
+            or self.target_contains_batch_sha is not True
+            or self.pull_request_merge_target_sha != self.target_head_sha
+            or self.merge_method != "merge"
+        ):
+            raise DeliveryIdentityMismatch(
+                "Batch delivery proof does not preserve exact PR and target identity"
+            )
+        return {**self.body(), "proof_digest": self.proof_digest}
+
+
+@dataclass(frozen=True)
+class BatchDeliveryObservation:
+    stable_action_id: str
+    batch_id: str
+    batch_sha: str
+    phase: Literal["running", "wait", "complete", "decision", "blocked"]
+    reason: str
+    receipt_digest: str
+    retry_count: int
+    fallback_generation: int
+    members: tuple[MemberDeliveryObservation, ...]
+    delivery_proofs: tuple[BatchDeliveryProof, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.phase not in {"running", "wait", "complete", "decision", "blocked"}
+            or type(self.retry_count) is not int
+            or self.retry_count < 0
+            or type(self.fallback_generation) is not int
+            or self.fallback_generation not in {0, 1}
+            or type(self.members) is not tuple
+            or type(self.delivery_proofs) is not tuple
+        ):
+            raise DeliveryIdentityMismatch(
+                "Batch observation phase, retry, fallback, members, or proofs are invalid"
+            )
+        if self.phase == "complete":
+            if not self.delivery_proofs:
+                raise DeliveryIdentityMismatch(
+                    "complete Batch observation has no exact delivery proofs"
+                )
+            for proof in self.delivery_proofs:
+                proof.canonical()
+            member_ticket_keys = tuple(member.ticket_key for member in self.members)
+            proof_ticket_keys = tuple(
+                ticket_key
+                for proof in self.delivery_proofs
+                for ticket_key in proof.member_ticket_keys
+            )
+            if (
+                any(member.status != "integrated" for member in self.members)
+                or len(set(proof_ticket_keys)) != len(proof_ticket_keys)
+                or proof_ticket_keys != member_ticket_keys
+            ):
+                raise DeliveryIdentityMismatch(
+                    "complete Batch proof partition does not exactly cover integrated members"
+                )
+            if self.fallback_generation == 0:
+                direct = self.delivery_proofs
+                if (
+                    len(direct) != 1
+                    or direct[0].delivery_stable_action_id != self.stable_action_id
+                    or direct[0].batch_id != self.batch_id
+                    or direct[0].batch_sha != self.batch_sha
+                ):
+                    raise DeliveryIdentityMismatch(
+                        "direct Batch proof does not match its action and Batch identity"
+                    )
+            elif self.fallback_generation == 1:
+                if (
+                    len(self.members) <= 1
+                    or len(self.delivery_proofs) != len(self.members)
+                    or any(len(proof.member_ticket_keys) != 1 for proof in self.delivery_proofs)
+                    or any(
+                        proof.delivery_stable_action_id == self.stable_action_id
+                        for proof in self.delivery_proofs
+                    )
+                    or len(
+                        {
+                            proof.delivery_stable_action_id
+                            for proof in self.delivery_proofs
+                        }
+                    )
+                    != len(self.delivery_proofs)
+                    or len({proof.batch_id for proof in self.delivery_proofs})
+                    != len(self.delivery_proofs)
+                    or len({proof.batch_sha for proof in self.delivery_proofs})
+                    != len(self.delivery_proofs)
+                ):
+                    raise DeliveryIdentityMismatch(
+                        "fallback parent must bind one distinct Singleton proof per member"
+                    )
+            else:
+                raise DeliveryIdentityMismatch(
+                    "complete Batch observation has an invalid fallback generation"
+                )
+        elif self.delivery_proofs:
+            raise DeliveryIdentityMismatch(
+                "non-complete Batch observation cannot claim delivery proofs"
+            )
+        if self.receipt_digest != digest_value(
+            {"kind": "batch-observation.v1", **self.body()}
+        ):
+            raise DeliveryIdentityMismatch(
+                "Batch observation receipt does not bind exact delivery proof"
+            )
+
+    def body(self) -> dict[str, object]:
+        return {
+            "stable_action_id": self.stable_action_id,
+            "batch_id": self.batch_id,
+            "batch_sha": self.batch_sha,
+            "phase": self.phase,
+            "reason": self.reason,
+            "retry_count": self.retry_count,
+            "fallback_generation": self.fallback_generation,
+            "members": [asdict(member) for member in self.members],
+            "delivery_proofs": [
+                proof.canonical() for proof in self.delivery_proofs
+            ],
+        }
+
+    def canonical(self) -> dict[str, object]:
+        return {**self.body(), "receipt_digest": self.receipt_digest}
 
 
 class BatchIntegrator:

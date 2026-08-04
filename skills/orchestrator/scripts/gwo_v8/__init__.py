@@ -19,6 +19,8 @@ from .activation import (
 from .compiler import CompiledPlan, CompileError, PlanCompiler
 from .batch_integrator import (
     BatchDeliveryAction,
+    BatchDeliveryObservation,
+    BatchDeliveryProof,
     BatchDeliveryRequest,
     BatchIntegrator,
     BatchIntegratorConfiguration,
@@ -28,6 +30,7 @@ from .batch_integrator import (
     DeliveryIdentityMismatch,
     HostedSuiteDefinition,
     LocalSuiteDefinition,
+    MemberDeliveryObservation,
 )
 from .plan_control import (
     ActivePlanReadback,
@@ -222,6 +225,8 @@ __all__ = [
     "AuthoritativeNodeReadback",
     "AuthoritativeRepositoryReadback",
     "BatchDeliveryAction",
+    "BatchDeliveryObservation",
+    "BatchDeliveryProof",
     "BatchDeliveryRequest",
     "BatchIntegrator",
     "BatchIntegratorConfiguration",
@@ -313,6 +318,7 @@ __all__ = [
     "KernelReconciliationPlan",
     "LocalPlanPublication",
     "LocalSuiteDefinition",
+    "MemberDeliveryObservation",
     "LegacyWriterControl",
     "LegacyActivationReceipt",
     "LegacyWriterReadback",
