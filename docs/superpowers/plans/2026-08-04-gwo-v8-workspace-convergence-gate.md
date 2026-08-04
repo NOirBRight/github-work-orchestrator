@@ -17,6 +17,7 @@
 - Preserve four selected green run triplets and a complete inventory; remove all 48 approved external test roots.
 - Five audited stale dirty worktrees may be force-removed only after their binary patch, untracked ZIP, ignored inventory, and hashes verify.
 - The root checkout's four untracked files may be removed only after their ZIP and hashes verify.
+- No pre-clean Git ref may be deleted or moved unexpectedly: `refs/heads/main` and `refs/remotes/origin/main` may fast-forward (with `origin/main` created only by the required fetch), and the captured `refs/heads/codex/gwo-v8-ga-plan` may be created or advanced only to `$ProtectedGaSha` (including its local remote-tracking ref); no other ref may move or be added.
 - Use only exact LiteralPath values from this plan. Reject `*`, `?`, `[` and `]` in every deletion input.
 - Never use `git clean`, wildcard deletion, `git worktree prune`, cross-shell generated delete commands, `--no-verify`, or force-push.
 - Do not start or restart Paseo. If live Paseo readback is unavailable, ambiguous, or references a target path, stop the Paseo subset and leave the gate on HOLD.
@@ -243,11 +244,17 @@ git -C $GaWorktree diff --cached --check
 git -C $GaWorktree commit -m 'docs: plan workspace convergence and GA release'
 if ($LASTEXITCODE -ne 0) { throw 'PLAN_COMMIT_FAILED' }
 $ProtectedGaSha = (git -C $GaWorktree rev-parse HEAD).Trim()
+if ($ProtectedGaSha -eq $ImplementationSha) {
+    throw 'PROTECTED_GA_SHA_DID_NOT_ADVANCE'
+}
 git -C $GaWorktree merge-base --is-ancestor $ImplementationSha $ProtectedGaSha
 if ($LASTEXITCODE -ne 0) { throw 'IMPLEMENTATION_BOUNDARY_NOT_ANCESTOR' }
+if (@(git -C $GaWorktree status --porcelain=v1 --untracked-files=all).Count -ne 0) {
+    throw 'PLAN_COMMIT_WORKTREE_NOT_CLEAN'
+}
 ```
 
-Expected: the worktree is clean, `$ProtectedGaSha` differs from `e58c596`, and no implementation file changed.
+Expected: the worktree is clean, `$ProtectedGaSha` differs from `$ImplementationSha`/`e58c596`, and no implementation file changed.
 
 ### Task 1: Freeze the Exact Pre-Clean State
 
@@ -466,15 +473,48 @@ Expected: the root ZIP contains four entries; v8-design contains 27; v8-plan64 c
 
 ```powershell
 $dirtyFiles = @(Get-ChildItem -LiteralPath (Join-Path $ArchiveRoot 'dirty') -File -Recurse)
-$hashRows = foreach ($file in $dirtyFiles) {
+$archiveRows = foreach ($file in $dirtyFiles) {
     $hash = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256
     [ordered]@{
-        path = $file.FullName.Substring($ArchiveRoot.Length + 1)
-        bytes = $file.Length
+        record_type = 'archive_file'
+        path = $file.FullName.Substring($ArchiveRoot.Length + 1).Replace('\','/')
+        bytes = [Int64]$file.Length
         sha256 = $hash.Hash.ToLowerInvariant()
     }
 }
-$hashRows | ConvertTo-Json -Depth 5 |
+$zipEntryRows = foreach ($zipPath in Get-ChildItem -LiteralPath (Join-Path $ArchiveRoot 'dirty') -Filter 'untracked.zip' -Recurse) {
+    $zip = [IO.Compression.ZipFile]::OpenRead($zipPath.FullName)
+    try {
+        foreach ($entry in $zip.Entries) {
+            if ([string]::IsNullOrEmpty($entry.Name)) {
+                throw "UNTRACKED_ZIP_DIRECTORY_ENTRY:$($zipPath.FullName):$($entry.FullName)"
+            }
+            $entryStream = $entry.Open()
+            $sha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+                $entryDigest = $sha256.ComputeHash($entryStream)
+            } finally {
+                $sha256.Dispose()
+                $entryStream.Dispose()
+            }
+            [ordered]@{
+                record_type = 'zip_entry'
+                archive_path = $zipPath.FullName.Substring($ArchiveRoot.Length + 1).Replace('\','/')
+                entry_path = $entry.FullName.Replace('\','/')
+                bytes = [Int64]$entry.Length
+                sha256 = ([BitConverter]::ToString($entryDigest) -replace '-','').ToLowerInvariant()
+            }
+        }
+    } finally {
+        $zip.Dispose()
+    }
+}
+$dirtyArchiveManifest = [ordered]@{
+    schema = 'gwo-dirty-archive-sha256.v2'
+    archive_files = @($archiveRows)
+    zip_entries = @($zipEntryRows)
+}
+$dirtyArchiveManifest | ConvertTo-Json -Depth 8 |
     Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\dirty-archive-sha256.json') -Encoding utf8NoBOM
 
 foreach ($zipPath in Get-ChildItem -LiteralPath (Join-Path $ArchiveRoot 'dirty') -Filter 'untracked.zip' -Recurse) {
@@ -484,6 +524,8 @@ foreach ($zipPath in Get-ChildItem -LiteralPath (Join-Path $ArchiveRoot 'dirty')
 }
 ```
 
+`dirty-archive-sha256.json` is the immutable pre-delete manifest: `archive_files` records every archive file's bytes and SHA-256, while `zip_entries` records every uncompressed ZIP entry's normalized relative path, bytes, and content SHA-256. Any missing, same-name, size, or content drift fails the later deletion gate.
+
 - [ ] **Step 4: Perform a second status read and fail on drift**
 
 Re-run the Task 1 status snapshot into `worktree-status-pre-delete.json`. Compare HEAD, branch, porcelain, untracked, and ignored lists with the first snapshot. Any difference stops cleanup and requires regenerating the affected archive under a new run ID; never overwrite the existing run.
@@ -491,30 +533,42 @@ Re-run the Task 1 status snapshot into `worktree-status-pre-delete.json`. Compar
 ### Task 3: Protect the Active GA Branch Remotely
 
 **Files:**
-- Create remote ref: `refs/heads/codex/gwo-v8-ga-plan`
+- Create or advance remote ref: `refs/heads/codex/gwo-v8-ga-plan`
+- Create outside Git: `$ArchiveRoot\inventory\remote-ga-ref-before.json`
 - Create outside Git: `$ArchiveRoot\inventory\remote-ga-ref.txt`
 
 **Interfaces:**
 - Consumes: verified pre-clean bundle, captured `$ProtectedGaSha`, and exact ancestor `e58c596`.
-- Produces: non-force remote protection for the 67 implementation commits and the reviewed plan-only commit.
+- Produces: non-force remote protection for the 67 implementation commits and the reviewed plan-only commit; the captured GA remote ref may move only to `$ProtectedGaSha`.
 
 - [ ] **Step 1: Read the remote ref without mutation**
 
 ```powershell
-$remoteLine = @(git -C $GaWorktree ls-remote --heads origin refs/heads/codex/gwo-v8-ga-plan)
+$gaRemoteRef = 'refs/heads/codex/gwo-v8-ga-plan'
+$gaRemoteTrackingRef = 'refs/remotes/origin/codex/gwo-v8-ga-plan'
+$remoteLine = @(git -C $GaWorktree ls-remote --heads origin $gaRemoteRef)
 if ($remoteLine.Count -gt 1) { throw 'REMOTE_GA_REF_AMBIGUOUS' }
 $needsPush = $remoteLine.Count -eq 0
+$remoteBeforeSha = $null
 if ($remoteLine.Count -eq 1) {
     $remoteSha = ($remoteLine[0] -split '\s+')[0]
+    if ($remoteSha -notmatch '^[0-9a-f]{40}$') { throw "REMOTE_GA_REF_SHA_INVALID:$remoteSha" }
+    $remoteBeforeSha = $remoteSha
     if ($remoteSha -ne $ProtectedGaSha) {
         git -C $GaWorktree merge-base --is-ancestor $remoteSha $ProtectedGaSha
         if ($LASTEXITCODE -ne 0) { throw "REMOTE_GA_REF_CONFLICT:$remoteSha" }
         $needsPush = $true
     }
 }
+[ordered]@{
+    ref = $gaRemoteRef
+    tracking_ref = $gaRemoteTrackingRef
+    sha = $remoteBeforeSha
+    captured_at = [DateTime]::UtcNow.ToString('o')
+} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\remote-ga-ref-before.json') -Encoding utf8NoBOM
 ```
 
-- [ ] **Step 2: Push only when absent**
+- [ ] **Step 2: Create or advance only to the captured plan head**
 
 ```powershell
 if ($needsPush) {
@@ -523,7 +577,7 @@ if ($needsPush) {
 }
 ```
 
-This command contains no force option and does not target `main`.
+This command contains no force option, does not target `main`, and is the only permitted remote-ref movement in Phase 1. If the captured ref existed, its recorded SHA must be an ancestor of `$ProtectedGaSha`; if it was absent, only creation at `$ProtectedGaSha` is allowed.
 
 - [ ] **Step 3: Verify exact remote readback**
 
@@ -590,11 +644,27 @@ $retainedRows = foreach ($source in $RetainedEvidenceFiles) {
         sha256 = $hash.Hash.ToLowerInvariant()
     }
 }
+$fixedStdoutHashes = [ordered]@{
+    'gwo-109-r14-full-run1' = 'fa25dcacb669c61e6e9938b4c128adf9a921b49f83c92ee4ddaadbf3ee516751'
+    'gwo-109-r13-full-run3' = '536ec9ab1d5f270d11122af683295659c05e99d3af319aeccdfe09da35e0f915'
+    'gwo-109-round7-full-final-race' = '37d7faf049813877a0ab80b592c8af0320d7684839e61dcead518fe12c1c2a69'
+}
+foreach ($runName in $fixedStdoutHashes.Keys) {
+    $stdoutRows = @($retainedRows | Where-Object { $_.source -eq "D:\$runName\stdout.log" })
+    if ($stdoutRows.Count -ne 1) { throw "FIXED_STDOUT_ROW_MISSING:$runName" }
+    if ($stdoutRows[0].sha256.ToLowerInvariant() -ne $fixedStdoutHashes[$runName]) {
+        throw "FIXED_STDOUT_SHA256_MISMATCH:$runName"
+    }
+}
+$r12StdoutRows = @($retainedRows | Where-Object { $_.source -eq 'D:\gwo-109-r12-full-synced\stdout.log' })
+if ($r12StdoutRows.Count -ne 1 -or [string]::IsNullOrWhiteSpace($r12StdoutRows[0].sha256)) {
+    throw 'R12_STDOUT_DYNAMIC_HASH_MISSING'
+}
 $retainedRows | ConvertTo-Json -Depth 5 |
     Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\retained-test-evidence-sha256.json') -Encoding utf8NoBOM
 ```
 
-Verify the expected stdout SHA-256 values:
+The execution-time assertions must pass for all three fixed stdout SHA-256 values:
 
 - `gwo-109-r14-full-run1`: `fa25dcacb669c61e6e9938b4c128adf9a921b49f83c92ee4ddaadbf3ee516751`
 - `gwo-109-r13-full-run3`: `536ec9ab1d5f270d11122af683295659c05e99d3af319aeccdfe09da35e0f915`
@@ -770,19 +840,40 @@ No clean target is escalated to `--force` merely because removal failed.
 
 - [ ] **Step 4: Reverify and force-remove only the five approved dirty targets**
 
-For every force target, verify its `status.txt`, `tracked.patch`, `untracked.zip`, and the corresponding SHA-256 rows still exist and can be opened. Then:
+For every force target, verify its `status.txt`, `tracked.patch`, `untracked.zip`, and `ignored.txt` rows still exist, recompute each recorded byte count and SHA-256, and only then open the ZIP. A readable file with a changed digest is not sufficient. Then:
 
 ```powershell
+$dirtyManifest = Get-Content -Raw -LiteralPath (Join-Path $ArchiveRoot 'inventory\dirty-archive-sha256.json') |
+    ConvertFrom-Json
+if ($dirtyManifest.schema -ne 'gwo-dirty-archive-sha256.v2') {
+    throw 'DIRTY_ARCHIVE_MANIFEST_SCHEMA_INVALID'
+}
+$archiveRows = @($dirtyManifest.archive_files)
 foreach ($path in $ForceRemoveWorktrees) {
     $slug = ($path.TrimEnd('\') -split '[\\/]')[-1]
     $archive = Join-Path $ArchiveRoot (Join-Path 'dirty' $slug)
     foreach ($name in 'status.txt','tracked.patch','untracked.zip','ignored.txt') {
-        if (-not (Test-Path -LiteralPath (Join-Path $archive $name))) {
+        $archiveFile = Join-Path $archive $name
+        if (-not (Test-Path -LiteralPath $archiveFile -PathType Leaf)) {
             throw "DIRTY_ARCHIVE_MISSING:$($slug):$name"
+        }
+        $relativeArchivePath = $archiveFile.Substring($ArchiveRoot.Length + 1).Replace('\','/')
+        $record = @($archiveRows | Where-Object {
+            $_.record_type -eq 'archive_file' -and $_.path -eq $relativeArchivePath
+        })
+        if ($record.Count -ne 1) { throw "DIRTY_ARCHIVE_MANIFEST_ROW_MISSING:$relativeArchivePath" }
+        $actualFile = Get-Item -LiteralPath $archiveFile -ErrorAction Stop
+        if ([Int64]$actualFile.Length -ne [Int64]$record[0].bytes) {
+            throw "DIRTY_ARCHIVE_BYTES_MISMATCH:$relativeArchivePath"
+        }
+        $actualSha = (Get-FileHash -LiteralPath $archiveFile -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualSha -ne $record[0].sha256.ToLowerInvariant()) {
+            throw "DIRTY_ARCHIVE_SHA256_MISMATCH:$relativeArchivePath"
         }
     }
     $zip = [IO.Compression.ZipFile]::OpenRead((Join-Path $archive 'untracked.zip'))
-    $zip.Dispose()
+    try { $null = @($zip.Entries | ForEach-Object { $_.FullName }) }
+    finally { $zip.Dispose() }
 
     git -C $Repo worktree remove --force $path
     if ($LASTEXITCODE -ne 0) { throw "DIRTY_WORKTREE_REMOVE_FAILED:$path" }
@@ -821,18 +912,82 @@ $RootUntracked = @(
     'D:\Workstation\github-work-orchestrator\docs\superpowers\plans\2026-08-02-route-scope-escapes-into-campaign-replanning.md'
 )
 $rootZip = Join-Path $ArchiveRoot 'dirty\github-work-orchestrator\untracked.zip'
+$rootZipRelativePath = 'dirty/github-work-orchestrator/untracked.zip'
+$dirtyManifest = Get-Content -Raw -LiteralPath (Join-Path $ArchiveRoot 'inventory\dirty-archive-sha256.json') |
+    ConvertFrom-Json
+if ($dirtyManifest.schema -ne 'gwo-dirty-archive-sha256.v2') {
+    throw 'ROOT_UNTRACKED_MANIFEST_SCHEMA_INVALID'
+}
+$root = [IO.Path]::GetFullPath($Repo).TrimEnd('\')
+$expectedRootEntries = @(
+    foreach ($path in $RootUntracked) {
+        $full = [IO.Path]::GetFullPath($path)
+        if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "ROOT_UNTRACKED_PATH_ESCAPES:$full"
+        }
+        $full.Substring($root.Length + 1).Replace('\','/')
+    }
+) | Sort-Object
+$rootZipFileRows = @($dirtyManifest.archive_files | Where-Object {
+    $_.record_type -eq 'archive_file' -and $_.path -eq $rootZipRelativePath
+})
+if ($rootZipFileRows.Count -ne 1) { throw 'ROOT_UNTRACKED_ARCHIVE_ROW_MISSING' }
+$rootZipItem = Get-Item -LiteralPath $rootZip -ErrorAction Stop
+if ([Int64]$rootZipItem.Length -ne [Int64]$rootZipFileRows[0].bytes) {
+    throw 'ROOT_UNTRACKED_ARCHIVE_BYTES_MISMATCH'
+}
+$rootZipSha = (Get-FileHash -LiteralPath $rootZip -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($rootZipSha -ne $rootZipFileRows[0].sha256.ToLowerInvariant()) {
+    throw 'ROOT_UNTRACKED_ARCHIVE_SHA256_MISMATCH'
+}
+$rootZipEntryRows = @($dirtyManifest.zip_entries | Where-Object {
+    $_.record_type -eq 'zip_entry' -and $_.archive_path -eq $rootZipRelativePath
+})
+$manifestRootEntries = @($rootZipEntryRows | ForEach-Object { $_.entry_path }) | Sort-Object
+if ($rootZipEntryRows.Count -ne $expectedRootEntries.Count -or
+    @(Compare-Object $manifestRootEntries $expectedRootEntries).Count -ne 0) {
+    throw 'ROOT_UNTRACKED_MANIFEST_ENTRY_SET_MISMATCH'
+}
 $zip = [IO.Compression.ZipFile]::OpenRead($rootZip)
 try {
-    if ($zip.Entries.Count -ne 4) { throw 'ROOT_UNTRACKED_ZIP_COUNT_INVALID' }
-} finally { $zip.Dispose() }
+    $actualRootEntries = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\','/') }) | Sort-Object
+    if ($zip.Entries.Count -ne $expectedRootEntries.Count -or
+        @(Compare-Object $actualRootEntries $expectedRootEntries).Count -ne 0) {
+        throw 'ROOT_UNTRACKED_ZIP_ENTRY_SET_MISMATCH'
+    }
+    foreach ($entry in $zip.Entries) {
+        $entryPath = $entry.FullName.Replace('\','/')
+        $record = @($rootZipEntryRows | Where-Object { $_.entry_path -eq $entryPath })
+        if ($record.Count -ne 1) { throw "ROOT_UNTRACKED_ENTRY_MANIFEST_ROW_MISSING:$entryPath" }
+        if ([Int64]$entry.Length -ne [Int64]$record[0].bytes) {
+            throw "ROOT_UNTRACKED_ENTRY_BYTES_MISMATCH:$entryPath"
+        }
+        $entryStream = $entry.Open()
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $entryDigest = $sha256.ComputeHash($entryStream)
+        } finally {
+            $sha256.Dispose()
+            $entryStream.Dispose()
+        }
+        $entrySha = ([BitConverter]::ToString($entryDigest) -replace '-','').ToLowerInvariant()
+        if ($entrySha -ne $record[0].sha256.ToLowerInvariant()) {
+            throw "ROOT_UNTRACKED_ENTRY_SHA256_MISMATCH:$entryPath"
+        }
+    }
+} finally {
+    $zip.Dispose()
+}
 
+# All path containment and archive-content checks above must pass before any deletion begins.
 foreach ($path in $RootUntracked) {
     $full = [IO.Path]::GetFullPath($path)
-    $root = [IO.Path]::GetFullPath($Repo).TrimEnd('\')
     if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
         throw "ROOT_UNTRACKED_PATH_ESCAPES:$full"
     }
-    Remove-Item -LiteralPath $full -Force
+}
+foreach ($path in $RootUntracked) {
+    Remove-Item -LiteralPath ([IO.Path]::GetFullPath($path)) -Force
 }
 ```
 
@@ -892,17 +1047,52 @@ foreach ($line in Get-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\re
     $name,$sha = $line -split "`t",2
     $after[$name] = $sha
 }
+$gaRemoteRef = 'refs/heads/codex/gwo-v8-ga-plan'
+$gaRemoteTrackingRef = 'refs/remotes/origin/codex/gwo-v8-ga-plan'
+$remoteBeforePath = Join-Path $ArchiveRoot 'inventory\remote-ga-ref-before.json'
+if (-not (Test-Path -LiteralPath $remoteBeforePath -PathType Leaf)) {
+    throw 'REMOTE_GA_REF_BEFORE_MISSING'
+}
+$remoteBefore = Get-Content -Raw -LiteralPath $remoteBeforePath | ConvertFrom-Json
+if ($remoteBefore.ref -ne $gaRemoteRef -or $remoteBefore.tracking_ref -ne $gaRemoteTrackingRef) {
+    throw 'REMOTE_GA_REF_BEFORE_IDENTITY_INVALID'
+}
+$remoteAfterLine = @(git -C $GaWorktree ls-remote --heads origin $gaRemoteRef)
+if ($remoteAfterLine.Count -ne 1) { throw 'REMOTE_GA_REF_AFTER_MISSING' }
+$remoteAfterSha = ($remoteAfterLine[0] -split '\s+')[0]
+if ($remoteAfterSha -ne $ProtectedGaSha) {
+    throw "REMOTE_GA_REF_MOVED_UNEXPECTEDLY:$remoteAfterSha"
+}
+if ($null -ne $remoteBefore.sha -and $remoteBefore.sha -ne $ProtectedGaSha) {
+    git -C $GaWorktree merge-base --is-ancestor $remoteBefore.sha $ProtectedGaSha
+    if ($LASTEXITCODE -ne 0) { throw 'REMOTE_GA_REF_NOT_FAST_FORWARD' }
+}
+$remoteAfterLine | Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\remote-ga-ref-after.txt') -Encoding utf8NoBOM
+$allowedFastForwardRefs = @('refs/heads/main','refs/remotes/origin/main')
 foreach ($name in $before.Keys) {
     if (-not $after.ContainsKey($name)) { throw "REF_DELETED:$name" }
-    if ($name -notin 'refs/heads/main','refs/remotes/origin/main' -and $after[$name] -ne $before[$name]) {
+    if ($name -eq $gaRemoteTrackingRef) {
+        if ($after[$name] -ne $ProtectedGaSha) { throw "REF_MOVED_UNEXPECTEDLY:$name" }
+    } elseif ($name -notin $allowedFastForwardRefs -and $after[$name] -ne $before[$name]) {
         throw "REF_MOVED_UNEXPECTEDLY:$name"
     }
 }
-foreach ($name in 'refs/heads/main','refs/remotes/origin/main') {
-    git -C $Repo merge-base --is-ancestor $before[$name] $after[$name]
-    if ($LASTEXITCODE -ne 0) { throw "REF_DID_NOT_FAST_FORWARD:$name" }
+foreach ($name in $after.Keys) {
+    if ($before.ContainsKey($name)) { continue }
+    if ($name -eq $gaRemoteTrackingRef -and $after[$name] -eq $ProtectedGaSha) { continue }
+    if ($name -eq 'refs/remotes/origin/main') { continue }
+    throw "REF_ADDED_UNEXPECTEDLY:$name"
+}
+foreach ($name in $allowedFastForwardRefs) {
+    if (-not $after.ContainsKey($name)) { throw "REF_MISSING_AFTER:$name" }
+    if ($before.ContainsKey($name)) {
+        git -C $Repo merge-base --is-ancestor $before[$name] $after[$name]
+        if ($LASTEXITCODE -ne 0) { throw "REF_DID_NOT_FAST_FORWARD:$name" }
+    }
 }
 ```
+
+The only non-`main` exception in this comparison is the captured GA remote ref and, if the push creates it, its exact local `origin` tracking ref; both must read `$ProtectedGaSha`. Every pre-clean ref must still exist, and any other movement or addition fails closed.
 
 - [ ] **Step 5: Run Git integrity and create the final bundle**
 
@@ -1027,7 +1217,43 @@ if ($presentPlanFiles.Count -eq 0) {
 }
 ```
 
-Expected: the cherry-picked commit contains only the two 2026-08-04 plans; none of the post-Beta1 implementation commits enters the Beta1 branch.
+Before proceeding, prove the existing or newly created branch is the intended Beta1 slice from the exact source boundary. Do not infer this from the two plan blobs or from an assumed remote branch:
+
+```powershell
+$beta1SourceBoundarySha = (git -C $Repo rev-parse 'ddc1785^{commit}').Trim()
+if ($LASTEXITCODE -ne 0 -or $beta1SourceBoundarySha -notmatch '^[0-9a-f]{40}$') {
+    throw 'BETA1_SOURCE_BOUNDARY_UNAVAILABLE'
+}
+$beta1Head = (git -C $Beta1Worktree rev-parse HEAD).Trim()
+git -C $Beta1Worktree merge-base --is-ancestor $beta1SourceBoundarySha $beta1Head
+if ($LASTEXITCODE -ne 0) { throw 'BETA1_SOURCE_BOUNDARY_NOT_ANCESTOR' }
+
+$beta1AllowedPaths = @(
+    $expectedPlanFiles
+    'docs/releases/gwo-v8-workspace-convergence.md'
+    'docs/releases/gwo-v8-release-train.md'
+    'tests/test_orchestrator_package.py'
+)
+$beta1Commits = @(git -C $Beta1Worktree rev-list "$beta1SourceBoundarySha..$beta1Head")
+$beta1TouchedPaths = @(
+    foreach ($commit in $beta1Commits) {
+        git -C $Beta1Worktree diff-tree --no-commit-id --name-only -r -m $commit
+    }
+)
+$beta1TouchedPaths = @($beta1TouchedPaths | ForEach-Object { $_.Replace('\','/') } | Sort-Object -Unique)
+if (@($beta1TouchedPaths | Where-Object { $_ -notin $beta1AllowedPaths }).Count -ne 0) {
+    throw "BETA1_FILE_SCOPE_DRIFTED:$($beta1TouchedPaths -join ',')"
+}
+$protectedPlanPaths = @(
+    git -C $GaWorktree diff-tree --no-commit-id --name-only -r $ProtectedGaSha |
+        ForEach-Object { $_.Replace('\','/') }
+)
+if (@(Compare-Object ($protectedPlanPaths | Sort-Object) ($expectedPlanFiles | Sort-Object)).Count -ne 0) {
+    throw 'PROTECTED_PLAN_COMMIT_SCOPE_INVALID'
+}
+```
+
+Expected: `$beta1SourceBoundarySha` is an available commit and an ancestor of the Beta1 head; every commit after it touches only the intended Beta1 file scope; and `$ProtectedGaSha` itself contains exactly the two plan files. No post-Beta1 implementation commit can enter the Beta1 branch through an existing local branch.
 
 - [ ] **Step 3: Write the failing structured receipt test**
 
@@ -1035,6 +1261,11 @@ Add to `tests/test_orchestrator_package.py`:
 
 ```python
 def test_beta1_requires_structured_workspace_convergence_receipt():
+    import hashlib
+    import os
+    import re
+    from pathlib import PurePosixPath, PureWindowsPath
+
     receipt_path = ROOT / "docs" / "releases" / "gwo-v8-workspace-convergence.md"
     release_train = (ROOT / "docs" / "releases" / "gwo-v8-release-train.md").read_text("utf-8")
     assert "Workspace Convergence Gate" in release_train
@@ -1057,6 +1288,7 @@ def test_beta1_requires_structured_workspace_convergence_receipt():
         "archive_manifest_sha256",
         "pre_clean_bundle_sha256",
         "post_clean_bundle_sha256",
+        "evidence",
         "completed_at",
     }
     assert receipt["schema"] == "gwo-workspace-convergence.v1"
@@ -1079,6 +1311,66 @@ def test_beta1_requires_structured_workspace_convergence_receipt():
         "post_clean_bundle_sha256",
     ):
         assert re.fullmatch(r"[0-9a-f]{64}", receipt[key])
+    evidence = receipt["evidence"]
+    assert set(evidence) == {
+        "manifest",
+        "pre_clean_bundle",
+        "post_clean_bundle",
+        "remote_ga_readback",
+    }
+    assert evidence["manifest"] == {
+        "path": "convergence-manifest.json",
+        "sha256": receipt["archive_manifest_sha256"],
+    }
+    assert evidence["pre_clean_bundle"] == {
+        "path": "pre-clean.bundle",
+        "sha256": receipt["pre_clean_bundle_sha256"],
+    }
+    assert evidence["post_clean_bundle"] == {
+        "path": "post-clean.bundle",
+        "sha256": receipt["post_clean_bundle_sha256"],
+    }
+    assert evidence["remote_ga_readback"] == {
+        "path": "inventory/remote-ga-ref-after.txt",
+        "ref": receipt["protected_remote_ref"],
+        "sha256": receipt["protected_remote_sha"],
+    }
+
+    def relative_path(value):
+        assert not Path(value).is_absolute()
+        assert not PureWindowsPath(value).is_absolute()
+        relative = PurePosixPath(value)
+        assert ".." not in relative.parts
+        return Path(*relative.parts)
+
+    for item in evidence.values():
+        relative_path(item["path"])
+
+    # Ordinary source checkouts do not contain the ephemeral archive. When the
+    # coordinator exposes it, bind the receipt to the actual local evidence.
+    archive_root_value = os.environ.get("GWO_CONVERGENCE_ARCHIVE_ROOT")
+    if archive_root_value:
+        archive_root = Path(archive_root_value)
+        manifest_path = archive_root / relative_path(evidence["manifest"]["path"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == receipt["archive_manifest_sha256"]
+        assert manifest["source_sha"] == receipt["source_sha"]
+        assert manifest["protected_remote_ref"] == receipt["protected_remote_ref"]
+        assert manifest["protected_remote_sha"] == receipt["protected_remote_sha"]
+        assert manifest["pre_clean_bundle_sha256"] == receipt["pre_clean_bundle_sha256"]
+        assert manifest["post_clean_bundle_sha256"] == receipt["post_clean_bundle_sha256"]
+        for receipt_key, evidence_key in (
+            ("pre_clean_bundle_sha256", "pre_clean_bundle"),
+            ("post_clean_bundle_sha256", "post_clean_bundle"),
+        ):
+            bundle_path = archive_root / relative_path(evidence[evidence_key]["path"])
+            assert hashlib.sha256(bundle_path.read_bytes()).hexdigest() == receipt[receipt_key]
+        readback_path = archive_root / relative_path(evidence["remote_ga_readback"]["path"])
+        readback_lines = readback_path.read_text(encoding="utf-8").splitlines()
+        assert len(readback_lines) == 1
+        readback_sha, readback_ref = readback_lines[0].split()
+        assert readback_sha == receipt["protected_remote_sha"]
+        assert readback_ref == receipt["protected_remote_ref"]
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T.+Z", receipt["completed_at"])
 ```
 
@@ -1094,7 +1386,22 @@ Expected: FAIL because the receipt file and release-train gate are absent.
 
 - [ ] **Step 5: Render the receipt from verified runtime values**
 
-Read the actual manifest and SHA files under `$ArchiveRoot`; write `docs/releases/gwo-v8-workspace-convergence.md` with one fenced JSON object containing exactly the tested keys. `archive_manifest_sha256`, bundle hashes, and `completed_at` come from Task 6 readback; never copy planning-time placeholder values.
+Read the actual manifest and SHA files under `$ArchiveRoot`; read the final `inventory\remote-ga-ref-after.txt`; and write `docs/releases/gwo-v8-workspace-convergence.md` with one fenced JSON object containing exactly the tested keys. `archive_manifest_sha256`, bundle hashes, the protected remote ref/SHA, and `completed_at` come from Task 6 readback; never copy planning-time placeholder values. Add this `evidence` object using archive-relative paths only:
+
+```json
+{
+  "manifest": {"path": "convergence-manifest.json", "sha256": "<archive_manifest_sha256>"},
+  "pre_clean_bundle": {"path": "pre-clean.bundle", "sha256": "<pre_clean_bundle_sha256>"},
+  "post_clean_bundle": {"path": "post-clean.bundle", "sha256": "<post_clean_bundle_sha256>"},
+  "remote_ga_readback": {
+    "path": "inventory/remote-ga-ref-after.txt",
+    "ref": "refs/heads/codex/gwo-v8-ga-plan",
+    "sha256": "<protected_remote_sha>"
+  }
+}
+```
+
+The test always checks these relative evidence bindings and, when `GWO_CONVERGENCE_ARCHIVE_ROOT` is supplied by coordinator verification, recomputes the manifest and bundle hashes and parses the actual remote readback. The environment variable is optional; no ephemeral absolute path is committed or required for an ordinary source-controlled test run.
 
 The prose before the JSON states:
 
@@ -1122,12 +1429,17 @@ Expected: all commands pass without regenerating a package manifest.
 - [ ] **Step 7: Commit, push, and remove the temporary receipt worktree**
 
 ```powershell
-git add `
+git -C $Beta1Worktree add -- `
     docs/releases/gwo-v8-workspace-convergence.md `
     docs/releases/gwo-v8-release-train.md `
     tests/test_orchestrator_package.py
-git commit -m 'docs: record workspace convergence gate'
-git push --set-upstream origin codex/gwo-v8-beta1
+if ($LASTEXITCODE -ne 0) { throw 'BETA1_RECEIPT_STAGE_FAILED' }
+git -C $Beta1Worktree diff --cached --check
+if ($LASTEXITCODE -ne 0) { throw 'BETA1_RECEIPT_DIFF_CHECK_FAILED' }
+git -C $Beta1Worktree commit -m 'docs: record workspace convergence gate'
+if ($LASTEXITCODE -ne 0) { throw 'BETA1_RECEIPT_COMMIT_FAILED' }
+git -C $Beta1Worktree push --set-upstream origin codex/gwo-v8-beta1
+if ($LASTEXITCODE -ne 0) { throw 'BETA1_RECEIPT_PUSH_FAILED' }
 ```
 
 Read back the remote Beta1 branch SHA. Then return to the canonical root and remove only the clean temporary worktree:
@@ -1205,7 +1517,7 @@ Set Phase 1 `PASS` only when both reviewers and the coordinator independently ag
 - [ ] All 48 test roots are absent; 12 retained log files verify in the archive.
 - [ ] Exactly two registered worktrees remain; both are clean.
 - [ ] Canonical root is latest fast-forwarded `main`; `work/issue-133` ref still exists.
-- [ ] Every pre-clean ref name remains; only `main` may have moved, and only by fast-forward.
+- [ ] Every pre-clean ref name remains; `refs/heads/main` and `refs/remotes/origin/main` may only fast-forward, the captured GA remote ref may only end at `$ProtectedGaSha`, and no other ref moves or additions are accepted.
 - [ ] Paseo live readback contains no removed target and no daemon mutation occurred.
 - [ ] `docs/releases/gwo-v8-workspace-convergence.md` matches the local manifest digests.
 - [ ] Beta1 release contract tests and repository checks pass.
