@@ -41,7 +41,7 @@
 
 | Output | Responsibility |
 | --- | --- |
-| `D:\Workstation\gwo-convergence-archive\$RunId\pre-clean.bundle` | Complete pre-clean Git ref protection |
+| `D:\gwo-convergence-archive\$RunId\pre-clean.bundle` | Complete pre-clean Git ref protection |
 | `...\inventory\` | Exact refs, worktrees, statuses, test-tree metadata, Paseo/GitHub readbacks |
 | `$ArchiveRoot\dirty\$slug\` | Binary patch, status, untracked ZIP, ignored inventory, SHA-256 |
 | `$ArchiveRoot\test-evidence\$runName\` | Four retained green triplets |
@@ -62,7 +62,7 @@ $GaWorktree = 'D:\Workstation\gwo-worktrees\issue-136'
 $ImplementationSha = 'e58c596998df90e65349bdb4b5f25d3d9dc1f7e2'
 $ProtectedGaSha = (git -C $GaWorktree rev-parse HEAD).Trim()
 $RunId = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
-$ArchiveRoot = Join-Path 'D:\Workstation\gwo-convergence-archive' $RunId
+$ArchiveRoot = Join-Path 'D:\gwo-convergence-archive' $RunId
 
 $KeepWorktrees = @(
     'D:\Workstation\github-work-orchestrator',
@@ -288,11 +288,21 @@ Expected: exact SHA/branch and no output from porcelain status.
 
 ```powershell
 if (Test-Path -LiteralPath $ArchiveRoot) { throw "ARCHIVE_ALREADY_EXISTS:$ArchiveRoot" }
-New-Item -ItemType Directory -LiteralPath $ArchiveRoot | Out-Null
+[IO.Directory]::CreateDirectory($ArchiveRoot) | Out-Null
 foreach ($name in 'inventory','dirty','test-evidence') {
-    New-Item -ItemType Directory -LiteralPath (Join-Path $ArchiveRoot $name) | Out-Null
+    [IO.Directory]::CreateDirectory((Join-Path $ArchiveRoot $name)) | Out-Null
 }
 ```
+
+PowerShell 7 does not expose `-LiteralPath` on `New-Item`. These
+`[IO.Directory]::CreateDirectory(...)` calls create only the exact
+`$ArchiveRoot` and `Join-Path $ArchiveRoot $name` directories without
+wildcard expansion. The global literal-path restriction for deletion inputs
+is unchanged and remains mandatory for every later removal command.
+The same PowerShell-7-compatible directory-creation form is used for the
+Task 2 archive/stage/destination directories and the Task 4 evidence
+destination; no directory-creation command relies on
+the unsupported PowerShell 7 `New-Item` literal-path parameter.
 
 - [ ] **Step 3: Assert exact path-set cardinality and uniqueness**
 
@@ -416,7 +426,7 @@ function New-UntrackedArchive {
     $root = [IO.Path]::GetFullPath($Worktree).TrimEnd('\')
     $stage = Join-Path $DestinationDirectory 'untracked-stage'
     $zip = Join-Path $DestinationDirectory 'untracked.zip'
-    New-Item -ItemType Directory -LiteralPath $stage | Out-Null
+    [IO.Directory]::CreateDirectory($stage) | Out-Null
 
     $relativePaths = @(git -C $root ls-files --others --exclude-standard)
     $fileRows = @()
@@ -428,7 +438,7 @@ function New-UntrackedArchive {
         }
         $destination = Join-Path $stage $relative
         $destinationParent = Split-Path -Parent $destination
-        New-Item -ItemType Directory -LiteralPath $destinationParent -Force | Out-Null
+        [IO.Directory]::CreateDirectory($destinationParent) | Out-Null
         Copy-Item -LiteralPath $source -Destination $destination
         $sourceItem = Get-Item -LiteralPath $source -Force -ErrorAction Stop
         if ($sourceItem.PSIsContainer) { throw "UNTRACKED_PATH_IS_DIRECTORY:$source" }
@@ -468,7 +478,7 @@ $untrackedFileRows = @()
 foreach ($worktree in $DirtyRoots) {
     $slug = ($worktree.TrimEnd('\') -split '[\\/]')[-1]
     $destination = Join-Path $ArchiveRoot (Join-Path 'dirty' $slug)
-    New-Item -ItemType Directory -LiteralPath $destination | Out-Null
+    [IO.Directory]::CreateDirectory($destination) | Out-Null
 
     git -C $worktree status --porcelain=v2 --branch --untracked-files=all |
         Set-Content -LiteralPath (Join-Path $destination 'status.txt') -Encoding utf8NoBOM
@@ -662,7 +672,7 @@ Expected planning baseline: 48 roots, 162,677 files, and 980,313,853 bytes. A ch
 $retainedRows = foreach ($source in $RetainedEvidenceFiles) {
     $runName = Split-Path -Leaf (Split-Path -Parent $source)
     $destinationDirectory = Join-Path $ArchiveRoot (Join-Path 'test-evidence' $runName)
-    New-Item -ItemType Directory -LiteralPath $destinationDirectory -Force | Out-Null
+    [IO.Directory]::CreateDirectory($destinationDirectory) | Out-Null
     $destination = Join-Path $destinationDirectory (Split-Path -Leaf $source)
     Copy-Item -LiteralPath $source -Destination $destination
     $hash = Get-FileHash -LiteralPath $destination -Algorithm SHA256
