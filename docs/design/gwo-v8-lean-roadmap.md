@@ -550,3 +550,20 @@ and push once for final hosted CI.
 
 After #116, the root Canary must use BatchIntegrator itself rather than a
 manual approximation.
+
+## Lean V8 release admission after Candidate assurance
+
+- Beta1: metadata and tracker repair only. It does not admit Lean V8
+  production execution.
+- Beta2: feature-complete preview. Exit requires merged #113, #114, #115,
+  #116, #117, and #137; the exact CandidateReceipt Kernel baseline;
+  authoritative Candidate Git identity; Standard and Strict Review bounds;
+  complete Finding dispositions; bounded repair_verify; Candidate budget
+  restart evidence; isolated V3 composition; and green CI for the exact
+  main SHA. Beta2 does not switch the default writer.
+- Beta3: cutover candidate. Entry requires the cutover Guard, exact target
+  and Activation read-back, rollback proof, and no unresolved native
+  blocker.
+- GA: requires a real public-API root Canary and exact target, Activation,
+  and default-writer read-back. Synthetic or private-helper execution is
+  not GA evidence.
