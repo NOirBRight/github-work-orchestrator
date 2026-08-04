@@ -19,6 +19,9 @@
 - The root checkout's four untracked files may be removed only after their ZIP and hashes verify.
 - No pre-clean Git ref may be deleted or moved unexpectedly: `refs/heads/main` and `refs/remotes/origin/main` may fast-forward (with `origin/main` created only by the required fetch), and the captured `refs/heads/codex/gwo-v8-ga-plan` may be created or advanced only to `$ProtectedGaSha` (including its local remote-tracking ref); no other ref may move or be added.
 - Use only exact LiteralPath values from this plan. Reject `*`, `?`, `[` and `]` in every deletion input.
+- The four exact inaccessible ignored roots listed in `$InaccessibleIgnoredRoots` are retained-protected evidence, never deletion candidates, and may be inspected only with non-recursive `Test-Path -LiteralPath`/`Get-Item -LiteralPath` metadata reads.
+- If an ignored-file inventory reports permission denial, capture the exact stderr and structured denial inventory before continuing. The only permitted denied paths are the four exact `$InaccessibleIgnoredRoots`; an unexpected denied path, missing expected denial, missing metadata, failed containment/disjointness proof, or failed retained-protected readback stops the gate.
+- No operation may traverse, copy, archive, change ACLs/ownership, enable backup privilege, or delete a retained-protected path. Later deletion commands must exclude the retained-protected inventory exactly.
 - Never use `git clean`, wildcard deletion, `git worktree prune`, cross-shell generated delete commands, `--no-verify`, or force-push.
 - Do not start or restart Paseo. If live Paseo readback is unavailable, ambiguous, or references a target path, stop the Paseo subset and leave the gate on HOLD.
 - Run Git worktree metadata mutations serially. Parallelism is limited to read-only inventory/archive lanes with disjoint archive subdirectories.
@@ -43,6 +46,11 @@
 | --- | --- |
 | `D:\gwo-convergence-archive\$RunId\pre-clean.bundle` | Complete pre-clean Git ref protection |
 | `...\inventory\` | Exact refs, worktrees, statuses, test-tree metadata, Paseo/GitHub readbacks |
+| `$ArchiveRoot\inventory\inaccessible-ignored-roots-stderr.txt` | Exact permission-denied stderr/readback from ignored-file inventory |
+| `$ArchiveRoot\inventory\inaccessible-ignored-roots.json` | Structured retained-protected records for the four inaccessible ignored roots |
+| `$ArchiveRoot\inventory\inaccessible-ignored-roots-sha256.json` | SHA-256 of the structured inaccessible-root inventory |
+| `$ArchiveRoot\inventory\inaccessible-ignored-roots-pre-delete.json` | Non-recursive retained-protected existence/metadata readback before later deletion |
+| `$ArchiveRoot\inventory\inaccessible-ignored-roots-final.json` | Non-recursive retained-protected existence/metadata readback after final convergence |
 | `$ArchiveRoot\dirty\$slug\` | Binary patch, status, untracked ZIP, ignored inventory, SHA-256 |
 | `$ArchiveRoot\test-evidence\$runName\` | Four retained green triplets |
 | `...\post-clean.bundle` | Final refs after canonical-main fast-forward and remote branch protection |
@@ -67,6 +75,13 @@ $ArchiveRoot = Join-Path 'D:\gwo-convergence-archive' $RunId
 $KeepWorktrees = @(
     'D:\Workstation\github-work-orchestrator',
     'D:\Workstation\gwo-worktrees\issue-136'
+)
+
+$InaccessibleIgnoredRoots = @(
+    'D:\Workstation\github-work-orchestrator\.gwo-worktrees\pytest-109-ef8fbb0b-bf81-41ae-b32b-3ec620501507',
+    'D:\Workstation\github-work-orchestrator\.gwo-worktrees\pytest-112-6fa6f981-79e8-4c9e-92e5-64cf109878d5',
+    'D:\Workstation\github-work-orchestrator\.gwo-worktrees\pytest-112-6fb97834-03c0-49d6-8d03-01258e144e85',
+    'D:\Workstation\github-work-orchestrator\.gwo-worktrees\pytest-112-d0034ae2-3b5d-4dc5-8a18-01d8415ae3df'
 )
 
 $RemoveWorktrees = @(
@@ -262,6 +277,9 @@ Expected: the worktree is clean, `$ProtectedGaSha` differs from `$Implementation
 - Create outside Git: `$ArchiveRoot\inventory\approved-paths.json`
 - Create outside Git: `$ArchiveRoot\inventory\refs-before.txt`
 - Create outside Git: `$ArchiveRoot\inventory\worktrees-before.txt`
+- Create outside Git: `$ArchiveRoot\inventory\inaccessible-ignored-roots-stderr.txt`
+- Create outside Git: `$ArchiveRoot\inventory\inaccessible-ignored-roots.json`
+- Create outside Git: `$ArchiveRoot\inventory\inaccessible-ignored-roots-sha256.json`
 - Create outside Git: `$ArchiveRoot\pre-clean.bundle`
 
 **Interfaces:**
@@ -312,16 +330,27 @@ if ($RemoveWorktrees.Count -ne 36) { throw 'REMOVE_WORKTREE_COUNT_INVALID' }
 if ($ForceRemoveWorktrees.Count -ne 5) { throw 'FORCE_WORKTREE_COUNT_INVALID' }
 if ($TestRoots.Count -ne 48) { throw 'TEST_ROOT_COUNT_INVALID' }
 if ($RetainedEvidenceFiles.Count -ne 12) { throw 'EVIDENCE_FILE_COUNT_INVALID' }
+if ($InaccessibleIgnoredRoots.Count -ne 4) { throw 'INACCESSIBLE_IGNORED_ROOT_COUNT_INVALID' }
 
 $allApproved = @($KeepWorktrees + $RemoveWorktrees + $TestRoots)
 $normalized = @($allApproved | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
 if (($normalized | Sort-Object -Unique).Count -ne $normalized.Count) {
     throw 'APPROVED_PATH_DUPLICATE'
 }
-foreach ($path in $normalized) {
+$normalizedInaccessible = @(
+    $InaccessibleIgnoredRoots | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') }
+)
+if (($normalizedInaccessible | Sort-Object -Unique).Count -ne $InaccessibleIgnoredRoots.Count) {
+    throw 'INACCESSIBLE_IGNORED_ROOT_DUPLICATE'
+}
+foreach ($path in @($normalized + $normalizedInaccessible)) {
     if ($path.IndexOfAny([char[]]'*?[]') -ge 0) { throw "WILDCARD_PATH_REJECTED:$path" }
 }
 ```
+
+Normalization is used only for uniqueness and wildcard checks; the original exact
+array values are the values serialized to `approved-paths.json` and used by all
+later gates.
 
 - [ ] **Step 4: Serialize the approved path policy**
 
@@ -348,26 +377,232 @@ $approvedPath = Join-Path $ArchiveRoot 'inventory\approved-paths.json'
 - [ ] **Step 5: Snapshot refs, worktrees, statuses, and disk usage**
 
 ```powershell
+function Invoke-GitCapture {
+    param(
+        [Parameter(Mandatory)] [string] $WorkingDirectory,
+        [Parameter(Mandatory)] [string[]] $Arguments
+    )
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git.exe'
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw "GIT_PROCESS_START_FAILED:$WorkingDirectory" }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    [ordered]@{
+        exit_code = [int]$process.ExitCode
+        stdout = $stdoutTask.GetAwaiter().GetResult()
+        stderr = $stderrTask.GetAwaiter().GetResult()
+    }
+}
+
+function Convert-GitOutputToLines {
+    param([AllowNull()] [string] $Text)
+    if ([string]::IsNullOrEmpty($Text)) { return @() }
+    @($Text -split "`r?`n" | Where-Object { $_ -ne '' })
+}
+
 git -C $Repo for-each-ref --format='%(refname)%09%(objectname)' |
     Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\refs-before.txt') -Encoding utf8NoBOM
 git -C $Repo worktree list --porcelain |
     Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\worktrees-before.txt') -Encoding utf8NoBOM
 
 $statusRows = foreach ($path in @($KeepWorktrees + $RemoveWorktrees)) {
+    $porcelainResult = Invoke-GitCapture -WorkingDirectory $path -Arguments @(
+        'status', '--porcelain=v2', '--branch', '--untracked-files=all'
+    )
+    $ignoredResult = Invoke-GitCapture -WorkingDirectory $path -Arguments @(
+        'ls-files', '--others', '--ignored', '--exclude-standard'
+    )
     [ordered]@{
         path = $path
         head = (git -C $path rev-parse HEAD).Trim()
         branch = (git -C $path branch --show-current).Trim()
-        porcelain = @(git -C $path status --porcelain=v2 --branch --untracked-files=all)
-        ignored = @(git -C $path ls-files --others --ignored --exclude-standard)
+        porcelain_exit_code = $porcelainResult.exit_code
+        porcelain = @(Convert-GitOutputToLines $porcelainResult.stdout)
+        porcelain_stderr = $porcelainResult.stderr
+        ignored_exit_code = $ignoredResult.exit_code
+        ignored = @(Convert-GitOutputToLines $ignoredResult.stdout)
+        ignored_stderr = $ignoredResult.stderr
     }
 }
-$statusRows | ConvertTo-Json -Depth 8 |
-    Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\worktree-status-before.json') -Encoding utf8NoBOM
+[IO.File]::WriteAllText(
+    (Join-Path $ArchiveRoot 'inventory\worktree-status-before.json'),
+    ($statusRows | ConvertTo-Json -Depth 10),
+    [Text.UTF8Encoding]::new($false)
+)
+if (@($statusRows | Where-Object { $_.porcelain_exit_code -ne 0 }).Count -ne 0) {
+    throw 'GIT_STATUS_SNAPSHOT_FAILED'
+}
+if (@($statusRows | Where-Object { $_.ignored_exit_code -ne 0 }).Count -ne 0) {
+    throw 'GIT_IGNORED_SNAPSHOT_FAILED'
+}
+
+# The canonical kept-root ignored stderr is retained byte-for-byte. It is not
+# converted into an empty ignored list when Git reports a permission warning.
+$canonicalRoot = [IO.Path]::GetFullPath($KeepWorktrees[0]).TrimEnd('\')
+$canonicalRows = @($statusRows | Where-Object {
+    [IO.Path]::GetFullPath($_.path).TrimEnd('\').Equals($canonicalRoot, [StringComparison]::OrdinalIgnoreCase)
+})
+if ($canonicalRows.Count -ne 1) { throw 'CANONICAL_STATUS_ROW_MISSING' }
+$canonicalIgnoredStderr = [string]$canonicalRows[0].ignored_stderr
+$denialStderrPath = Join-Path $ArchiveRoot 'inventory\inaccessible-ignored-roots-stderr.txt'
+[IO.File]::WriteAllText($denialStderrPath, $canonicalIgnoredStderr, [Text.UTF8Encoding]::new($false))
+if ([IO.File]::ReadAllText($denialStderrPath) -cne $canonicalIgnoredStderr) {
+    throw 'INACCESSIBLE_IGNORED_ROOT_STDERR_READBACK_MISMATCH'
+}
+
+$permissionDeniedLines = @(
+    $canonicalIgnoredStderr -split "`r?`n" |
+        Where-Object { $_.IndexOf('Permission denied', [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+)
+if ($permissionDeniedLines.Count -eq 0) { throw 'EXPECTED_PERMISSION_DENIAL_NOT_CAPTURED' }
+$expectedDenialPaths = @($InaccessibleIgnoredRoots | ForEach-Object {
+    [IO.Path]::GetFullPath($_).TrimEnd('\')
+})
+$expectedDenialRelatives = @($expectedDenialPaths | ForEach-Object {
+    $_.Substring($canonicalRoot.Length + 1).Replace('\','/')
+})
+foreach ($line in $permissionDeniedLines) {
+    $known = $false
+    foreach ($relative in $expectedDenialRelatives) {
+        if ($line.Contains($relative) -or $line.Contains($relative.Replace('/','\'))) {
+            $known = $true
+            break
+        }
+    }
+    if (-not $known) { throw "UNEXPECTED_PERMISSION_DENIED:$line" }
+}
+
+$keepIdentities = @($KeepWorktrees | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
+$deletionIdentities = @(
+    $RemoveWorktrees + $ForceRemoveWorktrees + $TestRoots |
+        ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') }
+)
+$denialRows = foreach ($path in $expectedDenialPaths) {
+    $parents = @($keepIdentities | Where-Object {
+        $path.StartsWith($_ + '\', [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($parents.Count -ne 1) { throw "INACCESSIBLE_ROOT_KEEP_CONTAINMENT_INVALID:$path" }
+    foreach ($target in $deletionIdentities) {
+        if ($path.Equals($target, [StringComparison]::OrdinalIgnoreCase) -or
+            $path.StartsWith($target + '\', [StringComparison]::OrdinalIgnoreCase) -or
+            $target.StartsWith($path + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "INACCESSIBLE_ROOT_DELETION_OVERLAP:$path:$target"
+        }
+    }
+
+    $relative = $path.Substring($canonicalRoot.Length + 1).Replace('\','/')
+    $matchingErrors = @($permissionDeniedLines | Where-Object {
+        $_.Contains($relative) -or $_.Contains($relative.Replace('/','\'))
+    })
+    if ($matchingErrors.Count -eq 0) { throw "EXPECTED_DENIAL_PATH_MISSING:$path" }
+
+    $item = $null
+    $getItemError = $null
+    try {
+        # This is a single non-recursive metadata read of the exact path.
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    } catch {
+        $getItemError = $_.Exception.ToString()
+    }
+    $metadata = $null
+    if ($null -ne $item) {
+        $metadata = [ordered]@{
+            full_name = $item.FullName
+            name = $item.Name
+            ps_is_container = [bool]$item.PSIsContainer
+            attributes = $item.Attributes.ToString()
+            length = if ($item.PSIsContainer) { $null } else { [Int64]$item.Length }
+            creation_time_utc = $item.CreationTimeUtc.ToString('o')
+            last_write_time_utc = $item.LastWriteTimeUtc.ToString('o')
+            last_access_time_utc = $item.LastAccessTimeUtc.ToString('o')
+        }
+    }
+    [ordered]@{
+        path = $path
+        parent_kept_root_identity = $parents[0]
+        parent_kept_root_head = (git -C $parents[0] rev-parse HEAD).Trim()
+        parent_kept_root_branch = (git -C $parents[0] branch --show-current).Trim()
+        access_denied_error = ($matchingErrors -join "`n")
+        get_item_metadata_available = ($null -ne $metadata)
+        get_item_metadata = $metadata
+        get_item_error = $getItemError
+        captured_at_utc = [DateTime]::UtcNow.ToString('o')
+        retention = 'retained-protected'
+        delete_candidate = $false
+        traversal_prohibited = $true
+    }
+}
+if (@($denialRows).Count -ne 4) { throw 'INACCESSIBLE_IGNORED_ROOT_INVENTORY_COUNT_INVALID' }
+
+$denialBody = [ordered]@{
+    schema = 'gwo-inaccessible-ignored-roots.v1'
+    run_id = $RunId
+    captured_at_utc = [DateTime]::UtcNow.ToString('o')
+    retention = 'retained-protected'
+    delete_candidate = $false
+    traversal_prohibited = $true
+    records = @($denialRows)
+}
+$denialInventoryPath = Join-Path $ArchiveRoot 'inventory\inaccessible-ignored-roots.json'
+[IO.File]::WriteAllText(
+    $denialInventoryPath,
+    ($denialBody | ConvertTo-Json -Depth 12),
+    [Text.UTF8Encoding]::new($false)
+)
+$denialHash = Get-FileHash -LiteralPath $denialInventoryPath -Algorithm SHA256
+$denialHashBody = [ordered]@{
+    schema = 'gwo-inaccessible-ignored-roots-sha256.v1'
+    path = 'inventory/inaccessible-ignored-roots.json'
+    algorithm = 'SHA256'
+    sha256 = $denialHash.Hash.ToLowerInvariant()
+    bytes = (Get-Item -LiteralPath $denialInventoryPath -Force).Length
+    captured_at_utc = [DateTime]::UtcNow.ToString('o')
+}
+$denialHashPath = Join-Path $ArchiveRoot 'inventory\inaccessible-ignored-roots-sha256.json'
+[IO.File]::WriteAllText(
+    $denialHashPath,
+    ($denialHashBody | ConvertTo-Json -Depth 8),
+    [Text.UTF8Encoding]::new($false)
+)
+$denialReadback = Get-Content -Raw -LiteralPath $denialInventoryPath | ConvertFrom-Json
+$denialHashReadback = Get-Content -Raw -LiteralPath $denialHashPath | ConvertFrom-Json
+if (@($denialReadback.records).Count -ne 4) { throw 'INACCESSIBLE_IGNORED_ROOT_READBACK_COUNT_INVALID' }
+if ($denialHashReadback.sha256.ToLowerInvariant() -ne
+    (Get-FileHash -LiteralPath $denialInventoryPath -Algorithm SHA256).Hash.ToLowerInvariant()) {
+    throw 'INACCESSIBLE_IGNORED_ROOT_HASH_READBACK_MISMATCH'
+}
+if (@($denialReadback.records | Where-Object {
+    $_.retention -ne 'retained-protected' -or $_.delete_candidate -ne $false -or
+    $_.traversal_prohibited -ne $true -or $_.get_item_metadata_available -ne $true
+}).Count -ne 0) {
+    throw 'INACCESSIBLE_IGNORED_ROOT_PROTECTION_READBACK_INVALID'
+}
+
 Get-PSDrive -Name C,D | Select-Object Name,Used,Free |
     ConvertTo-Json |
     Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\disk-before.json') -Encoding utf8NoBOM
 ```
+
+The status JSON retains `porcelain_exit_code`, `porcelain_stderr`,
+`ignored_exit_code`, and `ignored_stderr` independently. The four exact denied
+paths are checked only by strict containment/disjointness string comparisons;
+no wildcard or recursive read is permitted. The stderr file is the raw
+canonical `git ls-files` stderr and is read back byte-for-byte before the
+structured inventory is accepted. Task 2's second status snapshot must reuse
+this capture/readback protocol and compare both exit codes and stderr fields;
+permission warnings may never be represented as an empty ignored list.
 
 - [ ] **Step 6: Create and verify the complete pre-clean bundle**
 
@@ -567,7 +802,7 @@ foreach ($zipPath in Get-ChildItem -LiteralPath (Join-Path $ArchiveRoot 'dirty')
 
 - [ ] **Step 4: Perform a second status read and fail on drift**
 
-Re-run the Task 1 status snapshot into `worktree-status-pre-delete.json`. Compare HEAD, branch, porcelain, untracked, and ignored lists with the first snapshot. Any difference stops cleanup and requires regenerating the affected archive under a new run ID; never overwrite the existing run.
+Re-run the Task 1 status snapshot into `worktree-status-pre-delete.json` using `Invoke-GitCapture`. Compare HEAD, branch, porcelain, untracked, ignored lists, status exit codes, and both status stderr fields with the first snapshot. Any difference stops cleanup and requires regenerating the affected archive under a new run ID; never overwrite the existing run. Reapply the four-path retained-protected denial protocol and keep its exact stderr/readback separate from the ignored list.
 
 ### Task 3: Protect the Active GA Branch Remotely
 
@@ -629,6 +864,72 @@ $readback | Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\remote-g
 ```
 
 Expected: cleanup remains blocked until remote readback is exact.
+
+### Retained-Protected Deletion Authorization Barrier
+
+No later deletion may begin until the four exact inaccessible ignored roots have
+passed this readback. This is a non-destructive existence and metadata check only;
+it must not enumerate, traverse, copy, archive, alter ACLs or ownership, enable
+backup privilege, or delete any retained-protected path.
+
+- [ ] **Barrier Step: Read back retained-protected roots before later deletion**
+
+```powershell
+function Read-RetainedProtectedRoots {
+    param([Parameter(Mandatory)] [string] $OutputPath)
+
+    $rows = foreach ($path in $InaccessibleIgnoredRoots) {
+        $full = [IO.Path]::GetFullPath($path).TrimEnd('\')
+        $exists = Test-Path -LiteralPath $full
+        $item = $null
+        $errorText = $null
+        if ($exists) {
+            try {
+                # Exact non-recursive metadata read; never use Get-ChildItem here.
+                $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+            } catch {
+                $errorText = $_.Exception.ToString()
+            }
+        }
+        [ordered]@{
+            path = $full
+            exists = [bool]$exists
+            get_item_metadata_available = ($null -ne $item)
+            get_item_metadata = if ($null -ne $item) {
+                [ordered]@{
+                    full_name = $item.FullName
+                    name = $item.Name
+                    ps_is_container = [bool]$item.PSIsContainer
+                    attributes = $item.Attributes.ToString()
+                    creation_time_utc = $item.CreationTimeUtc.ToString('o')
+                    last_write_time_utc = $item.LastWriteTimeUtc.ToString('o')
+                    last_access_time_utc = $item.LastAccessTimeUtc.ToString('o')
+                }
+            } else { $null }
+            get_item_error = $errorText
+            retention = 'retained-protected'
+            delete_candidate = $false
+            traversal_prohibited = $true
+            captured_at_utc = [DateTime]::UtcNow.ToString('o')
+        }
+    }
+    if (@($rows | Where-Object {
+        $_.exists -ne $true -or $_.get_item_metadata_available -ne $true -or
+        $_.delete_candidate -ne $false -or $_.traversal_prohibited -ne $true
+    }).Count -ne 0) {
+        throw 'RETAINED_PROTECTED_PRE_DELETE_READBACK_FAILED'
+    }
+    [IO.File]::WriteAllText($OutputPath, ($rows | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+    $readback = Get-Content -Raw -LiteralPath $OutputPath | ConvertFrom-Json
+    if (@($readback).Count -ne 4 -or @($readback | Where-Object { $_.exists -ne $true }).Count -ne 0) {
+        throw 'RETAINED_PROTECTED_PRE_DELETE_FILE_READBACK_FAILED'
+    }
+}
+Read-RetainedProtectedRoots -OutputPath (Join-Path $ArchiveRoot 'inventory\inaccessible-ignored-roots-pre-delete.json')
+```
+
+The four paths remain retained-protected and are excluded from every deletion
+input; the readback must pass immediately before Task 4/Task 5 deletion begins.
 
 ### Task 4: Preserve Four Green Runs and Remove the 48 Test Roots
 
@@ -1129,6 +1430,53 @@ if ((git -C $GaWorktree rev-parse HEAD).Trim() -ne $ProtectedGaSha) {
 }
 git -C $GaWorktree merge-base --is-ancestor $ImplementationSha $ProtectedGaSha
 if ($LASTEXITCODE -ne 0) { throw 'IMPLEMENTATION_BOUNDARY_LOST' }
+$finalProtectedRows = foreach ($path in $InaccessibleIgnoredRoots) {
+    $full = [IO.Path]::GetFullPath($path).TrimEnd('\')
+    $exists = Test-Path -LiteralPath $full
+    $item = $null
+    $errorText = $null
+    if ($exists) {
+        try {
+            # Exact non-recursive metadata read; traversal remains prohibited.
+            $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+        } catch {
+            $errorText = $_.Exception.ToString()
+        }
+    }
+    [ordered]@{
+        path = $full
+        exists = [bool]$exists
+        get_item_metadata_available = ($null -ne $item)
+        get_item_metadata = if ($null -ne $item) {
+            [ordered]@{
+                full_name = $item.FullName
+                name = $item.Name
+                ps_is_container = [bool]$item.PSIsContainer
+                attributes = $item.Attributes.ToString()
+                creation_time_utc = $item.CreationTimeUtc.ToString('o')
+                last_write_time_utc = $item.LastWriteTimeUtc.ToString('o')
+                last_access_time_utc = $item.LastAccessTimeUtc.ToString('o')
+            }
+        } else { $null }
+        get_item_error = $errorText
+        retention = 'retained-protected'
+        delete_candidate = $false
+        traversal_prohibited = $true
+        captured_at_utc = [DateTime]::UtcNow.ToString('o')
+    }
+}
+if (@($finalProtectedRows | Where-Object {
+    $_.exists -ne $true -or $_.get_item_metadata_available -ne $true -or
+    $_.delete_candidate -ne $false -or $_.traversal_prohibited -ne $true
+}).Count -ne 0) {
+    throw 'RETAINED_PROTECTED_FINAL_READBACK_FAILED'
+}
+$finalProtectedPath = Join-Path $ArchiveRoot 'inventory\inaccessible-ignored-roots-final.json'
+[IO.File]::WriteAllText($finalProtectedPath, ($finalProtectedRows | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+$finalReadback = Get-Content -Raw -LiteralPath $finalProtectedPath | ConvertFrom-Json
+if (@($finalReadback).Count -ne 4 -or @($finalReadback | Where-Object { $_.exists -ne $true }).Count -ne 0) {
+    throw 'RETAINED_PROTECTED_FINAL_FILE_READBACK_FAILED'
+}
 ```
 
 - [ ] **Step 4: Prove no pre-clean ref disappeared**
