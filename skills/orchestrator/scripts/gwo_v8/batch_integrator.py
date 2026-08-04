@@ -1,0 +1,370 @@
+"""V3 BatchIntegrator identity boundary and delivery action seam."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Literal
+
+from ._canonical import digest_value
+from .candidate_gate import (
+    AcceptedCandidateReceipt,
+    InteractionClassification,
+    InteractionKey,
+)
+
+
+class BatchIntegratorError(RuntimeError):
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+        self.detail = detail
+
+
+class DeliveryIdentityMismatch(BatchIntegratorError):
+    def __init__(self, detail: str) -> None:
+        super().__init__("DELIVERY_IDENTITY_MISMATCH", detail)
+
+
+class DeliveryAttributionAmbiguous(BatchIntegratorError):
+    def __init__(self, detail: str) -> None:
+        super().__init__("DELIVERY_ATTRIBUTION_AMBIGUOUS", detail)
+
+
+def _require_object_id(name: str, value: str) -> str:
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None:
+        raise BatchIntegratorError(
+            "BATCH_OBJECT_ID_INVALID",
+            f"{name} must be a lowercase Git object ID",
+        )
+    return value
+
+
+def _require_digest(name: str, value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise BatchIntegratorError(
+            "BATCH_DIGEST_INVALID",
+            f"{name} must be a lowercase SHA-256 digest",
+        )
+    return value
+
+
+def _require_sorted_unique(name: str, values: tuple[str, ...]) -> tuple[str, ...]:
+    frozen = tuple(values)
+    if frozen != tuple(sorted(set(frozen))):
+        raise BatchIntegratorError(
+            "BATCH_CANONICAL_ORDER_INVALID",
+            f"{name} must be sorted and unique",
+        )
+    return frozen
+
+
+def _accepted_candidate_body(candidate: AcceptedCandidateReceipt) -> dict[str, object]:
+    body = dict(candidate.canonical())
+    if "result_digest" in body:
+        raise BatchIntegratorError(
+            "BATCH_RESULT_PREMATURE",
+            "accepted Candidate cannot contain result_digest",
+        )
+    if candidate.accepted_sequence < 0:
+        raise BatchIntegratorError(
+            "BATCH_SEQUENCE_INVALID",
+            "accepted_sequence must be non-negative",
+        )
+    for name in ("base_sha", "base_tree_oid", "candidate_sha", "candidate_tree_oid"):
+        _require_object_id(name, getattr(candidate, name))
+    for name in (
+        "candidate_receipt_digest",
+        "diff_record_digest",
+        "authority_subtree_digest",
+        "policy_witness_digest",
+        "review_subject_digest",
+        "assurance_requirement_digest",
+        "check_environment_digest",
+        "delivery_identity_digest",
+        "review_finding_ledger_digest",
+    ):
+        _require_digest(name, getattr(candidate, name))
+    evidence = _require_sorted_unique(
+        "evidence_digests", tuple(candidate.evidence_digests)
+    )
+    for digest in evidence:
+        _require_digest("evidence_digests item", digest)
+    _require_sorted_unique("protected_surfaces", tuple(candidate.protected_surfaces))
+    interaction_order = tuple(
+        (key.namespace, key.value, key.classification.value)
+        for key in candidate.interaction_keys
+    )
+    if interaction_order != tuple(sorted(set(interaction_order))):
+        raise BatchIntegratorError(
+            "BATCH_INTERACTION_ORDER_INVALID",
+            "interaction_keys must be sorted and unique",
+        )
+    _require_digest("accepted_candidate_digest", candidate.digest)
+    return body
+
+
+@dataclass(frozen=True)
+class BatchTarget:
+    repository: str
+    target_branch: str
+    target_head_sha: str
+    target_tree_oid: str
+    target_facts_digest: str
+
+    def __post_init__(self) -> None:
+        _require_object_id("target_head_sha", self.target_head_sha)
+        _require_object_id("target_tree_oid", self.target_tree_oid)
+        _require_digest("target_facts_digest", self.target_facts_digest)
+
+    def canonical(self) -> dict[str, str]:
+        return {
+            "repository": self.repository,
+            "target_branch": self.target_branch,
+            "target_head_sha": self.target_head_sha,
+            "target_tree_oid": self.target_tree_oid,
+            "target_facts_digest": self.target_facts_digest,
+        }
+
+
+@dataclass(frozen=True)
+class LocalSuiteDefinition:
+    suite_id: str
+    definition_digest: str
+    command: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        command = tuple(self.command)
+        if not self.suite_id or not command or any(not item for item in command):
+            raise BatchIntegratorError(
+                "BATCH_LOCAL_SUITE_INVALID",
+                "local suite ID and command are required",
+            )
+        _require_digest("local definition_digest", self.definition_digest)
+        object.__setattr__(self, "command", command)
+
+    def canonical(self) -> dict[str, object]:
+        return {
+            "suite_id": self.suite_id,
+            "definition_digest": self.definition_digest,
+            "command": list(self.command),
+        }
+
+
+@dataclass(frozen=True)
+class HostedSuiteDefinition:
+    suite_id: str
+    hosted_name: str
+    definition_digest: str
+
+    def __post_init__(self) -> None:
+        if not self.suite_id or not self.hosted_name:
+            raise BatchIntegratorError(
+                "BATCH_HOSTED_SUITE_INVALID",
+                "hosted suite identity is required",
+            )
+        _require_digest("hosted definition_digest", self.definition_digest)
+
+    def canonical(self) -> dict[str, str]:
+        return {
+            "suite_id": self.suite_id,
+            "hosted_name": self.hosted_name,
+            "definition_digest": self.definition_digest,
+        }
+
+
+@dataclass(frozen=True)
+class BatchIntegratorConfiguration:
+    host_member_limit: int = 4
+    repository_member_limits: dict[str, int] | None = None
+    infrastructure_retry_limit: int = 2
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.host_member_limit <= 4:
+            raise BatchIntegratorError(
+                "BATCH_MEMBER_LIMIT_INVALID",
+                "member limit must be between one and four",
+            )
+        if self.infrastructure_retry_limit != 2:
+            raise BatchIntegratorError(
+                "BATCH_RETRY_POLICY_INVALID",
+                "infrastructure retry limit is fixed at two",
+            )
+        copied = dict(sorted((self.repository_member_limits or {}).items()))
+        if any(not 1 <= limit <= 4 for limit in copied.values()):
+            raise BatchIntegratorError(
+                "BATCH_MEMBER_LIMIT_INVALID",
+                "repository member limit must be between one and four",
+            )
+        object.__setattr__(self, "repository_member_limits", MappingProxyType(copied))
+
+    def member_limit_for(self, repository: str) -> int:
+        return self.repository_member_limits.get(repository, self.host_member_limit)
+
+
+@dataclass(frozen=True)
+class BatchDeliveryRequest:
+    stable_action_id: str
+    repository: str
+    campaign_key: str
+    plan_revision_digest: str
+    target: BatchTarget
+    accepted_candidates: tuple[AcceptedCandidateReceipt, ...]
+    local_suite: LocalSuiteDefinition
+    hosted_suites: tuple[HostedSuiteDefinition, ...]
+    writer_generation: str
+    activation_id: str
+
+    def __post_init__(self) -> None:
+        candidates = tuple(self.accepted_candidates)
+        suites = tuple(self.hosted_suites)
+        if not self.stable_action_id or not self.repository or not self.campaign_key:
+            raise BatchIntegratorError(
+                "BATCH_REQUEST_IDENTITY_INVALID",
+                "request identity is required",
+            )
+        _require_digest("plan_revision_digest", self.plan_revision_digest)
+        ordered = tuple(
+            sorted(
+                candidates,
+                key=lambda item: (
+                    item.accepted_sequence,
+                    item.ticket_key,
+                    item.candidate_sha,
+                ),
+            )
+        )
+        if candidates != ordered:
+            raise BatchIntegratorError(
+                "BATCH_CANDIDATE_ORDER_INVALID",
+                "accepted_candidates must use canonical queue order",
+            )
+        sequences = tuple(item.accepted_sequence for item in candidates)
+        if len(sequences) != len(set(sequences)):
+            raise BatchIntegratorError(
+                "BATCH_SEQUENCE_DUPLICATE",
+                "accepted_sequence must be unique",
+            )
+        for candidate in candidates:
+            _accepted_candidate_body(candidate)
+            if (
+                candidate.repository != self.repository
+                or candidate.campaign_key != self.campaign_key
+                or candidate.plan_revision_digest != self.plan_revision_digest
+                or candidate.target_branch != self.target.target_branch
+            ):
+                raise BatchIntegratorError(
+                    "BATCH_CANDIDATE_SCOPE_MISMATCH",
+                    "accepted Candidate is outside the request scope",
+                )
+        suite_ids = tuple(suite.suite_id for suite in suites)
+        if not suites or suite_ids != tuple(sorted(set(suite_ids))):
+            raise BatchIntegratorError(
+                "BATCH_HOSTED_SUITE_ORDER_INVALID",
+                "hosted_suites must be non-empty, sorted, and unique",
+            )
+        object.__setattr__(self, "accepted_candidates", candidates)
+        object.__setattr__(self, "hosted_suites", suites)
+
+    def canonical(self) -> dict[str, object]:
+        return {
+            "kind": "batch-delivery-request.v1",
+            "stable_action_id": self.stable_action_id,
+            "repository": self.repository,
+            "campaign_key": self.campaign_key,
+            "plan_revision_digest": self.plan_revision_digest,
+            "target": self.target.canonical(),
+            "accepted_candidates": [
+                _accepted_candidate_body(candidate)
+                for candidate in self.accepted_candidates
+            ],
+            "local_suite": self.local_suite.canonical(),
+            "hosted_suites": [suite.canonical() for suite in self.hosted_suites],
+            "writer_generation": self.writer_generation,
+            "activation_id": self.activation_id,
+        }
+
+    @property
+    def request_digest(self) -> str:
+        return digest_value(self.canonical())
+
+
+@dataclass(frozen=True)
+class BatchDeliveryAction:
+    stable_action_id: str
+    request_digest: str
+    batch_id: str
+    batch_sha: str
+    member_ticket_keys: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _require_digest("request_digest", self.request_digest)
+        _require_digest("batch_id", self.batch_id)
+        _require_object_id("batch_sha", self.batch_sha)
+        object.__setattr__(
+            self,
+            "member_ticket_keys",
+            _require_sorted_unique(
+                "member_ticket_keys", tuple(self.member_ticket_keys)
+            ),
+        )
+
+
+class BatchIntegrator:
+    def __init__(
+        self,
+        *,
+        journal: "BatchDeliveryJournal",
+        git: "GitBatchDriver",
+        local: "LocalSuiteDriver",
+        hosted: "HostedBatchDriver",
+        configuration: BatchIntegratorConfiguration,
+    ) -> None:
+        self.journal = journal
+        self.git = git
+        self.local = local
+        self.hosted = hosted
+        self.configuration = configuration
+        self.formation_calls = 0
+        self._requests: dict[str, BatchDeliveryRequest] = {}
+
+    def prepare(self, request: BatchDeliveryRequest) -> BatchDeliveryAction:
+        self._validate_request(request)
+        self.formation_calls += 1
+        if not request.accepted_candidates:
+            raise BatchIntegratorError("BATCH_EMPTY", "accepted candidate set is empty")
+        batch_id = digest_value(
+            {"kind": "batch-id.v1", "request_digest": request.request_digest}
+        )
+        return BatchDeliveryAction(
+            stable_action_id=request.stable_action_id,
+            request_digest=request.request_digest,
+            batch_id=batch_id,
+            batch_sha=request.accepted_candidates[0].candidate_sha,
+            member_ticket_keys=tuple(
+                item.ticket_key for item in request.accepted_candidates
+            ),
+        )
+
+    def readback(
+        self, action: BatchDeliveryAction
+    ) -> "BatchDeliveryObservation | None":
+        return None
+
+    def execute(self, action: BatchDeliveryAction) -> "BatchDeliveryObservation":
+        existing = self.readback(action)
+        if existing is not None:
+            return existing
+        raise BatchIntegratorError(
+            "BATCH_EXECUTION_NOT_READY",
+            "delivery execution is installed by the later action-loop task",
+        )
+
+    @staticmethod
+    def _validate_request(request: BatchDeliveryRequest) -> None:
+        if request.target.repository != request.repository:
+            raise BatchIntegratorError(
+                "BATCH_TARGET_REPOSITORY_MISMATCH",
+                "request and target repository differ",
+            )
