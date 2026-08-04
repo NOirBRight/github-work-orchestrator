@@ -10,7 +10,11 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scr
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from gwo_v8.batch_integrator import BatchIntegratorError
+from gwo_v8.batch_integrator import (
+    BatchIntegrator,
+    BatchIntegratorConfiguration,
+    BatchIntegratorError,
+)
 from v8_batch_test_support import (
     make_accepted_candidate_receipt,
     make_batch_request,
@@ -62,3 +66,23 @@ def test_batch_request_digest_changes_when_member_set_or_target_changes():
 
     assert request.request_digest != changed_members.request_digest
     assert request.request_digest != changed_target.request_digest
+
+
+def test_batch_action_preserves_oldest_first_member_order():
+    request = make_batch_request(
+        accepted_candidates=(
+            make_accepted_candidate_receipt(ticket_key="issue:z", accepted_sequence=1),
+            make_accepted_candidate_receipt(ticket_key="issue:a", accepted_sequence=2),
+        )
+    )
+    integrator = BatchIntegrator(
+        journal=object(),
+        git=object(),
+        local=object(),
+        hosted=object(),
+        configuration=BatchIntegratorConfiguration(),
+    )
+
+    action = integrator.prepare(request)
+
+    assert action.member_ticket_keys == ("issue:z", "issue:a")

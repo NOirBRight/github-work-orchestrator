@@ -302,13 +302,17 @@ class BatchDeliveryAction:
         _require_digest("request_digest", self.request_digest)
         _require_digest("batch_id", self.batch_id)
         _require_object_id("batch_sha", self.batch_sha)
-        object.__setattr__(
-            self,
-            "member_ticket_keys",
-            _require_sorted_unique(
-                "member_ticket_keys", tuple(self.member_ticket_keys)
-            ),
-        )
+        member_ticket_keys = tuple(self.member_ticket_keys)
+        if (
+            not member_ticket_keys
+            or any(not isinstance(key, str) or not key for key in member_ticket_keys)
+            or len(set(member_ticket_keys)) != len(member_ticket_keys)
+        ):
+            raise BatchIntegratorError(
+                "BATCH_MEMBER_ORDER_INVALID",
+                "member_ticket_keys must be non-empty and unique",
+            )
+        object.__setattr__(self, "member_ticket_keys", member_ticket_keys)
 
 
 class BatchIntegrator:
