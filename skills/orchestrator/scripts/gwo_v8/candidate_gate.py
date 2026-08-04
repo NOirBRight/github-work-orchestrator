@@ -2719,6 +2719,14 @@ class CandidateReadbackPort(Protocol):
     ) -> CandidateReadback: ...
 
 
+class CandidateDiffArtifactStore(Protocol):
+    def put(self, record: CandidateDiffRecordV1) -> str:
+        pass
+
+    def read(self, digest: str) -> CandidateDiffRecordV1:
+        pass
+
+
 class FormalReviewer(Protocol):
     """A read-only Formal Review action over one immutable request."""
 
@@ -2812,6 +2820,7 @@ class CandidateGate:
         check_runner: CandidateCheckRunner | None = None,
         assurance_policy: AssurancePolicy | None = None,
         acceptance_facts: CandidateAcceptanceFacts | None = None,
+        diff_artifacts: CandidateDiffArtifactStore | None = None,
     ) -> None:
         if not callable(getattr(invalidation_reporter, "report_plan_invalidation", None)):
             raise CandidateGateError(
@@ -2860,6 +2869,14 @@ class CandidateGate:
                 "CANDIDATE_GATE_ACCEPTANCE_INVALID",
                 "Candidate acceptance facts are not exact",
             )
+        if diff_artifacts is not None and (
+            not callable(getattr(diff_artifacts, "put", None))
+            or not callable(getattr(diff_artifacts, "read", None))
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_ADAPTER_INVALID",
+                "Candidate diff Artifact Store lacks put/read",
+            )
         self._invalidation_reporter = invalidation_reporter
         self._candidate_reader = candidate_reader
         self._formal_reviewer = formal_reviewer
@@ -2867,6 +2884,31 @@ class CandidateGate:
         self._check_runner = check_runner
         self._assurance_policy = assurance_policy
         self._acceptance_facts = acceptance_facts
+        self._diff_artifacts = diff_artifacts
+
+    def _store_candidate_diff(
+        self,
+        record: CandidateDiffRecordV1,
+    ) -> CandidateDiffRecordV1:
+        store = self._diff_artifacts
+        if store is None:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_DIFF_ARTIFACT_INVALID",
+                "Candidate diff Artifact Store is not configured",
+            )
+        stored_digest = store.put(record)
+        if stored_digest != record.digest:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_DIFF_ARTIFACT_INVALID",
+                "Candidate diff Artifact Store changed the record digest",
+            )
+        persisted = store.read(stored_digest)
+        if type(persisted) is not CandidateDiffRecordV1 or persisted != record:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_DIFF_ARTIFACT_INVALID",
+                "Candidate diff Artifact readback changed the complete record",
+            )
+        return persisted
 
     def gate_candidate(
         self,
@@ -2894,6 +2936,13 @@ class CandidateGate:
             raise CandidateGateError(
                 "CANDIDATE_GATE_EVIDENCE_STALE",
                 "authoritative Candidate belongs to another repository",
+            )
+        if self._diff_artifacts is not None:
+            stored_record = self._store_candidate_diff(readback.diff_record)
+            readback = replace(
+                readback,
+                diff_record=stored_record,
+                readback_digest=None,
             )
         receipt = CandidateReceipt.from_readback(
             parent=parent,
@@ -2951,6 +3000,37 @@ class CandidateGate:
             assurance_requirement=requirement,
             accepted_candidate_receipt=accepted,
         )
+
+    def reuse_formal_review(
+        self,
+        *,
+        subject: ReviewSubject,
+        result: CandidateGateResult,
+    ) -> CandidateGateResult:
+        store = self._diff_artifacts
+        if store is None:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_DIFF_ARTIFACT_INVALID",
+                "Candidate diff Artifact Store is not configured",
+            )
+        record = store.read(subject.diff_record_digest)
+        if type(record) is not CandidateDiffRecordV1 or record.digest != subject.diff_record_digest:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_DIFF_ARTIFACT_INVALID",
+                "stored Candidate diff is missing or digest-invalid",
+            )
+        if result.review_subject is None or result.review_subject.digest != subject.digest:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REVIEW_REUSE_INVALID",
+                "Review reuse Subject identity changed",
+            )
+        if result.candidate_diff_record != record:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REVIEW_REUSE_INVALID",
+                "Review result is not bound to the stored complete diff",
+            )
+        self._validate_read_only_port(self._formal_reviewer, "Formal Reviewer")
+        return result
 
     def _make_accepted_candidate_receipt(
         self,
@@ -3943,6 +4023,7 @@ __all__ = [
     "CandidateCheckRunner",
     "CandidateDiffEntryV1",
     "CandidateDiffRecordV1",
+    "CandidateDiffArtifactStore",
     "CandidateGate",
     "CandidateGateError",
     "CandidateGateParent",
