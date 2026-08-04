@@ -9,3 +9,5 @@ Task 7: complete (commits 9efd982..8fb8228, fix round 1; scoped re-review approv
 Task 8: complete (commit 76b11e6, review approved)
 Task 9: complete (commits 992dfdb..b49fee7, fix rounds 1–2; scoped re-review approved; focused 243 passed, 1 warning)
 Task 10: complete (commit 6ab11b3; contract RED/GREEN and repository gates passed)
+Task 11: complete (local exact-head validation 1712 passed, 2 warnings; Beta2 HOLD because origin/main is a48c7d6, #113–#117 are OPEN, #137 is CLOSED, and no merge/CI admission readback exists)
+Batch Task 1: complete (commits 98d36cb..590f45a, fix rounds 1–2; scoped re-review approved; focused/package 20 passed)
