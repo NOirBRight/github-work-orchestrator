@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal
 
@@ -204,6 +205,13 @@ class BatchIntegratorConfiguration:
 
     def member_limit_for(self, repository: str) -> int:
         return self.repository_member_limits.get(repository, self.host_member_limit)
+
+
+class CompatibilityDecision(StrEnum):
+    COMPATIBLE = "compatible"
+    SINGLETON_REQUIRED = "singleton_required"
+    INCOMPATIBLE = "incompatible"
+    CLEAN_BASE_ADVANCE = "clean_base_advance"
 
 
 @dataclass(frozen=True)
@@ -636,6 +644,103 @@ class TargetDeltaReadback:
                 "target delta readback is not authoritative",
             )
         return body
+
+
+def form_batch_members(
+    candidates: tuple[AcceptedCandidateReceipt, ...],
+    target: BatchTarget,
+    *,
+    member_limit: int,
+) -> tuple[AcceptedCandidateReceipt, ...]:
+    if not 1 <= member_limit <= 4:
+        raise BatchIntegratorError(
+            "BATCH_MEMBER_LIMIT_INVALID",
+            "member limit must be between one and four",
+        )
+    ordered = tuple(
+        sorted(
+            candidates,
+            key=lambda item: (
+                item.accepted_sequence,
+                item.ticket_key,
+                item.candidate_sha,
+            ),
+        )
+    )
+    sequences = [item.accepted_sequence for item in ordered]
+    if len(sequences) != len(set(sequences)):
+        raise BatchIntegratorError(
+            "BATCH_SEQUENCE_DUPLICATE",
+            "accepted_sequence must be unique",
+        )
+    if not ordered:
+        return ()
+    seed = ordered[0]
+    if seed.repository != target.repository or seed.target_branch != target.target_branch:
+        return ()
+    selected: list[AcceptedCandidateReceipt] = [seed]
+    if _requires_singleton(seed):
+        return (seed,)
+    for candidate in ordered[1:]:
+        if len(selected) == member_limit:
+            break
+        if (
+            candidate.repository != target.repository
+            or candidate.target_branch != target.target_branch
+            or candidate.campaign_key != seed.campaign_key
+            or candidate.plan_revision_digest != seed.plan_revision_digest
+        ):
+            continue
+        decision = _pairwise_compatibility(candidate, selected, target)
+        if decision in {
+            CompatibilityDecision.COMPATIBLE,
+            CompatibilityDecision.CLEAN_BASE_ADVANCE,
+        }:
+            selected.append(candidate)
+    return tuple(selected)
+
+
+def _requires_singleton(candidate: AcceptedCandidateReceipt) -> bool:
+    return candidate.assurance == "strict" or candidate.gitlink_change or any(
+        key.requires_singleton for key in candidate.interaction_keys
+    )
+
+
+def _pairwise_compatibility(
+    candidate: AcceptedCandidateReceipt,
+    selected: list[AcceptedCandidateReceipt],
+    target: BatchTarget,
+) -> CompatibilityDecision:
+    if _requires_singleton(candidate):
+        return CompatibilityDecision.SINGLETON_REQUIRED
+    for member in selected:
+        if (
+            candidate.authority_subtree_digest != member.authority_subtree_digest
+            or candidate.policy_witness_digest != member.policy_witness_digest
+            or candidate.delivery_identity_digest != member.delivery_identity_digest
+            or candidate.assurance_requirement_digest
+            != member.assurance_requirement_digest
+            or candidate.check_environment_digest != member.check_environment_digest
+            or candidate.protected_surfaces != member.protected_surfaces
+        ):
+            return CompatibilityDecision.INCOMPATIBLE
+        if (
+            candidate.base_sha != member.base_sha
+            or candidate.base_tree_oid != member.base_tree_oid
+        ):
+            return CompatibilityDecision.CLEAN_BASE_ADVANCE
+        for left in candidate.interaction_keys:
+            for right in member.interaction_keys:
+                if (
+                    left.classification == InteractionClassification.ORDINARY
+                    and right.classification == InteractionClassification.ORDINARY
+                    and left.namespace == right.namespace
+                    and left.value == right.value
+                ):
+                    return CompatibilityDecision.INCOMPATIBLE
+    if candidate.base_sha != target.target_head_sha:
+        return CompatibilityDecision.CLEAN_BASE_ADVANCE
+    return CompatibilityDecision.COMPATIBLE
 
 
 class BatchIntegrator:

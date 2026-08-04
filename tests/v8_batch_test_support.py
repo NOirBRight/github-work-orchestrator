@@ -94,7 +94,7 @@ def make_accepted_candidate_receipt(
             review_subject_digest="5" * 64,
             assurance=assurance,
             assurance_requirement_digest=digest_value(
-                {"assurance": assurance, "ticket_key": ticket_key}
+                {"assurance": assurance}
             ),
             check_environment_digest="6" * 64,
             delivery_identity_digest=delivery_identity_digest,

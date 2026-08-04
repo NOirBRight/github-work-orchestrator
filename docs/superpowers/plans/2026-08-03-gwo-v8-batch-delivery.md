@@ -855,7 +855,7 @@ def make_accepted_candidate_receipt(
         review_subject_digest="5" * 64,
         assurance=assurance,
         assurance_requirement_digest=digest_value(
-            {"assurance": assurance, "ticket_key": ticket_key}
+            {"assurance": assurance}
         ),
         check_environment_digest="6" * 64,
         delivery_identity_digest=delivery_identity_digest,
@@ -2216,16 +2216,17 @@ def advance_action(
 statement that sets `state_json`, `phase`, and `version` and has the exact
 guard `WHERE stable_action_id=? AND phase=? AND version=?`; it must require
 exactly one changed row and raise `BATCH_ACTION_CAS_CONFLICT` on zero rows.
-Lease acquisition must use one `BEGIN IMMEDIATE` transaction with an
-`INSERT INTO v8_batch_integration_leases` with an
-`ON CONFLICT(repository) DO UPDATE` clause
-whose update predicate is `holder=?`, and only exact replay may use that
-predicate; a different holder raises `INTEGRATION_LEASE_UNAVAILABLE` without
-changing the stored row. Release must delete only
-`WHERE repository=? AND holder=?`, otherwise raise
-`INTEGRATION_LEASE_OWNER_MISMATCH`. Hosted receipt persistence must allow exact
-replay and reject any changed stable action, Batch SHA, suite, provider check,
-outcome, or observation digest as `DeliveryIdentityMismatch`.
+Lease acquisition must use one `BEGIN IMMEDIATE` transaction. An existing row
+must be read as an exact `IntegrationLeaseReceipt`; only an exact replay of
+the complete receipt may succeed, while any changed holder, writer generation,
+activation, or digest raises `INTEGRATION_LEASE_UNAVAILABLE` without changing
+the stored row. Release must receive the exact lease receipt and delete only
+when repository, holder, writer generation, activation, and lease digest all
+match; otherwise raise `INTEGRATION_LEASE_OWNER_MISMATCH`. Hosted receipt
+persistence must fail closed on the closed outcome union, identity fields,
+SHA/digest formats, and receipt digest, then allow exact replay and reject any
+changed stable action, Batch SHA, suite, provider check, outcome, or
+observation digest as `DeliveryIdentityMismatch`.
 
 `SqliteBatchDeliveryJournal.__init__(store_path, crash_hook=None)` stores the
 hook and calls it only in this concrete persistence boundary:

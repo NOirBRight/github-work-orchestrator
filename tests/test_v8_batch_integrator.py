@@ -20,6 +20,7 @@ from gwo_v8.batch_integrator import (
     DeliveryIdentityMismatch,
     MemberDeliveryObservation,
     TargetDeltaReadback,
+    form_batch_members,
 )
 from gwo_v8.batch_patch_identity import patch_identity_v1, require_clean_base_advance
 from gwo_v8._canonical import digest_value
@@ -30,11 +31,84 @@ from v8_batch_test_support import (
     make_batch_action,
     make_batch_request,
     make_ancestor_readback,
+    make_batch_target,
     make_hosted_result_receipt,
     make_interaction_key,
     make_patch_entry,
     make_target_delta,
 )
+
+
+def test_forms_oldest_pairwise_compatible_candidates_up_to_four_without_waiting():
+    queue = tuple(
+        make_accepted_candidate_receipt(
+            ticket_key=f"issue:{n}", accepted_sequence=n
+        )
+        for n in range(1, 6)
+    )
+    # The ordinary conflict is the exact same ordinary key as issue:1. Other
+    # ordinary keys are independent and must remain pairwise compatible.
+    queue = (
+        queue[0],
+        replace(queue[1], interaction_keys=queue[0].interaction_keys),
+        queue[2],
+        queue[3],
+        queue[4],
+    )
+
+    selected = form_batch_members(queue, make_batch_target(), member_limit=4)
+
+    assert [item.ticket_key for item in selected] == [
+        "issue:1",
+        "issue:3",
+        "issue:4",
+        "issue:5",
+    ]
+
+
+def test_formation_is_same_campaign_and_strict_or_gitlink_is_singleton():
+    seed = make_accepted_candidate_receipt(ticket_key="issue:1")
+    other_campaign = make_accepted_candidate_receipt(
+        ticket_key="issue:2", campaign_key="campaign:b", accepted_sequence=2
+    )
+    strict = make_accepted_candidate_receipt(
+        ticket_key="issue:3", assurance="strict", accepted_sequence=3
+    )
+    gitlink = make_accepted_candidate_receipt(
+        ticket_key="issue:4", gitlink_change=True, accepted_sequence=4
+    )
+
+    assert form_batch_members((seed, other_campaign), make_batch_target(), member_limit=4) == (seed,)
+    assert form_batch_members((seed, strict), make_batch_target(), member_limit=4) == (seed,)
+    assert form_batch_members((strict,), make_batch_target(), member_limit=4) == (strict,)
+    assert form_batch_members((seed, gitlink), make_batch_target(), member_limit=4) == (seed,)
+    assert form_batch_members((gitlink,), make_batch_target(), member_limit=4) == (gitlink,)
+
+
+def test_policy_classified_interaction_key_forces_singleton():
+    protected = make_accepted_candidate_receipt(
+        interaction_keys=(
+            make_interaction_key(
+                "schema:root", classification=InteractionClassification.PROTECTED
+            ),
+        )
+    )
+    ordinary = make_accepted_candidate_receipt(ticket_key="issue:2", accepted_sequence=2)
+
+    assert form_batch_members(
+        (protected, ordinary), make_batch_target(), member_limit=4
+    ) == (protected,)
+
+
+def test_member_limit_rejects_zero_or_more_than_four_and_accepts_repository_override():
+    with pytest.raises(BatchIntegratorError, match="member limit"):
+        BatchIntegratorConfiguration(host_member_limit=0)
+    with pytest.raises(BatchIntegratorError, match="member limit"):
+        BatchIntegratorConfiguration(host_member_limit=5)
+    configuration = BatchIntegratorConfiguration(
+        host_member_limit=4, repository_member_limits={"owner/repo": 2}
+    )
+    assert configuration.member_limit_for("owner/repo") == 2
 
 
 def test_accepted_candidate_receipt_digest_binds_every_delivery_fact():
