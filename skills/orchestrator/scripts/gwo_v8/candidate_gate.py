@@ -2114,7 +2114,7 @@ class FormalReviewer(Protocol):
 
 
 @dataclass(frozen=True)
-class FormalReviewFinding:
+class ReviewFinding:
     """Artifact-backed immutable Formal Review Finding Evidence."""
 
     parent_digest: str
@@ -2193,6 +2193,9 @@ class FormalReviewFinding:
         return {**self._body(), "content_digest": self.digest}
 
 
+FormalReviewFinding = ReviewFinding
+
+
 @dataclass(frozen=True)
 class FormalReviewResult:
     """A complete read-only result returned by the Formal Review port."""
@@ -2241,35 +2244,350 @@ class FormalReviewResult:
         return {**self._body(), "result_digest": self.digest}
 
 
-@dataclass(frozen=True)
+class ReviewFindingDisposition(str, Enum):
+    UNRESOLVED = "unresolved"
+    FIXED = "fixed"
+    ACCEPTED_RISK = "accepted_risk"
+    NOT_REPRODUCED = "not_reproduced"
+    SCOPE_ESCAPED = "scope_escaped"
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewFindingLedgerEntry:
+    finding: ReviewFinding
+    disposition: ReviewFindingDisposition
+    disposition_reason: str | None = None
+    disposition_evidence_digest: str | None = None
+    entry_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.finding) is not ReviewFinding or type(
+            self.disposition
+        ) is not ReviewFindingDisposition:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                "Finding ledger entry is not exactly typed",
+            )
+        if self.disposition is ReviewFindingDisposition.UNRESOLVED:
+            if (
+                self.disposition_reason is not None
+                or self.disposition_evidence_digest is not None
+            ):
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                    "unresolved Finding carries a completed disposition",
+                )
+        else:
+            _require_text(self.disposition_reason, "disposition_reason")
+            if self.disposition_evidence_digest is not None:
+                _require_digest(
+                    self.disposition_evidence_digest,
+                    "disposition_evidence_digest",
+                )
+        expected = digest_value(self._body())
+        if self.entry_digest is None:
+            object.__setattr__(self, "entry_digest", expected)
+        else:
+            _validate_stored_digest(
+                self.entry_digest,
+                self._body(),
+                code="CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                detail="Finding ledger entry digest changed",
+            )
+
+    def _body(self) -> dict[str, object]:
+        return {
+            "kind": "review_finding_ledger_entry.v1",
+            "finding": self.finding.canonical(),
+            "disposition": self.disposition.value,
+            "disposition_reason": self.disposition_reason,
+            "disposition_evidence_digest": self.disposition_evidence_digest,
+        }
+
+    @property
+    def digest(self) -> str:
+        assert self.entry_digest is not None
+        return self.entry_digest
+
+    def canonical(self) -> dict[str, object]:
+        return {**self._body(), "entry_digest": self.digest}
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewFindingLedger:
+    entries: tuple[ReviewFindingLedgerEntry, ...]
+    ledger_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.entries) is not tuple or any(
+            type(entry) is not ReviewFindingLedgerEntry for entry in self.entries
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                "Finding ledger entries are not an exact immutable tuple",
+            )
+        finding_ids = tuple(entry.finding.finding_id for entry in self.entries)
+        if finding_ids != tuple(sorted(set(finding_ids))):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                "Finding ledger IDs are not sorted and unique",
+            )
+        expected = digest_value(self._body())
+        if self.ledger_digest is None:
+            object.__setattr__(self, "ledger_digest", expected)
+        else:
+            _validate_stored_digest(
+                self.ledger_digest,
+                self._body(),
+                code="CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                detail="Finding ledger digest changed",
+            )
+
+    @classmethod
+    def from_review_result(
+        cls,
+        result: FormalReviewResult,
+    ) -> "ReviewFindingLedger":
+        return cls(
+            entries=tuple(
+                ReviewFindingLedgerEntry(
+                    finding=finding,
+                    disposition=ReviewFindingDisposition.UNRESOLVED,
+                )
+                for finding in sorted(result.findings, key=lambda item: item.finding_id)
+            )
+        )
+
+    def with_disposition(
+        self,
+        *,
+        finding_id: str,
+        disposition: ReviewFindingDisposition,
+        reason: str,
+        evidence_digest: str | None = None,
+    ) -> "ReviewFindingLedger":
+        if finding_id not in {entry.finding.finding_id for entry in self.entries}:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                "disposition names a Finding absent from the ledger",
+            )
+        return ReviewFindingLedger(
+            entries=tuple(
+                ReviewFindingLedgerEntry(
+                    finding=entry.finding,
+                    disposition=disposition,
+                    disposition_reason=reason,
+                    disposition_evidence_digest=evidence_digest,
+                )
+                if entry.finding.finding_id == finding_id
+                else entry
+                for entry in self.entries
+            )
+        )
+
+    @property
+    def is_complete(self) -> bool:
+        return all(
+            entry.disposition is not ReviewFindingDisposition.UNRESOLVED
+            for entry in self.entries
+        )
+
+    def _body(self) -> dict[str, object]:
+        return {
+            "kind": "review_finding_ledger.v1",
+            "entries": [entry.canonical() for entry in self.entries],
+        }
+
+    @property
+    def digest(self) -> str:
+        assert self.ledger_digest is not None
+        return self.ledger_digest
+
+    def canonical(self) -> dict[str, object]:
+        return {**self._body(), "ledger_digest": self.digest}
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class RepairPacket:
-    """The bounded repair scope produced only for ordinary Review Findings."""
+    """The complete bounded repair contract produced by CandidateGate."""
 
     parent_digest: str
     rejected_candidate_digest: str
+    candidate_receipt: CandidateReceipt | None
     prior_review_subject_digest: str
-    finding_digests: tuple[str, ...]
-    allowed_paths: tuple[str, ...]
-    required_effects: tuple[str, ...] = ()
+    assurance_requirement_digest: str | None
+    finding_ledger: ReviewFindingLedger | None
+    required_disposition_ids: tuple[str, ...]
+    allowed_path_tokens: tuple[str, ...]
+    required_check_ids: tuple[str, ...]
+    protocol_version: str
+    repair_instructions: tuple[str, ...]
+    required_effects: tuple[str, ...]
     packet_digest: str | None = None
+    finding_digests: tuple[str, ...] | None = None
+    allowed_paths: tuple[str, ...] | None = None
 
-    def __post_init__(self) -> None:
-        for value, label in (
-            (self.parent_digest, "parent_digest"),
-            (self.rejected_candidate_digest, "rejected_candidate_digest"),
-            (self.prior_review_subject_digest, "prior_review_subject_digest"),
+    def __init__(
+        self,
+        parent_digest: str,
+        rejected_candidate_digest: str,
+        prior_review_subject_digest: str,
+        finding_digests: tuple[str, ...] | None = None,
+        allowed_paths: tuple[str, ...] | None = None,
+        required_effects: tuple[str, ...] = (),
+        *,
+        candidate_receipt: CandidateReceipt | None = None,
+        assurance_requirement_digest: str | None = None,
+        finding_ledger: ReviewFindingLedger | None = None,
+        required_disposition_ids: tuple[str, ...] = (),
+        allowed_path_tokens: tuple[str, ...] | None = None,
+        required_check_ids: tuple[str, ...] = (),
+        protocol_version: str = "gwo.formal-review.v1",
+        repair_instructions: tuple[str, ...] = (),
+        packet_digest: str | None = None,
+    ) -> None:
+        _require_digest(parent_digest, "parent_digest")
+        _require_digest(rejected_candidate_digest, "rejected_candidate_digest")
+        _require_digest(
+            prior_review_subject_digest,
+            "prior_review_subject_digest",
+        )
+        _require_text_tuple(required_effects, "required_effects")
+        object.__setattr__(self, "parent_digest", parent_digest)
+        object.__setattr__(self, "rejected_candidate_digest", rejected_candidate_digest)
+        object.__setattr__(
+            self,
+            "prior_review_subject_digest",
+            prior_review_subject_digest,
+        )
+
+        complete = (
+            candidate_receipt is not None
+            or assurance_requirement_digest is not None
+            or finding_ledger is not None
+            or bool(required_disposition_ids)
+            or allowed_path_tokens is not None
+            or bool(required_check_ids)
+            or bool(repair_instructions)
+        )
+        if not complete:
+            _require_text_tuple(finding_digests, "finding_digests", allow_empty=False)
+            assert finding_digests is not None
+            for digest in finding_digests:
+                _require_digest(digest, "finding_digest")
+            legacy_paths = allowed_path_tokens
+            if legacy_paths is None:
+                legacy_paths = allowed_paths
+            _require_text_tuple(legacy_paths, "allowed_paths")
+            assert legacy_paths is not None
+            if allowed_paths is not None and tuple(allowed_paths) != tuple(legacy_paths):
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                    "Repair Packet allowed path aliases differ",
+                )
+            object.__setattr__(self, "candidate_receipt", None)
+            object.__setattr__(self, "assurance_requirement_digest", None)
+            object.__setattr__(self, "finding_ledger", None)
+            object.__setattr__(self, "required_disposition_ids", ())
+            object.__setattr__(self, "allowed_path_tokens", tuple(legacy_paths))
+            object.__setattr__(self, "required_check_ids", ())
+            object.__setattr__(self, "protocol_version", protocol_version)
+            object.__setattr__(self, "repair_instructions", ())
+            object.__setattr__(self, "required_effects", tuple(required_effects))
+            object.__setattr__(self, "finding_digests", tuple(finding_digests))
+            object.__setattr__(self, "allowed_paths", tuple(legacy_paths))
+            object.__setattr__(self, "packet_digest", packet_digest)
+            expected = _body_digest(self._body())
+            if packet_digest is None:
+                object.__setattr__(self, "packet_digest", expected)
+            else:
+                _validate_stored_digest(self.packet_digest, self._body())
+            return
+
+        if type(candidate_receipt) is not CandidateReceipt:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet CandidateReceipt is not exact",
+            )
+        _require_digest(
+            assurance_requirement_digest,
+            "assurance_requirement_digest",
+        )
+        if type(finding_ledger) is not ReviewFindingLedger:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet Finding ledger is not exact",
+            )
+        expected_ids = tuple(
+            entry.finding.finding_id for entry in finding_ledger.entries
+        )
+        if required_disposition_ids != expected_ids:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet disposition IDs do not cover the complete ledger",
+            )
+        if allowed_path_tokens is None:
+            allowed_path_tokens = allowed_paths
+        _require_text_tuple(allowed_path_tokens, "allowed_path_tokens")
+        assert allowed_path_tokens is not None
+        if allowed_paths is not None and tuple(allowed_paths) != tuple(allowed_path_tokens):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet allowed path aliases differ",
+            )
+        for value, field_name, allow_empty in (
+            (allowed_path_tokens, "allowed_path_tokens", True),
+            (required_check_ids, "required_check_ids", False),
+            (repair_instructions, "repair_instructions", False),
+            (required_effects, "required_effects", True),
         ):
-            _require_digest(value, label)
-        _require_text_tuple(self.finding_digests, "finding_digests", allow_empty=False)
-        for digest in self.finding_digests:
-            _require_digest(digest, "finding_digest")
-        _require_text_tuple(self.allowed_paths, "allowed_paths")
-        _require_text_tuple(self.required_effects, "required_effects")
+            _require_text_tuple(value, field_name, allow_empty=allow_empty)
+            if value != tuple(sorted(set(value))):
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                    f"{field_name} is not sorted and unique",
+                )
+        _require_text(protocol_version, "protocol_version")
+        if protocol_version != "gwo.formal-review.v1":
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet protocol version changed",
+            )
+        derived_finding_digests = tuple(
+            entry.finding.digest for entry in finding_ledger.entries
+        )
+        if finding_digests is not None and tuple(finding_digests) != derived_finding_digests:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet Finding digest alias differs",
+            )
+        if candidate_receipt.parent_digest != parent_digest:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet CandidateReceipt belongs to another parent",
+            )
+        object.__setattr__(self, "candidate_receipt", candidate_receipt)
+        object.__setattr__(self, "assurance_requirement_digest", assurance_requirement_digest)
+        object.__setattr__(self, "finding_ledger", finding_ledger)
+        object.__setattr__(self, "required_disposition_ids", tuple(required_disposition_ids))
+        object.__setattr__(self, "allowed_path_tokens", tuple(allowed_path_tokens))
+        object.__setattr__(self, "required_check_ids", tuple(required_check_ids))
+        object.__setattr__(self, "protocol_version", protocol_version)
+        object.__setattr__(self, "repair_instructions", tuple(repair_instructions))
+        object.__setattr__(self, "required_effects", tuple(required_effects))
+        object.__setattr__(self, "finding_digests", derived_finding_digests)
+        object.__setattr__(self, "allowed_paths", tuple(allowed_path_tokens))
+        object.__setattr__(self, "packet_digest", packet_digest)
         expected = _body_digest(self._body())
-        if self.packet_digest is None:
+        if packet_digest is None:
             object.__setattr__(self, "packet_digest", expected)
         else:
-            _validate_stored_digest(self.packet_digest, self._body())
+            _validate_stored_digest(
+                self.packet_digest,
+                self._body(),
+                code="CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                detail="Repair Packet digest changed",
+            )
 
     @classmethod
     def from_findings(
@@ -2298,14 +2616,95 @@ class RepairPacket:
             required_effects=effects,
         )
 
+    @classmethod
+    def from_review(
+        cls,
+        *,
+        parent: CandidateGateParent,
+        candidate_receipt: CandidateReceipt,
+        subject: ReviewSubject,
+        result: FormalReviewResult,
+        allowed_path_tokens: tuple[str, ...],
+        required_check_ids: tuple[str, ...],
+        repair_instructions: tuple[str, ...],
+    ) -> "RepairPacket":
+        if (
+            result.subject_digest != subject.digest
+            or subject.candidate_receipt_digest != candidate_receipt.digest
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Review result, Subject, and CandidateReceipt are not bound",
+            )
+        ledger = ReviewFindingLedger.from_review_result(result)
+        return cls(
+            parent_digest=parent.digest,
+            rejected_candidate_digest=subject.candidate_digest,
+            candidate_receipt=candidate_receipt,
+            prior_review_subject_digest=subject.digest,
+            assurance_requirement_digest=subject.assurance_requirement_digest,
+            finding_ledger=ledger,
+            required_disposition_ids=tuple(
+                entry.finding.finding_id for entry in ledger.entries
+            ),
+            allowed_path_tokens=tuple(sorted(set(allowed_path_tokens))),
+            required_check_ids=tuple(sorted(set(required_check_ids))),
+            protocol_version=subject.protocol_version,
+            repair_instructions=tuple(sorted(set(repair_instructions))),
+            required_effects=tuple(
+                sorted(
+                    {
+                        effect
+                        for entry in ledger.entries
+                        for effect in entry.finding.required_effects
+                    }
+                )
+            ),
+        )
+
+    def with_ledger(
+        self,
+        entries: tuple[ReviewFindingLedgerEntry, ...],
+    ) -> "RepairPacket":
+        if self.finding_ledger is None:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "legacy Repair Packet has no complete Finding ledger",
+            )
+        ledger = ReviewFindingLedger(entries=entries)
+        if tuple(entry.finding.finding_id for entry in ledger.entries) != (
+            self.required_disposition_ids
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "replacement ledger truncates required Findings",
+            )
+        return replace(self, finding_ledger=ledger, packet_digest=None)
+
     def _body(self) -> dict[str, Any]:
+        if self.finding_ledger is None:
+            return {
+                "kind": "repair_packet.v1",
+                "parent_digest": self.parent_digest,
+                "rejected_candidate_digest": self.rejected_candidate_digest,
+                "prior_review_subject_digest": self.prior_review_subject_digest,
+                "finding_digests": list(self.finding_digests or ()),
+                "allowed_paths": list(self.allowed_paths or ()),
+                "required_effects": list(self.required_effects),
+            }
         return {
             "kind": "repair_packet.v1",
             "parent_digest": self.parent_digest,
             "rejected_candidate_digest": self.rejected_candidate_digest,
+            "candidate_receipt": self.candidate_receipt.canonical(),
             "prior_review_subject_digest": self.prior_review_subject_digest,
-            "finding_digests": list(self.finding_digests),
-            "allowed_paths": list(self.allowed_paths),
+            "assurance_requirement_digest": self.assurance_requirement_digest,
+            "finding_ledger": self.finding_ledger.canonical(),
+            "required_disposition_ids": list(self.required_disposition_ids),
+            "allowed_path_tokens": list(self.allowed_path_tokens),
+            "required_check_ids": list(self.required_check_ids),
+            "protocol_version": self.protocol_version,
+            "repair_instructions": list(self.repair_instructions),
             "required_effects": list(self.required_effects),
         }
 
@@ -2316,6 +2715,15 @@ class RepairPacket:
 
     def canonical(self) -> dict[str, Any]:
         return {**self._body(), "packet_digest": self.digest}
+
+    @property
+    def candidate_receipt_digest(self) -> str:
+        if self.candidate_receipt is None:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "legacy Repair Packet has no CandidateReceipt",
+            )
+        return self.candidate_receipt.digest
 
 
 @dataclass(frozen=True)
@@ -3418,23 +3826,34 @@ class CandidateGate:
         hard_findings = tuple(
             finding for finding in findings if finding.severity == "hard"
         )
+        ledger = ReviewFindingLedger.from_review_result(review_result)
         if hard_findings:
-            packet = RepairPacket.from_findings(
-                parent,
-                audit.candidate,
-                subject,
-                hard_findings,
+            packet = RepairPacket.from_review(
+                parent=parent,
+                candidate_receipt=receipt,
+                subject=subject,
+                result=review_result,
+                allowed_path_tokens=readback.diff_record.changed_path_tokens,
+                required_check_ids=requirement.required_check_ids,
+                repair_instructions=tuple(
+                    sorted(
+                        f"{finding.finding_id}:{finding.message}"
+                        for finding in findings
+                    )
+                ),
             )
             return CandidateGateResult(
                 status=CandidateGateStatus.REPAIR_REQUIRED,
                 evidence=(candidate_evidence, *findings),
                 repair_packet=packet,
                 review_subject=subject,
+                review_finding_ledger_digest=ledger.digest,
             )
         return CandidateGateResult(
             status=CandidateGateStatus.REVIEW_ACCEPTED,
             evidence=(candidate_evidence, *findings),
             review_subject=subject,
+            review_finding_ledger_digest=ledger.digest,
         )
 
     def audit_candidate(
@@ -3500,6 +3919,7 @@ class CandidateGate:
         hard_findings = tuple(
             finding for finding in findings if finding.severity == "hard"
         )
+        ledger = ReviewFindingLedger.from_review_result(review_result)
         if hard_findings:
             packet = RepairPacket.from_findings(
                 parent,
@@ -3512,11 +3932,13 @@ class CandidateGate:
                 evidence=(candidate_evidence, *finding_evidence),
                 repair_packet=packet,
                 review_subject=request,
+                review_finding_ledger_digest=ledger.digest,
             )
         return CandidateGateResult(
             status=CandidateGateStatus.REVIEW_ACCEPTED,
             evidence=(candidate_evidence, *finding_evidence),
             review_subject=request,
+            review_finding_ledger_digest=ledger.digest,
         )
 
     def _read_authoritative_candidate(
@@ -4207,9 +4629,13 @@ __all__ = [
     "record_has_gitlink_change",
     "DeterministicAuditFailure",
     "FormalReviewer",
+    "ReviewFinding",
     "FormalReviewFinding",
     "FormalReviewRequest",
     "FormalReviewResult",
+    "ReviewFindingDisposition",
+    "ReviewFindingLedgerEntry",
+    "ReviewFindingLedger",
     "ReviewAction",
     "ReviewSubject",
     "PlanInvalidationEvidence",
