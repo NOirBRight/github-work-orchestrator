@@ -20,7 +20,7 @@ This document supersedes `2026-08-03-gwo-v8-ga-delivery-program.md` for program 
 - Use at most five subagents. Every spawned subagent uses `gpt-5.6-luna` with `max` reasoning.
 - Parallel workers receive disjoint write sets. Package manifests, `execution_kernel.py`, `production_host.py`, exports, transition code, and integration refs are serial hotspots.
 - Never commit or push directly to `main`; never force-push; never use `--no-verify`.
-- No branch or remote-tracking ref is deleted during Workspace Convergence. The first cleanup round removes worktrees only.
+- No branch or remote-tracking ref is deleted during Workspace Convergence. `refs/heads/main` and `refs/remotes/origin/main` may only fast-forward (with `origin/main` created only by the required fetch), and the captured GA remote ref may be created or advanced only to `$ProtectedGaSha`; no other ref may move or be added. The first cleanup round removes worktrees only.
 - Never use wildcard deletion, `git clean`, automatic Paseo daemon restart, manual Paseo registry edits, or manual `.git/worktrees` edits.
 - Beta1 and Beta2 admit no production work. Beta3 performs guarded rehearsal only. The default writer changes only after the accepted root Canary.
 - Release tags are annotated and immutable. Existing tags or Releases are verified, never moved, deleted, or recreated.
@@ -114,6 +114,8 @@ Use these exact source boundaries:
 | `codex/gwo-v8-issue-114-candidategate` | `657bf23` | authoritative Candidate and Standard assurance |
 | `codex/gwo-v8-issue-115-review-repair` | `a0f6976` | Strict Review, Finding ledger, bounded Repair, ADR/docs |
 | `codex/gwo-v8-issue-116-batch-wip` | `e58c596` | #116 Batch Tasks 1-5; remains Draft and incomplete |
+
+For `codex/gwo-v8-beta1`, resolve the locally available commit object `ddc1785^{commit}` and prove it is an ancestor of the branch head. Inspect every commit after that boundary, not just the two plan blobs: only the two 2026-08-04 plan paths, `docs/releases/gwo-v8-workspace-convergence.md`, `docs/releases/gwo-v8-release-train.md`, and `tests/test_orchestrator_package.py` may be touched for the Phase 1 receipt slice. If the boundary object is unavailable or any other path appears, stop rather than assuming an unavailable ref or accepting a post-Beta1 implementation commit.
 
 - [ ] Create each branch at its exact historical boundary; do not rewrite `codex/gwo-v8-ga-plan`.
 - [ ] Merge the updated predecessor branch into each successor with a normal merge commit so the old reviewed SHAs remain traceable.
@@ -229,7 +231,7 @@ Expected: Lean V8 becomes the default only for new Campaigns; existing durable r
 
 | Gate | Required proof |
 | --- | --- |
-| Workspace Convergence | two worktrees, 48 roots absent, archives verified, all refs retained, remote plan head protected with `e58c596` as ancestor |
+| Workspace Convergence | two worktrees, 48 roots absent, archives and content hashes verified, fixed green stdout hashes asserted, all refs retained with only the documented main/GA movements, remote plan head protected with `e58c596` as ancestor, receipt bound to local manifest/bundles/readback |
 | Every code PR | focused pytest, full pytest, quick validation, sync check, diff check, two independent reviews, hosted CI, merge/main readback |
 | Beta1 | convergence receipt, metadata merge, exact main CI, owner-approved tracker/milestones, immutable tag/Release |
 | Beta2 | #113-#117 closed, #137 revalidated, Production V3 isolated E2E, no writer cutover |

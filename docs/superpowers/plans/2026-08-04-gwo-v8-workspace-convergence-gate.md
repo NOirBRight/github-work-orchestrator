@@ -17,7 +17,11 @@
 - Preserve four selected green run triplets and a complete inventory; remove all 48 approved external test roots.
 - Five audited stale dirty worktrees may be force-removed only after their binary patch, untracked ZIP, ignored inventory, and hashes verify.
 - The root checkout's four untracked files may be removed only after their ZIP and hashes verify.
+- No pre-clean Git ref may be deleted or moved unexpectedly: `refs/heads/main` and `refs/remotes/origin/main` may fast-forward (with `origin/main` created only by the required fetch), and the captured `refs/heads/codex/gwo-v8-ga-plan` may be created or advanced only to `$ProtectedGaSha` (including its local remote-tracking ref); no other ref may move or be added.
 - Use only exact LiteralPath values from this plan. Reject `*`, `?`, `[` and `]` in every deletion input.
+- The four exact inaccessible ignored roots listed in `$InaccessibleIgnoredRoots` are retained-protected evidence, never deletion candidates, and may be inspected only with non-recursive `Test-Path -LiteralPath`/`Get-Item -LiteralPath` metadata reads.
+- If an ignored-file inventory reports permission denial, capture the exact stderr and structured denial inventory before continuing. The only permitted denied paths are the four exact `$InaccessibleIgnoredRoots`; an unexpected denied path, missing expected denial, missing metadata, failed containment/disjointness proof, or failed retained-protected readback stops the gate.
+- No operation may traverse, copy, archive, change ACLs/ownership, enable backup privilege, or delete a retained-protected path. Later deletion commands must exclude the retained-protected inventory exactly.
 - Never use `git clean`, wildcard deletion, `git worktree prune`, cross-shell generated delete commands, `--no-verify`, or force-push.
 - Do not start or restart Paseo. If live Paseo readback is unavailable, ambiguous, or references a target path, stop the Paseo subset and leave the gate on HOLD.
 - Run Git worktree metadata mutations serially. Parallelism is limited to read-only inventory/archive lanes with disjoint archive subdirectories.
@@ -40,8 +44,13 @@
 
 | Output | Responsibility |
 | --- | --- |
-| `D:\Workstation\gwo-convergence-archive\$RunId\pre-clean.bundle` | Complete pre-clean Git ref protection |
+| `D:\gwo-convergence-archive\$RunId\pre-clean.bundle` | Complete pre-clean Git ref protection |
 | `...\inventory\` | Exact refs, worktrees, statuses, test-tree metadata, Paseo/GitHub readbacks |
+| `$ArchiveRoot\inventory\inaccessible-ignored-roots-stderr.txt` | Exact permission-denied stderr/readback from ignored-file inventory |
+| `$ArchiveRoot\inventory\inaccessible-ignored-roots.json` | Structured retained-protected records for the four inaccessible ignored roots |
+| `$ArchiveRoot\inventory\inaccessible-ignored-roots-sha256.json` | SHA-256 of the structured inaccessible-root inventory |
+| `$ArchiveRoot\inventory\inaccessible-ignored-roots-pre-delete.json` | Non-recursive retained-protected existence/metadata readback before later deletion |
+| `$ArchiveRoot\inventory\inaccessible-ignored-roots-final.json` | Non-recursive retained-protected existence/metadata readback after final convergence |
 | `$ArchiveRoot\dirty\$slug\` | Binary patch, status, untracked ZIP, ignored inventory, SHA-256 |
 | `$ArchiveRoot\test-evidence\$runName\` | Four retained green triplets |
 | `...\post-clean.bundle` | Final refs after canonical-main fast-forward and remote branch protection |
@@ -61,11 +70,18 @@ $GaWorktree = 'D:\Workstation\gwo-worktrees\issue-136'
 $ImplementationSha = 'e58c596998df90e65349bdb4b5f25d3d9dc1f7e2'
 $ProtectedGaSha = (git -C $GaWorktree rev-parse HEAD).Trim()
 $RunId = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
-$ArchiveRoot = Join-Path 'D:\Workstation\gwo-convergence-archive' $RunId
+$ArchiveRoot = Join-Path 'D:\gwo-convergence-archive' $RunId
 
 $KeepWorktrees = @(
     'D:\Workstation\github-work-orchestrator',
     'D:\Workstation\gwo-worktrees\issue-136'
+)
+
+$InaccessibleIgnoredRoots = @(
+    'D:\Workstation\github-work-orchestrator\.gwo-worktrees\pytest-109-ef8fbb0b-bf81-41ae-b32b-3ec620501507',
+    'D:\Workstation\github-work-orchestrator\.gwo-worktrees\pytest-112-6fa6f981-79e8-4c9e-92e5-64cf109878d5',
+    'D:\Workstation\github-work-orchestrator\.gwo-worktrees\pytest-112-6fb97834-03c0-49d6-8d03-01258e144e85',
+    'D:\Workstation\github-work-orchestrator\.gwo-worktrees\pytest-112-d0034ae2-3b5d-4dc5-8a18-01d8415ae3df'
 )
 
 $RemoveWorktrees = @(
@@ -243,11 +259,17 @@ git -C $GaWorktree diff --cached --check
 git -C $GaWorktree commit -m 'docs: plan workspace convergence and GA release'
 if ($LASTEXITCODE -ne 0) { throw 'PLAN_COMMIT_FAILED' }
 $ProtectedGaSha = (git -C $GaWorktree rev-parse HEAD).Trim()
+if ($ProtectedGaSha -eq $ImplementationSha) {
+    throw 'PROTECTED_GA_SHA_DID_NOT_ADVANCE'
+}
 git -C $GaWorktree merge-base --is-ancestor $ImplementationSha $ProtectedGaSha
 if ($LASTEXITCODE -ne 0) { throw 'IMPLEMENTATION_BOUNDARY_NOT_ANCESTOR' }
+if (@(git -C $GaWorktree status --porcelain=v1 --untracked-files=all).Count -ne 0) {
+    throw 'PLAN_COMMIT_WORKTREE_NOT_CLEAN'
+}
 ```
 
-Expected: the worktree is clean, `$ProtectedGaSha` differs from `e58c596`, and no implementation file changed.
+Expected: the worktree is clean, `$ProtectedGaSha` differs from `$ImplementationSha`/`e58c596`, and no implementation file changed.
 
 ### Task 1: Freeze the Exact Pre-Clean State
 
@@ -255,6 +277,9 @@ Expected: the worktree is clean, `$ProtectedGaSha` differs from `e58c596`, and n
 - Create outside Git: `$ArchiveRoot\inventory\approved-paths.json`
 - Create outside Git: `$ArchiveRoot\inventory\refs-before.txt`
 - Create outside Git: `$ArchiveRoot\inventory\worktrees-before.txt`
+- Create outside Git: `$ArchiveRoot\inventory\inaccessible-ignored-roots-stderr.txt`
+- Create outside Git: `$ArchiveRoot\inventory\inaccessible-ignored-roots.json`
+- Create outside Git: `$ArchiveRoot\inventory\inaccessible-ignored-roots-sha256.json`
 - Create outside Git: `$ArchiveRoot\pre-clean.bundle`
 
 **Interfaces:**
@@ -281,11 +306,21 @@ Expected: exact SHA/branch and no output from porcelain status.
 
 ```powershell
 if (Test-Path -LiteralPath $ArchiveRoot) { throw "ARCHIVE_ALREADY_EXISTS:$ArchiveRoot" }
-New-Item -ItemType Directory -LiteralPath $ArchiveRoot | Out-Null
+[IO.Directory]::CreateDirectory($ArchiveRoot) | Out-Null
 foreach ($name in 'inventory','dirty','test-evidence') {
-    New-Item -ItemType Directory -LiteralPath (Join-Path $ArchiveRoot $name) | Out-Null
+    [IO.Directory]::CreateDirectory((Join-Path $ArchiveRoot $name)) | Out-Null
 }
 ```
+
+PowerShell 7 does not expose `-LiteralPath` on `New-Item`. These
+`[IO.Directory]::CreateDirectory(...)` calls create only the exact
+`$ArchiveRoot` and `Join-Path $ArchiveRoot $name` directories without
+wildcard expansion. The global literal-path restriction for deletion inputs
+is unchanged and remains mandatory for every later removal command.
+The same PowerShell-7-compatible directory-creation form is used for the
+Task 2 archive/stage/destination directories and the Task 4 evidence
+destination; no directory-creation command relies on
+the unsupported PowerShell 7 `New-Item` literal-path parameter.
 
 - [ ] **Step 3: Assert exact path-set cardinality and uniqueness**
 
@@ -295,16 +330,27 @@ if ($RemoveWorktrees.Count -ne 36) { throw 'REMOVE_WORKTREE_COUNT_INVALID' }
 if ($ForceRemoveWorktrees.Count -ne 5) { throw 'FORCE_WORKTREE_COUNT_INVALID' }
 if ($TestRoots.Count -ne 48) { throw 'TEST_ROOT_COUNT_INVALID' }
 if ($RetainedEvidenceFiles.Count -ne 12) { throw 'EVIDENCE_FILE_COUNT_INVALID' }
+if ($InaccessibleIgnoredRoots.Count -ne 4) { throw 'INACCESSIBLE_IGNORED_ROOT_COUNT_INVALID' }
 
 $allApproved = @($KeepWorktrees + $RemoveWorktrees + $TestRoots)
 $normalized = @($allApproved | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
 if (($normalized | Sort-Object -Unique).Count -ne $normalized.Count) {
     throw 'APPROVED_PATH_DUPLICATE'
 }
-foreach ($path in $normalized) {
+$normalizedInaccessible = @(
+    $InaccessibleIgnoredRoots | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') }
+)
+if (($normalizedInaccessible | Sort-Object -Unique).Count -ne $InaccessibleIgnoredRoots.Count) {
+    throw 'INACCESSIBLE_IGNORED_ROOT_DUPLICATE'
+}
+foreach ($path in @($normalized + $normalizedInaccessible)) {
     if ($path.IndexOfAny([char[]]'*?[]') -ge 0) { throw "WILDCARD_PATH_REJECTED:$path" }
 }
 ```
+
+Normalization is used only for uniqueness and wildcard checks; the original exact
+array values are the values serialized to `approved-paths.json` and used by all
+later gates.
 
 - [ ] **Step 4: Serialize the approved path policy**
 
@@ -331,26 +377,232 @@ $approvedPath = Join-Path $ArchiveRoot 'inventory\approved-paths.json'
 - [ ] **Step 5: Snapshot refs, worktrees, statuses, and disk usage**
 
 ```powershell
+function Invoke-GitCapture {
+    param(
+        [Parameter(Mandatory)] [string] $WorkingDirectory,
+        [Parameter(Mandatory)] [string[]] $Arguments
+    )
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git.exe'
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw "GIT_PROCESS_START_FAILED:$WorkingDirectory" }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    [ordered]@{
+        exit_code = [int]$process.ExitCode
+        stdout = $stdoutTask.GetAwaiter().GetResult()
+        stderr = $stderrTask.GetAwaiter().GetResult()
+    }
+}
+
+function Convert-GitOutputToLines {
+    param([AllowNull()] [string] $Text)
+    if ([string]::IsNullOrEmpty($Text)) { return @() }
+    @($Text -split "`r?`n" | Where-Object { $_ -ne '' })
+}
+
 git -C $Repo for-each-ref --format='%(refname)%09%(objectname)' |
     Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\refs-before.txt') -Encoding utf8NoBOM
 git -C $Repo worktree list --porcelain |
     Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\worktrees-before.txt') -Encoding utf8NoBOM
 
 $statusRows = foreach ($path in @($KeepWorktrees + $RemoveWorktrees)) {
+    $porcelainResult = Invoke-GitCapture -WorkingDirectory $path -Arguments @(
+        'status', '--porcelain=v2', '--branch', '--untracked-files=all'
+    )
+    $ignoredResult = Invoke-GitCapture -WorkingDirectory $path -Arguments @(
+        'ls-files', '--others', '--ignored', '--exclude-standard'
+    )
     [ordered]@{
         path = $path
         head = (git -C $path rev-parse HEAD).Trim()
         branch = (git -C $path branch --show-current).Trim()
-        porcelain = @(git -C $path status --porcelain=v2 --branch --untracked-files=all)
-        ignored = @(git -C $path ls-files --others --ignored --exclude-standard)
+        porcelain_exit_code = $porcelainResult.exit_code
+        porcelain = @(Convert-GitOutputToLines $porcelainResult.stdout)
+        porcelain_stderr = $porcelainResult.stderr
+        ignored_exit_code = $ignoredResult.exit_code
+        ignored = @(Convert-GitOutputToLines $ignoredResult.stdout)
+        ignored_stderr = $ignoredResult.stderr
     }
 }
-$statusRows | ConvertTo-Json -Depth 8 |
-    Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\worktree-status-before.json') -Encoding utf8NoBOM
+[IO.File]::WriteAllText(
+    (Join-Path $ArchiveRoot 'inventory\worktree-status-before.json'),
+    ($statusRows | ConvertTo-Json -Depth 10),
+    [Text.UTF8Encoding]::new($false)
+)
+if (@($statusRows | Where-Object { $_.porcelain_exit_code -ne 0 }).Count -ne 0) {
+    throw 'GIT_STATUS_SNAPSHOT_FAILED'
+}
+if (@($statusRows | Where-Object { $_.ignored_exit_code -ne 0 }).Count -ne 0) {
+    throw 'GIT_IGNORED_SNAPSHOT_FAILED'
+}
+
+# The canonical kept-root ignored stderr is retained byte-for-byte. It is not
+# converted into an empty ignored list when Git reports a permission warning.
+$canonicalRoot = [IO.Path]::GetFullPath($KeepWorktrees[0]).TrimEnd('\')
+$canonicalRows = @($statusRows | Where-Object {
+    [IO.Path]::GetFullPath($_.path).TrimEnd('\').Equals($canonicalRoot, [StringComparison]::OrdinalIgnoreCase)
+})
+if ($canonicalRows.Count -ne 1) { throw 'CANONICAL_STATUS_ROW_MISSING' }
+$canonicalIgnoredStderr = [string]$canonicalRows[0].ignored_stderr
+$denialStderrPath = Join-Path $ArchiveRoot 'inventory\inaccessible-ignored-roots-stderr.txt'
+[IO.File]::WriteAllText($denialStderrPath, $canonicalIgnoredStderr, [Text.UTF8Encoding]::new($false))
+if ([IO.File]::ReadAllText($denialStderrPath) -cne $canonicalIgnoredStderr) {
+    throw 'INACCESSIBLE_IGNORED_ROOT_STDERR_READBACK_MISMATCH'
+}
+
+$permissionDeniedLines = @(
+    $canonicalIgnoredStderr -split "`r?`n" |
+        Where-Object { $_.IndexOf('Permission denied', [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+)
+if ($permissionDeniedLines.Count -eq 0) { throw 'EXPECTED_PERMISSION_DENIAL_NOT_CAPTURED' }
+$expectedDenialPaths = @($InaccessibleIgnoredRoots | ForEach-Object {
+    [IO.Path]::GetFullPath($_).TrimEnd('\')
+})
+$expectedDenialRelatives = @($expectedDenialPaths | ForEach-Object {
+    $_.Substring($canonicalRoot.Length + 1).Replace('\','/')
+})
+foreach ($line in $permissionDeniedLines) {
+    $known = $false
+    foreach ($relative in $expectedDenialRelatives) {
+        if ($line.Contains($relative) -or $line.Contains($relative.Replace('/','\'))) {
+            $known = $true
+            break
+        }
+    }
+    if (-not $known) { throw "UNEXPECTED_PERMISSION_DENIED:$line" }
+}
+
+$keepIdentities = @($KeepWorktrees | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
+$deletionIdentities = @(
+    $RemoveWorktrees + $ForceRemoveWorktrees + $TestRoots |
+        ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') }
+)
+$denialRows = foreach ($path in $expectedDenialPaths) {
+    $parents = @($keepIdentities | Where-Object {
+        $path.StartsWith($_ + '\', [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($parents.Count -ne 1) { throw "INACCESSIBLE_ROOT_KEEP_CONTAINMENT_INVALID:$path" }
+    foreach ($target in $deletionIdentities) {
+        if ($path.Equals($target, [StringComparison]::OrdinalIgnoreCase) -or
+            $path.StartsWith($target + '\', [StringComparison]::OrdinalIgnoreCase) -or
+            $target.StartsWith($path + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "INACCESSIBLE_ROOT_DELETION_OVERLAP:$path:$target"
+        }
+    }
+
+    $relative = $path.Substring($canonicalRoot.Length + 1).Replace('\','/')
+    $matchingErrors = @($permissionDeniedLines | Where-Object {
+        $_.Contains($relative) -or $_.Contains($relative.Replace('/','\'))
+    })
+    if ($matchingErrors.Count -eq 0) { throw "EXPECTED_DENIAL_PATH_MISSING:$path" }
+
+    $item = $null
+    $getItemError = $null
+    try {
+        # This is a single non-recursive metadata read of the exact path.
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    } catch {
+        $getItemError = $_.Exception.ToString()
+    }
+    $metadata = $null
+    if ($null -ne $item) {
+        $metadata = [ordered]@{
+            full_name = $item.FullName
+            name = $item.Name
+            ps_is_container = [bool]$item.PSIsContainer
+            attributes = $item.Attributes.ToString()
+            length = if ($item.PSIsContainer) { $null } else { [Int64]$item.Length }
+            creation_time_utc = $item.CreationTimeUtc.ToString('o')
+            last_write_time_utc = $item.LastWriteTimeUtc.ToString('o')
+            last_access_time_utc = $item.LastAccessTimeUtc.ToString('o')
+        }
+    }
+    [ordered]@{
+        path = $path
+        parent_kept_root_identity = $parents[0]
+        parent_kept_root_head = (git -C $parents[0] rev-parse HEAD).Trim()
+        parent_kept_root_branch = (git -C $parents[0] branch --show-current).Trim()
+        access_denied_error = ($matchingErrors -join "`n")
+        get_item_metadata_available = ($null -ne $metadata)
+        get_item_metadata = $metadata
+        get_item_error = $getItemError
+        captured_at_utc = [DateTime]::UtcNow.ToString('o')
+        retention = 'retained-protected'
+        delete_candidate = $false
+        traversal_prohibited = $true
+    }
+}
+if (@($denialRows).Count -ne 4) { throw 'INACCESSIBLE_IGNORED_ROOT_INVENTORY_COUNT_INVALID' }
+
+$denialBody = [ordered]@{
+    schema = 'gwo-inaccessible-ignored-roots.v1'
+    run_id = $RunId
+    captured_at_utc = [DateTime]::UtcNow.ToString('o')
+    retention = 'retained-protected'
+    delete_candidate = $false
+    traversal_prohibited = $true
+    records = @($denialRows)
+}
+$denialInventoryPath = Join-Path $ArchiveRoot 'inventory\inaccessible-ignored-roots.json'
+[IO.File]::WriteAllText(
+    $denialInventoryPath,
+    ($denialBody | ConvertTo-Json -Depth 12),
+    [Text.UTF8Encoding]::new($false)
+)
+$denialHash = Get-FileHash -LiteralPath $denialInventoryPath -Algorithm SHA256
+$denialHashBody = [ordered]@{
+    schema = 'gwo-inaccessible-ignored-roots-sha256.v1'
+    path = 'inventory/inaccessible-ignored-roots.json'
+    algorithm = 'SHA256'
+    sha256 = $denialHash.Hash.ToLowerInvariant()
+    bytes = (Get-Item -LiteralPath $denialInventoryPath -Force).Length
+    captured_at_utc = [DateTime]::UtcNow.ToString('o')
+}
+$denialHashPath = Join-Path $ArchiveRoot 'inventory\inaccessible-ignored-roots-sha256.json'
+[IO.File]::WriteAllText(
+    $denialHashPath,
+    ($denialHashBody | ConvertTo-Json -Depth 8),
+    [Text.UTF8Encoding]::new($false)
+)
+$denialReadback = Get-Content -Raw -LiteralPath $denialInventoryPath | ConvertFrom-Json
+$denialHashReadback = Get-Content -Raw -LiteralPath $denialHashPath | ConvertFrom-Json
+if (@($denialReadback.records).Count -ne 4) { throw 'INACCESSIBLE_IGNORED_ROOT_READBACK_COUNT_INVALID' }
+if ($denialHashReadback.sha256.ToLowerInvariant() -ne
+    (Get-FileHash -LiteralPath $denialInventoryPath -Algorithm SHA256).Hash.ToLowerInvariant()) {
+    throw 'INACCESSIBLE_IGNORED_ROOT_HASH_READBACK_MISMATCH'
+}
+if (@($denialReadback.records | Where-Object {
+    $_.retention -ne 'retained-protected' -or $_.delete_candidate -ne $false -or
+    $_.traversal_prohibited -ne $true -or $_.get_item_metadata_available -ne $true
+}).Count -ne 0) {
+    throw 'INACCESSIBLE_IGNORED_ROOT_PROTECTION_READBACK_INVALID'
+}
+
 Get-PSDrive -Name C,D | Select-Object Name,Used,Free |
     ConvertTo-Json |
     Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\disk-before.json') -Encoding utf8NoBOM
 ```
+
+The status JSON retains `porcelain_exit_code`, `porcelain_stderr`,
+`ignored_exit_code`, and `ignored_stderr` independently. The four exact denied
+paths are checked only by strict containment/disjointness string comparisons;
+no wildcard or recursive read is permitted. The stderr file is the raw
+canonical `git ls-files` stderr and is read back byte-for-byte before the
+structured inventory is accepted. Task 2's second status snapshot must reuse
+this capture/readback protocol and compare both exit codes and stderr fields;
+permission warnings may never be represented as an empty ignored list.
 
 - [ ] **Step 6: Create and verify the complete pre-clean bundle**
 
@@ -375,6 +627,7 @@ Expected: bundle verification succeeds before fetch, push, cleanup, or branch mo
 - Create outside Git: `$ArchiveRoot\dirty\$slug\tracked.patch`
 - Create outside Git: `$ArchiveRoot\dirty\$slug\untracked.zip`
 - Create outside Git: `$ArchiveRoot\dirty\$slug\ignored.txt`
+- Create outside Git: `$ArchiveRoot\inventory\dirty-untracked-files.json`
 - Create outside Git: `$ArchiveRoot\inventory\dirty-archive-sha256.json`
 
 **Interfaces:**
@@ -408,9 +661,10 @@ function New-UntrackedArchive {
     $root = [IO.Path]::GetFullPath($Worktree).TrimEnd('\')
     $stage = Join-Path $DestinationDirectory 'untracked-stage'
     $zip = Join-Path $DestinationDirectory 'untracked.zip'
-    New-Item -ItemType Directory -LiteralPath $stage | Out-Null
+    [IO.Directory]::CreateDirectory($stage) | Out-Null
 
     $relativePaths = @(git -C $root ls-files --others --exclude-standard)
+    $fileRows = @()
     foreach ($relative in $relativePaths) {
         if ([string]::IsNullOrWhiteSpace($relative)) { continue }
         $source = [IO.Path]::GetFullPath((Join-Path $root $relative))
@@ -419,8 +673,17 @@ function New-UntrackedArchive {
         }
         $destination = Join-Path $stage $relative
         $destinationParent = Split-Path -Parent $destination
-        New-Item -ItemType Directory -LiteralPath $destinationParent -Force | Out-Null
+        [IO.Directory]::CreateDirectory($destinationParent) | Out-Null
         Copy-Item -LiteralPath $source -Destination $destination
+        $sourceItem = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+        if ($sourceItem.PSIsContainer) { throw "UNTRACKED_PATH_IS_DIRECTORY:$source" }
+        $fileRows += [ordered]@{
+            record_type = 'untracked_file'
+            root_identity = $root
+            relative_path = $relative.Replace('\','/')
+            bytes = [Int64]$sourceItem.Length
+            sha256 = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
     }
 
     [IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip, 'Optimal', $false)
@@ -439,16 +702,18 @@ function New-UntrackedArchive {
         throw 'UNTRACKED_STAGE_OUTSIDE_ARCHIVE'
     }
     Remove-Item -LiteralPath $stage -Recurse -Force
+    return $fileRows
 }
 ```
 
 - [ ] **Step 2: Export status, binary patch, untracked ZIP, and ignored inventory**
 
 ```powershell
+$untrackedFileRows = @()
 foreach ($worktree in $DirtyRoots) {
     $slug = ($worktree.TrimEnd('\') -split '[\\/]')[-1]
     $destination = Join-Path $ArchiveRoot (Join-Path 'dirty' $slug)
-    New-Item -ItemType Directory -LiteralPath $destination | Out-Null
+    [IO.Directory]::CreateDirectory($destination) | Out-Null
 
     git -C $worktree status --porcelain=v2 --branch --untracked-files=all |
         Set-Content -LiteralPath (Join-Path $destination 'status.txt') -Encoding utf8NoBOM
@@ -456,8 +721,13 @@ foreach ($worktree in $DirtyRoots) {
         Set-Content -LiteralPath (Join-Path $destination 'tracked.patch') -Encoding utf8NoBOM
     git -C $worktree ls-files --others --ignored --exclude-standard |
         Set-Content -LiteralPath (Join-Path $destination 'ignored.txt') -Encoding utf8NoBOM
-    New-UntrackedArchive -Worktree $worktree -DestinationDirectory $destination
+    $untrackedFileRows += @(New-UntrackedArchive -Worktree $worktree -DestinationDirectory $destination)
 }
+[ordered]@{
+    schema = 'gwo-dirty-untracked-files.v1'
+    files = @($untrackedFileRows)
+} | ConvertTo-Json -Depth 8 |
+    Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\dirty-untracked-files.json') -Encoding utf8NoBOM
 ```
 
 Expected: the root ZIP contains four entries; v8-design contains 27; v8-plan64 contains two; the three other untracked ZIPs are valid and empty.
@@ -465,16 +735,60 @@ Expected: the root ZIP contains four entries; v8-design contains 27; v8-plan64 c
 - [ ] **Step 3: Hash and reopen every archive**
 
 ```powershell
+$untrackedManifest = Get-Content -Raw -LiteralPath (Join-Path $ArchiveRoot 'inventory\dirty-untracked-files.json') |
+    ConvertFrom-Json
+if ($untrackedManifest.schema -ne 'gwo-dirty-untracked-files.v1') {
+    throw 'DIRTY_UNTRACKED_MANIFEST_SCHEMA_INVALID'
+}
+$untrackedFileRows = @($untrackedManifest.files)
+$untrackedKeys = @($untrackedFileRows | ForEach-Object { "$($_.root_identity)|$($_.relative_path)" })
+if (($untrackedKeys | Sort-Object -Unique).Count -ne $untrackedKeys.Count) {
+    throw 'DIRTY_UNTRACKED_MANIFEST_DUPLICATE'
+}
 $dirtyFiles = @(Get-ChildItem -LiteralPath (Join-Path $ArchiveRoot 'dirty') -File -Recurse)
-$hashRows = foreach ($file in $dirtyFiles) {
+$archiveRows = foreach ($file in $dirtyFiles) {
     $hash = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256
     [ordered]@{
-        path = $file.FullName.Substring($ArchiveRoot.Length + 1)
-        bytes = $file.Length
+        record_type = 'archive_file'
+        path = $file.FullName.Substring($ArchiveRoot.Length + 1).Replace('\','/')
+        bytes = [Int64]$file.Length
         sha256 = $hash.Hash.ToLowerInvariant()
     }
 }
-$hashRows | ConvertTo-Json -Depth 5 |
+$zipEntryRows = foreach ($zipPath in Get-ChildItem -LiteralPath (Join-Path $ArchiveRoot 'dirty') -Filter 'untracked.zip' -Recurse) {
+    $zip = [IO.Compression.ZipFile]::OpenRead($zipPath.FullName)
+    try {
+        foreach ($entry in $zip.Entries) {
+            if ([string]::IsNullOrEmpty($entry.Name)) {
+                throw "UNTRACKED_ZIP_DIRECTORY_ENTRY:$($zipPath.FullName):$($entry.FullName)"
+            }
+            $entryStream = $entry.Open()
+            $sha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+                $entryDigest = $sha256.ComputeHash($entryStream)
+            } finally {
+                $sha256.Dispose()
+                $entryStream.Dispose()
+            }
+            [ordered]@{
+                record_type = 'zip_entry'
+                archive_path = $zipPath.FullName.Substring($ArchiveRoot.Length + 1).Replace('\','/')
+                entry_path = $entry.FullName.Replace('\','/')
+                bytes = [Int64]$entry.Length
+                sha256 = ([BitConverter]::ToString($entryDigest) -replace '-','').ToLowerInvariant()
+            }
+        }
+    } finally {
+        $zip.Dispose()
+    }
+}
+$dirtyArchiveManifest = [ordered]@{
+    schema = 'gwo-dirty-archive-sha256.v2'
+    untracked_files = @($untrackedFileRows)
+    archive_files = @($archiveRows)
+    zip_entries = @($zipEntryRows)
+}
+$dirtyArchiveManifest | ConvertTo-Json -Depth 8 |
     Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\dirty-archive-sha256.json') -Encoding utf8NoBOM
 
 foreach ($zipPath in Get-ChildItem -LiteralPath (Join-Path $ArchiveRoot 'dirty') -Filter 'untracked.zip' -Recurse) {
@@ -484,37 +798,51 @@ foreach ($zipPath in Get-ChildItem -LiteralPath (Join-Path $ArchiveRoot 'dirty')
 }
 ```
 
+`dirty-untracked-files.json` is the immutable per-untracked-file manifest: every row binds a full `root_identity` to a normalized `relative_path`, byte count, and SHA-256. `dirty-archive-sha256.json` repeats those rows under `untracked_files`, records every archive file under `archive_files`, and records every uncompressed ZIP entry under `zip_entries`. Any missing, same-name, size, or content drift fails the later deletion gate.
+
 - [ ] **Step 4: Perform a second status read and fail on drift**
 
-Re-run the Task 1 status snapshot into `worktree-status-pre-delete.json`. Compare HEAD, branch, porcelain, untracked, and ignored lists with the first snapshot. Any difference stops cleanup and requires regenerating the affected archive under a new run ID; never overwrite the existing run.
+Re-run the Task 1 status snapshot into `worktree-status-pre-delete.json` using `Invoke-GitCapture`. Compare HEAD, branch, porcelain, untracked, ignored lists, status exit codes, and both status stderr fields with the first snapshot. Any difference stops cleanup and requires regenerating the affected archive under a new run ID; never overwrite the existing run. Reapply the four-path retained-protected denial protocol and keep its exact stderr/readback separate from the ignored list.
 
 ### Task 3: Protect the Active GA Branch Remotely
 
 **Files:**
-- Create remote ref: `refs/heads/codex/gwo-v8-ga-plan`
+- Create or advance remote ref: `refs/heads/codex/gwo-v8-ga-plan`
+- Create outside Git: `$ArchiveRoot\inventory\remote-ga-ref-before.json`
 - Create outside Git: `$ArchiveRoot\inventory\remote-ga-ref.txt`
 
 **Interfaces:**
 - Consumes: verified pre-clean bundle, captured `$ProtectedGaSha`, and exact ancestor `e58c596`.
-- Produces: non-force remote protection for the 67 implementation commits and the reviewed plan-only commit.
+- Produces: non-force remote protection for the 67 implementation commits and the reviewed plan-only commit; the captured GA remote ref may move only to `$ProtectedGaSha`.
 
 - [ ] **Step 1: Read the remote ref without mutation**
 
 ```powershell
-$remoteLine = @(git -C $GaWorktree ls-remote --heads origin refs/heads/codex/gwo-v8-ga-plan)
+$gaRemoteRef = 'refs/heads/codex/gwo-v8-ga-plan'
+$gaRemoteTrackingRef = 'refs/remotes/origin/codex/gwo-v8-ga-plan'
+$remoteLine = @(git -C $GaWorktree ls-remote --heads origin $gaRemoteRef)
 if ($remoteLine.Count -gt 1) { throw 'REMOTE_GA_REF_AMBIGUOUS' }
 $needsPush = $remoteLine.Count -eq 0
+$remoteBeforeSha = $null
 if ($remoteLine.Count -eq 1) {
     $remoteSha = ($remoteLine[0] -split '\s+')[0]
+    if ($remoteSha -notmatch '^[0-9a-f]{40}$') { throw "REMOTE_GA_REF_SHA_INVALID:$remoteSha" }
+    $remoteBeforeSha = $remoteSha
     if ($remoteSha -ne $ProtectedGaSha) {
         git -C $GaWorktree merge-base --is-ancestor $remoteSha $ProtectedGaSha
         if ($LASTEXITCODE -ne 0) { throw "REMOTE_GA_REF_CONFLICT:$remoteSha" }
         $needsPush = $true
     }
 }
+[ordered]@{
+    ref = $gaRemoteRef
+    tracking_ref = $gaRemoteTrackingRef
+    sha = $remoteBeforeSha
+    captured_at = [DateTime]::UtcNow.ToString('o')
+} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\remote-ga-ref-before.json') -Encoding utf8NoBOM
 ```
 
-- [ ] **Step 2: Push only when absent**
+- [ ] **Step 2: Create or advance only to the captured plan head**
 
 ```powershell
 if ($needsPush) {
@@ -523,7 +851,7 @@ if ($needsPush) {
 }
 ```
 
-This command contains no force option and does not target `main`.
+This command contains no force option, does not target `main`, and is the only permitted remote-ref movement in Phase 1. If the captured ref existed, its recorded SHA must be an ancestor of `$ProtectedGaSha`; if it was absent, only creation at `$ProtectedGaSha` is allowed.
 
 - [ ] **Step 3: Verify exact remote readback**
 
@@ -536,6 +864,72 @@ $readback | Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\remote-g
 ```
 
 Expected: cleanup remains blocked until remote readback is exact.
+
+### Retained-Protected Deletion Authorization Barrier
+
+No later deletion may begin until the four exact inaccessible ignored roots have
+passed this readback. This is a non-destructive existence and metadata check only;
+it must not enumerate, traverse, copy, archive, alter ACLs or ownership, enable
+backup privilege, or delete any retained-protected path.
+
+- [ ] **Barrier Step: Read back retained-protected roots before later deletion**
+
+```powershell
+function Read-RetainedProtectedRoots {
+    param([Parameter(Mandatory)] [string] $OutputPath)
+
+    $rows = foreach ($path in $InaccessibleIgnoredRoots) {
+        $full = [IO.Path]::GetFullPath($path).TrimEnd('\')
+        $exists = Test-Path -LiteralPath $full
+        $item = $null
+        $errorText = $null
+        if ($exists) {
+            try {
+                # Exact non-recursive metadata read; never use Get-ChildItem here.
+                $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+            } catch {
+                $errorText = $_.Exception.ToString()
+            }
+        }
+        [ordered]@{
+            path = $full
+            exists = [bool]$exists
+            get_item_metadata_available = ($null -ne $item)
+            get_item_metadata = if ($null -ne $item) {
+                [ordered]@{
+                    full_name = $item.FullName
+                    name = $item.Name
+                    ps_is_container = [bool]$item.PSIsContainer
+                    attributes = $item.Attributes.ToString()
+                    creation_time_utc = $item.CreationTimeUtc.ToString('o')
+                    last_write_time_utc = $item.LastWriteTimeUtc.ToString('o')
+                    last_access_time_utc = $item.LastAccessTimeUtc.ToString('o')
+                }
+            } else { $null }
+            get_item_error = $errorText
+            retention = 'retained-protected'
+            delete_candidate = $false
+            traversal_prohibited = $true
+            captured_at_utc = [DateTime]::UtcNow.ToString('o')
+        }
+    }
+    if (@($rows | Where-Object {
+        $_.exists -ne $true -or $_.get_item_metadata_available -ne $true -or
+        $_.delete_candidate -ne $false -or $_.traversal_prohibited -ne $true
+    }).Count -ne 0) {
+        throw 'RETAINED_PROTECTED_PRE_DELETE_READBACK_FAILED'
+    }
+    [IO.File]::WriteAllText($OutputPath, ($rows | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+    $readback = Get-Content -Raw -LiteralPath $OutputPath | ConvertFrom-Json
+    if (@($readback).Count -ne 4 -or @($readback | Where-Object { $_.exists -ne $true }).Count -ne 0) {
+        throw 'RETAINED_PROTECTED_PRE_DELETE_FILE_READBACK_FAILED'
+    }
+}
+Read-RetainedProtectedRoots -OutputPath (Join-Path $ArchiveRoot 'inventory\inaccessible-ignored-roots-pre-delete.json')
+```
+
+The four paths remain retained-protected and are excluded from every deletion
+input; the readback must pass immediately before Task 4/Task 5 deletion begins.
 
 ### Task 4: Preserve Four Green Runs and Remove the 48 Test Roots
 
@@ -579,7 +973,7 @@ Expected planning baseline: 48 roots, 162,677 files, and 980,313,853 bytes. A ch
 $retainedRows = foreach ($source in $RetainedEvidenceFiles) {
     $runName = Split-Path -Leaf (Split-Path -Parent $source)
     $destinationDirectory = Join-Path $ArchiveRoot (Join-Path 'test-evidence' $runName)
-    New-Item -ItemType Directory -LiteralPath $destinationDirectory -Force | Out-Null
+    [IO.Directory]::CreateDirectory($destinationDirectory) | Out-Null
     $destination = Join-Path $destinationDirectory (Split-Path -Leaf $source)
     Copy-Item -LiteralPath $source -Destination $destination
     $hash = Get-FileHash -LiteralPath $destination -Algorithm SHA256
@@ -590,11 +984,27 @@ $retainedRows = foreach ($source in $RetainedEvidenceFiles) {
         sha256 = $hash.Hash.ToLowerInvariant()
     }
 }
+$fixedStdoutHashes = [ordered]@{
+    'gwo-109-r14-full-run1' = 'fa25dcacb669c61e6e9938b4c128adf9a921b49f83c92ee4ddaadbf3ee516751'
+    'gwo-109-r13-full-run3' = '536ec9ab1d5f270d11122af683295659c05e99d3af319aeccdfe09da35e0f915'
+    'gwo-109-round7-full-final-race' = '37d7faf049813877a0ab80b592c8af0320d7684839e61dcead518fe12c1c2a69'
+}
+foreach ($runName in $fixedStdoutHashes.Keys) {
+    $stdoutRows = @($retainedRows | Where-Object { $_.source -eq "D:\$runName\stdout.log" })
+    if ($stdoutRows.Count -ne 1) { throw "FIXED_STDOUT_ROW_MISSING:$runName" }
+    if ($stdoutRows[0].sha256.ToLowerInvariant() -ne $fixedStdoutHashes[$runName]) {
+        throw "FIXED_STDOUT_SHA256_MISMATCH:$runName"
+    }
+}
+$r12StdoutRows = @($retainedRows | Where-Object { $_.source -eq 'D:\gwo-109-r12-full-synced\stdout.log' })
+if ($r12StdoutRows.Count -ne 1 -or [string]::IsNullOrWhiteSpace($r12StdoutRows[0].sha256)) {
+    throw 'R12_STDOUT_DYNAMIC_HASH_MISSING'
+}
 $retainedRows | ConvertTo-Json -Depth 5 |
     Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\retained-test-evidence-sha256.json') -Encoding utf8NoBOM
 ```
 
-Verify the expected stdout SHA-256 values:
+The execution-time assertions must pass for all three fixed stdout SHA-256 values:
 
 - `gwo-109-r14-full-run1`: `fa25dcacb669c61e6e9938b4c128adf9a921b49f83c92ee4ddaadbf3ee516751`
 - `gwo-109-r13-full-run3`: `536ec9ab1d5f270d11122af683295659c05e99d3af319aeccdfe09da35e0f915`
@@ -770,19 +1180,40 @@ No clean target is escalated to `--force` merely because removal failed.
 
 - [ ] **Step 4: Reverify and force-remove only the five approved dirty targets**
 
-For every force target, verify its `status.txt`, `tracked.patch`, `untracked.zip`, and the corresponding SHA-256 rows still exist and can be opened. Then:
+For every force target, verify its `status.txt`, `tracked.patch`, `untracked.zip`, and `ignored.txt` rows still exist, recompute each recorded byte count and SHA-256, and only then open the ZIP. A readable file with a changed digest is not sufficient. Then:
 
 ```powershell
+$dirtyManifest = Get-Content -Raw -LiteralPath (Join-Path $ArchiveRoot 'inventory\dirty-archive-sha256.json') |
+    ConvertFrom-Json
+if ($dirtyManifest.schema -ne 'gwo-dirty-archive-sha256.v2') {
+    throw 'DIRTY_ARCHIVE_MANIFEST_SCHEMA_INVALID'
+}
+$archiveRows = @($dirtyManifest.archive_files)
 foreach ($path in $ForceRemoveWorktrees) {
     $slug = ($path.TrimEnd('\') -split '[\\/]')[-1]
     $archive = Join-Path $ArchiveRoot (Join-Path 'dirty' $slug)
     foreach ($name in 'status.txt','tracked.patch','untracked.zip','ignored.txt') {
-        if (-not (Test-Path -LiteralPath (Join-Path $archive $name))) {
+        $archiveFile = Join-Path $archive $name
+        if (-not (Test-Path -LiteralPath $archiveFile -PathType Leaf)) {
             throw "DIRTY_ARCHIVE_MISSING:$($slug):$name"
+        }
+        $relativeArchivePath = $archiveFile.Substring($ArchiveRoot.Length + 1).Replace('\','/')
+        $record = @($archiveRows | Where-Object {
+            $_.record_type -eq 'archive_file' -and $_.path -eq $relativeArchivePath
+        })
+        if ($record.Count -ne 1) { throw "DIRTY_ARCHIVE_MANIFEST_ROW_MISSING:$relativeArchivePath" }
+        $actualFile = Get-Item -LiteralPath $archiveFile -ErrorAction Stop
+        if ([Int64]$actualFile.Length -ne [Int64]$record[0].bytes) {
+            throw "DIRTY_ARCHIVE_BYTES_MISMATCH:$relativeArchivePath"
+        }
+        $actualSha = (Get-FileHash -LiteralPath $archiveFile -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualSha -ne $record[0].sha256.ToLowerInvariant()) {
+            throw "DIRTY_ARCHIVE_SHA256_MISMATCH:$relativeArchivePath"
         }
     }
     $zip = [IO.Compression.ZipFile]::OpenRead((Join-Path $archive 'untracked.zip'))
-    $zip.Dispose()
+    try { $null = @($zip.Entries | ForEach-Object { $_.FullName }) }
+    finally { $zip.Dispose() }
 
     git -C $Repo worktree remove --force $path
     if ($LASTEXITCODE -ne 0) { throw "DIRTY_WORKTREE_REMOVE_FAILED:$path" }
@@ -821,18 +1252,143 @@ $RootUntracked = @(
     'D:\Workstation\github-work-orchestrator\docs\superpowers\plans\2026-08-02-route-scope-escapes-into-campaign-replanning.md'
 )
 $rootZip = Join-Path $ArchiveRoot 'dirty\github-work-orchestrator\untracked.zip'
+$rootZipRelativePath = 'dirty/github-work-orchestrator/untracked.zip'
+$dirtyManifest = Get-Content -Raw -LiteralPath (Join-Path $ArchiveRoot 'inventory\dirty-archive-sha256.json') |
+    ConvertFrom-Json
+if ($dirtyManifest.schema -ne 'gwo-dirty-archive-sha256.v2') {
+    throw 'ROOT_UNTRACKED_MANIFEST_SCHEMA_INVALID'
+}
+$root = [IO.Path]::GetFullPath($Repo).TrimEnd('\')
+$expectedRootEntries = @(
+    foreach ($path in $RootUntracked) {
+        $full = [IO.Path]::GetFullPath($path)
+        if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "ROOT_UNTRACKED_PATH_ESCAPES:$full"
+        }
+        $full.Substring($root.Length + 1).Replace('\','/')
+    }
+) | Sort-Object
+$untrackedManifest = Get-Content -Raw -LiteralPath (Join-Path $ArchiveRoot 'inventory\dirty-untracked-files.json') |
+    ConvertFrom-Json
+if ($untrackedManifest.schema -ne 'gwo-dirty-untracked-files.v1') {
+    throw 'ROOT_UNTRACKED_FILE_MANIFEST_SCHEMA_INVALID'
+}
+$rootFileManifestRows = @($untrackedManifest.files | Where-Object {
+    $_.record_type -eq 'untracked_file' -and $_.root_identity -eq $root
+})
+$rootFileManifestEntries = @($rootFileManifestRows | ForEach-Object { $_.relative_path }) | Sort-Object
+if ($rootFileManifestRows.Count -ne $expectedRootEntries.Count -or
+    @(Compare-Object $rootFileManifestEntries $expectedRootEntries).Count -ne 0) {
+    throw 'ROOT_UNTRACKED_FILE_MANIFEST_ENTRY_SET_MISMATCH'
+}
+$dirtyManifestRootFileRows = @($dirtyManifest.untracked_files | Where-Object {
+    $_.record_type -eq 'untracked_file' -and $_.root_identity -eq $root
+})
+if ($dirtyManifestRootFileRows.Count -ne $rootFileManifestRows.Count) {
+    throw 'ROOT_UNTRACKED_ARCHIVE_MANIFEST_FILE_COUNT_MISMATCH'
+}
+foreach ($relative in $expectedRootEntries) {
+    $durableRow = @($rootFileManifestRows | Where-Object { $_.relative_path -eq $relative })
+    $archiveRow = @($dirtyManifestRootFileRows | Where-Object { $_.relative_path -eq $relative })
+    if ($durableRow.Count -ne 1 -or $archiveRow.Count -ne 1) {
+        throw "ROOT_UNTRACKED_FILE_MANIFEST_ROW_MISSING:$relative"
+    }
+    if ($durableRow[0].root_identity -ne $archiveRow[0].root_identity -or
+        [Int64]$durableRow[0].bytes -ne [Int64]$archiveRow[0].bytes -or
+        $durableRow[0].sha256.ToLowerInvariant() -ne $archiveRow[0].sha256.ToLowerInvariant()) {
+        throw "ROOT_UNTRACKED_FILE_MANIFEST_DRIFTED:$relative"
+    }
+}
+$rootZipFileRows = @($dirtyManifest.archive_files | Where-Object {
+    $_.record_type -eq 'archive_file' -and $_.path -eq $rootZipRelativePath
+})
+if ($rootZipFileRows.Count -ne 1) { throw 'ROOT_UNTRACKED_ARCHIVE_ROW_MISSING' }
+$rootZipItem = Get-Item -LiteralPath $rootZip -ErrorAction Stop
+if ([Int64]$rootZipItem.Length -ne [Int64]$rootZipFileRows[0].bytes) {
+    throw 'ROOT_UNTRACKED_ARCHIVE_BYTES_MISMATCH'
+}
+$rootZipSha = (Get-FileHash -LiteralPath $rootZip -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($rootZipSha -ne $rootZipFileRows[0].sha256.ToLowerInvariant()) {
+    throw 'ROOT_UNTRACKED_ARCHIVE_SHA256_MISMATCH'
+}
+$rootZipEntryRows = @($dirtyManifest.zip_entries | Where-Object {
+    $_.record_type -eq 'zip_entry' -and $_.archive_path -eq $rootZipRelativePath
+})
+$manifestRootEntries = @($rootZipEntryRows | ForEach-Object { $_.entry_path }) | Sort-Object
+if ($rootZipEntryRows.Count -ne $expectedRootEntries.Count -or
+    @(Compare-Object $manifestRootEntries $expectedRootEntries).Count -ne 0) {
+    throw 'ROOT_UNTRACKED_MANIFEST_ENTRY_SET_MISMATCH'
+}
 $zip = [IO.Compression.ZipFile]::OpenRead($rootZip)
 try {
-    if ($zip.Entries.Count -ne 4) { throw 'ROOT_UNTRACKED_ZIP_COUNT_INVALID' }
-} finally { $zip.Dispose() }
-
-foreach ($path in $RootUntracked) {
-    $full = [IO.Path]::GetFullPath($path)
-    $root = [IO.Path]::GetFullPath($Repo).TrimEnd('\')
-    if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
-        throw "ROOT_UNTRACKED_PATH_ESCAPES:$full"
+    $actualRootEntries = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\','/') }) | Sort-Object
+    if ($zip.Entries.Count -ne $expectedRootEntries.Count -or
+        @(Compare-Object $actualRootEntries $expectedRootEntries).Count -ne 0) {
+        throw 'ROOT_UNTRACKED_ZIP_ENTRY_SET_MISMATCH'
     }
-    Remove-Item -LiteralPath $full -Force
+    foreach ($entry in $zip.Entries) {
+        $entryPath = $entry.FullName.Replace('\','/')
+        $record = @($rootZipEntryRows | Where-Object { $_.entry_path -eq $entryPath })
+        if ($record.Count -ne 1) { throw "ROOT_UNTRACKED_ENTRY_MANIFEST_ROW_MISSING:$entryPath" }
+        if ([Int64]$entry.Length -ne [Int64]$record[0].bytes) {
+            throw "ROOT_UNTRACKED_ENTRY_BYTES_MISMATCH:$entryPath"
+        }
+        $entryStream = $entry.Open()
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $entryDigest = $sha256.ComputeHash($entryStream)
+        } finally {
+            $sha256.Dispose()
+            $entryStream.Dispose()
+        }
+        $entrySha = ([BitConverter]::ToString($entryDigest) -replace '-','').ToLowerInvariant()
+        if ($entrySha -ne $record[0].sha256.ToLowerInvariant()) {
+            throw "ROOT_UNTRACKED_ENTRY_SHA256_MISMATCH:$entryPath"
+        }
+    }
+} finally {
+    $zip.Dispose()
+}
+
+# Rehash the four current source files as the final read-only operation immediately before deletion.
+$currentRootRows = foreach ($path in $RootUntracked) {
+    $full = [IO.Path]::GetFullPath($path)
+    $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if ($item.PSIsContainer) { throw "ROOT_UNTRACKED_PATH_IS_DIRECTORY:$full" }
+    [ordered]@{
+        record_type = 'untracked_file'
+        root_identity = $root
+        relative_path = $full.Substring($root.Length + 1).Replace('\','/')
+        bytes = [Int64]$item.Length
+        sha256 = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+}
+$currentRootEntries = @($currentRootRows | ForEach-Object { $_.relative_path }) | Sort-Object
+if ($currentRootRows.Count -ne $expectedRootEntries.Count -or
+    @(Compare-Object $currentRootEntries $expectedRootEntries).Count -ne 0) {
+    throw 'ROOT_UNTRACKED_CURRENT_ENTRY_SET_MISMATCH'
+}
+foreach ($relative in $expectedRootEntries) {
+    $currentRow = @($currentRootRows | Where-Object { $_.relative_path -eq $relative })
+    $durableRow = @($rootFileManifestRows | Where-Object { $_.relative_path -eq $relative })
+    $zipRow = @($rootZipEntryRows | Where-Object { $_.entry_path -eq $relative })
+    if ($currentRow.Count -ne 1 -or $durableRow.Count -ne 1 -or $zipRow.Count -ne 1) {
+        throw "ROOT_UNTRACKED_CURRENT_ROW_MISSING:$relative"
+    }
+    if ($currentRow[0].root_identity -ne $root -or
+        [Int64]$currentRow[0].bytes -ne [Int64]$durableRow[0].bytes -or
+        $currentRow[0].sha256.ToLowerInvariant() -ne $durableRow[0].sha256.ToLowerInvariant()) {
+        throw "ROOT_UNTRACKED_CURRENT_MANIFEST_MISMATCH:$relative"
+    }
+    if ([Int64]$currentRow[0].bytes -ne [Int64]$zipRow[0].bytes -or
+        $currentRow[0].sha256.ToLowerInvariant() -ne $zipRow[0].sha256.ToLowerInvariant()) {
+        throw "ROOT_UNTRACKED_CURRENT_ZIP_MISMATCH:$relative"
+    }
+}
+
+# Every path was containment-checked while constructing $expectedRootEntries; no deletion has occurred.
+foreach ($path in $RootUntracked) {
+    Remove-Item -LiteralPath ([IO.Path]::GetFullPath($path)) -Force
 }
 ```
 
@@ -874,6 +1430,53 @@ if ((git -C $GaWorktree rev-parse HEAD).Trim() -ne $ProtectedGaSha) {
 }
 git -C $GaWorktree merge-base --is-ancestor $ImplementationSha $ProtectedGaSha
 if ($LASTEXITCODE -ne 0) { throw 'IMPLEMENTATION_BOUNDARY_LOST' }
+$finalProtectedRows = foreach ($path in $InaccessibleIgnoredRoots) {
+    $full = [IO.Path]::GetFullPath($path).TrimEnd('\')
+    $exists = Test-Path -LiteralPath $full
+    $item = $null
+    $errorText = $null
+    if ($exists) {
+        try {
+            # Exact non-recursive metadata read; traversal remains prohibited.
+            $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+        } catch {
+            $errorText = $_.Exception.ToString()
+        }
+    }
+    [ordered]@{
+        path = $full
+        exists = [bool]$exists
+        get_item_metadata_available = ($null -ne $item)
+        get_item_metadata = if ($null -ne $item) {
+            [ordered]@{
+                full_name = $item.FullName
+                name = $item.Name
+                ps_is_container = [bool]$item.PSIsContainer
+                attributes = $item.Attributes.ToString()
+                creation_time_utc = $item.CreationTimeUtc.ToString('o')
+                last_write_time_utc = $item.LastWriteTimeUtc.ToString('o')
+                last_access_time_utc = $item.LastAccessTimeUtc.ToString('o')
+            }
+        } else { $null }
+        get_item_error = $errorText
+        retention = 'retained-protected'
+        delete_candidate = $false
+        traversal_prohibited = $true
+        captured_at_utc = [DateTime]::UtcNow.ToString('o')
+    }
+}
+if (@($finalProtectedRows | Where-Object {
+    $_.exists -ne $true -or $_.get_item_metadata_available -ne $true -or
+    $_.delete_candidate -ne $false -or $_.traversal_prohibited -ne $true
+}).Count -ne 0) {
+    throw 'RETAINED_PROTECTED_FINAL_READBACK_FAILED'
+}
+$finalProtectedPath = Join-Path $ArchiveRoot 'inventory\inaccessible-ignored-roots-final.json'
+[IO.File]::WriteAllText($finalProtectedPath, ($finalProtectedRows | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+$finalReadback = Get-Content -Raw -LiteralPath $finalProtectedPath | ConvertFrom-Json
+if (@($finalReadback).Count -ne 4 -or @($finalReadback | Where-Object { $_.exists -ne $true }).Count -ne 0) {
+    throw 'RETAINED_PROTECTED_FINAL_FILE_READBACK_FAILED'
+}
 ```
 
 - [ ] **Step 4: Prove no pre-clean ref disappeared**
@@ -892,17 +1495,52 @@ foreach ($line in Get-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\re
     $name,$sha = $line -split "`t",2
     $after[$name] = $sha
 }
+$gaRemoteRef = 'refs/heads/codex/gwo-v8-ga-plan'
+$gaRemoteTrackingRef = 'refs/remotes/origin/codex/gwo-v8-ga-plan'
+$remoteBeforePath = Join-Path $ArchiveRoot 'inventory\remote-ga-ref-before.json'
+if (-not (Test-Path -LiteralPath $remoteBeforePath -PathType Leaf)) {
+    throw 'REMOTE_GA_REF_BEFORE_MISSING'
+}
+$remoteBefore = Get-Content -Raw -LiteralPath $remoteBeforePath | ConvertFrom-Json
+if ($remoteBefore.ref -ne $gaRemoteRef -or $remoteBefore.tracking_ref -ne $gaRemoteTrackingRef) {
+    throw 'REMOTE_GA_REF_BEFORE_IDENTITY_INVALID'
+}
+$remoteAfterLine = @(git -C $GaWorktree ls-remote --heads origin $gaRemoteRef)
+if ($remoteAfterLine.Count -ne 1) { throw 'REMOTE_GA_REF_AFTER_MISSING' }
+$remoteAfterSha = ($remoteAfterLine[0] -split '\s+')[0]
+if ($remoteAfterSha -ne $ProtectedGaSha) {
+    throw "REMOTE_GA_REF_MOVED_UNEXPECTEDLY:$remoteAfterSha"
+}
+if ($null -ne $remoteBefore.sha -and $remoteBefore.sha -ne $ProtectedGaSha) {
+    git -C $GaWorktree merge-base --is-ancestor $remoteBefore.sha $ProtectedGaSha
+    if ($LASTEXITCODE -ne 0) { throw 'REMOTE_GA_REF_NOT_FAST_FORWARD' }
+}
+$remoteAfterLine | Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\remote-ga-ref-after.txt') -Encoding utf8NoBOM
+$allowedFastForwardRefs = @('refs/heads/main','refs/remotes/origin/main')
 foreach ($name in $before.Keys) {
     if (-not $after.ContainsKey($name)) { throw "REF_DELETED:$name" }
-    if ($name -notin 'refs/heads/main','refs/remotes/origin/main' -and $after[$name] -ne $before[$name]) {
+    if ($name -eq $gaRemoteTrackingRef) {
+        if ($after[$name] -ne $ProtectedGaSha) { throw "REF_MOVED_UNEXPECTEDLY:$name" }
+    } elseif ($name -notin $allowedFastForwardRefs -and $after[$name] -ne $before[$name]) {
         throw "REF_MOVED_UNEXPECTEDLY:$name"
     }
 }
-foreach ($name in 'refs/heads/main','refs/remotes/origin/main') {
-    git -C $Repo merge-base --is-ancestor $before[$name] $after[$name]
-    if ($LASTEXITCODE -ne 0) { throw "REF_DID_NOT_FAST_FORWARD:$name" }
+foreach ($name in $after.Keys) {
+    if ($before.ContainsKey($name)) { continue }
+    if ($name -eq $gaRemoteTrackingRef -and $after[$name] -eq $ProtectedGaSha) { continue }
+    if ($name -eq 'refs/remotes/origin/main') { continue }
+    throw "REF_ADDED_UNEXPECTEDLY:$name"
+}
+foreach ($name in $allowedFastForwardRefs) {
+    if (-not $after.ContainsKey($name)) { throw "REF_MISSING_AFTER:$name" }
+    if ($before.ContainsKey($name)) {
+        git -C $Repo merge-base --is-ancestor $before[$name] $after[$name]
+        if ($LASTEXITCODE -ne 0) { throw "REF_DID_NOT_FAST_FORWARD:$name" }
+    }
 }
 ```
+
+The only non-`main` exception in this comparison is the captured GA remote ref and, if the push creates it, its exact local `origin` tracking ref; both must read `$ProtectedGaSha`. Every pre-clean ref must still exist, and any other movement or addition fails closed.
 
 - [ ] **Step 5: Run Git integrity and create the final bundle**
 
@@ -1027,7 +1665,43 @@ if ($presentPlanFiles.Count -eq 0) {
 }
 ```
 
-Expected: the cherry-picked commit contains only the two 2026-08-04 plans; none of the post-Beta1 implementation commits enters the Beta1 branch.
+Before proceeding, prove the existing or newly created branch is the intended Beta1 slice from the exact source boundary. Do not infer this from the two plan blobs or from an assumed remote branch:
+
+```powershell
+$beta1SourceBoundarySha = (git -C $Repo rev-parse 'ddc1785^{commit}').Trim()
+if ($LASTEXITCODE -ne 0 -or $beta1SourceBoundarySha -notmatch '^[0-9a-f]{40}$') {
+    throw 'BETA1_SOURCE_BOUNDARY_UNAVAILABLE'
+}
+$beta1Head = (git -C $Beta1Worktree rev-parse HEAD).Trim()
+git -C $Beta1Worktree merge-base --is-ancestor $beta1SourceBoundarySha $beta1Head
+if ($LASTEXITCODE -ne 0) { throw 'BETA1_SOURCE_BOUNDARY_NOT_ANCESTOR' }
+
+$beta1AllowedPaths = @(
+    $expectedPlanFiles
+    'docs/releases/gwo-v8-workspace-convergence.md'
+    'docs/releases/gwo-v8-release-train.md'
+    'tests/test_orchestrator_package.py'
+)
+$beta1Commits = @(git -C $Beta1Worktree rev-list "$beta1SourceBoundarySha..$beta1Head")
+$beta1TouchedPaths = @(
+    foreach ($commit in $beta1Commits) {
+        git -C $Beta1Worktree diff-tree --no-commit-id --name-only -r -m $commit
+    }
+)
+$beta1TouchedPaths = @($beta1TouchedPaths | ForEach-Object { $_.Replace('\','/') } | Sort-Object -Unique)
+if (@($beta1TouchedPaths | Where-Object { $_ -notin $beta1AllowedPaths }).Count -ne 0) {
+    throw "BETA1_FILE_SCOPE_DRIFTED:$($beta1TouchedPaths -join ',')"
+}
+$protectedPlanPaths = @(
+    git -C $GaWorktree diff-tree --no-commit-id --name-only -r $ProtectedGaSha |
+        ForEach-Object { $_.Replace('\','/') }
+)
+if (@(Compare-Object ($protectedPlanPaths | Sort-Object) ($expectedPlanFiles | Sort-Object)).Count -ne 0) {
+    throw 'PROTECTED_PLAN_COMMIT_SCOPE_INVALID'
+}
+```
+
+Expected: `$beta1SourceBoundarySha` is an available commit and an ancestor of the Beta1 head; every commit after it touches only the intended Beta1 file scope; and `$ProtectedGaSha` itself contains exactly the two plan files. No post-Beta1 implementation commit can enter the Beta1 branch through an existing local branch.
 
 - [ ] **Step 3: Write the failing structured receipt test**
 
@@ -1035,6 +1709,11 @@ Add to `tests/test_orchestrator_package.py`:
 
 ```python
 def test_beta1_requires_structured_workspace_convergence_receipt():
+    import hashlib
+    import os
+    import re
+    from pathlib import PurePosixPath, PureWindowsPath
+
     receipt_path = ROOT / "docs" / "releases" / "gwo-v8-workspace-convergence.md"
     release_train = (ROOT / "docs" / "releases" / "gwo-v8-release-train.md").read_text("utf-8")
     assert "Workspace Convergence Gate" in release_train
@@ -1057,6 +1736,7 @@ def test_beta1_requires_structured_workspace_convergence_receipt():
         "archive_manifest_sha256",
         "pre_clean_bundle_sha256",
         "post_clean_bundle_sha256",
+        "evidence",
         "completed_at",
     }
     assert receipt["schema"] == "gwo-workspace-convergence.v1"
@@ -1079,22 +1759,112 @@ def test_beta1_requires_structured_workspace_convergence_receipt():
         "post_clean_bundle_sha256",
     ):
         assert re.fullmatch(r"[0-9a-f]{64}", receipt[key])
+    evidence = receipt["evidence"]
+    assert set(evidence) == {
+        "manifest",
+        "pre_clean_bundle",
+        "post_clean_bundle",
+        "remote_ga_readback",
+    }
+    assert evidence["manifest"] == {
+        "path": "convergence-manifest.json",
+        "sha256": receipt["archive_manifest_sha256"],
+    }
+    assert evidence["pre_clean_bundle"] == {
+        "path": "pre-clean.bundle",
+        "sha256": receipt["pre_clean_bundle_sha256"],
+    }
+    assert evidence["post_clean_bundle"] == {
+        "path": "post-clean.bundle",
+        "sha256": receipt["post_clean_bundle_sha256"],
+    }
+    assert evidence["remote_ga_readback"] == {
+        "path": "inventory/remote-ga-ref-after.txt",
+        "ref": receipt["protected_remote_ref"],
+        "sha256": receipt["protected_remote_sha"],
+    }
+
+    def relative_path(value):
+        assert not Path(value).is_absolute()
+        assert not PureWindowsPath(value).is_absolute()
+        relative = PurePosixPath(value)
+        assert ".." not in relative.parts
+        return Path(*relative.parts)
+
+    for item in evidence.values():
+        relative_path(item["path"])
+
+    archive_root_value = os.environ.get("GWO_CONVERGENCE_ARCHIVE_ROOT", "").strip()
+    assert archive_root_value, "GWO_CONVERGENCE_ARCHIVE_ROOT is required"
+    archive_root = Path(archive_root_value)
+    assert archive_root.is_dir(), archive_root
+    manifest_path = archive_root / relative_path(evidence["manifest"]["path"])
+    assert manifest_path.is_file(), manifest_path
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == receipt["archive_manifest_sha256"]
+    assert manifest["source_sha"] == receipt["source_sha"]
+    assert manifest["protected_remote_ref"] == receipt["protected_remote_ref"]
+    assert manifest["protected_remote_sha"] == receipt["protected_remote_sha"]
+    assert manifest["pre_clean_bundle_sha256"] == receipt["pre_clean_bundle_sha256"]
+    assert manifest["post_clean_bundle_sha256"] == receipt["post_clean_bundle_sha256"]
+    for receipt_key, evidence_key in (
+        ("pre_clean_bundle_sha256", "pre_clean_bundle"),
+        ("post_clean_bundle_sha256", "post_clean_bundle"),
+    ):
+        bundle_path = archive_root / relative_path(evidence[evidence_key]["path"])
+        assert bundle_path.is_file(), bundle_path
+        assert hashlib.sha256(bundle_path.read_bytes()).hexdigest() == receipt[receipt_key]
+    readback_path = archive_root / relative_path(evidence["remote_ga_readback"]["path"])
+    assert readback_path.is_file(), readback_path
+    readback_lines = readback_path.read_text(encoding="utf-8").splitlines()
+    assert len(readback_lines) == 1
+    readback_parts = readback_lines[0].split()
+    assert len(readback_parts) == 2
+    readback_sha, readback_ref = readback_parts
+    assert readback_sha == receipt["protected_remote_sha"]
+    assert readback_ref == receipt["protected_remote_ref"]
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T.+Z", receipt["completed_at"])
 ```
 
 - [ ] **Step 4: Run RED**
 
 ```powershell
-py -3.13 -m pytest `
-    tests/test_orchestrator_package.py::test_beta1_requires_structured_workspace_convergence_receipt `
-    -q
+$previousArchiveRoot = $env:GWO_CONVERGENCE_ARCHIVE_ROOT
+try {
+    $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $ArchiveRoot
+    py -3.13 -m pytest `
+        tests/test_orchestrator_package.py::test_beta1_requires_structured_workspace_convergence_receipt `
+        -q
+    if ($LASTEXITCODE -eq 0) { throw 'RECEIPT_RED_DID_NOT_FAIL' }
+} finally {
+    if ($null -eq $previousArchiveRoot) {
+        Remove-Item -LiteralPath Env:\GWO_CONVERGENCE_ARCHIVE_ROOT -ErrorAction SilentlyContinue
+    } else {
+        $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $previousArchiveRoot
+    }
+}
 ```
 
-Expected: FAIL because the receipt file and release-train gate are absent.
+Expected: FAIL because the receipt file and release-train gate are absent; the archive-root variable is still explicitly set and restored safely for this test command.
 
 - [ ] **Step 5: Render the receipt from verified runtime values**
 
-Read the actual manifest and SHA files under `$ArchiveRoot`; write `docs/releases/gwo-v8-workspace-convergence.md` with one fenced JSON object containing exactly the tested keys. `archive_manifest_sha256`, bundle hashes, and `completed_at` come from Task 6 readback; never copy planning-time placeholder values.
+Read the actual manifest and SHA files under `$ArchiveRoot`; read the final `inventory\remote-ga-ref-after.txt`; and write `docs/releases/gwo-v8-workspace-convergence.md` with one fenced JSON object containing exactly the tested keys. `archive_manifest_sha256`, bundle hashes, the protected remote ref/SHA, and `completed_at` come from Task 6 readback; never copy planning-time placeholder values. Add this `evidence` object using archive-relative paths only:
+
+```json
+{
+  "manifest": {"path": "convergence-manifest.json", "sha256": "<archive_manifest_sha256>"},
+  "pre_clean_bundle": {"path": "pre-clean.bundle", "sha256": "<pre_clean_bundle_sha256>"},
+  "post_clean_bundle": {"path": "post-clean.bundle", "sha256": "<post_clean_bundle_sha256>"},
+  "remote_ga_readback": {
+    "path": "inventory/remote-ga-ref-after.txt",
+    "ref": "refs/heads/codex/gwo-v8-ga-plan",
+    "sha256": "<protected_remote_sha>"
+  }
+}
+```
+
+The test always requires a non-empty `GWO_CONVERGENCE_ARCHIVE_ROOT` naming an existing directory, checks these relative evidence bindings, recomputes the actual manifest and bundle SHA-256 values, and parses the actual remote readback. A missing variable, non-directory, missing evidence file, hash mismatch, or readback mismatch fails the test; there is no shape-only passing path.
 
 The prose before the JSON states:
 
@@ -1108,26 +1878,46 @@ Update `docs/releases/gwo-v8-release-train.md` so Beta1 explicitly requires the 
 - [ ] **Step 6: Run GREEN and release-contract checks**
 
 ```powershell
-py -3.13 -m pytest `
-    tests/test_orchestrator_package.py::test_beta1_requires_structured_workspace_convergence_receipt `
-    -q
-py -3.13 -m pytest tests/test_orchestrator_package.py -q
-py -3.13 scripts/quick_validate.py
-py -3.13 scripts/sync_orchestrator.py --check
-git diff --check
+$previousArchiveRoot = $env:GWO_CONVERGENCE_ARCHIVE_ROOT
+try {
+    $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $ArchiveRoot
+    py -3.13 -m pytest `
+        tests/test_orchestrator_package.py::test_beta1_requires_structured_workspace_convergence_receipt `
+        -q
+    if ($LASTEXITCODE -ne 0) { throw 'RECEIPT_GREEN_TEST_FAILED' }
+    py -3.13 -m pytest tests/test_orchestrator_package.py -q
+    if ($LASTEXITCODE -ne 0) { throw 'RELEASE_CONTRACT_TESTS_FAILED' }
+    py -3.13 scripts/quick_validate.py
+    if ($LASTEXITCODE -ne 0) { throw 'QUICK_VALIDATE_FAILED' }
+    py -3.13 scripts/sync_orchestrator.py --check
+    if ($LASTEXITCODE -ne 0) { throw 'SYNC_CHECK_FAILED' }
+    git diff --check
+    if ($LASTEXITCODE -ne 0) { throw 'BETA1_DIFF_CHECK_FAILED' }
+} finally {
+    if ($null -eq $previousArchiveRoot) {
+        Remove-Item -LiteralPath Env:\GWO_CONVERGENCE_ARCHIVE_ROOT -ErrorAction SilentlyContinue
+    } else {
+        $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $previousArchiveRoot
+    }
+}
 ```
 
-Expected: all commands pass without regenerating a package manifest.
+Expected: all commands pass with the actual `$ArchiveRoot` evidence bound to the receipt test, without regenerating a package manifest, and the environment variable is restored afterward.
 
 - [ ] **Step 7: Commit, push, and remove the temporary receipt worktree**
 
 ```powershell
-git add `
+git -C $Beta1Worktree add -- `
     docs/releases/gwo-v8-workspace-convergence.md `
     docs/releases/gwo-v8-release-train.md `
     tests/test_orchestrator_package.py
-git commit -m 'docs: record workspace convergence gate'
-git push --set-upstream origin codex/gwo-v8-beta1
+if ($LASTEXITCODE -ne 0) { throw 'BETA1_RECEIPT_STAGE_FAILED' }
+git -C $Beta1Worktree diff --cached --check
+if ($LASTEXITCODE -ne 0) { throw 'BETA1_RECEIPT_DIFF_CHECK_FAILED' }
+git -C $Beta1Worktree commit -m 'docs: record workspace convergence gate'
+if ($LASTEXITCODE -ne 0) { throw 'BETA1_RECEIPT_COMMIT_FAILED' }
+git -C $Beta1Worktree push --set-upstream origin codex/gwo-v8-beta1
+if ($LASTEXITCODE -ne 0) { throw 'BETA1_RECEIPT_PUSH_FAILED' }
 ```
 
 Read back the remote Beta1 branch SHA. Then return to the canonical root and remove only the clean temporary worktree:
@@ -1179,7 +1969,9 @@ git -C $Repo bundle verify (Join-Path $ArchiveRoot 'pre-clean.bundle')
 git -C $Repo bundle verify (Join-Path $ArchiveRoot 'post-clean.bundle')
 git -C $Repo ls-remote --heads origin refs/heads/codex/gwo-v8-ga-plan refs/heads/codex/gwo-v8-beta1
 Push-Location $GaWorktree
+$previousArchiveRoot = $env:GWO_CONVERGENCE_ARCHIVE_ROOT
 try {
+    $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $ArchiveRoot
     py -3.13 -m pytest -q
     if ($LASTEXITCODE -ne 0) { throw 'GA_FULL_SUITE_FAILED' }
     py -3.13 scripts/quick_validate.py
@@ -1189,6 +1981,11 @@ try {
     git diff --check
     if ($LASTEXITCODE -ne 0) { throw 'GA_DIFF_CHECK_FAILED' }
 } finally {
+    if ($null -eq $previousArchiveRoot) {
+        Remove-Item -LiteralPath Env:\GWO_CONVERGENCE_ARCHIVE_ROOT -ErrorAction SilentlyContinue
+    } else {
+        $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $previousArchiveRoot
+    }
     Pop-Location
 }
 ```
@@ -1205,7 +2002,7 @@ Set Phase 1 `PASS` only when both reviewers and the coordinator independently ag
 - [ ] All 48 test roots are absent; 12 retained log files verify in the archive.
 - [ ] Exactly two registered worktrees remain; both are clean.
 - [ ] Canonical root is latest fast-forwarded `main`; `work/issue-133` ref still exists.
-- [ ] Every pre-clean ref name remains; only `main` may have moved, and only by fast-forward.
+- [ ] Every pre-clean ref name remains; `refs/heads/main` and `refs/remotes/origin/main` may only fast-forward, the captured GA remote ref may only end at `$ProtectedGaSha`, and no other ref moves or additions are accepted.
 - [ ] Paseo live readback contains no removed target and no daemon mutation occurred.
 - [ ] `docs/releases/gwo-v8-workspace-convergence.md` matches the local manifest digests.
 - [ ] Beta1 release contract tests and repository checks pass.
