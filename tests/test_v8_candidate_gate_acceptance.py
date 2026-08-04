@@ -312,6 +312,74 @@ def test_plan_invalidation_requires_the_complete_readback_pair():
     assert raised.value.code == "CANDIDATE_GATE_EVIDENCE_INVALID"
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    ["plan_invalidation_receipt", "plan_invalidation_report"],
+)
+def test_ordinary_rejection_cannot_carry_plan_invalidation_readback(
+    scope_escape_result,
+    field_name,
+):
+    with pytest.raises(CandidateGateError) as raised:
+        CandidateGateResult(
+            status=CandidateGateStatus.ORDINARY_REJECTED,
+            evidence=(),
+            **{field_name: getattr(scope_escape_result, field_name)},
+        )
+    assert raised.value.code == "CANDIDATE_GATE_EVIDENCE_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("status", "field_name"),
+    [
+        (CandidateGateStatus.REVIEW_ACCEPTED, "plan_invalidation_receipt"),
+        (CandidateGateStatus.REVIEW_ACCEPTED, "plan_invalidation_report"),
+        (
+            CandidateGateStatus.PLAN_INVALIDATION_REPORTED,
+            "plan_invalidation_receipt",
+        ),
+        (
+            CandidateGateStatus.PLAN_INVALIDATION_REPORTED,
+            "plan_invalidation_report",
+        ),
+    ],
+)
+def test_partial_plan_invalidation_pair_is_rejected_for_every_status(
+    scope_escape_result,
+    status,
+    field_name,
+):
+    with pytest.raises(CandidateGateError) as raised:
+        CandidateGateResult(
+            status=status,
+            evidence=(),
+            **{field_name: getattr(scope_escape_result, field_name)},
+        )
+    assert raised.value.code == "CANDIDATE_GATE_EVIDENCE_INVALID"
+
+
+def test_plan_invalidation_pair_requires_receipt_report_digest_binding(
+    scope_escape_result,
+):
+    receipt = scope_escape_result.plan_invalidation_receipt
+    assert receipt is not None
+    assert scope_escape_result.plan_invalidation_report is not None
+    stale_digest = "0" * 64
+    stale_receipt = replace(
+        receipt,
+        report_digest=stale_digest,
+        observation={**receipt.observation, "report_digest": stale_digest},
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        CandidateGateResult(
+            status=CandidateGateStatus.PLAN_INVALIDATION_REPORTED,
+            evidence=scope_escape_result.evidence,
+            plan_invalidation_receipt=stale_receipt,
+            plan_invalidation_report=scope_escape_result.plan_invalidation_report,
+        )
+    assert raised.value.code == "CANDIDATE_GATE_EVIDENCE_INVALID"
+
+
 def test_public_acceptance_requires_the_accepted_candidate_receipt(
     accepted_candidate_result,
 ):

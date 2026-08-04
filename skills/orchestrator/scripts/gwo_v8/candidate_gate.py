@@ -2678,11 +2678,23 @@ class CandidateGateResult:
                 self.review_finding_ledger_digest,
                 "review_finding_ledger_digest",
             )
-        has_invalidation = self.status is CandidateGateStatus.PLAN_INVALIDATION_REPORTED
-        if has_invalidation != (
-            self.plan_invalidation_receipt is not None
-            and self.plan_invalidation_report is not None
+        has_receipt = self.plan_invalidation_receipt is not None
+        has_report = self.plan_invalidation_report is not None
+        if has_receipt != has_report:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_EVIDENCE_INVALID",
+                "Plan Invalidation receipt and report must be both present or absent",
+            )
+        if has_receipt and (
+            self.plan_invalidation_receipt.report_digest
+            != self.plan_invalidation_report.digest
         ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_EVIDENCE_INVALID",
+                "Plan Invalidation receipt is not bound to its report",
+            )
+        has_invalidation = self.status is CandidateGateStatus.PLAN_INVALIDATION_REPORTED
+        if has_invalidation != (has_receipt and has_report):
             raise CandidateGateError(
                 "CANDIDATE_GATE_EVIDENCE_INVALID",
                 "Plan Invalidation status and readback pair do not match",

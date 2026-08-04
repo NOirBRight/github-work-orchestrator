@@ -64,3 +64,23 @@ the Task 5 contract: Plan Invalidation keeps its report/readback boundary,
 `classification` remains `None`, and both `review_subject` and the compatibility
 `formal_review_request` are `None`. The public test still exercises the full
 scope-escape and public advance path.
+
+## Review fix
+
+The review regressions were written and run before production changes:
+
+```powershell
+py -3.13 -m pytest tests/test_v8_candidate_gate_acceptance.py -q
+```
+
+Result: exit code `1`; `5 failed, 8 passed`. The failures covered isolated
+receipt/report fields on ordinary and accepted results, and a receipt/report
+digest mismatch.
+
+The minimal invariant now requires receipt and report to be both absent or
+both present for every status, requires both for Plan Invalidation, and binds
+`PlanInvalidationReceipt.report_digest` to `PlanInvalidationReport.digest`.
+
+The post-fix focused suite passed with `67 passed, 1 warning`. After regenerating
+the manifest, `quick_validate.py`, `sync_orchestrator.py --check`, and
+`git diff --check` all passed.
