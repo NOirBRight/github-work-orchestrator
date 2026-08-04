@@ -11,7 +11,6 @@ from gwo_v8._batch_integrator_store import (
     HostedResultReceipt,
     SqliteBatchDeliveryJournal,
 )
-from gwo_v8._batch_integrator_drivers import patch_identity_for_trees
 from gwo_v8.batch_integrator import (
     AncestorReadback,
     BatchDeliveryAction,
@@ -347,9 +346,6 @@ def make_disjoint_git_candidates(
         _run_git(repository, "commit", "--quiet", "-m", f"candidate {index}")
         candidate_sha = _run_git(repository, "rev-parse", "HEAD")
         candidate_tree_oid = _run_git(repository, "rev-parse", "HEAD^{tree}")
-        diff_record_digest = patch_identity_for_trees(
-            repository, target_tree_oid, candidate_tree_oid
-        )
         candidates.append(
             make_accepted_candidate_receipt(
                 repository="owner/repo",
@@ -359,7 +355,6 @@ def make_disjoint_git_candidates(
                 base_tree_oid=target_tree_oid,
                 candidate_sha=candidate_sha,
                 candidate_tree_oid=candidate_tree_oid,
-                diff_record_digest=diff_record_digest,
             )
         )
     _run_git(repository, "switch", "--quiet", "main")

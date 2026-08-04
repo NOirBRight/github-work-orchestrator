@@ -471,7 +471,14 @@ class GitCliBatchDriver:
             InteractionKey(
                 namespace="candidate-path",
                 value=_path_token(path),
-                classification=InteractionClassification.ORDINARY,
+                classification=(
+                    InteractionClassification.HIGH_COUPLING
+                    if (
+                        old_entries.get(path, ("", "", ""))[1] == "gitlink"
+                        or new_entries.get(path, ("", "", ""))[1] == "gitlink"
+                    )
+                    else InteractionClassification.ORDINARY
+                ),
             )
             for path in changed_paths
         )
@@ -486,6 +493,51 @@ class GitCliBatchDriver:
             target_head_sha=target.target_head_sha,
             interaction_keys=interaction_keys,
             protected_interaction_keys=(),
+            facts_digest=digest_value(body),
+            readback_digest=digest_value(
+                {"kind": "target-delta-readback.v1", **body}
+            ),
+        )
+
+    @staticmethod
+    def _apply_member_policy(
+        target_delta: "TargetDeltaReadback",
+        member: AcceptedCandidateReceipt,
+    ) -> "TargetDeltaReadback":
+        from .batch_integrator import TargetDeltaReadback
+
+        protected_surfaces = set(member.protected_surfaces)
+        member_interactions = {
+            (key.namespace, key.value): key.classification
+            for key in member.interaction_keys
+            if key.requires_singleton
+        }
+        keys = tuple(
+            InteractionKey(
+                namespace=key.namespace,
+                value=key.value,
+                classification=(
+                    InteractionClassification.PROTECTED
+                    if key.value in protected_surfaces
+                    else member_interactions.get(
+                        (key.namespace, key.value), key.classification
+                    )
+                ),
+            )
+            for key in target_delta.interaction_keys
+        )
+        protected = tuple(key for key in keys if key.requires_singleton)
+        body = {
+            "base_sha": target_delta.base_sha,
+            "target_head_sha": target_delta.target_head_sha,
+            "interaction_keys": [key.canonical() for key in keys],
+            "protected_interaction_keys": [key.canonical() for key in protected],
+        }
+        return TargetDeltaReadback(
+            base_sha=target_delta.base_sha,
+            target_head_sha=target_delta.target_head_sha,
+            interaction_keys=keys,
+            protected_interaction_keys=protected,
             facts_digest=digest_value(body),
             readback_digest=digest_value(
                 {"kind": "target-delta-readback.v1", **body}
@@ -701,15 +753,12 @@ class GitCliBatchDriver:
         self.clean_base_advance_calls.append(member.ticket_key)
         candidate_tree = self._verify_member(member)
         ancestor = self.read_ancestor(member.base_sha, target.target_head_sha)
-        target_delta = self.read_target_delta(member.base_sha, target)
+        target_delta = self._apply_member_policy(
+            self.read_target_delta(member.base_sha, target), member
+        )
         original_patch_digest = _patch_identity_for_trees(
             self.repository, member.base_tree_oid, candidate_tree
         )
-        if original_patch_digest != member.diff_record_digest:
-            raise _batch_error(
-                "CLEAN_BASE_PATCH_IDENTITY_MISMATCH",
-                "stored Candidate PatchIdentityV1 does not match its Git trees",
-            )
         directory, worktree = self._with_worktree(target.target_head_sha)
         try:
             completed = subprocess.run(
@@ -787,6 +836,11 @@ class GitCliBatchDriver:
         existing = self.read_ref(ref)
         if existing is not None:
             self._verify_batch_ref(existing, target, members)
+            if self.read_target(target) != target:
+                raise _batch_error(
+                    "BATCH_TARGET_READBACK_MISMATCH",
+                    "target branch moved while reusing a Batch ref",
+                )
             return existing
         self.compose_calls += 1
         if len(members) == 1 and (
