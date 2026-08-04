@@ -11,17 +11,25 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from gwo_v8.batch_integrator import (
+    AncestorReadback,
     BatchIntegrator,
     BatchIntegratorConfiguration,
     BatchDeliveryObservation,
     BatchDeliveryProof,
     BatchIntegratorError,
     MemberDeliveryObservation,
+    TargetDeltaReadback,
 )
+from gwo_v8.batch_patch_identity import patch_identity_v1, require_clean_base_advance
 from gwo_v8._canonical import digest_value
+from gwo_v8.candidate_gate import InteractionClassification
 from v8_batch_test_support import (
     make_accepted_candidate_receipt,
     make_batch_request,
+    make_ancestor_readback,
+    make_interaction_key,
+    make_patch_entry,
+    make_target_delta,
 )
 
 
@@ -144,3 +152,77 @@ def test_batch_observation_preserves_exact_delivery_proof_partition():
     )
 
     assert observation.canonical()["delivery_proofs"] == [proof.canonical()]
+
+
+def test_patch_identity_v1_is_independent_of_entry_input_order():
+    entries = (
+        make_patch_entry("b.txt", old_oid="1" * 40, new_oid="2" * 40),
+        make_patch_entry("a.txt", old_oid="3" * 40, new_oid="4" * 40),
+    )
+    assert patch_identity_v1("sha1", entries) == patch_identity_v1(
+        "sha1", tuple(reversed(entries))
+    )
+
+
+def test_patch_identity_v1_changes_for_mode_binary_and_gitlink_identity():
+    base = make_patch_entry("tool", old_mode="100644", new_mode="100755")
+    binary = make_patch_entry("image.bin", old_oid="1" * 40, new_oid="2" * 40)
+    gitlink = make_patch_entry(
+        "submodule",
+        old_mode="160000",
+        new_mode="160000",
+        old_oid="3" * 40,
+        new_oid="4" * 40,
+        old_object_type="gitlink",
+        new_object_type="gitlink",
+    )
+
+    assert len(
+        {patch_identity_v1("sha1", (entry,)) for entry in (base, binary, gitlink)}
+    ) == 3
+
+
+def test_clean_base_advance_rejects_recomputed_patch_identity_mismatch():
+    member = make_accepted_candidate_receipt()
+    with pytest.raises(BatchIntegratorError, match="PatchIdentityV1"):
+        require_clean_base_advance(
+            member=member,
+            original_patch_digest="a" * 64,
+            recomputed_patch_digest="b" * 64,
+            ancestor=make_ancestor_readback(member.base_sha, "b" * 40),
+            target_delta=make_target_delta(member.base_sha, "b" * 40),
+        )
+
+
+def test_clean_base_advance_requires_authoritative_original_base_ancestor():
+    member = make_accepted_candidate_receipt()
+    ancestor = make_ancestor_readback(member.base_sha, "b" * 40, is_ancestor=False)
+
+    with pytest.raises(BatchIntegratorError, match="CLEAN_BASE_ANCESTOR_REQUIRED"):
+        require_clean_base_advance(
+            member=member,
+            original_patch_digest=member.diff_record_digest,
+            recomputed_patch_digest=member.diff_record_digest,
+            ancestor=ancestor,
+            target_delta=make_target_delta(member.base_sha, "b" * 40),
+        )
+
+
+def test_clean_base_advance_rejects_protected_target_delta_interaction_key():
+    member = make_accepted_candidate_receipt()
+    protected = make_interaction_key(
+        "schema:root", classification=InteractionClassification.PROTECTED
+    )
+
+    with pytest.raises(
+        BatchIntegratorError, match="TARGET_DELTA_PROTECTED_INTERACTION"
+    ):
+        require_clean_base_advance(
+            member=member,
+            original_patch_digest=member.diff_record_digest,
+            recomputed_patch_digest=member.diff_record_digest,
+            ancestor=make_ancestor_readback(member.base_sha, "b" * 40),
+            target_delta=make_target_delta(
+                member.base_sha, "b" * 40, interaction_keys=(protected,)
+            ),
+        )

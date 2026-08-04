@@ -5,6 +5,7 @@ from typing import Literal
 
 from gwo_v8._canonical import digest_value
 from gwo_v8.batch_integrator import (
+    AncestorReadback,
     BatchDeliveryRequest,
     BatchIntegrator,
     BatchIntegratorConfiguration,
@@ -13,7 +14,9 @@ from gwo_v8.batch_integrator import (
     DeliveryAttributionAmbiguous,
     HostedSuiteDefinition,
     LocalSuiteDefinition,
+    TargetDeltaReadback,
 )
+from gwo_v8.batch_patch_identity import PatchIdentityEntry
 from gwo_v8.candidate_gate import (
     AcceptedCandidateReceipt,
     CandidateGateError,
@@ -136,4 +139,97 @@ def make_batch_request(
         ),
         writer_generation="writer:test",
         activation_id="activation:test",
+    )
+
+
+def make_batch_target(
+    *,
+    repository: str = "owner/repo",
+    target_branch: str = "main",
+    target_head_sha: str = "b" * 40,
+    target_tree_oid: str = "8" * 40,
+    target_facts_digest: str = "9" * 64,
+) -> BatchTarget:
+    return BatchTarget(
+        repository=repository,
+        target_branch=target_branch,
+        target_head_sha=target_head_sha,
+        target_tree_oid=target_tree_oid,
+        target_facts_digest=target_facts_digest,
+    )
+
+
+def make_three_standard_receipts() -> tuple[AcceptedCandidateReceipt, ...]:
+    return tuple(
+        make_accepted_candidate_receipt(
+            ticket_key=f"issue:{index}",
+            accepted_sequence=index,
+        )
+        for index in range(1, 4)
+    )
+
+
+def make_patch_entry(
+    path: str,
+    *,
+    old_path: str | None = None,
+    new_path: str | None = None,
+    change_kind: Literal["add", "delete", "modify", "type-change"] = "modify",
+    old_mode: str = "100644",
+    new_mode: str = "100644",
+    old_oid: str = "a" * 40,
+    new_oid: str = "a" * 40,
+    old_object_type: Literal["blob", "gitlink"] = "blob",
+    new_object_type: Literal["blob", "gitlink"] = "blob",
+) -> PatchIdentityEntry:
+    return PatchIdentityEntry(
+        old_path=old_path if old_path is not None else path,
+        new_path=new_path if new_path is not None else path,
+        change_kind=change_kind,
+        old_mode=old_mode,
+        new_mode=new_mode,
+        old_object_type=old_object_type,
+        new_object_type=new_object_type,
+        old_oid=old_oid,
+        new_oid=new_oid,
+    )
+
+
+def make_ancestor_readback(
+    ancestor_sha: str,
+    descendant_sha: str,
+    *,
+    is_ancestor: bool = True,
+) -> AncestorReadback:
+    body = {
+        "ancestor_sha": ancestor_sha,
+        "descendant_sha": descendant_sha,
+        "is_ancestor": is_ancestor,
+    }
+    return AncestorReadback(
+        **body,
+        readback_digest=digest_value({"kind": "ancestor-readback.v1", **body}),
+    )
+
+
+def make_target_delta(
+    base_sha: str,
+    target_head_sha: str,
+    *,
+    interaction_keys: tuple[InteractionKey, ...] = (),
+) -> TargetDeltaReadback:
+    protected = tuple(key for key in interaction_keys if key.requires_singleton)
+    body = {
+        "base_sha": base_sha,
+        "target_head_sha": target_head_sha,
+        "interaction_keys": [key.canonical() for key in interaction_keys],
+        "protected_interaction_keys": [key.canonical() for key in protected],
+    }
+    return TargetDeltaReadback(
+        base_sha=base_sha,
+        target_head_sha=target_head_sha,
+        interaction_keys=interaction_keys,
+        protected_interaction_keys=protected,
+        facts_digest=digest_value(body),
+        readback_digest=digest_value({"kind": "target-delta-readback.v1", **body}),
     )

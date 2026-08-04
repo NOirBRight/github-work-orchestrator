@@ -559,6 +559,74 @@ class BatchDeliveryObservation:
         return {**self.body(), "receipt_digest": self.receipt_digest}
 
 
+@dataclass(frozen=True)
+class AncestorReadback:
+    ancestor_sha: str
+    descendant_sha: str
+    is_ancestor: bool
+    readback_digest: str
+
+    def body(self) -> dict[str, object]:
+        return {
+            "ancestor_sha": self.ancestor_sha,
+            "descendant_sha": self.descendant_sha,
+            "is_ancestor": self.is_ancestor,
+        }
+
+    def validate(self) -> None:
+        _require_object_id("ancestor_sha", self.ancestor_sha)
+        _require_object_id("descendant_sha", self.descendant_sha)
+        if type(self.is_ancestor) is not bool:
+            raise BatchIntegratorError(
+                "CLEAN_BASE_ANCESTOR_READBACK_MISMATCH",
+                "ancestor readback has a non-boolean ancestry fact",
+            )
+        _require_digest("ancestor readback_digest", self.readback_digest)
+        if digest_value({"kind": "ancestor-readback.v1", **self.body()}) != self.readback_digest:
+            raise BatchIntegratorError(
+                "CLEAN_BASE_ANCESTOR_READBACK_MISMATCH",
+                "ancestor readback digest is not authoritative",
+            )
+
+
+@dataclass(frozen=True)
+class TargetDeltaReadback:
+    base_sha: str
+    target_head_sha: str
+    interaction_keys: tuple[InteractionKey, ...]
+    protected_interaction_keys: tuple[InteractionKey, ...]
+    facts_digest: str
+    readback_digest: str
+
+    def body(self) -> dict[str, object]:
+        return {
+            "base_sha": self.base_sha,
+            "target_head_sha": self.target_head_sha,
+            "interaction_keys": [key.canonical() for key in self.interaction_keys],
+            "protected_interaction_keys": [
+                key.canonical() for key in self.protected_interaction_keys
+            ],
+        }
+
+    def canonical(self) -> dict[str, object]:
+        _require_object_id("target delta base_sha", self.base_sha)
+        _require_object_id("target delta target_head_sha", self.target_head_sha)
+        _require_digest("target delta facts_digest", self.facts_digest)
+        _require_digest("target delta readback_digest", self.readback_digest)
+        body = self.body()
+        if digest_value(body) != self.facts_digest:
+            raise BatchIntegratorError(
+                "TARGET_DELTA_FACTS_DIGEST_MISMATCH",
+                "target delta Interaction Key facts are not canonical",
+            )
+        if digest_value({"kind": "target-delta-readback.v1", **body}) != self.readback_digest:
+            raise BatchIntegratorError(
+                "TARGET_DELTA_READBACK_DIGEST_MISMATCH",
+                "target delta readback is not authoritative",
+            )
+        return body
+
+
 class BatchIntegrator:
     def __init__(
         self,
