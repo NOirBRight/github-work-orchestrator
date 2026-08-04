@@ -513,7 +513,7 @@ class GitCliBatchDriver:
 
         protected_surfaces = set(member.protected_surfaces)
 
-        def value_aliases(value: str) -> set[str]:
+        def value_aliases(value: str) -> tuple[str, ...]:
             aliases = {value}
             try:
                 raw_value = base64.urlsafe_b64decode(
@@ -531,16 +531,23 @@ class GitCliBatchDriver:
                 .decode("ascii")
                 .rstrip("=")
             )
-            return aliases
+            return tuple(sorted(aliases))
 
         member_interactions: dict[tuple[str, str], InteractionClassification] = {}
+        classification_priority = {
+            InteractionClassification.ORDINARY: 0,
+            InteractionClassification.HIGH_COUPLING: 1,
+            InteractionClassification.NON_DECOMPOSABLE: 2,
+            InteractionClassification.PROTECTED: 3,
+        }
         for interaction in member.interaction_keys:
             if not interaction.requires_singleton:
                 continue
             for alias in value_aliases(interaction.value):
                 current = member_interactions.get((interaction.namespace, alias))
                 if current is None or (
-                    interaction.classification.value > current.value
+                    classification_priority[interaction.classification]
+                    > classification_priority[current]
                 ):
                     member_interactions[(interaction.namespace, alias)] = (
                         interaction.classification
