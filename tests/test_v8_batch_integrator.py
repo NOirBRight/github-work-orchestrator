@@ -17,16 +17,20 @@ from gwo_v8.batch_integrator import (
     BatchDeliveryObservation,
     BatchDeliveryProof,
     BatchIntegratorError,
+    DeliveryIdentityMismatch,
     MemberDeliveryObservation,
     TargetDeltaReadback,
 )
 from gwo_v8.batch_patch_identity import patch_identity_v1, require_clean_base_advance
 from gwo_v8._canonical import digest_value
+from gwo_v8._batch_integrator_store import SqliteBatchDeliveryJournal
 from gwo_v8.candidate_gate import InteractionClassification
 from v8_batch_test_support import (
     make_accepted_candidate_receipt,
+    make_batch_action,
     make_batch_request,
     make_ancestor_readback,
+    make_hosted_result_receipt,
     make_interaction_key,
     make_patch_entry,
     make_target_delta,
@@ -258,3 +262,91 @@ def test_clean_base_advance_rejects_forged_protected_partition():
             ancestor=make_ancestor_readback(member.base_sha, "b" * 40),
             target_delta=forged_delta,
         )
+
+
+def test_integration_lease_compare_and_swap_keeps_the_first_holder(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    first = journal.acquire_integration_lease(
+        "owner/repo", "action:one", "gen:1", "activation:1"
+    )
+
+    with pytest.raises(BatchIntegratorError, match="INTEGRATION_LEASE_UNAVAILABLE"):
+        journal.acquire_integration_lease(
+            "owner/repo", "action:two", "gen:1", "activation:1"
+        )
+
+    assert journal.read_integration_lease("owner/repo") == first
+
+
+def test_stale_lease_release_cannot_delete_the_current_holder(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    journal.acquire_integration_lease(
+        "owner/repo", "action:one", "gen:1", "activation:1"
+    )
+
+    with pytest.raises(BatchIntegratorError, match="INTEGRATION_LEASE_OWNER_MISMATCH"):
+        journal.release_integration_lease("owner/repo", "action:two")
+
+    assert journal.read_integration_lease("owner/repo") is not None
+
+
+def test_batch_journal_record_and_integration_lease_receipt_have_exact_bodies(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    action = make_batch_action()
+    record = journal.create_action(action, action.request_digest)
+    lease = journal.acquire_integration_lease(
+        "owner/repo", "action:one", "gen:1", "activation:1"
+    )
+
+    assert record.body() == {
+        "stable_action_id": action.stable_action_id,
+        "request_digest": action.request_digest,
+        "batch_id": action.batch_id,
+        "batch_sha": action.batch_sha,
+        "phase": "prepared",
+        "reason": "prepared",
+        "retry_count": 0,
+        "fallback_generation": 0,
+        "state_json": "{}",
+        "version": 0,
+    }
+    assert lease.body() == {
+        "repository": "owner/repo",
+        "holder": "action:one",
+        "writer_generation": "gen:1",
+        "activation_id": "activation:1",
+    }
+    assert lease.lease_digest == digest_value(
+        {"kind": "integration-lease.v1", **lease.body()}
+    )
+
+
+def test_stale_batch_action_write_does_not_overwrite_newer_version(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    action = make_batch_action()
+    created = journal.create_action(action, action.request_digest)
+    newer = journal.advance_action(
+        created, phase="published", reason="publication read back"
+    )
+
+    with pytest.raises(BatchIntegratorError, match="BATCH_ACTION_CAS_CONFLICT"):
+        journal.compare_and_swap_action(
+            action.stable_action_id,
+            expected_version=created.version,
+            expected_phase="prepared",
+            next_record=replace(
+                newer, phase="integrating", version=created.version + 1
+            ),
+        )
+
+    assert journal.read_action(action.stable_action_id).phase == "published"
+
+
+def test_identical_terminal_hosted_receipt_replays_but_wrong_identity_fails(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    receipt = make_hosted_result_receipt()
+    assert journal.persist_hosted_result(receipt) == receipt
+    assert journal.persist_hosted_result(receipt) == receipt
+
+    with pytest.raises(DeliveryIdentityMismatch):
+        journal.persist_hosted_result(replace(receipt, batch_sha="b" * 40))

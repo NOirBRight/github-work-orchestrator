@@ -4,8 +4,13 @@ from dataclasses import replace
 from typing import Literal
 
 from gwo_v8._canonical import digest_value
+from gwo_v8._batch_integrator_store import (
+    HostedResultReceipt,
+    SqliteBatchDeliveryJournal,
+)
 from gwo_v8.batch_integrator import (
     AncestorReadback,
+    BatchDeliveryAction,
     BatchDeliveryRequest,
     BatchIntegrator,
     BatchIntegratorConfiguration,
@@ -232,4 +237,47 @@ def make_target_delta(
         protected_interaction_keys=protected,
         facts_digest=digest_value(body),
         readback_digest=digest_value({"kind": "target-delta-readback.v1", **body}),
+    )
+
+
+def make_batch_action(
+    *,
+    stable_action_id: str = "delivery-action:1",
+    request_digest: str = "a" * 64,
+    batch_id: str = "b" * 64,
+    batch_sha: str = "c" * 40,
+    member_ticket_keys: tuple[str, ...] = ("issue:1",),
+) -> BatchDeliveryAction:
+    return BatchDeliveryAction(
+        stable_action_id=stable_action_id,
+        request_digest=request_digest,
+        batch_id=batch_id,
+        batch_sha=batch_sha,
+        member_ticket_keys=member_ticket_keys,
+    )
+
+
+def make_hosted_result_receipt(
+    *,
+    stable_action_id: str = "delivery-action:1",
+    batch_sha: str = "c" * 40,
+    suite_id: str = "hosted",
+    provider_check_id: str = "check:1",
+    outcome: Literal["passed", "code_failure", "infrastructure_failure"] = "passed",
+    observation_digest: str = "e" * 64,
+) -> HostedResultReceipt:
+    body = {
+        "stable_action_id": stable_action_id,
+        "batch_sha": batch_sha,
+        "suite_id": suite_id,
+        "provider_check_id": provider_check_id,
+        "outcome": outcome,
+        "observation_digest": observation_digest,
+        "source_ref": "checks:hosted",
+    }
+    return HostedResultReceipt(
+        **body,
+        receipt_digest=digest_value(
+            {"kind": "hosted_result_receipt.v1", **body}
+        ),
     )

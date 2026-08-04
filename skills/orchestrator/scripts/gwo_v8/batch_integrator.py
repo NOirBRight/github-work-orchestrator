@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass
 from types import MappingProxyType
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from ._canonical import digest_value
 from .candidate_gate import (
@@ -13,6 +13,9 @@ from .candidate_gate import (
     InteractionClassification,
     InteractionKey,
 )
+
+if TYPE_CHECKING:
+    from ._batch_integrator_store import BatchDeliveryJournal
 
 
 class BatchIntegratorError(RuntimeError):
