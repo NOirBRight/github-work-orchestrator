@@ -613,6 +613,14 @@ class TargetDeltaReadback:
         _require_object_id("target delta target_head_sha", self.target_head_sha)
         _require_digest("target delta facts_digest", self.facts_digest)
         _require_digest("target delta readback_digest", self.readback_digest)
+        derived_protected = tuple(
+            key for key in self.interaction_keys if key.requires_singleton
+        )
+        if derived_protected != self.protected_interaction_keys:
+            raise BatchIntegratorError(
+                "TARGET_DELTA_PROTECTED_INTERACTION",
+                "target delta protected InteractionKey partition is not canonical",
+            )
         body = self.body()
         if digest_value(body) != self.facts_digest:
             raise BatchIntegratorError(

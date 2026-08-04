@@ -226,3 +226,35 @@ def test_clean_base_advance_rejects_protected_target_delta_interaction_key():
                 member.base_sha, "b" * 40, interaction_keys=(protected,)
             ),
         )
+
+
+def test_clean_base_advance_rejects_forged_protected_partition():
+    member = make_accepted_candidate_receipt()
+    protected = make_interaction_key(
+        "schema:root", classification=InteractionClassification.PROTECTED
+    )
+    body = {
+        "base_sha": member.base_sha,
+        "target_head_sha": "b" * 40,
+        "interaction_keys": [protected.canonical()],
+        "protected_interaction_keys": [],
+    }
+    forged_delta = TargetDeltaReadback(
+        base_sha=member.base_sha,
+        target_head_sha="b" * 40,
+        interaction_keys=(protected,),
+        protected_interaction_keys=(),
+        facts_digest=digest_value(body),
+        readback_digest=digest_value(
+            {"kind": "target-delta-readback.v1", **body}
+        ),
+    )
+
+    with pytest.raises(BatchIntegratorError, match="protected"):
+        require_clean_base_advance(
+            member=member,
+            original_patch_digest=member.diff_record_digest,
+            recomputed_patch_digest=member.diff_record_digest,
+            ancestor=make_ancestor_readback(member.base_sha, "b" * 40),
+            target_delta=forged_delta,
+        )
