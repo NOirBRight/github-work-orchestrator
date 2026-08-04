@@ -17,9 +17,11 @@ from gwo_v8.batch_integrator import (
     BatchDeliveryObservation,
     BatchDeliveryProof,
     BatchIntegratorError,
+    CompatibilityDecision,
     DeliveryIdentityMismatch,
     MemberDeliveryObservation,
     TargetDeltaReadback,
+    _pairwise_compatibility,
     form_batch_members,
 )
 from gwo_v8.batch_patch_identity import patch_identity_v1, require_clean_base_advance
@@ -109,6 +111,68 @@ def test_member_limit_rejects_zero_or_more_than_four_and_accepts_repository_over
         host_member_limit=4, repository_member_limits={"owner/repo": 2}
     )
     assert configuration.member_limit_for("owner/repo") == 2
+
+
+def test_pairwise_checks_later_members_before_accepting_clean_base_advance():
+    target = make_batch_target(target_head_sha="b" * 40, target_tree_oid="2" * 40)
+    first = make_accepted_candidate_receipt(
+        ticket_key="issue:1",
+        accepted_sequence=1,
+        base_sha="a" * 40,
+        base_tree_oid="1" * 40,
+        interaction_keys=(make_interaction_key("key-1"),),
+    )
+    second = make_accepted_candidate_receipt(
+        ticket_key="issue:2",
+        accepted_sequence=2,
+        base_sha="a" * 40,
+        base_tree_oid="1" * 40,
+        interaction_keys=(make_interaction_key("key-2"),),
+    )
+    conflicting_later_member = make_accepted_candidate_receipt(
+        ticket_key="issue:3",
+        accepted_sequence=3,
+        base_sha="b" * 40,
+        base_tree_oid="2" * 40,
+        interaction_keys=(make_interaction_key("key-2"),),
+    )
+
+    selected = form_batch_members(
+        (first, second, conflicting_later_member), target, member_limit=4
+    )
+
+    assert selected == (first, second)
+
+
+def test_pairwise_treats_base_tree_mismatch_as_clean_base_advance():
+    target = make_batch_target(target_head_sha="b" * 40, target_tree_oid="2" * 40)
+    first = make_accepted_candidate_receipt(
+        ticket_key="issue:1",
+        accepted_sequence=1,
+        base_sha="b" * 40,
+        base_tree_oid="1" * 40,
+        interaction_keys=(make_interaction_key("key-1"),),
+    )
+    candidate = make_accepted_candidate_receipt(
+        ticket_key="issue:2",
+        accepted_sequence=2,
+        base_sha="b" * 40,
+        base_tree_oid="1" * 40,
+        interaction_keys=(make_interaction_key("key-2"),),
+    )
+
+    assert _pairwise_compatibility(candidate, [first], target) == CompatibilityDecision.CLEAN_BASE_ADVANCE
+
+
+def test_formation_skips_oldest_candidate_outside_target_scope():
+    out_of_scope = make_accepted_candidate_receipt(
+        repository="other/repo", ticket_key="issue:1", accepted_sequence=1
+    )
+    eligible = make_accepted_candidate_receipt(ticket_key="issue:2", accepted_sequence=2)
+
+    assert form_batch_members(
+        (out_of_scope, eligible), make_batch_target(), member_limit=4
+    ) == (eligible,)
 
 
 def test_accepted_candidate_receipt_digest_binds_every_delivery_fact():

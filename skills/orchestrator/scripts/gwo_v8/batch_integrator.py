@@ -657,9 +657,15 @@ def form_batch_members(
             "BATCH_MEMBER_LIMIT_INVALID",
             "member limit must be between one and four",
         )
+    eligible = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.repository == target.repository
+        and candidate.target_branch == target.target_branch
+    )
     ordered = tuple(
         sorted(
-            candidates,
+            eligible,
             key=lambda item: (
                 item.accepted_sequence,
                 item.ticket_key,
@@ -676,8 +682,6 @@ def form_batch_members(
     if not ordered:
         return ()
     seed = ordered[0]
-    if seed.repository != target.repository or seed.target_branch != target.target_branch:
-        return ()
     selected: list[AcceptedCandidateReceipt] = [seed]
     if _requires_singleton(seed):
         return (seed,)
@@ -713,6 +717,7 @@ def _pairwise_compatibility(
 ) -> CompatibilityDecision:
     if _requires_singleton(candidate):
         return CompatibilityDecision.SINGLETON_REQUIRED
+    clean_base_advance = False
     for member in selected:
         if (
             candidate.authority_subtree_digest != member.authority_subtree_digest
@@ -728,7 +733,7 @@ def _pairwise_compatibility(
             candidate.base_sha != member.base_sha
             or candidate.base_tree_oid != member.base_tree_oid
         ):
-            return CompatibilityDecision.CLEAN_BASE_ADVANCE
+            clean_base_advance = True
         for left in candidate.interaction_keys:
             for right in member.interaction_keys:
                 if (
@@ -738,7 +743,12 @@ def _pairwise_compatibility(
                     and left.value == right.value
                 ):
                     return CompatibilityDecision.INCOMPATIBLE
-    if candidate.base_sha != target.target_head_sha:
+    if (
+        candidate.base_sha != target.target_head_sha
+        or candidate.base_tree_oid != target.target_tree_oid
+    ):
+        clean_base_advance = True
+    if clean_base_advance:
         return CompatibilityDecision.CLEAN_BASE_ADVANCE
     return CompatibilityDecision.COMPATIBLE
 
