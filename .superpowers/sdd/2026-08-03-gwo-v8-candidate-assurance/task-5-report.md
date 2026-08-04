@@ -57,10 +57,10 @@ git diff --check
 - Preserved the private Candidate receipt, complete diff, Assurance,
   ReviewSubject, and accepted-Candidate receipt identity boundary.
 
-## Concern
+## Fix follow-up
 
-The combined command including `tests/test_v8_candidate_gate_public.py`
-reports `54 passed, 1 failed` because that excluded, pre-existing test still
-expects `formal_review_request` on a Plan Invalidation result. Task 5's exact
-invariant requires that result to have no `review_subject`, so the compatibility
-property correctly returns `None`. The excluded public test was not modified.
+The legacy public assertion for a Formal Review scope escape was migrated to
+the Task 5 contract: Plan Invalidation keeps its report/readback boundary,
+`classification` remains `None`, and both `review_subject` and the compatibility
+`formal_review_request` are `None`. The public test still exercises the full
+scope-escape and public advance path.

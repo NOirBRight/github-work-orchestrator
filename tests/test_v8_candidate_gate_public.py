@@ -302,8 +302,11 @@ def test_candidate_gate_formal_review_scope_escape_enters_same_public_path_witho
     ).audit_candidate(parent, audit)
     assert result.status is CandidateGateStatus.PLAN_INVALIDATION_REPORTED
     assert result.repair_packet is None
+    assert result.plan_invalidation_report is not None
+    assert result.review_subject is None
+    assert result.accepted_candidate_receipt is None
     assert reviewer.calls == 1
-    assert result.formal_review_request is not None
+    assert result.formal_review_request is None
     assert result.evidence[1].kind == "formal_review_finding"
     assert result.classification is None
     gateway.payload = _payload_with_evidence(
