@@ -382,6 +382,7 @@ Expected: bundle verification succeeds before fetch, push, cleanup, or branch mo
 - Create outside Git: `$ArchiveRoot\dirty\$slug\tracked.patch`
 - Create outside Git: `$ArchiveRoot\dirty\$slug\untracked.zip`
 - Create outside Git: `$ArchiveRoot\dirty\$slug\ignored.txt`
+- Create outside Git: `$ArchiveRoot\inventory\dirty-untracked-files.json`
 - Create outside Git: `$ArchiveRoot\inventory\dirty-archive-sha256.json`
 
 **Interfaces:**
@@ -418,6 +419,7 @@ function New-UntrackedArchive {
     New-Item -ItemType Directory -LiteralPath $stage | Out-Null
 
     $relativePaths = @(git -C $root ls-files --others --exclude-standard)
+    $fileRows = @()
     foreach ($relative in $relativePaths) {
         if ([string]::IsNullOrWhiteSpace($relative)) { continue }
         $source = [IO.Path]::GetFullPath((Join-Path $root $relative))
@@ -428,6 +430,15 @@ function New-UntrackedArchive {
         $destinationParent = Split-Path -Parent $destination
         New-Item -ItemType Directory -LiteralPath $destinationParent -Force | Out-Null
         Copy-Item -LiteralPath $source -Destination $destination
+        $sourceItem = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+        if ($sourceItem.PSIsContainer) { throw "UNTRACKED_PATH_IS_DIRECTORY:$source" }
+        $fileRows += [ordered]@{
+            record_type = 'untracked_file'
+            root_identity = $root
+            relative_path = $relative.Replace('\','/')
+            bytes = [Int64]$sourceItem.Length
+            sha256 = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
     }
 
     [IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip, 'Optimal', $false)
@@ -446,12 +457,14 @@ function New-UntrackedArchive {
         throw 'UNTRACKED_STAGE_OUTSIDE_ARCHIVE'
     }
     Remove-Item -LiteralPath $stage -Recurse -Force
+    return $fileRows
 }
 ```
 
 - [ ] **Step 2: Export status, binary patch, untracked ZIP, and ignored inventory**
 
 ```powershell
+$untrackedFileRows = @()
 foreach ($worktree in $DirtyRoots) {
     $slug = ($worktree.TrimEnd('\') -split '[\\/]')[-1]
     $destination = Join-Path $ArchiveRoot (Join-Path 'dirty' $slug)
@@ -463,8 +476,13 @@ foreach ($worktree in $DirtyRoots) {
         Set-Content -LiteralPath (Join-Path $destination 'tracked.patch') -Encoding utf8NoBOM
     git -C $worktree ls-files --others --ignored --exclude-standard |
         Set-Content -LiteralPath (Join-Path $destination 'ignored.txt') -Encoding utf8NoBOM
-    New-UntrackedArchive -Worktree $worktree -DestinationDirectory $destination
+    $untrackedFileRows += @(New-UntrackedArchive -Worktree $worktree -DestinationDirectory $destination)
 }
+[ordered]@{
+    schema = 'gwo-dirty-untracked-files.v1'
+    files = @($untrackedFileRows)
+} | ConvertTo-Json -Depth 8 |
+    Set-Content -LiteralPath (Join-Path $ArchiveRoot 'inventory\dirty-untracked-files.json') -Encoding utf8NoBOM
 ```
 
 Expected: the root ZIP contains four entries; v8-design contains 27; v8-plan64 contains two; the three other untracked ZIPs are valid and empty.
@@ -472,6 +490,16 @@ Expected: the root ZIP contains four entries; v8-design contains 27; v8-plan64 c
 - [ ] **Step 3: Hash and reopen every archive**
 
 ```powershell
+$untrackedManifest = Get-Content -Raw -LiteralPath (Join-Path $ArchiveRoot 'inventory\dirty-untracked-files.json') |
+    ConvertFrom-Json
+if ($untrackedManifest.schema -ne 'gwo-dirty-untracked-files.v1') {
+    throw 'DIRTY_UNTRACKED_MANIFEST_SCHEMA_INVALID'
+}
+$untrackedFileRows = @($untrackedManifest.files)
+$untrackedKeys = @($untrackedFileRows | ForEach-Object { "$($_.root_identity)|$($_.relative_path)" })
+if (($untrackedKeys | Sort-Object -Unique).Count -ne $untrackedKeys.Count) {
+    throw 'DIRTY_UNTRACKED_MANIFEST_DUPLICATE'
+}
 $dirtyFiles = @(Get-ChildItem -LiteralPath (Join-Path $ArchiveRoot 'dirty') -File -Recurse)
 $archiveRows = foreach ($file in $dirtyFiles) {
     $hash = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256
@@ -511,6 +539,7 @@ $zipEntryRows = foreach ($zipPath in Get-ChildItem -LiteralPath (Join-Path $Arch
 }
 $dirtyArchiveManifest = [ordered]@{
     schema = 'gwo-dirty-archive-sha256.v2'
+    untracked_files = @($untrackedFileRows)
     archive_files = @($archiveRows)
     zip_entries = @($zipEntryRows)
 }
@@ -524,7 +553,7 @@ foreach ($zipPath in Get-ChildItem -LiteralPath (Join-Path $ArchiveRoot 'dirty')
 }
 ```
 
-`dirty-archive-sha256.json` is the immutable pre-delete manifest: `archive_files` records every archive file's bytes and SHA-256, while `zip_entries` records every uncompressed ZIP entry's normalized relative path, bytes, and content SHA-256. Any missing, same-name, size, or content drift fails the later deletion gate.
+`dirty-untracked-files.json` is the immutable per-untracked-file manifest: every row binds a full `root_identity` to a normalized `relative_path`, byte count, and SHA-256. `dirty-archive-sha256.json` repeats those rows under `untracked_files`, records every archive file under `archive_files`, and records every uncompressed ZIP entry under `zip_entries`. Any missing, same-name, size, or content drift fails the later deletion gate.
 
 - [ ] **Step 4: Perform a second status read and fail on drift**
 
@@ -928,6 +957,37 @@ $expectedRootEntries = @(
         $full.Substring($root.Length + 1).Replace('\','/')
     }
 ) | Sort-Object
+$untrackedManifest = Get-Content -Raw -LiteralPath (Join-Path $ArchiveRoot 'inventory\dirty-untracked-files.json') |
+    ConvertFrom-Json
+if ($untrackedManifest.schema -ne 'gwo-dirty-untracked-files.v1') {
+    throw 'ROOT_UNTRACKED_FILE_MANIFEST_SCHEMA_INVALID'
+}
+$rootFileManifestRows = @($untrackedManifest.files | Where-Object {
+    $_.record_type -eq 'untracked_file' -and $_.root_identity -eq $root
+})
+$rootFileManifestEntries = @($rootFileManifestRows | ForEach-Object { $_.relative_path }) | Sort-Object
+if ($rootFileManifestRows.Count -ne $expectedRootEntries.Count -or
+    @(Compare-Object $rootFileManifestEntries $expectedRootEntries).Count -ne 0) {
+    throw 'ROOT_UNTRACKED_FILE_MANIFEST_ENTRY_SET_MISMATCH'
+}
+$dirtyManifestRootFileRows = @($dirtyManifest.untracked_files | Where-Object {
+    $_.record_type -eq 'untracked_file' -and $_.root_identity -eq $root
+})
+if ($dirtyManifestRootFileRows.Count -ne $rootFileManifestRows.Count) {
+    throw 'ROOT_UNTRACKED_ARCHIVE_MANIFEST_FILE_COUNT_MISMATCH'
+}
+foreach ($relative in $expectedRootEntries) {
+    $durableRow = @($rootFileManifestRows | Where-Object { $_.relative_path -eq $relative })
+    $archiveRow = @($dirtyManifestRootFileRows | Where-Object { $_.relative_path -eq $relative })
+    if ($durableRow.Count -ne 1 -or $archiveRow.Count -ne 1) {
+        throw "ROOT_UNTRACKED_FILE_MANIFEST_ROW_MISSING:$relative"
+    }
+    if ($durableRow[0].root_identity -ne $archiveRow[0].root_identity -or
+        [Int64]$durableRow[0].bytes -ne [Int64]$archiveRow[0].bytes -or
+        $durableRow[0].sha256.ToLowerInvariant() -ne $archiveRow[0].sha256.ToLowerInvariant()) {
+        throw "ROOT_UNTRACKED_FILE_MANIFEST_DRIFTED:$relative"
+    }
+}
 $rootZipFileRows = @($dirtyManifest.archive_files | Where-Object {
     $_.record_type -eq 'archive_file' -and $_.path -eq $rootZipRelativePath
 })
@@ -979,13 +1039,43 @@ try {
     $zip.Dispose()
 }
 
-# All path containment and archive-content checks above must pass before any deletion begins.
-foreach ($path in $RootUntracked) {
+# Rehash the four current source files as the final read-only operation immediately before deletion.
+$currentRootRows = foreach ($path in $RootUntracked) {
     $full = [IO.Path]::GetFullPath($path)
-    if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
-        throw "ROOT_UNTRACKED_PATH_ESCAPES:$full"
+    $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if ($item.PSIsContainer) { throw "ROOT_UNTRACKED_PATH_IS_DIRECTORY:$full" }
+    [ordered]@{
+        record_type = 'untracked_file'
+        root_identity = $root
+        relative_path = $full.Substring($root.Length + 1).Replace('\','/')
+        bytes = [Int64]$item.Length
+        sha256 = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 }
+$currentRootEntries = @($currentRootRows | ForEach-Object { $_.relative_path }) | Sort-Object
+if ($currentRootRows.Count -ne $expectedRootEntries.Count -or
+    @(Compare-Object $currentRootEntries $expectedRootEntries).Count -ne 0) {
+    throw 'ROOT_UNTRACKED_CURRENT_ENTRY_SET_MISMATCH'
+}
+foreach ($relative in $expectedRootEntries) {
+    $currentRow = @($currentRootRows | Where-Object { $_.relative_path -eq $relative })
+    $durableRow = @($rootFileManifestRows | Where-Object { $_.relative_path -eq $relative })
+    $zipRow = @($rootZipEntryRows | Where-Object { $_.entry_path -eq $relative })
+    if ($currentRow.Count -ne 1 -or $durableRow.Count -ne 1 -or $zipRow.Count -ne 1) {
+        throw "ROOT_UNTRACKED_CURRENT_ROW_MISSING:$relative"
+    }
+    if ($currentRow[0].root_identity -ne $root -or
+        [Int64]$currentRow[0].bytes -ne [Int64]$durableRow[0].bytes -or
+        $currentRow[0].sha256.ToLowerInvariant() -ne $durableRow[0].sha256.ToLowerInvariant()) {
+        throw "ROOT_UNTRACKED_CURRENT_MANIFEST_MISMATCH:$relative"
+    }
+    if ([Int64]$currentRow[0].bytes -ne [Int64]$zipRow[0].bytes -or
+        $currentRow[0].sha256.ToLowerInvariant() -ne $zipRow[0].sha256.ToLowerInvariant()) {
+        throw "ROOT_UNTRACKED_CURRENT_ZIP_MISMATCH:$relative"
+    }
+}
+
+# Every path was containment-checked while constructing $expectedRootEntries; no deletion has occurred.
 foreach ($path in $RootUntracked) {
     Remove-Item -LiteralPath ([IO.Path]::GetFullPath($path)) -Force
 }
@@ -1346,43 +1436,58 @@ def test_beta1_requires_structured_workspace_convergence_receipt():
     for item in evidence.values():
         relative_path(item["path"])
 
-    # Ordinary source checkouts do not contain the ephemeral archive. When the
-    # coordinator exposes it, bind the receipt to the actual local evidence.
-    archive_root_value = os.environ.get("GWO_CONVERGENCE_ARCHIVE_ROOT")
-    if archive_root_value:
-        archive_root = Path(archive_root_value)
-        manifest_path = archive_root / relative_path(evidence["manifest"]["path"])
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == receipt["archive_manifest_sha256"]
-        assert manifest["source_sha"] == receipt["source_sha"]
-        assert manifest["protected_remote_ref"] == receipt["protected_remote_ref"]
-        assert manifest["protected_remote_sha"] == receipt["protected_remote_sha"]
-        assert manifest["pre_clean_bundle_sha256"] == receipt["pre_clean_bundle_sha256"]
-        assert manifest["post_clean_bundle_sha256"] == receipt["post_clean_bundle_sha256"]
-        for receipt_key, evidence_key in (
-            ("pre_clean_bundle_sha256", "pre_clean_bundle"),
-            ("post_clean_bundle_sha256", "post_clean_bundle"),
-        ):
-            bundle_path = archive_root / relative_path(evidence[evidence_key]["path"])
-            assert hashlib.sha256(bundle_path.read_bytes()).hexdigest() == receipt[receipt_key]
-        readback_path = archive_root / relative_path(evidence["remote_ga_readback"]["path"])
-        readback_lines = readback_path.read_text(encoding="utf-8").splitlines()
-        assert len(readback_lines) == 1
-        readback_sha, readback_ref = readback_lines[0].split()
-        assert readback_sha == receipt["protected_remote_sha"]
-        assert readback_ref == receipt["protected_remote_ref"]
+    archive_root_value = os.environ.get("GWO_CONVERGENCE_ARCHIVE_ROOT", "").strip()
+    assert archive_root_value, "GWO_CONVERGENCE_ARCHIVE_ROOT is required"
+    archive_root = Path(archive_root_value)
+    assert archive_root.is_dir(), archive_root
+    manifest_path = archive_root / relative_path(evidence["manifest"]["path"])
+    assert manifest_path.is_file(), manifest_path
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == receipt["archive_manifest_sha256"]
+    assert manifest["source_sha"] == receipt["source_sha"]
+    assert manifest["protected_remote_ref"] == receipt["protected_remote_ref"]
+    assert manifest["protected_remote_sha"] == receipt["protected_remote_sha"]
+    assert manifest["pre_clean_bundle_sha256"] == receipt["pre_clean_bundle_sha256"]
+    assert manifest["post_clean_bundle_sha256"] == receipt["post_clean_bundle_sha256"]
+    for receipt_key, evidence_key in (
+        ("pre_clean_bundle_sha256", "pre_clean_bundle"),
+        ("post_clean_bundle_sha256", "post_clean_bundle"),
+    ):
+        bundle_path = archive_root / relative_path(evidence[evidence_key]["path"])
+        assert bundle_path.is_file(), bundle_path
+        assert hashlib.sha256(bundle_path.read_bytes()).hexdigest() == receipt[receipt_key]
+    readback_path = archive_root / relative_path(evidence["remote_ga_readback"]["path"])
+    assert readback_path.is_file(), readback_path
+    readback_lines = readback_path.read_text(encoding="utf-8").splitlines()
+    assert len(readback_lines) == 1
+    readback_parts = readback_lines[0].split()
+    assert len(readback_parts) == 2
+    readback_sha, readback_ref = readback_parts
+    assert readback_sha == receipt["protected_remote_sha"]
+    assert readback_ref == receipt["protected_remote_ref"]
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T.+Z", receipt["completed_at"])
 ```
 
 - [ ] **Step 4: Run RED**
 
 ```powershell
-py -3.13 -m pytest `
-    tests/test_orchestrator_package.py::test_beta1_requires_structured_workspace_convergence_receipt `
-    -q
+$previousArchiveRoot = $env:GWO_CONVERGENCE_ARCHIVE_ROOT
+try {
+    $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $ArchiveRoot
+    py -3.13 -m pytest `
+        tests/test_orchestrator_package.py::test_beta1_requires_structured_workspace_convergence_receipt `
+        -q
+    if ($LASTEXITCODE -eq 0) { throw 'RECEIPT_RED_DID_NOT_FAIL' }
+} finally {
+    if ($null -eq $previousArchiveRoot) {
+        Remove-Item -LiteralPath Env:\GWO_CONVERGENCE_ARCHIVE_ROOT -ErrorAction SilentlyContinue
+    } else {
+        $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $previousArchiveRoot
+    }
+}
 ```
 
-Expected: FAIL because the receipt file and release-train gate are absent.
+Expected: FAIL because the receipt file and release-train gate are absent; the archive-root variable is still explicitly set and restored safely for this test command.
 
 - [ ] **Step 5: Render the receipt from verified runtime values**
 
@@ -1401,7 +1506,7 @@ Read the actual manifest and SHA files under `$ArchiveRoot`; read the final `inv
 }
 ```
 
-The test always checks these relative evidence bindings and, when `GWO_CONVERGENCE_ARCHIVE_ROOT` is supplied by coordinator verification, recomputes the manifest and bundle hashes and parses the actual remote readback. The environment variable is optional; no ephemeral absolute path is committed or required for an ordinary source-controlled test run.
+The test always requires a non-empty `GWO_CONVERGENCE_ARCHIVE_ROOT` naming an existing directory, checks these relative evidence bindings, recomputes the actual manifest and bundle SHA-256 values, and parses the actual remote readback. A missing variable, non-directory, missing evidence file, hash mismatch, or readback mismatch fails the test; there is no shape-only passing path.
 
 The prose before the JSON states:
 
@@ -1415,16 +1520,31 @@ Update `docs/releases/gwo-v8-release-train.md` so Beta1 explicitly requires the 
 - [ ] **Step 6: Run GREEN and release-contract checks**
 
 ```powershell
-py -3.13 -m pytest `
-    tests/test_orchestrator_package.py::test_beta1_requires_structured_workspace_convergence_receipt `
-    -q
-py -3.13 -m pytest tests/test_orchestrator_package.py -q
-py -3.13 scripts/quick_validate.py
-py -3.13 scripts/sync_orchestrator.py --check
-git diff --check
+$previousArchiveRoot = $env:GWO_CONVERGENCE_ARCHIVE_ROOT
+try {
+    $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $ArchiveRoot
+    py -3.13 -m pytest `
+        tests/test_orchestrator_package.py::test_beta1_requires_structured_workspace_convergence_receipt `
+        -q
+    if ($LASTEXITCODE -ne 0) { throw 'RECEIPT_GREEN_TEST_FAILED' }
+    py -3.13 -m pytest tests/test_orchestrator_package.py -q
+    if ($LASTEXITCODE -ne 0) { throw 'RELEASE_CONTRACT_TESTS_FAILED' }
+    py -3.13 scripts/quick_validate.py
+    if ($LASTEXITCODE -ne 0) { throw 'QUICK_VALIDATE_FAILED' }
+    py -3.13 scripts/sync_orchestrator.py --check
+    if ($LASTEXITCODE -ne 0) { throw 'SYNC_CHECK_FAILED' }
+    git diff --check
+    if ($LASTEXITCODE -ne 0) { throw 'BETA1_DIFF_CHECK_FAILED' }
+} finally {
+    if ($null -eq $previousArchiveRoot) {
+        Remove-Item -LiteralPath Env:\GWO_CONVERGENCE_ARCHIVE_ROOT -ErrorAction SilentlyContinue
+    } else {
+        $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $previousArchiveRoot
+    }
+}
 ```
 
-Expected: all commands pass without regenerating a package manifest.
+Expected: all commands pass with the actual `$ArchiveRoot` evidence bound to the receipt test, without regenerating a package manifest, and the environment variable is restored afterward.
 
 - [ ] **Step 7: Commit, push, and remove the temporary receipt worktree**
 
@@ -1491,7 +1611,9 @@ git -C $Repo bundle verify (Join-Path $ArchiveRoot 'pre-clean.bundle')
 git -C $Repo bundle verify (Join-Path $ArchiveRoot 'post-clean.bundle')
 git -C $Repo ls-remote --heads origin refs/heads/codex/gwo-v8-ga-plan refs/heads/codex/gwo-v8-beta1
 Push-Location $GaWorktree
+$previousArchiveRoot = $env:GWO_CONVERGENCE_ARCHIVE_ROOT
 try {
+    $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $ArchiveRoot
     py -3.13 -m pytest -q
     if ($LASTEXITCODE -ne 0) { throw 'GA_FULL_SUITE_FAILED' }
     py -3.13 scripts/quick_validate.py
@@ -1501,6 +1623,11 @@ try {
     git diff --check
     if ($LASTEXITCODE -ne 0) { throw 'GA_DIFF_CHECK_FAILED' }
 } finally {
+    if ($null -eq $previousArchiveRoot) {
+        Remove-Item -LiteralPath Env:\GWO_CONVERGENCE_ARCHIVE_ROOT -ErrorAction SilentlyContinue
+    } else {
+        $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $previousArchiveRoot
+    }
     Pop-Location
 }
 ```
