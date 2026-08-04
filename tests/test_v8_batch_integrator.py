@@ -278,16 +278,34 @@ def test_integration_lease_compare_and_swap_keeps_the_first_holder(tmp_path):
     assert journal.read_integration_lease("owner/repo") == first
 
 
-def test_stale_lease_release_cannot_delete_the_current_holder(tmp_path):
+def test_same_holder_new_generation_cannot_replace_current_integration_lease(tmp_path):
     journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
-    journal.acquire_integration_lease(
+    first = journal.acquire_integration_lease(
         "owner/repo", "action:one", "gen:1", "activation:1"
     )
 
-    with pytest.raises(BatchIntegratorError, match="INTEGRATION_LEASE_OWNER_MISMATCH"):
-        journal.release_integration_lease("owner/repo", "action:two")
+    with pytest.raises(BatchIntegratorError, match="INTEGRATION_LEASE_UNAVAILABLE"):
+        journal.acquire_integration_lease(
+            "owner/repo", "action:one", "gen:2", "activation:2"
+        )
 
-    assert journal.read_integration_lease("owner/repo") is not None
+    assert journal.read_integration_lease("owner/repo") == first
+
+
+def test_stale_lease_release_cannot_delete_reacquired_current_receipt(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    first = journal.acquire_integration_lease(
+        "owner/repo", "action:one", "gen:1", "activation:1"
+    )
+    journal.release_integration_lease("owner/repo", first)
+    current = journal.acquire_integration_lease(
+        "owner/repo", "action:one", "gen:2", "activation:2"
+    )
+
+    with pytest.raises(BatchIntegratorError, match="INTEGRATION_LEASE_OWNER_MISMATCH"):
+        journal.release_integration_lease("owner/repo", first)
+
+    assert journal.read_integration_lease("owner/repo") == current
 
 
 def test_batch_journal_record_and_integration_lease_receipt_have_exact_bodies(tmp_path):
@@ -350,3 +368,11 @@ def test_identical_terminal_hosted_receipt_replays_but_wrong_identity_fails(tmp_
 
     with pytest.raises(DeliveryIdentityMismatch):
         journal.persist_hosted_result(replace(receipt, batch_sha="b" * 40))
+
+
+def test_hosted_result_persistence_rejects_runtime_invalid_outcome(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    forged = make_hosted_result_receipt(outcome="forged")  # type: ignore[arg-type]
+
+    with pytest.raises(DeliveryIdentityMismatch, match="outcome"):
+        journal.persist_hosted_result(forged)

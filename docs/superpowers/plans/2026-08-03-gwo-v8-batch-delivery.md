@@ -1624,14 +1624,26 @@ def test_integration_lease_compare_and_swap_keeps_the_first_holder(tmp_path):
     assert journal.read_integration_lease("owner/repo") == first
 
 
-def test_stale_lease_release_cannot_delete_the_current_holder(tmp_path):
+def test_same_holder_new_generation_cannot_replace_current_integration_lease(tmp_path):
     journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
-    journal.acquire_integration_lease("owner/repo", "action:one", "gen:1", "activation:1")
+    first = journal.acquire_integration_lease("owner/repo", "action:one", "gen:1", "activation:1")
+
+    with pytest.raises(BatchIntegratorError, match="INTEGRATION_LEASE_UNAVAILABLE"):
+        journal.acquire_integration_lease("owner/repo", "action:one", "gen:2", "activation:2")
+
+    assert journal.read_integration_lease("owner/repo") == first
+
+
+def test_stale_lease_release_cannot_delete_reacquired_current_receipt(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    first = journal.acquire_integration_lease("owner/repo", "action:one", "gen:1", "activation:1")
+    journal.release_integration_lease("owner/repo", first)
+    current = journal.acquire_integration_lease("owner/repo", "action:one", "gen:2", "activation:2")
 
     with pytest.raises(BatchIntegratorError, match="INTEGRATION_LEASE_OWNER_MISMATCH"):
-        journal.release_integration_lease("owner/repo", "action:two")
+        journal.release_integration_lease("owner/repo", first)
 
-    assert journal.read_integration_lease("owner/repo") is not None
+    assert journal.read_integration_lease("owner/repo") == current
 
 
 def test_batch_journal_record_and_integration_lease_receipt_have_exact_bodies(tmp_path):
@@ -1795,6 +1807,7 @@ journal methods; Task 1 and Task 2 support code therefore cannot import them:
 import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
+import re
 from typing import Callable, Literal
 
 from ._canonical import digest_value
@@ -2048,47 +2061,66 @@ class SqliteBatchDeliveryJournal:
         requested = IntegrationLeaseReceipt.create(
             repository, holder, writer_generation, activation_id
         )
+        self._validate_lease_digest(requested)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
                 "SELECT * FROM v8_batch_integration_leases WHERE repository=?",
                 (repository,),
             ).fetchone()
-            if current is not None and current["holder"] != holder:
-                connection.rollback()
-                raise BatchIntegratorError(
-                    "INTEGRATION_LEASE_UNAVAILABLE",
-                    "repository lease is held by another action",
+            if current is not None:
+                current_receipt = IntegrationLeaseReceipt(**dict(current))
+                self._validate_lease_digest(current_receipt)
+                if current_receipt != requested:
+                    connection.rollback()
+                    raise BatchIntegratorError(
+                        "INTEGRATION_LEASE_UNAVAILABLE",
+                        "repository lease identity is already active",
+                    )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO v8_batch_integration_leases
+                        (repository, holder, writer_generation, activation_id, lease_digest)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        requested.repository,
+                        requested.holder,
+                        requested.writer_generation,
+                        requested.activation_id,
+                        requested.lease_digest,
+                    ),
                 )
-            connection.execute(
-                """
-                INSERT INTO v8_batch_integration_leases
-                    (repository, holder, writer_generation, activation_id, lease_digest)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(repository) DO UPDATE SET
-                    holder=excluded.holder,
-                    writer_generation=excluded.writer_generation,
-                    activation_id=excluded.activation_id,
-                    lease_digest=excluded.lease_digest
-                WHERE holder=?
-                """,
-                (
-                    requested.repository,
-                    requested.holder,
-                    requested.writer_generation,
-                    requested.activation_id,
-                    requested.lease_digest,
-                    holder,
-                ),
-            )
             connection.commit()
         return requested
 
-    def release_integration_lease(self, repository: str, holder: str) -> None:
+    def release_integration_lease(self, repository: str, lease: IntegrationLeaseReceipt) -> None:
+        if type(lease) is not IntegrationLeaseReceipt:
+            raise BatchIntegratorError(
+                "INTEGRATION_LEASE_OWNER_MISMATCH",
+                "lease release requires the exact lease receipt",
+            )
+        self._validate_lease_digest(lease)
+        if lease.repository != repository:
+            raise BatchIntegratorError(
+                "INTEGRATION_LEASE_OWNER_MISMATCH",
+                "lease release repository does not match the receipt",
+            )
         with self._connect() as connection:
             changed = connection.execute(
-                "DELETE FROM v8_batch_integration_leases WHERE repository=? AND holder=?",
-                (repository, holder),
+                """
+                DELETE FROM v8_batch_integration_leases
+                 WHERE repository=? AND holder=? AND writer_generation=?
+                   AND activation_id=? AND lease_digest=?
+                """,
+                (
+                    repository,
+                    lease.holder,
+                    lease.writer_generation,
+                    lease.activation_id,
+                    lease.lease_digest,
+                ),
             ).rowcount
             if changed != 1:
                 raise BatchIntegratorError(
@@ -2099,6 +2131,35 @@ class SqliteBatchDeliveryJournal:
 
     @staticmethod
     def _validate_hosted_receipt_digest(receipt: HostedResultReceipt) -> None:
+        if (
+            type(receipt.outcome) is not str
+            or receipt.outcome
+            not in {"passed", "code_failure", "infrastructure_failure"}
+        ):
+            raise DeliveryIdentityMismatch("hosted receipt outcome is invalid")
+        for field_name in (
+            "stable_action_id",
+            "suite_id",
+            "provider_check_id",
+            "source_ref",
+        ):
+            value = getattr(receipt, field_name)
+            if type(value) is not str or not value or "\x00" in value:
+                raise DeliveryIdentityMismatch(
+                    f"hosted receipt {field_name} identity is malformed"
+                )
+        if (
+            type(receipt.batch_sha) is not str
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", receipt.batch_sha)
+            is None
+        ):
+            raise DeliveryIdentityMismatch("hosted receipt batch SHA is malformed")
+        for field_name in ("observation_digest", "receipt_digest"):
+            value = getattr(receipt, field_name)
+            if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise DeliveryIdentityMismatch(
+                    f"hosted receipt {field_name} is malformed"
+                )
         expected = digest_value({"kind": "hosted_result_receipt.v1", **receipt.body()})
         if expected != receipt.receipt_digest:
             raise DeliveryIdentityMismatch("hosted receipt digest mismatch")
@@ -3521,7 +3582,7 @@ def execute(self, action: BatchDeliveryAction) -> BatchDeliveryObservation:
         )
     finally:
         self.journal.release_integration_lease(
-            request.repository, action.stable_action_id
+            request.repository, lease
         )
     members = tuple(
         MemberDeliveryObservation(
@@ -3696,7 +3757,7 @@ def _advance_one_delivery_step(
                 )
         finally:
             self.journal.release_integration_lease(
-                request.repository, lease.holder
+                request.repository, lease
             )
         local_receipt = LocalCheckReceipt(**state["local_receipt"])
         publication = BatchPublicationReceipt(**state["publication"])
