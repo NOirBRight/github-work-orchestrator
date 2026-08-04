@@ -2953,6 +2953,26 @@ class RepairVerificationRequest:
                 "CANDIDATE_GATE_REPAIR_REQUEST_INVALID",
                 "Repair Verification request identity is internally inconsistent",
             )
+        check_digests = tuple(
+            check.digest for check in self.required_check_evidence
+        )
+        if (
+            self.candidate_receipt.base_commit_oid
+            != self.candidate.base_commit_oid
+            or self.candidate_receipt.base_tree_oid != self.candidate.base_tree_oid
+            or self.candidate_receipt.reported_reference
+            != self.candidate.reported_reference
+            or self.review_subject.base_commit_oid
+            != self.candidate.base_commit_oid
+            or self.review_subject.base_tree_oid != self.candidate.base_tree_oid
+            or len(set(check_digests)) != len(check_digests)
+            or tuple(sorted(check_digests))
+            != self.review_subject.check_evidence_digests
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_REQUEST_INVALID",
+                "Repair Verification request base, reference, or check identity is inconsistent",
+            )
         expected = _body_digest(self._body())
         if self.request_digest is None:
             object.__setattr__(self, "request_digest", expected)

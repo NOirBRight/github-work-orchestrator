@@ -454,3 +454,69 @@ def test_repair_request_rejects_delta_candidate_cross_binding(repair_gate):
             request_digest=None,
         )
     assert raised.value.code == "CANDIDATE_GATE_REPAIR_REQUEST_INVALID"
+
+
+def test_repair_request_rejects_receipt_base_and_reference_cross_binding(repair_gate):
+    gate, verifier, parent, packet, candidate = repair_gate
+    gate.verify_repair(parent, packet, candidate)
+    request = verifier.requests[0]
+    receipt = replace(
+        request.candidate_receipt,
+        base_commit_oid="e" * 40,
+        reported_reference="refs/heads/other",
+        receipt_digest=None,
+    )
+    subject = replace(
+        request.review_subject,
+        candidate_receipt_digest=receipt.digest,
+        subject_digest=None,
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        replace(
+            request,
+            candidate_receipt=receipt,
+            review_subject=subject,
+            request_digest=None,
+        )
+    assert raised.value.code == "CANDIDATE_GATE_REPAIR_REQUEST_INVALID"
+
+
+def test_repair_request_rejects_subject_base_cross_binding(repair_gate):
+    gate, verifier, parent, packet, candidate = repair_gate
+    gate.verify_repair(parent, packet, candidate)
+    request = verifier.requests[0]
+    subject = replace(
+        request.review_subject,
+        base_tree_oid="e" * 40,
+        subject_digest=None,
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        replace(request, review_subject=subject, request_digest=None)
+    assert raised.value.code == "CANDIDATE_GATE_REPAIR_REQUEST_INVALID"
+
+
+def test_repair_request_rejects_check_evidence_digest_mismatch(repair_gate):
+    gate, verifier, parent, packet, candidate = repair_gate
+    gate.verify_repair(parent, packet, candidate)
+    request = verifier.requests[0]
+    subject = replace(
+        request.review_subject,
+        check_evidence_digests=("e" * 64,),
+        subject_digest=None,
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        replace(request, review_subject=subject, request_digest=None)
+    assert raised.value.code == "CANDIDATE_GATE_REPAIR_REQUEST_INVALID"
+
+
+def test_repair_request_rejects_duplicate_check_evidence_digests(repair_gate):
+    gate, verifier, parent, packet, candidate = repair_gate
+    gate.verify_repair(parent, packet, candidate)
+    request = verifier.requests[0]
+    with pytest.raises(CandidateGateError) as raised:
+        replace(
+            request,
+            required_check_evidence=(request.required_check_evidence[0],) * 2,
+            request_digest=None,
+        )
+    assert raised.value.code == "CANDIDATE_GATE_REPAIR_REQUEST_INVALID"

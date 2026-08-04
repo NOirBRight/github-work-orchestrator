@@ -94,3 +94,30 @@ py -3.13 -m pytest tests/test_v8_repair_verification.py tests/test_v8_repair_pac
 ```
 
 Result: `238 passed, 1 warning`.
+
+## Review fix round 2
+
+The scoped re-review identified four remaining cross-field seams in
+`RepairVerificationRequest`. Regression tests were added before the fix and
+run with:
+
+```powershell
+py -3.13 -m pytest tests/test_v8_repair_verification.py -q
+```
+
+Result: `4 failed, 8 passed`. The failures covered CandidateReceipt base and
+reference identity, ReviewSubject base identity, and required-check Evidence
+digest mismatch/duplication.
+
+The minimal fix now binds those exact fields and rejects duplicate or
+non-matching required-check Evidence digests. The same command then produced
+`12 passed`.
+
+The complete fix-round focused set, including the Task 10 contract test,
+passed:
+
+```powershell
+py -3.13 -m pytest tests/test_v8_repair_verification.py tests/test_v8_repair_packet.py tests/test_v8_candidate_gate.py tests/test_v8_candidate_gate_public.py tests/test_v8_candidate_strict_review.py tests/test_v8_candidate_assurance_standard.py tests/test_v8_candidate_gate_acceptance.py tests/test_v8_candidate_review_reuse.py tests/test_v8_candidate_receipt_foundation.py tests/test_v8_candidate_receipt_kernel.py tests/test_v8_candidate_budget_kernel.py tests/test_v8_watchdog_execution_kernel.py tests/test_v8_execution_kernel.py tests/test_v8_successor_execution_kernel.py tests/test_v8_candidate_assurance_contract.py -q
+```
+
+Result: `243 passed, 1 warning`.
