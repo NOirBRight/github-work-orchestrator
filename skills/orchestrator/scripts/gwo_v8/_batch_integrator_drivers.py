@@ -482,17 +482,22 @@ class GitCliBatchDriver:
             )
             for path in changed_paths
         )
+        protected_interaction_keys = tuple(
+            key for key in interaction_keys if key.requires_singleton
+        )
         body = {
             "base_sha": base_sha,
             "target_head_sha": target.target_head_sha,
             "interaction_keys": [key.canonical() for key in interaction_keys],
-            "protected_interaction_keys": [],
+            "protected_interaction_keys": [
+                key.canonical() for key in protected_interaction_keys
+            ],
         }
         return TargetDeltaReadback(
             base_sha=base_sha,
             target_head_sha=target.target_head_sha,
             interaction_keys=interaction_keys,
-            protected_interaction_keys=(),
+            protected_interaction_keys=protected_interaction_keys,
             facts_digest=digest_value(body),
             readback_digest=digest_value(
                 {"kind": "target-delta-readback.v1", **body}
@@ -512,13 +517,25 @@ class GitCliBatchDriver:
             for key in member.interaction_keys
             if key.requires_singleton
         }
+
+        def is_protected_surface(key: InteractionKey) -> bool:
+            if key.value in protected_surfaces:
+                return True
+            try:
+                raw_path = base64.urlsafe_b64decode(
+                    key.value + "=" * (-len(key.value) % 4)
+                ).decode("utf-8")
+            except (UnicodeDecodeError, ValueError):
+                return False
+            return raw_path in protected_surfaces
+
         keys = tuple(
             InteractionKey(
                 namespace=key.namespace,
                 value=key.value,
                 classification=(
                     InteractionClassification.PROTECTED
-                    if key.value in protected_surfaces
+                    if is_protected_surface(key)
                     else member_interactions.get(
                         (key.namespace, key.value), key.classification
                     )

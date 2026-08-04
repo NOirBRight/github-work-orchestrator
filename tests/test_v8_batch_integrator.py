@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import asdict, replace
 from pathlib import Path
 import sys
@@ -317,6 +318,24 @@ def test_clean_base_advance_protected_target_delta_fails_before_multi_member_com
         )
 
     assert drivers.git.compose_calls == 0
+
+
+def test_git_driver_maps_raw_protected_surfaces_to_canonical_target_path_keys():
+    from gwo_v8._batch_integrator_drivers import GitCliBatchDriver
+
+    member = make_accepted_candidate_receipt(
+        protected_surfaces=("protected/path",)
+    )
+    token = base64.urlsafe_b64encode(b"protected/path").decode("ascii").rstrip("=")
+    target_delta = make_target_delta(
+        member.base_sha,
+        "b" * 40,
+        interaction_keys=(make_interaction_key(token),),
+    )
+
+    mapped = GitCliBatchDriver._apply_member_policy(target_delta, member)
+
+    assert mapped.protected_interaction_keys == mapped.interaction_keys
 
 
 def test_crash_after_batch_ref_publication_is_recovered_by_exact_ref_readback(tmp_path):
