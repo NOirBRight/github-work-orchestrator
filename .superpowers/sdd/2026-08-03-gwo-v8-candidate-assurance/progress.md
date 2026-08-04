@@ -7,3 +7,5 @@ Task 5: complete (commits 741eb25..d34015a, fix round 1; review fix round 1; sco
 Task 6: complete (commits 13daeec..7234417, fix round 1; scoped re-review approved; minor retry coverage parked)
 Task 7: complete (commits 9efd982..8fb8228, fix round 1; scoped re-review approved)
 Task 8: complete (commit 76b11e6, review approved)
+Task 9: complete (commits 992dfdb..b49fee7, fix rounds 1–2; scoped re-review approved; focused 243 passed, 1 warning)
+Task 10: complete (commit 6ab11b3; contract RED/GREEN and repository gates passed)
