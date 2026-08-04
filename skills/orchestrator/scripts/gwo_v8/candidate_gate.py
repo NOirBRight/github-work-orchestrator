@@ -2630,11 +2630,12 @@ class RepairPacket:
     ) -> "RepairPacket":
         if (
             result.subject_digest != subject.digest
+            or subject.parent_digest != parent.digest
             or subject.candidate_receipt_digest != candidate_receipt.digest
         ):
             raise CandidateGateError(
                 "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
-                "Review result, Subject, and CandidateReceipt are not bound",
+                "Review result, parent, Subject, and CandidateReceipt are not bound",
             )
         ledger = ReviewFindingLedger.from_review_result(result)
         return cls(
@@ -3793,10 +3794,12 @@ class CandidateGate:
             requirement=requirement,
         )
         if requirement.mode is AssuranceMode.NO_REVIEW:
+            ledger = ReviewFindingLedger(entries=())
             return CandidateGateResult(
                 status=CandidateGateStatus.REVIEW_ACCEPTED,
                 evidence=(candidate_evidence,),
                 review_subject=subject,
+                review_finding_ledger_digest=ledger.digest,
             )
         review_result = self._run_assurance_review(parent, subject, requirement)
         if review_result is None:
@@ -3890,12 +3893,21 @@ class CandidateGate:
                 status=CandidateGateStatus.ORDINARY_REJECTED,
                 evidence=(candidate_evidence,),
             )
+        if (
+            self._candidate_reader is not None
+            and self._check_runner is not None
+            and self._assurance_policy is not None
+        ):
+            return self.gate_candidate(
+                parent,
+                audit.candidate.reported_reference,
+            )
         request = FormalReviewRequest.from_parent(parent, audit)
         reviewer = self._formal_reviewer
         if reviewer is None:
             raise CandidateGateError(
-                "CANDIDATE_GATE_REVIEWER_UNAVAILABLE",
-                "a clean deterministic Candidate requires the CandidateGate Formal Reviewer",
+                "CANDIDATE_GATE_LEGACY_REVIEW_INCOMPLETE",
+                "legacy clean review lacks the complete CandidateGate assurance inputs",
             )
         self._validate_read_only_port(reviewer, "Formal Reviewer")
         review_result = reviewer.review(request)
@@ -3916,29 +3928,9 @@ class CandidateGate:
                 plan_invalidation_receipt=receipt,
                 plan_invalidation_report=report,
             )
-        hard_findings = tuple(
-            finding for finding in findings if finding.severity == "hard"
-        )
-        ledger = ReviewFindingLedger.from_review_result(review_result)
-        if hard_findings:
-            packet = RepairPacket.from_findings(
-                parent,
-                audit.candidate,
-                request,
-                hard_findings,
-            )
-            return CandidateGateResult(
-                status=CandidateGateStatus.REPAIR_REQUIRED,
-                evidence=(candidate_evidence, *finding_evidence),
-                repair_packet=packet,
-                review_subject=request,
-                review_finding_ledger_digest=ledger.digest,
-            )
-        return CandidateGateResult(
-            status=CandidateGateStatus.REVIEW_ACCEPTED,
-            evidence=(candidate_evidence, *finding_evidence),
-            review_subject=request,
-            review_finding_ledger_digest=ledger.digest,
+        raise CandidateGateError(
+            "CANDIDATE_GATE_LEGACY_REVIEW_INCOMPLETE",
+            "legacy clean review lacks the complete CandidateGate assurance inputs",
         )
 
     def _read_authoritative_candidate(

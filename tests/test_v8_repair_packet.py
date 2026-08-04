@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -145,5 +146,36 @@ def test_packet_rejects_truncated_ledger(rejected):
 
     with pytest.raises(CandidateGateError) as raised:
         packet.with_ledger(packet.finding_ledger.entries[:1])
+
+    assert raised.value.code == "CANDIDATE_GATE_REPAIR_PACKET_INVALID"
+
+
+def test_packet_rejects_subject_parent_mismatch(rejected):
+    mismatched_parent = replace(
+        rejected.parent,
+        parent_digest=None,
+        ticket_contract_digest="0" * 64,
+    )
+    mismatched_receipt = replace(
+        rejected.candidate_receipt,
+        parent_digest=mismatched_parent.digest,
+        receipt_digest=None,
+    )
+    mismatched_subject = replace(
+        rejected.subject,
+        candidate_receipt_digest=mismatched_receipt.digest,
+        subject_digest=None,
+    )
+
+    with pytest.raises(CandidateGateError) as raised:
+        RepairPacket.from_review(
+            parent=mismatched_parent,
+            candidate_receipt=mismatched_receipt,
+            subject=mismatched_subject,
+            result=FormalReviewResult(subject_digest=mismatched_subject.digest),
+            allowed_path_tokens=("c3JjL21haW4ucHk",),
+            required_check_ids=("unit",),
+            repair_instructions=("fix named findings only",),
+        )
 
     assert raised.value.code == "CANDIDATE_GATE_REPAIR_PACKET_INVALID"

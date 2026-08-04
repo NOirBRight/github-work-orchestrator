@@ -281,10 +281,13 @@ def test_deterministic_failure_stops_before_reviewer(gate_with_failed_check):
 
 
 def test_no_review_allowlist_uses_zero_calls(no_review_gate):
+    from gwo_v8.candidate_gate import ReviewFindingLedger
+
     gate, reviewer, parent = no_review_gate
     result = gate.gate_candidate(parent, "refs/heads/candidate")
     assert result.status == CandidateGateStatus.REVIEW_ACCEPTED
     assert reviewer.actions == []
+    assert result.review_finding_ledger_digest == ReviewFindingLedger(entries=()).digest
     assert result.accepted_candidate_receipt.assurance == "no_review"
 
 
