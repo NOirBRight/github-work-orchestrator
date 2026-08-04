@@ -18,6 +18,7 @@ from gwo_v8.candidate_gate import (  # noqa: E402
     CandidateDiffEntryV1,
     CandidateDiffRecordV1,
     CandidateGate,
+    CandidateGateError,
     CandidateGateParent,
     CandidateGateStatus,
     CandidateReadback,
@@ -121,6 +122,16 @@ class _Reviewer:
         return FormalReviewResult(subject_digest=action.subject.digest)
 
 
+class _StrictRetryBudgetReviewer(_Reviewer):
+    def review(self, action):
+        self.actions.append(action)
+        from gwo_v8.candidate_gate import InvalidReviewTransport
+
+        if action.kind in {"formal_review", "specialist_review"}:
+            raise InvalidReviewTransport("review payload was not typed")
+        return FormalReviewResult(subject_digest=action.subject.digest)
+
+
 def _parent_and_readback():
     subject = WorkRunSubject(
         repository="owner/repository",
@@ -219,6 +230,15 @@ def invalid_transport_gate():
 
 
 @pytest.fixture
+def strict_retry_budget_gate():
+    return _gate(
+        mode=AssuranceMode.STRICT,
+        specialist_policy_id="security",
+        reviewer=_StrictRetryBudgetReviewer(),
+    )
+
+
+@pytest.fixture
 def rejected_gate():
     return _gate(
         mode=AssuranceMode.STANDARD,
@@ -261,6 +281,29 @@ def test_invalid_transport_retries_same_subject_as_review_strong(
     assert reviewer.actions[0].purpose == WorkRunPurpose.formal_review()
     assert reviewer.actions[1].purpose == WorkRunPurpose.invalid_review_payload_retry()
     assert reviewer.actions[0].subject.digest == reviewer.actions[1].subject.digest
+
+
+def test_strict_transport_retry_budget_is_shared_by_subject(
+    strict_retry_budget_gate,
+):
+    gate, reviewer, parent = strict_retry_budget_gate
+    caught = None
+    try:
+        gate.gate_candidate(parent, "refs/heads/candidate")
+    except Exception as error:  # noqa: BLE001 - assert the typed boundary below
+        caught = error
+
+    assert [action.kind for action in reviewer.actions] == [
+        "formal_review",
+        "review_strong",
+        "specialist_review",
+    ]
+    assert len({action.subject.digest for action in reviewer.actions}) == 1
+    assert isinstance(caught, CandidateGateError)
+    assert caught.code == "CANDIDATE_GATE_REVIEW_TRANSPORT_RETRY_EXHAUSTED"
+    assert caught.detail == (
+        "Review transport retry budget was already consumed for this ReviewSubject"
+    )
 
 
 def test_valid_rejection_does_not_repeat_unchanged_subject(rejected_gate):

@@ -2965,6 +2965,7 @@ class CandidateGate:
         self._acceptance_facts = acceptance_facts
         self._diff_artifacts = diff_artifacts
         self._review_results: dict[str, FormalReviewResult] = {}
+        self._review_transport_retries: set[str] = set()
 
     def _store_candidate_diff(
         self,
@@ -3260,7 +3261,13 @@ class CandidateGate:
     ) -> FormalReviewResult:
         try:
             return self._invoke_review_action(parent, action)
-        except InvalidReviewTransport:
+        except InvalidReviewTransport as transport_error:
+            if action.subject.digest in self._review_transport_retries:
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_REVIEW_TRANSPORT_RETRY_EXHAUSTED",
+                    "Review transport retry budget was already consumed for this ReviewSubject",
+                ) from transport_error
+            self._review_transport_retries.add(action.subject.digest)
             retry = ReviewAction.for_subject(
                 kind="review_strong",
                 subject=action.subject,
