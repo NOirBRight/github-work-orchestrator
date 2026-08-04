@@ -119,6 +119,18 @@ class _ReceiptReporter:
         )
 
 
+class _DiffStore:
+    def __init__(self):
+        self.records = {}
+
+    def put(self, record):
+        self.records[record.digest] = record
+        return record.digest
+
+    def read(self, digest):
+        return self.records.get(digest)
+
+
 def _audit(parent, *, kind="scope", route=None, code="PERSISTENT_SCOPE"):
     from gwo_v8.candidate_gate import (
         AuditFailureKind,
@@ -488,7 +500,7 @@ def test_public_candidate_gate_advance_inspect_retains_source_evidence_lineage(
     assert run.plan_invalidation.source_evidence_digests == (finding.digest,)
 
 
-def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
+def test_public_repair_scope_escape_fails_before_repair_verifier(tmp_path):
     import gwo_v8
     from gwo_v8.candidate_gate import (
         AssuranceMode,
@@ -498,10 +510,12 @@ def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
         CandidateCheckEvidence,
         CandidateDiffEntryV1,
         CandidateDiffRecordV1,
+        CandidateGateError,
         CandidateReadback,
         FormalReviewFinding,
         FormalReviewResult,
         RepairVerificationResult,
+        ReviewFindingDisposition,
     )
     from gwo_v8._canonical import digest_value
     from gwo_v8.runtime_gateway import CapabilityPolicy, CapabilityPolicyProof
@@ -583,7 +597,11 @@ def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
             authority_record_digest="9" * 64,
         )
 
+        def __init__(self):
+            self.calls = 0
+
         def verify(self, request):
+            self.calls += 1
             # Deliberately omit the escape: CandidateGate must derive it from
             # the authoritative repaired Candidate delta, not trust the port.
             return RepairVerificationResult(
@@ -683,11 +701,13 @@ def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
 
     reporter = _ReceiptReporter()
     reader = Reader()
+    verifier = Verifier()
+    diff_store = _DiffStore()
     gate = CandidateGate(
         invalidation_reporter=reporter,
         candidate_reader=reader,
         formal_reviewer=Reviewer(),
-        repair_verifier=Verifier(),
+        repair_verifier=verifier,
         check_runner=Checks(),
         assurance_policy=Policy(),
         acceptance_facts=CandidateAcceptanceFacts(
@@ -698,60 +718,29 @@ def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
             delivery_identity_digest="7" * 64,
             protected_surfaces=("protected/path",),
         ),
+        diff_artifacts=diff_store,
     )
     reviewed = gate.gate_candidate(parent, "refs/heads/candidate")
     assert reviewed.repair_packet is not None
     assert reviewed.repair_packet.candidate_receipt is reviewed.candidate_receipt
     assert reviewed.repair_packet.finding_ledger is not None
     assert reviewed.repair_packet.required_check_ids == ("check:unit",)
-    result = gate.verify_repair(parent, reviewed.repair_packet, repaired)
-
-    assert result.status.value == "plan_invalidation_reported"
-    assert result.plan_invalidation_receipt is not None
-    verification_evidence = result.evidence[0]
-    plan_evidence = result.evidence[-1]
-    assert verification_evidence.kind == "repair_scope_escape"
-    assert verification_evidence.scope_escape_paths == (outside_path,)
-    assert plan_evidence.source_kind == "repair_verification"
-    assert plan_evidence.invalidated_obligation == "repair packet allowed scope"
-    assert plan_evidence.required_effects == ("owner.persist.v1",)
-    assert plan_evidence.source_evidence_digest == verification_evidence.digest
-    assert {
-        item.get("kind") for item in plan_evidence.lineage_artifacts
-    } >= {
-        "candidate_identity.v1",
-        "repair_packet.v1",
-        "repair_verification_subject.v1",
-        "repair_verification_result.v1",
-        "repair_scope_escape.v1",
-    }
-    assert any(
-        item.get("schema_version") == "CandidateDiffRecordV1"
-        for item in plan_evidence.lineage_artifacts
+    complete_ledger = reviewed.repair_packet.finding_ledger.with_disposition(
+        finding_id=reviewed.repair_packet.finding_ledger.entries[0].finding.finding_id,
+        disposition=ReviewFindingDisposition.FIXED,
+        reason="the bounded repair is ready for verification",
     )
+    packet = reviewed.repair_packet.with_ledger(complete_ledger.entries)
+    with pytest.raises(CandidateGateError) as raised:
+        gate.verify_repair(parent, packet, repaired)
+
+    assert raised.value.code == "CANDIDATE_GATE_REPAIR_SCOPE_INVALID"
     assert reader.calls == [
         (parent.runtime_subject.repository, "refs/heads/candidate"),
         (parent.runtime_subject.repository, "refs/heads/repaired"),
     ]
-    assert reporter.calls == 1
-    gateway.payload = _payload_with_evidence(
-        _successor_payload(), result.plan_invalidation_report.evidence_digest
-    )
-    outcome = gwo_v8.advance(handle, plan_invalidation=result.plan_invalidation_receipt)
-    diagnostics = gwo_v8.inspect(handle)
-    run = next(item for item in diagnostics.work_runs if item.ticket_key == "issue:109")
-
-    assert outcome.status is diagnostics.status
-    # The public advance first persists the invalidation/quiescence boundary,
-    # then consumes the approved successor payload in the same call.  Therefore
-    # the current Work Run is the successor's fresh run, while the predecessor
-    # invalidation remains visible in revision lineage.
-    assert diagnostics.plan_revision_digest != parent.runtime_subject.plan_revision_digest
-    assert gateway.replan_progresses == 1
-    assert run.phase == "running"
-    assert diagnostics.revision_lineage[0].source_evidence_digests == (
-        result.evidence[0].digest,
-    )
+    assert verifier.calls == 0
+    assert reporter.calls == 0
 
 
 def test_public_candidate_invalidation_duplicate_advance_and_restart_does_not_repeat_transitions(
