@@ -2678,6 +2678,63 @@ class CandidateGateResult:
                 self.review_finding_ledger_digest,
                 "review_finding_ledger_digest",
             )
+        has_invalidation = self.status is CandidateGateStatus.PLAN_INVALIDATION_REPORTED
+        if has_invalidation != (
+            self.plan_invalidation_receipt is not None
+            and self.plan_invalidation_report is not None
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_EVIDENCE_INVALID",
+                "Plan Invalidation status and readback pair do not match",
+            )
+        if self.status in {
+            CandidateGateStatus.ORDINARY_REJECTED,
+            CandidateGateStatus.PLAN_INVALIDATION_REPORTED,
+        } and (
+            self.review_subject is not None
+            or self.accepted_candidate_receipt is not None
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_EVIDENCE_INVALID",
+                "deterministic stop carries Review-only identity",
+            )
+        if self.accepted_candidate_receipt is not None:
+            if (
+                self.status
+                not in {
+                    CandidateGateStatus.REVIEW_ACCEPTED,
+                    CandidateGateStatus.REPAIR_ACCEPTED,
+                }
+                or self.candidate_receipt is None
+                or self.candidate_diff_record is None
+                or self.assurance_requirement is None
+                or self.review_subject is None
+                or self.accepted_candidate_receipt.candidate_receipt_digest
+                != self.candidate_receipt.digest
+                or self.accepted_candidate_receipt.diff_record_digest
+                != self.candidate_diff_record.digest
+                or self.accepted_candidate_receipt.review_subject_digest
+                != self.review_subject.digest
+                or self.accepted_candidate_receipt.assurance_requirement_digest
+                != self.assurance_requirement.digest
+            ):
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_ACCEPTANCE_INVALID",
+                    "accepted Candidate receipt is not bound to complete #114 identity",
+                )
+        if (
+            self.status
+            in {
+                CandidateGateStatus.REVIEW_ACCEPTED,
+                CandidateGateStatus.REPAIR_ACCEPTED,
+            }
+            and self.candidate_receipt is not None
+            and self.accepted_candidate_receipt is None
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_ACCEPTANCE_INVALID",
+                "public accepted Candidate lacks the delivery receipt",
+            )
 
     @property
     def formal_review_request(self) -> ReviewSubject | None:
@@ -2932,10 +2989,13 @@ class CandidateGate:
                 "CANDIDATE_GATE_READBACK_INVALID",
                 "authoritative Candidate readback is not the exact typed value",
             )
-        if readback.repository != parent.runtime_subject.repository:
+        if (
+            readback.repository != parent.runtime_subject.repository
+            or readback.candidate.reported_reference != reported_reference
+        ):
             raise CandidateGateError(
                 "CANDIDATE_GATE_EVIDENCE_STALE",
-                "authoritative Candidate belongs to another repository",
+                "authoritative Candidate readback changed repository or reference",
             )
         if self._diff_artifacts is not None:
             stored_record = self._store_candidate_diff(readback.diff_record)
@@ -3247,7 +3307,6 @@ class CandidateGate:
                 evidence=(candidate_evidence, *findings, plan_evidence),
                 plan_invalidation_receipt=invalidation_receipt,
                 plan_invalidation_report=report,
-                review_subject=subject,
             )
         hard_findings = tuple(
             finding for finding in findings if finding.severity == "hard"
@@ -3330,7 +3389,6 @@ class CandidateGate:
                 evidence=(candidate_evidence, *finding_evidence, plan_evidence),
                 plan_invalidation_receipt=receipt,
                 plan_invalidation_report=report,
-                review_subject=request,
             )
         hard_findings = tuple(
             finding for finding in findings if finding.severity == "hard"
@@ -3599,6 +3657,7 @@ class CandidateGate:
             status=CandidateGateStatus.PLAN_INVALIDATION_REPORTED,
             evidence=(evidence,),
             plan_invalidation_receipt=receipt,
+            plan_invalidation_report=report,
         )
 
     @staticmethod

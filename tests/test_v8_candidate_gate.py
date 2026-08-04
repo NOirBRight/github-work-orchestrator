@@ -538,7 +538,7 @@ def test_duplicate_plan_invalidation_replay_reads_back_the_same_receipt():
     assert replay.plan_invalidation_receipt.receipt_digest == (
         first.plan_invalidation_receipt.receipt_digest
     )
-    assert replay.plan_invalidation_report is None
+    assert replay.plan_invalidation_report == first.plan_invalidation_report
     assert port.calls == 2
 
 
