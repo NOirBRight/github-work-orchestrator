@@ -3076,6 +3076,8 @@ class ExecutionKernel:
                     "candidate_identity": None,
                     "candidate_receipt": None,
                     "candidate_receipt_digest": None,
+                    "candidate_commit_oids": [],
+                    "candidate_receipt_digests": [],
                     "trusted_progress_revision": 0,
                     "result_digest": None,
                     "evidence_digests": [],
@@ -3216,6 +3218,12 @@ class ExecutionKernel:
                 dirty = True
             if "candidate_receipt_digest" not in run:
                 run["candidate_receipt_digest"] = None
+                dirty = True
+            if "candidate_commit_oids" not in run:
+                run.setdefault("candidate_commit_oids", [])
+                dirty = True
+            if "candidate_receipt_digests" not in run:
+                run.setdefault("candidate_receipt_digests", [])
                 dirty = True
             if "trusted_progress_revision" not in run:
                 run["trusted_progress_revision"] = 0
@@ -4190,6 +4198,8 @@ class ExecutionKernel:
             "candidate_identity": None,
             "candidate_receipt": None,
             "candidate_receipt_digest": None,
+            "candidate_commit_oids": [],
+            "candidate_receipt_digests": [],
             "trusted_progress_revision": 0,
             "result_digest": None,
             "evidence_digests": [],
@@ -6070,6 +6080,78 @@ class ExecutionKernel:
         wake_ref: str | None,
     ) -> bool:
         run = state["runs"][ticket_key]
+        candidate_commit_oids = run.setdefault("candidate_commit_oids", [])
+        candidate_receipt_digests = run.setdefault("candidate_receipt_digests", [])
+        if type(candidate_commit_oids) is not list or any(
+            type(oid) is not str
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", oid) is None
+            for oid in candidate_commit_oids
+        ):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Candidate commit OID history is malformed",
+            )
+        if len(candidate_commit_oids) != len(set(candidate_commit_oids)):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Candidate commit OID history contains duplicates",
+            )
+        if type(candidate_receipt_digests) is not list or any(
+            type(digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for digest in candidate_receipt_digests
+        ):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Candidate receipt digest history is malformed",
+            )
+        if len(candidate_receipt_digests) != len(set(candidate_receipt_digests)):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Candidate receipt digest history contains duplicates",
+            )
+
+        stored_receipt = run.get("candidate_receipt")
+        history_changed = False
+        if stored_receipt is not None:
+            try:
+                receipt = CandidateReceipt.from_canonical(stored_receipt)
+            except CandidateGateError as error:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Candidate budget input failed canonical receipt readback",
+                ) from error
+            if (
+                receipt.repository != active.handle.repository
+                or receipt.campaign_key != active.handle.campaign_key
+                or receipt.campaign_handle != active.handle.campaign_key
+                or receipt.plan_revision_digest != active.current_revision_digest
+                or receipt.ticket_key != ticket_key
+                or receipt.work_run_key != run["work_run_key"]
+                or receipt.runtime_subject_digest != run["work_subject_digest"]
+            ):
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Candidate budget receipt is bound to another Work Run",
+                )
+            if receipt.digest not in candidate_receipt_digests:
+                candidate_receipt_digests.append(receipt.digest)
+                history_changed = True
+            if receipt.candidate_commit_oid not in candidate_commit_oids:
+                candidate_commit_oids.append(receipt.candidate_commit_oid)
+                history_changed = True
+            if len(candidate_commit_oids) > 3:
+                run["phase"] = "decision"
+                run["reason"] = f"CandidateBudgetExhausted:{ticket_key}"
+                run["next_check_at"] = None
+                run["slot_held"] = False
+                run["claim_state"] = "released"
+                self._save(active.handle, state)
+                return
+
+        if history_changed:
+            self._save(active.handle, state)
+
         prior_action_id = run.get("last_action_id")
         if (
             run.get("stale_follow_up_action_id") is not None
