@@ -66,12 +66,22 @@ class CandidateGateStatus(str, Enum):
     REPAIR_REQUIRED = "repair_required"
     REPAIR_REJECTED = "repair_rejected"
     REPAIR_ACCEPTED = "repair_accepted"
+    DECISION_REQUIRED = "decision_required"
 
 
 class AssuranceMode(str, Enum):
     NO_REVIEW = "no_review"
     STANDARD = "standard"
     STRICT = "strict"
+
+
+class InvalidReviewTransport(RuntimeError):
+    """A typed, retryable Formal Review transport failure."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.code = "INVALID_REVIEW_TRANSPORT"
+        self.detail = detail
 
 
 def _require_text(value: object, field_name: str) -> str:
@@ -2954,6 +2964,7 @@ class CandidateGate:
         self._assurance_policy = assurance_policy
         self._acceptance_facts = acceptance_facts
         self._diff_artifacts = diff_artifacts
+        self._review_results: dict[str, FormalReviewResult] = {}
 
     def _store_candidate_diff(
         self,
@@ -3226,22 +3237,98 @@ class CandidateGate:
             assurance_requirement=requirement.digest,
         )
 
-    def _review_primary(
+    def _invoke_review_action(
         self,
         parent: CandidateGateParent,
-        subject: ReviewSubject,
+        action: ReviewAction,
     ) -> FormalReviewResult:
         reviewer = self._formal_reviewer
         if reviewer is None:
             raise CandidateGateError(
                 "CANDIDATE_GATE_REVIEWER_UNAVAILABLE",
-                "Standard Assurance requires the CandidateGate Formal Reviewer",
+                "Assurance requires the CandidateGate Formal Reviewer",
             )
         self._validate_read_only_port(reviewer, "Formal Reviewer")
-        action = ReviewAction.for_subject(kind="formal_review", subject=subject)
         result = reviewer.review(action)
-        self._validate_review_result(parent, subject, result)
+        self._validate_review_result(parent, action.subject, result)
         return result
+
+    def _review_with_transport_retry(
+        self,
+        parent: CandidateGateParent,
+        action: ReviewAction,
+    ) -> FormalReviewResult:
+        try:
+            return self._invoke_review_action(parent, action)
+        except InvalidReviewTransport:
+            retry = ReviewAction.for_subject(
+                kind="review_strong",
+                subject=action.subject,
+            )
+            if retry.subject.digest != action.subject.digest:
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_REVIEW_SUBJECT_INVALID",
+                    "review_strong retry changed ReviewSubject identity",
+                )
+            return self._invoke_review_action(parent, retry)
+
+    def _merge_review_results(
+        self,
+        subject: ReviewSubject,
+        results: tuple[FormalReviewResult, ...],
+    ) -> FormalReviewResult:
+        by_id: dict[str, FormalReviewFinding] = {}
+        for result in results:
+            for finding in result.findings:
+                prior = by_id.get(finding.finding_id)
+                if prior is not None and prior.digest != finding.digest:
+                    raise CandidateGateError(
+                        "CANDIDATE_GATE_EVIDENCE_INVALID",
+                        "Reviewers returned conflicting Findings with one ID",
+                    )
+                by_id[finding.finding_id] = finding
+        return FormalReviewResult(
+            subject_digest=subject.digest,
+            findings=tuple(by_id[key] for key in sorted(by_id)),
+        )
+
+    def _run_assurance_review(
+        self,
+        parent: CandidateGateParent,
+        subject: ReviewSubject,
+        requirement: AssuranceRequirement,
+    ) -> FormalReviewResult | None:
+        cached = self._review_results.get(subject.digest)
+        if cached is not None:
+            self._validate_review_result(parent, subject, cached)
+            return cached
+        if requirement.mode is AssuranceMode.NO_REVIEW:
+            return FormalReviewResult(subject_digest=subject.digest, findings=())
+        if (
+            requirement.mode is AssuranceMode.STRICT
+            and requirement.specialist_policy_id is None
+        ):
+            return None
+        primary = self._review_with_transport_retry(
+            parent,
+            ReviewAction.for_subject(kind="formal_review", subject=subject),
+        )
+        results = [primary]
+        if requirement.mode is AssuranceMode.STRICT:
+            assert requirement.specialist_policy_id is not None
+            results.append(
+                self._review_with_transport_retry(
+                    parent,
+                    ReviewAction.for_subject(
+                        kind="specialist_review",
+                        subject=subject,
+                        specialist_policy_id=requirement.specialist_policy_id,
+                    ),
+                )
+            )
+        merged = self._merge_review_results(subject, tuple(results))
+        self._review_results[subject.digest] = merged
+        return merged
 
     def _audit_without_second_readback(
         self,
@@ -3296,12 +3383,13 @@ class CandidateGate:
                 evidence=(candidate_evidence,),
                 review_subject=subject,
             )
-        if requirement.mode is AssuranceMode.STRICT:
-            raise CandidateGateError(
-                "CANDIDATE_GATE_ASSURANCE_INVALID",
-                "Strict Assurance is enabled only after the Task 6 matrix lands",
+        review_result = self._run_assurance_review(parent, subject, requirement)
+        if review_result is None:
+            return CandidateGateResult(
+                status=CandidateGateStatus.DECISION_REQUIRED,
+                evidence=(candidate_evidence,),
+                review_subject=subject,
             )
-        review_result = self._review_primary(parent, subject)
         findings = tuple(sorted(review_result.findings, key=lambda finding: finding.digest))
         scope_findings = tuple(finding for finding in findings if finding.scope_escape)
         if scope_findings:
@@ -4105,6 +4193,7 @@ __all__ = [
     "CandidateReadbackPort",
     "CandidateReceipt",
     "DigestEvidence",
+    "InvalidReviewTransport",
     "InteractionClassification",
     "InteractionKey",
     "derive_interaction_keys",
