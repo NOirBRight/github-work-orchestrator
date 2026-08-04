@@ -69,3 +69,28 @@ py -3.13 scripts/sync_orchestrator.py
 ```
 
 No `execution_kernel.py`, #113, or Task 10 files were changed.
+
+## Review fix round
+
+The review regressions were added before the fix and run with:
+
+```powershell
+py -3.13 -m pytest tests/test_v8_repair_verification.py -q
+```
+
+Result: `5 failed, 3 passed`. The failures covered duplicate check IDs,
+repaired-base drift, and the missing RepairVerificationRequest cross-field
+bindings.
+
+The minimal fix added raw exact-tuple and duplicate-ID rejection before the
+check map, prior Artifact and repaired-base binding, and parent/Subject/
+Candidate/RepairDelta identity invariants. The same command then produced
+`8 passed`.
+
+The complete requested fix-round focused set passed:
+
+```powershell
+py -3.13 -m pytest tests/test_v8_repair_verification.py tests/test_v8_repair_packet.py tests/test_v8_candidate_gate.py tests/test_v8_candidate_gate_public.py tests/test_v8_candidate_strict_review.py tests/test_v8_candidate_assurance_standard.py tests/test_v8_candidate_gate_acceptance.py tests/test_v8_candidate_review_reuse.py tests/test_v8_candidate_receipt_foundation.py tests/test_v8_candidate_receipt_kernel.py tests/test_v8_candidate_budget_kernel.py tests/test_v8_watchdog_execution_kernel.py tests/test_v8_execution_kernel.py tests/test_v8_successor_execution_kernel.py -q
+```
+
+Result: `238 passed, 1 warning`.

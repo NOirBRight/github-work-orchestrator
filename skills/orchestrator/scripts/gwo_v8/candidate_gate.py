@@ -2923,16 +2923,31 @@ class RepairVerificationRequest:
                 "Repair Verification checks are not an exact tuple",
             )
         if (
-            self.review_subject.action_kind != "repair_verify"
+            self.candidate_receipt.parent_digest != self.parent_digest
+            or self.review_subject.parent_digest != self.parent_digest
+            or self.review_subject.action_kind != "repair_verify"
             or self.review_subject.repair_packet_digest
             != self.repair_packet_digest
             or self.review_subject.repair_delta_digest != self.repair_delta.digest
             or self.review_subject.candidate_receipt_digest
             != self.candidate_receipt.digest
+            or self.review_subject.candidate_digest != self.candidate.digest
+            or self.review_subject.candidate_commit_oid
+            != self.candidate.candidate_commit_oid
+            or self.review_subject.candidate_tree_oid
+            != self.candidate.candidate_tree_oid
+            or self.review_subject.diff_record_digest
+            != self.candidate_receipt.diff_record_digest
             or self.candidate_receipt.candidate_commit_oid
             != self.candidate.candidate_commit_oid
             or self.candidate_receipt.candidate_tree_oid
             != self.candidate.candidate_tree_oid
+            or self.repair_delta.repaired_candidate_commit_oid
+            != self.candidate_receipt.candidate_commit_oid
+            or self.repair_delta.repaired_candidate_tree_oid
+            != self.candidate_receipt.candidate_tree_oid
+            or self.repair_delta.repaired_diff_record_digest
+            != self.candidate_receipt.diff_record_digest
         ):
             raise CandidateGateError(
                 "CANDIDATE_GATE_REPAIR_REQUEST_INVALID",
@@ -4372,6 +4387,7 @@ class CandidateGate:
                 packet,
                 candidate,
             )
+        prior_receipt = packet.candidate_receipt
         if not packet.finding_ledger.is_complete:
             raise CandidateGateError(
                 "CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
@@ -4409,7 +4425,40 @@ class CandidateGate:
                 "CANDIDATE_GATE_DIFF_ARTIFACT_INVALID",
                 "prior Candidate diff Artifact changed before Repair Verification",
             )
+        if (
+            prior_record.base_commit_oid != prior_receipt.base_commit_oid
+            or prior_record.base_tree_oid != prior_receipt.base_tree_oid
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_BASE_INVALID",
+                "prior Candidate diff Artifact base is not bound to its receipt",
+            )
+        if (
+            readback.candidate.base_commit_oid != prior_receipt.base_commit_oid
+            or readback.candidate.base_tree_oid != prior_receipt.base_tree_oid
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_BASE_INVALID",
+                "repaired Candidate base changed from the prior receipt",
+            )
         delta = RepairDelta.from_records(prior_record, repaired_record)
+        if (
+            delta.prior_candidate_commit_oid != prior_receipt.candidate_commit_oid
+            or delta.prior_candidate_tree_oid != prior_receipt.candidate_tree_oid
+            or delta.prior_diff_record_digest != prior_receipt.diff_record_digest
+            or delta.repaired_candidate_commit_oid
+            != repaired_receipt.candidate_commit_oid
+            or delta.repaired_candidate_tree_oid != repaired_receipt.candidate_tree_oid
+            or delta.repaired_diff_record_digest != repaired_receipt.diff_record_digest
+            or delta.repaired_candidate_commit_oid
+            != readback.candidate.candidate_commit_oid
+            or delta.repaired_candidate_tree_oid
+            != readback.candidate.candidate_tree_oid
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_REQUEST_INVALID",
+                "RepairDelta is not bound to the prior and repaired Candidate receipts",
+            )
         escaped_paths = tuple(
             sorted(
                 set(repaired_record.changed_path_tokens)
@@ -4431,6 +4480,19 @@ class CandidateGate:
                 "Repair Verification requires checks and Assurance policy",
             )
         checks = check_runner.run(parent, readback)
+        if type(checks) is not tuple or any(
+            type(check) is not CandidateCheckEvidence for check in checks
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_CHECK_INVALID",
+                "Repair Verification checks are not an exact immutable tuple",
+            )
+        check_ids = tuple(check.check_id for check in checks)
+        if len(set(check_ids)) != len(check_ids):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_CHECK_INVALID",
+                "Repair Verification checks contain duplicate check IDs",
+            )
         by_id = {check.check_id: check for check in checks}
         if set(by_id) != set(packet.required_check_ids) or any(
             by_id[check_id].outcome != "passed"

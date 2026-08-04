@@ -14,6 +14,8 @@ from gwo_v8._canonical import digest_value  # noqa: E402
 from gwo_v8.candidate_gate import (  # noqa: E402
     AssuranceMode,
     AssuranceRequirement,
+    AuditFailureKind,
+    AuditFailureRoute,
     CandidateAuditReport,
     CandidateAcceptanceFacts,
     CandidateCheckEvidence,
@@ -26,6 +28,7 @@ from gwo_v8.candidate_gate import (  # noqa: E402
     CandidateIdentity,
     CandidateReadback,
     CandidateReceipt,
+    DeterministicAuditFailure,
     FormalReviewFinding,
     FormalReviewResult,
     RepairPacket,
@@ -95,6 +98,37 @@ class _Checks:
         )
 
 
+class _DuplicateChecks:
+    def run(self, _parent, readback):
+        passed = _Checks().run(_parent, readback)[0]
+        failure = DeterministicAuditFailure(
+            kind=AuditFailureKind.AFFECTED_CHECK,
+            route=AuditFailureRoute.ORDINARY_UNAUTHORIZED,
+            code="CHECK_FAILED",
+            detail="the duplicate check deliberately failed",
+        )
+        failed = CandidateCheckEvidence(
+            check_id=passed.check_id,
+            candidate_tree_oid=passed.candidate_tree_oid,
+            outcome="failed",
+            definition_digest=passed.definition_digest,
+            observation_digest=digest_value(
+                {
+                    "kind": "candidate_check_observation.v1",
+                    "check_id": passed.check_id,
+                    "candidate_tree_oid": passed.candidate_tree_oid,
+                    "diff_record_digest": readback.diff_record.digest,
+                    "outcome": "failed",
+                    "failure_digest": failure.digest,
+                }
+            ),
+            failure=failure,
+        )
+        # Put the failed item first so a dict collapse would mask it with the
+        # later passing item.
+        return (failed, passed)
+
+
 class _Policy:
     def derive(self, _parent, _readback, _checks):
         return AssuranceRequirement(
@@ -138,12 +172,19 @@ class _Verifier:
         )
 
 
-def _record(*, candidate_commit_oid, candidate_tree_oid, path_tokens):
+def _record(
+    *,
+    candidate_commit_oid,
+    candidate_tree_oid,
+    path_tokens,
+    base_commit_oid="1" * 40,
+    base_tree_oid="2" * 40,
+):
     return CandidateDiffRecordV1(
         schema_version="CandidateDiffRecordV1",
         repository_object_format="sha1",
-        base_commit_oid="1" * 40,
-        base_tree_oid="2" * 40,
+        base_commit_oid=base_commit_oid,
+        base_tree_oid=base_tree_oid,
         candidate_commit_oid=candidate_commit_oid,
         candidate_tree_oid=candidate_tree_oid,
         entries=tuple(
@@ -163,7 +204,7 @@ def _record(*, candidate_commit_oid, candidate_tree_oid, path_tokens):
     )
 
 
-def _make_fixture(*, scope_escape=False):
+def _make_fixture(*, scope_escape=False, check_runner=None, base_mismatch=False):
     runtime_subject = WorkRunSubject(
         repository="owner/repository",
         campaign_key="campaign:one",
@@ -261,6 +302,8 @@ def _make_fixture(*, scope_escape=False):
         candidate_commit_oid="c" * 40,
         candidate_tree_oid="d" * 40,
         path_tokens=tuple(sorted(repaired_paths)),
+        base_commit_oid=("e" * 40 if base_mismatch else prior_record.base_commit_oid),
+        base_tree_oid=("f" * 40 if base_mismatch else prior_record.base_tree_oid),
     )
     repaired_candidate = CandidateIdentity(
         reported_reference="refs/heads/repaired",
@@ -282,7 +325,7 @@ def _make_fixture(*, scope_escape=False):
         candidate_reader=_Reader(repaired_readback),
         formal_reviewer=formal_reviewer,
         repair_verifier=verifier,
-        check_runner=_Checks(),
+        check_runner=_Checks() if check_runner is None else check_runner,
         assurance_policy=_Policy(),
         acceptance_facts=CandidateAcceptanceFacts(
             target_branch="main",
@@ -344,3 +387,70 @@ def test_repair_scope_escape_fails_before_verifier(scope_escape_repair):
         gate.verify_repair(parent, packet, candidate)
     assert raised.value.code == "CANDIDATE_GATE_REPAIR_SCOPE_INVALID"
     assert verifier.requests == []
+
+
+def test_repair_rejects_duplicate_check_ids_before_verifier():
+    gate, verifier, _reviewer, parent, _packet, packet, candidate = _make_fixture(
+        check_runner=_DuplicateChecks(),
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        gate.verify_repair(parent, packet, candidate)
+    assert raised.value.code == "CANDIDATE_GATE_REPAIR_CHECK_INVALID"
+    assert verifier.requests == []
+
+
+def test_repair_rejects_changed_base_before_verifier():
+    gate, verifier, _reviewer, parent, _packet, packet, candidate = _make_fixture(
+        base_mismatch=True,
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        gate.verify_repair(parent, packet, candidate)
+    assert raised.value.code == "CANDIDATE_GATE_REPAIR_BASE_INVALID"
+    assert verifier.requests == []
+
+
+def test_repair_request_rejects_parent_cross_binding(repair_gate):
+    gate, verifier, parent, packet, candidate = repair_gate
+    gate.verify_repair(parent, packet, candidate)
+    request = verifier.requests[0]
+    with pytest.raises(CandidateGateError) as raised:
+        replace(request, parent_digest="a" * 64, request_digest=None)
+    assert raised.value.code == "CANDIDATE_GATE_REPAIR_REQUEST_INVALID"
+
+
+def test_repair_request_rejects_subject_candidate_cross_binding(repair_gate):
+    gate, verifier, parent, packet, candidate = repair_gate
+    gate.verify_repair(parent, packet, candidate)
+    request = verifier.requests[0]
+    subject = replace(
+        request.review_subject,
+        candidate_digest="e" * 64,
+        subject_digest=None,
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        replace(request, review_subject=subject, request_digest=None)
+    assert raised.value.code == "CANDIDATE_GATE_REPAIR_REQUEST_INVALID"
+
+
+def test_repair_request_rejects_delta_candidate_cross_binding(repair_gate):
+    gate, verifier, parent, packet, candidate = repair_gate
+    gate.verify_repair(parent, packet, candidate)
+    request = verifier.requests[0]
+    delta = replace(
+        request.repair_delta,
+        repaired_candidate_tree_oid="e" * 40,
+        delta_digest=None,
+    )
+    subject = replace(
+        request.review_subject,
+        repair_delta_digest=delta.digest,
+        subject_digest=None,
+    )
+    with pytest.raises(CandidateGateError) as raised:
+        replace(
+            request,
+            review_subject=subject,
+            repair_delta=delta,
+            request_digest=None,
+        )
+    assert raised.value.code == "CANDIDATE_GATE_REPAIR_REQUEST_INVALID"
