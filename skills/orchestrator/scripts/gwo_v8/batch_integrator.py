@@ -774,19 +774,31 @@ class BatchIntegrator:
     def prepare(self, request: BatchDeliveryRequest) -> BatchDeliveryAction:
         self._validate_request(request)
         self.formation_calls += 1
-        if not request.accepted_candidates:
-            raise BatchIntegratorError("BATCH_EMPTY", "accepted candidate set is empty")
-        batch_id = digest_value(
-            {"kind": "batch-id.v1", "request_digest": request.request_digest}
+        target = self.git.read_target(request.target)
+        members = form_batch_members(
+            request.accepted_candidates,
+            target,
+            member_limit=self.configuration.member_limit_for(request.repository),
         )
+        if not members:
+            raise BatchIntegratorError("BATCH_EMPTY", "no eligible accepted Candidate")
+        batch_id = digest_value(
+            {
+                "kind": "batch-id.v1",
+                "campaign_key": request.campaign_key,
+                "plan_revision_digest": request.plan_revision_digest,
+                "target": target.target_facts_digest,
+                "members": [member.digest for member in members],
+            }
+        )
+        batch_sha = self.git.compose_batch(batch_id, target, members)
+        self._requests[request.stable_action_id] = request
         return BatchDeliveryAction(
             stable_action_id=request.stable_action_id,
             request_digest=request.request_digest,
             batch_id=batch_id,
-            batch_sha=request.accepted_candidates[0].candidate_sha,
-            member_ticket_keys=tuple(
-                item.ticket_key for item in request.accepted_candidates
-            ),
+            batch_sha=batch_sha,
+            member_ticket_keys=tuple(member.ticket_key for member in members),
         )
 
     def readback(

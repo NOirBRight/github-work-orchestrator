@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Literal
+import hashlib
+from dataclasses import dataclass, replace
+from pathlib import Path
+import subprocess
+from typing import Callable, Literal
 
 from gwo_v8._canonical import digest_value
 from gwo_v8._batch_integrator_store import (
     HostedResultReceipt,
     SqliteBatchDeliveryJournal,
 )
+from gwo_v8._batch_integrator_drivers import patch_identity_for_trees
 from gwo_v8.batch_integrator import (
     AncestorReadback,
     BatchDeliveryAction,
@@ -28,6 +32,9 @@ from gwo_v8.candidate_gate import (
     InteractionClassification,
     InteractionKey,
 )
+
+
+_REAL_TARGET_TREES: dict[str, str] = {}
 
 
 def make_interaction_key(
@@ -51,6 +58,7 @@ def make_accepted_candidate_receipt(
     candidate_tree_oid: str | None = None,
     delivery_identity_digest: str = "d" * 64,
     evidence_digests: tuple[str, ...] = ("e" * 64,),
+    diff_record_digest: str = "2" * 64,
     assurance: Literal["standard", "strict"] = "standard",
     interaction_keys: tuple[InteractionKey, ...] | None = None,
     protected_surfaces: tuple[str, ...] = (),
@@ -88,7 +96,7 @@ def make_accepted_candidate_receipt(
                 }
             ),
             diff_schema_version="CandidateDiffRecordV1",
-            diff_record_digest="2" * 64,
+            diff_record_digest=diff_record_digest,
             authority_subtree_digest="3" * 64,
             policy_witness_digest="4" * 64,
             review_subject_digest="5" * 64,
@@ -116,7 +124,11 @@ def make_batch_request(
     accepted_candidates: tuple[AcceptedCandidateReceipt, ...],
     stable_action_id: str = "delivery-action:1",
     target_head_sha: str = "7" * 40,
+    target_tree_oid: str | None = None,
 ) -> BatchDeliveryRequest:
+    resolved_target_tree_oid = target_tree_oid or _REAL_TARGET_TREES.get(
+        target_head_sha, "8" * 40
+    )
     return BatchDeliveryRequest(
         stable_action_id=stable_action_id,
         repository="owner/repo",
@@ -126,7 +138,7 @@ def make_batch_request(
             repository="owner/repo",
             target_branch="main",
             target_head_sha=target_head_sha,
-            target_tree_oid="8" * 40,
+            target_tree_oid=resolved_target_tree_oid,
             target_facts_digest="9" * 64,
         ),
         accepted_candidates=accepted_candidates,
@@ -281,3 +293,297 @@ def make_hosted_result_receipt(
             {"kind": "hosted_result_receipt.v1", **body}
         ),
     )
+
+
+class CrashInjected(RuntimeError):
+    def __init__(self, boundary: str) -> None:
+        self.boundary = boundary
+        super().__init__(f"crash injected at {boundary}")
+
+
+def crash_hook_for(boundary: str | None) -> Callable[[str], None]:
+    def hook(observed_boundary: str) -> None:
+        if boundary is not None and observed_boundary == boundary:
+            raise CrashInjected(observed_boundary)
+
+    return hook
+
+
+def _run_git(
+    repository: Path, *arguments: str, env: dict[str, str] | None = None
+) -> str:
+    completed = subprocess.run(
+        ("git", *arguments),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    return completed.stdout.strip()
+
+
+def make_disjoint_git_candidates(
+    root: Path, *, count: int
+) -> tuple[Path, str, tuple[AcceptedCandidateReceipt, ...]]:
+    repository = root / "disjoint-repository"
+    repository.mkdir(parents=True, exist_ok=True)
+    _run_git(repository, "init", "--quiet", "--initial-branch=main")
+    _run_git(repository, "config", "user.email", "gwo-tests@example.invalid")
+    _run_git(repository, "config", "user.name", "GWO Test Builder")
+    (repository / "README.md").write_text("GWO test base\n", encoding="utf-8")
+    _run_git(repository, "add", "README.md")
+    _run_git(repository, "commit", "--quiet", "-m", "test base")
+    target_sha = _run_git(repository, "rev-parse", "HEAD")
+    target_tree_oid = _run_git(repository, "rev-parse", "HEAD^{tree}")
+    _REAL_TARGET_TREES[target_sha] = target_tree_oid
+    candidates: list[AcceptedCandidateReceipt] = []
+    for index in range(1, count + 1):
+        branch = f"candidate-{index}"
+        _run_git(repository, "switch", "--quiet", "-c", branch, target_sha)
+        path = repository / f"module-{index}.py"
+        path.write_text(f"VALUE = {index}\n", encoding="utf-8")
+        _run_git(repository, "add", path.name)
+        _run_git(repository, "commit", "--quiet", "-m", f"candidate {index}")
+        candidate_sha = _run_git(repository, "rev-parse", "HEAD")
+        candidate_tree_oid = _run_git(repository, "rev-parse", "HEAD^{tree}")
+        diff_record_digest = patch_identity_for_trees(
+            repository, target_tree_oid, candidate_tree_oid
+        )
+        candidates.append(
+            make_accepted_candidate_receipt(
+                repository="owner/repo",
+                ticket_key=f"issue:{index}",
+                accepted_sequence=index,
+                base_sha=target_sha,
+                base_tree_oid=target_tree_oid,
+                candidate_sha=candidate_sha,
+                candidate_tree_oid=candidate_tree_oid,
+                diff_record_digest=diff_record_digest,
+            )
+        )
+    _run_git(repository, "switch", "--quiet", "main")
+    return repository, target_sha, tuple(candidates)
+
+
+def make_advanced_target_candidates(
+    root: Path, *, count: int
+) -> tuple[Path, str, tuple[AcceptedCandidateReceipt, ...]]:
+    repository, original_target_sha, candidates = make_disjoint_git_candidates(
+        root, count=count
+    )
+    _run_git(repository, "switch", "--quiet", "main")
+    (repository / "target-only.py").write_text(
+        "TARGET_ONLY = True\n", encoding="utf-8"
+    )
+    _run_git(repository, "add", "target-only.py")
+    _run_git(repository, "commit", "--quiet", "-m", "advance target")
+    advanced_target_sha = _run_git(repository, "rev-parse", "HEAD")
+    _REAL_TARGET_TREES[advanced_target_sha] = _run_git(
+        repository, "rev-parse", "HEAD^{tree}"
+    )
+    assert all(member.base_sha == original_target_sha for member in candidates)
+    return repository, advanced_target_sha, candidates
+
+
+def drop_batch_ref(repository: Path, batch_id: str) -> None:
+    _run_git(
+        repository,
+        "update-ref",
+        "-d",
+        f"refs/gwo-v8/integration-batches/{batch_id}",
+    )
+
+
+class RecordingGitBatchDriver:
+    def __init__(
+        self,
+        *,
+        crash_hook: Callable[[str], None],
+        ancestor_is_ancestor: bool = True,
+        target_delta_interaction_keys: tuple[InteractionKey, ...] = (),
+    ) -> None:
+        self.crash_hook = crash_hook
+        self.ancestor_is_ancestor = ancestor_is_ancestor
+        self.target_delta_interaction_keys = target_delta_interaction_keys
+        self.refs: dict[str, str] = {}
+        self.compose_calls = 0
+        self.clean_base_advance_calls: list[str] = []
+        self.recomputed_patch_digest: str | None = None
+        self.tree_paths: dict[str, set[str]] = {}
+
+    def read_target(self, target: BatchTarget) -> BatchTarget:
+        return target
+
+    def read_ancestor(self, ancestor_sha: str, descendant_sha: str) -> AncestorReadback:
+        body = {
+            "ancestor_sha": ancestor_sha,
+            "descendant_sha": descendant_sha,
+            "is_ancestor": self.ancestor_is_ancestor,
+        }
+        return AncestorReadback(
+            **body,
+            readback_digest=digest_value({"kind": "ancestor-readback.v1", **body}),
+        )
+
+    def read_target_delta(
+        self, base_sha: str, target: BatchTarget
+    ) -> TargetDeltaReadback:
+        return make_target_delta(
+            base_sha,
+            target.target_head_sha,
+            interaction_keys=self.target_delta_interaction_keys,
+        )
+
+    def read_ref(self, ref: str) -> str | None:
+        return self.refs.get(ref)
+
+    def update_ref_cas(self, ref: str, expected_sha: str | None, new_sha: str) -> str:
+        current = self.refs.get(ref)
+        if current != expected_sha:
+            raise BatchIntegratorError(
+                "BATCH_REF_CAS_CONFLICT", f"unexpected current SHA for {ref}"
+            )
+        self.refs[ref] = new_sha
+        return new_sha
+
+    def compose_batch(
+        self,
+        batch_id: str,
+        target: BatchTarget,
+        members: tuple[AcceptedCandidateReceipt, ...],
+    ) -> str:
+        for member in members:
+            if (
+                member.base_sha != target.target_head_sha
+                or member.base_tree_oid != target.target_tree_oid
+            ):
+                self.clean_base_advance(batch_id, target, member)
+        self.compose_calls += 1
+        if len(members) == 1:
+            batch_sha = members[0].candidate_sha
+        else:
+            batch_sha = hashlib.sha1(
+                digest_value(
+                    {
+                        "batch_id": batch_id,
+                        "target": target.target_head_sha,
+                        "members": [member.digest for member in members],
+                    }
+                ).encode("ascii")
+            ).hexdigest()
+        self.refs[f"refs/gwo-v8/integration-batches/{batch_id}"] = batch_sha
+        self.tree_paths[batch_sha] = {
+            f"module-{index}.py" for index in range(1, len(members) + 1)
+        }
+        self.crash_hook("batch_ref_publication")
+        return batch_sha
+
+    def clean_base_advance(
+        self,
+        batch_id: str,
+        target: BatchTarget,
+        member: AcceptedCandidateReceipt,
+    ):
+        from gwo_v8.batch_patch_identity import require_clean_base_advance
+
+        self.clean_base_advance_calls.append(member.ticket_key)
+        recomputed = self.recomputed_patch_digest or member.diff_record_digest
+        return require_clean_base_advance(
+            member=member,
+            original_patch_digest=member.diff_record_digest,
+            recomputed_patch_digest=recomputed,
+            ancestor=self.read_ancestor(member.base_sha, target.target_head_sha),
+            target_delta=self.read_target_delta(member.base_sha, target),
+            target_tree_oid=target.target_tree_oid,
+            advanced_member_tree_oid=member.candidate_tree_oid,
+        )
+
+    def tree_contains(self, batch_sha: str, path: str) -> bool:
+        return path in self.tree_paths.get(batch_sha, set())
+
+
+class RecordingLocalSuiteDriver:
+    def __init__(self) -> None:
+        self.batch_shas: list[str] = []
+
+    def run(self, batch_sha: str, suite: LocalSuiteDefinition):
+        from gwo_v8._batch_integrator_drivers import LocalCheckReceipt
+
+        self.batch_shas.append(batch_sha)
+        body = {
+            "batch_sha": batch_sha,
+            "suite_id": suite.suite_id,
+            "definition_digest": suite.definition_digest,
+            "outcome": "passed",
+            "source_ref": f"refs/gwo-v8/integration-batches/{batch_sha}",
+        }
+        observation_digest = digest_value({"kind": "local-observation.v1", **body})
+        return LocalCheckReceipt(
+            **body,
+            observation_digest=observation_digest,
+            receipt_digest=digest_value(
+                {
+                    "kind": "local-check-receipt.v1",
+                    **body,
+                    "observation_digest": observation_digest,
+                }
+            ),
+        )
+
+
+class NoopHostedDriver:
+    def read_publication(self, repository, batch_sha):
+        return None
+
+    def publish_once(self, repository, batch_sha, manifest_digest):
+        raise AssertionError("hosted driver is not part of Task 5")
+
+    def read_pull_request(self, repository, batch_sha):
+        raise AssertionError("hosted driver is not part of Task 5")
+
+    def read_hosted_result(self, repository, batch_sha, suite):
+        raise AssertionError("hosted driver is not part of Task 5")
+
+    def retry_hosted(self, repository, batch_sha, provider_check_id):
+        raise AssertionError("hosted driver is not part of Task 5")
+
+    def integrate_serially(self, repository, batch_sha, target, pull_request):
+        raise AssertionError("hosted driver is not part of Task 5")
+
+
+@dataclass
+class CompositionDriverSet:
+    git: object
+    local: RecordingLocalSuiteDriver
+
+
+def make_composition_integrator(
+    repository: Path,
+    *,
+    ancestor_is_ancestor: bool = True,
+    target_delta_interaction_keys: tuple[InteractionKey, ...] = (),
+    crash_after: str | None = None,
+):
+    root = Path(repository)
+    root.mkdir(parents=True, exist_ok=True)
+    crash_hook = crash_hook_for(crash_after)
+    if (root / ".git").is_dir() and ancestor_is_ancestor and not target_delta_interaction_keys:
+        from gwo_v8._batch_integrator_drivers import GitCliBatchDriver
+
+        git = GitCliBatchDriver(root, crash_hook=crash_hook)
+    else:
+        git = RecordingGitBatchDriver(
+            crash_hook=crash_hook,
+            ancestor_is_ancestor=ancestor_is_ancestor,
+            target_delta_interaction_keys=target_delta_interaction_keys,
+        )
+    local = RecordingLocalSuiteDriver()
+    integrator = BatchIntegrator(
+        journal=SqliteBatchDeliveryJournal(root / "v8.sqlite3"),
+        git=git,
+        local=local,
+        hosted=NoopHostedDriver(),
+        configuration=BatchIntegratorConfiguration(),
+    )
+    return integrator, CompositionDriverSet(git=git, local=local)

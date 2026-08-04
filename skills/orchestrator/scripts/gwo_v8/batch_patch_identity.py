@@ -85,31 +85,68 @@ def _validate_object_id(value: str) -> None:
 
 @dataclass(frozen=True)
 class PatchIdentityEntry:
-    old_path: str
-    new_path: str
+    old_path: str | None
+    new_path: str | None
     change_kind: Literal["add", "delete", "modify", "type-change"]
-    old_mode: str
-    new_mode: str
-    old_object_type: Literal["blob", "gitlink"]
-    new_object_type: Literal["blob", "gitlink"]
-    old_oid: str
-    new_oid: str
+    old_mode: str | None
+    new_mode: str | None
+    old_object_type: Literal["blob", "gitlink"] | None
+    new_object_type: Literal["blob", "gitlink"] | None
+    old_oid: str | None
+    new_oid: str | None
 
     def __post_init__(self) -> None:
         if self.change_kind not in _CHANGE_KINDS:
             raise ValueError("unsupported PatchIdentityV1 change kind")
-        for path in (self.old_path, self.new_path):
+        old_values = (
+            self.old_path,
+            self.old_mode,
+            self.old_object_type,
+            self.old_oid,
+        )
+        new_values = (
+            self.new_path,
+            self.new_mode,
+            self.new_object_type,
+            self.new_oid,
+        )
+        for side, values in (("old", old_values), ("new", new_values)):
+            present = values[0] is not None
+            if present and any(value is None for value in values):
+                raise ValueError(
+                    f"PatchIdentityV1 {side} entry is only partially present"
+                )
+            if not present and any(value is not None for value in values):
+                raise ValueError(
+                    f"PatchIdentityV1 {side} entry has fields without a path"
+                )
+            if not present:
+                continue
+            path, mode, object_type, oid = values
+            assert isinstance(path, str)
+            assert isinstance(mode, str)
+            assert isinstance(object_type, str)
+            assert isinstance(oid, str)
             _validate_path(path)
-        for mode in (self.old_mode, self.new_mode):
-            if type(mode) is not str or len(mode) != 6 or not mode.isdigit():
+            if len(mode) != 6 or not mode.isdigit():
                 raise ValueError("PatchIdentityV1 modes must be six-digit Git modes")
-        for object_type in (self.old_object_type, self.new_object_type):
             if object_type not in _OBJECT_TYPES:
                 raise ValueError(
                     "PatchIdentityV1 object types must be blob or gitlink"
                 )
-        for oid in (self.old_oid, self.new_oid):
             _validate_object_id(oid)
+        if self.change_kind == "add" and (
+            self.old_path is not None or self.new_path is None
+        ):
+            raise ValueError("PatchIdentityV1 add entry has invalid sides")
+        if self.change_kind == "delete" and (
+            self.old_path is None or self.new_path is not None
+        ):
+            raise ValueError("PatchIdentityV1 delete entry has invalid sides")
+        if self.change_kind in {"modify", "type-change"} and (
+            self.old_path is None or self.new_path is None
+        ):
+            raise ValueError("PatchIdentityV1 change entry has invalid sides")
         if self.change_kind == "type-change" and (
             self.old_mode == self.new_mode
             and self.old_object_type == self.new_object_type
@@ -120,15 +157,19 @@ class PatchIdentityEntry:
 
     def encoded(self) -> bytes:
         fields = (
-            self.old_path.encode("utf-8"),
-            self.new_path.encode("utf-8"),
+            b"" if self.old_path is None else self.old_path.encode("utf-8"),
+            b"" if self.new_path is None else self.new_path.encode("utf-8"),
             self.change_kind.encode("ascii"),
-            self.old_mode.encode("ascii"),
-            self.new_mode.encode("ascii"),
-            self.old_object_type.encode("ascii"),
-            self.new_object_type.encode("ascii"),
-            bytes.fromhex(self.old_oid),
-            bytes.fromhex(self.new_oid),
+            b"" if self.old_mode is None else self.old_mode.encode("ascii"),
+            b"" if self.new_mode is None else self.new_mode.encode("ascii"),
+            b""
+            if self.old_object_type is None
+            else self.old_object_type.encode("ascii"),
+            b""
+            if self.new_object_type is None
+            else self.new_object_type.encode("ascii"),
+            b"" if self.old_oid is None else bytes.fromhex(self.old_oid),
+            b"" if self.new_oid is None else bytes.fromhex(self.new_oid),
         )
         return b"".join(length_prefix(field) for field in fields)
 
@@ -168,6 +209,8 @@ def _validate_entries(
         if type(entry) is not PatchIdentityEntry:
             raise ValueError("PatchIdentityV1 entries must be exact tree entries")
         for path in (entry.old_path, entry.new_path):
+            if path is None:
+                continue
             folded = path.casefold()
             existing = path_by_casefold.setdefault(folded, path)
             if existing != path:
@@ -182,6 +225,8 @@ def _validate_entries(
             ("old_oid", entry.old_oid),
             ("new_oid", entry.new_oid),
         ):
+            if oid is None:
+                continue
             _validate_object_id(oid)
             if len(oid) != expected_oid_length:
                 raise ValueError(

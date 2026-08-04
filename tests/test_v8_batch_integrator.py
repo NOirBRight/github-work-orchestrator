@@ -175,6 +175,178 @@ def test_formation_skips_oldest_candidate_outside_target_scope():
     ) == (eligible,)
 
 
+def test_composes_three_members_without_moving_target_and_reads_exact_tree(tmp_path):
+    from v8_batch_test_support import make_composition_integrator, make_disjoint_git_candidates
+
+    repository, target_sha, candidates = make_disjoint_git_candidates(tmp_path, count=3)
+    integrator, drivers = make_composition_integrator(repository)
+    request = make_batch_request(
+        accepted_candidates=tuple(candidates),
+        target_head_sha=target_sha,
+    )
+
+    action = integrator.prepare(request)
+
+    assert drivers.git.read_target(request.target).target_head_sha == target_sha
+    assert drivers.git.tree_contains(action.batch_sha, "module-1.py")
+    assert drivers.git.tree_contains(action.batch_sha, "module-2.py")
+    assert drivers.git.tree_contains(action.batch_sha, "module-3.py")
+    assert (
+        drivers.git.read_ref(f"refs/gwo-v8/integration-batches/{action.batch_id}")
+        == action.batch_sha
+    )
+
+
+def test_existing_batch_ref_is_reused_without_a_second_merge(tmp_path):
+    from v8_batch_test_support import make_composition_integrator, make_disjoint_git_candidates
+
+    repository, target_sha, candidates = make_disjoint_git_candidates(tmp_path, count=2)
+    first, _drivers = make_composition_integrator(repository)
+    request = make_batch_request(
+        accepted_candidates=tuple(candidates), target_head_sha=target_sha
+    )
+    first_action = first.prepare(request)
+    second, restarted_drivers = make_composition_integrator(repository)
+
+    second_action = second.prepare(request)
+
+    assert second_action == first_action
+    assert restarted_drivers.git.compose_calls == 0
+
+
+def test_lost_batch_ref_recomposition_reuses_the_same_deterministic_commit_sha(tmp_path):
+    from v8_batch_test_support import (
+        drop_batch_ref,
+        make_composition_integrator,
+        make_disjoint_git_candidates,
+    )
+
+    repository, target_sha, candidates = make_disjoint_git_candidates(tmp_path, count=2)
+    first, _drivers = make_composition_integrator(repository)
+    request = make_batch_request(
+        accepted_candidates=tuple(candidates), target_head_sha=target_sha
+    )
+    first_action = first.prepare(request)
+
+    drop_batch_ref(repository, first_action.batch_id)
+    restarted, restarted_drivers = make_composition_integrator(repository)
+    second_action = restarted.prepare(request)
+
+    assert second_action.batch_sha == first_action.batch_sha
+    assert restarted_drivers.git.compose_calls == 1
+
+
+def test_clean_base_advance_requires_each_member_patch_identity_before_multi_member_compose(
+    tmp_path,
+):
+    from v8_batch_test_support import make_advanced_target_candidates, make_composition_integrator
+
+    repository, advanced_target_sha, candidates = make_advanced_target_candidates(
+        tmp_path, count=2
+    )
+    integrator, drivers = make_composition_integrator(repository)
+    request = make_batch_request(
+        accepted_candidates=tuple(candidates),
+        target_head_sha=advanced_target_sha,
+    )
+
+    action = integrator.prepare(request)
+
+    assert len(drivers.git.clean_base_advance_calls) == 2
+    assert action.batch_sha != advanced_target_sha
+
+
+def test_clean_base_advance_patch_identity_mismatch_fails_before_multi_member_compose(
+    tmp_path,
+):
+    from v8_batch_test_support import make_advanced_target_candidates, make_composition_integrator
+
+    repository, target_sha, candidates = make_advanced_target_candidates(tmp_path, count=2)
+    integrator, drivers = make_composition_integrator(repository)
+    drivers.git.recomputed_patch_digest = "f" * 64
+
+    with pytest.raises(BatchIntegratorError, match="CLEAN_BASE_PATCH_IDENTITY_MISMATCH"):
+        integrator.prepare(
+            make_batch_request(
+                accepted_candidates=tuple(candidates), target_head_sha=target_sha
+            )
+        )
+
+    assert drivers.git.compose_calls == 0
+
+
+def test_clean_base_advance_non_ancestor_fails_before_multi_member_compose(tmp_path):
+    from v8_batch_test_support import make_advanced_target_candidates, make_composition_integrator
+
+    repository, target_sha, candidates = make_advanced_target_candidates(tmp_path, count=2)
+    integrator, drivers = make_composition_integrator(
+        repository, ancestor_is_ancestor=False
+    )
+
+    with pytest.raises(BatchIntegratorError, match="CLEAN_BASE_ANCESTOR_REQUIRED"):
+        integrator.prepare(
+            make_batch_request(
+                accepted_candidates=tuple(candidates), target_head_sha=target_sha
+            )
+        )
+
+    assert drivers.git.compose_calls == 0
+
+
+def test_clean_base_advance_protected_target_delta_fails_before_multi_member_compose(
+    tmp_path,
+):
+    from v8_batch_test_support import (
+        make_advanced_target_candidates,
+        make_composition_integrator,
+    )
+
+    repository, target_sha, candidates = make_advanced_target_candidates(tmp_path, count=2)
+    protected = make_interaction_key(
+        "schema:root", classification=InteractionClassification.PROTECTED
+    )
+    integrator, drivers = make_composition_integrator(
+        repository, target_delta_interaction_keys=(protected,)
+    )
+
+    with pytest.raises(BatchIntegratorError, match="TARGET_DELTA_PROTECTED_INTERACTION"):
+        integrator.prepare(
+            make_batch_request(
+                accepted_candidates=tuple(candidates), target_head_sha=target_sha
+            )
+        )
+
+    assert drivers.git.compose_calls == 0
+
+
+def test_crash_after_batch_ref_publication_is_recovered_by_exact_ref_readback(tmp_path):
+    from v8_batch_test_support import (
+        CrashInjected,
+        make_composition_integrator,
+        make_disjoint_git_candidates,
+    )
+
+    repository, target_sha, candidates = make_disjoint_git_candidates(tmp_path, count=2)
+    first, drivers = make_composition_integrator(
+        repository, crash_after="batch_ref_publication"
+    )
+    request = make_batch_request(
+        accepted_candidates=tuple(candidates), target_head_sha=target_sha
+    )
+
+    with pytest.raises(CrashInjected, match="batch_ref_publication"):
+        first.prepare(request)
+
+    restarted, restarted_drivers = make_composition_integrator(repository)
+    action = restarted.prepare(request)
+
+    assert (
+        action.batch_sha
+        == drivers.git.read_ref(f"refs/gwo-v8/integration-batches/{action.batch_id}")
+    )
+    assert restarted_drivers.git.compose_calls == 0
+
+
 def test_accepted_candidate_receipt_digest_binds_every_delivery_fact():
     first = make_accepted_candidate_receipt(
         ticket_key="issue:1", candidate_sha="a" * 40
@@ -229,9 +401,16 @@ def test_batch_action_preserves_oldest_first_member_order():
             make_accepted_candidate_receipt(ticket_key="issue:a", accepted_sequence=2),
         )
     )
+    class FakeGit:
+        def read_target(self, target):
+            return target
+
+        def compose_batch(self, batch_id, target, members):
+            return members[0].candidate_sha
+
     integrator = BatchIntegrator(
         journal=object(),
-        git=object(),
+        git=FakeGit(),
         local=object(),
         hosted=object(),
         configuration=BatchIntegratorConfiguration(),
