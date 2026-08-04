@@ -338,6 +338,33 @@ def test_git_driver_maps_raw_protected_surfaces_to_canonical_target_path_keys():
     assert mapped.protected_interaction_keys == mapped.interaction_keys
 
 
+def test_git_driver_maps_raw_singleton_interactions_to_canonical_target_path_keys():
+    from gwo_v8._batch_integrator_drivers import GitCliBatchDriver
+
+    member = make_accepted_candidate_receipt(
+        interaction_keys=(
+            make_interaction_key(
+                "high-coupling/path",
+                classification=InteractionClassification.HIGH_COUPLING,
+            ),
+        )
+    )
+    token = base64.urlsafe_b64encode(b"high-coupling/path").decode("ascii").rstrip("=")
+    target_delta = make_target_delta(
+        member.base_sha,
+        "b" * 40,
+        interaction_keys=(make_interaction_key(token),),
+    )
+
+    mapped = GitCliBatchDriver._apply_member_policy(target_delta, member)
+
+    assert mapped.protected_interaction_keys == mapped.interaction_keys
+    assert (
+        mapped.interaction_keys[0].classification
+        == InteractionClassification.HIGH_COUPLING
+    )
+
+
 def test_crash_after_batch_ref_publication_is_recovered_by_exact_ref_readback(tmp_path):
     from v8_batch_test_support import (
         CrashInjected,

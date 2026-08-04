@@ -512,11 +512,39 @@ class GitCliBatchDriver:
         from .batch_integrator import TargetDeltaReadback
 
         protected_surfaces = set(member.protected_surfaces)
-        member_interactions = {
-            (key.namespace, key.value): key.classification
-            for key in member.interaction_keys
-            if key.requires_singleton
-        }
+
+        def value_aliases(value: str) -> set[str]:
+            aliases = {value}
+            try:
+                raw_value = base64.urlsafe_b64decode(
+                    value + "=" * (-len(value) % 4)
+                )
+            except ValueError:
+                raw_value = None
+            if raw_value is not None:
+                try:
+                    aliases.add(raw_value.decode("utf-8"))
+                except UnicodeDecodeError:
+                    pass
+            aliases.add(
+                base64.urlsafe_b64encode(value.encode("utf-8"))
+                .decode("ascii")
+                .rstrip("=")
+            )
+            return aliases
+
+        member_interactions: dict[tuple[str, str], InteractionClassification] = {}
+        for interaction in member.interaction_keys:
+            if not interaction.requires_singleton:
+                continue
+            for alias in value_aliases(interaction.value):
+                current = member_interactions.get((interaction.namespace, alias))
+                if current is None or (
+                    interaction.classification.value > current.value
+                ):
+                    member_interactions[(interaction.namespace, alias)] = (
+                        interaction.classification
+                    )
 
         def is_protected_surface(key: InteractionKey) -> bool:
             if key.value in protected_surfaces:
@@ -536,8 +564,13 @@ class GitCliBatchDriver:
                 classification=(
                     InteractionClassification.PROTECTED
                     if is_protected_surface(key)
-                    else member_interactions.get(
-                        (key.namespace, key.value), key.classification
+                    else next(
+                        (
+                            member_interactions[(key.namespace, alias)]
+                            for alias in value_aliases(key.value)
+                            if (key.namespace, alias) in member_interactions
+                        ),
+                        key.classification,
                     )
                 ),
             )
