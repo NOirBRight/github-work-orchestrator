@@ -12,3 +12,4 @@ Task 10: complete (commit 6ab11b3; contract RED/GREEN and repository gates passe
 Task 11: complete (local exact-head validation 1712 passed, 2 warnings; Beta2 HOLD because origin/main is a48c7d6, #113–#117 are OPEN, #137 is CLOSED, and no merge/CI admission readback exists)
 Batch Task 1: complete (commits 98d36cb..590f45a, fix rounds 1–2; scoped re-review approved; focused/package 20 passed)
 Batch Task 2: complete (commits bca6953..43b2189, fix round 1; scoped re-review approved; focused 6 passed, package 11 passed)
+Batch Task 3: complete (commits 1844416, 3b5f343; fix round 1; scoped re-review approved; focused/package 19 passed)
