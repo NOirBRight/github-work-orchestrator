@@ -308,38 +308,113 @@ def test_release_train_blocker_graph_contains_native_prerequisite_edges():
         assert required_edge in text
 
 
-def test_beta1_release_contract_has_structured_baseline_ci_dynamic_issue_and_nongoal():
+def test_beta1_release_contract_has_structured_local_evidence_v2_issue_and_nongoal():
     note = (ROOT / "docs" / "releases" / "v8.0.0-beta.1.md").read_text("utf-8")
     blocks = re.findall(r"```json\n(\{.*?\})\n```", note, re.DOTALL)
     assert len(blocks) == 1
     evidence = json.loads(blocks[0])
     assert set(evidence) == {
+        "schema",
+        "verification_mode",
         "core_baseline_sha",
-        "ci_url",
-        "dynamic_pass_summary",
+        "core_baseline_tree",
+        "python_version",
+        "requirements_sha256",
+        "local_verification_manifest_sha256",
+        "main_attestation_sha256",
+        "full_pytest_summary",
         "issues",
         "non_goal",
     }
+    assert evidence["schema"] == "gwo-beta1-release-evidence.v2"
+    assert evidence["verification_mode"] == "local-only"
+    assert evidence["core_baseline_sha"] == (
+        "2c72d9a153dac07e507c746548258efc44b62875"
+    )
+    assert evidence["core_baseline_tree"] == (
+        "1905079fa3cd0d90dd9b1930ed5dd726fad9f114"
+    )
+    assert evidence["python_version"] == "Python 3.13.11"
+    assert evidence["requirements_sha256"] == (
+        "ee3c9f14db38950f5869759a5a94347197c9d4db3f138147b614ad6c4d862534"
+    )
+    assert evidence["local_verification_manifest_sha256"] == (
+        "1f01205bc9846bebfd8e767744a60d4d1e4c185f081f6083606047cd37e9d4a3"
+    )
+    assert evidence["main_attestation_sha256"] == (
+        "689ccbdf84667d9931b83f18b4234816a853ca61ba6cca8382117f2179e15818"
+    )
+    assert evidence["full_pytest_summary"] == "1521 passed in 1987.16s (0:33:07)"
     assert re.fullmatch(r"[0-9a-f]{40}", evidence["core_baseline_sha"])
-    ci_match = re.fullmatch(
-        r"https://github\.com/.+/actions/runs/(?P<run_id>[1-9][0-9]*)",
-        evidence["ci_url"],
-    )
-    assert ci_match is not None
-    summary_match = re.fullmatch(
-        r"(?P<passed>[1-9][0-9]*) passed in [0-9]+\.[0-9]{2}s \([0-9]+:[0-9]{2}:[0-9]{2}\)",
-        evidence["dynamic_pass_summary"],
-    )
-    assert summary_match is not None
-    assert int(summary_match["passed"]) > 0
+    assert re.fullmatch(r"[0-9a-f]{40}", evidence["core_baseline_tree"])
+    baseline_tree = subprocess.run(
+        ["git", "rev-parse", f"{evidence['core_baseline_sha']}^{{tree}}"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert baseline_tree == evidence["core_baseline_tree"]
+    for key in (
+        "requirements_sha256",
+        "local_verification_manifest_sha256",
+        "main_attestation_sha256",
+    ):
+        assert re.fullmatch(r"[0-9a-f]{64}", evidence[key])
+    assert "ci_url" not in evidence
+    assert "dynamic_pass_summary" not in evidence
+    assert '"ci_url"' not in note
+    assert '"dynamic_pass_summary"' not in note
     compact_note = " ".join(note.split()).casefold()
     assert (
-        "one exact-sha ci readback binds the baseline sha, ci run, and dynamic pass summary"
+        "repository release acceptance is local verification only"
         in compact_note
     )
-    assert set(evidence["issues"]) == {"113", "114", "115", "116", "117", "118", "119"}
-    assert all(value in {"OPEN", "CLOSED"} for value in evidence["issues"].values())
+    assert "successful main ci readback" not in compact_note
+    assert "dynamic main-ci" not in compact_note
+    assert "GWO product Hosted CI".casefold() in compact_note
+    assert evidence["issues"] == {
+        "113": "OPEN",
+        "114": "OPEN",
+        "115": "OPEN",
+        "116": "OPEN",
+        "117": "OPEN",
+        "118": "OPEN",
+        "119": "OPEN",
+    }
     assert evidence["non_goal"] == "Lean V8 production cutover"
+
+
+def test_release_gates_separate_repository_acceptance_from_gwo_product_hosted_ci():
+    note = (ROOT / "docs" / "releases" / "v8.0.0-beta.1.md").read_text("utf-8")
+    train = (ROOT / "docs" / "releases" / "gwo-v8-release-train.md").read_text(
+        "utf-8"
+    )
+    roadmap = (ROOT / "docs" / "design" / "gwo-v8-lean-roadmap.md").read_text(
+        "utf-8"
+    )
+    program = (
+        ROOT / "docs" / "superpowers" / "plans" / "2026-08-04-gwo-v8-ga-release-program.md"
+    ).read_text("utf-8")
+    contributing = (ROOT / "CONTRIBUTING.md").read_text("utf-8")
+
+    compact_note = " ".join(note.split()).casefold()
+    assert "repository release acceptance is local verification only" in compact_note
+    assert "exact sha/tree" in compact_note
+    assert "before the immutable prerelease tag" in compact_note
+    assert "GWO product Hosted CI".casefold() in compact_note
+    assert "repository release acceptance" in " ".join(train.split()).casefold()
+    assert "GWO product Hosted CI" in train
+    assert "GWO product Hosted CI" in roadmap
+    assert "GWO product Hosted CI" in program
+    assert "through pull requests" in contributing
+    assert "GitHub Actions acceptance is disabled" in contributing
+    assert "repository release acceptance is local verification only" in (
+        " ".join(contributing.split()).casefold()
+    )
+    assert "Python 3.13" in contributing
+    assert "--require-hashes" in contributing
+    assert ".github/requirements-ci-win-py313.txt" in contributing
 
 
 def test_beta1_requires_structured_workspace_convergence_receipt():

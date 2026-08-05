@@ -45,24 +45,29 @@ Release sequencing and publication boundaries are recorded in
 metadata and exit-criteria work; it does not redefine V8 mechanics or
 authorize a production writer.
 
+Repository release acceptance is Local Verification Only. Beta1 uses exact
+SHA/tree evidence from Python 3.13 and the retained hash-locked requirements
+file before tag or Release publication. GWO product Hosted CI remains the
+product-layer delivery mechanism for product acceptance.
+
 | Release | Required merged state | Production authority |
 | --- | --- | --- |
-| Beta1 / Core Preview | Green `origin/main` baseline, release metadata, and owner-approved tracker readback | No production admission |
+| Beta1 / Core Preview | Exact `main` SHA/tree local Python 3.13 evidence, release metadata, and owner-approved tracker readback | No production admission |
 | Beta2 / Feature Complete Preview | #113–#117 complete, #137 revalidated, and isolated Production V3 acceptance | No writer cutover |
 | Beta3 / Cutover Candidate | #118 Guard and activation contract pass; legacy writer paths absent or unreachable | Guarded rehearsal only; no default change |
 | GA / `v8.0.0` | #119 root Canary accepted with exact Activation/default-writer readback | Lean V8 is default for new Campaigns |
 
-The Beta1 baseline record names the exact `origin/main` SHA and dynamic main-CI
-readback, rather than this roadmap or the metadata branch SHA. Package
-publication is not writer activation; the durable writer-generation and
+The Beta1 baseline record names the exact `main` SHA/tree and local Python 3.13
+verification readback, rather than this roadmap or the metadata branch SHA.
+Package publication is not writer activation; the durable writer-generation and
 Activation Receipt remain the sole authority-transfer commit point.
 
 ## Published successor sequence
 
 The native blocker graph was read back on 2026-08-01. Issue #121 was a
-temporary dedicated-runner prerequisite; the repository now uses the standard
-GitHub-hosted `windows-2025` runner, so the migration supersedes #121's
-self-hosted operational assumption and remains outside the V8 Candidate graph.
+temporary dedicated-runner prerequisite; GWO product Hosted CI now uses the
+standard `windows-2025` runner, so the migration supersedes #121's self-hosted
+operational assumption and remains outside the V8 Candidate graph.
 Closed prerequisite Tickets #123 and #126 remain visible below because they
 are native blockers even though they add no remaining work. Issue #131
 decomposed bounded Campaign replanning into successor Tickets #132–#137; #132
@@ -145,8 +150,9 @@ Exit criteria:
   defaults have one integrated definition in the architecture;
 - historical V7 and V8 architecture and roadmap documents are visibly
   non-executable;
-- repository package/link validation, diff checks, local acceptance, and exact
-  hosted acceptance pass; and
+- repository package/link validation, diff checks, Local Verification Only
+  acceptance, and exact GWO product Hosted CI acceptance for product delivery;
+  and
 - no product Runtime, writer, production execution, or unrelated tracker state
   changes.
 
@@ -251,7 +257,7 @@ Exit criteria for #112:
 
 Exit criteria for #113:
 
-- Runtime and hosted-check events and due timers wake the same `advance`
+- Runtime and GWO product Hosted CI events and due timers wake the same `advance`
   operation;
 - Worker Candidate-reference reports and Runtime notifications are wake hints;
   RuntimeGateway transports them without adopting a Candidate;
@@ -310,11 +316,12 @@ Exit criteria for #116:
   when applied alone to the same exact advanced target before multi-member
   composition, and Batch Evidence binds every specified tree, digest, and
   check;
-- every required terminal hosted check persists the exact keyed
-  [`hosted-result receipt`](gwo-v8-lean-architecture.md#durable-hosted-result-adoption)
+- every required terminal GWO product Hosted CI check persists the exact keyed
+  [`GWO product Hosted CI result receipt`](gwo-v8-lean-architecture.md#durable-hosted-result-adoption)
   for its stable delivery action, Batch SHA, suite identity, provider check ID,
   terminal outcome, and observation digest before integration;
-- the local suite, pushed and PR head, and hosted CI all observe one Batch SHA;
+- the local suite, pushed and PR head, and GWO product Hosted CI all observe one
+  Batch SHA;
   and
 - target readback proves the exact Batch SHA reachable through the PR merge
   mapping.
@@ -327,7 +334,7 @@ Exit criteria for #117:
 - only a failing Singleton can resume its Work Run with changed code returning
   through CandidateGate;
 - a persisted integrity-valid terminal
-  [`hosted-result receipt`](gwo-v8-lean-architecture.md#durable-hosted-result-adoption)
+  [`GWO product Hosted CI result receipt`](gwo-v8-lean-architecture.md#durable-hosted-result-adoption)
   is adopted after restart without provider reread; and
 - `DeliveryIdentityMismatch` and `DeliveryAttributionAmbiguous` preserve all
   observations and Evidence and allow neither Singleton fallback nor Worker
@@ -362,7 +369,7 @@ Exit criteria for #119:
   Standard-Assurance accepted Candidates form one compatible multi-member
   Batch, while its Strict-Assurance accepted Candidate forms a separate
   Singleton Batch and is never co-batched. Each Batch has its own exact Batch
-  SHA, repository-equivalent local verification, pull-request, hosted-CI,
+  SHA, repository-equivalent local verification, pull-request, GWO product Hosted CI,
   Integration-Lease-serialized target integration, and target-readback
   boundary;
 - Canary acceptance reads back the frozen Authority Grants, Policy Witness, and
@@ -540,13 +547,13 @@ instructions.
 | #105 | Closed; preserved by #112 |
 | #35 | Independent unless it becomes a proven RuntimeGateway blocker |
 
-## PR and CI strategy during landing
+## PR and GWO product Hosted CI strategy during landing
 
 Before BatchIntegrator is live, use one reviewable PR per Ticket or tightly
 coupled delivery pair. Multiple independently executable Tickets may share a
 PR only when their exact Candidate identities and individual acceptance
-mapping remain explicit. Run repository acceptance on the final composed head
-and push once for final hosted CI.
+mapping remain explicit. Run Local Verification Only repository acceptance on
+the final composed head and push once for final GWO product Hosted CI.
 
 After #116, the root Canary must use BatchIntegrator itself rather than a
 manual approximation.

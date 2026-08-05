@@ -6,34 +6,42 @@ production writer cutover. The normative order remains `CONTEXT.md`, accepted
 ADRs, the integrated architecture, the stabilization specification, and the
 lean roadmap.
 
+Repository release acceptance is Local Verification Only, and this repository's
+GitHub Actions acceptance is disabled. Release gates use exact SHA/tree
+evidence from a Python 3.13 environment installed from the retained
+hash-locked requirements file. GWO product Hosted CI remains the separate
+product-layer delivery mechanism.
+
 ## Release sequence
 
 | Release | Immutable tag | Required merged state | Production authority |
 | --- | --- | --- | --- |
-| Beta1 / Core Preview | `v8.0.0-beta.1` | The green `origin/main` Core baseline, this metadata, and pending explicit owner approval/readback for tracker repair | **no production admission**; no V8 writer activation |
+| Beta1 / Core Preview | `v8.0.0-beta.1` | Exact `main` SHA/tree local Python 3.13 evidence, this metadata, and pending explicit owner approval/readback for tracker repair | **no production admission**; no V8 writer activation |
 | Beta2 / Feature Complete Preview | `v8.0.0-beta.2` | #113–#117 complete, #137 revalidated, and isolated Production V3 composition acceptance | No writer cutover |
 | Beta3 / Cutover Candidate | `v8.0.0-beta.3` | #118 Cutover Guard and activation contract pass; every legacy writer path is absent or unreachable | Guarded rehearsal only; no default change |
 | GA | `v8.0.0` | #119 root Canary accepted with #123, activation, and default-writer readback | Lean V8 is the default for new Campaigns |
 
-The Beta1 evidence record is a read-only snapshot of the exact `origin/main`
-SHA and its successful main CI. It is not a claim about the SHA of the
+The Beta1 evidence record is a read-only snapshot of the exact `main` SHA/tree
+and its local Python 3.13 verification. It is not a claim about the SHA of the
 metadata commit that contains the record. After this metadata merges, the
-merged documentation SHA must receive its own successful main CI readback
+merged documentation SHA/tree must receive its own exact local verification
 before the immutable Beta1 tag or GitHub Release is created.
 
 ## Exact exit gates
 
 ### Beta1 — Core Preview
 
-- `core_baseline_sha`, the exact GWO CI URL, and the dynamic pytest summary
-  come from one successful CI readback for the same `origin/main` SHA.
+- The v2 evidence object binds the exact `core_baseline_sha` and
+  `core_baseline_tree` to the local Python 3.13 verification manifest,
+  requirements digest, main attestation, and full pytest summary.
 - Issues #113–#119 are read back with canonical `OPEN` or `CLOSED` states;
   plan text is never used as Issue-state evidence.
 - The #137 tracker-semantic checkpoint remains pending explicit owner
   approval/readback. Its native blockers and the full body/comments readback
   are preserved; this metadata lane does not perform that mutation.
-- The Beta1 tag gate is a merged-main SHA and post-merge successful main CI
-  readback, not the feature-branch SHA or self-referential text in the commit.
+- The Beta1 tag gate is a merged-main SHA/tree with exact post-merge local
+  verification, not the feature-branch SHA or self-referential text in the
+  commit.
 - Beta1 requires the structured Workspace Convergence Gate receipt
   (`docs/releases/gwo-v8-workspace-convergence.md`) before metadata merge, tag,
   or Release publication. This gate proves local workspace convergence only;
@@ -45,12 +53,13 @@ before the immutable Beta1 tag or GitHub Release is created.
 ### Beta2 — Feature Complete Preview
 
 - #113, #114, #115, #116, and #117 read back `CLOSED` after their exact PR,
-  hosted-CI, and target-readback boundaries pass.
+  GWO product Hosted CI, and target-readback boundaries pass.
 - #137 is revalidated against the complete Candidate/Review scope-escape
   contract, and Production V3 composition passes its isolated end-to-end
   acceptance without adopting a Candidate across Plan Revisions.
-- The package manifests, repository validation, and exact merged-main CI are
-  green. Beta2 does not cut over or enable the default V8 writer.
+- The package manifests, repository validation, and exact merged-main local
+  verification are green. Beta2 does not cut over or enable the default V8
+  writer.
 
 ### Beta3 — Cutover Candidate
 
@@ -72,7 +81,8 @@ before the immutable Beta1 tag or GitHub Release is created.
 - #123 and all transitive #118 gates (#136 and #137 included) read back
   `CLOSED`; the root Canary acceptance readback, Activation Receipt, and
   default-writer receipt identify the same immutable release subject.
-- Only after exact post-merge main CI, tag, Release, and default-writer
+- Only after exact post-merge local verification, tag, Release, and
+  default-writer
   readbacks does Lean V8 become the default for new Campaigns.
 
 ## Executable blocker graph
@@ -127,10 +137,11 @@ lane records this follow-up but does not perform it.
 ## Immutable tags and publication boundary
 
 `v8.0.0-beta.1`, `v8.0.0-beta.2`, `v8.0.0-beta.3`, and `v8.0.0` are annotated,
-immutable tags. Each tag is created once from the approved merged `origin/main`
-SHA, pushed once, peeled and verified against that SHA, and then used for the
-matching GitHub Release. A tag or Release that already exists is read back and
-verified; it is never moved, deleted, or recreated.
+immutable tags. Each tag is created once from the approved merged `main`
+SHA/tree after exact local verification, pushed once, peeled and verified
+against that SHA, and then used for the matching GitHub Release. A tag or
+Release that already exists is read back and verified; it is never moved,
+deleted, or recreated.
 
 **Package publication is not writer activation.** Publishing or installing a
 package, committing release metadata, creating a Git tag, or publishing a
@@ -156,5 +167,5 @@ A failed Cutover Guard leaves the V6.1 writer and production state unchanged.
 After an Activation Receipt exists, rollback is a new durable action: it never
 erases or rewrites the receipt, never moves an immutable tag, and never relies
 on an automatic fallback. New admission is frozen until the owner has the
-exact receipt, target, CI, and writer-generation readbacks needed for the next
-action.
+exact receipt, target, GWO product Hosted CI, and writer-generation readbacks
+needed for the next action.

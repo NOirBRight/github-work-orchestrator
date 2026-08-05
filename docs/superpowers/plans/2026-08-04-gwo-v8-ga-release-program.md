@@ -4,9 +4,9 @@
 
 **Goal:** Converge the current local workspace safely, preserve the unpushed GWO V8 implementation, and deliver immutable Beta1, Beta2, Beta3, root Canary, and GA releases without admitting an unverified writer.
 
-**Architecture:** Add a fail-closed Workspace Convergence Gate before Beta1, then publish the existing 67-commit implementation as a stacked Draft-PR train. Preserve the accepted five-module Lean V8 architecture and finish Batch delivery, Production V3 composition, Cutover Guard, and the four-Ticket root Canary in blocker order, with exact GitHub, CI, target, Activation, and default-writer readback at every release boundary.
+**Architecture:** Add a fail-closed Workspace Convergence Gate before Beta1, then publish the existing 67-commit implementation as a stacked Draft-PR train. Preserve the accepted five-module Lean V8 architecture and finish Batch delivery, Production V3 composition, Cutover Guard, and the four-Ticket root Canary in blocker order, with exact GitHub, GWO product Hosted CI, target, Activation, and default-writer readback at every product delivery boundary.
 
-**Tech Stack:** Python 3.13, pytest, PowerShell 7, Git worktrees/bundles, SHA-256, GitHub CLI and Actions, Paseo Runtime readback, SQLite compare-and-swap, canonical JSON, Skill package manifests.
+**Tech Stack:** Python 3.13, pytest, PowerShell 7, Git worktrees/bundles, SHA-256, GitHub CLI and GWO product Hosted CI, Paseo Runtime readback, SQLite compare-and-swap, canonical JSON, Skill package manifests.
 
 This document supersedes `2026-08-03-gwo-v8-ga-delivery-program.md` for program sequencing and release gates. The six 2026-08-03 subsystem child plans remain the authoritative implementation details referenced below.
 
@@ -17,6 +17,7 @@ This document supersedes `2026-08-03-gwo-v8-ga-delivery-program.md` for program 
 - Public statuses remain exactly `Complete`, `Running`, `Decision`, `Wait`, and `Blocked`.
 - The five deep modules remain PlanControl, ExecutionKernel, RuntimeGateway, CandidateGate, and BatchIntegrator; Campaign Watchdog remains a wake adapter.
 - Every production change uses TDD: behavior RED, minimum GREEN implementation, focused regression, then commit.
+- Repository release acceptance is Local Verification Only. GWO product Hosted CI remains the product-layer delivery mechanism.
 - Use at most five subagents. Every spawned subagent uses `gpt-5.6-luna` with `max` reasoning.
 - Parallel workers receive disjoint write sets. Package manifests, `execution_kernel.py`, `production_host.py`, exports, transition code, and integration refs are serial hotspots.
 - Never commit or push directly to `main`; never force-push; never use `--no-verify`.
@@ -31,7 +32,7 @@ This document supersedes `2026-08-03-gwo-v8-ga-delivery-program.md` for program 
 
 | Surface | Exact planning-time state |
 | --- | --- |
-| Remote main | `a48c7d6142ae3538725cb876a8782f4ca804cd22`; successful GWO CI run `30778312688`, 1521 passed |
+| Main baseline | `2c72d9a153dac07e507c746548258efc44b62875` / tree `1905079fa3cd0d90dd9b1930ed5dd726fad9f114`; Python 3.13.11 local verification, 1521 passed |
 | Active GA worktree | `D:\Workstation\gwo-worktrees\issue-136`; implementation boundary `e58c596998df90e65349bdb4b5f25d3d9dc1f7e2` on `codex/gwo-v8-ga-plan` |
 | Local GA delta | 67 implementation commits and 45,635 inserted lines over `origin/main`; this plan-only authoring change is committed before Phase 1 and its resulting head is protected remotely |
 | Completed locally | Beta1 metadata; Candidate foundation; #113; #114; #115; #116 Batch Tasks 1-5 |
@@ -135,16 +136,16 @@ Expected: the large local delta is remotely durable and reviewable as bounded sl
 - Test: `tests/test_orchestrator_package.py`
 
 **Interfaces:**
-- Consumes: exact convergence receipt, successful Beta1 PR checks, merged-main SHA, exact post-merge main CI, and explicit owner approval/readback.
+- Consumes: exact convergence receipt, successful Beta1 local verification, merged-main SHA/tree, exact post-merge local verification, and explicit owner approval/readback.
 - Produces: immutable annotated tag and GitHub prerelease `v8.0.0-beta.1`.
 
 - [ ] Run `py -3.13 -m pytest tests/test_orchestrator_package.py -q`, full pytest, quick validation, sync check, and `git diff --check` on the Beta1 PR head.
 - [ ] Merge the Beta1 PR only after independent Standards/Spec review is clean.
-- [ ] Read back the exact merged-main SHA and one successful GWO CI run for that SHA; dynamically parse the pytest summary.
+- [ ] Read back the exact merged-main SHA/tree and its local Python 3.13 verification; preserve the parsed pytest summary.
 - [ ] Stop for named owner approval before reopening #137, creating milestones, assigning Issues, or publishing any release object.
 - [ ] With approval, reopen #137 only if its native blockers are still open; preserve body, comments, and blocker readback.
 - [ ] Create/assign milestones idempotently: #113-#117 and #137 to Beta2, #118 to Beta3, #119 to GA.
-- [ ] Create and push annotated `v8.0.0-beta.1`; verify the remote peeled SHA equals the approved merged-main SHA.
+- [ ] Create and push annotated `v8.0.0-beta.1` only after the exact SHA/tree local verification gate; verify the remote peeled SHA equals the approved merged-main SHA.
 - [ ] Create the GitHub prerelease with `--verify-tag`, then read back tag, target, prerelease state, and URL.
 
 Expected: Beta1 is Core Preview only; V8 writer admission remains disabled.
@@ -157,14 +158,14 @@ Expected: Beta1 is Core Preview only; V8 writer admission remains disabled.
 
 **Interfaces:**
 - Consumes: published Beta1 and the stacked foundation/#113/#114/#115 branches.
-- Produces: merged and post-main-CI-verified Issues #113, #114, and #115.
+- Produces: merged and locally verified Issues #113, #114, and #115.
 
 For each slice, in order:
 
 - [ ] Update the branch with its newly merged predecessor using a normal merge.
 - [ ] Run its child-plan focused suite and the repository-wide release gate.
 - [ ] Perform independent Standards and Spec review on the exact PR head.
-- [ ] Merge the PR, read back the merge SHA, wait for successful main CI, then close only the Issue owned by that slice.
+- [ ] Merge the PR, read back the merge SHA, complete exact local verification, then close only the Issue owned by that slice.
 - [ ] Update the next Draft PR base; never batch-close Issues from plan text or local reports.
 
 Expected: Candidate foundation, Watchdog, Standard assurance, Strict Review, Finding ledger, bounded Candidate budget, and Repair are durable on `main` before Batch delivery continues.
@@ -176,16 +177,16 @@ Expected: Candidate foundation, Watchdog, Standard assurance, Strict Review, Fin
 - Follow: `docs/superpowers/plans/2026-08-03-gwo-v8-production-composition.md`
 
 **Interfaces:**
-- Consumes: merged #113-#115, current #116 Task-5 boundary, exact GitHub/CI drivers, and the approved #137 tracker state.
+- Consumes: merged #113-#115, current #116 Task-5 boundary, exact GitHub/GWO product Hosted CI drivers, and the approved #137 tracker state.
 - Produces: complete #116/#117, Production V3 host composition, revalidated #137, and immutable `v8.0.0-beta.2`.
 
-- [ ] Continue #116 with Task 6 publication/PR/hosted-CI/Integration-Lease/target readback and Task 7 normal V3 action loop plus predecessor quarantine.
+- [ ] Continue #116 with Task 6 publication/PR/GWO product Hosted CI/Integration-Lease/target readback and Task 7 normal V3 action loop plus predecessor quarantine.
 - [ ] Implement #117 Task 8 unchanged-SHA infrastructure recovery and Task 9 deterministic Singleton fallback/Strict recovery.
 - [ ] Run Batch Task 10 full verification and exact Beta2 evidence.
-- [ ] Merge #116, then #117, with separate exact-head PR and post-main-CI gates.
+- [ ] Merge #116, then #117, with separate exact-head PR and post-merge local verification gates.
 - [ ] Execute Production V3 composition Tasks 1-10, including Campaign CAS, Result integrity, public host composition, restart convergence, and isolated provider/target E2E.
 - [ ] Revalidate #137 only against the complete merged Candidate/Review/Batch scope-escape contract.
-- [ ] Publish annotated `v8.0.0-beta.2` only after #113-#117 and #137 read back CLOSED and exact main/package/CI evidence is green.
+- [ ] Publish annotated `v8.0.0-beta.2` only after #113-#117 and #137 read back CLOSED and exact main/package/local verification evidence is green.
 
 Expected: V8 is feature complete but has no production writer authority.
 
@@ -202,7 +203,7 @@ Expected: V8 is feature complete but has no production writer authority.
 - [ ] Prove predecessor writer/package/export paths are absent or unreachable.
 - [ ] Compose Runtime-only configuration preflight and require the Guard token at the fenced activation point.
 - [ ] Run the human go/no-go CLI over exact readback; a failed Guard changes no durable production state.
-- [ ] Close #118 only after exact PR, hosted CI, merge, main CI, and Guard evidence readback.
+- [ ] Close #118 only after exact PR, GWO product Hosted CI, merge, local verification, and Guard evidence readback.
 - [ ] Publish annotated `v8.0.0-beta.3`; do not change the default writer.
 
 Expected: Beta3 proves the authority-transfer mechanism without performing the GA default promotion.
@@ -213,15 +214,15 @@ Expected: Beta3 proves the authority-transfer mechanism without performing the G
 - Follow: `docs/superpowers/plans/2026-08-03-gwo-v8-root-canary-ga.md`
 
 **Interfaces:**
-- Consumes: Beta3 Guard/Activation subject, four approved low-risk root Tickets, exact Runtime and GitHub adapters, and explicit production owner authorization.
+- Consumes: Beta3 Guard/Activation subject, four approved low-risk root Tickets, exact Runtime and GWO product Hosted CI adapters, and explicit production owner authorization.
 - Produces: accepted root Canary, default-writer receipt, immutable `v8.0.0`, and post-release smoke evidence.
 
 - [ ] Provision four real Tickets: three Standard members and one Strict Singleton, each with one bounded documentation-only write.
 - [ ] Run only through installed public `start`, `advance`, and `inspect`; inject the planned restart/acknowledgement-loss failures.
-- [ ] Prove four concurrent Work Runs, frozen authority, Candidate assurance, bounded repair/replacement, one Standard multi-member Batch, one Strict Singleton Batch, serial integration, hosted CI, and exact target readback.
+- [ ] Prove four concurrent Work Runs, frozen authority, Candidate assurance, bounded repair/replacement, one Standard multi-member Batch, one Strict Singleton Batch, serial integration, GWO product Hosted CI, and exact target readback.
 - [ ] On failure, freeze admission and retain the prior writer; do not auto-fallback or erase any receipt.
 - [ ] On acceptance, bind the same release subject through root-Canary receipt, Activation Receipt, and default-writer readback.
-- [ ] Merge GA metadata, obtain exact post-merge main CI, publish annotated `v8.0.0`, and verify the GitHub Release.
+- [ ] Merge GA metadata, obtain exact post-merge local verification, publish annotated `v8.0.0`, and verify the GitHub Release.
 - [ ] Run clean-install smoke on `.agents`, `.claude`, and `.codex` surfaces, then run post-release public API smoke.
 - [ ] Close #119 only after tag, Release, target, activation, default-writer, and smoke readbacks are all exact.
 
@@ -232,8 +233,8 @@ Expected: Lean V8 becomes the default only for new Campaigns; existing durable r
 | Gate | Required proof |
 | --- | --- |
 | Workspace Convergence | two worktrees, 48 roots absent, archives and content hashes verified, fixed green stdout hashes asserted, all refs retained with only the documented main/GA movements, remote plan head protected with `e58c596` as ancestor, receipt bound to local manifest/bundles/readback |
-| Every code PR | focused pytest, full pytest, quick validation, sync check, diff check, two independent reviews, hosted CI, merge/main readback |
-| Beta1 | convergence receipt, metadata merge, exact main CI, owner-approved tracker/milestones, immutable tag/Release |
+| Every code PR | focused pytest, full pytest, quick validation, sync check, diff check, two independent reviews, GWO product Hosted CI where product delivery applies, merge/readback |
+| Beta1 | convergence receipt, metadata merge, exact SHA/tree local verification, owner-approved tracker/milestones, immutable tag/Release |
 | Beta2 | #113-#117 closed, #137 revalidated, Production V3 isolated E2E, no writer cutover |
 | Beta3 | #118 Guard and activation rehearsal, predecessor writer unreachable, no default change |
 | GA | four-Ticket real Canary, two delivery boundaries, restart/exactly-once proof, activation/default receipt, clean install and smoke |

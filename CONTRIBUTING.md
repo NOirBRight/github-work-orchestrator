@@ -4,7 +4,16 @@ This repository uses `main` as its only integration branch. Changes are
 accepted through pull requests and must preserve the public
 `start -> advance -> inspect` seam and its five public statuses.
 
-GitHub Actions are disabled, and repository acceptance is local-only.
+This repository's GitHub Actions acceptance is disabled. Repository release
+acceptance is Local Verification Only.
+
+Use a Python 3.13 virtual environment installed from the retained hash-locked
+requirements file before running local acceptance:
+
+```powershell
+py -3.13 -m venv .venv
+.venv\Scripts\python.exe -m pip install --require-hashes -r .github/requirements-ci-win-py313.txt
+```
 
 Before opening a pull request:
 
