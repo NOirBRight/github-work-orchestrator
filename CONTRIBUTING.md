@@ -4,12 +4,7 @@ This repository uses `main` as its only integration branch. Changes are
 accepted through pull requests and must preserve the public
 `start -> advance -> inspect` seam and its five public statuses.
 
-The acceptance workflow runs on GitHub-hosted Windows runners for pushes to
-`main` and for pull requests from branches in this repository. Pull requests
-from external forks are intentionally skipped for now; they must not use
-`pull_request_target`, repository secrets, or self-hosted runner labels. A
-maintainer may copy a reviewed change to a trusted same-repository branch
-before requesting acceptance.
+GitHub Actions are disabled, and repository acceptance is local-only.
 
 Before opening a pull request:
 

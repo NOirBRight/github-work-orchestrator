@@ -164,25 +164,13 @@ def test_openai_metadata_is_explicit_and_invocable():
     assert "allow_implicit_invocation: false" in alias
 
 
-def test_ci_uses_pinned_action_revisions_on_hosted_windows_python313():
-    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
-        encoding="utf-8"
+def test_repository_acceptance_is_local_only():
+    workflows = ROOT / ".github" / "workflows"
+    workflow_files = sorted(
+        path for pattern in ("*.yml", "*.yaml") for path in workflows.glob(pattern)
     )
 
-    for required in (
-        "runs-on: windows-2025",
-        "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
-        "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
-        'python-version: "3.13"',
-        "--require-hashes",
-        "--no-cache-dir",
-        'Write-Host "ImageOS: $env:ImageOS"',
-        'Write-Host "ImageVersion: $env:ImageVersion"',
-    ):
-        assert required in workflow
-    assert "self-hosted" not in workflow
-    assert "pull_request_target" not in workflow
-    assert "actions/cache" not in workflow
+    assert workflow_files == []
 
 
 def test_v61_parallel_frontier_remains_documented_during_compatibility_release():
