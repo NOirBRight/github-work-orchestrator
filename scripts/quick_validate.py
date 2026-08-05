@@ -43,6 +43,27 @@ def _sync_module(root: Path):
     return module
 
 
+def _markdown_outside_fenced_code(text: str) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    in_fence = False
+    for line in text.splitlines(keepends=True):
+        if re.match(r"^ {0,3}```", line):
+            if in_fence:
+                in_fence = False
+            else:
+                if current:
+                    chunks.append("".join(current))
+                    current = []
+                in_fence = True
+            continue
+        if not in_fence:
+            current.append(line)
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
 def findings(root: Path) -> list[str]:
     errors: list[str] = []
     package = root / "skills" / CORE_SKILL
@@ -143,10 +164,15 @@ def findings(root: Path) -> list[str]:
     for path in set(markdown):
         if not path.is_file():
             continue
-        for target in link_pattern.findall(path.read_text(encoding="utf-8")):
-            clean = target.split("#", 1)[0]
-            if clean and not (path.parent / clean).resolve().exists():
-                errors.append(f"broken link: {path.relative_to(root)} -> {target}")
+        for chunk in _markdown_outside_fenced_code(
+            path.read_text(encoding="utf-8")
+        ):
+            for target in link_pattern.findall(chunk):
+                clean = target.split("#", 1)[0]
+                if clean and not (path.parent / clean).resolve().exists():
+                    errors.append(
+                        f"broken link: {path.relative_to(root)} -> {target}"
+                    )
     for skill in SKILLS:
         candidate = root / "skills" / skill
         if candidate.is_dir():

@@ -34,6 +34,10 @@ before the immutable Beta1 tag or GitHub Release is created.
   are preserved; this metadata lane does not perform that mutation.
 - The Beta1 tag gate is a merged-main SHA and post-merge successful main CI
   readback, not the feature-branch SHA or self-referential text in the commit.
+- Beta1 requires the structured Workspace Convergence Gate receipt
+  (`docs/releases/gwo-v8-workspace-convergence.md`) before metadata merge, tag,
+  or Release publication. This gate proves local workspace convergence only;
+  it does not publish Beta1 or transfer writer authority.
 - The same explicit owner approval/readback gate is required before any remote
   publication or mutation, including tag or GitHub Release creation; this lane
   does not perform it.

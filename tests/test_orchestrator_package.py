@@ -38,6 +38,18 @@ def test_quick_validation_and_manifest_are_at_fixed_point():
         }
 
 
+def test_quick_validation_ignores_brackets_and_parentheses_in_fenced_code():
+    quick = _load(
+        "quick_validate_fenced_code_test", ROOT / "scripts" / "quick_validate.py"
+    )
+    findings = quick.findings(ROOT)
+    assert not any(
+        finding.startswith("broken link:")
+        and "Measure-Object Length -Sum" in finding
+        for finding in findings
+    )
+
+
 def test_phase_two_exposes_implement_gwo_and_one_release_alias_only():
     assert not (ROOT / "SKILL.md").exists()
     assert not (ROOT / "skills" / "agile-orchestrator" / "SKILL.md").exists()
@@ -340,3 +352,121 @@ def test_beta1_release_contract_has_structured_baseline_ci_dynamic_issue_and_non
     assert set(evidence["issues"]) == {"113", "114", "115", "116", "117", "118", "119"}
     assert all(value in {"OPEN", "CLOSED"} for value in evidence["issues"].values())
     assert evidence["non_goal"] == "Lean V8 production cutover"
+
+
+def test_beta1_requires_structured_workspace_convergence_receipt():
+    import hashlib
+    import os
+    import re
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    receipt_path = ROOT / "docs" / "releases" / "gwo-v8-workspace-convergence.md"
+    release_train = (ROOT / "docs" / "releases" / "gwo-v8-release-train.md").read_text("utf-8")
+    assert "Workspace Convergence Gate" in release_train
+    assert "gwo-v8-workspace-convergence.md" in release_train
+
+    text = receipt_path.read_text("utf-8")
+    blocks = re.findall(r"```json\n(\{.*?\})\n```", text, re.DOTALL)
+    assert len(blocks) == 1
+    receipt = json.loads(blocks[0])
+    assert set(receipt) == {
+        "schema",
+        "source_sha",
+        "protected_remote_ref",
+        "protected_remote_sha",
+        "kept_worktrees",
+        "removed_worktree_count",
+        "removed_test_root_count",
+        "retained_green_runs",
+        "refs_deleted",
+        "archive_manifest_sha256",
+        "pre_clean_bundle_sha256",
+        "post_clean_bundle_sha256",
+        "evidence",
+        "completed_at",
+    }
+    assert receipt["schema"] == "gwo-workspace-convergence.v1"
+    assert receipt["source_sha"] == "e58c596998df90e65349bdb4b5f25d3d9dc1f7e2"
+    assert receipt["protected_remote_ref"] == "refs/heads/codex/gwo-v8-ga-plan"
+    assert re.fullmatch(r"[0-9a-f]{40}", receipt["protected_remote_sha"])
+    assert receipt["kept_worktrees"] == ["canonical-main", "active-ga"]
+    assert receipt["removed_worktree_count"] == 36
+    assert receipt["removed_test_root_count"] == 48
+    assert receipt["retained_green_runs"] == [
+        "gwo-109-r14-full-run1",
+        "gwo-109-r13-full-run3",
+        "gwo-109-round7-full-final-race",
+        "gwo-109-r12-full-synced",
+    ]
+    assert receipt["refs_deleted"] is False
+    for key in (
+        "archive_manifest_sha256",
+        "pre_clean_bundle_sha256",
+        "post_clean_bundle_sha256",
+    ):
+        assert re.fullmatch(r"[0-9a-f]{64}", receipt[key])
+    evidence = receipt["evidence"]
+    assert set(evidence) == {
+        "manifest",
+        "pre_clean_bundle",
+        "post_clean_bundle",
+        "remote_ga_readback",
+    }
+    assert evidence["manifest"] == {
+        "path": "convergence-manifest.json",
+        "sha256": receipt["archive_manifest_sha256"],
+    }
+    assert evidence["pre_clean_bundle"] == {
+        "path": "pre-clean.bundle",
+        "sha256": receipt["pre_clean_bundle_sha256"],
+    }
+    assert evidence["post_clean_bundle"] == {
+        "path": "post-clean.bundle",
+        "sha256": receipt["post_clean_bundle_sha256"],
+    }
+    assert evidence["remote_ga_readback"] == {
+        "path": "inventory/remote-ga-ref-after.txt",
+        "ref": receipt["protected_remote_ref"],
+        "sha256": receipt["protected_remote_sha"],
+    }
+
+    def relative_path(value):
+        assert not Path(value).is_absolute()
+        assert not PureWindowsPath(value).is_absolute()
+        relative = PurePosixPath(value)
+        assert ".." not in relative.parts
+        return Path(*relative.parts)
+
+    for item in evidence.values():
+        relative_path(item["path"])
+
+    archive_root_value = os.environ.get("GWO_CONVERGENCE_ARCHIVE_ROOT", "").strip()
+    assert archive_root_value, "GWO_CONVERGENCE_ARCHIVE_ROOT is required"
+    archive_root = Path(archive_root_value)
+    assert archive_root.is_dir(), archive_root
+    manifest_path = archive_root / relative_path(evidence["manifest"]["path"])
+    assert manifest_path.is_file(), manifest_path
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == receipt["archive_manifest_sha256"]
+    assert manifest["source_sha"] == receipt["source_sha"]
+    assert manifest["protected_remote_ref"] == receipt["protected_remote_ref"]
+    assert manifest["protected_remote_sha"] == receipt["protected_remote_sha"]
+    assert manifest["pre_clean_bundle_sha256"] == receipt["pre_clean_bundle_sha256"]
+    assert manifest["post_clean_bundle_sha256"] == receipt["post_clean_bundle_sha256"]
+    for receipt_key, evidence_key in (
+        ("pre_clean_bundle_sha256", "pre_clean_bundle"),
+        ("post_clean_bundle_sha256", "post_clean_bundle"),
+    ):
+        bundle_path = archive_root / relative_path(evidence[evidence_key]["path"])
+        assert bundle_path.is_file(), bundle_path
+        assert hashlib.sha256(bundle_path.read_bytes()).hexdigest() == receipt[receipt_key]
+    readback_path = archive_root / relative_path(evidence["remote_ga_readback"]["path"])
+    assert readback_path.is_file(), readback_path
+    readback_lines = readback_path.read_text(encoding="utf-8").splitlines()
+    assert len(readback_lines) == 1
+    readback_parts = readback_lines[0].split()
+    assert len(readback_parts) == 2
+    readback_sha, readback_ref = readback_parts
+    assert readback_sha == receipt["protected_remote_sha"]
+    assert readback_ref == receipt["protected_remote_ref"]
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T.+Z", receipt["completed_at"])
