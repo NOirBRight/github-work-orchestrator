@@ -1,1371 +1,1363 @@
 # GWO V8 C1 Beta1 Core Preview Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
-**Goal:** Publish the C0-validated GWO V8 Core Preview as immutable `v8.0.0-beta.1` without merging the protected GA implementation wholesale or activating the V8 writer.
+**Goal:** Re-freeze C1 as a metadata and release-control campaign that is
+executable with Local Verification Only. C1 does not admit production work,
+activate the default writer, move the protected GA ref, or close #113-#119.
 
-**Architecture:** C1 is a metadata and release-control campaign, not a production implementation campaign. It audits the exact Beta1 history, merges `codex/gwo-v8-beta1` through one normal PR, waits for exact-SHA CI, performs separately approved tracker follow-ups, and publishes one annotated tag and prerelease. Persistent JSON evidence binds each serial step so no PowerShell fence depends on process-local variables from an earlier fence.
+**Mode:** Local Verification Only. GitHub Actions acceptance is disabled.
+GWO product Hosted CI remains a product-layer delivery mechanism only; it is
+not repository acceptance evidence.
 
-**Tech Stack:** Git 2.x, GitHub CLI, GitHub Actions workflow `GWO CI`, Python 3.13, pytest, PowerShell 7, GitHub Issues/PRs/milestones/releases.
+**Architecture:** C1 audits one immutable Beta1 successor, exact first-parent
+history, external evidence, and live repository policy; runs exact local
+Python 3.13 gates; obtains three independent owner-scoped leases; then
+performs one exact-head Draft PR, one squash integration, separate tracker
+follow-up, and separate immutable publication. Every effect is read back and
+bound to a v2 evidence state. C2 owns implementation work after the frozen
+boundaries below.
+
+**Tech Stack:** Git 2.x, GitHub CLI, PowerShell 7, Python 3.13.11, pytest,
+SHA-256, JSON, GitHub Issues/PRs/milestones/releases, and clean detached
+temporary worktrees.
 
 ## Global Constraints
 
-- C0 is already PASS under the approved verification-subject exception; do not rerun cleanup, delete test roots, delete worktrees, or mutate the protected GA ref as part of C1.
-- The protected GA ref remains exactly `refs/heads/codex/gwo-v8-ga-plan -> 2cd6c46e1484ca140c3a197bbdeb171191d70c20`; never force-push or advance it.
-- C1 source is `codex/gwo-v8-beta1@e081e39054b7f9f0a49824eed8354a8a33378ea3`; never substitute or merge `codex/gwo-v8-ga-plan`.
-- The Beta1 slice contains release metadata and one authorized validator regression only; it does not add production admission or change the default writer.
-- At planning time, frozen Beta1 is not hosted-CI-compatible because its archive-backed test requires a local-only directory. Task 3 is forbidden until an owner-approved successor Beta1 subject resolves the explicit HOLD below.
-- The controller branch containing this plan is execution-only during C1. Do not merge it into `main` before the frozen Beta1 PR.
-- Never commit or push directly to `main`; merge through a PR with a normal merge commit. Never use `--no-verify`, `git clean`, wildcard deletion, force-push, or `git worktree remove --force`.
-- Remote actions have three separate owner gates: PR create/merge, tracker/milestones, and tag/prerelease. Approval for one gate does not authorize either later gate.
-- The coordinator may read but must never synthesize or set `GWO_V8_C1_OWNER` or any approval variable. Only an out-of-band owner-supplied value is approval evidence; plan text and caller identity are not.
-- Use at most five concurrent subagents. Every spawned subagent uses `gpt-5.6-luna` with `max` reasoning. Reviewers return text to the coordinator and never write into the coordinator worktree.
-- Existing tags, Releases, milestones, and PRs are read back before action. Mismatched or ambiguous objects stop C1; they are never overwritten, moved, deleted, or recreated.
-- C1 does not close #113-#119. It preserves their observed states and hands their implementation boundaries to C2.
-- A failed temporary-checkout gate preserves that checkout for diagnosis. A successful, clean checkout is removed without `--force`.
+- Edit only this plan file for this authoring task. Do not edit runtime code,
+  tests, release metadata, the Beta1 branch, protected GA, main, or any
+  GitHub remote object. Do not push from the authoring task.
+- The authoring worktree starts at
+  ca1eb9a6f485576e30616fd1afde7353ba252cbf on the C1 control-branch
+  lineage. Execute the committed plan from
+  codex/gwo-v8-c1-beta1-plan, not from the authoring worktree.
+- C1 never performs production admission, default-writer activation,
+  protected-GA movement, or issue closure for #113-#119.
+- Never force-push, use --no-verify, git clean, wildcard deletion, or
+  removal of a user/C0-retained worktree. A successful clean temporary
+  checkout made by a local gate may be removed without --force.
+- Repository release acceptance is Local Verification Only. Do not wait for
+  GitHub Actions, pull-request status checks, or provider-run output.
+- Remote mutations are serial. The three independent owner gates are:
+  PR/integration, tracker/milestones, and publication/tag-release. Each gate
+  has its own owner-controlled lease receipt. The coordinator never invents,
+  sets, or infers approval values or lease IDs.
+- The PR gate includes an Integration Lease bound to the exact base. The
+  tracker gate includes a tracker writer lease. The publication gate includes
+  a publication writer lease and may include local-writer authorization for
+  the final canonical-main fast-forward; that is not a fourth owner gate.
+- At most five read-only reviewers run concurrently. Every reviewer is exactly
+  gpt-5.6-luna with max reasoning, returns text only, and cannot write to the
+  coordinator worktree. Never run two implementation writers concurrently.
+- Any identity mismatch, malformed receipt, dirty checkout, unresolved
+  review thread, missing lease, conflicting object, or missing approval stops
+  the current gate without deleting or overwriting evidence.
+- Every PowerShell fence below resolves its own Git root, reloads v2 state,
+  validates coordinator root/branch/head and all frozen identities, and
+  defines every helper it uses inside that fence. No fence uses a variable or
+  helper from another fence.
+- Every native command checks LASTEXITCODE immediately after it runs. A
+  failing command is captured before any later command overwrites its exit
+  code.
+- Evidence is external to the repository. Empty logs still receive a
+  SHA-256. Mutable state is written to a same-directory temporary file,
+  parsed, atomically replaced, and parsed again. Before-snapshots, approvals,
+  and effect receipts are immutable.
+- An absent evidence root starts a fresh run. An existing matching
+  gwo-v8-c1-state.v2 file is readback-only resume input. A conflicting or
+  malformed root stops before any mutation.
 
----
+## Files and Interfaces
+
+**Repository file:** only
+docs/superpowers/plans/2026-08-05-gwo-v8-c1-beta1-core-preview.md is edited.
+
+**External evidence roots:**
+
+- C1 root:
+  D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview
+- main/Actions-disable evidence:
+  D:/gwo-release-evidence/2026-08-05-disable-github-ci
+- Beta1 successor evidence:
+  D:/gwo-release-evidence/2026-08-05-gwo-v8-beta1-successor
+- retained C0 archive:
+  D:/gwo-convergence-archive/20260804T185544Z
+
+**Consumed documents:** CONTEXT.md, ADR-0036, ADR-0040, ADR-0060,
+the Beta1 branch release train, the Beta1 GA delivery/release programs, the
+C0 receipt/report, and the external JSON/log evidence above.
+
+**Produced external artifacts:** state.json, raw policy/API readbacks,
+local-verification manifests, command logs, five review reports, three
+owner receipts, PR/merge/tracker/publication receipts, and closure.json.
+
+## Frozen Identity Contract
+
+| Surface | Exact identity |
+| --- | --- |
+| Base ref | refs/heads/main |
+| Base SHA | 2c72d9a153dac07e507c746548258efc44b62875 |
+| Base tree | 1905079fa3cd0d90dd9b1930ed5dd726fad9f114 |
+| Base parents | [a48c7d6142ae3538725cb876a8782f4ca804cd22] |
+| Beta1 ref | refs/heads/codex/gwo-v8-beta1 |
+| Beta1 SHA | 70eaa70d5e87ff4f7a6791facd254abab8ff1377 |
+| Beta1 tree | 663c5b12502554890bdd92fad6bffc5d6aa9c5f1 |
+| Beta1 parents | [3fe3bb829f844627cac82a2d5a24bac8e58564b9] |
+| Integration merge SHA | 3fe3bb829f844627cac82a2d5a24bac8e58564b9 |
+| Integration tree | 5bbf203cf06b65e5e7c7e0c05059d0a1ce0b4b10 |
+| Integration parents, ordered | [e081e39054b7f9f0a49824eed8354a8a33378ea3, 2c72d9a153dac07e507c746548258efc44b62875] |
+| Protected GA ref | refs/heads/codex/gwo-v8-ga-plan |
+| Protected GA SHA | 2cd6c46e1484ca140c3a197bbdeb171191d70c20 |
+| Protected GA tree | d59a7414cf7f4873d0e1fc03cc2be8a9f18a6577 |
+| Protected GA parents | [3b7097213ac482b3a9dcc31320e7bd84191bf2c0] |
+| Implementation boundary | e58c596998df90e65349bdb4b5f25d3d9dc1f7e2 |
+| Beta1 boundary | ddc1785f84b6a82a7b5c34d5928b046d4e9a781d |
+
+The old a48c7d6 and e081e390 objects are historical parents only: a48c7d6 is
+the exact parent of the frozen base, and e081e390 is the first parent of the
+exact integration merge. Neither is the active base or active Beta1 subject.
+
+The exact main-to-Beta1 diff is exactly these 17 paths:
+
+1. .superpowers/sdd/2026-08-03-gwo-v8-ga-delivery-program/task-1-report.md
+2. `CONTRIBUTING.md`
+3. docs/design/gwo-v8-lean-roadmap.md
+4. docs/releases/gwo-v8-release-train.md
+5. docs/releases/gwo-v8-workspace-convergence.md
+6. docs/releases/v8.0.0-beta.1.md
+7. docs/superpowers/plans/2026-08-03-gwo-v8-batch-delivery.md
+8. docs/superpowers/plans/2026-08-03-gwo-v8-campaign-watchdog.md
+9. docs/superpowers/plans/2026-08-03-gwo-v8-candidate-assurance.md
+10. docs/superpowers/plans/2026-08-03-gwo-v8-cutover-guard.md
+11. docs/superpowers/plans/2026-08-03-gwo-v8-ga-delivery-program.md
+12. docs/superpowers/plans/2026-08-03-gwo-v8-production-composition.md
+13. docs/superpowers/plans/2026-08-03-gwo-v8-root-canary-ga.md
+14. docs/superpowers/plans/2026-08-04-gwo-v8-ga-release-program.md
+15. docs/superpowers/plans/2026-08-04-gwo-v8-workspace-convergence-gate.md
+16. scripts/quick_validate.py
+17. tests/test_orchestrator_package.py
+
+## First-Parent Scope Contract
+
+Do not audit a reachable commit range as one aggregate. Audit this exact
+first-parent Beta1 chain after ddc1785:
+
+| Commit | Kind | Authorized non-merge paths |
+| --- | --- | --- |
+| bda3ede710339100e3c12eb4bea176be0d029e34 | non-merge | the two 2026-08-04 plan files |
+| a60371e4b6bcb111ea7183d73db6b743c0f47da4 | non-merge | the two 2026-08-04 plan files |
+| e081e39054b7f9f0a49824eed8354a8a33378ea3 | non-merge | release train, convergence receipt, quick validator, package test |
+| 3fe3bb829f844627cac82a2d5a24bac8e58564b9 | exact integration merge | verify only SHA/tree/ordered parents; do not use parent diff as an allowlist |
+| 70eaa70d5e87ff4f7a6791facd254abab8ff1377 | non-merge | CONTRIBUTING.md, roadmap, release train, Beta1 notes, GA release program, package test |
+
+For each non-merge commit compare its direct parent diff to its row. For the
+integration merge compare only exact SHA, tree, and ordered parent identity.
+
+## External Hash Contract
+
+- Beta1 manifest:
+  413dd208f18ff6d82d4a64491e03dbfbf06f82712f71b8990d6e95716ecef024
+- Beta1 push receipt:
+  9bee5bd4f6b3a95236b7125cec2f8549fac8914941f8b104582466901a2f26ca
+- main manifest:
+  1f01205bc9846bebfd8e767744a60d4d1e4c185f081f6083606047cd37e9d4a3
+- main attestation:
+  689ccbdf84667d9931b83f18b4234816a853ca61ba6cca8382117f2179e15818
+- ci-disable closure:
+  dd5dd6724567fee050fe42deecc8bd91baaae674ecba15c0a07cfae474ee386d
+- C0 manifest:
+  e6939fbd27eedca2198b87f17de0d14bd3e367a65a37fc51542aa87ade889409
+- C0 pre-clean bundle:
+  5eb64cffaed0ac2fd2748a575cb9cd041b2f7463d4d46d7dbfabf9dbdc0e8530
+- C0 post-clean bundle:
+  9c91a126003e867a3c5736a4e4a69f5c3c079ce1adf5667c1108351181ac4f40
+- C0 remote-GA readback:
+  9b0152f0553f18c1ac6a9aac0c5c2ec3b4ecdb4491835d3ebe0318d2d031c1ea
+- Beta1 GA-release-program blob:
+  189236cb189ca990ee550ea01d047bdf9fc8f36c
+- Beta1 convergence-gate blob and protected-GA convergence-gate blob:
+  731efda241693ee9d73e1979e9d0c5b339d96e3b
+- requirements:
+  ee3c9f14db38950f5869759a5a94347197c9d4db3f138147b614ad6c4d862534
 
 ## C0 Closure Record
 
-C0 is closed and must not be reopened:
+Re-read the receipt at the exact Beta1 SHA and preserve the approved
+verification-subject exception. Require source e58c596, protected GA
+2cd6c46, refs_deleted false, kept worktrees canonical-main and active-ga,
+and the four C0 archive hashes above. Re-read the existing C0 report at
+D:/Workstation/gwo-worktrees/issue-136/.superpowers/sdd/2026-08-04-gwo-v8-workspace-convergence-gate/task-8-report.md
+and require exactly one line matching the approved Phase 1 PASS under the
+verification-subject exception. Do not rerun C0 cleanup.
 
-- Verdict: PASS - approved verification-subject exception.
-- C0 receipt: `docs/releases/gwo-v8-workspace-convergence.md` at the frozen Beta1 SHA.
-- C0 independent report: `D:/Workstation/gwo-worktrees/issue-136/.superpowers/sdd/2026-08-04-gwo-v8-workspace-convergence-gate/task-8-report.md`.
-- Required local archive subject: `D:/gwo-convergence-archive/20260804T185544Z`.
-- Implementation boundary `e58c596998df90e65349bdb4b5f25d3d9dc1f7e2` is an ancestor of protected GA `2cd6c46e1484ca140c3a197bbdeb171191d70c20`.
-- Archive manifest SHA-256: `e6939fbd27eedca2198b87f17de0d14bd3e367a65a37fc51542aa87ade889409`.
-- Pre-clean bundle SHA-256: `5eb64cffaed0ac2fd2748a575cb9cd041b2f7463d4d46d7dbfabf9dbdc0e8530`.
-- Post-clean bundle SHA-256: `9c91a126003e867a3c5736a4e4a69f5c3c079ce1adf5667c1108351181ac4f40`.
-- The protected-GA suite's sole failure is the approved fenced-PowerShell validator false positive. The C1 subject is the Beta1 branch, including its authorized validator fix and regression.
+## Persistent v2 State Contract
 
-Any mismatch stops C1.
+The evidence root is
+D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview.
+state.json uses schema gwo-v8-c1-state.v2 and includes:
 
-## C1 Identity and Scope
+- mode Local Verification Only;
+- coordinator_root, coordinator_branch, coordinator_head;
+- base, Beta1, integration, protected-GA SHA/tree/parents arrays and both
+  boundaries;
+- the exact 17-path list and first-parent chain;
+- all external evidence and policy-readback digests/semantics;
+- beta1 and merged-main local-verification manifest/log digests;
+- five reports, each verdict and report hash;
+- independent PR, tracker, and publication approval/lease receipts;
+- PR repository/head/base/path identity and squash merge identity;
+- tracker before/after state and mutation receipts;
+- tag object/type/peel, release id/URL, normalized notes/body hashes;
+- closure and C2 handoff fields.
 
-| Surface | Required identity |
-| --- | --- |
-| Frozen base | `main@a48c7d6142ae3538725cb876a8782f4ca804cd22` |
-| Beta1 boundary | `ddc1785f84b6a82a7b5c34d5928b046d4e9a781d` |
-| Beta1 source | `codex/gwo-v8-beta1@e081e39054b7f9f0a49824eed8354a8a33378ea3` |
-| Protected full implementation | `codex/gwo-v8-ga-plan@2cd6c46e1484ca140c3a197bbdeb171191d70c20` |
-| Implementation ancestor for C2 | `e58c596998df90e65349bdb4b5f25d3d9dc1f7e2` |
-| Baseline GWO CI | run `30778312688`, 1521 passed in 704.60s, for `a48c7d6` |
-| Release object | annotated tag and prerelease `v8.0.0-beta.1` |
+The state has no hosted acceptance run fields. Every update checks schema and
+frozen identity, refuses a conflicting existing field, writes a same-directory
+temporary JSON, parses it, replaces state atomically, and parses state again.
 
-The aggregate `a48c7d6...e081e390` PR diff is exactly these 16 paths:
+## Fence Preamble
 
-- `.superpowers/sdd/2026-08-03-gwo-v8-ga-delivery-program/task-1-report.md`
-- `docs/design/gwo-v8-lean-roadmap.md`
-- `docs/releases/gwo-v8-release-train.md`
-- `docs/releases/gwo-v8-workspace-convergence.md`
-- `docs/releases/v8.0.0-beta.1.md`
-- `docs/superpowers/plans/2026-08-03-gwo-v8-batch-delivery.md`
-- `docs/superpowers/plans/2026-08-03-gwo-v8-campaign-watchdog.md`
-- `docs/superpowers/plans/2026-08-03-gwo-v8-candidate-assurance.md`
-- `docs/superpowers/plans/2026-08-03-gwo-v8-cutover-guard.md`
-- `docs/superpowers/plans/2026-08-03-gwo-v8-ga-delivery-program.md`
-- `docs/superpowers/plans/2026-08-03-gwo-v8-production-composition.md`
-- `docs/superpowers/plans/2026-08-03-gwo-v8-root-canary-ga.md`
-- `docs/superpowers/plans/2026-08-04-gwo-v8-ga-release-program.md`
-- `docs/superpowers/plans/2026-08-04-gwo-v8-workspace-convergence-gate.md`
-- `scripts/quick_validate.py`
-- `tests/test_orchestrator_package.py`
-
-For every commit after `ddc1785`, the narrower approved set is the two 2026-08-04 plans, the convergence receipt, release train, package test, and the user-authorized `scripts/quick_validate.py` fix. Auditing only the final aggregate diff is insufficient because a later commit could hide an earlier out-of-scope write.
-
-## Planning-Time Hosted CI Blocker - HOLD
-
-The frozen subject cannot currently satisfy its own PR/main CI gate:
-
-- `e081e390:tests/test_orchestrator_package.py::test_beta1_requires_structured_workspace_convergence_receipt` requires nonempty `GWO_CONVERGENCE_ARCHIVE_ROOT` and rehashes the real convergence archive.
-- The authoritative archive exists only at `D:/gwo-convergence-archive/20260804T185544Z`.
-- `e081e390:.github/workflows/ci.yml` runs on GitHub-hosted `windows-2025`, invokes full pytest, and neither provisions the archive nor sets `GWO_CONVERGENCE_ARCHIVE_ROOT`.
-- Therefore local C1 verification can pass with the real archive, but the frozen PR and post-merge `GWO CI` runs cannot pass.
-
-This plan remains read-only through Task 2 and blocks before Task 3. The recommended unblock is a separately approved successor Beta1 SHA that keeps the real local archive gate authoritative, marks only that external-evidence test outside hosted acceptance, updates the release documents with an explicit split-verification exception, and then re-freezes every SHA/path/CI assertion in this plan. Committing the archive publicly or silently weakening the test is not authorized.
-
-## Persistent Evidence Contract
-
-The coordinator creates external operational evidence under this fixed path so reports never dirty a Git worktree:
-
-`D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview/`
-
-`state.json` uses schema `gwo-v8-c1-state.v1` and carries exact SHAs, PR identity, merge SHA, CI run identity, scoped approvals, tracker completion, tag identity, and Release URL. Every later PowerShell fence resolves its own repository root and reloads this file; no fence consumes a variable from a previous fence.
-
-## Safe Parallel Schedule
-
-After Task 0, run Task 1 Step 1 (history/scope audit) and Task 1 Step 2 (detached local verification) concurrently. They write disjoint evidence (`task-1-audit.json` versus test logs/state fields) and neither mutates a remote object. The coordinator runs Task 1 Step 3 after both finish.
-
-Then run these five read-only lanes concurrently:
-
-1. Standards review: repository instructions, plan executability, safety, and no hidden process state.
-2. Spec review: GA program, release train, Beta1 notes, C0 decision, and release boundaries.
-3. Git/scope review: merge-base, ancestry, every post-boundary commit, aggregate allowlist, and protected ref identity.
-4. Tracker review: complete #113-#119 and #137 body, labels, comments, milestones, states, and native blockers.
-5. Release review: exact-SHA CI, PR/merge commands, approvals, tag annotation/peel, Release target, and resumption safety.
-
-Tasks 3-6 are serial. Tracker work in Task 5 is an explicitly approved post-merge release-control follow-up; it is not part of the Beta1 metadata PR, resolving the release-note statement that the metadata lane itself does not perform tracker mutation.
-
----
-
-### Task 0: Freeze C0 and C1 identities
-
-**Files:**
-- Read from the frozen Beta1 commit: `docs/releases/gwo-v8-workspace-convergence.md`
-- Read: `D:/Workstation/gwo-worktrees/issue-136/.superpowers/sdd/2026-08-04-gwo-v8-workspace-convergence-gate/task-8-report.md`
-- Create: `D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview/state.json`
-
-**Interfaces:**
-- Consumes: C0 receipt/report, local/remote refs, current worktree registry, and publication readback.
-- Produces: a frozen state file proving C0 is closed and C1 has not begun remotely.
-
-- [ ] **Step 1: Verify the dynamic coordinator root, both C0 roots, and every frozen Git identity.**
+Every fence after the first snapshot begins with this complete preamble. It is
+repeated rather than relying on process-local state.
 
 ~~~powershell
 $ErrorActionPreference = 'Stop'
 $root = (git rev-parse --show-toplevel).Trim()
-if ($LASTEXITCODE -ne 0) { throw 'The coordinator root is not a Git worktree.' }
-$canonical = 'D:/Workstation/github-work-orchestrator'
-$gaRoot = 'D:/Workstation/gwo-worktrees/issue-136'
-function Normalize-Path([string]$Path) {
-    return ([IO.Path]::GetFullPath($Path).Replace('\','/')).TrimEnd([char[]]'/')
-}
-$root = Normalize-Path $root
-$expectedRoots = @((Normalize-Path $canonical), (Normalize-Path $gaRoot), $root) | Sort-Object -Unique
-if ($expectedRoots.Count -ne 3) { throw 'C1 must run from its isolated coordinator worktree.' }
-$actualRoots = @(git -C $root worktree list --porcelain |
-    Select-String '^worktree ' |
-    ForEach-Object { Normalize-Path $_.Line.Substring(9) } |
-    Sort-Object -Unique)
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read the worktree registry.' }
-$rootDiff = @(Compare-Object $expectedRoots $actualRoots)
-if ($rootDiff) { $rootDiff; throw 'C1 requires exactly canonical main, active GA, and the current coordinator worktree.' }
-foreach ($path in $expectedRoots) {
-    $dirty = @(git -C $path status --porcelain=v1 --untracked-files=all)
-    if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) { $dirty; throw "Worktree is not clean: $path" }
-}
-if ((git -C $root symbolic-ref --short HEAD).Trim() -ne 'codex/gwo-v8-c1-beta1-plan') { throw 'Coordinator worktree is on the wrong branch.' }
-if ((git -C $canonical symbolic-ref --short HEAD).Trim() -ne 'main') { throw 'Canonical root is not on main.' }
-if ((git -C $canonical rev-parse HEAD).Trim() -ne 'a48c7d6142ae3538725cb876a8782f4ca804cd22') { throw 'Canonical main moved.' }
-if ((git -C $gaRoot symbolic-ref --short HEAD).Trim() -ne 'codex/gwo-v8-ga-plan') { throw 'Active GA root is on the wrong branch.' }
-if ((git -C $gaRoot rev-parse HEAD).Trim() -ne '2cd6c46e1484ca140c3a197bbdeb171191d70c20') { throw 'Protected GA moved.' }
-if ((git -C $root rev-parse refs/heads/codex/gwo-v8-beta1).Trim() -ne 'e081e39054b7f9f0a49824eed8354a8a33378ea3') { throw 'Local Beta1 moved.' }
-git -C $root merge-base --is-ancestor e58c596998df90e65349bdb4b5f25d3d9dc1f7e2 2cd6c46e1484ca140c3a197bbdeb171191d70c20
-if ($LASTEXITCODE -ne 0) { throw 'Required implementation boundary is not an ancestor of protected GA.' }
-function Read-RemoteHead([string]$Name) {
-    $rows = @(git -C $root ls-remote --heads origin "refs/heads/$Name")
-    if ($LASTEXITCODE -ne 0 -or $rows.Count -ne 1) { throw "Remote head is missing or ambiguous: $Name" }
-    return (($rows[0] -split '\s+')[0])
-}
-$remoteMain = Read-RemoteHead 'main'
-$remoteBeta1 = Read-RemoteHead 'codex/gwo-v8-beta1'
-$remoteGa = Read-RemoteHead 'codex/gwo-v8-ga-plan'
-if ($remoteMain -ne 'a48c7d6142ae3538725cb876a8782f4ca804cd22') { throw 'Remote main moved.' }
-if ($remoteBeta1 -ne 'e081e39054b7f9f0a49824eed8354a8a33378ea3') { throw 'Remote Beta1 moved.' }
-if ($remoteGa -ne '2cd6c46e1484ca140c3a197bbdeb171191d70c20') { throw 'Remote protected GA moved.' }
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
 $evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-if (Test-Path -LiteralPath $evidence) { throw "C1 evidence root already exists; inspect and resume it instead of overwriting: $evidence" }
-New-Item -ItemType Directory -Path $evidence | Out-Null
+$statePath = Join-Path $evidence 'state.json'
+if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { throw 'STATE_MISSING' }
+try { $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_MALFORMED' }
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_SCHEMA_OR_MODE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim()
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'COORDINATOR_MUST_BE_ATTACHED' }
+$head = (git rev-parse HEAD).Trim()
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'COORDINATOR_HEAD_UNAVAILABLE' }
+if ($root -ne $state.coordinator_root -or $branch -ne $state.coordinator_branch -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_IDENTITY_DRIFTED' }
+if ($state.identities.base.sha -ne '2c72d9a153dac07e507c746548258efc44b62875' -or $state.identities.base.tree -ne '1905079fa3cd0d90dd9b1930ed5dd726fad9f114' -or (@($state.identities.base.parents) -join ',') -ne 'a48c7d6142ae3538725cb876a8782f4ca804cd22') { throw 'BASE_IDENTITY_DRIFTED' }
+if ($state.identities.beta1.sha -ne '70eaa70d5e87ff4f7a6791facd254abab8ff1377' -or $state.identities.beta1.tree -ne '663c5b12502554890bdd92fad6bffc5d6aa9c5f1' -or (@($state.identities.beta1.parents) -join ',') -ne '3fe3bb829f844627cac82a2d5a24bac8e58564b9') { throw 'BETA1_IDENTITY_DRIFTED' }
+if ($state.identities.integration.sha -ne '3fe3bb829f844627cac82a2d5a24bac8e58564b9' -or $state.identities.integration.tree -ne '5bbf203cf06b65e5e7c7e0c05059d0a1ce0b4b10' -or (@($state.identities.integration.parents) -join ',') -ne 'e081e39054b7f9f0a49824eed8354a8a33378ea3,2c72d9a153dac07e507c746548258efc44b62875') { throw 'INTEGRATION_IDENTITY_DRIFTED' }
+if ($state.identities.protected_ga.sha -ne '2cd6c46e1484ca140c3a197bbdeb171191d70c20' -or $state.identities.protected_ga.tree -ne 'd59a7414cf7f4873d0e1fc03cc2be8a9f18a6577' -or (@($state.identities.protected_ga.parents) -join ',') -ne '3b7097213ac482b3a9dcc31320e7bd84191bf2c0') { throw 'PROTECTED_GA_IDENTITY_DRIFTED' }
+if ($state.identities.boundaries.implementation -ne 'e58c596998df90e65349bdb4b5f25d3d9dc1f7e2' -or $state.identities.boundaries.beta1 -ne 'ddc1785f84b6a82a7b5c34d5928b046d4e9a781d') { throw 'BOUNDARY_IDENTITY_DRIFTED' }
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
+}
+~~~
+
+## Task 0: Freeze coordinator, evidence, and live policy
+
+**Files:** read-only CONTEXT.md, ADR-0036/0040/0060, Beta1 GA program and
+release train, C0 receipt/report, external evidence; create only external
+state/readbacks/logs.
+
+**Interfaces:** consumes the committed coordinator checkout and frozen Git
+objects; produces immutable v2 state, external evidence digest bindings, and
+initial live policy readback.
+
+- [ ] **0.1 Start fresh or resume without overwriting evidence.**
+
+~~~powershell
+$ErrorActionPreference = 'Stop'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE
+if ($exit -ne 0 -or $branch -ne 'codex/gwo-v8-c1-beta1-plan') { throw 'WRONG_COORDINATOR_BRANCH' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'COORDINATOR_HEAD_UNAVAILABLE' }
+git merge-base --is-ancestor ca1eb9a6f485576e30616fd1afde7353ba252cbf HEAD
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'CONTROL_BRANCH_NOT_FROM_REQUIRED_START' }
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
+$statePath = Join-Path $evidence 'state.json'
+if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+    try { $old = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_MALFORMED' }
+    if ($old.schema -ne 'gwo-v8-c1-state.v2' -or $old.mode -ne 'Local Verification Only' -or $old.coordinator_root -ne $root -or $old.coordinator_branch -ne $branch -or $old.coordinator_head -ne $head) { throw 'CONFLICTING_RESUME_STATE' }
+    Write-Output 'MATCHING_V2_STATE_READBACK_ONLY'
+    exit 0
+}
+if (Test-Path -LiteralPath $evidence) { throw 'EVIDENCE_ROOT_HAS_NO_MATCHING_STATE' }
+New-Item -ItemType Directory -Path $evidence -ErrorAction Stop | Out-Null
 $state = [ordered]@{
-    schema = 'gwo-v8-c1-state.v1'
+    schema = 'gwo-v8-c1-state.v2'
+    mode = 'Local Verification Only'
+    repository = 'NOirBRight/github-work-orchestrator'
     coordinator_root = $root
-    coordinator_head = (git -C $root rev-parse HEAD).Trim()
-    base_sha = $remoteMain
-    beta1_boundary_sha = 'ddc1785f84b6a82a7b5c34d5928b046d4e9a781d'
-    beta1_sha = $remoteBeta1
-    protected_ga_sha = $remoteGa
-    implementation_boundary_sha = 'e58c596998df90e65349bdb4b5f25d3d9dc1f7e2'
-    initialized_at = (Get-Date -AsUTC -Format o)
-}
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $evidence 'state.json') -Encoding utf8NoBOM
-~~~
-
-Expected: exactly three clean registered worktrees; canonical main, Beta1, and protected GA match all local/remote frozen SHAs.
-
-- [ ] **Step 2: Parse and verify the C0 receipt and approved decision without an end-of-file assumption.**
-
-~~~powershell
-$ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$statePath = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview/state.json'
-$state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-$receiptLines = @(git -C $root show "$($state.beta1_sha):docs/releases/gwo-v8-workspace-convergence.md")
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read the frozen C0 receipt.' }
-$receiptText = $receiptLines -join [Environment]::NewLine
-$fence = ([string][char]96) * 3
-$pattern = '(?ms)^' + [regex]::Escape($fence) + 'json\s*\r?\n(?<json>\{.*?\})\s*\r?\n' + [regex]::Escape($fence) + '\s*(?:\r?\n|$)'
-$matches = [regex]::Matches($receiptText, $pattern)
-if ($matches.Count -ne 1) { throw 'The C0 receipt must contain exactly one fenced JSON object.' }
-$receipt = $matches[0].Groups['json'].Value | ConvertFrom-Json
-$keptDiff = @(Compare-Object @('active-ga','canonical-main') @($receipt.kept_worktrees | Sort-Object))
-if ($keptDiff -or $receipt.schema -ne 'gwo-workspace-convergence.v1' -or
-    $receipt.source_sha -ne $state.implementation_boundary_sha -or
-    $receipt.protected_remote_ref -ne 'refs/heads/codex/gwo-v8-ga-plan' -or
-    $receipt.protected_remote_sha -ne $state.protected_ga_sha -or
-    $receipt.removed_worktree_count -ne 36 -or
-    $receipt.removed_test_root_count -ne 48 -or
-    $receipt.refs_deleted -ne $false -or
-    $receipt.archive_manifest_sha256 -ne 'e6939fbd27eedca2198b87f17de0d14bd3e367a65a37fc51542aa87ade889409' -or
-    $receipt.pre_clean_bundle_sha256 -ne '5eb64cffaed0ac2fd2748a575cb9cd041b2f7463d4d46d7dbfabf9dbdc0e8530' -or
-    $receipt.post_clean_bundle_sha256 -ne '9c91a126003e867a3c5736a4e4a69f5c3c079ce1adf5667c1108351181ac4f40') {
-    throw 'C0 receipt identity drifted.'
-}
-$decision = 'D:/Workstation/gwo-worktrees/issue-136/.superpowers/sdd/2026-08-04-gwo-v8-workspace-convergence-gate/task-8-report.md'
-$pass = @(Select-String -LiteralPath $decision -Pattern '^Phase 1 is \*\*PASS\*\* under the approved verification-subject exception\. The$' -CaseSensitive)
-if ($pass.Count -ne 1) { throw 'The approved C0 PASS line is absent or ambiguous.' }
-$state | Add-Member -NotePropertyName c0_receipt_verified_at -NotePropertyValue (Get-Date -AsUTC -Format o) -Force
-$state | Add-Member -NotePropertyName c0_archive_manifest_sha256 -NotePropertyValue $receipt.archive_manifest_sha256 -Force
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
-~~~
-
-Expected: the exact receipt values and exact C0 PASS decision are read successfully; explanatory prose after the JSON fence does not invalidate parsing.
-
-- [ ] **Step 3: Prove the Beta1 tag and Release are both absent before C1 mutation.**
-
-~~~powershell
-$ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$repo = 'NOirBRight/github-work-orchestrator'
-$tagName = 'v8.0.0-beta.1'
-$statePath = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview/state.json'
-$state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-$tagRows = @(git -C $root ls-remote --tags origin "refs/tags/$tagName" "refs/tags/$tagName^{}")
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read remote Beta1 tag state.' }
-$releaseProbe = @(gh api "repos/$repo/releases/tags/$tagName" 2>&1)
-$releaseProbeExit = $LASTEXITCODE
-if ($releaseProbeExit -ne 0 -and (($releaseProbe -join "`n") -notmatch '\(HTTP 404\)')) { throw 'Cannot read GitHub Release state.' }
-$releaseExists = $releaseProbeExit -eq 0
-$tagExists = $tagRows.Count -gt 0
-if ($tagExists -xor $releaseExists) { throw 'Partial Beta1 publication exists; stop without recreating either object.' }
-if ($tagExists -and $releaseExists) {
-    $parsed = @($tagRows | ForEach-Object { $parts = $_ -split '\s+'; [pscustomobject]@{ sha = $parts[0]; ref = $parts[1] } })
-    $direct = @($parsed | Where-Object ref -eq "refs/tags/$tagName")
-    $peeled = @($parsed | Where-Object ref -eq "refs/tags/$tagName^{}")
-    $release = ($releaseProbe -join [Environment]::NewLine) | ConvertFrom-Json
-    if ($direct.Count -ne 1 -or $peeled.Count -ne 1 -or $release.tag_name -ne $tagName -or
-        $release.target_commitish -ne $peeled[0].sha -or -not $release.prerelease -or $release.draft) {
-        throw 'Existing Beta1 publication is malformed.'
+    coordinator_branch = $branch
+    coordinator_head = $head
+    identities = [ordered]@{
+        base = [ordered]@{ ref = 'refs/heads/main'; sha = '2c72d9a153dac07e507c746548258efc44b62875'; tree = '1905079fa3cd0d90dd9b1930ed5dd726fad9f114'; parents = @('a48c7d6142ae3538725cb876a8782f4ca804cd22') }
+        beta1 = [ordered]@{ ref = 'refs/heads/codex/gwo-v8-beta1'; sha = '70eaa70d5e87ff4f7a6791facd254abab8ff1377'; tree = '663c5b12502554890bdd92fad6bffc5d6aa9c5f1'; parents = @('3fe3bb829f844627cac82a2d5a24bac8e58564b9') }
+        integration = [ordered]@{ sha = '3fe3bb829f844627cac82a2d5a24bac8e58564b9'; tree = '5bbf203cf06b65e5e7c7e0c05059d0a1ce0b4b10'; parents = @('e081e39054b7f9f0a49824eed8354a8a33378ea3','2c72d9a153dac07e507c746548258efc44b62875') }
+        protected_ga = [ordered]@{ ref = 'refs/heads/codex/gwo-v8-ga-plan'; sha = '2cd6c46e1484ca140c3a197bbdeb171191d70c20'; tree = 'd59a7414cf7f4873d0e1fc03cc2be8a9f18a6577'; parents = @('3b7097213ac482b3a9dcc31320e7bd84191bf2c0') }
+        boundaries = [ordered]@{ implementation = 'e58c596998df90e65349bdb4b5f25d3d9dc1f7e2'; beta1 = 'ddc1785f84b6a82a7b5c34d5928b046d4e9a781d' }
     }
-    throw 'Beta1 is already published. Do not rerun C1 mutations; perform a dedicated readback audit.'
+    scope = [ordered]@{ main_to_beta1_paths = @(); first_parent_chain = @() }
+    external_evidence = [ordered]@{}
+    policy_readbacks = [ordered]@{}
+    local_verification = [ordered]@{}
+    reviews = [ordered]@{}
+    approvals = [ordered]@{}
+    pr = [ordered]@{}
+    tracker = [ordered]@{}
+    publication = [ordered]@{}
+    closure = [ordered]@{}
+    c2_handoff = [ordered]@{}
 }
-$state | Add-Member -NotePropertyName initial_tag_absent -NotePropertyValue $true -Force
-$state | Add-Member -NotePropertyName initial_release_absent -NotePropertyValue $true -Force
-$state | Add-Member -NotePropertyName publication_preflight_at -NotePropertyValue (Get-Date -AsUTC -Format o) -Force
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
+$tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+[IO.File]::WriteAllText($tmp,($state | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+[IO.File]::Move($tmp,$statePath)
+try { $check = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_INITIAL_READBACK_FAILED' }
+if ($check.schema -ne 'gwo-v8-c1-state.v2') { throw 'STATE_SCHEMA_READBACK_FAILED' }
 ~~~
 
-Expected at C1 start: no remote tag and no GitHub Release.
+Expected: the first run creates one v2 state at the frozen coordinator
+identity; a resume reads the matching state and performs no overwrite.
 
----
-
-### Task 1: Audit every Beta1 commit and pass the complete Beta1 gate
-
-**Files:**
-- Read: the 16 aggregate paths and six post-boundary approved paths
-- Test: `tests/test_orchestrator_package.py` and the complete pytest suite
-- Verify: `scripts/quick_validate.py`, `scripts/sync_orchestrator.py`, and `git diff --check`
-- Create: `task-1-audit.json` and Task 1 command logs under the evidence directory
-
-**Interfaces:**
-- Consumes: frozen `state.json` and C0 authorization for the validator fix.
-- Produces: exact ancestry/path evidence and a clean, fully tested Beta1 SHA.
-
-- [ ] **Step 1: Verify merge-base, boundary ancestry, every post-boundary commit, aggregate allowlist, and protected plan blobs.**
+- [ ] **0.2 Re-read, parse, and hash every external evidence file.**
 
 ~~~powershell
 $ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$statePath = Join-Path $evidence 'state.json'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'
 $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-$base = $state.base_sha
-$candidate = $state.beta1_sha
-$boundary = $state.beta1_boundary_sha
-if ((git -C $root merge-base $base $candidate).Trim() -ne $base) { throw 'Beta1 merge-base is not the frozen main SHA.' }
-git -C $root merge-base --is-ancestor $boundary $candidate
-if ($LASTEXITCODE -ne 0) { throw 'The Beta1 boundary is not an ancestor of the candidate.' }
-$postBoundaryAllowed = @(
-    'docs/releases/gwo-v8-release-train.md',
-    'docs/releases/gwo-v8-workspace-convergence.md',
-    'docs/superpowers/plans/2026-08-04-gwo-v8-ga-release-program.md',
-    'docs/superpowers/plans/2026-08-04-gwo-v8-workspace-convergence-gate.md',
-    'scripts/quick_validate.py',
-    'tests/test_orchestrator_package.py'
-) | Sort-Object
-$commits = @(git -C $root rev-list --reverse "$boundary..$candidate")
-if ($LASTEXITCODE -ne 0 -or $commits.Count -eq 0) { throw 'Cannot enumerate post-boundary commits.' }
-$commitAudit = @()
-foreach ($commit in $commits) {
-    $parentText = (git -C $root show -s --format=%P $commit).Trim()
-    $parents = @($parentText -split ' ' | Where-Object { $_ })
-    $paths = @(
-        if ($parents.Count -eq 0) {
-            git -C $root show --pretty=format: --name-only $commit
-        } else {
-            foreach ($parent in $parents) { git -C $root diff --name-only $parent $commit }
-        }
-    ) | Where-Object { $_ } | Sort-Object -Unique
-    $bad = @($paths | Where-Object { $_ -notin $postBoundaryAllowed })
-    if ($bad) { $bad; throw "Post-boundary commit writes outside the approved set: $commit" }
-    $commitAudit += [pscustomobject]@{ commit = $commit; paths = $paths }
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE
+if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE
+if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
 }
-$aggregateExpected = @(
-    '.superpowers/sdd/2026-08-03-gwo-v8-ga-delivery-program/task-1-report.md',
-    'docs/design/gwo-v8-lean-roadmap.md',
-    'docs/releases/gwo-v8-release-train.md',
-    'docs/releases/gwo-v8-workspace-convergence.md',
-    'docs/releases/v8.0.0-beta.1.md',
-    'docs/superpowers/plans/2026-08-03-gwo-v8-batch-delivery.md',
-    'docs/superpowers/plans/2026-08-03-gwo-v8-campaign-watchdog.md',
-    'docs/superpowers/plans/2026-08-03-gwo-v8-candidate-assurance.md',
-    'docs/superpowers/plans/2026-08-03-gwo-v8-cutover-guard.md',
-    'docs/superpowers/plans/2026-08-03-gwo-v8-ga-delivery-program.md',
-    'docs/superpowers/plans/2026-08-03-gwo-v8-production-composition.md',
-    'docs/superpowers/plans/2026-08-03-gwo-v8-root-canary-ga.md',
-    'docs/superpowers/plans/2026-08-04-gwo-v8-ga-release-program.md',
-    'docs/superpowers/plans/2026-08-04-gwo-v8-workspace-convergence-gate.md',
-    'scripts/quick_validate.py',
-    'tests/test_orchestrator_package.py'
-) | Sort-Object
-$aggregateActual = @(git -C $root diff --name-only "$base...$candidate" | Sort-Object)
-$aggregateDiff = @(Compare-Object $aggregateExpected $aggregateActual)
-if ($aggregateDiff) { $aggregateDiff; throw 'The aggregate Beta1 path allowlist failed.' }
-foreach ($path in @('docs/superpowers/plans/2026-08-04-gwo-v8-ga-release-program.md','docs/superpowers/plans/2026-08-04-gwo-v8-workspace-convergence-gate.md')) {
-    $betaBlob = (git -C $root rev-parse "${candidate}:$path").Trim()
-    $gaBlob = (git -C $root rev-parse "$($state.protected_ga_sha):$path").Trim()
-    if ($betaBlob -ne $gaBlob) { throw "Protected plan blob mismatch: $path" }
+function Hash-Expected([string]$path,[string]$expected) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "MISSING:$path" }
+    $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) { throw "HASH_MISMATCH:$path" }
+    return $actual
 }
-$audit = [ordered]@{
-    merge_base = (git -C $root merge-base $base $candidate).Trim()
-    boundary = $boundary
-    candidate = $candidate
-    commits = $commitAudit
-    aggregate_paths = $aggregateActual
-    verified_at = (Get-Date -AsUTC -Format o)
+function Read-Json([string]$path) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "MISSING:$path" }
+    try { return Get-Content -Raw -LiteralPath $path | ConvertFrom-Json } catch { throw "BAD_JSON:$path" }
 }
-$audit | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $evidence 'task-1-audit.json') -Encoding utf8NoBOM
+$disable = 'D:/gwo-release-evidence/2026-08-05-disable-github-ci'
+$successor = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-beta1-successor'
+$mainManifestPath = Join-Path $disable 'manifest.json'; $mainAttestationPath = Join-Path $disable 'main-attestation.json'; $closurePath = Join-Path $disable 'closure.json'
+$betaManifestPath = Join-Path $successor 'manifest.json'; $pushReceiptPath = Join-Path $successor 'push-receipt.json'
+$mainManifestHash = Hash-Expected $mainManifestPath '1f01205bc9846bebfd8e767744a60d4d1e4c185f081f6083606047cd37e9d4a3'
+$mainAttestationHash = Hash-Expected $mainAttestationPath '689ccbdf84667d9931b83f18b4234816a853ca61ba6cca8382117f2179e15818'
+$closureHash = Hash-Expected $closurePath 'dd5dd6724567fee050fe42deecc8bd91baaae674ecba15c0a07cfae474ee386d'
+$betaManifestHash = Hash-Expected $betaManifestPath '413dd208f18ff6d82d4a64491e03dbfbf06f82712f71b8990d6e95716ecef024'
+$pushReceiptHash = Hash-Expected $pushReceiptPath '9bee5bd4f6b3a95236b7125cec2f8549fac8914941f8b104582466901a2f26ca'
+$mainManifest = Read-Json $mainManifestPath; $mainAttestation = Read-Json $mainAttestationPath; $closure = Read-Json $closurePath; $betaManifest = Read-Json $betaManifestPath; $pushReceipt = Read-Json $pushReceiptPath
+if ($mainAttestation.source_ref -ne 'refs/heads/main' -or $mainAttestation.source_sha -ne $state.identities.base.sha -or $mainAttestation.source_tree -ne $state.identities.base.tree -or (@($mainAttestation.parent_shas) -join ',') -ne 'a48c7d6142ae3538725cb876a8782f4ca804cd22' -or $mainAttestation.github.merge_method -ne 'squash' -or $mainAttestation.github.actions_enabled -ne $false -or $mainAttestation.verification_manifest_sha256 -ne $mainManifestHash) { throw 'MAIN_ATTESTATION_INVALID' }
+if ($closure.main_sha -ne $state.identities.base.sha -or $closure.main_tree -ne $state.identities.base.tree -or $closure.merge_method -ne 'squash' -or $closure.actions_enabled -ne $false -or $closure.workflow_count -ne 0 -or $closure.required_status_rules -ne 0 -or $closure.bypass_actor_count -ne 0) { throw 'CI_DISABLE_CLOSURE_INVALID' }
+$rules = @('deletion','non_fast_forward','pull_request','required_linear_history')
+if (@(Compare-Object ($rules | Sort-Object) (@($closure.preserved_rule_types) | Sort-Object)).Count -ne 0) { throw 'PRESERVED_RULES_INVALID' }
+if ($betaManifest.subject_sha -ne $state.identities.beta1.sha -or $betaManifest.subject_tree -ne $state.identities.beta1.tree -or $betaManifest.main_sha -ne $state.identities.base.sha -or $betaManifest.integration_merge_sha -ne $state.identities.integration.sha -or (@($betaManifest.integration_parent_shas) -join ',') -ne 'e081e39054b7f9f0a49824eed8354a8a33378ea3,2c72d9a153dac07e507c746548258efc44b62875' -or $betaManifest.python_version -ne 'Python 3.13.11' -or $betaManifest.requirements_sha256 -ne 'ee3c9f14db38950f5869759a5a94347197c9d4db3f138147b614ad6c4d862534' -or $betaManifest.final_outcome -ne 'pass' -or $betaManifest.workflow_count -ne 0 -or $betaManifest.diff_checks -ne 'clean' -or $betaManifest.worktree_status -ne 'clean') { throw 'BETA1_MANIFEST_INVALID' }
+foreach ($item in @($betaManifest.logs)) {
+    if ([IO.Path]::IsPathRooted([string]$item.name) -or ([string]$item.name).Contains('..')) { throw 'LOG_PATH_INVALID' }
+    Hash-Expected (Join-Path $successor ([string]$item.name)) ([string]$item.sha256) | Out-Null
+}
+if ($pushReceipt.branch -ne 'refs/heads/codex/gwo-v8-beta1' -or $pushReceipt.old_sha -ne 'e081e39054b7f9f0a49824eed8354a8a33378ea3' -or $pushReceipt.new_sha -ne $state.identities.beta1.sha -or $pushReceipt.main_sha -ne $state.identities.base.sha -or $pushReceipt.protected_ga_sha -ne $state.identities.protected_ga.sha -or $pushReceipt.verification_manifest_sha256 -ne $betaManifestHash -or $pushReceipt.actions_enabled -ne $false) { throw 'PUSH_RECEIPT_INVALID' }
+$archive = 'D:/gwo-convergence-archive/20260804T185544Z'
+$c0ManifestHash = Hash-Expected (Join-Path $archive 'convergence-manifest.json') 'e6939fbd27eedca2198b87f17de0d14bd3e367a65a37fc51542aa87ade889409'
+$c0PreHash = Hash-Expected (Join-Path $archive 'pre-clean.bundle') '5eb64cffaed0ac2fd2748a575cb9cd041b2f7463d4d46d7dbfabf9dbdc0e8530'
+$c0PostHash = Hash-Expected (Join-Path $archive 'post-clean.bundle') '9c91a126003e867a3c5736a4e4a69f5c3c079ce1adf5667c1108351181ac4f40'
+$c0RemoteHash = Hash-Expected (Join-Path $archive 'inventory/remote-ga-ref-after.txt') '9b0152f0553f18c1ac6a9aac0c5c2ec3b4ecdb4491835d3ebe0318d2d031c1ea'
+$receipt = @(git show "$($state.identities.beta1.sha):docs/releases/gwo-v8-workspace-convergence.md"); $exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'C0_RECEIPT_READ_FAILED' }
+$matches = [regex]::Matches(($receipt -join [Environment]::NewLine),'(?ms)^~~~json\s*\r?\n(?<json>\{.*?\})\s*\r?\n~~~\s*(?:\r?\n|$)')
+if ($matches.Count -ne 1) { throw 'C0_RECEIPT_JSON_INVALID' }
+$c0 = $matches[0].Groups['json'].Value | ConvertFrom-Json
+if ($c0.source_sha -ne $state.identities.boundaries.implementation -or $c0.protected_remote_sha -ne $state.identities.protected_ga.sha -or $c0.refs_deleted -ne $false -or $c0.archive_manifest_sha256 -ne $c0ManifestHash -or $c0.pre_clean_bundle_sha256 -ne $c0PreHash -or $c0.post_clean_bundle_sha256 -ne $c0PostHash) { throw 'C0_RECEIPT_FIELDS_INVALID' }
+$report = 'D:/Workstation/gwo-worktrees/issue-136/.superpowers/sdd/2026-08-04-gwo-v8-workspace-convergence-gate/task-8-report.md'
+if (@(Select-String -LiteralPath $report -Pattern '^Phase 1 is \*\*PASS\*\* under the approved verification-subject exception\.' -CaseSensitive).Count -ne 1) { throw 'C0_APPROVAL_MISSING' }
+$betaProgram = (git rev-parse "$($state.identities.beta1.sha):docs/superpowers/plans/2026-08-04-gwo-v8-ga-release-program.md").Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $betaProgram -ne '189236cb189ca990ee550ea01d047bdf9fc8f36c') { throw 'BETA_PROGRAM_BLOB_INVALID' }
+$convProgram = (git rev-parse "$($state.identities.beta1.sha):docs/superpowers/plans/2026-08-04-gwo-v8-workspace-convergence-gate.md").Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $convProgram -ne '731efda241693ee9d73e1979e9d0c5b339d96e3b') { throw 'BETA_CONVERGENCE_BLOB_INVALID' }
+$gaConv = (git rev-parse "$($state.identities.protected_ga.sha):docs/superpowers/plans/2026-08-04-gwo-v8-workspace-convergence-gate.md").Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $gaConv -ne '731efda241693ee9d73e1979e9d0c5b339d96e3b') { throw 'GA_CONVERGENCE_BLOB_INVALID' }
+$state.external_evidence = [ordered]@{ main_manifest_sha256 = $mainManifestHash; main_attestation_sha256 = $mainAttestationHash; ci_disable_closure_sha256 = $closureHash; beta1_manifest_sha256 = $betaManifestHash; beta1_push_receipt_sha256 = $pushReceiptHash; c0_archive = [ordered]@{ manifest_sha256 = $c0ManifestHash; pre_bundle_sha256 = $c0PreHash; post_bundle_sha256 = $c0PostHash; remote_ga_ref_sha256 = $c0RemoteHash }; beta1_plan_blobs = [ordered]@{ ga_release_program = $betaProgram; workspace_convergence_gate = $convProgram; protected_ga_workspace_convergence_gate = $gaConv } }
+Save-State $state
 ~~~
 
-Expected: merge-base equals `a48c7d6`, `ddc1785` is an ancestor, every later commit is within the six-path authorization, the aggregate diff is exactly 16 paths, and both final plan blobs match protected GA.
+Expected: the real JSON files parse, every successor log and C0 archive file
+rehashes to its recorded value, the C0 exception remains approved, and the
+Beta1 plan blobs are distinguished correctly.
 
-- [ ] **Step 2: Run focused and full verification inside an exact detached checkout.**
+- [ ] **0.3 Save and parse initial live policy readback.**
+
+Use these exact API calls and save each raw response before parsing:
 
 ~~~powershell
 $ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$statePath = Join-Path $evidence 'state.json'
-$state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-$archiveRoot = 'D:/gwo-convergence-archive/20260804T185544Z'
-if (-not (Test-Path -LiteralPath $archiveRoot -PathType Container)) { throw "Required C0 archive is absent: $archiveRoot" }
-$verify = 'D:/Workstation/gwo-worktrees/c1-beta1-verify'
-if (Test-Path -LiteralPath $verify) { throw "Verification checkout already exists: $verify" }
-git -C $root worktree add --detach $verify $state.beta1_sha
-if ($LASTEXITCODE -ne 0) { throw 'Cannot create the exact Beta1 verification checkout.' }
-$completed = $false
-Push-Location -LiteralPath $verify
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
+}
+$repo = $state.repository; $dir = Join-Path $evidence 'policy-initial'
+if (Test-Path -LiteralPath $dir) { throw 'POLICY_SNAPSHOT_EXISTS' }; New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null
+$actions = @(gh api "repos/$repo/actions/permissions" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'ACTIONS_READBACK_FAILED' }
+$workflows = @(gh api "repos/$repo/actions/workflows" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'WORKFLOW_READBACK_FAILED' }
+$ruleset = @(gh api "repos/$repo/rulesets/20160628" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'RULESET_READBACK_FAILED' }
+[IO.File]::WriteAllText((Join-Path $dir 'actions.json'),($actions -join [Environment]::NewLine),[Text.UTF8Encoding]::new($false)); [IO.File]::WriteAllText((Join-Path $dir 'workflows.json'),($workflows -join [Environment]::NewLine),[Text.UTF8Encoding]::new($false)); [IO.File]::WriteAllText((Join-Path $dir 'ruleset.json'),($ruleset -join [Environment]::NewLine),[Text.UTF8Encoding]::new($false))
+$a = ($actions -join [Environment]::NewLine) | ConvertFrom-Json; $w = ($workflows -join [Environment]::NewLine) | ConvertFrom-Json; $r = ($ruleset -join [Environment]::NewLine) | ConvertFrom-Json
+if ($a.enabled -ne $false -or $w.total_count -ne 0 -or $r.id -ne 20160628 -or $r.enforcement -ne 'active' -or $r.source -ne $repo -or @($r.bypass_actors).Count -ne 0 -or @($r.rules | Where-Object type -eq 'required_status_checks').Count -ne 0) { throw 'POLICY_SEMANTICS_INVALID' }
+$types = @($r.rules | ForEach-Object type); if (@(Compare-Object (@('deletion','non_fast_forward','pull_request','required_linear_history') | Sort-Object) ($types | Sort-Object)).Count -ne 0) { throw 'RULESET_TYPES_INVALID' }
+$pull = @($r.rules | Where-Object type -eq 'pull_request')[0]; if (@($pull.parameters.allowed_merge_methods) -notcontains 'squash') { throw 'SQUASH_NOT_ALLOWED' }
+$hashes = [ordered]@{}; foreach ($name in @('actions.json','workflows.json','ruleset.json')) { $hashes[$name] = (Get-FileHash -LiteralPath (Join-Path $dir $name) -Algorithm SHA256).Hash.ToLowerInvariant() }
+$summary = [ordered]@{ actions_enabled = $a.enabled; workflow_count = $w.total_count; required_status_rule_count = @($r.rules | Where-Object type -eq 'required_status_checks').Count; preserved_rule_types = @($types | Sort-Object); bypass_actor_count = @($r.bypass_actors).Count; allowed_merge_methods = @($pull.parameters.allowed_merge_methods); files = $hashes }
+[IO.File]::WriteAllText((Join-Path $dir 'summary.json'),($summary | ConvertTo-Json -Depth 20),[Text.UTF8Encoding]::new($false)); $summaryHash = (Get-FileHash -LiteralPath (Join-Path $dir 'summary.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+$state.policy_readbacks = [ordered]@{ initial = [ordered]@{ directory = $dir.Replace('\','/'); summary_sha256 = $summaryHash; semantics = $summary } }; Save-State $state
+~~~
+
+Expected: Actions are disabled, workflow_count is zero, ruleset 20160628 is
+active on the default branch, there is no required status rule, the four
+preserved rule types and zero bypass actors are present, and squash is allowed.
+
+## Task 1: Audit exact Git history, paths, refs, and C0 boundaries
+
+**Files:** read-only frozen Git objects, the exact 17 paths, the protected GA
+ref, C0 archive, and state; create only external audit JSON.
+
+**Interfaces:** consumes Task 0 state/evidence/policy readbacks and produces
+an exact first-parent scope audit without changing any branch or remote object.
+
+- [ ] **1.1 Verify object identity, ancestry, remote refs, exact paths, and
+  first-parent allowlists.**
+
+~~~powershell
+$ErrorActionPreference = 'Stop'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
+}
+function Git-Text([string[]]$args) { $out = @(git -C $root @args); $code = $LASTEXITCODE; if ($code -ne 0) { throw ('GIT_FAILED:' + ($args -join ' ')) }; return @($out) }
+function Tree([string]$sha) { return (Git-Text @('rev-parse',($sha + '^{tree}')))[0].Trim() }
+function Parents([string]$sha) { $row = (Git-Text @('show','-s','--format=%P',$sha))[0]; return @($row -split '\s+' | Where-Object { $_ }) }
+if ((Tree $state.identities.base.sha) -ne $state.identities.base.tree -or (@(Parents $state.identities.base.sha) -join ',') -ne 'a48c7d6142ae3538725cb876a8782f4ca804cd22') { throw 'BASE_OBJECT_INVALID' }
+if ((Tree $state.identities.beta1.sha) -ne $state.identities.beta1.tree -or (@(Parents $state.identities.beta1.sha) -join ',') -ne '3fe3bb829f844627cac82a2d5a24bac8e58564b9') { throw 'BETA1_OBJECT_INVALID' }
+if ((Tree $state.identities.integration.sha) -ne $state.identities.integration.tree -or (@(Parents $state.identities.integration.sha) -join ',') -ne 'e081e39054b7f9f0a49824eed8354a8a33378ea3,2c72d9a153dac07e507c746548258efc44b62875') { throw 'INTEGRATION_OBJECT_INVALID' }
+if ((Tree $state.identities.protected_ga.sha) -ne $state.identities.protected_ga.tree -or (@(Parents $state.identities.protected_ga.sha) -join ',') -ne '3b7097213ac482b3a9dcc31320e7bd84191bf2c0') { throw 'PROTECTED_GA_OBJECT_INVALID' }
+$base = $state.identities.base.sha; $beta = $state.identities.beta1.sha
+$mb = (Git-Text @('merge-base',$base,$beta))[0].Trim(); if ($mb -ne $base) { throw 'MERGE_BASE_INVALID' }
+git -C $root merge-base --is-ancestor $state.identities.boundaries.beta1 $beta; $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'BETA1_BOUNDARY_NOT_ANCESTOR' }
+git -C $root merge-base --is-ancestor $state.identities.boundaries.implementation $state.identities.protected_ga.sha; $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'IMPLEMENTATION_BOUNDARY_NOT_GA_ANCESTOR' }
+$remoteRows = @(git -C $root ls-remote --heads origin 'refs/heads/main' 'refs/heads/codex/gwo-v8-beta1' 'refs/heads/codex/gwo-v8-ga-plan'); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'REMOTE_READ_FAILED' }
+$remote = @{}; foreach ($row in $remoteRows) { $parts = $row -split '\s+'; if ($parts.Count -ne 2) { throw 'REMOTE_ROW_INVALID' }; $remote[$parts[1]] = $parts[0] }
+if ($remote['refs/heads/main'] -ne $base -or $remote['refs/heads/codex/gwo-v8-beta1'] -ne $beta -or $remote['refs/heads/codex/gwo-v8-ga-plan'] -ne $state.identities.protected_ga.sha) { throw 'FROZEN_REMOTE_MOVED' }
+$paths = @('.superpowers/sdd/2026-08-03-gwo-v8-ga-delivery-program/task-1-report.md','CONTRIBUTING.md','docs/design/gwo-v8-lean-roadmap.md','docs/releases/gwo-v8-release-train.md','docs/releases/gwo-v8-workspace-convergence.md','docs/releases/v8.0.0-beta.1.md','docs/superpowers/plans/2026-08-03-gwo-v8-batch-delivery.md','docs/superpowers/plans/2026-08-03-gwo-v8-campaign-watchdog.md','docs/superpowers/plans/2026-08-03-gwo-v8-candidate-assurance.md','docs/superpowers/plans/2026-08-03-gwo-v8-cutover-guard.md','docs/superpowers/plans/2026-08-03-gwo-v8-ga-delivery-program.md','docs/superpowers/plans/2026-08-03-gwo-v8-production-composition.md','docs/superpowers/plans/2026-08-03-gwo-v8-root-canary-ga.md','docs/superpowers/plans/2026-08-04-gwo-v8-ga-release-program.md','docs/superpowers/plans/2026-08-04-gwo-v8-workspace-convergence-gate.md','scripts/quick_validate.py','tests/test_orchestrator_package.py')
+$diff = @(git -C $root diff --name-only "$base..$beta"); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'DIFF_READ_FAILED' }; $diff = @($diff | ForEach-Object { $_.Replace('\','/') } | Sort-Object)
+if ($diff.Count -ne 17 -or @(Compare-Object ($paths | Sort-Object) $diff).Count -ne 0) { throw 'EXACT_17_PATHS_FAILED' }
+$chainExpected = @('bda3ede710339100e3c12eb4bea176be0d029e34','a60371e4b6bcb111ea7183d73db6b743c0f47da4','e081e39054b7f9f0a49824eed8354a8a33378ea3','3fe3bb829f844627cac82a2d5a24bac8e58564b9','70eaa70d5e87ff4f7a6791facd254abab8ff1377')
+$chain = @(git -C $root rev-list --first-parent --reverse "$($state.identities.boundaries.beta1)..$beta"); $exit = $LASTEXITCODE; if ($exit -ne 0 -or @(Compare-Object $chainExpected $chain).Count -ne 0) { throw 'FIRST_PARENT_CHAIN_FAILED' }
+$allow = @{}
+$allow[$chainExpected[0]] = @('docs/superpowers/plans/2026-08-04-gwo-v8-ga-release-program.md','docs/superpowers/plans/2026-08-04-gwo-v8-workspace-convergence-gate.md')
+$allow[$chainExpected[1]] = $allow[$chainExpected[0]]
+$allow[$chainExpected[2]] = @('docs/releases/gwo-v8-release-train.md','docs/releases/gwo-v8-workspace-convergence.md','scripts/quick_validate.py','tests/test_orchestrator_package.py')
+$allow[$chainExpected[4]] = @('CONTRIBUTING.md','docs/design/gwo-v8-lean-roadmap.md','docs/releases/gwo-v8-release-train.md','docs/releases/v8.0.0-beta.1.md','docs/superpowers/plans/2026-08-04-gwo-v8-ga-release-program.md','tests/test_orchestrator_package.py')
+foreach ($commit in $chain) {
+    $parents = @(Parents $commit)
+    if ($commit -eq $state.identities.integration.sha) { if (@($parents) -join ',' -ne 'e081e39054b7f9f0a49824eed8354a8a33378ea3,2c72d9a153dac07e507c746548258efc44b62875' -or (Tree $commit) -ne $state.identities.integration.tree) { throw 'INTEGRATION_READBACK_FAILED' }; continue }
+    if ($parents.Count -ne 1) { throw 'NON_MERGE_PARENT_COUNT_FAILED' }
+    $touched = @(git -C $root diff-tree --no-commit-id --name-only -r $parents[0] $commit); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'COMMIT_DIFF_FAILED' }; $touched = @($touched | ForEach-Object { $_.Replace('\','/') } | Sort-Object -Unique)
+    if (@(Compare-Object ($allow[$commit] | Sort-Object) $touched).Count -ne 0) { throw "COMMIT_SCOPE_FAILED:$commit" }
+}
+$state.scope = [ordered]@{ main_to_beta1_paths = $paths; first_parent_chain = $chain; remote_refs = $remote }
+[IO.File]::WriteAllText((Join-Path $evidence 'scope-audit.json'),($state.scope | ConvertTo-Json -Depth 20),[Text.UTF8Encoding]::new($false)); Save-State $state
+~~~
+
+Expected: all exact SHA/tree/parent checks, ancestry, unchanged remote refs,
+exactly 17 paths, and every non-merge allowlist pass. The integration merge is
+validated only as its own ordered identity.
+
+- [ ] **1.2 Verify the three expected C0/C1 clean worktrees.**
+
+The execution registry must contain exactly:
+D:/Workstation/github-work-orchestrator on main,
+D:/Workstation/gwo-worktrees/issue-136 on codex/gwo-v8-ga-plan, and the
+current coordinator root on codex/gwo-v8-c1-beta1-plan. Require all three
+clean. Do not include the authoring c1-plan-writer worktree in an execution
+run, and do not remove it as part of C1.
+
+~~~powershell
+$ErrorActionPreference = 'Stop'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
+}
+$rows = @(git -C $root worktree list --porcelain); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'WORKTREE_LIST_FAILED' }
+$roots = @($rows | Where-Object { $_ -like 'worktree *' } | ForEach-Object { ([IO.Path]::GetFullPath($_.Substring(9)).Replace('\','/')).TrimEnd('/') } | Sort-Object -Unique)
+$expected = @('D:/Workstation/github-work-orchestrator','D:/Workstation/gwo-worktrees/issue-136',$root) | ForEach-Object { $_.Replace('\','/').TrimEnd('/') } | Sort-Object -Unique
+if (@(Compare-Object $expected $roots).Count -ne 0) { throw 'WORKTREE_SET_INVALID' }
+foreach ($path in $expected) { $dirty = @(git -C $path status --porcelain=v1 --untracked-files=all); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $dirty.Count -ne 0) { throw "DIRTY_WORKTREE:$path" } }
+$state.scope.worktrees = $expected; Save-State $state
+~~~
+
+Expected: exactly three clean execution worktrees are read back; no C0
+retained/user worktree is deleted.
+
+## Task 2: Run exact Beta1 local verification and five review lanes
+
+**Files:** read-only exact Beta1 tree and hash-locked requirements; create only
+external logs, a local verification manifest, and five report receipts.
+
+**Interfaces:** consumes the exact scope/policy state and produces a local
+manifest with a SHA-256 plus five independent read-only verdicts.
+
+- [ ] **2.1 Create a dedicated Python 3.13 environment and run the Beta1 gate.**
+
+Use an external venv at
+D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview/python313.
+Verify Python 3.13.11 and the exact requirements hash before installing. A
+failed detached checkout remains for diagnosis; only a successful clean
+checkout is removed.
+The full-suite command is python -m pytest -q.
+
+~~~powershell
+$ErrorActionPreference = 'Stop'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+if ($state.identities.beta1.sha -ne '70eaa70d5e87ff4f7a6791facd254abab8ff1377' -or $state.identities.beta1.tree -ne '663c5b12502554890bdd92fad6bffc5d6aa9c5f1') { throw 'BETA1_IDENTITY_INVALID' }
+function Run-Log([string]$name,[string]$exe,[string[]]$args,[string]$cwd,[string]$log) {
+    Push-Location $cwd
+    try { & $exe @args *> $log; $code = $LASTEXITCODE } finally { Pop-Location }
+    $tail = @(Get-Content -LiteralPath $log -ErrorAction Stop | Select-Object -Last 20) -join [Environment]::NewLine
+    $hash = (Get-FileHash -LiteralPath $log -Algorithm SHA256).Hash.ToLowerInvariant()
+    return [ordered]@{ name = $name; log = $log.Replace('\','/'); exit_code = $code; summary = $tail; sha256 = $hash }
+}
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true); try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
+}
+$venv = Join-Path $evidence 'python313'; $python = Join-Path $venv 'Scripts/python.exe'
+if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { & py -3.13 -m venv $venv; $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'VENV_CREATE_FAILED' } }
+$version = (& $python --version 2>&1) -join ' '; $exit = $LASTEXITCODE; if ($exit -ne 0 -or $version -ne 'Python 3.13.11') { throw 'PYTHON_VERSION_INVALID' }
+$requirements = Join-Path $root '.github/requirements-ci-win-py313.txt'; if (-not (Test-Path -LiteralPath $requirements -PathType Leaf)) { throw 'REQUIREMENTS_MISSING' }
+$reqHash = (Get-FileHash -LiteralPath $requirements -Algorithm SHA256).Hash.ToLowerInvariant(); if ($reqHash -ne 'ee3c9f14db38950f5869759a5a94347197c9d4db3f138147b614ad6c4d862534') { throw 'REQUIREMENTS_HASH_INVALID' }
+$installLog = Join-Path $evidence 'beta1-pip-install.log'; & $python -m pip install --require-hashes -r $requirements *> $installLog; $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'PIP_INSTALL_FAILED' }
+$checkout = Join-Path $evidence 'worktrees/beta1-local'; if (Test-Path -LiteralPath $checkout) { throw 'BETA1_CHECKOUT_EXISTS' }; New-Item -ItemType Directory -Path (Split-Path $checkout) -ErrorAction Stop | Out-Null
+git -C $root worktree add --detach $checkout $state.identities.beta1.sha; $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'BETA1_CHECKOUT_CREATE_FAILED' }
+$logs = Join-Path $evidence 'logs/beta1'; New-Item -ItemType Directory -Path $logs -ErrorAction Stop | Out-Null; $records = @()
+$previous = $env:GWO_CONVERGENCE_ARCHIVE_ROOT
 try {
-    if ((git rev-parse HEAD).Trim() -ne $state.beta1_sha) { throw 'Verification checkout is on the wrong SHA.' }
-    $previousArchiveRoot = $env:GWO_CONVERGENCE_ARCHIVE_ROOT
-    try {
-        $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $archiveRoot
-    $packageOutput = @(& py -3.13 -m pytest tests/test_orchestrator_package.py -q 2>&1)
-    $packageExit = $LASTEXITCODE
-    $packageOutput | Set-Content -LiteralPath (Join-Path $evidence 'task-1-package.log') -Encoding utf8NoBOM
-    if ($packageExit -ne 0) { throw 'Beta1 package tests failed.' }
-    $fullOutput = @(& py -3.13 -m pytest -q 2>&1)
-    $fullExit = $LASTEXITCODE
-    $fullOutput | Set-Content -LiteralPath (Join-Path $evidence 'task-1-full-pytest.log') -Encoding utf8NoBOM
-    if ($fullExit -ne 0) { throw 'Beta1 full pytest failed.' }
-    $quickOutput = @(& py -3.13 scripts/quick_validate.py 2>&1)
-    $quickExit = $LASTEXITCODE
-    $quickOutput | Set-Content -LiteralPath (Join-Path $evidence 'task-1-quick-validate.log') -Encoding utf8NoBOM
-    if ($quickExit -ne 0) { throw 'Beta1 quick validation failed.' }
-    $syncOutput = @(& py -3.13 scripts/sync_orchestrator.py --check 2>&1)
-    $syncExit = $LASTEXITCODE
-    $syncOutput | Set-Content -LiteralPath (Join-Path $evidence 'task-1-sync-check.log') -Encoding utf8NoBOM
-    if ($syncExit -ne 0) { throw 'Beta1 package synchronization failed.' }
-    $diffOutput = @(git diff --check "$($state.base_sha)...HEAD" 2>&1)
-    $diffExit = $LASTEXITCODE
-    $diffOutput | Set-Content -LiteralPath (Join-Path $evidence 'task-1-diff-check.log') -Encoding utf8NoBOM
-    if ($diffExit -ne 0) { throw 'Beta1 diff check failed.' }
-    $dirty = @(git status --porcelain=v1 --untracked-files=all)
-    if ($dirty.Count -ne 0) { $dirty; throw 'Verification changed the detached checkout.' }
-    $packageSummary = @($packageOutput | Select-String -Pattern '[0-9][0-9,]* passed')
-    $fullSummary = @($fullOutput | Select-String -Pattern '[0-9][0-9,]* passed')
-    if ($packageSummary.Count -eq 0 -or $fullSummary.Count -eq 0) { throw 'Dynamic pytest summaries are missing.' }
-    $state | Add-Member -NotePropertyName beta1_package_summary -NotePropertyValue $packageSummary[-1].Line.Trim() -Force
-    $state | Add-Member -NotePropertyName beta1_full_summary -NotePropertyValue $fullSummary[-1].Line.Trim() -Force
-    $state | Add-Member -NotePropertyName beta1_verified_at -NotePropertyValue (Get-Date -AsUTC -Format o) -Force
-    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
-    } finally {
-        if ($null -eq $previousArchiveRoot) {
-            Remove-Item -LiteralPath Env:\GWO_CONVERGENCE_ARCHIVE_ROOT -ErrorAction SilentlyContinue
-        } else {
-            $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $previousArchiveRoot
-        }
-    }
-    $completed = $true
+    $env:GWO_CONVERGENCE_ARCHIVE_ROOT = 'D:/gwo-convergence-archive/20260804T185544Z'
+    $records += Run-Log 'package' $python @('-m','pytest','tests/test_orchestrator_package.py','-q') $checkout (Join-Path $logs 'package.log'); if ($records[-1].exit_code -ne 0) { throw 'PACKAGE_GATE_FAILED' }
+    $records += Run-Log 'full' $python @('-m','pytest','-q') $checkout (Join-Path $logs 'full.log'); if ($records[-1].exit_code -ne 0) { throw 'FULL_GATE_FAILED' }
+    $records += Run-Log 'quick' $python @('scripts/quick_validate.py') $checkout (Join-Path $logs 'quick.log'); if ($records[-1].exit_code -ne 0) { throw 'QUICK_GATE_FAILED' }
+    $records += Run-Log 'sync' $python @('scripts/sync_orchestrator.py','--check') $checkout (Join-Path $logs 'sync.log'); if ($records[-1].exit_code -ne 0) { throw 'SYNC_GATE_FAILED' }
+    $records += Run-Log 'diff' 'git' @('-C',$checkout,'diff','--check',"$($state.identities.base.sha)...$($state.identities.beta1.sha)") $checkout (Join-Path $logs 'diff.log'); if ($records[-1].exit_code -ne 0) { throw 'DIFF_GATE_FAILED' }
+    $records += Run-Log 'status' 'git' @('-C',$checkout,'status','--porcelain=v1','--untracked-files=all') $checkout (Join-Path $logs 'status.log'); if ($records[-1].exit_code -ne 0 -or $records[-1].summary.Trim().Length -ne 0) { throw 'STATUS_NOT_CLEAN' }
 } finally {
-    Pop-Location
-    if ($completed) {
-        git -C $root worktree remove $verify
-        if ($LASTEXITCODE -ne 0) { throw "Verified checkout stayed registered: $verify" }
-    } else {
-        Write-Warning "Verification failed; preserved checkout for diagnosis: $verify"
-    }
+    if ($null -eq $previous) { Remove-Item -LiteralPath Env:\GWO_CONVERGENCE_ARCHIVE_ROOT -ErrorAction SilentlyContinue } else { $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $previous }
 }
+$workflows = @(git -C $checkout ls-tree -r --name-only HEAD .github/workflows); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $workflows.Count -ne 0) { throw 'SUBJECT_WORKFLOW_PRESENT' }
+$parents = ((git -C $checkout show -s --format=%P HEAD)); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'PARENT_READ_FAILED' }
+$manifest = [ordered]@{ schema = 'gwo-c1-local-verification.v2'; mode = 'Local Verification Only'; subject_sha = $state.identities.beta1.sha; subject_tree = $state.identities.beta1.tree; parent_shas = @($parents -split '\s+' | Where-Object { $_ }); base_sha = $state.identities.base.sha; base_tree = $state.identities.base.tree; python_version = $version; requirements_sha256 = $reqHash; commands = $records; workflow_count = 0; final_outcome = 'pass' }
+$manifestPath = Join-Path $evidence 'beta1-local-verification.json'; [IO.File]::WriteAllText($manifestPath,($manifest | ConvertTo-Json -Depth 30),[Text.UTF8Encoding]::new($false)); $manifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$clean = @(git -C $checkout status --porcelain=v1 --untracked-files=all); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $clean.Count -ne 0) { throw 'CHECKOUT_NOT_CLEAN' }
+git -C $root worktree remove $checkout; $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'CLEAN_CHECKOUT_REMOVE_FAILED' }
+$state.local_verification.beta1 = [ordered]@{ manifest = $manifestPath.Replace('\','/'); manifest_sha256 = $manifestHash; requirements_sha256 = $reqHash; command_count = $records.Count }
+Save-State $state
 ~~~
 
-Expected: focused package tests and full pytest pass with dynamic summaries; quick validation, sync, and diff checks pass; the exact checkout stays clean and is removed without force.
+Expected: a clean detached Beta1 checkout passes the focused package test,
+full pytest, quick validation, sync check, diff check, and clean status. The
+manifest lists and re-hashes all six logs, records its own SHA-256 in state,
+requires Python 3.13.11 and the locked requirements, and the environment is
+restored or removed in finally. workflow_files must be empty. A failed
+checkout remains.
 
-- [ ] **Step 3: Persist the deterministic hosted-CI compatibility HOLD.**
+- [ ] **2.2 Run five read-only review lanes concurrently.**
+
+Dispatch exactly five read-only jobs, all gpt-5.6-luna with max reasoning:
+
+1. standards: repository instructions, ADR language, executable fences,
+   atomic state, Local Verification Only, and stale-contract removal;
+2. release/spec: Beta1 release train, GA program, C0 exception, notes schema,
+   non-goals, and C2 sequencing;
+3. Git/history/scope: all SHA/tree/parent identities, first-parent chain,
+   authorized paths, exact 17 paths, and immutable source/GA refs;
+4. tracker: #113-#119/#137 state, native blockers, exact milestones,
+   conditional #137 rule, ETag behavior, and no issue closure;
+5. local/publication safety: evidence/log hashes, policy, local gates, three
+   leases, PR repository identity, squash/tree readback, tag peel, body, and
+   closure.
+
+Each prompt binds base SHA/tree, Beta1 SHA/tree, and Beta1 manifest digest
+413dd208f18ff6d82d4a64491e03dbfbf06f82712f71b8990d6e95716ecef024. Each
+report must end with exactly the non-empty line Verdict: PASS. Any other final
+line blocks. The coordinator saves each returned report once under
+reviews/<lane>.md, computes Get-FileHash SHA256, and records the report hash,
+bound identities, and verdict in state. Reviewers do not write to this
+worktree. The five lanes may overlap the single full local runner above.
+
+**Expected:** five independent reports and hashes are present, all bind the
+same exact subject, and no remote mutation occurs during review.
+
+## Task 3: PR owner gate, exact Draft PR, and squash integration
+
+**Files:** read-only state, policy/evidence/local manifests/reports/refs and
+PR list; create only external PR and merge receipts. Do not push Beta1.
+
+**Interfaces:** consumes the exact Beta1 evidence and five PASS reports;
+produces one Draft PR and one exact squash result with immediate readback.
+
+- [ ] **3.1 Read the PR owner approval and Integration Lease.**
+
+The owner supplies approvals/pr-owner.json. The coordinator only parses it.
+Require schema gwo-v8-c1-pr-owner-approval.v1, repository
+NOirBRight/github-work-orchestrator, base ref main and base SHA
+2c72d9a153dac07e507c746548258efc44b62875, head ref codex/gwo-v8-beta1 and
+head SHA 70eaa70d5e87ff4f7a6791facd254abab8ff1377, action scope exactly
+create/ready/merge one squash PR, a non-empty owner identity, a
+non-empty owner-controlled integration_lease_id, and an owner receipt hash.
+The receipt must bind the lease window from the last base/head/policy
+readback through squash and immediate readback. Missing, expired, reused, or
+conflicting receipts stop. Never set an approval or lease environment value.
+
+- [ ] **3.2 Re-read live policy immediately before PR creation/reuse.**
+
+Every remote mutation in Tasks 3, 5, and 6 first saves new raw responses for
+these exact calls, parses them, and checks all semantics. The helper is
+redeclared in each fence.
+The exact unquoted API forms are gh api repos/$repo/actions/permissions,
+gh api repos/$repo/actions/workflows, and gh api repos/$repo/rulesets/20160628.
 
 ~~~powershell
 $ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$statePath = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview/state.json'
-$state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-$testText = @(git -C $root show "$($state.beta1_sha):tests/test_orchestrator_package.py") -join "`n"
-if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the frozen Beta1 package test.' }
-$workflowText = @(git -C $root show "$($state.beta1_sha):.github/workflows/ci.yml") -join "`n"
-if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the frozen hosted CI workflow.' }
-$frozenBeta1 = 'e081e39054b7f9f0a49824eed8354a8a33378ea3'
-if ($state.beta1_sha -ne $frozenBeta1) { throw 'Beta1 SHA changed; rewrite and re-review this plan instead of reusing the frozen compatibility decision.' }
-$requiresArchive = $testText -match 'GWO_CONVERGENCE_ARCHIVE_ROOT is required'
-$provisionsArchive = $workflowText -match 'GWO_CONVERGENCE_ARCHIVE_ROOT'
-if (-not $requiresArchive -or $provisionsArchive) { throw 'Frozen hosted-CI facts changed; re-freeze the C1 plan.' }
-$compatible = $false
-$state | Add-Member -NotePropertyName hosted_ci_compatible -NotePropertyValue $compatible -Force
-$state | Add-Member -NotePropertyName hosted_ci_checked_at -NotePropertyValue (Get-Date -AsUTC -Format o) -Force
-if (-not $compatible) {
-    $state | Add-Member -NotePropertyName c1_hold_reason -NotePropertyValue 'Frozen Beta1 requires a local convergence archive that hosted GWO CI does not provision.' -Force
-}
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
-if (-not $compatible) { Write-Warning 'C1 HOLD: Tasks 0-2 may complete, but Task 3 remote mutation is forbidden.' }
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+if ($state.identities.base.sha -ne '2c72d9a153dac07e507c746548258efc44b62875' -or $state.identities.beta1.sha -ne '70eaa70d5e87ff4f7a6791facd254abab8ff1377') { throw 'FROZEN_IDENTITY_INVALID' }
+$repo = $state.repository; $approvalPath = Join-Path $evidence 'approvals/pr-owner.json'; if (-not (Test-Path -LiteralPath $approvalPath -PathType Leaf)) { throw 'PR_APPROVAL_MISSING' }
+$approval = Get-Content -Raw -LiteralPath $approvalPath | ConvertFrom-Json; if ($approval.schema -ne 'gwo-v8-c1-pr-owner-approval.v1' -or $approval.base_sha -ne $state.identities.base.sha -or $approval.head_sha -ne $state.identities.beta1.sha -or [string]::IsNullOrWhiteSpace([string]$approval.integration_lease_id)) { throw 'PR_APPROVAL_INVALID' }
+$policyDir = Join-Path $evidence 'policy-before-pr'; if (Test-Path -LiteralPath $policyDir) { throw 'POLICY_READBACK_EXISTS' }; New-Item -ItemType Directory -Path $policyDir -ErrorAction Stop | Out-Null
+$actions = @(gh api "repos/$repo/actions/permissions" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'ACTIONS_READBACK_FAILED' }
+$workflows = @(gh api "repos/$repo/actions/workflows" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'WORKFLOW_READBACK_FAILED' }
+$ruleset = @(gh api "repos/$repo/rulesets/20160628" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'RULESET_READBACK_FAILED' }
+[IO.File]::WriteAllText((Join-Path $policyDir 'actions.json'),($actions -join [Environment]::NewLine),[Text.UTF8Encoding]::new($false)); [IO.File]::WriteAllText((Join-Path $policyDir 'workflows.json'),($workflows -join [Environment]::NewLine),[Text.UTF8Encoding]::new($false)); [IO.File]::WriteAllText((Join-Path $policyDir 'ruleset.json'),($ruleset -join [Environment]::NewLine),[Text.UTF8Encoding]::new($false))
+$a = ($actions -join [Environment]::NewLine) | ConvertFrom-Json; $w = ($workflows -join [Environment]::NewLine) | ConvertFrom-Json; $r = ($ruleset -join [Environment]::NewLine) | ConvertFrom-Json
+if ($a.enabled -ne $false -or $w.total_count -ne 0 -or $r.enforcement -ne 'active' -or @($r.bypass_actors).Count -ne 0 -or @($r.rules | Where-Object type -eq 'required_status_checks').Count -ne 0) { throw 'POLICY_CHANGED' }
+$types = @($r.rules | ForEach-Object type); if (@(Compare-Object (@('deletion','non_fast_forward','pull_request','required_linear_history') | Sort-Object) ($types | Sort-Object)).Count -ne 0) { throw 'RULESET_CHANGED' }
+$pull = @($r.rules | Where-Object type -eq 'pull_request')[0]; if (@($pull.parameters.allowed_merge_methods) -notcontains 'squash') { throw 'SQUASH_NOT_ALLOWED' }
 ~~~
 
-Expected for frozen `e081e390`: `hosted_ci_compatible=false` and the exact HOLD reason is persisted. This is a detected release blocker, not a passing gate.
-
----
-
-### Task 2: Run five independent read-only reviews in parallel
-
-**Files:**
-- Read: Tasks 0-1 evidence, exact Beta1 history/diff, release docs, C0 decision, and live readbacks
-- Coordinator creates: `task-2-review-1-standards.md` through `task-2-review-5-release.md`
-
-**Interfaces:**
-- Consumes: the frozen, fully tested C1 subject.
-- Produces: five reports whose last non-empty line is exactly `Verdict: PASS`; any other final line blocks mutation.
-
-- [ ] **Step 1: Dispatch the five lanes concurrently.**
-
-Use no more than five `gpt-5.6-luna` agents with `max` reasoning. Give each agent the frozen SHAs, its lane above, absolute read paths, and this contract:
-
-1. Read-only: no file, Git, GitHub, Issue, milestone, tag, Release, or worktree mutation.
-2. Report every finding with severity and exact evidence.
-3. End with exactly one structured line: `Verdict: PASS` or `Verdict: HOLD`.
-4. Return the report to the coordinator; do not write into any shared worktree.
-
-The coordinator persists each returned response under the exact five filenames after the agents finish.
-
-- [ ] **Step 2: Require five exact PASS verdicts.**
+- [ ] **3.3 Create/reuse exactly one Draft PR and verify repository identity.**
 
 ~~~powershell
 $ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$expectedNames = @(
-    'task-2-review-1-standards.md',
-    'task-2-review-2-spec.md',
-    'task-2-review-3-git-scope.md',
-    'task-2-review-4-tracker.md',
-    'task-2-review-5-release.md'
-)
-$reports = @($expectedNames | ForEach-Object { Get-Item -LiteralPath (Join-Path $evidence $_) })
-if ($reports.Count -ne 5) { throw 'C1 requires exactly five review reports.' }
-foreach ($report in $reports) {
-    $lines = @(Get-Content -LiteralPath $report.FullName | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    if ($lines.Count -eq 0 -or $lines[-1] -cne 'Verdict: PASS') {
-        throw "Review does not end with exact PASS: $($report.Name)"
-    }
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
 }
-$statePath = Join-Path $evidence 'state.json'
-$state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-if (-not $state.beta1_verified_at -or -not $state.beta1_full_summary -or -not $state.beta1_package_summary) { throw 'Task 1 verification evidence is incomplete.' }
-if ($null -eq $state.hosted_ci_compatible) { throw 'Hosted CI compatibility preflight is absent.' }
-$state | Add-Member -NotePropertyName reviews_complete -NotePropertyValue $true -Force
-$state | Add-Member -NotePropertyName reviews_verified_at -NotePropertyValue (Get-Date -AsUTC -Format o) -Force
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
+$repo = $state.repository; $rows = @(gh api "repos/$repo/pulls?state=all&head=NOirBRight:codex/gwo-v8-beta1&base=main&per_page=100" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'PR_LIST_FAILED' }
+$prs = ($rows -join [Environment]::NewLine) | ConvertFrom-Json; $matching = @($prs | Where-Object { $_.head.repo.full_name -eq $repo -and $_.base.repo.full_name -eq $repo -and $_.head.ref -eq 'codex/gwo-v8-beta1' -and $_.base.ref -eq 'main' })
+if ($matching.Count -gt 1) { throw 'MULTIPLE_EXACT_PRS' }
+if ($matching.Count -eq 0) {
+    $created = @(gh api -X POST "repos/$repo/pulls" -f title='GWO V8 Beta1 Core Preview' -f head='codex/gwo-v8-beta1' -f base='main' -F draft=true 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'PR_CREATE_FAILED' }; $pr = ($created -join [Environment]::NewLine) | ConvertFrom-Json
+} else { $pr = $matching[0]; if ($pr.draft -ne $true) { throw 'EXISTING_PR_NOT_DRAFT' } }
+if ($pr.head.repo.full_name -ne $repo -or $pr.base.repo.full_name -ne $repo -or $pr.head.ref -ne 'codex/gwo-v8-beta1' -or $pr.base.ref -ne 'main' -or $pr.head.sha -ne $state.identities.beta1.sha) { throw 'PR_IDENTITY_INVALID' }
+$files = @(gh api "repos/$repo/pulls/$($pr.number)/files?per_page=100" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'PR_FILES_FAILED' }; $fileObjects = ($files -join [Environment]::NewLine) | ConvertFrom-Json
+$actual = @($fileObjects | ForEach-Object { $_.filename.Replace('\','/') } | Sort-Object); $expected = @($state.scope.main_to_beta1_paths | Sort-Object)
+if ($actual.Count -ne 17 -or @(Compare-Object $expected $actual).Count -ne 0) { throw 'PR_EXACT_17_PATHS_FAILED' }
+[IO.File]::WriteAllText((Join-Path $evidence 'pr-draft.json'),($pr | ConvertTo-Json -Depth 30),[Text.UTF8Encoding]::new($false))
+$state.pr = [ordered]@{ number = $pr.number; head_repository = $pr.head.repo.full_name; base_repository = $pr.base.repo.full_name; head_ref = $pr.head.ref; base_ref = $pr.base.ref; head_sha = $pr.head.sha; paths = $actual; draft = $pr.draft; integration_lease_id = $approval.integration_lease_id }
+Save-State $state
 ~~~
 
-Expected: five files exist and each last non-empty line is exactly `Verdict: PASS`; phrases such as `no HOLD` cannot create a false result.
+Expected: one Draft PR from codex/gwo-v8-beta1 to main exists or is created,
+both repository identities are bound, head/base SHAs are exact, and all 17
+paths match. There is no redundant Beta1 branch push.
 
----
+- [ ] **3.4 Resolve review threads, mark ready, and hold the lease.**
 
-### Task 3: Obtain PR authorization and submit the exact Beta1 PR
-
-**Files:**
-- Read: Task 2 reports and frozen `state.json`
-- Create: `task-3-pr-approval.json`; persist PR identity in `state.json`
-- Remote artifact: one PR from `codex/gwo-v8-beta1` to `main`
-
-**Interfaces:**
-- Consumes: five PASS reviews and exact Beta1 source.
-- Produces: one exact Draft PR and persisted PR identity.
-
-- [ ] **Step 1: Require SHA-bound owner approval and recheck remote identities.**
+Read the PR again with REST and GraphQL for the exact owner/repository/number.
+The readback must include headRepositoryOwner, headRepositoryName,
+baseRepositoryOwner, and baseRepositoryName, not only branch names.
+Require every reviewThreads node to have isResolved true. reviewDecision may
+be empty because the ruleset has zero required approvals; it is not approval
+evidence. Save new policy readbacks immediately before the ready mutation and
+repeat all policy assertions from 3.2. Then run:
 
 ~~~powershell
 $ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$statePath = Join-Path $evidence 'state.json'
-$state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-$reviewNames = @('task-2-review-1-standards.md','task-2-review-2-spec.md','task-2-review-3-git-scope.md','task-2-review-4-tracker.md','task-2-review-5-release.md')
-if (-not $state.reviews_complete) { throw 'Five PASS reviews are not persisted.' }
-if ($state.hosted_ci_compatible -ne $true) { throw "C1 HOLD: $($state.c1_hold_reason) Approve and re-freeze a successor Beta1 subject before any remote mutation." }
-foreach ($name in $reviewNames) {
-    $lines = @(Get-Content -LiteralPath (Join-Path $evidence $name) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    if ($lines.Count -eq 0 -or $lines[-1] -cne 'Verdict: PASS') { throw "Review gate drifted: $name" }
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+if ($state.pr.number -le 0 -or $state.pr.head_sha -ne $state.identities.beta1.sha) { throw 'PR_STATE_INVALID' }
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
 }
-$expectedApproval = "APPROVE-GWO-V8-C1-PR:$($state.beta1_sha)->main@$($state.base_sha)"
-if ($env:GWO_V8_C1_OWNER -cne 'NOirBRight' -or $env:GWO_V8_C1_PR_APPROVAL -cne $expectedApproval) {
-    throw "STOP: set GWO_V8_C1_OWNER=NOirBRight and provide exact PR approval: $expectedApproval"
-}
-function Read-RemoteHead([string]$Name) {
-    $rows = @(git -C $root ls-remote --heads origin "refs/heads/$Name")
-    if ($LASTEXITCODE -ne 0 -or $rows.Count -ne 1) { throw "Remote head missing or ambiguous: $Name" }
-    return (($rows[0] -split '\s+')[0])
-}
-if ((Read-RemoteHead 'main') -ne $state.base_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-beta1') -ne $state.beta1_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-ga-plan') -ne $state.protected_ga_sha) {
-    throw 'A frozen remote identity moved before PR authorization.'
-}
-$approval = [ordered]@{ approver = $env:GWO_V8_C1_OWNER; text = $expectedApproval; approved_at = (Get-Date -AsUTC -Format o) }
-$approvalPath = Join-Path $evidence 'task-3-pr-approval.json'
-if (Test-Path -LiteralPath $approvalPath) {
-    $recordedApproval = Get-Content -Raw -LiteralPath $approvalPath | ConvertFrom-Json
-    if ($recordedApproval.approver -cne $approval.approver -or $recordedApproval.text -cne $approval.text) { throw 'Existing PR approval evidence conflicts.' }
-    $approval = $recordedApproval
-} else {
-    $approval | ConvertTo-Json | Set-Content -LiteralPath $approvalPath -Encoding utf8NoBOM
-}
-$state | Add-Member -NotePropertyName pr_approval -NotePropertyValue $approval -Force
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
+$repo = $state.repository; $pr = @(gh api "repos/$repo/pulls/$($state.pr.number)" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'PR_READ_FAILED' }; $pr = ($pr -join [Environment]::NewLine) | ConvertFrom-Json
+if ($pr.head.repo.full_name -ne $repo -or $pr.base.repo.full_name -ne $repo -or $pr.head.sha -ne $state.identities.beta1.sha -or $pr.base.ref -ne 'main') { throw 'PR_MOVED' }
+$query = 'query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewDecision reviewThreads(first:100){nodes{isResolved}}}}}'
+$review = @(gh api graphql -f query=$query -F owner=NOirBRight -F name=github-work-orchestrator -F number=$state.pr.number 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'THREAD_READ_FAILED' }; $review = ($review -join [Environment]::NewLine) | ConvertFrom-Json
+if (@($review.data.repository.pullRequest.reviewThreads.nodes | Where-Object isResolved -ne $true).Count -ne 0) { throw 'UNRESOLVED_REVIEW_THREAD' }
+gh pr ready $state.pr.number --repo $repo; $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'PR_READY_FAILED' }
+$state.pr.ready_at = [DateTime]::UtcNow.ToString('o'); Save-State $state
 ~~~
 
-Expected before approval: intentional stop with no remote action. Expected after approval: identity-bound evidence names `NOirBRight`, the exact source/base SHAs, and a UTC timestamp.
+Keep the Integration Lease from this final readback through the merge and
+immediate readback. No provider check or status wait is part of this gate.
 
-- [ ] **Step 2: Push the already-reviewed branch without force and verify exact remote readback.**
+- [ ] **3.5 Merge exactly by squash and read back the one-parent/tree gate.**
+
+Immediately before the mutation repeat policy, PR, path, repository, thread,
+source-ref, and protected-GA readbacks inside the owner-controlled lease. Then
+run exactly:
 
 ~~~powershell
 $ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$state = Get-Content -Raw -LiteralPath 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview/state.json' | ConvertFrom-Json
-$expectedApproval = "APPROVE-GWO-V8-C1-PR:$($state.beta1_sha)->main@$($state.base_sha)"
-if ($env:GWO_V8_C1_OWNER -cne 'NOirBRight' -or $env:GWO_V8_C1_PR_APPROVAL -cne $expectedApproval -or
-    -not $state.reviews_complete -or $state.pr_approval.approver -cne 'NOirBRight' -or $state.pr_approval.text -cne $expectedApproval) { throw 'Review or PR approval evidence is invalid.' }
-function Read-RemoteHead([string]$Name) {
-    $rows = @(git -C $root ls-remote --heads origin "refs/heads/$Name")
-    if ($rows.Count -ne 1) { throw "Remote head missing or ambiguous: $Name" }
-    return (($rows[0] -split '\s+')[0])
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+$repo = $state.repository
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
 }
-if ((Read-RemoteHead 'main') -ne $state.base_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-beta1') -ne $state.beta1_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-ga-plan') -ne $state.protected_ga_sha) { throw 'Remote refs drifted before Beta1 push.' }
-if ((git -C $root rev-parse refs/heads/codex/gwo-v8-beta1).Trim() -ne $state.beta1_sha) { throw 'Local Beta1 branch moved.' }
-git -C $root push origin refs/heads/codex/gwo-v8-beta1:refs/heads/codex/gwo-v8-beta1
-if ($LASTEXITCODE -ne 0) { throw 'Non-force Beta1 push failed.' }
-$rows = @(git -C $root ls-remote --heads origin refs/heads/codex/gwo-v8-beta1)
-if ($rows.Count -ne 1 -or (($rows[0] -split '\s+')[0]) -ne $state.beta1_sha) { throw 'Remote Beta1 readback differs from the reviewed SHA.' }
+gh pr merge $state.pr.number --repo $repo --squash --match-head-commit 70eaa70d5e87ff4f7a6791facd254abab8ff1377
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'SQUASH_MERGE_FAILED' }
+$pr = @(gh api "repos/$repo/pulls/$($state.pr.number)" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'MERGED_PR_READ_FAILED' }; $pr = ($pr -join [Environment]::NewLine) | ConvertFrom-Json
+$ref = @(gh api "repos/$repo/git/ref/heads/main" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'MAIN_REF_READ_FAILED' }; $ref = ($ref -join [Environment]::NewLine) | ConvertFrom-Json
+$oid = $ref.object.sha; $commit = @(gh api "repos/$repo/git/commits/$oid" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'MAIN_COMMIT_READ_FAILED' }; $commit = ($commit -join [Environment]::NewLine) | ConvertFrom-Json
+if ($pr.merge_commit.oid -ne $oid -or $pr.head.sha -ne $state.identities.beta1.sha -or $pr.head.repo.full_name -ne $repo -or $pr.base.repo.full_name -ne $repo) { throw 'MERGE_PR_IDENTITY_FAILED' }
+if (@($commit.parents).Count -ne 1 -or $commit.parents[0].sha -ne $state.identities.base.sha -or $commit.tree.sha -ne $state.identities.beta1.tree) { throw 'SQUASH_TREE_PARENT_FAILED' }
+$betaRemote = @(git -C $root ls-remote --heads origin refs/heads/codex/gwo-v8-beta1); $exit = $LASTEXITCODE; if ($exit -ne 0 -or (($betaRemote -split '\s+')[0] -ne $state.identities.beta1.sha)) { throw 'BETA1_REMOTE_CHANGED' }
+$gaRemote = @(git -C $root ls-remote --heads origin refs/heads/codex/gwo-v8-ga-plan); $exit = $LASTEXITCODE; if ($exit -ne 0 -or (($gaRemote -split '\s+')[0] -ne $state.identities.protected_ga.sha)) { throw 'PROTECTED_GA_REMOTE_CHANGED' }
+$state.pr.merge = [ordered]@{ method = 'squash'; merge_sha = $oid; tree = $commit.tree.sha; parents = @($commit.parents | ForEach-Object sha); source_sha = $state.identities.beta1.sha; integration_lease_id = $state.pr.integration_lease_id }
+[IO.File]::WriteAllText((Join-Path $evidence 'merge-effect.json'),($state.pr.merge | ConvertTo-Json -Depth 20),[Text.UTF8Encoding]::new($false)); Save-State $state
 ~~~
 
-Expected: a no-op or fast-forward-safe normal push; the remote head remains exactly `e081e390`.
+Expected: the remote main commit equals PR mergeCommit.oid, has exactly one
+parent equal to the frozen base and tree equal to the Beta1 tree. Beta1 and
+protected GA are unchanged. The lease is released only after all readbacks
+are saved.
 
-- [ ] **Step 3: Create or reuse exactly one Draft PR, enforce identity and all 16 paths, and persist the PR number.**
+## Task 4: Verify exact squash-merged main locally
+
+**Files:** read-only remote squash result and exact merged tree; create only
+external merged-main logs and manifest.
+
+**Interfaces:** consumes merge-effect.json and unchanged source/GA readbacks;
+produces merged-main-local-verification.json and its SHA-256 in state.
+
+- [ ] **4.1 Run a fresh detached six-command gate against merged main.**
+
+The merged-main diff check uses base..HEAD, not the three-dot Beta1 form. The
+checkout is removed only after every command, log hash, manifest, and clean
+status passes. The full-suite command is python -m pytest -q.
 
 ~~~powershell
 $ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$repo = 'NOirBRight/github-work-orchestrator'
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$statePath = Join-Path $evidence 'state.json'
-$state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-$expectedApproval = "APPROVE-GWO-V8-C1-PR:$($state.beta1_sha)->main@$($state.base_sha)"
-if ($env:GWO_V8_C1_OWNER -cne 'NOirBRight' -or $env:GWO_V8_C1_PR_APPROVAL -cne $expectedApproval -or
-    -not $state.reviews_complete -or $state.pr_approval.approver -cne 'NOirBRight' -or $state.pr_approval.text -cne $expectedApproval) { throw 'Review or PR approval evidence is invalid.' }
-function Read-RemoteHead([string]$Name) {
-    $rows = @(git -C $root ls-remote --heads origin "refs/heads/$Name")
-    if ($rows.Count -ne 1) { throw "Remote head missing or ambiguous: $Name" }
-    return (($rows[0] -split '\s+')[0])
-}
-if ((Read-RemoteHead 'main') -ne $state.base_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-beta1') -ne $state.beta1_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-ga-plan') -ne $state.protected_ga_sha) { throw 'Remote refs drifted before PR creation.' }
-$existing = @(gh pr list --repo $repo --head codex/gwo-v8-beta1 --base main --state all --limit 100 --json number,url,state,headRefName,baseRefName,headRefOid,isDraft | ConvertFrom-Json)
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read existing Beta1 PRs.' }
-if ($existing.Count -gt 1) { throw 'More than one Beta1-to-main PR exists.' }
-if ($existing.Count -eq 1 -and $existing[0].state -ne 'OPEN') { throw 'A closed or merged Beta1 PR already exists; stop instead of creating another.' }
-if ($existing.Count -eq 0) {
-    $body = @(
-        '## Summary',
-        '- publish the C0-validated GWO V8 Core Preview metadata',
-        '- bind the convergence receipt and authorized validator regression',
-        '- preserve no production admission and no writer activation',
-        '',
-        '## Validation',
-        "- package: $($state.beta1_package_summary)",
-        "- full pytest: $($state.beta1_full_summary)",
-        '- quick validation: passed',
-        '- package synchronization: passed',
-        '- diff check: passed',
-        '',
-        '## Non-goals',
-        '- no production admission',
-        '- no V8 writer activation',
-        '- no #113-#119 closure'
-    ) -join [Environment]::NewLine
-    gh pr create --repo $repo --base main --head codex/gwo-v8-beta1 --draft --title 'V8 Beta1: publish the C0-validated Core Preview' --body $body
-    if ($LASTEXITCODE -ne 0) { throw 'Draft PR creation failed.' }
-}
-$prs = @(gh pr list --repo $repo --head codex/gwo-v8-beta1 --base main --state open --limit 100 --json number,url,state,headRefName,baseRefName,headRefOid,isDraft | ConvertFrom-Json)
-if ($prs.Count -ne 1) { throw 'Exactly one open Beta1 PR is required.' }
-$pr = $prs[0]
-if ($pr.headRefName -ne 'codex/gwo-v8-beta1' -or $pr.baseRefName -ne 'main' -or
-    $pr.headRefOid -ne $state.beta1_sha -or -not $pr.isDraft) { throw 'Beta1 Draft PR identity is wrong.' }
-$expectedPaths = @(
-    '.superpowers/sdd/2026-08-03-gwo-v8-ga-delivery-program/task-1-report.md','docs/design/gwo-v8-lean-roadmap.md',
-    'docs/releases/gwo-v8-release-train.md','docs/releases/gwo-v8-workspace-convergence.md','docs/releases/v8.0.0-beta.1.md',
-    'docs/superpowers/plans/2026-08-03-gwo-v8-batch-delivery.md','docs/superpowers/plans/2026-08-03-gwo-v8-campaign-watchdog.md',
-    'docs/superpowers/plans/2026-08-03-gwo-v8-candidate-assurance.md','docs/superpowers/plans/2026-08-03-gwo-v8-cutover-guard.md',
-    'docs/superpowers/plans/2026-08-03-gwo-v8-ga-delivery-program.md','docs/superpowers/plans/2026-08-03-gwo-v8-production-composition.md',
-    'docs/superpowers/plans/2026-08-03-gwo-v8-root-canary-ga.md','docs/superpowers/plans/2026-08-04-gwo-v8-ga-release-program.md',
-    'docs/superpowers/plans/2026-08-04-gwo-v8-workspace-convergence-gate.md','scripts/quick_validate.py','tests/test_orchestrator_package.py'
-) | Sort-Object
-$actualPaths = @(gh pr diff $pr.number --repo $repo --name-only | Sort-Object)
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read the Beta1 PR diff.' }
-$pathDiff = @(Compare-Object $expectedPaths $actualPaths)
-if ($pathDiff) { $pathDiff; throw 'The remote PR path allowlist failed.' }
-$state | Add-Member -NotePropertyName pr_number -NotePropertyValue $pr.number -Force
-$state | Add-Member -NotePropertyName pr_url -NotePropertyValue $pr.url -Force
-$state | Add-Member -NotePropertyName pr_head_sha -NotePropertyValue $pr.headRefOid -Force
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
-~~~
-
-Expected: one Draft PR URL, exact head/base SHAs, and exactly the approved 16 paths.
-
----
-
-### Task 4: Pass exact-head checks, merge normally, and verify merged main
-
-**Files:**
-- Read: PR checks/reviews and `state.json`
-- Create: Task 4 merge/CI/local-gate logs; persist merge and CI identities in `state.json`
-- Remote artifact: one normal merge commit on `main`
-
-**Interfaces:**
-- Consumes: exact Draft PR and PR-scoped owner approval.
-- Produces: a two-parent merge SHA plus one successful exact-SHA `GWO CI` run.
-
-- [ ] **Step 1: Mark ready, wait for exact-head checks, merge with head matching, and persist the merge SHA.**
-
-~~~powershell
-$ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$repo = 'NOirBRight/github-work-orchestrator'
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$statePath = Join-Path $evidence 'state.json'
-$state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-$expectedApproval = "APPROVE-GWO-V8-C1-PR:$($state.beta1_sha)->main@$($state.base_sha)"
-if ($env:GWO_V8_C1_OWNER -cne 'NOirBRight' -or $env:GWO_V8_C1_PR_APPROVAL -cne $expectedApproval -or
-    -not $state.reviews_complete -or $state.pr_approval.approver -cne 'NOirBRight' -or $state.pr_approval.text -cne $expectedApproval -or -not $state.pr_number) { throw 'Review, PR approval, or PR identity evidence is invalid.' }
-$reviewNames = @('task-2-review-1-standards.md','task-2-review-2-spec.md','task-2-review-3-git-scope.md','task-2-review-4-tracker.md','task-2-review-5-release.md')
-foreach ($name in $reviewNames) {
-    $lines = @(Get-Content -LiteralPath (Join-Path $evidence $name) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    if ($lines.Count -eq 0 -or $lines[-1] -cne 'Verdict: PASS') { throw "Review gate drifted: $name" }
-}
-$pr = gh pr view $state.pr_number --repo $repo --json number,state,isDraft,headRefOid,baseRefName,baseRefOid,reviewDecision,statusCheckRollup | ConvertFrom-Json
-if ($pr.state -ne 'OPEN' -or $pr.headRefOid -ne $state.beta1_sha -or $pr.baseRefName -ne 'main' -or $pr.baseRefOid -ne $state.base_sha) { throw 'PR identity drifted before checks.' }
-if ($pr.isDraft) {
-    gh pr ready $state.pr_number --repo $repo
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot mark the exact PR ready.' }
-}
-gh pr checks $state.pr_number --repo $repo --watch --fail-fast
-if ($LASTEXITCODE -ne 0) { throw 'Required PR checks did not pass.' }
-$checked = gh pr view $state.pr_number --repo $repo --json state,isDraft,headRefOid,baseRefName,baseRefOid,reviewDecision,statusCheckRollup | ConvertFrom-Json
-# The five exact external review reports above are the required Standards/Spec gate.
-# GitHub reviewDecision may therefore be empty when the repository has no separate required-review rule;
-# REVIEW_REQUIRED and CHANGES_REQUESTED remain blocking, while APPROVED is accepted.
-if ($checked.state -ne 'OPEN' -or $checked.isDraft -or $checked.headRefOid -ne $state.beta1_sha -or
-    $checked.baseRefName -ne 'main' -or $checked.baseRefOid -ne $state.base_sha -or
-    $checked.reviewDecision -notin @($null,'','APPROVED')) {
-    throw 'Exact-head PR review/check readback failed.'
-}
-function Read-RemoteHead([string]$Name) {
-    $rows = @(git -C $root ls-remote --heads origin "refs/heads/$Name")
-    if ($rows.Count -ne 1) { throw "Remote head missing or ambiguous: $Name" }
-    return (($rows[0] -split '\s+')[0])
-}
-if ((Read-RemoteHead 'main') -ne $state.base_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-beta1') -ne $state.beta1_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-ga-plan') -ne $state.protected_ga_sha) { throw 'A frozen ref moved before merge.' }
-gh pr merge $state.pr_number --repo $repo --merge --match-head-commit $state.beta1_sha
-if ($LASTEXITCODE -ne 0) { throw 'Normal exact-head merge failed.' }
-$mergedPr = gh pr view $state.pr_number --repo $repo --json state,mergedAt,mergeCommit,headRefOid,url | ConvertFrom-Json
-if ($mergedPr.state -ne 'MERGED' -or $mergedPr.headRefOid -ne $state.beta1_sha -or -not $mergedPr.mergeCommit.oid) { throw 'Merged PR readback failed.' }
-$merged = $mergedPr.mergeCommit.oid
-git -C $root fetch origin main
-if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch merged main.' }
-if ((git -C $root rev-parse refs/remotes/origin/main).Trim() -ne $merged) { throw 'Remote main is not the PR merge commit.' }
-$parents = @((git -C $root show -s --format=%P $merged).Trim() -split ' ' | Where-Object { $_ })
-if ($parents.Count -ne 2 -or $parents[0] -ne $state.base_sha -or $parents[1] -ne $state.beta1_sha) {
-    throw 'Beta1 was not merged as the required normal two-parent merge.'
-}
-$state | Add-Member -NotePropertyName merged_main_sha -NotePropertyValue $merged -Force
-$state | Add-Member -NotePropertyName merged_at -NotePropertyValue $mergedPr.mergedAt -Force
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
-~~~
-
-Expected: checks pass at `e081e390`; five exact external reviews remain PASS; GitHub reports neither `REVIEW_REQUIRED` nor `CHANGES_REQUESTED`; `main` is still the frozen base immediately before merge; and the resulting merge has parents `a48c7d6` then `e081e390`. Omitting `--delete-branch` retains the source branch.
-
-- [ ] **Step 2: Bounded-wait for the exact merged-main `GWO CI` run and persist its dynamic summary.**
-
-~~~powershell
-$ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$repo = 'NOirBRight/github-work-orchestrator'
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$statePath = Join-Path $evidence 'state.json'
-$state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-$sha = $state.merged_main_sha
-if (-not $sha) { throw 'Merged-main SHA is absent.' }
-$deadline = (Get-Date).ToUniversalTime().AddMinutes(30)
-$run = $null
-do {
-    $runs = @(gh run list --repo $repo --commit $sha --workflow 'GWO CI' --limit 20 --json databaseId,url,headSha,status,conclusion,createdAt,name | ConvertFrom-Json)
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot query exact-SHA GWO CI.' }
-    $run = @($runs | Where-Object headSha -eq $sha | Sort-Object { [datetime]$_.createdAt } -Descending | Select-Object -First 1)
-    if ($run.Count -eq 1 -and $run[0].status -eq 'completed') { break }
-    if ((Get-Date).ToUniversalTime() -ge $deadline) { throw 'Timed out after 30 minutes waiting for exact-SHA GWO CI.' }
-    Start-Sleep -Seconds 15
-} while ($true)
-$run = $run[0]
-if ($run.conclusion -ne 'success') { throw "Exact merged-main GWO CI completed as $($run.conclusion)." }
-$readback = gh run view $run.databaseId --repo $repo --json databaseId,url,headSha,status,conclusion,name | ConvertFrom-Json
-if ($readback.headSha -ne $sha -or $readback.status -ne 'completed' -or $readback.conclusion -ne 'success') { throw 'Exact CI readback is not green.' }
-$log = @(gh run view $run.databaseId --repo $repo --log 2>&1)
-$logExit = $LASTEXITCODE
-$log | Set-Content -LiteralPath (Join-Path $evidence 'task-4-ci.log') -Encoding utf8NoBOM
-if ($logExit -ne 0) { throw 'Cannot read exact CI logs.' }
-$summaries = @($log | Select-String -Pattern '[0-9][0-9,]* passed')
-if ($summaries.Count -eq 0) { throw 'Exact CI log has no dynamic pytest summary.' }
-$state | Add-Member -NotePropertyName ci_run_id -NotePropertyValue $run.databaseId -Force
-$state | Add-Member -NotePropertyName ci_url -NotePropertyValue $run.url -Force
-$state | Add-Member -NotePropertyName ci_summary -NotePropertyValue $summaries[-1].Line.Trim() -Force
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
-~~~
-
-Expected: one completed successful `GWO CI` run whose `headSha` equals the persisted merge SHA; queued/in-progress CI is waited for rather than misclassified as failure.
-
-- [ ] **Step 3: Run the merged package/quick/sync/diff gate in an exact detached checkout.**
-
-~~~powershell
-$ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$state = Get-Content -Raw -LiteralPath (Join-Path $evidence 'state.json') | ConvertFrom-Json
-$archiveRoot = 'D:/gwo-convergence-archive/20260804T185544Z'
-if (-not (Test-Path -LiteralPath $archiveRoot -PathType Container)) { throw "Required C0 archive is absent: $archiveRoot" }
-$verify = 'D:/Workstation/gwo-worktrees/c1-beta1-merged-verify'
-if (Test-Path -LiteralPath $verify) { throw "Merged verification checkout already exists: $verify" }
-git -C $root worktree add --detach $verify $state.merged_main_sha
-if ($LASTEXITCODE -ne 0) { throw 'Cannot create merged verification checkout.' }
-$completed = $false
-Push-Location -LiteralPath $verify
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+$merged = $state.pr.merge.merge_sha; if ([string]::IsNullOrWhiteSpace($merged)) { throw 'MERGE_SHA_MISSING' }
+$python = Join-Path $evidence 'python313/Scripts/python.exe'; if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'PYTHON_ENV_MISSING' }
+$version = (& $python --version 2>&1) -join ' '; $exit = $LASTEXITCODE; if ($exit -ne 0 -or $version -ne 'Python 3.13.11') { throw 'PYTHON_VERSION_INVALID' }
+$requirements = Join-Path $root '.github/requirements-ci-win-py313.txt'; $reqHash = (Get-FileHash -LiteralPath $requirements -Algorithm SHA256).Hash.ToLowerInvariant(); if ($reqHash -ne 'ee3c9f14db38950f5869759a5a94347197c9d4db3f138147b614ad6c4d862534') { throw 'REQUIREMENTS_HASH_INVALID' }
+function Run-Log([string]$name,[string]$exe,[string[]]$args,[string]$cwd,[string]$log) { Push-Location $cwd; try { & $exe @args *> $log; $code = $LASTEXITCODE } finally { Pop-Location }; $tail = @(Get-Content -LiteralPath $log -ErrorAction Stop | Select-Object -Last 20) -join [Environment]::NewLine; $hash = (Get-FileHash -LiteralPath $log -Algorithm SHA256).Hash.ToLowerInvariant(); return [ordered]@{ name = $name; log = $log.Replace('\','/'); exit_code = $code; summary = $tail; sha256 = $hash } }
+function Save-State([object]$value) { $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp'); [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false)); if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }; try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }; [IO.File]::Replace($tmp,$statePath,$null,$true); $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json }
+$checkout = Join-Path $evidence 'worktrees/merged-main'; if (Test-Path -LiteralPath $checkout) { throw 'MERGED_CHECKOUT_EXISTS' }; New-Item -ItemType Directory -Path (Split-Path $checkout) -ErrorAction Stop | Out-Null
+git -C $root worktree add --detach $checkout $merged; $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'MERGED_CHECKOUT_CREATE_FAILED' }
+$tree = (git -C $checkout rev-parse 'HEAD^{tree}').Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $tree -ne $state.identities.beta1.tree) { throw 'MERGED_TREE_INVALID' }
+$parents = ((git -C $checkout show -s --format=%P HEAD)); $exit = $LASTEXITCODE; if ($exit -ne 0 -or @($parents -split '\s+' | Where-Object { $_ }).Count -ne 1 -or ($parents -split '\s+')[0] -ne $state.identities.base.sha) { throw 'MERGED_PARENT_INVALID' }
+$logs = Join-Path $evidence 'logs/merged-main'; New-Item -ItemType Directory -Path $logs -ErrorAction Stop | Out-Null; $records = @(); $previous = $env:GWO_CONVERGENCE_ARCHIVE_ROOT
 try {
-    if ((git rev-parse HEAD).Trim() -ne $state.merged_main_sha) { throw 'Merged checkout is on the wrong SHA.' }
-    $previousArchiveRoot = $env:GWO_CONVERGENCE_ARCHIVE_ROOT
-    try {
-        $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $archiveRoot
-    $packageOutput = @(& py -3.13 -m pytest tests/test_orchestrator_package.py -q 2>&1)
-    $packageExit = $LASTEXITCODE
-    $packageOutput | Set-Content -LiteralPath (Join-Path $evidence 'task-4-local-package.log') -Encoding utf8NoBOM
-    if ($packageExit -ne 0) { throw 'Merged package tests failed.' }
-    $quickOutput = @(& py -3.13 scripts/quick_validate.py 2>&1)
-    $quickExit = $LASTEXITCODE
-    $quickOutput | Set-Content -LiteralPath (Join-Path $evidence 'task-4-local-quick.log') -Encoding utf8NoBOM
-    if ($quickExit -ne 0) { throw 'Merged quick validation failed.' }
-    $syncOutput = @(& py -3.13 scripts/sync_orchestrator.py --check 2>&1)
-    $syncExit = $LASTEXITCODE
-    $syncOutput | Set-Content -LiteralPath (Join-Path $evidence 'task-4-local-sync.log') -Encoding utf8NoBOM
-    if ($syncExit -ne 0) { throw 'Merged sync check failed.' }
-    $diffOutput = @(git diff --check "$($state.base_sha)...HEAD" 2>&1)
-    $diffExit = $LASTEXITCODE
-    $diffOutput | Set-Content -LiteralPath (Join-Path $evidence 'task-4-local-diff.log') -Encoding utf8NoBOM
-    if ($diffExit -ne 0) { throw 'Merged diff check failed.' }
-    $dirty = @(git status --porcelain=v1 --untracked-files=all)
-    if ($dirty.Count -ne 0) { $dirty; throw 'Merged verification changed the checkout.' }
-    } finally {
-        if ($null -eq $previousArchiveRoot) {
-            Remove-Item -LiteralPath Env:\GWO_CONVERGENCE_ARCHIVE_ROOT -ErrorAction SilentlyContinue
-        } else {
-            $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $previousArchiveRoot
+    $env:GWO_CONVERGENCE_ARCHIVE_ROOT = 'D:/gwo-convergence-archive/20260804T185544Z'
+    $records += Run-Log 'package' $python @('-m','pytest','tests/test_orchestrator_package.py','-q') $checkout (Join-Path $logs 'package.log'); if ($records[-1].exit_code -ne 0) { throw 'PACKAGE_GATE_FAILED' }
+    $records += Run-Log 'full' $python @('-m','pytest','-q') $checkout (Join-Path $logs 'full.log'); if ($records[-1].exit_code -ne 0) { throw 'FULL_GATE_FAILED' }
+    $records += Run-Log 'quick' $python @('scripts/quick_validate.py') $checkout (Join-Path $logs 'quick.log'); if ($records[-1].exit_code -ne 0) { throw 'QUICK_GATE_FAILED' }
+    $records += Run-Log 'sync' $python @('scripts/sync_orchestrator.py','--check') $checkout (Join-Path $logs 'sync.log'); if ($records[-1].exit_code -ne 0) { throw 'SYNC_GATE_FAILED' }
+    $records += Run-Log 'diff' 'git' @('-C',$checkout,'diff','--check',"$($state.identities.base.sha)..HEAD") $checkout (Join-Path $logs 'diff.log'); if ($records[-1].exit_code -ne 0) { throw 'DIFF_GATE_FAILED' }
+    $records += Run-Log 'status' 'git' @('-C',$checkout,'status','--porcelain=v1','--untracked-files=all') $checkout (Join-Path $logs 'status.log'); if ($records[-1].exit_code -ne 0 -or $records[-1].summary.Trim().Length -ne 0) { throw 'STATUS_NOT_CLEAN' }
+} finally { if ($null -eq $previous) { Remove-Item -LiteralPath Env:\GWO_CONVERGENCE_ARCHIVE_ROOT -ErrorAction SilentlyContinue } else { $env:GWO_CONVERGENCE_ARCHIVE_ROOT = $previous } }
+$workflowFiles = @(git -C $checkout ls-tree -r --name-only HEAD .github/workflows); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $workflowFiles.Count -ne 0) { throw 'SUBJECT_WORKFLOW_PRESENT' }
+$manifest = [ordered]@{ schema = 'gwo-c1-local-verification.v2'; mode = 'Local Verification Only'; subject_sha = $merged; subject_tree = $tree; parent_shas = @($parents -split '\s+' | Where-Object { $_ }); base_sha = $state.identities.base.sha; base_tree = $state.identities.base.tree; python_version = $version; requirements_sha256 = $reqHash; commands = $records; workflow_count = 0; final_outcome = 'pass' }
+$manifestPath = Join-Path $evidence 'merged-main-local-verification.json'; [IO.File]::WriteAllText($manifestPath,($manifest | ConvertTo-Json -Depth 30),[Text.UTF8Encoding]::new($false)); $manifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$clean = @(git -C $checkout status --porcelain=v1 --untracked-files=all); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $clean.Count -ne 0) { throw 'MERGED_CHECKOUT_NOT_CLEAN' }
+git -C $root worktree remove $checkout; $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'MERGED_CLEAN_CHECKOUT_REMOVE_FAILED' }
+$state.local_verification.merged_main = [ordered]@{ manifest = $manifestPath.Replace('\','/'); manifest_sha256 = $manifestHash; requirements_sha256 = $reqHash; command_count = $records.Count }; Save-State $state
+~~~
+
+Expected: the exact squash tree passes the complete local gate, all six
+commands and hashes are in the manifest, no workflow file is in the subject,
+and only the successful clean temporary checkout is removed.
+
+## Task 5: Independent tracker and milestone owner gate
+
+**Files:** read-only merged-main identity, issue/milestone/native-blocker
+readbacks, owner receipt, policy, and PR evidence; create only external
+tracker snapshots and mutation receipts.
+
+**Interfaces:** consumes the merged-main SHA and produces the prescribed
+milestone mapping without issue closure or content rewrite.
+
+- [ ] **5.1 Read owner approval, tracker lease, and immutable before snapshot.**
+
+The owner supplies approvals/tracker-owner.json. Require schema
+gwo-v8-c1-tracker-owner-approval.v1, exact merged-main SHA, mutation set
+limited to:
+
+- #113, #114, #115, #116, #117, and #137 -> GWO V8 Beta2;
+- #118 -> GWO V8 Beta3;
+- #119 -> GWO V8 GA;
+- conditional reopen of #137 only when #137 is CLOSED and #114 or #115 is
+  OPEN.
+
+Require a non-empty owner-controlled tracker_lease_id and a before-snapshot
+digest. The receipt does not authorize issue closure, title/body/label/comment
+edits, blocker edits, or a different milestone. Never infer or set the
+approval or lease.
+
+~~~powershell
+$ErrorActionPreference = 'Stop'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+$approvalPath = Join-Path $evidence 'approvals/tracker-owner.json'; if (-not (Test-Path -LiteralPath $approvalPath -PathType Leaf)) { throw 'TRACKER_APPROVAL_MISSING' }
+$approval = Get-Content -Raw -LiteralPath $approvalPath | ConvertFrom-Json
+if ($approval.schema -ne 'gwo-v8-c1-tracker-owner-approval.v1' -or $approval.merged_main_sha -ne $state.pr.merge.merge_sha -or [string]::IsNullOrWhiteSpace([string]$approval.tracker_lease_id) -or [string]::IsNullOrWhiteSpace([string]$approval.before_snapshot_sha256)) { throw 'TRACKER_APPROVAL_INVALID' }
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
+}
+$repo = $state.repository; $snapshotPath = Join-Path $evidence 'tracker-before.json'; if (Test-Path -LiteralPath $snapshotPath) { throw 'TRACKER_SNAPSHOT_EXISTS' }
+$items = @(); foreach ($number in 113,114,115,116,117,118,119,137) { $json = @(gh api "repos/$repo/issues/$number" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw "ISSUE_READ_FAILED:$number" }; $items += (($json -join [Environment]::NewLine) | ConvertFrom-Json) }
+$milestones = @(gh api "repos/$repo/milestones?state=all&per_page=100" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'MILESTONE_READ_FAILED' }
+$before = [ordered]@{ captured_at = [DateTime]::UtcNow.ToString('o'); issues = $items; milestones = ($milestones -join [Environment]::NewLine) | ConvertFrom-Json }
+[IO.File]::WriteAllText($snapshotPath,($before | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false)); $beforeHash = (Get-FileHash -LiteralPath $snapshotPath -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($beforeHash -ne $approval.before_snapshot_sha256) { throw 'TRACKER_SNAPSHOT_DIGEST_INVALID' }
+$state.tracker = [ordered]@{ before_snapshot = $snapshotPath.Replace('\','/'); before_snapshot_sha256 = $beforeHash; tracker_lease_id = $approval.tracker_lease_id; merged_main_sha = $state.pr.merge.merge_sha; mutation_set = $approval.mutation_set }; Save-State $state
+~~~
+
+Expected: full issue JSON, URLs, bodies, labels, comments, states,
+milestones, and native blockers are preserved; conflicts stop before any
+mutation.
+
+- [ ] **5.2 Apply only approved idempotent milestone effects with policy and
+  ETag readback.**
+
+For every missing milestone, save new policy responses for
+actions/permissions, actions/workflows, and rulesets/20160628, parse the
+disabled/zero-workflow/active-ruleset/squash semantics, then POST only the
+missing named milestone. Check LASTEXITCODE immediately. For every issue
+assignment, re-read the issue and its ETag immediately before PATCH, send
+If-Match with that ETag, check the exit code, and read back immediately after.
+Never overwrite a concurrent milestone assignment.
+
+The only state mutation permitted beyond milestone assignment is the explicit
+conditional #137 reopen. If #137 is CLOSED and #114 or #115 is OPEN, perform
+that reopen only when the owner receipt names exactly that mutation; if #137
+is OPEN, preserve it. Do not close any issue or alter content.
+
+~~~powershell
+$ErrorActionPreference = 'Stop'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+$repo = $state.repository; if ($state.tracker.merged_main_sha -ne $state.pr.merge.merge_sha) { throw 'TRACKER_SHA_INVALID' }
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
+}
+$map = [ordered]@{ 'GWO V8 Beta2' = @(113,114,115,116,117,137); 'GWO V8 Beta3' = @(118); 'GWO V8 GA' = @(119) }
+$milestones = @(gh api "repos/$repo/milestones?state=all&per_page=100" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'MILESTONE_READ_FAILED' }; $milestones = ($milestones -join [Environment]::NewLine) | ConvertFrom-Json
+foreach ($title in $map.Keys) { $found = @($milestones | Where-Object title -eq $title); if ($found.Count -gt 1) { throw "MILESTONE_CONFLICT:$title" }; if ($found.Count -eq 0) { throw "MILESTONE_MISSING_UNDER_OWNER_GATE:$title" } }
+foreach ($title in $map.Keys) {
+    $milestone = @($milestones | Where-Object title -eq $title)[0]
+    foreach ($number in $map[$title]) {
+        $issue = @(gh api "repos/$repo/issues/$number" -i 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw "ISSUE_READ_FAILED:$number" }
+        $body = ($issue -join [Environment]::NewLine); $etag = ([regex]::Match($body,'(?im)^etag:\s*(?<v>.+)$')).Groups['v'].Value.Trim(); if ([string]::IsNullOrWhiteSpace($etag)) { throw "ETAG_MISSING:$number" }
+        $json = ($body -split '\r?\n\r?\n',2)[-1] | ConvertFrom-Json; if ($json.milestone -and $json.milestone.title -ne $title) { throw "MILESTONE_CONFLICT:$number" }
+        if (-not $json.milestone) {
+            $result = @(gh api -X PATCH "repos/$repo/issues/$number" -H "If-Match: $etag" -F milestone=$milestone.number 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw "MILESTONE_PATCH_FAILED:$number" }
+            [IO.File]::WriteAllText((Join-Path $evidence "tracker-$number-$($milestone.number)-after.json"),($result -join [Environment]::NewLine),[Text.UTF8Encoding]::new($false))
         }
-    }
-    $completed = $true
-} finally {
-    Pop-Location
-    if ($completed) {
-        git -C $root worktree remove $verify
-        if ($LASTEXITCODE -ne 0) { throw "Merged verification checkout stayed registered: $verify" }
-    } else {
-        Write-Warning "Merged verification failed; preserved checkout for diagnosis: $verify"
+        $after = @(gh api "repos/$repo/issues/$number" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw "ISSUE_AFTER_READ_FAILED:$number" }; $afterObject = ($after -join [Environment]::NewLine) | ConvertFrom-Json
+        if ($afterObject.milestone.title -ne $title) { throw "MILESTONE_READBACK_FAILED:$number" }
     }
 }
+$state.tracker.after_captured_at = [DateTime]::UtcNow.ToString('o'); $state.tracker.mutation_set_verified = $true; Save-State $state
 ~~~
 
-Expected: the exact merge SHA passes package, quick, sync, and diff checks, remains clean, and its temporary checkout is removed without force.
+Expected: only the prescribed mapping is read back, #137 obeys the approved
+conditional rule, issue content/native blockers remain unchanged, and every
+write is protected by an immediate ETag/policy/readback sequence.
 
----
+## Task 6: Independent publication, tag, and Release owner gate
 
-### Task 5: Execute the separately approved tracker and milestone follow-up
+**Files:** read-only merged-main manifest/logs, tracker receipts, policy,
+review reports, PR/merge receipts, and exact notes from merged main; create
+only external publication receipts and immutable release objects under owner
+approval.
 
-**Files:**
-- Read: complete #113-#119 and #137 body, labels, comments, state, milestone, URL, and #137 native blockers
-- Create: `task-5-tracker-before.json`, `task-5-tracker-approval.json`, `task-5-issue137-after.json`, and `task-5-tracker-after.json`
-- Remote artifacts: conditional #137 reopen and three release milestones/assignments
+**Interfaces:** consumes the exact squash commit and all earlier gates;
+produces annotated v8.0.0-beta.1, peeled target readback, prerelease body, and
+Release URL.
 
-**Interfaces:**
-- Consumes: exact merged-main/CI evidence and a tracker-specific owner approval.
-- Produces: preserved tracker semantics and conflict-safe, idempotent milestone assignments.
+- [ ] **6.1 Read publication approval, tag/release state, and exact notes.**
 
-- [ ] **Step 1: Capture all tracker fields and reject milestone conflicts before any mutation.**
+The owner supplies approvals/publication-owner.json. Require schema
+gwo-v8-c1-publication-owner-approval.v1, exact merged-main SHA,
+mutation set exactly tag v8.0.0-beta.1 plus prerelease, a non-empty
+publication_lease_id, and any local-writer authorization separately scoped to
+the optional canonical-main fast-forward. Never set an approval value or
+invent a lease ID.
+
+Read notes from exact merged main and parse exactly one fenced JSON object with
+schema gwo-beta1-release-evidence.v2. Require verification_mode local-only,
+core_baseline_sha 2c72d9a153dac07e507c746548258efc44b62875,
+core_baseline_tree 1905079fa3cd0d90dd9b1930ed5dd726fad9f114,
+Python 3.13.11, requirements digest
+ee3c9f14db38950f5869759a5a94347197c9d4db3f138147b614ad6c4d862534,
+main manifest digest 1f01205bc9846bebfd8e767744a60d4d1e4c185f081f6083606047cd37e9d4a3,
+main attestation digest
+689ccbdf84667d9931b83f18b4234816a853ca61ba6cca8382117f2179e15818,
+issues #113-#119 read back OPEN, and non_goal Lean V8 production cutover.
+The prose also states no production admission and no default-writer
+activation. Save exact notes and normalized SHA-256.
 
 ~~~powershell
 $ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$repo = 'NOirBRight/github-work-orchestrator'
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$numbers = @(113..119) + 137
-$expectedMilestone = @{
-    '113'='GWO V8 Beta2'; '114'='GWO V8 Beta2'; '115'='GWO V8 Beta2'; '116'='GWO V8 Beta2';
-    '117'='GWO V8 Beta2'; '137'='GWO V8 Beta2'; '118'='GWO V8 Beta3'; '119'='GWO V8 GA'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+$approvalPath = Join-Path $evidence 'approvals/publication-owner.json'; if (-not (Test-Path -LiteralPath $approvalPath -PathType Leaf)) { throw 'PUBLICATION_APPROVAL_MISSING' }
+$approval = Get-Content -Raw -LiteralPath $approvalPath | ConvertFrom-Json; if ($approval.schema -ne 'gwo-v8-c1-publication-owner-approval.v1' -or $approval.merged_main_sha -ne $state.pr.merge.merge_sha -or [string]::IsNullOrWhiteSpace([string]$approval.publication_lease_id)) { throw 'PUBLICATION_APPROVAL_INVALID' }
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
 }
-$issues = @($numbers | ForEach-Object {
-    gh issue view $_ --repo $repo --json number,state,title,body,labels,comments,milestone,url | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0) { throw "Cannot read Issue #$_" }
-})
-foreach ($issue in $issues) {
-    $wanted = $expectedMilestone[[string]$issue.number]
-    if ($issue.milestone -and $issue.milestone.title -ne $wanted) {
-        throw "Issue #$($issue.number) already has conflicting milestone '$($issue.milestone.title)'."
-    }
-}
-$blockers = gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){blockedBy(first:100){nodes{number state}}}}}' -F owner=NOirBRight -F name=github-work-orchestrator -F number=137 | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read #137 native blockers.' }
-$milestones = @(gh api "repos/$repo/milestones?state=all&per_page=100" | ConvertFrom-Json)
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read milestones.' }
-foreach ($title in @('GWO V8 Beta2','GWO V8 Beta3','GWO V8 GA')) {
-    $matches = @($milestones | Where-Object title -eq $title)
-    if ($matches.Count -gt 1) { throw "Milestone title is ambiguous: $title" }
-    if ($matches.Count -eq 1 -and $matches[0].state -ne 'open') { throw "Required milestone is closed: $title" }
-}
-$snapshot = [ordered]@{
-    captured_at = (Get-Date -AsUTC -Format o)
-    issues = $issues
-    blocked_by = @($blockers.data.repository.issue.blockedBy.nodes)
-    milestones = $milestones
-}
-$snapshot | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath (Join-Path $evidence 'task-5-tracker-before.json') -Encoding utf8NoBOM
+$notesLines = @(git show "$($state.pr.merge.merge_sha):docs/releases/v8.0.0-beta.1.md"); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOTES_READ_FAILED' }
+$notes = $notesLines -join [Environment]::NewLine; $blocks = [regex]::Matches($notes,'(?ms)^~~~json\s*\r?\n(?<json>\{.*?\})\s*\r?\n~~~\s*(?:\r?\n|$)'); if ($blocks.Count -ne 1) { throw 'NOTES_JSON_COUNT_INVALID' }
+$releaseEvidence = $blocks[0].Groups['json'].Value | ConvertFrom-Json
+if ($releaseEvidence.schema -ne 'gwo-beta1-release-evidence.v2' -or $releaseEvidence.verification_mode -ne 'local-only' -or $releaseEvidence.core_baseline_sha -ne $state.identities.base.sha -or $releaseEvidence.core_baseline_tree -ne $state.identities.base.tree -or $releaseEvidence.python_version -ne 'Python 3.13.11' -or $releaseEvidence.requirements_sha256 -ne 'ee3c9f14db38950f5869759a5a94347197c9d4db3f138147b614ad6c4d862534' -or $releaseEvidence.local_verification_manifest_sha256 -ne '1f01205bc9846bebfd8e767744a60d4d1e4c185f081f6083606047cd37e9d4a3' -or $releaseEvidence.main_attestation_sha256 -ne '689ccbdf84667d9931b83f18b4234816a853ca61ba6cca8382117f2179e15818' -or $releaseEvidence.non_goal -ne 'Lean V8 production cutover') { throw 'RELEASE_EVIDENCE_INVALID' }
+foreach ($number in 113,114,115,116,117,118,119) { if ($releaseEvidence.issues.$number -ne 'OPEN') { throw "RELEASE_ISSUE_STATE_INVALID:$number" } }
+if ($notes -notmatch 'no production admission' -or $notes -notmatch 'default-writer') { throw 'RELEASE_NON_GOALS_MISSING' }
+$notesPath = Join-Path $evidence 'release-notes-from-merged-sha.md'; [IO.File]::WriteAllText($notesPath,$notes,[Text.UTF8Encoding]::new($false)); $normalizedNotes = $notes -replace '\r\n', ([char]10); $notesHash = [Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($normalizedNotes)); $notesHash = ([BitConverter]::ToString($notesHash) -replace '-','').ToLowerInvariant()
+$repo = $state.repository; $tagRows = @(git -C $root ls-remote --tags origin refs/tags/v8.0.0-beta.1 'refs/tags/v8.0.0-beta.1^{}'); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'TAG_READ_FAILED' }
+$releaseProbe = @(gh api "repos/$repo/releases/tags/v8.0.0-beta.1" 2>&1); $releaseExit = $LASTEXITCODE; if ($releaseExit -ne 0 -and (($releaseProbe -join [Environment]::NewLine) -notmatch 'HTTP 404')) { throw 'RELEASE_READ_FAILED' }
+if (($tagRows.Count -gt 0) -xor ($releaseExit -eq 0)) { throw 'PARTIAL_PUBLICATION' }
+$state.publication = [ordered]@{ owner_receipt = $approvalPath.Replace('\','/'); publication_lease_id = $approval.publication_lease_id; notes_path = $notesPath.Replace('\','/'); notes_sha256 = $notesHash; release_evidence = $releaseEvidence; initial_tag_present = ($tagRows.Count -gt 0); initial_release_present = ($releaseExit -eq 0) }; Save-State $state
 ~~~
 
-Expected: complete bodies, labels, comments, states, milestones, URLs, and native blockers are persisted. Any nonempty wrong milestone or duplicate/closed required milestone stops before mutation.
+If a matching tag and Release already exist, read them back and do not
+recreate them. A partial or conflicting pair stops.
 
-- [ ] **Step 2: Require tracker-specific approval, reopen #137 only for the approved anomaly, and prove semantic preservation.**
+- [ ] **6.2 Create/read back the annotated tag under a fresh policy readback.**
+
+Immediately before the tag mutation, save and parse all three policy API
+responses again, verify disabled Actions, zero workflows, active ruleset,
+required_linear_history, pull_request, deletion, non_fast_forward, zero
+bypass actors, no required status rule, and squash allowed. Re-read source,
+protected GA, merged main, notes, and owner lease. Then create the annotated
+tag from the exact squash SHA and push only the approved tag:
 
 ~~~powershell
 $ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$repo = 'NOirBRight/github-work-orchestrator'
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$state = Get-Content -Raw -LiteralPath (Join-Path $evidence 'state.json') | ConvertFrom-Json
-function Read-RemoteHead([string]$Name) {
-    $rows = @(git -C $root ls-remote --heads origin "refs/heads/$Name")
-    if ($rows.Count -ne 1) { throw "Remote head missing or ambiguous: $Name" }
-    return (($rows[0] -split '\s+')[0])
-}
-if ((Read-RemoteHead 'main') -ne $state.merged_main_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-beta1') -ne $state.beta1_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-ga-plan') -ne $state.protected_ga_sha) { throw 'Release refs drifted before tracker mutation.' }
-$ci = gh run view $state.ci_run_id --repo $repo --json headSha,status,conclusion | ConvertFrom-Json
-if ($ci.headSha -ne $state.merged_main_sha -or $ci.status -ne 'completed' -or $ci.conclusion -ne 'success') { throw 'Exact-main CI is not valid before tracker mutation.' }
-$expectedApproval = 'APPROVE-GWO-V8-C1-TRACKER-AND-MILESTONES-V1'
-if ($env:GWO_V8_C1_OWNER -cne 'NOirBRight' -or $env:GWO_V8_C1_TRACKER_APPROVAL -cne $expectedApproval) {
-    throw "STOP: tracker approval must be exactly $expectedApproval from NOirBRight."
-}
-$snapshot = Get-Content -Raw -LiteralPath (Join-Path $evidence 'task-5-tracker-before.json') | ConvertFrom-Json
-$before = @($snapshot.issues | Where-Object number -eq 137)[0]
-$fresh = gh issue view 137 --repo $repo --json number,state,title,body,labels,comments,milestone,url | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0) { throw 'Cannot re-read #137 before mutation.' }
-$freshBlockersRaw = gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){blockedBy(first:100){nodes{number state}}}}}' -F owner=NOirBRight -F name=github-work-orchestrator -F number=137 | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0) { throw 'Cannot re-read #137 blockers before mutation.' }
-$freshBlockers = @($freshBlockersRaw.data.repository.issue.blockedBy.nodes)
-function Canonical-Json($Value) { return ($Value | ConvertTo-Json -Depth 100 -Compress) }
-$snapshotOpenBlockers = @($snapshot.blocked_by | Where-Object state -eq 'OPEN')
-$needsReopen = $before.state -eq 'CLOSED' -and $snapshotOpenBlockers.Count -gt 0
-$allowedFreshStates = if ($needsReopen) { @('CLOSED','OPEN') } else { @($before.state) }
-if ($fresh.state -notin $allowedFreshStates -or $fresh.title -cne $before.title -or $fresh.body -cne $before.body -or
-    (Canonical-Json $fresh.labels) -cne (Canonical-Json $before.labels) -or
-    (Canonical-Json $fresh.comments) -cne (Canonical-Json $before.comments) -or
-    $fresh.milestone.title -cne $before.milestone.title) { throw '#137 drifted after the pre-mutation snapshot.' }
-$beforeBlockerKeys = @($snapshot.blocked_by | Sort-Object number | ForEach-Object { "$($_.number):$($_.state)" })
-$freshBlockerKeys = @($freshBlockers | Sort-Object number | ForEach-Object { "$($_.number):$($_.state)" })
-if (Compare-Object $beforeBlockerKeys $freshBlockerKeys) { throw '#137 native blockers drifted before mutation.' }
-$approval = [ordered]@{ approver = $env:GWO_V8_C1_OWNER; text = $expectedApproval; approved_at = (Get-Date -AsUTC -Format o) }
-$approvalPath = Join-Path $evidence 'task-5-tracker-approval.json'
-if (Test-Path -LiteralPath $approvalPath) {
-    $recordedApproval = Get-Content -Raw -LiteralPath $approvalPath | ConvertFrom-Json
-    if ($recordedApproval.approver -cne $approval.approver -or $recordedApproval.text -cne $approval.text) { throw 'Existing tracker approval evidence conflicts.' }
-    $approval = $recordedApproval
-} else {
-    $approval | ConvertTo-Json | Set-Content -LiteralPath $approvalPath -Encoding utf8NoBOM
-}
-if ($needsReopen -and $fresh.state -eq 'CLOSED') {
-    gh issue reopen 137 --repo $repo
-    if ($LASTEXITCODE -ne 0) { throw 'Approved #137 reopen failed.' }
-}
-$after = gh issue view 137 --repo $repo --json number,state,title,body,labels,comments,milestone,url | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read #137 after conditional reopen.' }
-$afterBlockersRaw = gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){blockedBy(first:100){nodes{number state}}}}}' -F owner=NOirBRight -F name=github-work-orchestrator -F number=137 | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read #137 blockers after conditional reopen.' }
-$afterBlockers = @($afterBlockersRaw.data.repository.issue.blockedBy.nodes)
-$expectedState = if ($needsReopen) { 'OPEN' } else { $before.state }
-if ($after.state -ne $expectedState -or $after.title -cne $fresh.title -or $after.body -cne $fresh.body -or
-    (Canonical-Json $after.labels) -cne (Canonical-Json $fresh.labels) -or
-    (Canonical-Json $after.comments) -cne (Canonical-Json $fresh.comments) -or
-    $after.milestone.title -cne $fresh.milestone.title) { throw '#137 semantic preservation failed.' }
-$afterBlockerKeys = @($afterBlockers | Sort-Object number | ForEach-Object { "$($_.number):$($_.state)" })
-if (Compare-Object $freshBlockerKeys $afterBlockerKeys) { throw '#137 native blockers changed.' }
-[ordered]@{ issue = $after; blocked_by = $afterBlockers; reopened = $needsReopen; approval = $approval } |
-    ConvertTo-Json -Depth 100 | Set-Content -LiteralPath (Join-Path $evidence 'task-5-issue137-after.json') -Encoding utf8NoBOM
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+if ($state.pr.merge.method -ne 'squash' -or $state.pr.merge.tree -ne $state.identities.beta1.tree) { throw 'MERGE_STATE_INVALID' }
+git tag -a v8.0.0-beta.1 $state.pr.merge.merge_sha -m 'GWO V8 Beta1 - Core Preview'
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'TAG_CREATE_FAILED' }
+git push origin refs/tags/v8.0.0-beta.1
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'TAG_PUSH_FAILED' }
 ~~~
 
-Expected: #137 changes from CLOSED to OPEN only when at least one native blocker is OPEN. Otherwise its state is preserved. Body, labels, comments, milestone, and blocker relations are not rewritten.
+Read direct and peeled tag refs, tag object API, and annotated tag content.
+Require object type tag, tag object SHA, and peeled target exactly equal to
+the squash commit. Persist tag object/type/peel and all response hashes.
+Never move, delete, overwrite, or recreate a conflicting object.
 
-- [ ] **Step 3: Create missing milestones and assign only unassigned Issues after a second conflict preflight.**
+- [ ] **6.3 Create/read back the prerelease with exact body equality.**
+
+Re-read policy and tag/release state immediately before this mutation. Run:
 
 ~~~powershell
 $ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$repo = 'NOirBRight/github-work-orchestrator'
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$statePath = Join-Path $evidence 'state.json'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
+}
+$notesPath = $state.publication.notes_path; if (-not (Test-Path -LiteralPath $notesPath -PathType Leaf)) { throw 'NOTES_FILE_MISSING' }
+gh release create v8.0.0-beta.1 --repo NOirBRight/github-work-orchestrator --verify-tag --prerelease --title 'GWO V8 Beta1 - Core Preview' --notes-file $notesPath
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'RELEASE_CREATE_FAILED' }
+$release = @(gh api "repos/$($state.repository)/releases/tags/v8.0.0-beta.1" 2>&1); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'RELEASE_READBACK_FAILED' }; $release = ($release -join [Environment]::NewLine) | ConvertFrom-Json
+if ($release.tag_name -ne 'v8.0.0-beta.1' -or $release.prerelease -ne $true -or $release.draft -ne $false -or $null -eq $release.html_url) { throw 'RELEASE_FIELDS_INVALID' }
+$body = ([string]$release.body) -replace '\r\n', ([char]10); $notes = (Get-Content -Raw -LiteralPath $notesPath) -replace '\r\n', ([char]10); if ($body -ne $notes) { throw 'RELEASE_BODY_NOT_EXACT_NOTES' }
+$bodyHash = [Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($body)); $bodyHash = ([BitConverter]::ToString($bodyHash) -replace '-','').ToLowerInvariant()
+$state.publication.release = [ordered]@{ id = $release.id; url = $release.html_url; tag_name = $release.tag_name; prerelease = $release.prerelease; draft = $release.draft; notes_sha256 = $state.publication.notes_sha256; body_sha256 = $bodyHash; merged_sha = $state.pr.merge.merge_sha }; Save-State $state
+~~~
+
+The exact target identity is the annotated tag's peeled SHA, never only an
+API targetCommitish representation. The publication lease remains held
+through tag/Release readback and is released only after the receipt is saved.
+
+## Task 7: Closure and C2 handoff
+
+**Files:** read-only all external evidence, refs/API readbacks, local
+manifests/logs, reports, three owner receipts, tracker, tag/Release, worktree
+registry, and protected GA; create only external closure evidence.
+
+**Interfaces:** consumes all exact release gates and produces closure.json
+plus a precise C2 scope handoff without moving protected GA or closing issues.
+
+- [ ] **7.1 Freshly re-verify every identity and evidence digest.**
+
+Use a new fence with the full preamble. Re-read remote refs and require main
+equals the recorded squash commit, one parent equals
+2c72d9a153dac07e507c746548258efc44b62875, and tree equals
+663c5b12502554890bdd92fad6bffc5d6aa9c5f1. Re-read Beta1
+70eaa70d5e87ff4f7a6791facd254abab8ff1377 and protected GA
+2cd6c46e1484ca140c3a197bbdeb171191d70c20 with their exact trees/parents.
+
+Freshly call and parse:
+
+- repos/NOirBRight/github-work-orchestrator/actions/permissions;
+- repos/NOirBRight/github-work-orchestrator/actions/workflows;
+- repos/NOirBRight/github-work-orchestrator/rulesets/20160628.
+
+Require Actions disabled, workflow_count zero, active default-branch ruleset,
+required_linear_history, pull_request, deletion, non_fast_forward, zero
+bypass actors, no required status rule, and squash allowed. Re-hash every
+file listed by both local manifests and every review report. Require all five
+reports to end exactly Verdict: PASS, all report hashes to match state, all
+three approval/lease receipts to bind the exact action scope and SHA, tracker
+state to match mapping/conditional #137, tag to be annotated and peeled to
+the squash commit, and Release id/URL/body/notes hashes to match.
+
+Require C0 receipt/archive hashes and the approved exception again. Require
+exactly three clean execution worktrees: canonical main, active GA, and this
+coordinator. A failed temporary checkout is preserved, not deleted. Save a
+new closure-preflight directory and digest; do not replace prior evidence.
+
+- [ ] **7.2 Fast-forward canonical local main only with explicit
+  local-writer authorization.**
+
+The publication owner receipt may contain local-writer authorization scoped
+to a fast-forward from the recorded canonical old SHA to the exact squash
+SHA. If absent, record canonical_main_action = read-only and leave canonical
+main unchanged. If present, re-read canonical root, current SHA, remote main,
+policy, and all gates inside that authorization window, then run:
+
+~~~powershell
+$ErrorActionPreference = 'Stop'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+function Save-State([object]$value) {
+    $tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp,($value | ConvertTo-Json -Depth 40),[Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }
+    try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }
+    [IO.File]::Replace($tmp,$statePath,$null,$true)
+    try { $null = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { throw 'STATE_READBACK_FAILED' }
+}
+$auth = $state.publication.local_writer_authorization; if ($null -eq $auth) { $state.closure = [ordered]@{ canonical_main_action = 'read-only'; canonical_main_sha = (git -C D:/Workstation/github-work-orchestrator rev-parse HEAD).Trim() }; Save-State $state; exit 0 }
+if ($auth.target_sha -ne $state.pr.merge.merge_sha -or $auth.from_sha -ne $state.identities.base.sha) { throw 'LOCAL_WRITER_SCOPE_INVALID' }
+git -C D:/Workstation/github-work-orchestrator merge --ff-only $state.pr.merge.merge_sha; $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'CANONICAL_FAST_FORWARD_FAILED' }
+$canonical = (git -C D:/Workstation/github-work-orchestrator rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $canonical -ne $state.pr.merge.merge_sha) { throw 'CANONICAL_READBACK_FAILED' }
+$remote = @(git -C $root ls-remote --heads origin refs/heads/main); $exit = $LASTEXITCODE; if ($exit -ne 0 -or (($remote -split '\s+')[0] -ne $canonical)) { throw 'REMOTE_CANONICAL_MISMATCH' }
+$state.closure = [ordered]@{ canonical_main_action = 'authorized-fast-forward'; canonical_main_sha = $canonical; remote_main_sha = $canonical }; Save-State $state
+~~~
+
+This is a local branch update only. It is never a remote push. A failure
+preserves the branch and records the readback.
+
+- [ ] **7.3 Verify C2 boundaries and write closure/handoff.**
+
+Re-read current Tickets #113-#119 and #137 with their states, milestones,
+native blockers, URLs, and preserved #137 content before writing the handoff.
+Verify every supplied Git object and ancestry:
+
+| C2 item | Existing exact boundary |
+| --- | --- |
+| foundation | 77ac3e3 |
+| #113 | 07086ce |
+| #114 | 657bf23 |
+| #115 | a0f6976 |
+| #116 WIP | e58c596 |
+| C2/Beta2 scope | #113-#117 plus #137 |
+| Beta3 | #118 |
+| GA | #119 |
+
+The #117 completion and final #137 revalidation entries are implementation
+scope with no completed exact SHA. They must never be labeled completed
+evidence. Persist closure.json with exact digests, not provider-run fields,
+then atomically append closure and c2_handoff to v2 state.
+
+~~~powershell
+$ErrorActionPreference = 'Stop'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'; $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+$boundaries = [ordered]@{ foundation = '77ac3e3'; issue_113 = '07086ce'; issue_114 = '657bf23'; issue_115 = 'a0f6976'; issue_116_wip = 'e58c596'; beta2_scope = @('#113','#114','#115','#116','#117','#137'); beta3 = '#118'; ga = '#119'; unfinished = @('#117 completion','final #137 revalidation') }
+foreach ($name in @('foundation','issue_113','issue_114','issue_115','issue_116_wip')) { git -C $root cat-file -e ($boundaries[$name] + '^{commit}'); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw "BOUNDARY_OBJECT_MISSING:$name" } }
+$closure = [ordered]@{ schema = 'gwo-v8-c1-closure.v2'; mode = 'Local Verification Only'; merged_sha = $state.pr.merge.merge_sha; merged_manifest_sha256 = $state.local_verification.merged_main.manifest_sha256; beta1_manifest_sha256 = $state.local_verification.beta1.manifest_sha256; external_evidence = $state.external_evidence; policy_readbacks = $state.policy_readbacks; reviews = $state.reviews; approvals = $state.approvals; tracker = $state.tracker; publication = $state.publication; worktrees = $state.scope.worktrees; protected_ga_sha = $state.identities.protected_ga.sha; c2_handoff = $boundaries; completed_at = [DateTime]::UtcNow.ToString('o') }
+$closurePath = Join-Path $evidence 'closure.json'; [IO.File]::WriteAllText($closurePath,($closure | ConvertTo-Json -Depth 50),[Text.UTF8Encoding]::new($false)); $closureHash = (Get-FileHash -LiteralPath $closurePath -Algorithm SHA256).Hash.ToLowerInvariant()
+$state.closure = [ordered]@{ path = $closurePath.Replace('\','/'); sha256 = $closureHash; completed_at = $closure.completed_at }; $state.c2_handoff = $boundaries
+$tmp = Join-Path $evidence ('.state.' + [guid]::NewGuid().ToString('N') + '.tmp'); [IO.File]::WriteAllText($tmp,($state | ConvertTo-Json -Depth 50),[Text.UTF8Encoding]::new($false)); if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { throw 'STATE_TEMP_WRITE_FAILED' }; try { $null = Get-Content -Raw -LiteralPath $tmp | ConvertFrom-Json } catch { throw 'STATE_TEMP_PARSE_FAILED' }; [IO.File]::Replace($tmp,$statePath,$null,$true); $check = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json; if ($check.closure.sha256 -ne $closureHash) { throw 'CLOSURE_STATE_READBACK_FAILED' }
+~~~
+
+Expected: closure contains exact SHA-256 evidence, the three independent
+owner gates, exact tracker/tag/Release readbacks, protected-GA identity, and
+the C2 handoff. C1 leaves implementation Tickets and writer authority alone.
+
+## Stop Rules
+
+Stop before the next effect if any condition is true:
+
+- state schema/mode/root/branch/head or any frozen SHA/tree/parent/boundary
+  identity differs;
+- any external JSON, C0 archive file, recorded log, report, or manifest hash
+  differs;
+- a subject tree contains a workflow, a local command is not clean, Python
+  or requirements identity differs, or a local manifest omits a log/hash;
+- Actions are enabled, workflows are nonzero, the ruleset is inactive, a
+  required status rule appears, a preserved rule disappears, a bypass actor
+  appears, or squash is not allowed;
+- any review report does not end exactly Verdict: PASS or lacks the exact
+  base/Beta1/tree/manifest binding;
+- an approval or lease is missing, expired, reused, conflicting, or broader
+  than its gate, or the coordinator would need to invent a value;
+- PR repository/head/base/path/thread readback changes, the merge is not
+  squash with the exact head, the result has a parent other than frozen base,
+  or the result tree differs from the Beta1 tree;
+- a milestone conflicts, an ETag changes before a conditional write, #137
+  does not satisfy the approved reopen condition, or issue content/closure is
+  requested;
+- a tag or Release is partial/conflicting, the tag is not annotated, the
+  peeled SHA differs, the body differs from exact merged-SHA notes, or target
+  identity relies only on targetCommitish;
+- a failed checkout would be deleted, canonical main would move without
+  explicit local-writer authorization, or source/main/protected-GA moves.
+
+## Completion Checklist
+
+- [ ] Only this plan file is changed in the repository.
+- [ ] Local Verification Only, no production admission, no default-writer
+  activation, no protected-GA movement, and no #113-#119 closure are explicit.
+- [ ] State schema gwo-v8-c1-state.v2 contains exact SHA/tree/parent arrays,
+  external digests, policy semantics, local manifest/log digests, five
+  verdicts, three independent approval/lease receipts, PR/squash identity,
+  tracker state, tag peel, Release URL, closure, and C2 fields.
+- [ ] Real external JSON/log/archive files were parsed and re-hashed.
+- [ ] Exactly 17 paths and the exact first-parent chain passed; the integration
+  merge was checked by SHA/tree/ordered parents independently.
+- [ ] Both local gates used clean detached worktrees, Python 3.13.11, the
+  requirements digest, six logs, SHA-256 manifests, bounded environment
+  restoration, and no workflow files.
+- [ ] Five read-only gpt-5.6-luna/max reports ran concurrently and each ended
+  exactly Verdict: PASS.
+- [ ] PR Integration Lease, tracker writer lease, and publication writer
+  lease remained independent and serial; no approval was inferred.
+- [ ] PR readback bound both repositories and all 17 paths; merge used
+  --squash --match-head-commit; result had one parent equal to base and the
+  Beta1 tree.
+- [ ] Tracker mapping and conditional #137 behavior were read back without
+  closing #113-#119.
+- [ ] Annotated v8.0.0-beta.1 and prerelease peel/body/notes read back to the
+  exact squash commit.
+- [ ] Closure freshly verified refs, policy, reviews, approvals, tracker,
+  tag/Release, all log hashes, three clean worktrees, and protected GA.
+- [ ] C2 boundaries 77ac3e3, 07086ce, 657bf23, a0f6976, and e58c596 are
+  verified; unfinished #117/#137 work is scope, not completed evidence.
+
+## TDD and Final Verification
+
+The controller supplied this RED result before editing:
+
+AssertionError: missing required C1 contracts: ['state schema', 'local mode',
+'base sha', 'base tree', 'beta1 sha', 'beta1 tree', 'integration merge',
+'beta1 manifest digest', 'main manifest digest', 'main attestation digest',
+'ci-disable closure digest', 'beta1 evidence root', 'squash merge',
+'actions readback', 'workflow readback', 'hash readback', 'new path']
+
+After writing, run the copied exact contract:
+
+~~~powershell
+$ErrorActionPreference = 'Stop'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'
+if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { throw 'STATE_MISSING' }
 $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-$before = Get-Content -Raw -LiteralPath (Join-Path $evidence 'task-5-tracker-before.json') | ConvertFrom-Json
-$issue137After = Get-Content -Raw -LiteralPath (Join-Path $evidence 'task-5-issue137-after.json') | ConvertFrom-Json
-$approval = Get-Content -Raw -LiteralPath (Join-Path $evidence 'task-5-tracker-approval.json') | ConvertFrom-Json
-$expectedApproval = 'APPROVE-GWO-V8-C1-TRACKER-AND-MILESTONES-V1'
-if ($env:GWO_V8_C1_OWNER -cne 'NOirBRight' -or $env:GWO_V8_C1_TRACKER_APPROVAL -cne $expectedApproval -or
-    $approval.approver -cne 'NOirBRight' -or $approval.text -cne $expectedApproval) { throw 'Tracker approval evidence is invalid.' }
-function Read-RemoteHead([string]$Name) {
-    $rows = @(git -C $root ls-remote --heads origin "refs/heads/$Name")
-    if ($rows.Count -ne 1) { throw "Remote head missing or ambiguous: $Name" }
-    return (($rows[0] -split '\s+')[0])
-}
-if ((Read-RemoteHead 'main') -ne $state.merged_main_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-beta1') -ne $state.beta1_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-ga-plan') -ne $state.protected_ga_sha) { throw 'Release refs drifted before milestone mutation.' }
-$ci = gh run view $state.ci_run_id --repo $repo --json headSha,status,conclusion | ConvertFrom-Json
-if ($ci.headSha -ne $state.merged_main_sha -or $ci.status -ne 'completed' -or $ci.conclusion -ne 'success') { throw 'Exact-main CI is not valid before milestone mutation.' }
-$plan = [ordered]@{ 'GWO V8 Beta2' = @(113,114,115,116,117,137); 'GWO V8 Beta3' = @(118); 'GWO V8 GA' = @(119) }
-$expectedByNumber = @{}
-foreach ($title in $plan.Keys) { foreach ($number in $plan[$title]) { $expectedByNumber[[string]$number] = $title } }
-$currentIssues = @((@(113..119) + 137) | ForEach-Object {
-    gh issue view $_ --repo $repo --json number,state,title,body,labels,comments,milestone,url | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0) { throw "Cannot re-read Issue #$_ before milestone mutation." }
-})
-function Canonical-Json($Value) { return ($Value | ConvertTo-Json -Depth 100 -Compress) }
-foreach ($issue in $currentIssues) {
-    $wanted = $expectedByNumber[[string]$issue.number]
-    if ($issue.milestone -and $issue.milestone.title -ne $wanted) { throw "Conflicting milestone appeared on #$($issue.number)." }
-    $original = @($before.issues | Where-Object number -eq $issue.number)[0]
-    $reference = if ($issue.number -eq 137) { $issue137After.issue } else { $original }
-    $expectedState = $reference.state
-    if ($issue.state -ne $expectedState -or $issue.title -cne $reference.title -or $issue.body -cne $reference.body -or
-        (Canonical-Json $issue.labels) -cne (Canonical-Json $reference.labels) -or
-        (Canonical-Json $issue.comments) -cne (Canonical-Json $reference.comments)) {
-        throw "Issue semantics drifted before milestone assignment: #$($issue.number)"
-    }
-}
-$existing = @(gh api "repos/$repo/milestones?state=all&per_page=100" | ConvertFrom-Json)
-if ($LASTEXITCODE -ne 0) { throw 'Cannot re-read milestones before mutation.' }
-foreach ($title in $plan.Keys) {
-    $matches = @($existing | Where-Object title -eq $title)
-    if ($matches.Count -gt 1 -or ($matches.Count -eq 1 -and $matches[0].state -ne 'open')) { throw "Milestone conflict: $title" }
-}
-foreach ($title in $plan.Keys) {
-    if (@($existing | Where-Object title -eq $title).Count -eq 0) {
-        gh api "repos/$repo/milestones" -f "title=$title" -f 'description=See docs/releases/gwo-v8-release-train.md' | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Milestone creation failed: $title" }
-    }
-}
-$all = @(gh api "repos/$repo/milestones?state=all&per_page=100" | ConvertFrom-Json)
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read milestones after creation.' }
-foreach ($title in $plan.Keys) {
-    $milestone = @($all | Where-Object title -eq $title)
-    if ($milestone.Count -ne 1 -or $milestone[0].state -ne 'open') { throw "Milestone readback failed: $title" }
-    foreach ($number in $plan[$title]) {
-        $freshIssue = gh issue view $number --repo $repo --json number,state,title,body,labels,comments,milestone,url | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0) { throw "Cannot re-read Issue #$number immediately before assignment." }
-        $original = @($before.issues | Where-Object number -eq $number)[0]
-        $reference = if ($number -eq 137) { $issue137After.issue } else { $original }
-        if ($freshIssue.state -ne $reference.state -or $freshIssue.title -cne $reference.title -or
-            $freshIssue.body -cne $reference.body -or
-            (Canonical-Json $freshIssue.labels) -cne (Canonical-Json $reference.labels) -or
-            (Canonical-Json $freshIssue.comments) -cne (Canonical-Json $reference.comments)) {
-            throw "Issue semantics drifted immediately before assignment: #$number"
-        }
-        if ($freshIssue.milestone -and $freshIssue.milestone.title -ne $title) { throw "Concurrent milestone conflict appeared on #$number." }
-        if (-not $freshIssue.milestone) {
-            gh api -X PATCH "repos/$repo/issues/$number" -F "milestone=$($milestone[0].number)" | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Milestone assignment failed: #$number" }
-        }
-    }
-}
-$afterIssues = @((@(113..119) + 137) | ForEach-Object {
-    gh issue view $_ --repo $repo --json number,state,title,body,labels,comments,milestone,url | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0) { throw "Cannot read Issue #$_ after milestone mutation." }
-})
-foreach ($issue in $afterIssues) {
-    $wanted = $expectedByNumber[[string]$issue.number]
-    $original = @($before.issues | Where-Object number -eq $issue.number)[0]
-    $reference = if ($issue.number -eq 137) { $issue137After.issue } else { $original }
-    if ($issue.milestone.title -ne $wanted -or $issue.state -ne $reference.state -or
-        $issue.title -cne $reference.title -or $issue.body -cne $reference.body -or
-        (Canonical-Json $issue.labels) -cne (Canonical-Json $reference.labels) -or
-        (Canonical-Json $issue.comments) -cne (Canonical-Json $reference.comments)) {
-        throw "Tracker readback failed: #$($issue.number)"
-    }
-}
-$blockersAfterRaw = gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){blockedBy(first:100){nodes{number state}}}}}' -F owner=NOirBRight -F name=github-work-orchestrator -F number=137 | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read final #137 native blockers.' }
-$expectedBlockerKeys = @($issue137After.blocked_by | Sort-Object number | ForEach-Object { "$($_.number):$($_.state)" })
-$actualBlockerKeys = @($blockersAfterRaw.data.repository.issue.blockedBy.nodes | Sort-Object number | ForEach-Object { "$($_.number):$($_.state)" })
-if (Compare-Object $expectedBlockerKeys $actualBlockerKeys) { throw '#137 native blockers changed during milestone assignment.' }
-$afterSnapshot = [ordered]@{ captured_at = (Get-Date -AsUTC -Format o); issues = $afterIssues; milestones = $all; issue137 = $issue137After; blocked_by = @($blockersAfterRaw.data.repository.issue.blockedBy.nodes) }
-$afterSnapshot | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath (Join-Path $evidence 'task-5-tracker-after.json') -Encoding utf8NoBOM
-$state | Add-Member -NotePropertyName tracker_complete -NotePropertyValue $true -Force
-$state | Add-Member -NotePropertyName tracker_completed_at -NotePropertyValue (Get-Date -AsUTC -Format o) -Force
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+python .superpowers/sdd/2026-08-05-gwo-v8-c1-plan-hardening/test_plan_contract.py
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'C1_PLAN_CONTRACT_GREEN_FAILED' }
 ~~~
 
-Expected: #113-#117/#137 read back under Beta2, #118 under Beta3, and #119 under GA. Existing correct assignments are no-ops; conflicting nonempty assignments stop before any overwrite; Issue states remain unchanged except the approved conditional #137 reopen.
-
----
-
-### Task 6: Create and verify the immutable Beta1 publication
-
-**Files:**
-- Read from the exact merged SHA: `docs/releases/v8.0.0-beta.1.md`
-- Create: `task-6-publication-approval.json` and `v8.0.0-beta.1.notes.md`; persist tag and Release identities in `state.json`
-- Remote artifacts: annotated `refs/tags/v8.0.0-beta.1` and GitHub prerelease `v8.0.0-beta.1`
-
-**Interfaces:**
-- Consumes: exact merge/CI evidence, completed tracker readback, and publication-specific SHA-bound owner approval.
-- Produces: one immutable annotated tag and one non-draft prerelease targeting the same merged SHA.
-
-- [ ] **Step 1: Recheck main, protected refs, CI, tracker assignments, and require publication-specific approval.**
+Then run exactly:
 
 ~~~powershell
 $ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$repo = 'NOirBRight/github-work-orchestrator'
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$statePath = Join-Path $evidence 'state.json'
+$root = (git rev-parse --show-toplevel).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0) { throw 'NOT_A_GIT_WORKTREE' }
+$root = ([IO.Path]::GetFullPath($root).Replace('\','/')).TrimEnd('/')
+$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'; $statePath = Join-Path $evidence 'state.json'
+if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { throw 'STATE_MISSING' }
 $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-if (-not $state.tracker_complete -or -not $state.merged_main_sha -or -not $state.ci_run_id) { throw 'Merge, CI, or tracker evidence is incomplete.' }
-function Read-RemoteHead([string]$Name) {
-    $rows = @(git -C $root ls-remote --heads origin "refs/heads/$Name")
-    if ($rows.Count -ne 1) { throw "Remote head missing or ambiguous: $Name" }
-    return (($rows[0] -split '\s+')[0])
-}
-if ((Read-RemoteHead 'main') -ne $state.merged_main_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-beta1') -ne $state.beta1_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-ga-plan') -ne $state.protected_ga_sha) { throw 'Release refs drifted.' }
-$ci = gh run view $state.ci_run_id --repo $repo --json databaseId,url,headSha,status,conclusion,name | ConvertFrom-Json
-if ($ci.headSha -ne $state.merged_main_sha -or $ci.status -ne 'completed' -or $ci.conclusion -ne 'success') { throw 'Persisted exact-main CI is no longer valid.' }
-$expectedAssignments = @{ '113'='GWO V8 Beta2';'114'='GWO V8 Beta2';'115'='GWO V8 Beta2';'116'='GWO V8 Beta2';'117'='GWO V8 Beta2';'137'='GWO V8 Beta2';'118'='GWO V8 Beta3';'119'='GWO V8 GA' }
-foreach ($number in @(113,114,115,116,117,137,118,119)) {
-    $issue = gh issue view $number --repo $repo --json number,milestone | ConvertFrom-Json
-    if ($issue.milestone.title -ne $expectedAssignments[[string]$number]) { throw "Milestone drifted before publication: #$number" }
-}
-$expectedApproval = "APPROVE-GWO-V8-C1-PUBLISH-V8.0.0-BETA.1@$($state.merged_main_sha)"
-if ($env:GWO_V8_C1_OWNER -cne 'NOirBRight' -or $env:GWO_V8_C1_PUBLICATION_APPROVAL -cne $expectedApproval) {
-    throw "STOP: publication approval must be exactly $expectedApproval from NOirBRight."
-}
-$approval = [ordered]@{ approver = $env:GWO_V8_C1_OWNER; text = $expectedApproval; approved_at = (Get-Date -AsUTC -Format o) }
-$approvalPath = Join-Path $evidence 'task-6-publication-approval.json'
-if (Test-Path -LiteralPath $approvalPath) {
-    $recordedApproval = Get-Content -Raw -LiteralPath $approvalPath | ConvertFrom-Json
-    if ($recordedApproval.approver -cne $approval.approver -or $recordedApproval.text -cne $approval.text) { throw 'Existing publication approval evidence conflicts.' }
-    $approval = $recordedApproval
-} else {
-    $approval | ConvertTo-Json | Set-Content -LiteralPath $approvalPath -Encoding utf8NoBOM
-}
-$state | Add-Member -NotePropertyName publication_approval -NotePropertyValue $approval -Force
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only') { throw 'STATE_INVALID' }
+$branch = (git symbolic-ref --quiet --short HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $branch -ne $state.coordinator_branch) { throw 'COORDINATOR_BRANCH_INVALID' }
+$head = (git rev-parse HEAD).Trim(); $exit = $LASTEXITCODE; if ($exit -ne 0 -or $head -ne $state.coordinator_head) { throw 'COORDINATOR_HEAD_INVALID' }
+git diff --check
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'DIFF_CHECK_FAILED' }
+python -m pytest tests/test_orchestrator_package.py -q
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'PACKAGE_TEST_FAILED' }
+python scripts/quick_validate.py
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'QUICK_VALIDATE_FAILED' }
+python scripts/sync_orchestrator.py --check
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw 'SYNC_CHECK_FAILED' }
 ~~~
 
-Expected: main still equals the merge SHA, Beta1 and protected GA are unchanged, exact CI remains successful, milestone assignments are exact, and approval text is bound to the merge SHA.
+Before commit, self-review the plan text for zero forbidden hosted-acceptance
+fields/commands, zero planning-time hosted gates, zero incompatible-mode
+language, zero non-squash/multi-parent integration claims, and no obsolete
+path-count claims. Verify every executable fence resolves root, reloads state, checks
+frozen identities and LASTEXITCODE, and restores bounded environment state.
+Verify no placeholder, stale exact identity, omitted helper, cross-fence
+variable, unbound approval/lease, or missing exact path remains.
 
-- [ ] **Step 2: Verify or create the annotated tag, generate notes from the merged SHA, and verify or create the prerelease.**
+Commit only this plan file with:
 
-~~~powershell
-$ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$repo = 'NOirBRight/github-work-orchestrator'
-$tagName = 'v8.0.0-beta.1'
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$statePath = Join-Path $evidence 'state.json'
-$state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-$sha = $state.merged_main_sha
-$expectedApproval = "APPROVE-GWO-V8-C1-PUBLISH-V8.0.0-BETA.1@$sha"
-if ($env:GWO_V8_C1_OWNER -cne 'NOirBRight' -or $env:GWO_V8_C1_PUBLICATION_APPROVAL -cne $expectedApproval -or
-    $state.publication_approval.approver -cne 'NOirBRight' -or $state.publication_approval.text -cne $expectedApproval) { throw 'Publication approval evidence is invalid.' }
-function Read-RemoteHead([string]$Name) {
-    $rows = @(git -C $root ls-remote --heads origin "refs/heads/$Name")
-    if ($rows.Count -ne 1) { throw "Remote head missing or ambiguous: $Name" }
-    return (($rows[0] -split '\s+')[0])
-}
-if ((Read-RemoteHead 'main') -ne $sha -or
-    (Read-RemoteHead 'codex/gwo-v8-beta1') -ne $state.beta1_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-ga-plan') -ne $state.protected_ga_sha) { throw 'Release refs drifted before publication.' }
-$ci = gh run view $state.ci_run_id --repo $repo --json headSha,status,conclusion | ConvertFrom-Json
-if ($ci.headSha -ne $sha -or $ci.status -ne 'completed' -or $ci.conclusion -ne 'success') { throw 'Exact-main CI is not valid before publication.' }
-$expectedAssignments = @{ '113'='GWO V8 Beta2';'114'='GWO V8 Beta2';'115'='GWO V8 Beta2';'116'='GWO V8 Beta2';'117'='GWO V8 Beta2';'137'='GWO V8 Beta2';'118'='GWO V8 Beta3';'119'='GWO V8 GA' }
-foreach ($number in @(113,114,115,116,117,137,118,119)) {
-    $issue = gh issue view $number --repo $repo --json number,milestone | ConvertFrom-Json
-    if ($issue.milestone.title -ne $expectedAssignments[[string]$number]) { throw "Milestone drifted before publication: #$number" }
-}
-$tagRows = @(git -C $root ls-remote --tags origin "refs/tags/$tagName" "refs/tags/$tagName^{}")
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read remote tag state.' }
-$parsedTags = @($tagRows | ForEach-Object { $parts = $_ -split '\s+'; [pscustomobject]@{ sha = $parts[0]; ref = $parts[1] } })
-$direct = @($parsedTags | Where-Object ref -eq "refs/tags/$tagName")
-$peeled = @($parsedTags | Where-Object ref -eq "refs/tags/$tagName^{}")
-$releaseProbe = @(gh api "repos/$repo/releases/tags/$tagName" 2>&1)
-$releaseProbeExit = $LASTEXITCODE
-if ($releaseProbeExit -ne 0 -and (($releaseProbe -join "`n") -notmatch '\(HTTP 404\)')) { throw 'Cannot read GitHub Release state.' }
-$releaseExists = $releaseProbeExit -eq 0
-if ($direct.Count -eq 0 -and $peeled.Count -gt 0) { throw 'Remote tag has a peeled ref without its direct ref.' }
-if ($direct.Count -eq 0 -and $releaseExists) { throw 'Release exists without the required remote tag.' }
-if ($direct.Count -gt 0) {
-    if ($direct.Count -ne 1 -or $peeled.Count -ne 1 -or $peeled[0].sha -ne $sha) { throw 'Existing remote tag is not the required annotated tag target.' }
-} else {
-    git -C $root show-ref --verify --quiet "refs/tags/$tagName"
-    $localTagExists = $LASTEXITCODE -eq 0
-    if ($localTagExists) {
-        if ((git -C $root cat-file -t "refs/tags/$tagName").Trim() -ne 'tag' -or
-            (git -C $root rev-parse "refs/tags/$tagName^{}").Trim() -ne $sha) { throw 'Existing local tag is not the required annotated target.' }
-    } else {
-        git -C $root tag -a $tagName $sha -m 'GWO V8 Beta1 - Core Preview'
-        if ($LASTEXITCODE -ne 0) { throw 'Annotated local Beta1 tag creation failed.' }
-    }
-    git -C $root push origin "refs/tags/$tagName:refs/tags/$tagName"
-    if ($LASTEXITCODE -ne 0) { throw 'Remote tag push failed; stop and read back any concurrent object.' }
-}
-$remoteAfter = @(git -C $root ls-remote --tags origin "refs/tags/$tagName" "refs/tags/$tagName^{}")
-$parsedAfter = @($remoteAfter | ForEach-Object { $parts = $_ -split '\s+'; [pscustomobject]@{ sha = $parts[0]; ref = $parts[1] } })
-$directAfter = @($parsedAfter | Where-Object ref -eq "refs/tags/$tagName")
-$peeledAfter = @($parsedAfter | Where-Object ref -eq "refs/tags/$tagName^{}")
-if ($directAfter.Count -ne 1 -or $peeledAfter.Count -ne 1 -or $peeledAfter[0].sha -ne $sha) { throw 'Remote annotated-tag readback failed.' }
-$notesPath = Join-Path $evidence 'v8.0.0-beta.1.notes.md'
-$notes = @(git -C $root show "${sha}:docs/releases/v8.0.0-beta.1.md")
-if ($LASTEXITCODE -ne 0 -or $notes.Count -eq 0) { throw 'Cannot read release notes from the exact merged SHA.' }
-$notes | Set-Content -LiteralPath $notesPath -Encoding utf8NoBOM
-if (-not $releaseExists) {
-    gh release create $tagName --repo $repo --verify-tag --prerelease --target $sha --title 'GWO V8 Beta1 - Core Preview' --notes-file $notesPath
-    if ($LASTEXITCODE -ne 0) { throw 'GitHub prerelease creation failed.' }
-}
-$release = gh release view $tagName --repo $repo --json tagName,targetCommitish,isDraft,isPrerelease,url,body | ConvertFrom-Json
-if ($release.tagName -ne $tagName -or $release.targetCommitish -ne $sha -or $release.isDraft -or -not $release.isPrerelease) {
-    throw 'GitHub prerelease identity readback failed.'
-}
-$expectedBody = (($notes -join "`n").TrimEnd())
-$actualBody = (($release.body -replace "`r`n","`n").TrimEnd())
-if ($actualBody -cne $expectedBody) { throw 'GitHub prerelease body differs from exact merged-SHA notes.' }
-$state | Add-Member -NotePropertyName tag_name -NotePropertyValue $tagName -Force
-$state | Add-Member -NotePropertyName tag_peeled_sha -NotePropertyValue $peeledAfter[0].sha -Force
-$state | Add-Member -NotePropertyName release_url -NotePropertyValue $release.url -Force
-$state | Add-Member -NotePropertyName published_at -NotePropertyValue (Get-Date -AsUTC -Format o) -Force
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
-~~~
+docs: re-freeze C1 for local verification
 
-Expected: the remote tag has both direct and peeled refs and peels to the merge SHA; notes come from that SHA rather than the controller checkout; the Release is non-draft, prerelease, exact-target, and body-identical.
-
----
-
-### Task 7: Close C1 and hand off the frozen C2 boundaries
-
-**Files:**
-- Read: all Tasks 0-6 evidence and fresh remote readbacks
-- Create: `task-7-report.md`
-
-**Interfaces:**
-- Consumes: complete C1 publication evidence.
-- Produces: a traceable C1 PASS, current canonical main, and exact C2 handoff subjects.
-
-- [ ] **Step 1: Perform final refs, CI, tag, Release, tracker, and clean-worktree readback; then fast-forward only canonical local main.**
-
-~~~powershell
-$ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$repo = 'NOirBRight/github-work-orchestrator'
-$canonical = 'D:/Workstation/github-work-orchestrator'
-$gaRoot = 'D:/Workstation/gwo-worktrees/issue-136'
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$statePath = Join-Path $evidence 'state.json'
-$state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-function Read-RemoteHead([string]$Name) {
-    $rows = @(git -C $root ls-remote --heads origin "refs/heads/$Name")
-    if ($rows.Count -ne 1) { throw "Remote head missing or ambiguous: $Name" }
-    return (($rows[0] -split '\s+')[0])
-}
-if ((Read-RemoteHead 'main') -ne $state.merged_main_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-beta1') -ne $state.beta1_sha -or
-    (Read-RemoteHead 'codex/gwo-v8-ga-plan') -ne $state.protected_ga_sha) { throw 'Final remote ref identity failed.' }
-if ((git -C $root rev-parse refs/heads/codex/gwo-v8-beta1).Trim() -ne $state.beta1_sha -or
-    (git -C $root rev-parse refs/heads/codex/gwo-v8-ga-plan).Trim() -ne $state.protected_ga_sha) { throw 'Final local protected branch identity failed.' }
-$ci = gh run view $state.ci_run_id --repo $repo --json databaseId,url,headSha,status,conclusion,name | ConvertFrom-Json
-if ($ci.headSha -ne $state.merged_main_sha -or $ci.status -ne 'completed' -or $ci.conclusion -ne 'success') { throw 'Final CI identity failed.' }
-$tagRows = @(git -C $root ls-remote --tags origin "refs/tags/$($state.tag_name)" "refs/tags/$($state.tag_name)^{}")
-$parsed = @($tagRows | ForEach-Object { $parts = $_ -split '\s+'; [pscustomobject]@{ sha = $parts[0]; ref = $parts[1] } })
-$direct = @($parsed | Where-Object ref -eq "refs/tags/$($state.tag_name)")
-$peeled = @($parsed | Where-Object ref -eq "refs/tags/$($state.tag_name)^{}")
-if ($direct.Count -ne 1 -or $peeled.Count -ne 1 -or $peeled[0].sha -ne $state.merged_main_sha) { throw 'Final tag identity failed.' }
-$release = gh release view $state.tag_name --repo $repo --json tagName,targetCommitish,isDraft,isPrerelease,url,body | ConvertFrom-Json
-if ($release.tagName -ne $state.tag_name -or $release.targetCommitish -ne $state.merged_main_sha -or
-    $release.url -ne $state.release_url -or $release.isDraft -or -not $release.isPrerelease) { throw 'Final Release identity failed.' }
-$expectedBody = ((Get-Content -Raw -LiteralPath (Join-Path $evidence 'v8.0.0-beta.1.notes.md') -Encoding utf8).Replace("`r`n","`n").TrimEnd())
-$actualBody = (($release.body -replace "`r`n","`n").TrimEnd())
-if ($actualBody -cne $expectedBody) { throw 'Final Release body identity failed.' }
-$expectedAssignments = @{ '113'='GWO V8 Beta2';'114'='GWO V8 Beta2';'115'='GWO V8 Beta2';'116'='GWO V8 Beta2';'117'='GWO V8 Beta2';'137'='GWO V8 Beta2';'118'='GWO V8 Beta3';'119'='GWO V8 GA' }
-$trackerAfter = Get-Content -Raw -LiteralPath (Join-Path $evidence 'task-5-tracker-after.json') | ConvertFrom-Json
-function Canonical-Json($Value) { return ($Value | ConvertTo-Json -Depth 100 -Compress) }
-foreach ($number in @(113,114,115,116,117,137,118,119)) {
-    $issue = gh issue view $number --repo $repo --json number,state,title,body,labels,comments,milestone,url | ConvertFrom-Json
-    $reference = @($trackerAfter.issues | Where-Object number -eq $number)[0]
-    if ($issue.milestone.title -ne $expectedAssignments[[string]$number] -or $issue.state -ne $reference.state -or
-        $issue.title -cne $reference.title -or $issue.body -cne $reference.body -or
-        (Canonical-Json $issue.labels) -cne (Canonical-Json $reference.labels) -or
-        (Canonical-Json $issue.comments) -cne (Canonical-Json $reference.comments)) {
-        throw "Final tracker identity failed: #$number"
-    }
-}
-$blockersRaw = gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){blockedBy(first:100){nodes{number state}}}}}' -F owner=NOirBRight -F name=github-work-orchestrator -F number=137 | ConvertFrom-Json
-$expectedBlockers = @($trackerAfter.blocked_by | Sort-Object number | ForEach-Object { "$($_.number):$($_.state)" })
-$actualBlockers = @($blockersRaw.data.repository.issue.blockedBy.nodes | Sort-Object number | ForEach-Object { "$($_.number):$($_.state)" })
-if (Compare-Object $expectedBlockers $actualBlockers) { throw 'Final #137 native blocker identity failed.' }
-if ((git -C $canonical symbolic-ref --short HEAD).Trim() -ne 'main') { throw 'Canonical checkout left main.' }
-$canonicalDirty = @(git -C $canonical status --porcelain=v1 --untracked-files=all)
-if ($canonicalDirty.Count -ne 0) { $canonicalDirty; throw 'Canonical main is dirty.' }
-$localMain = (git -C $canonical rev-parse HEAD).Trim()
-if ($localMain -notin @($state.base_sha,$state.merged_main_sha)) { throw 'Canonical local main has an unexpected commit.' }
-git -C $canonical fetch origin main
-if ($LASTEXITCODE -ne 0 -or (git -C $canonical rev-parse refs/remotes/origin/main).Trim() -ne $state.merged_main_sha) { throw 'Canonical fetch readback failed.' }
-if ($localMain -eq $state.base_sha) {
-    git -C $canonical merge --ff-only $state.merged_main_sha
-    if ($LASTEXITCODE -ne 0) { throw 'Canonical main did not fast-forward to the Beta1 merge.' }
-}
-function Normalize-Path([string]$Path) { return ([IO.Path]::GetFullPath($Path).Replace('\','/')).TrimEnd([char[]]'/') }
-$expectedRoots = @((Normalize-Path $canonical),(Normalize-Path $gaRoot),(Normalize-Path $root)) | Sort-Object -Unique
-$actualRoots = @(git -C $root worktree list --porcelain | Select-String '^worktree ' | ForEach-Object { Normalize-Path $_.Line.Substring(9) } | Sort-Object -Unique)
-if (Compare-Object $expectedRoots $actualRoots) { throw 'Unexpected worktree exists at C1 closure.' }
-foreach ($path in $expectedRoots) {
-    $dirty = @(git -C $path status --porcelain=v1 --untracked-files=all)
-    if ($dirty.Count -ne 0) { $dirty; throw "Closure worktree is dirty: $path" }
-}
-if ((git -C $canonical rev-parse HEAD).Trim() -ne $state.merged_main_sha -or
-    (git -C $gaRoot rev-parse HEAD).Trim() -ne $state.protected_ga_sha) { throw 'Final local ref identity failed.' }
-$state | Add-Member -NotePropertyName final_verified -NotePropertyValue $true -Force
-$state | Add-Member -NotePropertyName final_verified_at -NotePropertyValue (Get-Date -AsUTC -Format o) -Force
-$state | Add-Member -NotePropertyName canonical_main_sha -NotePropertyValue (git -C $canonical rev-parse HEAD).Trim() -Force
-$state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
-~~~
-
-Expected: remote and local main equal the Beta1 merge, Beta1/GA refs remain frozen, exact CI is green, tag/Release/milestones are exact, and only the two C0 roots plus the current coordinator root exist and are clean.
-
-- [ ] **Step 2: Write the C1 closure report and exact C2 handoff.**
-
-~~~powershell
-$ErrorActionPreference = 'Stop'
-$root = (git rev-parse --show-toplevel).Trim()
-$evidence = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview'
-$state = Get-Content -Raw -LiteralPath (Join-Path $evidence 'state.json') | ConvertFrom-Json
-$requiredState = @('pr_number','pr_url','beta1_sha','merged_main_sha','ci_run_id','ci_url','ci_summary','tag_name','tag_peeled_sha','release_url','canonical_main_sha','final_verified_at')
-foreach ($name in $requiredState) {
-    if ([string]::IsNullOrWhiteSpace([string]$state.$name)) { throw "Closure state is missing: $name" }
-}
-if (-not $state.final_verified -or -not $state.tracker_complete -or $state.canonical_main_sha -ne $state.merged_main_sha) { throw 'Closure gates are not complete.' }
-foreach ($name in @('task-3-pr-approval.json','task-5-tracker-approval.json','task-5-tracker-after.json','task-6-publication-approval.json','v8.0.0-beta.1.notes.md')) {
-    if (-not (Test-Path -LiteralPath (Join-Path $evidence $name) -PathType Leaf)) { throw "Closure evidence file is absent: $name" }
-}
-$reportPath = Join-Path $evidence 'task-7-report.md'
-if (Test-Path -LiteralPath $reportPath) { throw "Closure report already exists; do not overwrite it: $reportPath" }
-$lines = @(
-    '# C1 Beta1 Core Preview Closure',
-    '',
-    '## Verdict',
-    '',
-    '**PASS**',
-    '',
-    'C1 Beta1 Core Preview is published; Lean V8 production admission and default-writer activation remain disabled.',
-    '',
-    '## Exact evidence',
-    '',
-    "- PR: #$($state.pr_number) $($state.pr_url)",
-    "- PR head: $($state.beta1_sha)",
-    "- Merge SHA: $($state.merged_main_sha)",
-    "- GWO CI: $($state.ci_url)",
-    "- Dynamic summary: $($state.ci_summary)",
-    "- Tag: $($state.tag_name) -> $($state.tag_peeled_sha)",
-    "- Release: $($state.release_url)",
-    '- Tracker evidence: task-5-tracker-before.json and task-5-tracker-after.json',
-    '- Approval evidence: task-3-pr-approval.json, task-5-tracker-approval.json, task-6-publication-approval.json',
-    '',
-    '## C2 frozen handoff',
-    '',
-    '- Candidate foundation: 77ac3e3ef14241d1840150b22cb227d2e5088fb4',
-    '- #113 Watchdog: 07086ce1036198a41547ca1d9a9a506acfb8fcf7',
-    '- #114 CandidateGate: 657bf236d765735cdee117910a5939c6c2cd3292',
-    '- #115 Review/Repair: a0f697656be6471bed601103c169185988a9e4ac',
-    '- #116 Batch WIP: e58c596998df90e65349bdb4b5f25d3d9dc1f7e2'
-)
-$lines | Set-Content -LiteralPath $reportPath -Encoding utf8NoBOM
-~~~
-
-Expected: the report contains the exact PR, merge, CI, tracker, approval, tag, Release, no-writer statement, and full C2 boundary SHAs.
-
-## C1 Stop Rules
-
-Stop immediately when `hosted_ci_compatible` is false, or on any frozen ref drift, wrong merge-base/ancestry/path, failed focused/full/quick/sync/diff/CI gate, non-PASS structured reviewer verdict, absent scoped approval, PR head/base movement, non-normal merge, incomplete Issue readback, changed #137 semantics, conflicting milestone, partial/mismatched tag or Release, or dirty verification checkout. Never compensate with force-push, direct main push, object deletion/recreation, wildcard deletion, ACL changes, daemon restart, or manual `.git`/Paseo registry edits.
-
-## C1 Completion Checklist
-
-- [ ] C0 receipt and approved exception re-read; protected GA unchanged.
-- [ ] Owner-approved successor Beta1 resolves the hosted-CI archive blocker; every frozen SHA and path assertion in this plan is updated and re-reviewed. Current `e081e390` does not satisfy this item.
-- [ ] `ddc1785` ancestry, every post-boundary commit, exact merge-base, six-path history fence, and 16-path aggregate fence pass.
-- [ ] Focused package, full pytest, quick, sync, and diff checks pass on exact Beta1 SHA.
-- [ ] Five read-only Luna Max reviews end with exact `Verdict: PASS`.
-- [ ] SHA-bound PR approval is recorded; one exact PR targets `main` from `codex/gwo-v8-beta1`.
-- [ ] Exact-head checks pass; normal two-parent merge and exact merged-main `GWO CI` read back.
-- [ ] Tracker-specific approval is recorded; #137 semantics are preserved and milestones are assigned without overwriting conflicts.
-- [ ] Publication approval is bound to the merge SHA.
-- [ ] `v8.0.0-beta.1` is annotated, immutable, and peels to merged main.
-- [ ] GitHub Release is non-draft, prerelease, exact-target, and body-identical to merged-SHA notes.
-- [ ] Canonical main is fast-forwarded, all three retained worktrees are clean, and protected GA remains unchanged.
-- [ ] C1 closure report preserves the no-production-admission and no-default-writer boundary.
+No push is part of this task.
