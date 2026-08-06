@@ -538,7 +538,7 @@ def test_duplicate_plan_invalidation_replay_reads_back_the_same_receipt():
     assert replay.plan_invalidation_receipt.receipt_digest == (
         first.plan_invalidation_receipt.receipt_digest
     )
-    assert replay.plan_invalidation_report is None
+    assert replay.plan_invalidation_report == first.plan_invalidation_report
     assert port.calls == 2
 
 
@@ -556,6 +556,111 @@ def test_candidate_identity_rejects_noncanonical_changed_path_order():
         )
 
     assert raised.value.code == "CANDIDATE_GATE_EVIDENCE_INVALID"
+
+
+def test_exact_diff_record_sorts_add_before_delete_when_old_path_is_absent():
+    from gwo_v8.candidate_gate import CandidateDiffRecordV1
+
+    record = CandidateDiffRecordV1.from_tree_entries(
+        repository_object_format="sha1",
+        base_commit_oid="1" * 40,
+        base_tree_oid="2" * 40,
+        candidate_commit_oid="3" * 40,
+        candidate_tree_oid="4" * 40,
+        base_entries={b"b": ("100644", "blob", "5" * 40)},
+        candidate_entries={b"a": ("100644", "blob", "6" * 40)},
+    )
+
+    assert [
+        (entry.change_kind, entry.old_path, entry.new_path)
+        for entry in record.entries
+    ] == [
+        ("add", None, "YQ"),
+        ("delete", "Yg", None),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("object_format", "valid_width", "invalid_width"),
+    [("sha1", 40, 64), ("sha256", 64, 40)],
+)
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "base_commit_oid",
+        "base_tree_oid",
+        "candidate_commit_oid",
+        "candidate_tree_oid",
+    ],
+)
+def test_exact_diff_record_rejects_record_oid_width_mismatch(
+    object_format, valid_width, invalid_width, field_name
+):
+    from gwo_v8.candidate_gate import CandidateDiffEntryV1, CandidateDiffRecordV1
+
+    values = {
+        "base_commit_oid": "1" * valid_width,
+        "base_tree_oid": "2" * valid_width,
+        "candidate_commit_oid": "3" * valid_width,
+        "candidate_tree_oid": "4" * valid_width,
+    }
+    values[field_name] = "f" * invalid_width
+    entry = CandidateDiffEntryV1(
+        old_path=None,
+        new_path="YQ",
+        change_kind="add",
+        old_mode=None,
+        new_mode="100644",
+        old_object_type=None,
+        new_object_type="blob",
+        old_oid=None,
+        new_oid="5" * valid_width,
+    )
+
+    with pytest.raises(Exception) as raised:
+        CandidateDiffRecordV1(
+            schema_version="CandidateDiffRecordV1",
+            repository_object_format=object_format,
+            entries=(entry,),
+            **values,
+        )
+
+    assert raised.value.code == "CANDIDATE_GATE_DIFF_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("object_format", "valid_width", "invalid_width"),
+    [("sha1", 40, 64), ("sha256", 64, 40)],
+)
+def test_exact_diff_record_rejects_entry_oid_width_mismatch(
+    object_format, valid_width, invalid_width
+):
+    from gwo_v8.candidate_gate import CandidateDiffEntryV1, CandidateDiffRecordV1
+
+    entry = CandidateDiffEntryV1(
+        old_path=None,
+        new_path="YQ",
+        change_kind="add",
+        old_mode=None,
+        new_mode="100644",
+        old_object_type=None,
+        new_object_type="blob",
+        old_oid=None,
+        new_oid="5" * invalid_width,
+    )
+
+    with pytest.raises(Exception) as raised:
+        CandidateDiffRecordV1(
+            schema_version="CandidateDiffRecordV1",
+            repository_object_format=object_format,
+            base_commit_oid="1" * valid_width,
+            base_tree_oid="2" * valid_width,
+            candidate_commit_oid="3" * valid_width,
+            candidate_tree_oid="4" * valid_width,
+            entries=(entry,),
+        )
+
+    assert raised.value.code == "CANDIDATE_GATE_DIFF_INVALID"
 
 
 @pytest.mark.parametrize(
@@ -1416,28 +1521,33 @@ def test_candidate_gate_uses_authoritative_candidate_readback_and_complete_diff_
     from gwo_v8.runtime_gateway import CapabilityPolicy, CapabilityPolicyProof
 
     parent = _parent()
+    path_token = "c3JjL3Byb3RvY29sLnB5"
     candidate = CandidateIdentity(
         reported_reference="refs/heads/candidate",
         base_commit_oid="1" * 40,
         base_tree_oid="2" * 40,
         candidate_commit_oid="3" * 40,
         candidate_tree_oid="4" * 40,
-        changed_paths=("src/protocol.py",),
+        changed_path_tokens=(path_token,),
     )
     diff = CandidateDiffRecordV1(
-        repository=parent.runtime_subject.repository,
-        object_format="sha1",
+        schema_version="CandidateDiffRecordV1",
+        repository_object_format="sha1",
         base_commit_oid=candidate.base_commit_oid,
         base_tree_oid=candidate.base_tree_oid,
         candidate_commit_oid=candidate.candidate_commit_oid,
         candidate_tree_oid=candidate.candidate_tree_oid,
         entries=(
             CandidateDiffEntryV1(
-                side="candidate",
-                path="src/protocol.py",
-                mode="100644",
-                object_type="blob",
-                object_oid="5" * 40,
+                old_path=None,
+                new_path=path_token,
+                change_kind="add",
+                old_mode=None,
+                new_mode="100644",
+                old_object_type=None,
+                new_object_type="blob",
+                old_oid=None,
+                new_oid="5" * 40,
             ),
         ),
     )
@@ -1464,7 +1574,7 @@ def test_candidate_gate_uses_authoritative_candidate_readback_and_complete_diff_
         def review(self, request):
             assert request.base_commit_oid == candidate.base_commit_oid
             assert request.candidate_tree_oid == candidate.candidate_tree_oid
-            assert request.diff_schema_version == "gwo.candidate-diff.v1"
+            assert request.diff_schema_version == "CandidateDiffRecordV1"
             assert request.diff_digest == diff.digest
             return FormalReviewResult(subject_digest=request.digest)
 
