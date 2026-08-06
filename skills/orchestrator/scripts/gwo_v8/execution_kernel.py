@@ -6471,7 +6471,11 @@ class ExecutionKernel:
         run["resume_after_invalidation"] = False
         if observation.candidate_identity is not None:
             run["candidate_identity"] = observation.candidate_identity
-        if observation.phase == "runtime_unavailable" and observation.binding_established:
+        if (
+            not candidate_budget_exhausted
+            and observation.phase == "runtime_unavailable"
+            and observation.binding_established
+        ):
             # A live unavailable binding retains the Slot until #112 proves a
             # park/terminal transition.  The phase itself is a durable Wait.
             run["slot_held"] = True

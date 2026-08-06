@@ -56,6 +56,33 @@ class _SequencedCandidateEffects:
 
 
 @dataclass
+class _RuntimeUnavailableCandidateEffects:
+    receipts: tuple[CandidateReceipt, ...]
+    executed: list[WorkRunAction] = field(default_factory=list)
+
+    def readback(self, _action: WorkRunAction) -> WorkRunObservation | None:
+        return None
+
+    def execute(self, action: WorkRunAction) -> WorkRunObservation:
+        if len(self.executed) >= len(self.receipts):
+            raise AssertionError("the effect owner was called after the budget boundary")
+        self.executed.append(action)
+        receipt = self.receipts[len(self.executed) - 1]
+        return WorkRunObservation(
+            phase=(
+                "runtime_unavailable"
+                if len(self.executed) == len(self.receipts)
+                else "parked"
+            ),
+            stable_action_id=action.stable_action_id,
+            receipt_digest=receipt.digest,
+            binding_established=True,
+            candidate_receipt=receipt,
+            runtime_binding_id="binding:initial",
+        )
+
+
+@dataclass
 class _StaleCandidateEffects:
     receipt: CandidateReceipt
     executed: list[WorkRunAction] = field(default_factory=list)
@@ -292,3 +319,36 @@ def test_stale_candidate_readback_after_restart_cannot_bypass_budget(tmp_path):
     assert run["phase"] == "decision"
     assert run["slot_held"] is False
     assert len(stale_effects.executed) == 1
+
+
+def test_candidate_budget_exhaustion_does_not_retain_runtime_unavailable_slot(tmp_path):
+    ticket_key = "issue:115"
+    active, campaign = _minimal_candidate_campaign(ticket_key)
+    receipts = tuple(
+        make_candidate_receipt(
+            active,
+            campaign,
+            ticket_key,
+            candidate_commit_oid=oid,
+            candidate_tree_oid=oid,
+        )
+        for oid in ("4" * 40, "5" * 40, "6" * 40, "7" * 40)
+    )
+    effects = _RuntimeUnavailableCandidateEffects(receipts)
+    kernel = ExecutionKernel(
+        store_path=tmp_path / "runtime-unavailable-budget.sqlite3",
+        plan_control=_StaticPlanReader(active),
+        effects=effects,
+    )
+
+    for ordinal in range(1, 5):
+        outcome = kernel.advance(campaign, wake_ref=f"candidate:{ordinal}")
+
+    assert outcome.status == CampaignStatus.DECISION
+    assert outcome.reason == f"CandidateBudgetExhausted:{ticket_key}"
+    state = read_kernel_state(kernel, campaign)
+    run = state["runs"][ticket_key]
+    assert run["phase"] == "decision"
+    assert run["slot_held"] is False
+    assert run["claim_state"] == "released"
+    assert len(effects.executed) == 4
