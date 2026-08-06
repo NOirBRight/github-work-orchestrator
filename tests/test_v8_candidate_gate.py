@@ -400,6 +400,64 @@ def test_formal_review_scope_finding_is_preserved_and_routed_without_repair():
     assert result.evidence[2].source_evidence_digest == finding.digest
 
 
+def test_legacy_clean_review_never_emits_an_incomplete_repair_packet():
+    from gwo_v8.candidate_gate import (
+        CandidateGate,
+        CandidateGateError,
+        FormalReviewFinding,
+        FormalReviewResult,
+    )
+    from gwo_v8.runtime_gateway import CapabilityPolicy, CapabilityPolicyProof
+
+    parent = _parent()
+    audit = _clean_audit(parent)
+
+    class Reviewer:
+        capability_policy_proof = CapabilityPolicyProof(
+            capability_policy=CapabilityPolicy(worker_can_edit_issues=False),
+            authority_record_digest="9" * 64,
+        )
+
+        def __init__(self):
+            self.calls = 0
+
+        def review(self, request):
+            self.calls += 1
+            return FormalReviewResult(
+                subject_digest=request.digest,
+                findings=(
+                    FormalReviewFinding(
+                        parent_digest=request.parent_digest,
+                        candidate_digest=request.candidate_digest,
+                        review_subject_digest=request.digest,
+                        finding_id="finding:hard",
+                        severity="hard",
+                        code="REPAIR_REQUIRED",
+                        message="the hard finding requires repair",
+                    ),
+                    FormalReviewFinding(
+                        parent_digest=request.parent_digest,
+                        candidate_digest=request.candidate_digest,
+                        review_subject_digest=request.digest,
+                        finding_id="finding:advisory",
+                        severity="advisory",
+                        code="ADVISORY",
+                        message="the advisory finding must remain recorded",
+                    ),
+                ),
+            )
+
+    reviewer = Reviewer()
+    with pytest.raises(CandidateGateError) as raised:
+        CandidateGate(
+            invalidation_reporter=_RecordingPort(),
+            formal_reviewer=reviewer,
+        ).audit_candidate(parent, audit)
+
+    assert raised.value.code == "CANDIDATE_GATE_LEGACY_REVIEW_INCOMPLETE"
+    assert reviewer.calls == 1
+
+
 def test_repair_scope_escape_is_evidence_and_never_reopens_formal_review():
     from gwo_v8.candidate_gate import (
         CandidateGate,
@@ -1510,6 +1568,10 @@ def test_repair_verification_fails_closed_when_authoritative_immutable_identity_
 def test_candidate_gate_uses_authoritative_candidate_readback_and_complete_diff_subject():
     from gwo_v8.candidate_gate import (
         CandidateAuditReport,
+        AssuranceMode,
+        AssuranceRequirement,
+        CandidateAcceptanceFacts,
+        CandidateCheckEvidence,
         CandidateDiffEntryV1,
         CandidateDiffRecordV1,
         CandidateGate,
@@ -1518,6 +1580,7 @@ def test_candidate_gate_uses_authoritative_candidate_readback_and_complete_diff_
         CandidateReadback,
         FormalReviewResult,
     )
+    from gwo_v8._canonical import digest_value
     from gwo_v8.runtime_gateway import CapabilityPolicy, CapabilityPolicyProof
 
     parent = _parent()
@@ -1572,21 +1635,66 @@ def test_candidate_gate_uses_authoritative_candidate_readback_and_complete_diff_
         )
 
         def review(self, request):
-            assert request.base_commit_oid == candidate.base_commit_oid
-            assert request.candidate_tree_oid == candidate.candidate_tree_oid
-            assert request.diff_schema_version == "CandidateDiffRecordV1"
-            assert request.diff_digest == diff.digest
-            return FormalReviewResult(subject_digest=request.digest)
+            subject = getattr(request, "subject", request)
+            assert subject.base_commit_oid == candidate.base_commit_oid
+            assert subject.candidate_tree_oid == candidate.candidate_tree_oid
+            assert subject.diff_schema_version == "CandidateDiffRecordV1"
+            assert subject.diff_digest == diff.digest
+            return FormalReviewResult(subject_digest=subject.digest)
+
+    class Checks:
+        def run(self, _parent, readback):
+            return (
+                CandidateCheckEvidence(
+                    check_id="check:unit",
+                    candidate_tree_oid=readback.candidate.candidate_tree_oid,
+                    outcome="passed",
+                    definition_digest="a" * 64,
+                    observation_digest=digest_value(
+                        {
+                            "kind": "candidate_check_observation.v1",
+                            "check_id": "check:unit",
+                            "candidate_tree_oid": readback.candidate.candidate_tree_oid,
+                            "diff_record_digest": readback.diff_record.digest,
+                            "outcome": "passed",
+                            "failure_digest": None,
+                        }
+                    ),
+                ),
+            )
+
+    class Policy:
+        def derive(self, _parent, _readback, _checks):
+            return AssuranceRequirement(
+                policy_id="policy:candidate-assurance",
+                policy_version="1",
+                mode=AssuranceMode.STANDARD,
+                required_check_ids=("check:unit",),
+                standards=("standard:repository",),
+            )
 
     reader = Reader()
     result = CandidateGate(
         invalidation_reporter=_RecordingPort(),
         candidate_reader=reader,
         formal_reviewer=Reviewer(),
+        check_runner=Checks(),
+        assurance_policy=Policy(),
+        acceptance_facts=CandidateAcceptanceFacts(
+            target_branch="main",
+            integration_node_key="integration:issue:one",
+            accepted_sequence=1,
+            check_environment_digest="6" * 64,
+            delivery_identity_digest="7" * 64,
+            protected_surfaces=("protected/path",),
+        ),
     ).audit_candidate(
         parent,
         CandidateAuditReport(parent_digest=parent.digest, candidate=candidate),
     )
 
     assert result.status.value == "review_accepted"
-    assert reader.calls == [(parent.runtime_subject.repository, candidate.reported_reference)]
+    assert reader.calls == [
+        (parent.runtime_subject.repository, candidate.reported_reference),
+        (parent.runtime_subject.repository, candidate.reported_reference),
+    ]

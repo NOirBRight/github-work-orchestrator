@@ -66,12 +66,22 @@ class CandidateGateStatus(str, Enum):
     REPAIR_REQUIRED = "repair_required"
     REPAIR_REJECTED = "repair_rejected"
     REPAIR_ACCEPTED = "repair_accepted"
+    DECISION_REQUIRED = "decision_required"
 
 
 class AssuranceMode(str, Enum):
     NO_REVIEW = "no_review"
     STANDARD = "standard"
     STRICT = "strict"
+
+
+class InvalidReviewTransport(RuntimeError):
+    """A typed, retryable Formal Review transport failure."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.code = "INVALID_REVIEW_TRANSPORT"
+        self.detail = detail
 
 
 def _require_text(value: object, field_name: str) -> str:
@@ -2104,7 +2114,7 @@ class FormalReviewer(Protocol):
 
 
 @dataclass(frozen=True)
-class FormalReviewFinding:
+class ReviewFinding:
     """Artifact-backed immutable Formal Review Finding Evidence."""
 
     parent_digest: str
@@ -2183,6 +2193,9 @@ class FormalReviewFinding:
         return {**self._body(), "content_digest": self.digest}
 
 
+FormalReviewFinding = ReviewFinding
+
+
 @dataclass(frozen=True)
 class FormalReviewResult:
     """A complete read-only result returned by the Formal Review port."""
@@ -2231,35 +2244,350 @@ class FormalReviewResult:
         return {**self._body(), "result_digest": self.digest}
 
 
-@dataclass(frozen=True)
+class ReviewFindingDisposition(str, Enum):
+    UNRESOLVED = "unresolved"
+    FIXED = "fixed"
+    ACCEPTED_RISK = "accepted_risk"
+    NOT_REPRODUCED = "not_reproduced"
+    SCOPE_ESCAPED = "scope_escaped"
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewFindingLedgerEntry:
+    finding: ReviewFinding
+    disposition: ReviewFindingDisposition
+    disposition_reason: str | None = None
+    disposition_evidence_digest: str | None = None
+    entry_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.finding) is not ReviewFinding or type(
+            self.disposition
+        ) is not ReviewFindingDisposition:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                "Finding ledger entry is not exactly typed",
+            )
+        if self.disposition is ReviewFindingDisposition.UNRESOLVED:
+            if (
+                self.disposition_reason is not None
+                or self.disposition_evidence_digest is not None
+            ):
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                    "unresolved Finding carries a completed disposition",
+                )
+        else:
+            _require_text(self.disposition_reason, "disposition_reason")
+            if self.disposition_evidence_digest is not None:
+                _require_digest(
+                    self.disposition_evidence_digest,
+                    "disposition_evidence_digest",
+                )
+        expected = digest_value(self._body())
+        if self.entry_digest is None:
+            object.__setattr__(self, "entry_digest", expected)
+        else:
+            _validate_stored_digest(
+                self.entry_digest,
+                self._body(),
+                code="CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                detail="Finding ledger entry digest changed",
+            )
+
+    def _body(self) -> dict[str, object]:
+        return {
+            "kind": "review_finding_ledger_entry.v1",
+            "finding": self.finding.canonical(),
+            "disposition": self.disposition.value,
+            "disposition_reason": self.disposition_reason,
+            "disposition_evidence_digest": self.disposition_evidence_digest,
+        }
+
+    @property
+    def digest(self) -> str:
+        assert self.entry_digest is not None
+        return self.entry_digest
+
+    def canonical(self) -> dict[str, object]:
+        return {**self._body(), "entry_digest": self.digest}
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewFindingLedger:
+    entries: tuple[ReviewFindingLedgerEntry, ...]
+    ledger_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.entries) is not tuple or any(
+            type(entry) is not ReviewFindingLedgerEntry for entry in self.entries
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                "Finding ledger entries are not an exact immutable tuple",
+            )
+        finding_ids = tuple(entry.finding.finding_id for entry in self.entries)
+        if finding_ids != tuple(sorted(set(finding_ids))):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                "Finding ledger IDs are not sorted and unique",
+            )
+        expected = digest_value(self._body())
+        if self.ledger_digest is None:
+            object.__setattr__(self, "ledger_digest", expected)
+        else:
+            _validate_stored_digest(
+                self.ledger_digest,
+                self._body(),
+                code="CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                detail="Finding ledger digest changed",
+            )
+
+    @classmethod
+    def from_review_result(
+        cls,
+        result: FormalReviewResult,
+    ) -> "ReviewFindingLedger":
+        return cls(
+            entries=tuple(
+                ReviewFindingLedgerEntry(
+                    finding=finding,
+                    disposition=ReviewFindingDisposition.UNRESOLVED,
+                )
+                for finding in sorted(result.findings, key=lambda item: item.finding_id)
+            )
+        )
+
+    def with_disposition(
+        self,
+        *,
+        finding_id: str,
+        disposition: ReviewFindingDisposition,
+        reason: str,
+        evidence_digest: str | None = None,
+    ) -> "ReviewFindingLedger":
+        if finding_id not in {entry.finding.finding_id for entry in self.entries}:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                "disposition names a Finding absent from the ledger",
+            )
+        return ReviewFindingLedger(
+            entries=tuple(
+                ReviewFindingLedgerEntry(
+                    finding=entry.finding,
+                    disposition=disposition,
+                    disposition_reason=reason,
+                    disposition_evidence_digest=evidence_digest,
+                )
+                if entry.finding.finding_id == finding_id
+                else entry
+                for entry in self.entries
+            )
+        )
+
+    @property
+    def is_complete(self) -> bool:
+        return all(
+            entry.disposition is not ReviewFindingDisposition.UNRESOLVED
+            for entry in self.entries
+        )
+
+    def _body(self) -> dict[str, object]:
+        return {
+            "kind": "review_finding_ledger.v1",
+            "entries": [entry.canonical() for entry in self.entries],
+        }
+
+    @property
+    def digest(self) -> str:
+        assert self.ledger_digest is not None
+        return self.ledger_digest
+
+    def canonical(self) -> dict[str, object]:
+        return {**self._body(), "ledger_digest": self.digest}
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class RepairPacket:
-    """The bounded repair scope produced only for ordinary Review Findings."""
+    """The complete bounded repair contract produced by CandidateGate."""
 
     parent_digest: str
     rejected_candidate_digest: str
+    candidate_receipt: CandidateReceipt | None
     prior_review_subject_digest: str
-    finding_digests: tuple[str, ...]
-    allowed_paths: tuple[str, ...]
-    required_effects: tuple[str, ...] = ()
+    assurance_requirement_digest: str | None
+    finding_ledger: ReviewFindingLedger | None
+    required_disposition_ids: tuple[str, ...]
+    allowed_path_tokens: tuple[str, ...]
+    required_check_ids: tuple[str, ...]
+    protocol_version: str
+    repair_instructions: tuple[str, ...]
+    required_effects: tuple[str, ...]
     packet_digest: str | None = None
+    finding_digests: tuple[str, ...] | None = None
+    allowed_paths: tuple[str, ...] | None = None
 
-    def __post_init__(self) -> None:
-        for value, label in (
-            (self.parent_digest, "parent_digest"),
-            (self.rejected_candidate_digest, "rejected_candidate_digest"),
-            (self.prior_review_subject_digest, "prior_review_subject_digest"),
+    def __init__(
+        self,
+        parent_digest: str,
+        rejected_candidate_digest: str,
+        prior_review_subject_digest: str,
+        finding_digests: tuple[str, ...] | None = None,
+        allowed_paths: tuple[str, ...] | None = None,
+        required_effects: tuple[str, ...] = (),
+        *,
+        candidate_receipt: CandidateReceipt | None = None,
+        assurance_requirement_digest: str | None = None,
+        finding_ledger: ReviewFindingLedger | None = None,
+        required_disposition_ids: tuple[str, ...] = (),
+        allowed_path_tokens: tuple[str, ...] | None = None,
+        required_check_ids: tuple[str, ...] = (),
+        protocol_version: str = "gwo.formal-review.v1",
+        repair_instructions: tuple[str, ...] = (),
+        packet_digest: str | None = None,
+    ) -> None:
+        _require_digest(parent_digest, "parent_digest")
+        _require_digest(rejected_candidate_digest, "rejected_candidate_digest")
+        _require_digest(
+            prior_review_subject_digest,
+            "prior_review_subject_digest",
+        )
+        _require_text_tuple(required_effects, "required_effects")
+        object.__setattr__(self, "parent_digest", parent_digest)
+        object.__setattr__(self, "rejected_candidate_digest", rejected_candidate_digest)
+        object.__setattr__(
+            self,
+            "prior_review_subject_digest",
+            prior_review_subject_digest,
+        )
+
+        complete = (
+            candidate_receipt is not None
+            or assurance_requirement_digest is not None
+            or finding_ledger is not None
+            or bool(required_disposition_ids)
+            or allowed_path_tokens is not None
+            or bool(required_check_ids)
+            or bool(repair_instructions)
+        )
+        if not complete:
+            _require_text_tuple(finding_digests, "finding_digests", allow_empty=False)
+            assert finding_digests is not None
+            for digest in finding_digests:
+                _require_digest(digest, "finding_digest")
+            legacy_paths = allowed_path_tokens
+            if legacy_paths is None:
+                legacy_paths = allowed_paths
+            _require_text_tuple(legacy_paths, "allowed_paths")
+            assert legacy_paths is not None
+            if allowed_paths is not None and tuple(allowed_paths) != tuple(legacy_paths):
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                    "Repair Packet allowed path aliases differ",
+                )
+            object.__setattr__(self, "candidate_receipt", None)
+            object.__setattr__(self, "assurance_requirement_digest", None)
+            object.__setattr__(self, "finding_ledger", None)
+            object.__setattr__(self, "required_disposition_ids", ())
+            object.__setattr__(self, "allowed_path_tokens", tuple(legacy_paths))
+            object.__setattr__(self, "required_check_ids", ())
+            object.__setattr__(self, "protocol_version", protocol_version)
+            object.__setattr__(self, "repair_instructions", ())
+            object.__setattr__(self, "required_effects", tuple(required_effects))
+            object.__setattr__(self, "finding_digests", tuple(finding_digests))
+            object.__setattr__(self, "allowed_paths", tuple(legacy_paths))
+            object.__setattr__(self, "packet_digest", packet_digest)
+            expected = _body_digest(self._body())
+            if packet_digest is None:
+                object.__setattr__(self, "packet_digest", expected)
+            else:
+                _validate_stored_digest(self.packet_digest, self._body())
+            return
+
+        if type(candidate_receipt) is not CandidateReceipt:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet CandidateReceipt is not exact",
+            )
+        _require_digest(
+            assurance_requirement_digest,
+            "assurance_requirement_digest",
+        )
+        if type(finding_ledger) is not ReviewFindingLedger:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet Finding ledger is not exact",
+            )
+        expected_ids = tuple(
+            entry.finding.finding_id for entry in finding_ledger.entries
+        )
+        if required_disposition_ids != expected_ids:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet disposition IDs do not cover the complete ledger",
+            )
+        if allowed_path_tokens is None:
+            allowed_path_tokens = allowed_paths
+        _require_text_tuple(allowed_path_tokens, "allowed_path_tokens")
+        assert allowed_path_tokens is not None
+        if allowed_paths is not None and tuple(allowed_paths) != tuple(allowed_path_tokens):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet allowed path aliases differ",
+            )
+        for value, field_name, allow_empty in (
+            (allowed_path_tokens, "allowed_path_tokens", True),
+            (required_check_ids, "required_check_ids", False),
+            (repair_instructions, "repair_instructions", False),
+            (required_effects, "required_effects", True),
         ):
-            _require_digest(value, label)
-        _require_text_tuple(self.finding_digests, "finding_digests", allow_empty=False)
-        for digest in self.finding_digests:
-            _require_digest(digest, "finding_digest")
-        _require_text_tuple(self.allowed_paths, "allowed_paths")
-        _require_text_tuple(self.required_effects, "required_effects")
+            _require_text_tuple(value, field_name, allow_empty=allow_empty)
+            if value != tuple(sorted(set(value))):
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                    f"{field_name} is not sorted and unique",
+                )
+        _require_text(protocol_version, "protocol_version")
+        if protocol_version != "gwo.formal-review.v1":
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet protocol version changed",
+            )
+        derived_finding_digests = tuple(
+            entry.finding.digest for entry in finding_ledger.entries
+        )
+        if finding_digests is not None and tuple(finding_digests) != derived_finding_digests:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet Finding digest alias differs",
+            )
+        if candidate_receipt.parent_digest != parent_digest:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Repair Packet CandidateReceipt belongs to another parent",
+            )
+        object.__setattr__(self, "candidate_receipt", candidate_receipt)
+        object.__setattr__(self, "assurance_requirement_digest", assurance_requirement_digest)
+        object.__setattr__(self, "finding_ledger", finding_ledger)
+        object.__setattr__(self, "required_disposition_ids", tuple(required_disposition_ids))
+        object.__setattr__(self, "allowed_path_tokens", tuple(allowed_path_tokens))
+        object.__setattr__(self, "required_check_ids", tuple(required_check_ids))
+        object.__setattr__(self, "protocol_version", protocol_version)
+        object.__setattr__(self, "repair_instructions", tuple(repair_instructions))
+        object.__setattr__(self, "required_effects", tuple(required_effects))
+        object.__setattr__(self, "finding_digests", derived_finding_digests)
+        object.__setattr__(self, "allowed_paths", tuple(allowed_path_tokens))
+        object.__setattr__(self, "packet_digest", packet_digest)
         expected = _body_digest(self._body())
-        if self.packet_digest is None:
+        if packet_digest is None:
             object.__setattr__(self, "packet_digest", expected)
         else:
-            _validate_stored_digest(self.packet_digest, self._body())
+            _validate_stored_digest(
+                self.packet_digest,
+                self._body(),
+                code="CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                detail="Repair Packet digest changed",
+            )
 
     @classmethod
     def from_findings(
@@ -2288,14 +2616,96 @@ class RepairPacket:
             required_effects=effects,
         )
 
+    @classmethod
+    def from_review(
+        cls,
+        *,
+        parent: CandidateGateParent,
+        candidate_receipt: CandidateReceipt,
+        subject: ReviewSubject,
+        result: FormalReviewResult,
+        allowed_path_tokens: tuple[str, ...],
+        required_check_ids: tuple[str, ...],
+        repair_instructions: tuple[str, ...],
+    ) -> "RepairPacket":
+        if (
+            result.subject_digest != subject.digest
+            or subject.parent_digest != parent.digest
+            or subject.candidate_receipt_digest != candidate_receipt.digest
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "Review result, parent, Subject, and CandidateReceipt are not bound",
+            )
+        ledger = ReviewFindingLedger.from_review_result(result)
+        return cls(
+            parent_digest=parent.digest,
+            rejected_candidate_digest=subject.candidate_digest,
+            candidate_receipt=candidate_receipt,
+            prior_review_subject_digest=subject.digest,
+            assurance_requirement_digest=subject.assurance_requirement_digest,
+            finding_ledger=ledger,
+            required_disposition_ids=tuple(
+                entry.finding.finding_id for entry in ledger.entries
+            ),
+            allowed_path_tokens=tuple(sorted(set(allowed_path_tokens))),
+            required_check_ids=tuple(sorted(set(required_check_ids))),
+            protocol_version=subject.protocol_version,
+            repair_instructions=tuple(sorted(set(repair_instructions))),
+            required_effects=tuple(
+                sorted(
+                    {
+                        effect
+                        for entry in ledger.entries
+                        for effect in entry.finding.required_effects
+                    }
+                )
+            ),
+        )
+
+    def with_ledger(
+        self,
+        entries: tuple[ReviewFindingLedgerEntry, ...],
+    ) -> "RepairPacket":
+        if self.finding_ledger is None:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "legacy Repair Packet has no complete Finding ledger",
+            )
+        ledger = ReviewFindingLedger(entries=entries)
+        if tuple(entry.finding.finding_id for entry in ledger.entries) != (
+            self.required_disposition_ids
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "replacement ledger truncates required Findings",
+            )
+        return replace(self, finding_ledger=ledger, packet_digest=None)
+
     def _body(self) -> dict[str, Any]:
+        if self.finding_ledger is None:
+            return {
+                "kind": "repair_packet.v1",
+                "parent_digest": self.parent_digest,
+                "rejected_candidate_digest": self.rejected_candidate_digest,
+                "prior_review_subject_digest": self.prior_review_subject_digest,
+                "finding_digests": list(self.finding_digests or ()),
+                "allowed_paths": list(self.allowed_paths or ()),
+                "required_effects": list(self.required_effects),
+            }
         return {
             "kind": "repair_packet.v1",
             "parent_digest": self.parent_digest,
             "rejected_candidate_digest": self.rejected_candidate_digest,
+            "candidate_receipt": self.candidate_receipt.canonical(),
             "prior_review_subject_digest": self.prior_review_subject_digest,
-            "finding_digests": list(self.finding_digests),
-            "allowed_paths": list(self.allowed_paths),
+            "assurance_requirement_digest": self.assurance_requirement_digest,
+            "finding_ledger": self.finding_ledger.canonical(),
+            "required_disposition_ids": list(self.required_disposition_ids),
+            "allowed_path_tokens": list(self.allowed_path_tokens),
+            "required_check_ids": list(self.required_check_ids),
+            "protocol_version": self.protocol_version,
+            "repair_instructions": list(self.repair_instructions),
             "required_effects": list(self.required_effects),
         }
 
@@ -2307,10 +2717,131 @@ class RepairPacket:
     def canonical(self) -> dict[str, Any]:
         return {**self._body(), "packet_digest": self.digest}
 
+    @property
+    def candidate_receipt_digest(self) -> str:
+        if self.candidate_receipt is None:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_PACKET_INVALID",
+                "legacy Repair Packet has no CandidateReceipt",
+            )
+        return self.candidate_receipt.digest
 
-@dataclass(frozen=True)
-class RepairVerificationRequest:
-    """The bounded successor action input; it cannot request a new Review."""
+
+@dataclass(frozen=True, slots=True)
+class RepairDelta:
+    prior_candidate_commit_oid: str
+    prior_candidate_tree_oid: str
+    prior_diff_record_digest: str
+    repaired_candidate_commit_oid: str
+    repaired_candidate_tree_oid: str
+    repaired_diff_record_digest: str
+    added_path_tokens: tuple[str, ...]
+    removed_path_tokens: tuple[str, ...]
+    changed_path_tokens: tuple[str, ...]
+    delta_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "prior_candidate_commit_oid",
+            "prior_candidate_tree_oid",
+            "repaired_candidate_commit_oid",
+            "repaired_candidate_tree_oid",
+        ):
+            _require_object_id(getattr(self, field_name), field_name)
+        for field_name in (
+            "prior_diff_record_digest",
+            "repaired_diff_record_digest",
+        ):
+            _require_digest(getattr(self, field_name), field_name)
+        token_groups = (
+            self.added_path_tokens,
+            self.removed_path_tokens,
+            self.changed_path_tokens,
+        )
+        for value, field_name in zip(
+            token_groups,
+            (
+                "added_path_tokens",
+                "removed_path_tokens",
+                "changed_path_tokens",
+            ),
+            strict=True,
+        ):
+            _require_text_tuple(value, field_name)
+            if value != tuple(sorted(set(value))):
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_REPAIR_DELTA_INVALID",
+                    f"{field_name} is not sorted and unique",
+                )
+        if any(
+            set(left) & set(right)
+            for left, right in (
+                (self.added_path_tokens, self.removed_path_tokens),
+                (self.added_path_tokens, self.changed_path_tokens),
+                (self.removed_path_tokens, self.changed_path_tokens),
+            )
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_DELTA_INVALID",
+                "RepairDelta path classifications overlap",
+            )
+        expected = digest_value(self._body())
+        if self.delta_digest is None:
+            object.__setattr__(self, "delta_digest", expected)
+        else:
+            _validate_stored_digest(
+                self.delta_digest,
+                self._body(),
+                code="CANDIDATE_GATE_REPAIR_DELTA_INVALID",
+                detail="RepairDelta digest changed",
+            )
+
+    @classmethod
+    def from_records(
+        cls,
+        prior: CandidateDiffRecordV1,
+        repaired: CandidateDiffRecordV1,
+    ) -> "RepairDelta":
+        old = set(prior.changed_path_tokens)
+        new = set(repaired.changed_path_tokens)
+        return cls(
+            prior_candidate_commit_oid=prior.candidate_commit_oid,
+            prior_candidate_tree_oid=prior.candidate_tree_oid,
+            prior_diff_record_digest=prior.digest,
+            repaired_candidate_commit_oid=repaired.candidate_commit_oid,
+            repaired_candidate_tree_oid=repaired.candidate_tree_oid,
+            repaired_diff_record_digest=repaired.digest,
+            added_path_tokens=tuple(sorted(new - old)),
+            removed_path_tokens=tuple(sorted(old - new)),
+            changed_path_tokens=tuple(sorted(old & new)),
+        )
+
+    def _body(self) -> dict[str, object]:
+        return {
+            "kind": "repair_delta.v1",
+            "prior_candidate_commit_oid": self.prior_candidate_commit_oid,
+            "prior_candidate_tree_oid": self.prior_candidate_tree_oid,
+            "prior_diff_record_digest": self.prior_diff_record_digest,
+            "repaired_candidate_commit_oid": self.repaired_candidate_commit_oid,
+            "repaired_candidate_tree_oid": self.repaired_candidate_tree_oid,
+            "repaired_diff_record_digest": self.repaired_diff_record_digest,
+            "added_path_tokens": list(self.added_path_tokens),
+            "removed_path_tokens": list(self.removed_path_tokens),
+            "changed_path_tokens": list(self.changed_path_tokens),
+        }
+
+    @property
+    def digest(self) -> str:
+        assert self.delta_digest is not None
+        return self.delta_digest
+
+    def canonical(self) -> dict[str, object]:
+        return {**self._body(), "delta_digest": self.digest}
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyRepairVerificationRequest:
+    """Private compatibility input for manually constructed legacy packets."""
 
     parent_digest: str
     repair_packet_digest: str
@@ -2344,6 +2875,128 @@ class RepairVerificationRequest:
             "candidate": self.candidate.canonical(),
             "prior_review_subject_digest": self.prior_review_subject_digest,
             "action_kind": "repair_verify",
+        }
+
+    @property
+    def digest(self) -> str:
+        assert self.request_digest is not None
+        return self.request_digest
+
+    def canonical(self) -> dict[str, Any]:
+        return {**self._body(), "request_digest": self.digest}
+
+
+@dataclass(frozen=True, slots=True)
+class RepairVerificationRequest:
+    """The complete bounded successor action input."""
+
+    parent_digest: str
+    repair_packet_digest: str
+    candidate_receipt: CandidateReceipt
+    candidate: CandidateIdentity
+    review_subject: ReviewSubject
+    repair_delta: RepairDelta
+    finding_ledger: ReviewFindingLedger
+    required_check_evidence: tuple[CandidateCheckEvidence, ...]
+    request_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_digest(self.parent_digest, "parent_digest")
+        _require_digest(self.repair_packet_digest, "repair_packet_digest")
+        if (
+            type(self.candidate_receipt) is not CandidateReceipt
+            or type(self.candidate) is not CandidateIdentity
+            or type(self.review_subject) is not ReviewSubject
+            or type(self.repair_delta) is not RepairDelta
+            or type(self.finding_ledger) is not ReviewFindingLedger
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_REQUEST_INVALID",
+                "Repair Verification request contains a non-exact typed value",
+            )
+        if type(self.required_check_evidence) is not tuple or any(
+            type(check) is not CandidateCheckEvidence
+            for check in self.required_check_evidence
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_REQUEST_INVALID",
+                "Repair Verification checks are not an exact tuple",
+            )
+        if (
+            self.candidate_receipt.parent_digest != self.parent_digest
+            or self.review_subject.parent_digest != self.parent_digest
+            or self.review_subject.action_kind != "repair_verify"
+            or self.review_subject.repair_packet_digest
+            != self.repair_packet_digest
+            or self.review_subject.repair_delta_digest != self.repair_delta.digest
+            or self.review_subject.candidate_receipt_digest
+            != self.candidate_receipt.digest
+            or self.review_subject.candidate_digest != self.candidate.digest
+            or self.review_subject.candidate_commit_oid
+            != self.candidate.candidate_commit_oid
+            or self.review_subject.candidate_tree_oid
+            != self.candidate.candidate_tree_oid
+            or self.review_subject.diff_record_digest
+            != self.candidate_receipt.diff_record_digest
+            or self.candidate_receipt.candidate_commit_oid
+            != self.candidate.candidate_commit_oid
+            or self.candidate_receipt.candidate_tree_oid
+            != self.candidate.candidate_tree_oid
+            or self.repair_delta.repaired_candidate_commit_oid
+            != self.candidate_receipt.candidate_commit_oid
+            or self.repair_delta.repaired_candidate_tree_oid
+            != self.candidate_receipt.candidate_tree_oid
+            or self.repair_delta.repaired_diff_record_digest
+            != self.candidate_receipt.diff_record_digest
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_REQUEST_INVALID",
+                "Repair Verification request identity is internally inconsistent",
+            )
+        check_digests = tuple(
+            check.digest for check in self.required_check_evidence
+        )
+        if (
+            self.candidate_receipt.base_commit_oid
+            != self.candidate.base_commit_oid
+            or self.candidate_receipt.base_tree_oid != self.candidate.base_tree_oid
+            or self.candidate_receipt.reported_reference
+            != self.candidate.reported_reference
+            or self.review_subject.base_commit_oid
+            != self.candidate.base_commit_oid
+            or self.review_subject.base_tree_oid != self.candidate.base_tree_oid
+            or len(set(check_digests)) != len(check_digests)
+            or tuple(sorted(check_digests))
+            != self.review_subject.check_evidence_digests
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_REQUEST_INVALID",
+                "Repair Verification request base, reference, or check identity is inconsistent",
+            )
+        expected = _body_digest(self._body())
+        if self.request_digest is None:
+            object.__setattr__(self, "request_digest", expected)
+        else:
+            _validate_stored_digest(
+                self.request_digest,
+                self._body(),
+                code="CANDIDATE_GATE_REPAIR_REQUEST_INVALID",
+                detail="Repair Verification request digest changed",
+            )
+
+    def _body(self) -> dict[str, Any]:
+        return {
+            "kind": "repair_verification_request.v1",
+            "parent_digest": self.parent_digest,
+            "repair_packet_digest": self.repair_packet_digest,
+            "candidate_receipt": self.candidate_receipt.canonical(),
+            "candidate": self.candidate.canonical(),
+            "review_subject": self.review_subject.canonical(),
+            "repair_delta": self.repair_delta.canonical(),
+            "finding_ledger": self.finding_ledger.canonical(),
+            "required_check_evidence": [
+                check.canonical() for check in self.required_check_evidence
+            ],
         }
 
     @property
@@ -2954,6 +3607,8 @@ class CandidateGate:
         self._assurance_policy = assurance_policy
         self._acceptance_facts = acceptance_facts
         self._diff_artifacts = diff_artifacts
+        self._review_results: dict[str, FormalReviewResult] = {}
+        self._review_transport_retries: set[str] = set()
 
     def _store_candidate_diff(
         self,
@@ -3226,22 +3881,104 @@ class CandidateGate:
             assurance_requirement=requirement.digest,
         )
 
-    def _review_primary(
+    def _invoke_review_action(
         self,
         parent: CandidateGateParent,
-        subject: ReviewSubject,
+        action: ReviewAction,
     ) -> FormalReviewResult:
         reviewer = self._formal_reviewer
         if reviewer is None:
             raise CandidateGateError(
                 "CANDIDATE_GATE_REVIEWER_UNAVAILABLE",
-                "Standard Assurance requires the CandidateGate Formal Reviewer",
+                "Assurance requires the CandidateGate Formal Reviewer",
             )
         self._validate_read_only_port(reviewer, "Formal Reviewer")
-        action = ReviewAction.for_subject(kind="formal_review", subject=subject)
         result = reviewer.review(action)
-        self._validate_review_result(parent, subject, result)
+        self._validate_review_result(parent, action.subject, result)
         return result
+
+    def _review_with_transport_retry(
+        self,
+        parent: CandidateGateParent,
+        action: ReviewAction,
+    ) -> FormalReviewResult:
+        try:
+            return self._invoke_review_action(parent, action)
+        except InvalidReviewTransport as transport_error:
+            if action.subject.digest in self._review_transport_retries:
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_REVIEW_TRANSPORT_RETRY_EXHAUSTED",
+                    "Review transport retry budget was already consumed for this ReviewSubject",
+                ) from transport_error
+            self._review_transport_retries.add(action.subject.digest)
+            retry = ReviewAction.for_subject(
+                kind="review_strong",
+                subject=action.subject,
+            )
+            if retry.subject.digest != action.subject.digest:
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_REVIEW_SUBJECT_INVALID",
+                    "review_strong retry changed ReviewSubject identity",
+                )
+            return self._invoke_review_action(parent, retry)
+
+    def _merge_review_results(
+        self,
+        subject: ReviewSubject,
+        results: tuple[FormalReviewResult, ...],
+    ) -> FormalReviewResult:
+        by_id: dict[str, FormalReviewFinding] = {}
+        for result in results:
+            for finding in result.findings:
+                prior = by_id.get(finding.finding_id)
+                if prior is not None and prior.digest != finding.digest:
+                    raise CandidateGateError(
+                        "CANDIDATE_GATE_EVIDENCE_INVALID",
+                        "Reviewers returned conflicting Findings with one ID",
+                    )
+                by_id[finding.finding_id] = finding
+        return FormalReviewResult(
+            subject_digest=subject.digest,
+            findings=tuple(by_id[key] for key in sorted(by_id)),
+        )
+
+    def _run_assurance_review(
+        self,
+        parent: CandidateGateParent,
+        subject: ReviewSubject,
+        requirement: AssuranceRequirement,
+    ) -> FormalReviewResult | None:
+        cached = self._review_results.get(subject.digest)
+        if cached is not None:
+            self._validate_review_result(parent, subject, cached)
+            return cached
+        if requirement.mode is AssuranceMode.NO_REVIEW:
+            return FormalReviewResult(subject_digest=subject.digest, findings=())
+        if (
+            requirement.mode is AssuranceMode.STRICT
+            and requirement.specialist_policy_id is None
+        ):
+            return None
+        primary = self._review_with_transport_retry(
+            parent,
+            ReviewAction.for_subject(kind="formal_review", subject=subject),
+        )
+        results = [primary]
+        if requirement.mode is AssuranceMode.STRICT:
+            assert requirement.specialist_policy_id is not None
+            results.append(
+                self._review_with_transport_retry(
+                    parent,
+                    ReviewAction.for_subject(
+                        kind="specialist_review",
+                        subject=subject,
+                        specialist_policy_id=requirement.specialist_policy_id,
+                    ),
+                )
+            )
+        merged = self._merge_review_results(subject, tuple(results))
+        self._review_results[subject.digest] = merged
+        return merged
 
     def _audit_without_second_readback(
         self,
@@ -3291,17 +4028,20 @@ class CandidateGate:
             requirement=requirement,
         )
         if requirement.mode is AssuranceMode.NO_REVIEW:
+            ledger = ReviewFindingLedger(entries=())
             return CandidateGateResult(
                 status=CandidateGateStatus.REVIEW_ACCEPTED,
                 evidence=(candidate_evidence,),
                 review_subject=subject,
+                review_finding_ledger_digest=ledger.digest,
             )
-        if requirement.mode is AssuranceMode.STRICT:
-            raise CandidateGateError(
-                "CANDIDATE_GATE_ASSURANCE_INVALID",
-                "Strict Assurance is enabled only after the Task 6 matrix lands",
+        review_result = self._run_assurance_review(parent, subject, requirement)
+        if review_result is None:
+            return CandidateGateResult(
+                status=CandidateGateStatus.DECISION_REQUIRED,
+                evidence=(candidate_evidence,),
+                review_subject=subject,
             )
-        review_result = self._review_primary(parent, subject)
         findings = tuple(sorted(review_result.findings, key=lambda finding: finding.digest))
         scope_findings = tuple(finding for finding in findings if finding.scope_escape)
         if scope_findings:
@@ -3323,23 +4063,34 @@ class CandidateGate:
         hard_findings = tuple(
             finding for finding in findings if finding.severity == "hard"
         )
+        ledger = ReviewFindingLedger.from_review_result(review_result)
         if hard_findings:
-            packet = RepairPacket.from_findings(
-                parent,
-                audit.candidate,
-                subject,
-                hard_findings,
+            packet = RepairPacket.from_review(
+                parent=parent,
+                candidate_receipt=receipt,
+                subject=subject,
+                result=review_result,
+                allowed_path_tokens=readback.diff_record.changed_path_tokens,
+                required_check_ids=requirement.required_check_ids,
+                repair_instructions=tuple(
+                    sorted(
+                        f"{finding.finding_id}:{finding.message}"
+                        for finding in findings
+                    )
+                ),
             )
             return CandidateGateResult(
                 status=CandidateGateStatus.REPAIR_REQUIRED,
                 evidence=(candidate_evidence, *findings),
                 repair_packet=packet,
                 review_subject=subject,
+                review_finding_ledger_digest=ledger.digest,
             )
         return CandidateGateResult(
             status=CandidateGateStatus.REVIEW_ACCEPTED,
             evidence=(candidate_evidence, *findings),
             review_subject=subject,
+            review_finding_ledger_digest=ledger.digest,
         )
 
     def audit_candidate(
@@ -3376,12 +4127,21 @@ class CandidateGate:
                 status=CandidateGateStatus.ORDINARY_REJECTED,
                 evidence=(candidate_evidence,),
             )
+        if (
+            self._candidate_reader is not None
+            and self._check_runner is not None
+            and self._assurance_policy is not None
+        ):
+            return self.gate_candidate(
+                parent,
+                audit.candidate.reported_reference,
+            )
         request = FormalReviewRequest.from_parent(parent, audit)
         reviewer = self._formal_reviewer
         if reviewer is None:
             raise CandidateGateError(
-                "CANDIDATE_GATE_REVIEWER_UNAVAILABLE",
-                "a clean deterministic Candidate requires the CandidateGate Formal Reviewer",
+                "CANDIDATE_GATE_LEGACY_REVIEW_INCOMPLETE",
+                "legacy clean review lacks the complete CandidateGate assurance inputs",
             )
         self._validate_read_only_port(reviewer, "Formal Reviewer")
         review_result = reviewer.review(request)
@@ -3402,26 +4162,9 @@ class CandidateGate:
                 plan_invalidation_receipt=receipt,
                 plan_invalidation_report=report,
             )
-        hard_findings = tuple(
-            finding for finding in findings if finding.severity == "hard"
-        )
-        if hard_findings:
-            packet = RepairPacket.from_findings(
-                parent,
-                audit.candidate,
-                request,
-                hard_findings,
-            )
-            return CandidateGateResult(
-                status=CandidateGateStatus.REPAIR_REQUIRED,
-                evidence=(candidate_evidence, *finding_evidence),
-                repair_packet=packet,
-                review_subject=request,
-            )
-        return CandidateGateResult(
-            status=CandidateGateStatus.REVIEW_ACCEPTED,
-            evidence=(candidate_evidence, *finding_evidence),
-            review_subject=request,
+        raise CandidateGateError(
+            "CANDIDATE_GATE_LEGACY_REVIEW_INCOMPLETE",
+            "legacy clean review lacks the complete CandidateGate assurance inputs",
         )
 
     def _read_authoritative_candidate(
@@ -3536,24 +4279,24 @@ class CandidateGate:
             )
         return readback
 
-    def verify_repair(
+    def _verify_legacy_repair(
         self,
         parent: CandidateGateParent,
         packet: RepairPacket,
         candidate: CandidateIdentity,
     ) -> CandidateGateResult:
-        """Verify a bounded Repair Packet without reopening Formal Review."""
+        """Retain the private manual-packet repair-verification seam.
 
-        self._validate_parent(parent)
-        self._validate_repair_packet(parent, packet)
-        if type(candidate) is not CandidateIdentity:
-            raise CandidateGateError(
-                "CANDIDATE_GATE_EVIDENCE_INVALID",
-                "Repair Verification requires an exact CandidateIdentity",
-            )
+        CandidateGate never produces this legacy packet shape.  It remains
+        readable only for predecessor callers that constructed a
+        ``RepairPacket`` manually before the complete Receipt/ledger contract
+        existed; all new repair production uses ``verify_repair``'s complete
+        continuation below.
+        """
+
         readback = self._read_authoritative_repair_candidate(parent, candidate)
         candidate = readback.candidate
-        request = RepairVerificationRequest(
+        request = _LegacyRepairVerificationRequest(
             parent_digest=parent.digest,
             repair_packet_digest=packet.digest,
             candidate=candidate,
@@ -3568,14 +4311,9 @@ class CandidateGate:
         self._validate_read_only_port(verifier, "Repair Verifier")
         result = verifier.verify(request)
         self._validate_repair_result(request, result)
-        allowed_paths = set(packet.allowed_paths)
+        allowed_paths = set(packet.allowed_paths or ())
         candidate_paths = set(candidate.changed_path_tokens)
         reported_paths = set(result.scope_escape_paths)
-        # The verifier is a read-only observer.  Its claim cannot enlarge the
-        # repair boundary, and an allowed path is not a Campaign-level scope
-        # escape merely because the verifier mentioned it.  CandidateGate
-        # derives the authoritative escape set from the exact repaired
-        # Candidate paths and fails closed on an unverifiable extra claim.
         if reported_paths & allowed_paths:
             raise CandidateGateError(
                 "CANDIDATE_GATE_REPAIR_SCOPE_INVALID",
@@ -3646,6 +4384,221 @@ class CandidateGate:
             ),
             evidence=(verification_evidence,),
             repair_packet=packet,
+        )
+
+    def verify_repair(
+        self,
+        parent: CandidateGateParent,
+        packet: RepairPacket,
+        candidate: CandidateIdentity,
+    ) -> CandidateGateResult:
+        """Verify one complete Repair Packet as a bounded continuation."""
+
+        self._validate_parent(parent)
+        self._validate_repair_packet(parent, packet)
+        if type(candidate) is not CandidateIdentity:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_EVIDENCE_INVALID",
+                "Repair Verification requires an exact CandidateIdentity",
+            )
+        if packet.candidate_receipt is None or packet.finding_ledger is None:
+            return self._verify_legacy_repair(
+                parent,
+                packet,
+                candidate,
+            )
+        prior_receipt = packet.candidate_receipt
+        if not packet.finding_ledger.is_complete:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_LEDGER_INVALID",
+                "every prior Finding requires a completed disposition",
+            )
+
+        readback = self._read_authoritative_repair_candidate(parent, candidate)
+        repaired_record = self._store_candidate_diff(readback.diff_record)
+        readback = replace(
+            readback,
+            diff_record=repaired_record,
+            readback_digest=None,
+        )
+        repaired_receipt = CandidateReceipt.from_readback(
+            parent=parent,
+            reported_reference=candidate.reported_reference,
+            readback=readback,
+        )
+        store = self._diff_artifacts
+        if store is None:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_DIFF_ARTIFACT_INVALID",
+                "Repair Verification lacks the prior Candidate diff Artifact",
+            )
+        prior_record = store.read(packet.candidate_receipt.diff_record_digest)
+        if (
+            type(prior_record) is not CandidateDiffRecordV1
+            or prior_record.digest != packet.candidate_receipt.diff_record_digest
+            or prior_record.candidate_commit_oid
+            != packet.candidate_receipt.candidate_commit_oid
+            or prior_record.candidate_tree_oid
+            != packet.candidate_receipt.candidate_tree_oid
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_DIFF_ARTIFACT_INVALID",
+                "prior Candidate diff Artifact changed before Repair Verification",
+            )
+        if (
+            prior_record.base_commit_oid != prior_receipt.base_commit_oid
+            or prior_record.base_tree_oid != prior_receipt.base_tree_oid
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_BASE_INVALID",
+                "prior Candidate diff Artifact base is not bound to its receipt",
+            )
+        if (
+            readback.candidate.base_commit_oid != prior_receipt.base_commit_oid
+            or readback.candidate.base_tree_oid != prior_receipt.base_tree_oid
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_BASE_INVALID",
+                "repaired Candidate base changed from the prior receipt",
+            )
+        delta = RepairDelta.from_records(prior_record, repaired_record)
+        if (
+            delta.prior_candidate_commit_oid != prior_receipt.candidate_commit_oid
+            or delta.prior_candidate_tree_oid != prior_receipt.candidate_tree_oid
+            or delta.prior_diff_record_digest != prior_receipt.diff_record_digest
+            or delta.repaired_candidate_commit_oid
+            != repaired_receipt.candidate_commit_oid
+            or delta.repaired_candidate_tree_oid != repaired_receipt.candidate_tree_oid
+            or delta.repaired_diff_record_digest != repaired_receipt.diff_record_digest
+            or delta.repaired_candidate_commit_oid
+            != readback.candidate.candidate_commit_oid
+            or delta.repaired_candidate_tree_oid
+            != readback.candidate.candidate_tree_oid
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_REQUEST_INVALID",
+                "RepairDelta is not bound to the prior and repaired Candidate receipts",
+            )
+        escaped_paths = tuple(
+            sorted(
+                set(repaired_record.changed_path_tokens)
+                - set(packet.allowed_path_tokens)
+            )
+        )
+        if escaped_paths:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_SCOPE_INVALID",
+                "repaired Candidate changed paths outside Repair Packet scope: "
+                + ",".join(escaped_paths),
+            )
+
+        check_runner = self._check_runner
+        assurance_policy = self._assurance_policy
+        if check_runner is None or assurance_policy is None:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_ADAPTER_INVALID",
+                "Repair Verification requires checks and Assurance policy",
+            )
+        checks = check_runner.run(parent, readback)
+        if type(checks) is not tuple or any(
+            type(check) is not CandidateCheckEvidence for check in checks
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_CHECK_INVALID",
+                "Repair Verification checks are not an exact immutable tuple",
+            )
+        check_ids = tuple(check.check_id for check in checks)
+        if len(set(check_ids)) != len(check_ids):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_CHECK_INVALID",
+                "Repair Verification checks contain duplicate check IDs",
+            )
+        by_id = {check.check_id: check for check in checks}
+        if set(by_id) != set(packet.required_check_ids) or any(
+            by_id[check_id].outcome != "passed"
+            for check_id in packet.required_check_ids
+        ):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_CHECK_INVALID",
+                "Repair Verification lacks an exact passing required-check set",
+            )
+        required_checks = tuple(by_id[key] for key in sorted(by_id))
+        requirement = assurance_policy.derive(parent, readback, required_checks)
+        if requirement.digest != packet.assurance_requirement_digest:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_ASSURANCE_INVALID",
+                "Repair changed the frozen Assurance Requirement",
+            )
+        audit = self._audit_readback(parent, readback, required_checks, requirement)
+        initial_subject = ReviewSubject.from_assurance(
+            parent=parent,
+            candidate_receipt=repaired_receipt,
+            readback=readback,
+            audit=audit,
+            checks=required_checks,
+            requirement=requirement,
+        )
+        repair_subject = replace(
+            initial_subject,
+            action_kind="repair_verify",
+            prior_review_subject_digest=packet.prior_review_subject_digest,
+            repair_packet_digest=packet.digest,
+            repair_delta_digest=delta.digest,
+            subject_digest=None,
+        )
+        request = RepairVerificationRequest(
+            parent_digest=parent.digest,
+            repair_packet_digest=packet.digest,
+            candidate_receipt=repaired_receipt,
+            candidate=readback.candidate,
+            review_subject=repair_subject,
+            repair_delta=delta,
+            finding_ledger=packet.finding_ledger,
+            required_check_evidence=required_checks,
+        )
+        verifier = self._repair_verifier
+        if verifier is None:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_REPAIR_VERIFIER_UNAVAILABLE",
+                "Repair Verification requires the CandidateGate Repair Verifier",
+            )
+        self._validate_read_only_port(verifier, "Repair Verifier")
+        verification = verifier.verify(request)
+        self._validate_repair_result(request, verification)
+        verification_evidence = RepairVerificationEvidence(
+            parent_digest=parent.digest,
+            candidate_digest=readback.candidate.digest,
+            repair_packet_digest=packet.digest,
+            request_digest=request.digest,
+            accepted=verification.accepted,
+            scope_escape_paths=(),
+            details=verification.details,
+        )
+        accepted = None
+        if verification.accepted:
+            accepted = self._make_accepted_candidate_receipt(
+                parent=parent,
+                candidate_receipt=repaired_receipt,
+                candidate_diff_record=repaired_record,
+                review_subject=repair_subject,
+                assurance_requirement=requirement,
+                evidence=(verification_evidence,),
+                review_finding_ledger_digest=packet.finding_ledger.digest,
+            )
+        return CandidateGateResult(
+            status=(
+                CandidateGateStatus.REPAIR_ACCEPTED
+                if verification.accepted
+                else CandidateGateStatus.REPAIR_REJECTED
+            ),
+            evidence=(verification_evidence,),
+            repair_packet=packet,
+            candidate_receipt=repaired_receipt,
+            candidate_diff_record=repaired_record,
+            assurance_requirement=requirement,
+            review_subject=repair_subject,
+            accepted_candidate_receipt=accepted,
+            review_finding_ledger_digest=packet.finding_ledger.digest,
         )
 
     def replay_plan_invalidation(
@@ -4105,20 +5058,26 @@ __all__ = [
     "CandidateReadbackPort",
     "CandidateReceipt",
     "DigestEvidence",
+    "InvalidReviewTransport",
     "InteractionClassification",
     "InteractionKey",
     "derive_interaction_keys",
     "record_has_gitlink_change",
     "DeterministicAuditFailure",
     "FormalReviewer",
+    "ReviewFinding",
     "FormalReviewFinding",
     "FormalReviewRequest",
     "FormalReviewResult",
+    "ReviewFindingDisposition",
+    "ReviewFindingLedgerEntry",
+    "ReviewFindingLedger",
     "ReviewAction",
     "ReviewSubject",
     "PlanInvalidationEvidence",
     "PlanInvalidationReporter",
     "RepairPacket",
+    "RepairDelta",
     "RepairVerifier",
     "RepairVerificationEvidence",
     "RepairVerificationRequest",

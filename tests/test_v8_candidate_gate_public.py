@@ -119,6 +119,18 @@ class _ReceiptReporter:
         )
 
 
+class _DiffStore:
+    def __init__(self):
+        self.records = {}
+
+    def put(self, record):
+        self.records[record.digest] = record
+        return record.digest
+
+    def read(self, digest):
+        return self.records.get(digest)
+
+
 def _audit(parent, *, kind="scope", route=None, code="PERSISTENT_SCOPE"):
     from gwo_v8.candidate_gate import (
         AuditFailureKind,
@@ -488,25 +500,42 @@ def test_public_candidate_gate_advance_inspect_retains_source_evidence_lineage(
     assert run.plan_invalidation.source_evidence_digests == (finding.digest,)
 
 
-def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
+def test_public_repair_scope_escape_fails_before_repair_verifier(tmp_path):
     import gwo_v8
     from gwo_v8.candidate_gate import (
+        AssuranceMode,
+        AssuranceRequirement,
         CandidateGate,
+        CandidateAcceptanceFacts,
+        CandidateCheckEvidence,
         CandidateDiffEntryV1,
         CandidateDiffRecordV1,
+        CandidateGateError,
         CandidateReadback,
         FormalReviewFinding,
         FormalReviewResult,
         RepairVerificationResult,
+        ReviewFindingDisposition,
     )
+    from gwo_v8._canonical import digest_value
     from gwo_v8.runtime_gateway import CapabilityPolicy, CapabilityPolicyProof
 
     _control, _repository, gateway, _artifacts, _source, host, handle, _harness = _campaign(
         tmp_path, _successor_payload()
     )
     parent = _candidate_parent(host, handle)
+    protocol_path = "c3JjL3Byb3RvY29sLnB5"
+    outside_path = "c3JjL291dHNpZGUucHk"
     audit = _audit(parent)
-    audit = type(audit)(parent_digest=audit.parent_digest, candidate=audit.candidate)
+    audit_candidate = type(audit.candidate)(
+        reported_reference=audit.candidate.reported_reference,
+        base_commit_oid=audit.candidate.base_commit_oid,
+        base_tree_oid=audit.candidate.base_tree_oid,
+        candidate_commit_oid=audit.candidate.candidate_commit_oid,
+        candidate_tree_oid=audit.candidate.candidate_tree_oid,
+        changed_path_tokens=(protocol_path,),
+    )
+    audit = type(audit)(parent_digest=audit.parent_digest, candidate=audit_candidate)
 
     class Reviewer:
         capability_policy_proof = CapabilityPolicyProof(
@@ -515,13 +544,14 @@ def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
         )
 
         def review(self, request):
+            subject = getattr(request, "subject", request)
             return FormalReviewResult(
-                subject_digest=request.digest,
+                subject_digest=subject.digest,
                 findings=(
                     FormalReviewFinding(
-                        parent_digest=request.parent_digest,
-                        candidate_digest=request.candidate_digest,
-                        review_subject_digest=request.digest,
+                        parent_digest=subject.parent_digest,
+                        candidate_digest=subject.candidate_digest,
+                        review_subject_digest=subject.digest,
                         finding_id="finding:repair",
                         severity="hard",
                         code="CHECK_REQUIRES_REPAIR",
@@ -530,13 +560,48 @@ def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
                 ),
             )
 
+    class Checks:
+        def run(self, _parent, readback):
+            return (
+                CandidateCheckEvidence(
+                    check_id="check:unit",
+                    candidate_tree_oid=readback.candidate.candidate_tree_oid,
+                    outcome="passed",
+                    definition_digest="a" * 64,
+                    observation_digest=digest_value(
+                        {
+                            "kind": "candidate_check_observation.v1",
+                            "check_id": "check:unit",
+                            "candidate_tree_oid": readback.candidate.candidate_tree_oid,
+                            "diff_record_digest": readback.diff_record.digest,
+                            "outcome": "passed",
+                            "failure_digest": None,
+                        }
+                    ),
+                ),
+            )
+
+    class Policy:
+        def derive(self, _parent, _readback, _checks):
+            return AssuranceRequirement(
+                policy_id="policy:candidate-assurance",
+                policy_version="1",
+                mode=AssuranceMode.STANDARD,
+                required_check_ids=("check:unit",),
+                standards=("standard:repository",),
+            )
+
     class Verifier:
         capability_policy_proof = CapabilityPolicyProof(
             capability_policy=CapabilityPolicy(worker_can_edit_issues=False),
             authority_record_digest="9" * 64,
         )
 
+        def __init__(self):
+            self.calls = 0
+
         def verify(self, request):
+            self.calls += 1
             # Deliberately omit the escape: CandidateGate must derive it from
             # the authoritative repaired Candidate delta, not trust the port.
             return RepairVerificationResult(
@@ -554,7 +619,7 @@ def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
         candidate_commit_oid="5" * 40,
         candidate_tree_oid="6" * 40,
         # The caller deliberately omits the out-of-scope path.
-        changed_paths=("src/protocol.py",),
+        changed_path_tokens=(protocol_path,),
     )
 
     class Reader:
@@ -566,19 +631,23 @@ def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
             candidate = audit.candidate if reference.endswith("candidate") else repaired
             paths = candidate.changed_paths
             diff = CandidateDiffRecordV1(
-                repository=repository,
-                object_format="sha1",
+                schema_version="CandidateDiffRecordV1",
+                repository_object_format="sha1",
                 base_commit_oid=candidate.base_commit_oid,
                 base_tree_oid=candidate.base_tree_oid,
                 candidate_commit_oid=candidate.candidate_commit_oid,
                 candidate_tree_oid=candidate.candidate_tree_oid,
                 entries=tuple(
                     CandidateDiffEntryV1(
-                        side="candidate",
-                        path=path,
-                        mode="100644",
-                        object_type="blob",
-                        object_oid=("7" if path == "src/protocol.py" else "8") * 40,
+                        old_path=None,
+                        new_path=path,
+                        change_kind="add",
+                        old_mode=None,
+                        new_mode="100644",
+                        old_object_type=None,
+                        new_object_type="blob",
+                        old_oid=None,
+                        new_oid=("7" if path == protocol_path else "8") * 40,
                     )
                     for path in paths
                 ),
@@ -590,29 +659,37 @@ def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
                     base_tree_oid=candidate.base_tree_oid,
                     candidate_commit_oid=candidate.candidate_commit_oid,
                     candidate_tree_oid=candidate.candidate_tree_oid,
-                    changed_paths=("src/outside.py", "src/protocol.py"),
+                    changed_path_tokens=(outside_path, protocol_path),
                 )
                 diff = CandidateDiffRecordV1(
-                    repository=repository,
-                    object_format="sha1",
+                    schema_version="CandidateDiffRecordV1",
+                    repository_object_format="sha1",
                     base_commit_oid=candidate.base_commit_oid,
                     base_tree_oid=candidate.base_tree_oid,
                     candidate_commit_oid=candidate.candidate_commit_oid,
                     candidate_tree_oid=candidate.candidate_tree_oid,
                     entries=(
                         CandidateDiffEntryV1(
-                            side="candidate",
-                            path="src/outside.py",
-                            mode="100644",
-                            object_type="blob",
-                            object_oid="8" * 40,
+                            old_path=None,
+                            new_path=outside_path,
+                            change_kind="add",
+                            old_mode=None,
+                            new_mode="100644",
+                            old_object_type=None,
+                            new_object_type="blob",
+                            old_oid=None,
+                            new_oid="8" * 40,
                         ),
                         CandidateDiffEntryV1(
-                            side="candidate",
-                            path="src/protocol.py",
-                            mode="100644",
-                            object_type="blob",
-                            object_oid="7" * 40,
+                            old_path=None,
+                            new_path=protocol_path,
+                            change_kind="add",
+                            old_mode=None,
+                            new_mode="100644",
+                            old_object_type=None,
+                            new_object_type="blob",
+                            old_oid=None,
+                            new_oid="7" * 40,
                         ),
                     ),
                 )
@@ -624,58 +701,46 @@ def test_public_repair_scope_escape_enters_same_advance_inspect_path(tmp_path):
 
     reporter = _ReceiptReporter()
     reader = Reader()
+    verifier = Verifier()
+    diff_store = _DiffStore()
     gate = CandidateGate(
         invalidation_reporter=reporter,
         candidate_reader=reader,
         formal_reviewer=Reviewer(),
-        repair_verifier=Verifier(),
+        repair_verifier=verifier,
+        check_runner=Checks(),
+        assurance_policy=Policy(),
+        acceptance_facts=CandidateAcceptanceFacts(
+            target_branch="main",
+            integration_node_key="integration:issue:109",
+            accepted_sequence=1,
+            check_environment_digest="6" * 64,
+            delivery_identity_digest="7" * 64,
+            protected_surfaces=("protected/path",),
+        ),
+        diff_artifacts=diff_store,
     )
-    reviewed = gate.audit_candidate(parent, audit)
-    result = gate.verify_repair(parent, reviewed.repair_packet, repaired)
+    reviewed = gate.gate_candidate(parent, "refs/heads/candidate")
+    assert reviewed.repair_packet is not None
+    assert reviewed.repair_packet.candidate_receipt is reviewed.candidate_receipt
+    assert reviewed.repair_packet.finding_ledger is not None
+    assert reviewed.repair_packet.required_check_ids == ("check:unit",)
+    complete_ledger = reviewed.repair_packet.finding_ledger.with_disposition(
+        finding_id=reviewed.repair_packet.finding_ledger.entries[0].finding.finding_id,
+        disposition=ReviewFindingDisposition.FIXED,
+        reason="the bounded repair is ready for verification",
+    )
+    packet = reviewed.repair_packet.with_ledger(complete_ledger.entries)
+    with pytest.raises(CandidateGateError) as raised:
+        gate.verify_repair(parent, packet, repaired)
 
-    assert result.status.value == "plan_invalidation_reported"
-    assert result.plan_invalidation_receipt is not None
-    verification_evidence = result.evidence[0]
-    plan_evidence = result.evidence[-1]
-    assert verification_evidence.kind == "repair_scope_escape"
-    assert verification_evidence.scope_escape_paths == ("src/outside.py",)
-    assert plan_evidence.source_kind == "repair_verification"
-    assert plan_evidence.invalidated_obligation == "repair packet allowed scope"
-    assert plan_evidence.required_effects == ("owner.persist.v1",)
-    assert plan_evidence.source_evidence_digest == verification_evidence.digest
-    assert {
-        item.get("kind") for item in plan_evidence.lineage_artifacts
-    } >= {
-        "candidate_identity.v1",
-        "repair_packet.v1",
-        "repair_verification_subject.v1",
-        "repair_verification_result.v1",
-        "repair_scope_escape.v1",
-        "candidate_diff_record.v1",
-    }
+    assert raised.value.code == "CANDIDATE_GATE_REPAIR_SCOPE_INVALID"
     assert reader.calls == [
         (parent.runtime_subject.repository, "refs/heads/candidate"),
         (parent.runtime_subject.repository, "refs/heads/repaired"),
     ]
-    assert reporter.calls == 1
-    gateway.payload = _payload_with_evidence(
-        _successor_payload(), result.plan_invalidation_report.evidence_digest
-    )
-    outcome = gwo_v8.advance(handle, plan_invalidation=result.plan_invalidation_receipt)
-    diagnostics = gwo_v8.inspect(handle)
-    run = next(item for item in diagnostics.work_runs if item.ticket_key == "issue:109")
-
-    assert outcome.status is diagnostics.status
-    # The public advance first persists the invalidation/quiescence boundary,
-    # then consumes the approved successor payload in the same call.  Therefore
-    # the current Work Run is the successor's fresh run, while the predecessor
-    # invalidation remains visible in revision lineage.
-    assert diagnostics.plan_revision_digest != parent.runtime_subject.plan_revision_digest
-    assert gateway.replan_progresses == 1
-    assert run.phase == "running"
-    assert diagnostics.revision_lineage[0].source_evidence_digests == (
-        result.evidence[0].digest,
-    )
+    assert verifier.calls == 0
+    assert reporter.calls == 0
 
 
 def test_public_candidate_invalidation_duplicate_advance_and_restart_does_not_repeat_transitions(

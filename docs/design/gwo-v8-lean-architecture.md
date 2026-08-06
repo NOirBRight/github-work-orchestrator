@@ -1225,3 +1225,36 @@ semantic or external effect. The Canary also proves the bounded
 zero-LLM-readback-plus-one-diagnosis stale-binding path. Passing makes V8 the
 default for new Campaigns in this repository before downstream repositories
 adopt it.
+
+## Candidate assurance, Review, and Repair
+
+CandidateGate is the sole Formal Review entry and remains a private deep
+module behind start, advance, and inspect. Its execution flow is:
+
+1. GitCandidateReader resolves the frozen base and reported reference to
+   exact commit and tree OIDs.
+2. CandidateGate constructs one CandidateDiffRecordV1 and one private
+   CandidateReceipt; ExecutionKernel persists the canonical receipt at
+   state["runs"][ticket_key]["candidate_receipt"].
+3. Scope, protected-surface, authority, and affected checks consume the
+   same diff. A deterministic failure stops before Review.
+4. AssuranceRequirement selects NO_REVIEW, STANDARD, or STRICT. STANDARD
+   allows one formal_review; STRICT adds at most one specialist_review;
+   malformed transport allows one same-Subject review_strong retry.
+5. Accepted Review emits AcceptedCandidateReceipt. Hard Findings emit a
+   RepairPacket containing the complete ReviewFindingLedger. repair_verify
+   rereads Git, computes RepairDelta, reruns required checks, and calls only
+   RepairVerifier.
+6. A proved Ticket-unsatisfiable escape goes only to #137 Plan
+   Invalidation. CandidateGate never performs Campaign classification or
+   successor planning.
+
+CandidateReceipt and AcceptedCandidateReceipt are distinct. The first is
+Kernel-persisted Work Run identity consumed read-only by #113. The second
+is delivery eligibility consumed by #116 and contains concrete
+InteractionKey values owned by candidate_gate.py. Neither value is a code
+Result; Result identity requires integration and target read-back.
+
+Reviewer and RepairVerifier ports accept only capability-proven read-only,
+no-delegation subjects. Candidate history, binding history, repair,
+restart, and replacement remain bounded by ADR-0063.
