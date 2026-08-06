@@ -458,6 +458,51 @@ def test_legacy_clean_review_never_emits_an_incomplete_repair_packet():
     assert reviewer.calls == 1
 
 
+def test_transport_retry_exhaustion_is_typed_after_strong_retry_transport_failure():
+    from gwo_v8.candidate_gate import (
+        CandidateGate,
+        CandidateGateError,
+        InvalidReviewTransport,
+        ReviewAction,
+        ReviewSubject,
+    )
+    from gwo_v8.runtime_gateway import CapabilityPolicy, CapabilityPolicyProof
+
+    parent = _parent()
+    subject = ReviewSubject.from_parent(parent, _clean_audit(parent))
+
+    class Reviewer:
+        capability_policy_proof = CapabilityPolicyProof(
+            capability_policy=CapabilityPolicy(worker_can_edit_issues=False),
+            authority_record_digest="9" * 64,
+        )
+
+        def __init__(self):
+            self.actions = []
+
+        def review(self, action):
+            self.actions.append(action.kind)
+            raise InvalidReviewTransport(f"transport failed for {action.kind}")
+
+    reviewer = Reviewer()
+    gate = CandidateGate(
+        invalidation_reporter=_RecordingPort(),
+        formal_reviewer=reviewer,
+    )
+
+    with pytest.raises(CandidateGateError) as raised:
+        gate._review_with_transport_retry(
+            parent,
+            ReviewAction.for_subject(kind="formal_review", subject=subject),
+        )
+
+    assert reviewer.actions == ["formal_review", "review_strong"]
+    assert raised.value.code == "CANDIDATE_GATE_REVIEW_TRANSPORT_RETRY_EXHAUSTED"
+    assert raised.value.detail == (
+        "Review transport retry budget was already consumed for this ReviewSubject"
+    )
+
+
 def test_repair_scope_escape_is_evidence_and_never_reopens_formal_review():
     from gwo_v8.candidate_gate import (
         CandidateGate,

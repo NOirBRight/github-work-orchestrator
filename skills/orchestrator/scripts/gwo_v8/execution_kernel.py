@@ -4723,6 +4723,68 @@ class ExecutionKernel:
             transcript_tail=tuple(transcript_tail),
         )
 
+    @staticmethod
+    def _candidate_history(
+        run: dict[str, Any],
+    ) -> tuple[list[str], list[str]]:
+        candidate_commit_oids = run.setdefault("candidate_commit_oids", [])
+        candidate_receipt_digests = run.setdefault("candidate_receipt_digests", [])
+        if type(candidate_commit_oids) is not list or any(
+            type(oid) is not str
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", oid) is None
+            for oid in candidate_commit_oids
+        ):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Candidate commit OID history is malformed",
+            )
+        if len(candidate_commit_oids) != len(set(candidate_commit_oids)):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Candidate commit OID history contains duplicates",
+            )
+        if type(candidate_receipt_digests) is not list or any(
+            type(digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for digest in candidate_receipt_digests
+        ):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Candidate receipt digest history is malformed",
+            )
+        if len(candidate_receipt_digests) != len(set(candidate_receipt_digests)):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Candidate receipt digest history contains duplicates",
+            )
+        return candidate_commit_oids, candidate_receipt_digests
+
+    def _record_candidate_history(
+        self,
+        run: dict[str, Any],
+        receipt: CandidateReceipt,
+    ) -> tuple[bool, bool]:
+        candidate_commit_oids, candidate_receipt_digests = self._candidate_history(run)
+        history_changed = False
+        if receipt.digest not in candidate_receipt_digests:
+            candidate_receipt_digests.append(receipt.digest)
+            history_changed = True
+        if receipt.candidate_commit_oid not in candidate_commit_oids:
+            candidate_commit_oids.append(receipt.candidate_commit_oid)
+            history_changed = True
+        return history_changed, len(candidate_commit_oids) > 3
+
+    @staticmethod
+    def _mark_candidate_budget_exhausted(
+        run: dict[str, Any],
+        ticket_key: str,
+    ) -> None:
+        run["phase"] = "decision"
+        run["reason"] = f"CandidateBudgetExhausted:{ticket_key}"
+        run["next_check_at"] = None
+        run["slot_held"] = False
+        run["claim_state"] = "released"
+
     def _persist_candidate_receipt(
         self,
         active: ActivePlanReadback,
@@ -4730,7 +4792,7 @@ class ExecutionKernel:
         run: dict[str, Any],
         ticket_key: str,
         receipt: CandidateReceipt,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         if (
             type(receipt) is not CandidateReceipt
             or receipt.repository != active.handle.repository
@@ -4750,7 +4812,8 @@ class ExecutionKernel:
         run["candidate_receipt"] = receipt_canonical
         run["candidate_receipt_digest"] = receipt.digest
         run["candidate_identity"] = f"candidate:{receipt.candidate_commit_oid}"
-        if changed:
+        history_changed, budget_exhausted = self._record_candidate_history(run, receipt)
+        if changed or history_changed:
             count = run.get("candidate_submission_count", 0)
             if type(count) is not int or isinstance(count, bool) or count < 0:
                 raise ExecutionKernelError(
@@ -4792,7 +4855,7 @@ class ExecutionKernel:
             )
         state.clear()
         state.update(persisted)
-        return changed
+        return changed, budget_exhausted
 
     def _apply_mechanical_stale_readback(
         self,
@@ -4942,21 +5005,30 @@ class ExecutionKernel:
                 "CANDIDATE_RECEIVED stale readback lacks an exact CandidateReceipt",
             )
         candidate_progress_recorded = False
+        candidate_budget_exhausted = False
         if stale_readback.candidate_receipt is not None:
             if stale_readback.state is not StaleReadbackState.CANDIDATE_RECEIVED:
                 raise ExecutionKernelError(
                     "EFFECT_READBACK_INVALID",
                     "CandidateReceipt is attached to a non-Candidate stale state",
                 )
-            candidate_progress_recorded = self._persist_candidate_receipt(
+            candidate_progress_recorded, candidate_budget_exhausted = self._persist_candidate_receipt(
                 active,
                 state,
                 state["runs"][ticket_key],
                 ticket_key,
                 stale_readback.candidate_receipt,
             )
+            run = state["runs"][ticket_key]
         self._persist_effect_readback(active, state, action, stale_readback)
+        run = state["runs"][ticket_key]
         run["last_action_id"] = action.stable_action_id
+        if candidate_budget_exhausted:
+            self._mark_candidate_budget_exhausted(run, ticket_key)
+            run["stale_due_at"] = None
+            run["stale_disposition"] = stale_readback.state.value
+            self._save(active.handle, state)
+            return True
         if stale_readback.state in {
             StaleReadbackState.TERMINAL,
             StaleReadbackState.IDLE,
@@ -6141,11 +6213,7 @@ class ExecutionKernel:
                 candidate_commit_oids.append(receipt.candidate_commit_oid)
                 history_changed = True
             if len(candidate_commit_oids) > 3:
-                run["phase"] = "decision"
-                run["reason"] = f"CandidateBudgetExhausted:{ticket_key}"
-                run["next_check_at"] = None
-                run["slot_held"] = False
-                run["claim_state"] = "released"
+                self._mark_candidate_budget_exhausted(run, ticket_key)
                 self._save(active.handle, state)
                 return
 
@@ -6317,6 +6385,7 @@ class ExecutionKernel:
             run["runtime_binding_id"] = observation.runtime_binding_id
         run.setdefault("candidate_receipt", None)
         receipt = observation.candidate_receipt
+        candidate_budget_exhausted = False
         if receipt is not None:
             if (
                 receipt.repository != active.handle.repository
@@ -6335,6 +6404,10 @@ class ExecutionKernel:
             receipt_changed = run.get("candidate_receipt") != receipt_canonical
             run["candidate_receipt"] = receipt_canonical
             run["candidate_receipt_digest"] = receipt.digest
+            _history_changed, candidate_budget_exhausted = self._record_candidate_history(
+                run,
+                receipt,
+            )
             state["candidate_receipts"] = [
                 value["candidate_receipt"]
                 for _key, value in sorted(state["runs"].items())
@@ -6377,15 +6450,18 @@ class ExecutionKernel:
             state.clear()
             state.update(persisted_state)
             run = state["runs"][ticket_key]
-        run["phase"] = observation.phase
-        run["reason"] = observation.reason
-        run["next_check_at"] = observation.next_check_at
-        run["slot_held"] = observation.phase in _SLOT_PHASES or (
-            observation.phase == "wait"
-            and observation.binding_established
-            and observation.runtime_binding_id is not None
-        )
-        run["claim_state"] = "held" if run["slot_held"] else "released"
+        if candidate_budget_exhausted:
+            self._mark_candidate_budget_exhausted(run, ticket_key)
+        else:
+            run["phase"] = observation.phase
+            run["reason"] = observation.reason
+            run["next_check_at"] = observation.next_check_at
+            run["slot_held"] = observation.phase in _SLOT_PHASES or (
+                observation.phase == "wait"
+                and observation.binding_established
+                and observation.runtime_binding_id is not None
+            )
+            run["claim_state"] = "held" if run["slot_held"] else "released"
         run["last_wake_ref"] = wake_ref
         if wake_ref is not None:
             state.setdefault("last_wake_refs", [])
@@ -6408,7 +6484,7 @@ class ExecutionKernel:
             "receipt_digest": observation.receipt_digest,
             **effect_identity,
         }
-        if observation.phase == "completed":
+        if not candidate_budget_exhausted and observation.phase == "completed":
             try:
                 plan = load_canonical_json(active.plan_spec_bytes)
             except CanonicalJsonError as error:  # pragma: no cover - validated earlier

@@ -3920,7 +3920,13 @@ class CandidateGate:
                     "CANDIDATE_GATE_REVIEW_SUBJECT_INVALID",
                     "review_strong retry changed ReviewSubject identity",
                 )
-            return self._invoke_review_action(parent, retry)
+            try:
+                return self._invoke_review_action(parent, retry)
+            except InvalidReviewTransport as retry_transport_error:
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_REVIEW_TRANSPORT_RETRY_EXHAUSTED",
+                    "Review transport retry budget was already consumed for this ReviewSubject",
+                ) from retry_transport_error
 
     def _merge_review_results(
         self,
