@@ -10,7 +10,9 @@
 
 ## Global Constraints
 
-- C2 starts only after C1 has actually produced a valid `gwo-v8-c1-closure.v2` and `gwo-v8-c2-handoff.v1`; a plan commit or proposed C1 state is not release evidence.
+- C2 starts only after the separately executed C1 R3 predecessor has actually produced a valid `gwo-v8-c1-closure.v2` and `gwo-v8-c2-handoff.v1`; a plan commit or proposed C1 state is not release evidence.
+- At plan-authoring time, `origin/main` is `4c18210490e7cd6c79b626ac516c8dd6d10790f8` (tree `17ff8fd2527140131f6004552942f507ddf10e4e`, parent `928789c2c0d559d14894b8cfdab8bff3b41acc3d`). It contains the merged C1 planning documents, not the executed C1 Beta1 closure.
+- The existing `D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview/state.json` is not a valid C2 predecessor: it has empty `closure`/`c2_handoff` objects and null local-verification/approval slots. The merged C1 R2 plan is also stale because it froze `928789c2c0d559d14894b8cfdab8bff3b41acc3d` before the `4c18210490e7cd6c79b626ac516c8dd6d10790f8` plan merge. Re-freeze and execute C1 from the current `origin/main` as R3, writing the exact predecessor root below, before Task 0 can pass.
 - Verification mode is exactly **Local Verification Only**. GitHub Actions acceptance remains disabled. No remote provider check, workflow run, or status rollup is a C2 release gate.
 - Beta2 admits no production work and does not activate the default writer. Every executable V8 host uses `preview_mode="beta2_isolated_preview"` and `writer_activation_enabled=False` against a target beneath a temporary isolation root.
 - The public workflow remains exactly `start(repository, ready_refs, options?)`, `advance(campaign_handle, wake_ref?)`, and `inspect(campaign_handle)`. Public statuses remain Complete, Running, Decision, Wait, and Blocked.
@@ -18,13 +20,15 @@
 - CandidateGate remains the only Candidate, Formal Review, and Repair Verification entry. BatchIntegrator remains the only delivery boundary. ExecutionKernel remains the only persisted Campaign workflow driver.
 - A Candidate is neither Evidence nor a Result. A code Result requires the exact Candidate receipt, accepted-Candidate receipt, immutable Batch delivery proof, local/provider-isolation verification evidence, and target readback.
 - The protected GA branch `refs/heads/codex/gwo-v8-ga-plan` remains fixed at `2cd6c46e1484ca140c3a197bbdeb171191d70c20`. C2 does not rewrite or advance it.
-- C2 inherits these exact implementation boundaries from C1: foundation `77ac3e3ef14241d1840150b22cb227d2e5088fb4`, #113 `07086ce1036198a41547ca1d9a9a506acfb8fcf7`, #114 `657bf236d765735cdee117910a5939c6c2cd3292`, #115 `a0f697656be6471bed601103c169185988a9e4ac`, and #116 WIP `e58c596998df90e65349bdb4b5f25d3d9dc1f7e2`.
+- C2 treats these as candidate implementation boundaries named by the C1 contract, not as current-main or release evidence: foundation `77ac3e3ef14241d1840150b22cb227d2e5088fb4`, #113 `07086ce1036198a41547ca1d9a9a506acfb8fcf7`, #114 `657bf236d765735cdee117910a5939c6c2cd3292`, #115 `a0f697656be6471bed601103c169185988a9e4ac`, and #116 WIP `e58c596998df90e65349bdb4b5f25d3d9dc1f7e2`. Task 0/1 must resolve and re-hash them from the validated C1 R3 handoff before any implementation lane starts.
 - Dynamic C1 and C2 SHA values come only from digest-validated state/readback. Do not copy the historical C1 baseline into a C2 mutation command.
 - The authoritative child plans are read from protected GA commit `2cd6c46e1484ca140c3a197bbdeb171191d70c20` with `git show <sha>:docs/superpowers/plans/2026-08-03-gwo-v8-batch-delivery.md` and `git show <sha>:docs/superpowers/plans/2026-08-03-gwo-v8-production-composition.md`. They need not exist in the C1 checkout and their broad protected-GA tree is never merged. This plan supersedes only their remote acceptance assumptions; their product contracts and TDD cases remain binding.
 - Product-level hosted-result and retry semantics remain tested through local deterministic drivers and an isolated provider adapter. Disabling remote acceptance does not delete those BatchIntegrator contracts.
 - Every source change follows RED, observed RED, minimum GREEN, observed GREEN, refactor while green, focused verification, package synchronization, and a small commit.
 - Use at most five concurrent subagents. Every subagent uses `gpt-5.6-luna` with max reasoning. Tasks sharing any source, test-support, generated manifest, evidence writer, or release-state file are serialized.
+- The five-subagent scheduler has one repository/evidence writer slot and at most four read-only review/readback slots. Tasks 4–6 have one implementation writer only; Tasks 8 and 9 may use two disjoint implementation writers after the production gate, while their reviews are queued within the remaining slots. Every worker uses its own worktree and may write only its named files; no worker writes C2 `state.json`, owner approvals/leases, policy snapshots, authorizations, receipts, tracker snapshots, or publication files.
 - `skills/orchestrator/.skill-package.json` and `skills/implement-gwo/.skill-package.json` are generated write-set members. A lane touching either manifest is serialized with every other lane touching the same manifest.
+- The coordinator is the sole writer of `D:/gwo-release-evidence/2026-08-06-gwo-v8-c2-beta2-feature-complete/state.json`, `policy/`, `authorizations/`, `receipts/`, and publication/closure state. Each child may create only a uniquely named review or local-test evidence file beneath its assigned lane directory; the coordinator hashes and adopts it after the child exits.
 - No SQLite transaction stays open across RuntimeGateway, CandidateGate, BatchIntegrator, Git, GitHub, provider, or watcher calls.
 - No push, PR mutation, merge, Issue mutation, tag, Release, or canonical-main fast-forward occurs without an effect-specific owner approval and exclusive writer lease whose original bytes and SHA-256 are persisted and reloaded immediately before the effect.
 - Every remote effect is effect-first on resume: discover the visible effect, validate its immutable authorization and policy receipt, then adopt it; never create a second effect after an ambiguous timeout.
@@ -32,13 +36,47 @@
 
 ---
 
-## Inherited State and Evidence Contract
+## Current Planning Baseline and C1 R3 Entry
 
-C1 evidence is read from:
+This file is a C2 implementation plan, not proof that C1 is complete. The
+only repository mutation already observed for the current baseline is the
+documentation-only squash at `origin/main=4c18210490e7cd6c79b626ac516c8dd6d10790f8`.
+It does not satisfy the C1 closure gate. A separate C1 R3 run must first be
+re-frozen from that exact SHA and must write this exact external input:
 
 ```text
-D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview/state.json
+D:/gwo-release-evidence/2026-08-06-gwo-v8-c1-beta1-core-preview-r3/state.json
 ```
+
+The R3 state must contain a digest-valid `gwo-v8-c1-closure.v2` and
+`gwo-v8-c2-handoff.v1`, a merged-main identity descended from the current
+`origin/main`, and the unfinished scope exactly `issue_117_completion` and
+`final_issue_137_revalidation`. The old 2026-08-05 state and the unexecuted
+R2 plan are historical inputs only. Until R3 exists and passes Task 0, C2
+creates no state, dispatches no implementation worker, mutates no Issue, and
+publishes no Beta2 object.
+
+The live tracker readback at authoring time is also only a precondition
+observation: #113–#117 are OPEN, #137 is CLOSED, #136 is CLOSED, and #118/#119
+are OPEN. C1 R3 must acquire and validate its own owner authorization for the
+conditional #137 reopen effect when the preserved #114/#115 state requires it;
+that authorization does not exist merely because the C1 plan names the effect.
+C2 Task 5 never invents a reopen, and C2 Task 10 closes #137 only after its
+separate revalidation and close approval.
+
+---
+
+## Inherited State and Evidence Contract
+
+C1 R3 evidence is read from:
+
+```text
+D:/gwo-release-evidence/2026-08-06-gwo-v8-c1-beta1-core-preview-r3/state.json
+```
+
+The path is a required predecessor output, not an existing authoring fixture.
+If it is absent, malformed, hash-inconsistent, or still contains empty
+`closure`/`c2_handoff` objects, Task 0 returns HOLD and performs no C2 write.
 
 C2 writes only beneath:
 
@@ -90,14 +128,20 @@ Owner-supplied approval/lease bytes use schema `gwo-v8-c2-owner-gate.v1`. The co
 | `skills/orchestrator/scripts/gwo_v8/_batch_integrator_drivers.py` | Exact local publication/provider/target drivers behind BatchIntegrator. |
 | `skills/orchestrator/scripts/gwo_v8/_batch_integrator_store.py` | Durable action, lease, retry, fallback, and hosted-result receipt CAS. |
 | `skills/orchestrator/scripts/gwo_v8/batch_integrator.py` | #116/#117 immutable Batch action and recovery loop. |
+| `skills/orchestrator/scripts/gwo_v8/batch_patch_identity.py` | Exact content-derived Batch patch/tree identity and clean-base advance proof. |
 | `skills/orchestrator/scripts/gwo_v8/integration_batch.py` | Direct-import-only predecessor compatibility surface. |
+| `skills/orchestrator/scripts/gwo_v8/campaign_watchdog.py` | #113 wake/timer adapter landed as a source slice; it owns no workflow state machine. |
 | `skills/orchestrator/scripts/gwo_v8/candidate_gate.py` | #137 Candidate/Review/Repair Plan Invalidation reporting seam; no Campaign disposition authority. |
+| `skills/orchestrator/scripts/gwo_v8/candidate_git.py` | #114/#115 authoritative Candidate Git readback and diff identity. |
+| `skills/orchestrator/scripts/gwo_v8/runtime_gateway.py` | #113 Runtime wake/recovery contract consumed by the production host. |
 | `skills/orchestrator/scripts/gwo_v8/execution_kernel.py` | Campaign CAS, quiescence, exact Result integrity, and Plan Invalidation handoff. |
 | `skills/orchestrator/scripts/gwo_v8/production_effects.py` | Host-private Runtime/Candidate/Batch effect adapter and effect receipt ledger. |
 | `skills/orchestrator/scripts/gwo_v8/production_host.py` | Isolated ProductionGwoHost assembly and three public operations. |
 | `skills/orchestrator/scripts/gwo_v8/plan_control_host.py` | Host-private planning continuation and RuntimeGateway factory. |
 | `skills/implement-gwo/SKILL.md` | Beta2 isolated-preview guidance only; no default-writer authority. |
 | `tests/v8_batch_test_support.py` | Batch deterministic drivers, crash injection, and evidence fixtures. |
+| `tests/v8_candidate_assurance_test_support.py` | #114/#115 Candidate, Review, Repair, and Finding-ledger fixtures. |
+| `tests/v8_watchdog_test_support.py` | #113 watchdog wake/timer fixtures. |
 | `tests/v8_production_test_support.py` | Composition ports, isolated targets, restart fixtures, and evidence builder. |
 | `tests/test_v8_batch_integrator.py` | #116 exact Batch boundary. |
 | `tests/test_v8_batch_recovery.py` | #117 retry, fallback, attribution, and restart behavior. |
@@ -118,21 +162,31 @@ Task 0 C1 closure gate
   -> Task 2 validate/land #113-#115
   -> Task 3 freeze completion write sets
        -> Task 4 #116 completion
-       -> Task 5 #137 CandidateGate repair
-       -> Task 6 #117 + Batch evidence
-                                      -> Task 7 Production Tasks 1-7 (serial child tasks)
-                                           -> Task 8 Skill lane -----+
-                                           -> Task 9 isolated E2E ---+   Task 8 || Task 9
-                                                                    -> Task 10 Beta2 merge/tracker gate
-                                                                    -> Task 11 tag/Release/closure/C3 handoff
+            -> Task 5 #137 CandidateGate repair
+                 -> Task 6 #117 + Batch evidence
+                      -> G137_OPEN_RECHECK
+                           -> Task 7 Production Tasks 1-7 (serial child tasks)
+                                -> Task 8 Skill lane -----+
+                                -> Task 9 isolated E2E ---+   Task 8 || Task 9
+                                                         -> Task 10 Beta2 merge/local-go gate
+                                                              -> Task 11 tag/Release/tracker closure/C3 handoff
 ```
 
-Tasks 4 and 5 are source-disjoint but both regenerate `skills/orchestrator/.skill-package.json`, so they are serialized. Their read-only WIP/code review and focused baseline test runs may use separate workers concurrently, but no source commit or generated manifest is shared concurrently. Task 6 waits for Task 4 and #115. Production composition waits for merged #113–#117, the Task 5 CandidateGate fix, and an approved OPEN #137 checkpoint. Inside Task 7, child Tasks 1–7 remain serial because they share `execution_kernel.py`, `production_effects.py`, `production_host.py`, shared support, and the orchestrator manifest. Only Tasks 8 and 9 are implementation-write parallel.
+Tasks 4, 5, and 6 are one serial implementation lane: all three regenerate
+`skills/orchestrator/.skill-package.json`, and Tasks 4/6 also share Batch source
+and support files. Their read-only WIP/code review and focused baseline test
+runs may use separate workers concurrently, but no source commit or generated
+manifest is shared concurrently. `G137_OPEN_RECHECK` is a fresh tracker and
+receipt readback after #114/#115 merge and before Production child Task 6; an
+earlier C1 or Task 5 readback is not reusable. Inside Task 7, child Tasks 1–7
+remain serial because they share `execution_kernel.py`,
+`production_effects.py`, `production_host.py`, shared support, and the
+orchestrator manifest. Only Tasks 8 and 9 are implementation-write parallel.
 
 ### Task 0: Require the completed C1 closure and freeze the C2 coordinator
 
 **Files:**
-- Read: `D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview/state.json`
+- Read: `D:/gwo-release-evidence/2026-08-06-gwo-v8-c1-beta1-core-preview-r3/state.json`
 - Create externally: `D:/gwo-release-evidence/2026-08-06-gwo-v8-c2-beta2-feature-complete/state.json`
 - Create externally: `D:/gwo-release-evidence/2026-08-06-gwo-v8-c2-beta2-feature-complete/c1-entry-readback.json`
 
@@ -143,19 +197,50 @@ Tasks 4 and 5 are source-disjoint but both regenerate `skills/orchestrator/.skil
 - [ ] **Step 1: Run the fail-closed read-only entry test**
 
 ```powershell
-$c1 = 'D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview/state.json'
+$c1 = 'D:/gwo-release-evidence/2026-08-06-gwo-v8-c1-beta1-core-preview-r3/state.json'
 if (-not (Test-Path -LiteralPath $c1 -PathType Leaf)) { throw 'C1_CLOSURE_REQUIRED' }
 $state = Get-Content -Raw -LiteralPath $c1 | ConvertFrom-Json
-if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.closure.schema -ne 'gwo-v8-c1-closure.v2' -or $state.c2_handoff.schema -ne 'gwo-v8-c2-handoff.v1') { throw 'C1_HANDOFF_INVALID' }
+if ($state.schema -ne 'gwo-v8-c1-state.v2' -or $state.mode -ne 'Local Verification Only' -or $state.closure.schema -ne 'gwo-v8-c1-closure.v2' -or $state.c2_handoff.schema -ne 'gwo-v8-c2-handoff.v1') { throw 'C1_HANDOFF_INVALID' }
+if ($null -eq $state.closure.path -or $null -eq $state.closure.sha256 -or $null -eq $state.c2_handoff.ticket_readback_path -or $null -eq $state.c2_handoff.ticket_readback_sha256) { throw 'C1_HANDOFF_INCOMPLETE' }
+if (@($state.c2_handoff.unfinished_scope | Where-Object { $_.status -ne 'unfinished' }).Count -ne 0) { throw 'C1_SCOPE_CLOSED_EARLY' }
 ```
 
-Expected before C1 execution: HOLD with `C1_CLOSURE_REQUIRED`; perform zero mutation. Expected after C1 closure: PASS.
+Expected before C1 execution: HOLD with `C1_CLOSURE_REQUIRED` when the R3
+file is absent, or `C1_HANDOFF_INVALID`/`C1_HANDOFF_INCOMPLETE` when the file
+exists in the current pre-closure shape; perform zero mutation in both cases.
+Expected after C1 R3 closure: PASS.
 
 This is a terminal entry fence: on the missing-file result, schema failure, hash failure, coordinator mismatch, or remote-ref mismatch, write no C2 state and do not dispatch Task 1.
 
 - [ ] **Step 2: Re-hash every consumed C1 artifact**
 
 For every state-referenced closure, C2 ticket readback, tracker-after snapshot, local-verification manifest/attestation/log, review-state file, policy snapshot, approval, lease, mutation authorization, PR/merge receipt, tag receipt, Release receipt, and canonical-main receipt, require a normalized path, schema, SHA-256, and parseable bytes. Recompute every digest and require state -> artifact and closure -> state references to agree. Bind the recorded C1 coordinator root, branch, HEAD, merged-main SHA/tree/ordered parent, repository/default branch, Beta1 tag peel, Release ID/body digest, tracker digest, and protected-GA identity. Require remote `main` to equal the dynamic C1 merged SHA and the protected GA remote to remain `2cd6c46e1484ca140c3a197bbdeb171191d70c20`.
+
+Use this read-only assertion before creating C2 state; all values except the
+protected-GA identity come from the reloaded C1 state:
+
+```powershell
+$root = (git rev-parse --show-toplevel).Trim()
+function Hash-File([string]$path) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "EVIDENCE_MISSING:$path" }
+    return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+$closurePath = ([string]$state.closure.path).Replace('\','/')
+if ((Hash-File $closurePath) -ne [string]$state.closure.sha256) { throw 'C1_CLOSURE_HASH_INVALID' }
+$closure = Get-Content -Raw -LiteralPath $closurePath | ConvertFrom-Json
+if ($closure.schema -ne 'gwo-v8-c1-closure.v2' -or $closure.merged_sha -ne $state.pr.merge.merge_sha -or $closure.protected_ga_sha -ne '2cd6c46e1484ca140c3a197bbdeb171191d70c20') { throw 'C1_CLOSURE_IDENTITY_INVALID' }
+$remoteMain = (git -C $root ls-remote origin refs/heads/main).Trim().Split("`t")[0]
+if ($LASTEXITCODE -ne 0 -or $remoteMain -ne $state.pr.merge.merge_sha) { throw 'C1_REMOTE_MAIN_INVALID' }
+$commit = git -C $root cat-file -p $state.pr.merge.merge_sha
+if ($LASTEXITCODE -ne 0 -or @($commit | Where-Object { $_ -like 'tree *' }).Count -ne 1) { throw 'C1_MERGED_COMMIT_INVALID' }
+$handoffPath = ([string]$state.c2_handoff.ticket_readback_path).Replace('\','/')
+if ((Hash-File $handoffPath) -ne [string]$state.c2_handoff.ticket_readback_sha256) { throw 'C1_TICKET_READBACK_HASH_INVALID' }
+```
+
+The complete fence also verifies the ordered parent list, actual tree object,
+Beta1 tag peel and Release body digest, tracker-after digest, every local log
+digest, and the protected-GA remote ref. Any failed artifact read is HOLD, not
+a synthesized replacement fixture.
 
 - [ ] **Step 3: Create and read back C2 state**
 
@@ -180,28 +265,36 @@ import json
 from pathlib import Path
 
 state = json.loads(
-    Path("D:/gwo-release-evidence/2026-08-05-gwo-v8-c1-beta1-core-preview/state.json")
+    Path("D:/gwo-release-evidence/2026-08-06-gwo-v8-c1-beta1-core-preview-r3/state.json")
     .read_text(encoding="utf-8")
 )
 handoff = state["c2_handoff"]
 
-def test_c2_handoff_marks_only_113_114_115_complete():
-    assert handoff["existing_completed_boundaries"]["issue_113"].startswith("07086ce")
-    assert handoff["existing_completed_boundaries"]["issue_114"].startswith("657bf23")
-    assert handoff["existing_completed_boundaries"]["issue_115"].startswith("a0f6976")
+def test_c2_handoff_has_exact_boundaries_and_unfinished_scope():
+    assert handoff["existing_completed_boundaries"] == {
+        "foundation": "77ac3e3ef14241d1840150b22cb227d2e5088fb4",
+        "issue_113": "07086ce1036198a41547ca1d9a9a506acfb8fcf7",
+        "issue_114": "657bf236d765735cdee117910a5939c6c2cd3292",
+        "issue_115": "a0f697656be6471bed601103c169185988a9e4ac",
+        "issue_116_wip": "e58c596998df90e65349bdb4b5f25d3d9dc1f7e2",
+    }
     assert handoff["unfinished_scope"] == [
         {"item": "issue_117_completion", "status": "unfinished", "completed_boundary_sha": None},
         {"item": "final_issue_137_revalidation", "status": "unfinished", "completed_boundary_sha": None},
     ]
+    assert handoff["unfinished_scope"][0]["completed_boundary_sha"] is None
 ```
 
 - [ ] **Step 2: Prove RED against any handoff that treats `e58c596` as completed #116**
 
-Expected: FAIL because `e58c596` is a WIP boundary, not a Result.
+Expected: FAIL because `e58c596` is recorded only under the explicit
+`issue_116_wip` key and is not a Result receipt or a closed Issue state. Derive
+the C2 work item `issue_116_completion` from this WIP boundary; do not rewrite
+the C1 handoff's two-entry unfinished list.
 
 - [ ] **Step 3: Build the exact lineage record**
 
-Record tree/parents and path ranges for foundation, #113, #114, #115, and #116 WIP. Confirm all are ancestors of the protected GA branch and not already ancestors of C2 base. Compute overlap between C2 base delta and feature paths; any overlap outside expected package/metadata paths stops.
+Record tree/parents and path ranges for foundation, #113, #114, #115, and #116 WIP. Confirm all are ancestors of the protected GA branch and that none is an ancestor of the validated C1 R3 merged-main SHA unless the C1 handoff explicitly records that boundary as present. Compute overlap between the dynamic C2 base delta and feature paths; any overlap outside the reviewed package/metadata paths stops. The source allowlists must be materialized in `slice-113.json`, `slice-114.json`, and `slice-115.json`; do not treat a raw reachable commit range as an Issue allowlist.
 
 - [ ] **Step 4: Re-run accepted-slice local gates**
 
@@ -219,7 +312,7 @@ Persist command, executable, arguments, exit code, output digest, subject SHA/tr
 ### Task 2: Land the reviewed #113, #114, and #115 slices in dependency order
 
 **Files:**
-- Modify only through reviewed slice PRs: files in the exact `a48c7d6..07086ce`, `07086ce..657bf23`, and `657bf23..a0f6976` ranges
+- Modify only through reviewed slice PRs: the materialized allowlists for the exact `a48c7d6..07086ce`, `07086ce..657bf23`, and `657bf23..a0f6976` source ranges
 - Create externally: `slice-113.json`, `slice-114.json`, `slice-115.json`
 
 **Interfaces:**
@@ -228,7 +321,24 @@ Persist command, executable, arguments, exit code, output digest, subject SHA/tr
 
 - [ ] **Step 1: Preview each squash result locally**
 
-For each slice, read the exact protected-GA source objects and path allowlist, create a temporary clean worktree at the dynamic current C2 target, and apply only the fixed source range (`a48c7d6..07086ce`, `07086ce..657bf23`, then `657bf23..a0f6976`) with `git merge --squash`. Record source commit/tree/parents, dynamic target-before SHA/tree, patch digest, ordered changed paths, expected squash tree, and focused manifest. A conflict, context-dependent patch change, extra path, changed generated manifest outside the allowlist, or different tree is HOLD; never rebase or silently edit a historical slice to fit dynamic main.
+For each slice, read the exact protected-GA source objects and path allowlist,
+create a temporary clean worktree at the dynamic current C2 target from the
+validated C1 R3 merged-main SHA, and apply only the fixed source range
+(`a48c7d6..07086ce`, `07086ce..657bf23`, then `657bf23..a0f6976`) with
+`git merge --squash`. The first source range intentionally includes the
+foundation boundary `77ac3e3`: current C1 R3 main is not allowed to be assumed
+to contain that implementation, so the range parent `a48c7d6` is source
+provenance, not the mutation target. The historical range parent is a source
+identity only; never use `a48c7d6`, `2c72d9a`, `928789c`, or `4c18210` as a
+mutation target literal. Record source commit/tree/parents, dynamic
+target-before SHA/tree, patch digest, ordered changed paths, expected squash
+tree, and focused manifest. The current protected-GA source path counts are
+26 for #113's stacked foundation/watchdog slice, 14 for #114, and 21 for #115;
+the ordered path lists must be stored in the three slice receipts and checked
+against the issue-specific allowlist before applying them. A conflict,
+context-dependent patch change, extra path, changed generated manifest outside
+the allowlist, or different tree is HOLD; never rebase or silently edit a
+historical slice to fit dynamic main.
 
 - [ ] **Step 2: Acquire the repository-global PR writer lease**
 
@@ -260,29 +370,67 @@ batch_paths = (
     "skills/orchestrator/scripts/gwo_v8/_batch_integrator_drivers.py",
     "skills/orchestrator/scripts/gwo_v8/_batch_integrator_store.py",
     "skills/orchestrator/scripts/gwo_v8/batch_integrator.py",
+    "skills/orchestrator/scripts/gwo_v8/batch_patch_identity.py",
+    "skills/orchestrator/scripts/gwo_v8/integration_batch.py",
+    "skills/orchestrator/scripts/gwo_v8/__init__.py",
+    "tests/v8_batch_test_support.py",
     "tests/test_v8_batch_integrator.py",
+    "tests/test_orchestrator_v8_integration_batch.py",
 )
 replan_paths = (
     "skills/orchestrator/.skill-package.json",
     "skills/orchestrator/scripts/gwo_v8/candidate_gate.py",
     "tests/test_v8_repair_verification.py",
     "tests/test_v8_candidate_gate_public.py",
+    "tests/test_v8_candidate_gate.py",
+)
+recovery_paths = (
+    "skills/orchestrator/.skill-package.json",
+    "skills/orchestrator/scripts/gwo_v8/_batch_integrator_store.py",
+    "skills/orchestrator/scripts/gwo_v8/batch_integrator.py",
+    "tests/v8_batch_test_support.py",
+    "tests/test_v8_batch_recovery.py",
+    "tests/test_v8_batch_beta2.py",
+    "scripts/write_v8_batch_evidence.py",
+    "docs/e2e/gwo-v8-batch-integrator.md",
 )
 
-def test_c2_source_lanes_share_only_the_generated_manifest():
-    overlap = set(batch_paths) & set(replan_paths)
-    assert overlap == {"skills/orchestrator/.skill-package.json"}
-    assert "skills/orchestrator/.skill-package.json" in batch_paths
-    assert "skills/orchestrator/.skill-package.json" in replan_paths
+def test_c2_source_lanes_have_exact_shared_write_sets():
+    manifest = {"skills/orchestrator/.skill-package.json"}
+    assert set(batch_paths) & set(replan_paths) == manifest
+    assert set(batch_paths) & set(recovery_paths) == {
+        *manifest,
+        "skills/orchestrator/scripts/gwo_v8/_batch_integrator_store.py",
+        "skills/orchestrator/scripts/gwo_v8/batch_integrator.py",
+        "tests/v8_batch_test_support.py",
+    }
+    assert set(replan_paths) & set(recovery_paths) == manifest
+
+
+def test_c2_subagent_scheduler_has_one_writer_and_four_review_slots():
+    writer_slots = 1
+    review_slots = 4
+    assert writer_slots + review_slots == 5
+    assert writer_slots == 1
 ```
 
-- [ ] **Step 2: Prove RED if Tasks 4 and 5 are marked implementation-parallel**
+- [ ] **Step 2: Prove RED if Tasks 4–6 are marked implementation-parallel**
 
-Expected: FAIL because the required CandidateGate source repair changes the generated orchestrator package manifest. Record Tasks 4, 5, and 6 as serialized source/manifest writers. Up to five separate workers may concurrently perform read-only lineage review, focused baseline tests, and GitHub readback into separate evidence files.
+Expected: FAIL because the exact shared sets include the generated
+orchestrator manifest, Batch source, and Batch support. Record Tasks 4, 5, and
+6 as serialized source/manifest writers. Up to five separate workers may
+concurrently perform read-only lineage review, focused baseline tests, and
+tracker readback into distinct evidence files.
 
 - [ ] **Step 3: Freeze lane bases**
 
-Task 4 starts from the validated #116 WIP content cleanly advanced onto Task 2 main. Task 5 starts from Task 4's merged main, and Task 6 starts from Task 5's merged main. Persist every base SHA/tree and refuse branch drift. This order keeps every source change and its regenerated manifest in the same reviewed commit.
+Task 4 resolves `issue_116_wip` from the validated C1 R3 handoff, proves that
+the object is a commit, is an ancestor of protected GA, and is not a Result or
+closed Issue receipt, then cleanly advances that WIP content onto Task 2 main.
+Task 5 starts from Task 4's merged main, and Task 6 starts from Task 5's
+merged main. Persist every base SHA/tree and refuse branch drift. This order
+keeps every source change and its regenerated manifest in the same reviewed
+commit.
 
 ### Task 4: Complete and land #116 exact Batch delivery
 
@@ -290,6 +438,7 @@ Task 4 starts from the validated #116 WIP content cleanly advanced onto Task 2 m
 - Modify: `skills/orchestrator/scripts/gwo_v8/_batch_integrator_drivers.py`
 - Modify: `skills/orchestrator/scripts/gwo_v8/_batch_integrator_store.py`
 - Modify: `skills/orchestrator/scripts/gwo_v8/batch_integrator.py`
+- Create: `skills/orchestrator/scripts/gwo_v8/batch_patch_identity.py`
 - Modify only for Task 7's minimum direct-import quarantine proof: `skills/orchestrator/scripts/gwo_v8/integration_batch.py`
 - Modify: `skills/orchestrator/scripts/gwo_v8/__init__.py`
 - Modify: `tests/v8_batch_test_support.py`
@@ -311,6 +460,11 @@ from hashlib import sha256
 from pathlib import Path
 
 review_path = Path("D:/gwo-release-evidence/2026-08-06-gwo-v8-c2-beta2-feature-complete/reviews/batch-task5-review.json")
+c1_state = json.loads(
+    Path("D:/gwo-release-evidence/2026-08-06-gwo-v8-c1-beta1-core-preview-r3/state.json")
+    .read_text(encoding="utf-8")
+)
+expected_wip_sha = c1_state["c2_handoff"]["existing_completed_boundaries"]["issue_116_wip"]
 expected_task5_paths = [
     "skills/orchestrator/.skill-package.json",
     "skills/orchestrator/scripts/gwo_v8/_batch_integrator_drivers.py",
@@ -321,7 +475,8 @@ expected_task5_paths = [
 ]
 receipt = json.loads(Path(review_path).read_text(encoding="utf-8"))
 assert receipt["schema"] == "gwo-v8-batch-task5-review.v1"
-assert receipt["source_boundary_sha"] == "e58c596998df90e65349bdb4b5f25d3d9dc1f7e2"
+assert receipt["source_boundary_sha"] == expected_wip_sha
+assert receipt["source_boundary_sha"] != receipt.get("result_sha")
 assert receipt["review"] == "PASS"
 assert receipt["changed_paths"] == expected_task5_paths
 assert receipt["focused_manifest_digest"] == sha256(Path(receipt["focused_manifest_path"]).read_bytes()).hexdigest()
@@ -408,7 +563,15 @@ Run independent spec/code reviews, create an exact-head Draft PR, resolve every 
 
 - [ ] **Step 1: Acquire and validate the OPEN checkpoint**
 
-If C1 reopened #137 under its recorded owner approval, validate and adopt that exact receipt. Otherwise stop; this task never invents a reopen path. Re-read #137 body, comments, blockers, labels, milestone, state, and URL and require `OPEN` before running the acceptance test.
+Task 0 must supply a C1 R3 tracker readback showing #137 `OPEN`; when the
+live precondition began CLOSED, that readback must include C1's separately
+authorized conditional reopen effect and immediate readback. If C1 R3 did not
+need or did not perform that effect, the only alternative is a new
+post-merge manual owner approval and reopen receipt after #114/#115 merge.
+Validate and adopt one exact path. If the handoff says CLOSED or omits both
+reopen paths, stop; this task never invents a reopen. Re-read #137 body,
+comments, blockers, labels, milestone, state, and URL and require `OPEN` before
+running the acceptance test.
 
 - [ ] **Step 2: Replace the obsolete exception expectations with a failing result contract**
 
@@ -506,7 +669,7 @@ git commit -m "feat: adopt terminal hosted receipts and bound infrastructure ret
 Trigger fallback only for composition, exact-local code, or code-class hosted-result failure. Persist `fallback_generation=1`; create exactly one Singleton child per parent member; preserve unaffected Candidate/Check/Review Evidence; resume only the failing child; never fall back recursively. The complete parent proof partition contains every Ticket exactly once.
 
 ```powershell
-py -3.13 -m pytest tests/test_v8_batch_recovery.py::test_multi_member_code_failure_dissolves_once_into_singletons tests/test_v8_batch_recovery.py::test_successful_singleton_fallback_proof_partition_covers_each_member_once -q
+py -3.13 -m pytest tests/test_v8_batch_recovery.py::test_multi_member_code_failure_dissolves_once_into_singletons tests/test_v8_batch_recovery.py::test_fallback_has_one_singleton_proof_per_member -q
 py -3.13 -m pytest tests/test_v8_batch_integrator.py tests/test_v8_batch_recovery.py -q
 py -3.13 scripts/sync_orchestrator.py
 py -3.13 scripts/sync_orchestrator.py --check
@@ -540,7 +703,23 @@ git commit -m "test: record local Batch Beta2 evidence"
 
 - [ ] **Step 6: Review and squash-land the #117 Result**
 
-Create the exact-head Draft PR from Task 5 merged main, complete spec/code reviews, acquire the repository owner approval/lease, and squash merge. Read back the expected tree, exact #117 path set, focused/local package gates, and Result receipt. Leave #117 OPEN until Task 10.
+Create the exact-head Draft PR from Task 5 merged main, complete spec/code reviews, acquire the repository owner approval/lease, and squash merge. Read back the expected tree, exact #117 path set, focused/local package gates, and Result receipt. Leave #117 OPEN until the final Task 11 tracker gate.
+
+### Gate: `G137_OPEN_RECHECK` before Production composition
+
+**Files:**
+- Read: `D:/gwo-release-evidence/2026-08-06-gwo-v8-c1-beta1-core-preview-r3/state.json`
+- Read: Task 5 CandidateGate repair receipt and Task 2 #114/#115 merge receipts
+- Create externally: `D:/gwo-release-evidence/2026-08-06-gwo-v8-c2-beta2-feature-complete/reviews/issue-137-open-recheck.json`
+
+Re-read #137 body, comments, blockers, labels, milestone, URL, and state after
+the #114/#115 and CandidateGate merges. Require the exact C1 conditional
+reopen authorization/effect receipt (or the separately approved
+`post_merge_manual_approval` path), a fresh `OPEN` readback, and exact
+CandidateGate repair receipt digest. Hash and atomically write the gate
+receipt. If #137 is CLOSED, content-drifted, missing its reopen evidence, or
+the readback is older than the last relevant merge, HOLD and do not start
+Production child Task 6 or any parallel Skill/E2E writer.
 
 ### Task 7: Execute Production V3 composition child Tasks 1–7 serially
 
@@ -636,7 +815,13 @@ git commit -m "feat: add isolated ProductionGwoHost"
 
 - [ ] **Step 6: Child Task 6 — revalidate #137 through the public seam**
 
-With #137 still OPEN, write the public deterministic-audit, Formal-Review, repaired-Candidate escape, ordinary rejection, replay/restart, and unaffected-Work-Run tests in `tests/test_v8_production_replanning.py`. The repaired-Candidate case must consume Task 5's CandidateGate result, reach no Batch, and persist one invalidation observation.
+With the fresh `G137_OPEN_RECHECK` receipt, write the public deterministic-audit,
+Formal-Review, repaired-Candidate escape, ordinary rejection, replay/restart,
+and unaffected-Work-Run tests in `tests/test_v8_production_replanning.py`. The
+repaired-Candidate case must consume Task 5's CandidateGate result, reach no
+Batch, and persist one invalidation observation. Add negative assertions that
+the public path does not classify Campaign disposition, reopen Review, create a
+second Candidate, expand Authority, or mutate the Issue tracker.
 
 ```powershell
 py -3.13 -m pytest tests/test_v8_production_replanning.py -q
@@ -680,16 +865,89 @@ The Production branch base is Task 6 merged main; its PR head is the final commi
 
 **Interfaces:**
 - Consumes: Task 7 ProductionGwoHost.
-- Produces: isolated-preview guidance and predecessor unreachability proof; no writer activation.
+- Produces: isolated-preview guidance and predecessor unreachability proof; no writer activation. The install-argument helper below is test-local to `tests/test_implement_gwo_skill.py`, so this lane does not write shared `tests/v8_production_test_support.py` and can run in parallel with Task 9.
 
 - [ ] **Step 1: Write the failing Skill contract**
 
-Assert exactly three public operations, five deep modules, the two Beta2 configuration values, temporary-target containment, and absence of predecessor execution calls.
+Add `tests/test_implement_gwo_skill.py` with these exact assertions. The
+helper must construct only the Task 7 host configuration; it must not start a
+provider or touch a repository during test collection.
+
+```python
+import inspect
+from pathlib import Path
+
+import pytest
+
+from gwo_v8.production_host import (
+    ProductionCompositionError,
+    ProductionGwoHost,
+    ProductionHostConfiguration,
+)
+from v8_production_test_support import (
+    ProductionCompositionHarness,
+)
+
+
+def test_implement_gwo_skill_names_only_the_v8_public_path():
+    text = Path("skills/implement-gwo/SKILL.md").read_text(encoding="utf-8")
+    assert "start(repository, ready_refs, options?)" in text
+    assert "advance(campaign_handle, wake_ref?)" in text
+    assert "inspect(campaign_handle)" in text
+    for module in ("PlanControl", "ExecutionKernel", "RuntimeGateway", "CandidateGate", "BatchIntegrator"):
+        assert module in text
+    assert "preview_mode=\"beta2_isolated_preview\"" in text
+    assert "writer_activation_enabled=False" in text
+    assert "reconcile_once" not in text
+    assert "GoalDriver" not in text
+
+
+def test_production_host_has_no_predecessor_driver_import():
+    source = inspect.getsource(ProductionGwoHost)
+    assert "GoalDriver" not in source
+    assert "reconcile_once" not in source
+    assert "GitIntegrationBatchAssembler" not in source
+
+
+def test_normal_repository_is_rejected_by_beta2_install(tmp_path):
+    arguments = isolated_beta2_install_arguments(
+        target_path=Path("D:/Workstation/github-work-orchestrator"),
+        target_isolation_root=tmp_path,
+    )
+    with pytest.raises(ProductionCompositionError) as raised:
+        ProductionGwoHost.install(**arguments)
+    assert raised.value.code == "V8_ISOLATED_PREVIEW_REQUIRED"
+```
+
+Define the helper used by the tests with this exact construction; it only
+rewrites the target and host-configuration values returned by the Task 7
+fixture:
+
+```python
+def isolated_beta2_install_arguments(
+    *,
+    target_path: Path,
+    target_isolation_root: Path,
+) -> dict[str, object]:
+    harness = ProductionCompositionHarness.from_task7_dependencies(
+        target_path=target_path.resolve(),
+        evidence_dir=(target_isolation_root / "skill-admission").resolve(),
+        provider_command="recording-provider --no-dispatch",
+    )
+    arguments = harness.install_arguments()
+    arguments["target_path"] = target_path.resolve()
+    arguments["host_configuration"] = ProductionHostConfiguration(
+        preview_mode="beta2_isolated_preview",
+        target_isolation_root=target_isolation_root.resolve(),
+        writer_activation_enabled=False,
+    )
+    return arguments
+```
 
 - [ ] **Step 2: Observe RED, minimally replace guidance, and prove GREEN**
 
 ```powershell
-py -3.13 -m pytest tests/test_implement_gwo_skill.py -q
+py -3.13 -m pytest tests/test_implement_gwo_skill.py tests/test_orchestrator_package.py -q
 py -3.13 scripts/sync_orchestrator.py
 py -3.13 scripts/sync_orchestrator.py --check
 git diff --check
@@ -716,7 +974,10 @@ import json
 from pathlib import Path
 import pytest
 
-def test_beta2_refuses_canonical_repository_as_target(tmp_path):
+from gwo_v8.production_host import ProductionCompositionError
+from v8_production_test_support import write_beta2_evidence_bundle
+
+def test_real_provider_e2e_refuses_a_non_temporary_target(tmp_path):
     with pytest.raises(ProductionCompositionError) as raised:
         assert_isolated_e2e_target(Path("D:/Workstation/github-work-orchestrator"), tmp_path)
     assert raised.value.code == "REAL_E2E_TARGET_NOT_ISOLATED"
@@ -726,7 +987,7 @@ def test_beta2_manifest_binds_local_subject(tmp_path):
     path = write_beta2_evidence_bundle(
         tmp_path,
         subject=exact_subject,
-        issue_states={str(n): "CLOSED" for n in (113, 114, 115, 116, 117, 137)},
+        issue_states={str(n): "CLOSED" for n in (113, 114, 115, 116, 117, 136, 137)},
         campaign_handle="owner/repo:campaign:beta2",
         plan_revision_digest="d" * 64,
         writer_generation_before="v6.1",
@@ -769,7 +1030,51 @@ Expected: FAIL because the isolation helper and v2 Local Verification Only evide
 
 - [ ] **Step 3: Implement the Local Verification Only evidence amendment**
 
-Start from protected child Task 9's concrete helper bodies, but replace its stale hosted-repository acceptance input and field with exact `subject_tree`, `local_verification_manifest_digest`, and `workflow_count=0`. `full_gate` contains only `pytest`, `quick_validate`, `package_sync`, `diff_check`, and `clean_status`. The default path uses a recording provider and temporary Git target; the optional real-provider result is diagnostic evidence, never a release gate.
+Implement `write_beta2_evidence_bundle(...)` directly in
+`tests/v8_production_test_support.py`; do not copy the protected plan's stale
+hosted-repository acceptance field. Validate a lowercase 40-hex
+`subject["sha"]`, a lowercase 40-hex `subject["tree"]`, a `parents` list of
+40-hex IDs, a lowercase 64-hex `plan_revision_digest`, non-empty Campaign
+handle, equal writer-generation readbacks, seven exact CLOSED issue keys
+(#113–#117, #136, and #137), one or more lowercase 64-hex Result digests, one
+Batch proof digest per Result, the
+exact nine-key `issue_137_revalidation` object from the test above,
+`workflow_count == 0`, and `writer_activation_enabled is False`. Render this
+exact top-level shape with canonical sorted JSON and a final newline:
+
+```python
+manifest = {
+    "schema_version": "gwo-v8-beta2-composition-evidence.v2",
+    "verification_mode": "Local Verification Only",
+    "preview_mode": "beta2_isolated_preview",
+    "subject": subject,
+    "issue_states": issue_states,
+    "campaign_handle": campaign_handle,
+    "plan_revision_digest": plan_revision_digest,
+    "writer_generation_before": writer_generation_before,
+    "writer_generation_after": writer_generation_after,
+    "writer_activation_enabled": False,
+    "result_integrity_digests": list(result_integrity_digests),
+    "batch_delivery_proof_digests": list(batch_delivery_proof_digests),
+    "issue_137_revalidation": issue_137_revalidation,
+    "local_verification_manifest_digest": local_verification_manifest_digest,
+    "workflow_count": 0,
+    "full_gate": {
+        "pytest": {"status": "passed"},
+        "quick_validate": {"status": "passed"},
+        "package_sync": {"status": "passed"},
+        "diff_check": {"status": "passed"},
+        "clean_status": {"status": "passed", "output": ""},
+    },
+    "target_isolation": True,
+}
+```
+
+Write through a same-directory temporary file, parse before replacement,
+reload the final file, and compare the parsed object and SHA-256. The default
+path uses a recording provider and temporary Git target; the optional
+real-provider result is diagnostic evidence, never a release gate. No CI URL,
+hosted repository-check field, or workflow-run field may be emitted.
 
 ```powershell
 py -3.13 -m pytest tests/test_v8_production_composition_e2e.py tests/test_v8_production_docs.py -q
@@ -793,17 +1098,17 @@ git add tests/v8_production_test_support.py tests/test_v8_production_composition
 git commit -m "test: add isolated Beta2 composition evidence"
 ```
 
-### Task 10: Merge C2 implementation, close Beta2 Tickets, and run the local go/no-go gate
+### Task 10: Merge C2 implementation and run the local go/no-go gate
 
 **Files:**
 - Create: `docs/releases/v8.0.0-beta.2.md`
 - Modify: package manifests only through sync if merged implementation changed their sources
 - Create externally: `D:/gwo-release-evidence/2026-08-06-gwo-v8-c2-beta2-feature-complete/test_beta2_release_evidence.py`
-- Create externally: `beta2-local-verification.json`, `tracker-before.json`, `tracker-after.json`
+- Create externally: `beta2-local-go.json`, `tracker-before.json`, `tracker-after.json`
 
 **Interfaces:**
 - Consumes: Tasks 4–9, exact branch heads, all reviews, and owner gates.
-- Produces: one merged main SHA/tree, #113–#117 CLOSED, #137 CLOSED after separate approval, and GO/HOLD evidence. It creates no tag yet.
+- Produces: one merged main SHA/tree, a complete Local Verification Only GO/HOLD receipt, and prepared tracker-close authorization. It closes no Issue and creates no tag or Release.
 
 - [ ] **Step 1: Write the failing release-evidence contract**
 
@@ -815,9 +1120,25 @@ from pathlib import Path
 evidence = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert evidence["schema"] == "gwo-v8-beta2-local-verification.v1"
 assert evidence["verification_mode"] == "Local Verification Only"
-assert evidence["issues"] == {str(n): "CLOSED" for n in (113, 114, 115, 116, 117, 137)}
+assert evidence["phase"] in {"pre-publication", "final"}
+if evidence["phase"] == "pre-publication":
+    assert evidence["issues"] == {
+        **{str(n): "OPEN" for n in (113, 114, 115, 116, 117, 137)},
+        "136": "CLOSED",
+        "118": "OPEN",
+        "119": "OPEN",
+    }
+    assert evidence["tracker_closure_pending"] is True
+else:
+    assert evidence["issues"] == {
+        **{str(n): "CLOSED" for n in (113, 114, 115, 116, 117, 136, 137)},
+        "118": "OPEN",
+        "119": "OPEN",
+    }
+    assert evidence["tracker_closure_pending"] is False
 assert evidence["preview_mode"] == "beta2_isolated_preview"
 assert evidence["writer_activation_enabled"] is False
+assert evidence["v8_writer_activation_enabled"] is False
 assert evidence["workflow_count"] == 0
 assert evidence["python_version"] == "Python 3.13.11"
 assert len(evidence["requirements_digest"]) == 64
@@ -873,27 +1194,42 @@ git status --porcelain=v1 --untracked-files=all
 
 Require Python `3.13.11`, zero repository workflow files, the expected disabled-Actions policy readback, and no output from status. Every command must exit zero. A timeout, missing/unfinished JUnit record, skip outside the explicitly opt-in provider case, dirty status, or Issue drift is HOLD.
 
-- [ ] **Step 5: Close Issues through a separate tracker owner gate**
+- [ ] **Step 5: Prepare, but do not execute, the separate tracker owner gate**
 
-Validate or idempotently adopt the `GWO V8 Beta2` milestone and its exact #113–#117/#137 assignments from C1; any missing assignment requires a separately named tracker-owner effect before closure. Close #113–#117 only when their exact merged Result receipts and blocker readbacks are valid. Close #137 only after Task 5 and production public-seam revalidation pass and a separate close approval is persisted. Re-read bodies, comments, native blockers, milestones, states, and URLs after each effect. Leave #118 assigned to `GWO V8 Beta3` and #119 assigned to `GWO V8 GA`, both OPEN.
+Validate or idempotently adopt the `GWO V8 Beta2` milestone and its exact
+#113–#117/#137 assignments from C1; any missing assignment requires a
+separately named tracker-owner effect before closure. Persist immutable
+close authorizations for #113–#117 and #137, but execute no tracker mutation
+in Task 10. Re-read bodies, comments, native blockers, milestones, states, and
+URLs. Require #113–#117 and #137 to remain OPEN at this pre-publication
+checkpoint, #136 to remain CLOSED without a C2 effect, and #118/#119 to remain
+OPEN with their Beta3/GA assignments.
 
-- [ ] **Step 6: Write and read back the final GO/HOLD evidence**
+- [ ] **Step 6: Write and read back the pre-publication GO/HOLD evidence**
 
-Write `beta2-local-verification.json` atomically, run the external test against it, and hash its reloaded bytes:
+Write `beta2-local-go.json` atomically with `phase="pre-publication"` and
+`tracker_closure_pending=true`,
+the exact pre-publication Issue readbacks above, all local command/log
+digests, final merged subject SHA/tree/parents, policy receipt, zero workflow
+count, unchanged writer generation, `writer_activation_enabled=false`,
+`v8_writer_activation_enabled=false`, and isolated-preview configuration. Run the
+prepared verifier in pre-publication mode and hash the reloaded bytes. A
+missing command, fabricated digest, remote CI field, dirty checkout, or
+unexpected Issue state is HOLD.
 
 ```powershell
-py -3.13 D:/gwo-release-evidence/2026-08-06-gwo-v8-c2-beta2-feature-complete/test_beta2_release_evidence.py D:/gwo-release-evidence/2026-08-06-gwo-v8-c2-beta2-feature-complete/beta2-local-verification.json
+py -3.13 D:/gwo-release-evidence/2026-08-06-gwo-v8-c2-beta2-feature-complete/test_beta2_release_evidence.py D:/gwo-release-evidence/2026-08-06-gwo-v8-c2-beta2-feature-complete/beta2-local-go.json
 ```
 
 ### Task 11: Publish Beta2 and write C2 closure/C3 handoff
 
 **Files:**
 - Read: merged `docs/releases/v8.0.0-beta.2.md`
-- Create externally: `tag-receipt.json`, `release-receipt.json`, `closure.json`, `c3-handoff.json`
+- Create externally: `tag-receipt.json`, `release-receipt.json`, `beta2-local-verification.json`, `tracker-after.json`, `closure.json`, `c3-handoff.json`
 
 **Interfaces:**
 - Consumes: Task 10 GO evidence and a publication owner approval/lease.
-- Produces: annotated `v8.0.0-beta.2`, matching prerelease, `gwo-v8-c2-closure.v1`, and `gwo-v8-c3-handoff.v1` for #118.
+- Produces: annotated `v8.0.0-beta.2`, matching prerelease, final Issue readbacks, `gwo-v8-c2-closure.v1`, and `gwo-v8-c3-handoff.v1` for #118.
 
 - [ ] **Step 1: Acquire the publication owner gate**
 
@@ -907,15 +1243,49 @@ The tag object must be annotated, have name `v8.0.0-beta.2`, message `GWO V8 v8.
 
 Require exact tag, title `GWO V8 Beta2 - Feature Complete Preview`, `prerelease=true`, `draft=false`, and body bytes equal the merged release notes. Persist ID, URL, body digest, and API readback.
 
-- [ ] **Step 4: Write closure and C3 handoff**
+- [ ] **Step 4: Close the Beta2 Issues only after publication succeeds**
 
-`gwo-v8-c2-closure.v1` binds C1 closure, merged SHA/tree/parent, all local command manifests, review digests, #113–#117/#137 tracker readbacks, tag peel, Release receipt, protected GA identity, and non-goals.
+After the tag and Release have exact readbacks, acquire the prepared tracker
+owner approval/lease again and execute the close effects serially. Close
+#113–#117 only from their exact merged Result receipts and blocker readbacks;
+close #137 only from the fresh `G137_OPEN_RECHECK`, public-seam revalidation,
+and its independent close approval. Re-read full Issue JSON, body, comments,
+labels, native blockers, milestone, state, and URL after every effect. Read
+#136 as CLOSED and perform no #136 mutation. Keep #118 assigned to `GWO V8
+Beta3` and OPEN, and #119 assigned to `GWO V8 GA` and OPEN.
 
-`gwo-v8-c3-handoff.v1` names #118 as the next scope, requires #113/#117/#136/#137 CLOSED, preserves #119 as blocked, records `writer_activation_enabled=false`, and grants no Activation or default-writer authority.
+- [ ] **Step 5: Write final evidence, closure, and C3 handoff**
 
-- [ ] **Step 5: Verify final non-goals**
+Write `beta2-local-verification.json` atomically with `phase="final"` from the exact post-close
+tracker readback, changing only the Issue states and adding each close effect
+receipt/digest to the pre-publication GO evidence. Run the same verifier and
+require the final map to be #113–#117/#136/#137 `CLOSED` with #118/#119 `OPEN`;
+recompute every referenced log, Result, Batch, approval, effect receipt,
+subject SHA/tree/parents, and local-policy digest. Then write:
 
-Read back that no writer generation or Activation Receipt changed, no production target was admitted, protected GA remains fixed, #118/#119 remain OPEN, and default writer remains unchanged.
+`gwo-v8-c2-closure.v1` binds both the C1 closure path/SHA and C1 handoff
+path/SHA, merged SHA/tree/ordered parent, all local command manifests, review
+digests, complete #113–#119/#136/#137 tracker-before/after readbacks, all
+close-effect receipts, tag peel, Release receipt, protected GA identity, and
+non-goals. It must not use the C2 plan commit or a plan path as subject
+evidence.
+
+`gwo-v8-c3-handoff.v1` names #118 as the next scope, requires
+#113/#114/#115/#116/#117/#136/#137 CLOSED, preserves #118 and #119 as OPEN
+with their Beta3/GA assignments, records
+`writer_activation_enabled=false`, `production_admission=false`,
+`default_writer_authority=false`, an empty `activation_authority`, and no
+Activation or default-writer authority. #136 is a readback-only prerequisite
+in C2; C2 creates no #136 mutation.
+
+- [ ] **Step 6: Verify final non-goals**
+
+Read back that `v8_writer_activation_enabled=false`, no writer generation or
+Activation Receipt changed, `production_admission=false`, no production target
+was admitted, protected GA remains the frozen ref/SHA/tree/parents, #118/#119
+remain OPEN, and default-writer authority remains unchanged. Repository PR,
+tracker, tag, and Release leases are effect-specific remote writers and do not
+count as V8 production-writer activation.
 
 ## Stop Rules
 
