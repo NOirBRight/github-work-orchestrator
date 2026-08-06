@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -35,6 +36,18 @@ def test_quick_validation_and_manifest_are_at_fixed_point():
             "skill": skill,
             "version": "8.0.0",
         }
+
+
+def test_quick_validation_ignores_brackets_and_parentheses_in_fenced_code():
+    quick = _load(
+        "quick_validate_fenced_code_test", ROOT / "scripts" / "quick_validate.py"
+    )
+    findings = quick.findings(ROOT)
+    assert not any(
+        finding.startswith("broken link:")
+        and "Measure-Object Length -Sum" in finding
+        for finding in findings
+    )
 
 
 def test_phase_two_exposes_implement_gwo_and_one_release_alias_only():
@@ -233,3 +246,290 @@ def test_three_install_surfaces_receive_both_packages_and_cli_smokes(tmp_path):
     assert payload["status"] == "idle"
     assert payload["actions"] == []
     assert payload["warnings"] == []
+
+
+def test_v8_release_train_names_exact_gates():
+    text = (ROOT / "docs" / "releases" / "gwo-v8-release-train.md").read_text(
+        "utf-8"
+    )
+    for required in (
+        "v8.0.0-beta.1",
+        "v8.0.0-beta.2",
+        "v8.0.0-beta.3",
+        "v8.0.0",
+        "#113",
+        "#114",
+        "#115",
+        "#116",
+        "#117",
+        "#118",
+        "#119",
+        "#123",
+        "#136",
+        "#137",
+        "no production admission",
+        "root Canary acceptance readback",
+    ):
+        assert required in text
+
+
+def test_beta1_tracker_and_publication_gates_require_pending_owner_readback():
+    note = (ROOT / "docs" / "releases" / "v8.0.0-beta.1.md").read_text("utf-8")
+    train = (ROOT / "docs" / "releases" / "gwo-v8-release-train.md").read_text(
+        "utf-8"
+    )
+    compact_note = " ".join(note.split())
+    publication = " ".join(
+        train.split("## Immutable tags and publication boundary", 1)[1].split()
+    ).casefold()
+
+    assert "pending explicit owner approval/readback" in compact_note
+    assert "owner-approved #137" not in compact_note
+    assert "same explicit owner approval/readback gate" in publication
+    assert "before any remote publication or mutation" in publication
+    assert "this lane does not perform it" in publication
+
+
+def test_release_train_blocker_graph_contains_native_prerequisite_edges():
+    text = (ROOT / "docs" / "releases" / "gwo-v8-release-train.md").read_text(
+        "utf-8"
+    )
+    for required_edge in (
+        'T108["#108 Contract"] --> T111["#111 RuntimeGateway"]',
+        'T126["#126 CI headroom"] --> T111',
+        'T111 --> T109["#109 PlanControl"]',
+        'T109 --> T110["#110 ExecutionKernel"]',
+        'T111 --> T112["#112 Runtime recovery"]',
+        'T136 --> T118',
+        'T137 --> T118',
+        'T118 --> T119["#119 root Canary"]',
+        'T123["#123 Canary prerequisite"] --> T119',
+    ):
+        assert required_edge in text
+
+
+def test_beta1_release_contract_has_structured_local_evidence_v2_issue_and_nongoal():
+    note = (ROOT / "docs" / "releases" / "v8.0.0-beta.1.md").read_text("utf-8")
+    blocks = re.findall(r"```json\n(\{.*?\})\n```", note, re.DOTALL)
+    assert len(blocks) == 1
+    evidence = json.loads(blocks[0])
+    assert set(evidence) == {
+        "schema",
+        "verification_mode",
+        "core_baseline_sha",
+        "core_baseline_tree",
+        "python_version",
+        "requirements_sha256",
+        "local_verification_manifest_sha256",
+        "main_attestation_sha256",
+        "full_pytest_summary",
+        "issues",
+        "non_goal",
+    }
+    assert evidence["schema"] == "gwo-beta1-release-evidence.v2"
+    assert evidence["verification_mode"] == "local-only"
+    assert evidence["core_baseline_sha"] == (
+        "2c72d9a153dac07e507c746548258efc44b62875"
+    )
+    assert evidence["core_baseline_tree"] == (
+        "1905079fa3cd0d90dd9b1930ed5dd726fad9f114"
+    )
+    assert evidence["python_version"] == "Python 3.13.11"
+    assert evidence["requirements_sha256"] == (
+        "ee3c9f14db38950f5869759a5a94347197c9d4db3f138147b614ad6c4d862534"
+    )
+    assert evidence["local_verification_manifest_sha256"] == (
+        "1f01205bc9846bebfd8e767744a60d4d1e4c185f081f6083606047cd37e9d4a3"
+    )
+    assert evidence["main_attestation_sha256"] == (
+        "689ccbdf84667d9931b83f18b4234816a853ca61ba6cca8382117f2179e15818"
+    )
+    assert evidence["full_pytest_summary"] == "1521 passed in 1987.16s (0:33:07)"
+    assert re.fullmatch(r"[0-9a-f]{40}", evidence["core_baseline_sha"])
+    assert re.fullmatch(r"[0-9a-f]{40}", evidence["core_baseline_tree"])
+    baseline_tree = subprocess.run(
+        ["git", "rev-parse", f"{evidence['core_baseline_sha']}^{{tree}}"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert baseline_tree == evidence["core_baseline_tree"]
+    for key in (
+        "requirements_sha256",
+        "local_verification_manifest_sha256",
+        "main_attestation_sha256",
+    ):
+        assert re.fullmatch(r"[0-9a-f]{64}", evidence[key])
+    assert "ci_url" not in evidence
+    assert "dynamic_pass_summary" not in evidence
+    assert '"ci_url"' not in note
+    assert '"dynamic_pass_summary"' not in note
+    compact_note = " ".join(note.split()).casefold()
+    assert (
+        "repository release acceptance is local verification only"
+        in compact_note
+    )
+    assert "successful main ci readback" not in compact_note
+    assert "dynamic main-ci" not in compact_note
+    assert "GWO product Hosted CI".casefold() in compact_note
+    assert evidence["issues"] == {
+        "113": "OPEN",
+        "114": "OPEN",
+        "115": "OPEN",
+        "116": "OPEN",
+        "117": "OPEN",
+        "118": "OPEN",
+        "119": "OPEN",
+    }
+    assert evidence["non_goal"] == "Lean V8 production cutover"
+
+
+def test_release_gates_separate_repository_acceptance_from_gwo_product_hosted_ci():
+    note = (ROOT / "docs" / "releases" / "v8.0.0-beta.1.md").read_text("utf-8")
+    train = (ROOT / "docs" / "releases" / "gwo-v8-release-train.md").read_text(
+        "utf-8"
+    )
+    roadmap = (ROOT / "docs" / "design" / "gwo-v8-lean-roadmap.md").read_text(
+        "utf-8"
+    )
+    program = (
+        ROOT / "docs" / "superpowers" / "plans" / "2026-08-04-gwo-v8-ga-release-program.md"
+    ).read_text("utf-8")
+    contributing = (ROOT / "CONTRIBUTING.md").read_text("utf-8")
+
+    compact_note = " ".join(note.split()).casefold()
+    assert "repository release acceptance is local verification only" in compact_note
+    assert "exact sha/tree" in compact_note
+    assert "before the immutable prerelease tag" in compact_note
+    assert "GWO product Hosted CI".casefold() in compact_note
+    assert "repository release acceptance" in " ".join(train.split()).casefold()
+    assert "GWO product Hosted CI" in train
+    assert "GWO product Hosted CI" in roadmap
+    assert "GWO product Hosted CI" in program
+    assert "through pull requests" in contributing
+    assert "GitHub Actions acceptance is disabled" in contributing
+    assert "repository release acceptance is local verification only" in (
+        " ".join(contributing.split()).casefold()
+    )
+    assert "Python 3.13" in contributing
+    assert "--require-hashes" in contributing
+    assert ".github/requirements-ci-win-py313.txt" in contributing
+
+
+def test_beta1_requires_structured_workspace_convergence_receipt():
+    import hashlib
+    import os
+    import re
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    receipt_path = ROOT / "docs" / "releases" / "gwo-v8-workspace-convergence.md"
+    release_train = (ROOT / "docs" / "releases" / "gwo-v8-release-train.md").read_text("utf-8")
+    assert "Workspace Convergence Gate" in release_train
+    assert "gwo-v8-workspace-convergence.md" in release_train
+
+    text = receipt_path.read_text("utf-8")
+    blocks = re.findall(r"```json\n(\{.*?\})\n```", text, re.DOTALL)
+    assert len(blocks) == 1
+    receipt = json.loads(blocks[0])
+    assert set(receipt) == {
+        "schema",
+        "source_sha",
+        "protected_remote_ref",
+        "protected_remote_sha",
+        "kept_worktrees",
+        "removed_worktree_count",
+        "removed_test_root_count",
+        "retained_green_runs",
+        "refs_deleted",
+        "archive_manifest_sha256",
+        "pre_clean_bundle_sha256",
+        "post_clean_bundle_sha256",
+        "evidence",
+        "completed_at",
+    }
+    assert receipt["schema"] == "gwo-workspace-convergence.v1"
+    assert receipt["source_sha"] == "e58c596998df90e65349bdb4b5f25d3d9dc1f7e2"
+    assert receipt["protected_remote_ref"] == "refs/heads/codex/gwo-v8-ga-plan"
+    assert re.fullmatch(r"[0-9a-f]{40}", receipt["protected_remote_sha"])
+    assert receipt["kept_worktrees"] == ["canonical-main", "active-ga"]
+    assert receipt["removed_worktree_count"] == 36
+    assert receipt["removed_test_root_count"] == 48
+    assert receipt["retained_green_runs"] == [
+        "gwo-109-r14-full-run1",
+        "gwo-109-r13-full-run3",
+        "gwo-109-round7-full-final-race",
+        "gwo-109-r12-full-synced",
+    ]
+    assert receipt["refs_deleted"] is False
+    for key in (
+        "archive_manifest_sha256",
+        "pre_clean_bundle_sha256",
+        "post_clean_bundle_sha256",
+    ):
+        assert re.fullmatch(r"[0-9a-f]{64}", receipt[key])
+    evidence = receipt["evidence"]
+    assert set(evidence) == {
+        "manifest",
+        "pre_clean_bundle",
+        "post_clean_bundle",
+        "remote_ga_readback",
+    }
+    assert evidence["manifest"] == {
+        "path": "convergence-manifest.json",
+        "sha256": receipt["archive_manifest_sha256"],
+    }
+    assert evidence["pre_clean_bundle"] == {
+        "path": "pre-clean.bundle",
+        "sha256": receipt["pre_clean_bundle_sha256"],
+    }
+    assert evidence["post_clean_bundle"] == {
+        "path": "post-clean.bundle",
+        "sha256": receipt["post_clean_bundle_sha256"],
+    }
+    assert evidence["remote_ga_readback"] == {
+        "path": "inventory/remote-ga-ref-after.txt",
+        "ref": receipt["protected_remote_ref"],
+        "sha256": receipt["protected_remote_sha"],
+    }
+
+    def relative_path(value):
+        assert not Path(value).is_absolute()
+        assert not PureWindowsPath(value).is_absolute()
+        relative = PurePosixPath(value)
+        assert ".." not in relative.parts
+        return Path(*relative.parts)
+
+    for item in evidence.values():
+        relative_path(item["path"])
+
+    archive_root_value = os.environ.get("GWO_CONVERGENCE_ARCHIVE_ROOT", "").strip()
+    assert archive_root_value, "GWO_CONVERGENCE_ARCHIVE_ROOT is required"
+    archive_root = Path(archive_root_value)
+    assert archive_root.is_dir(), archive_root
+    manifest_path = archive_root / relative_path(evidence["manifest"]["path"])
+    assert manifest_path.is_file(), manifest_path
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == receipt["archive_manifest_sha256"]
+    assert manifest["source_sha"] == receipt["source_sha"]
+    assert manifest["protected_remote_ref"] == receipt["protected_remote_ref"]
+    assert manifest["protected_remote_sha"] == receipt["protected_remote_sha"]
+    assert manifest["pre_clean_bundle_sha256"] == receipt["pre_clean_bundle_sha256"]
+    assert manifest["post_clean_bundle_sha256"] == receipt["post_clean_bundle_sha256"]
+    for receipt_key, evidence_key in (
+        ("pre_clean_bundle_sha256", "pre_clean_bundle"),
+        ("post_clean_bundle_sha256", "post_clean_bundle"),
+    ):
+        bundle_path = archive_root / relative_path(evidence[evidence_key]["path"])
+        assert bundle_path.is_file(), bundle_path
+        assert hashlib.sha256(bundle_path.read_bytes()).hexdigest() == receipt[receipt_key]
+    readback_path = archive_root / relative_path(evidence["remote_ga_readback"]["path"])
+    assert readback_path.is_file(), readback_path
+    readback_lines = readback_path.read_text(encoding="utf-8").splitlines()
+    assert len(readback_lines) == 1
+    readback_parts = readback_lines[0].split()
+    assert len(readback_parts) == 2
+    readback_sha, readback_ref = readback_parts
+    assert readback_sha == receipt["protected_remote_sha"]
+    assert readback_ref == receipt["protected_remote_ref"]
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T.+Z", receipt["completed_at"])
