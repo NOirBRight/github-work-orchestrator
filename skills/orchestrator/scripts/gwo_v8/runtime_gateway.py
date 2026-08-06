@@ -88,6 +88,7 @@ _MAXIMUM_RUNTIME_EVENT_CURSOR = _MAXIMUM_RUNTIME_SCALAR_INTEGER
 _MAXIMUM_RUNTIME_EVENT_CURSOR_TEXT = str(_MAXIMUM_RUNTIME_EVENT_CURSOR)
 _RUNTIME_EVENT_KINDS = frozenset(
     {
+        "candidate:reference",
         "state:prepared",
         "state:running",
         "state:parked",
@@ -3502,6 +3503,22 @@ class _RuntimeEvent:
 @dataclass(frozen=True)
 class _RuntimeEventPage:
     events: tuple[_RuntimeEvent, ...]
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
+class _RuntimeCampaignWake:
+    cursor: str
+    repository: str
+    campaign_key: str
+    source: str
+    stable_action_id: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class _RuntimeCampaignWakePage:
+    events: tuple[_RuntimeCampaignWake, ...]
     next_cursor: str | None
 
 
@@ -10587,6 +10604,93 @@ class RuntimeGateway:
             ):
                 hints.append(f"{event.cursor}:{event.stable_action_id}:{event.kind}")
         return tuple(hints), page.next_cursor
+
+    def _read_watchdog_events(
+        self,
+        after_cursor: str | None,
+    ) -> _RuntimeCampaignWakePage:
+        if _runtime_event_cursor_value(after_cursor) is None:
+            raise RuntimeGatewayError(
+                "RUNTIME_EVENT_CURSOR_INVALID",
+                "after_cursor must be one canonical positive decimal cursor",
+            )
+        for stable_action_id, record in self._data["actions"].items():
+            if type(record) is not dict:
+                raise RuntimeGatewayError(
+                    "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+                    "event action has no persisted record",
+                )
+            try:
+                subject = _subject_from_canonical(record.get("subject"))
+            except RuntimeGatewayError as error:
+                raise RuntimeGatewayError(
+                    "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+                    "event action has an invalid persisted Subject",
+                ) from error
+            if (
+                subject.stable_action_id != stable_action_id
+                or record.get("subject_digest") != subject.digest
+            ):
+                raise RuntimeGatewayError(
+                    "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+                    "event action and exact persisted Subject differ",
+                )
+        self._refresh_before_adapter_io()
+        raw_page = self._adapter.events(after_cursor)
+        verdict = _RuntimeEventPageProtocol.validate(raw_page, after_cursor=after_cursor)
+        if verdict.kind != "page":
+            assert verdict.failure is not None
+            self._raise_failure(verdict.failure)
+        assert verdict.page is not None
+        return _RuntimeCampaignWakePage(
+            events=tuple(self._watchdog_wake_for_event(event) for event in verdict.page.events),
+            next_cursor=verdict.page.next_cursor,
+        )
+
+    def _watchdog_wake_for_event(
+        self,
+        event: _RuntimeEvent,
+    ) -> _RuntimeCampaignWake:
+        record = self._data["actions"].get(event.stable_action_id)
+        if type(record) is not dict:
+            raise RuntimeGatewayError(
+                "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+                "event action has no persisted record",
+            )
+        subject = _subject_from_canonical(record.get("subject"))
+        if (
+            record.get("subject_digest") != subject.digest
+            or subject.stable_action_id != event.stable_action_id
+        ):
+            raise RuntimeGatewayError(
+                "RUNTIME_PROVIDER_PROTOCOL_INVALID",
+                "event action and exact persisted Subject differ",
+            )
+        if (
+            event.kind == "candidate:reference"
+            or record.get("candidate_reference_emitted") is True
+        ):
+            source = "candidate"
+        elif (
+            type(subject) is WorkRunSubject
+            and subject.purpose.kind
+            in {
+                "formal_review",
+                "invalid_review_payload_retry",
+                "specialist_review",
+            }
+        ):
+            source = "review"
+        else:
+            source = "runtime"
+        return _RuntimeCampaignWake(
+            event.cursor,
+            subject.repository,
+            subject.campaign_key,
+            source,
+            subject.stable_action_id,
+            event.kind,
+        )
 
     @staticmethod
     def _raise_failure(failure: _RuntimeFailure) -> None:

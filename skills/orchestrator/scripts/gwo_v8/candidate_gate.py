@@ -10,7 +10,9 @@ Plan Invalidation contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import base64
+import binascii
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import re
 from typing import Any, Mapping, Protocol
@@ -27,6 +29,7 @@ from .runtime_gateway import (
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_MISSING = object()
 
 
 class CandidateGateError(RuntimeError):
@@ -161,7 +164,12 @@ def _validate_stored_digest(
     code: str = "CANDIDATE_GATE_EVIDENCE_INVALID",
     detail: str = "CandidateGate evidence digest changed",
 ) -> str:
-    _require_digest(stored, "content_digest")
+    try:
+        _require_digest(stored, "content_digest")
+    except CandidateGateError as error:
+        if code == "CANDIDATE_GATE_EVIDENCE_INVALID":
+            raise
+        raise CandidateGateError(code, error.detail) from error
     expected = _body_digest(body)
     if stored != expected:
         raise CandidateGateError(code, detail)
@@ -211,7 +219,75 @@ class CandidateGateParent:
         return {**self._body(), "parent_digest": self.digest}
 
 
-@dataclass(frozen=True)
+def _decode_candidate_path_token(token: str, field_name: str) -> bytes:
+    _require_text(token, field_name)
+    if "=" in token:
+        raise CandidateGateError(
+            "CANDIDATE_GATE_DIFF_INVALID",
+            f"{field_name} is padded instead of unpadded base64url",
+        )
+    try:
+        raw = base64.b64decode(
+            token + "=" * (-len(token) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (ValueError, binascii.Error) as error:
+        raise CandidateGateError(
+            "CANDIDATE_GATE_DIFF_INVALID",
+            f"{field_name} is not canonical base64url",
+        ) from error
+    if not raw or b"\x00" in raw or raw.startswith(b"/"):
+        raise CandidateGateError(
+            "CANDIDATE_GATE_DIFF_INVALID",
+            f"{field_name} is not a non-empty repository-relative raw path",
+        )
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    if encoded != token:
+        raise CandidateGateError(
+            "CANDIDATE_GATE_DIFF_INVALID",
+            f"{field_name} is not in canonical base64url form",
+        )
+    return raw
+
+
+def _validate_diff_side(
+    *,
+    path: str | None,
+    mode: str | None,
+    object_type: str | None,
+    oid: str | None,
+    side: str,
+    legacy: bool = False,
+) -> None:
+    values = (path, mode, object_type, oid)
+    if all(value is None for value in values):
+        return
+    if any(value is None for value in values):
+        raise CandidateGateError(
+            "CANDIDATE_GATE_DIFF_INVALID",
+            f"Candidate diff {side} identity is only partially present",
+        )
+    assert path is not None and mode is not None
+    assert object_type is not None and oid is not None
+    if legacy:
+        _require_text(path, f"{side}_path")
+    else:
+        _decode_candidate_path_token(path, f"{side}_path")
+    if re.fullmatch(r"[0-7]{6}", mode) is None:
+        raise CandidateGateError(
+            "CANDIDATE_GATE_DIFF_INVALID",
+            f"Candidate diff {side} mode is invalid",
+        )
+    if object_type not in {"blob", "gitlink"}:
+        raise CandidateGateError(
+            "CANDIDATE_GATE_DIFF_INVALID",
+            f"Candidate diff {side} object type is invalid",
+        )
+    _require_object_id(oid, f"{side}_oid")
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateIdentity:
     """The exact Candidate/base identity consumed by deterministic audit."""
 
@@ -220,8 +296,42 @@ class CandidateIdentity:
     base_tree_oid: str
     candidate_commit_oid: str
     candidate_tree_oid: str
-    changed_paths: tuple[str, ...]
+    changed_path_tokens: tuple[str, ...]
     candidate_digest: str | None = None
+
+    def __init__(
+        self,
+        reported_reference: str,
+        base_commit_oid: str,
+        base_tree_oid: str,
+        candidate_commit_oid: str,
+        candidate_tree_oid: str,
+        changed_path_tokens: tuple[str, ...] | None = None,
+        candidate_digest: str | None = None,
+        *,
+        changed_paths: tuple[str, ...] | None = None,
+    ) -> None:
+        if changed_path_tokens is not None and changed_paths is not None:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_EVIDENCE_INVALID",
+                "CandidateIdentity received both changed path spellings",
+            )
+        object.__setattr__(
+            self,
+            "reported_reference",
+            reported_reference,
+        )
+        object.__setattr__(self, "base_commit_oid", base_commit_oid)
+        object.__setattr__(self, "base_tree_oid", base_tree_oid)
+        object.__setattr__(self, "candidate_commit_oid", candidate_commit_oid)
+        object.__setattr__(self, "candidate_tree_oid", candidate_tree_oid)
+        object.__setattr__(
+            self,
+            "changed_path_tokens",
+            changed_path_tokens if changed_path_tokens is not None else changed_paths,
+        )
+        object.__setattr__(self, "candidate_digest", candidate_digest)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         _require_text(self.reported_reference, "reported_reference")
@@ -232,24 +342,24 @@ class CandidateIdentity:
             "candidate_tree_oid",
         ):
             _require_object_id(getattr(self, field_name), field_name)
-        _require_text_tuple(self.changed_paths, "changed_paths")
-        if len(set(self.changed_paths)) != len(self.changed_paths):
+        _require_text_tuple(self.changed_path_tokens, "changed_path_tokens")
+        if self.changed_path_tokens != tuple(sorted(set(self.changed_path_tokens))):
             raise CandidateGateError(
                 "CANDIDATE_GATE_EVIDENCE_INVALID",
-                "changed_paths must not contain duplicates",
+                "changed_path_tokens must be sorted and unique",
             )
-        if self.changed_paths != tuple(sorted(self.changed_paths)):
-            raise CandidateGateError(
-                "CANDIDATE_GATE_EVIDENCE_INVALID",
-                "changed_paths must use deterministic repository-relative ordering",
-            )
-        expected = _body_digest(self._body())
+        expected = digest_value(self._body())
         if self.candidate_digest is None:
             object.__setattr__(self, "candidate_digest", expected)
         else:
-            _validate_stored_digest(self.candidate_digest, self._body())
+            _validate_stored_digest(
+                self.candidate_digest,
+                self._body(),
+                code="CANDIDATE_GATE_EVIDENCE_INVALID",
+                detail="CandidateIdentity digest changed",
+            )
 
-    def _body(self) -> dict[str, Any]:
+    def _body(self) -> dict[str, object]:
         return {
             "kind": "candidate_identity.v1",
             "reported_reference": self.reported_reference,
@@ -257,7 +367,7 @@ class CandidateIdentity:
             "base_tree_oid": self.base_tree_oid,
             "candidate_commit_oid": self.candidate_commit_oid,
             "candidate_tree_oid": self.candidate_tree_oid,
-            "changed_paths": list(self.changed_paths),
+            "changed_path_tokens": list(self.changed_path_tokens),
         }
 
     @property
@@ -265,133 +375,484 @@ class CandidateIdentity:
         assert self.candidate_digest is not None
         return self.candidate_digest
 
-    def canonical(self) -> dict[str, Any]:
+    @property
+    def changed_paths(self) -> tuple[str, ...]:
+        """Read-only migration spelling for predecessor tests."""
+        return self.changed_path_tokens
+
+    def canonical(self) -> dict[str, object]:
         return {**self._body(), "candidate_digest": self.digest}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, init=False)
 class CandidateDiffEntryV1:
-    """One raw Git tree entry used by the complete Candidate diff record."""
+    """One complete old/new raw-Git tree entry in a Candidate diff."""
 
-    side: str
-    path: str
-    mode: str
-    object_type: str
-    object_oid: str
+    old_path: str | None
+    new_path: str | None
+    change_kind: str
+    old_mode: str | None
+    new_mode: str | None
+    old_object_type: str | None
+    new_object_type: str | None
+    old_oid: str | None
+    new_oid: str | None
+    _legacy_mode: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __init__(
+        self,
+        *args: object,
+        old_path: str | None = _MISSING,
+        new_path: str | None = _MISSING,
+        change_kind: str = _MISSING,
+        old_mode: str | None = _MISSING,
+        new_mode: str | None = _MISSING,
+        old_object_type: str | None = _MISSING,
+        new_object_type: str | None = _MISSING,
+        old_oid: str | None = _MISSING,
+        new_oid: str | None = _MISSING,
+        side: str = _MISSING,
+        path: str = _MISSING,
+        mode: str = _MISSING,
+        object_type: str = _MISSING,
+        object_oid: str = _MISSING,
+    ) -> None:
+        legacy = side is not _MISSING or any(
+            value is not _MISSING
+            for value in (path, mode, object_type, object_oid)
+        )
+        if args:
+            if legacy:
+                raise TypeError("CandidateDiffEntryV1 mixes old and new arguments")
+            if len(args) == 9:
+                (
+                    old_path,
+                    new_path,
+                    change_kind,
+                    old_mode,
+                    new_mode,
+                    old_object_type,
+                    new_object_type,
+                    old_oid,
+                    new_oid,
+                ) = args
+            elif len(args) == 5:
+                legacy = True
+                side, path, mode, object_type, object_oid = args
+            else:
+                raise TypeError("CandidateDiffEntryV1 expects 9 or 5 positional values")
+        if legacy:
+            if any(
+                value is not _MISSING
+                for value in (
+                    old_path,
+                    new_path,
+                    change_kind,
+                    old_mode,
+                    new_mode,
+                    old_object_type,
+                    new_object_type,
+                    old_oid,
+                    new_oid,
+                )
+            ):
+                raise TypeError("CandidateDiffEntryV1 mixes old and new arguments")
+            if side == "base":
+                old_path, new_path, change_kind = path, None, "delete"
+                old_mode, new_mode = mode, None
+                old_object_type, new_object_type = object_type, None
+                old_oid, new_oid = object_oid, None
+            elif side == "candidate":
+                old_path, new_path, change_kind = None, path, "add"
+                old_mode, new_mode = None, mode
+                old_object_type, new_object_type = None, object_type
+                old_oid, new_oid = None, object_oid
+            else:
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_DIFF_INVALID",
+                    "Candidate diff entry side is outside the closed union",
+                )
+            if object_type in {"tree", "commit", "submodule"}:
+                if side == "base":
+                    old_object_type = "gitlink"
+                else:
+                    new_object_type = "gitlink"
+        for name, value in (
+            ("old_path", old_path),
+            ("new_path", new_path),
+            ("change_kind", change_kind),
+            ("old_mode", old_mode),
+            ("new_mode", new_mode),
+            ("old_object_type", old_object_type),
+            ("new_object_type", new_object_type),
+            ("old_oid", old_oid),
+            ("new_oid", new_oid),
+        ):
+            object.__setattr__(self, name, None if value is _MISSING else value)
+        object.__setattr__(self, "_legacy_mode", legacy)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        if self.side not in {"base", "candidate"}:
+        if self.change_kind not in {"add", "delete", "modify", "type-change"}:
             raise CandidateGateError(
                 "CANDIDATE_GATE_DIFF_INVALID",
-                "Candidate diff entry side is outside the closed union",
+                "Candidate diff change kind is outside the closed union",
             )
-        _require_text(self.path, "Candidate diff path")
-        if self.path.startswith("/") or "\\" in self.path or any(
-            part in {"", ".", ".."} for part in self.path.split("/")
+        _validate_diff_side(
+            path=self.old_path,
+            mode=self.old_mode,
+            object_type=self.old_object_type,
+            oid=self.old_oid,
+            side="old",
+            legacy=self._legacy_mode,
+        )
+        _validate_diff_side(
+            path=self.new_path,
+            mode=self.new_mode,
+            object_type=self.new_object_type,
+            oid=self.new_oid,
+            side="new",
+            legacy=self._legacy_mode,
+        )
+        old_missing = self.old_path is None
+        new_missing = self.new_path is None
+        if (
+            (self.change_kind == "add" and (not old_missing or new_missing))
+            or (self.change_kind == "delete" and (old_missing or not new_missing))
+            or (
+                self.change_kind in {"modify", "type-change"}
+                and (old_missing or new_missing)
+            )
         ):
             raise CandidateGateError(
                 "CANDIDATE_GATE_DIFF_INVALID",
-                "Candidate diff path is not repository-relative",
+                "Candidate diff side presence does not match change kind",
             )
-        _require_text(self.mode, "Candidate diff mode")
-        if not re.fullmatch(r"[0-7]{6}", self.mode):
+        if self.change_kind == "type-change" and (
+            self.old_object_type == self.new_object_type
+        ):
             raise CandidateGateError(
                 "CANDIDATE_GATE_DIFF_INVALID",
-                "Candidate diff mode is not an exact Git mode",
+                "type-change requires different old and new object types",
             )
-        if self.object_type not in {"blob", "tree", "commit", "submodule"}:
-            raise CandidateGateError(
-                "CANDIDATE_GATE_DIFF_INVALID",
-                "Candidate diff object type is outside the closed union",
-            )
-        _require_object_id(self.object_oid, "Candidate diff object OID")
 
-    def canonical(self) -> dict[str, str]:
+    def canonical(self) -> dict[str, str | None]:
         return {
-            "side": self.side,
-            "path": self.path,
-            "mode": self.mode,
-            "object_type": self.object_type,
-            "object_oid": self.object_oid,
+            "old_path": self.old_path,
+            "new_path": self.new_path,
+            "change_kind": self.change_kind,
+            "old_mode": self.old_mode,
+            "new_mode": self.new_mode,
+            "old_object_type": self.old_object_type,
+            "new_object_type": self.new_object_type,
+            "old_oid": self.old_oid,
+            "new_oid": self.new_oid,
         }
 
+    # The following read-only views retain the predecessor entry seam while
+    # all new canonical payloads use the complete old/new identity above.
+    @property
+    def side(self) -> str:
+        return "base" if self.new_path is None else "candidate"
 
-@dataclass(frozen=True)
+    @property
+    def path(self) -> str:
+        value = self.old_path if self.old_path is not None else self.new_path
+        assert value is not None
+        return value
+
+    @property
+    def mode(self) -> str:
+        value = self.old_mode if self.old_mode is not None else self.new_mode
+        assert value is not None
+        return value
+
+    @property
+    def object_type(self) -> str:
+        value = (
+            self.old_object_type
+            if self.old_object_type is not None
+            else self.new_object_type
+        )
+        assert value is not None
+        return value
+
+    @property
+    def object_oid(self) -> str:
+        value = self.old_oid if self.old_oid is not None else self.new_oid
+        assert value is not None
+        return value
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class CandidateDiffRecordV1:
     """The one complete, digest-addressed raw-Git Candidate diff Artifact."""
 
-    repository: str
-    object_format: str
+    schema_version: str
+    repository_object_format: str
     base_commit_oid: str
     base_tree_oid: str
     candidate_commit_oid: str
     candidate_tree_oid: str
     entries: tuple[CandidateDiffEntryV1, ...]
     record_digest: str | None = None
-    schema_version: str = "gwo.candidate-diff.v1"
+    _legacy_mode: bool = field(default=False, init=False, repr=False, compare=False)
+    _legacy_repository: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __init__(
+        self,
+        *args: object,
+        schema_version: str = _MISSING,
+        repository_object_format: str = _MISSING,
+        base_commit_oid: str = _MISSING,
+        base_tree_oid: str = _MISSING,
+        candidate_commit_oid: str = _MISSING,
+        candidate_tree_oid: str = _MISSING,
+        entries: tuple[CandidateDiffEntryV1, ...] = _MISSING,
+        record_digest: str | None = None,
+        repository: str = _MISSING,
+        object_format: str = _MISSING,
+    ) -> None:
+        legacy = repository is not _MISSING or object_format is not _MISSING
+        if args:
+            if legacy:
+                raise TypeError("CandidateDiffRecordV1 mixes old and new arguments")
+            if len(args) == 7:
+                (
+                    schema_version,
+                    repository_object_format,
+                    base_commit_oid,
+                    base_tree_oid,
+                    candidate_commit_oid,
+                    candidate_tree_oid,
+                    entries,
+                ) = args[:7]
+                legacy = schema_version == "gwo.candidate-diff.v1"
+                if legacy:
+                    object_format = repository_object_format
+            elif len(args) == 8 and args[0] in {
+                "CandidateDiffRecordV1",
+                "gwo.candidate-diff.v1",
+            }:
+                (
+                    schema_version,
+                    repository_object_format,
+                    base_commit_oid,
+                    base_tree_oid,
+                    candidate_commit_oid,
+                    candidate_tree_oid,
+                    entries,
+                    record_digest,
+                ) = args
+                legacy = schema_version == "gwo.candidate-diff.v1"
+                if legacy:
+                    object_format = repository_object_format
+            elif len(args) in {8, 9}:
+                # The predecessor positional order started with repository and
+                # object_format and is retained for existing callers.
+                legacy = True
+                (
+                    repository,
+                    object_format,
+                    base_commit_oid,
+                    base_tree_oid,
+                    candidate_commit_oid,
+                    candidate_tree_oid,
+                    entries,
+                    record_digest,
+                ) = args[:8]
+                if len(args) == 9:
+                    schema_version = args[8]
+            else:
+                raise TypeError("CandidateDiffRecordV1 has an unsupported positional shape")
+        if legacy:
+            if schema_version is not _MISSING and schema_version != "gwo.candidate-diff.v1":
+                raise TypeError("legacy CandidateDiffRecordV1 schema is not supported")
+            if object_format is _MISSING:
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_DIFF_INVALID",
+                    "legacy Candidate diff object format is missing",
+                )
+            schema_version = "gwo.candidate-diff.v1"
+            repository_object_format = object_format
+            if repository is not _MISSING:
+                _require_text(repository, "Candidate diff repository")
+        elif schema_version is _MISSING:
+            schema_version = None
+        if repository_object_format is _MISSING:
+            repository_object_format = None
+        if base_commit_oid is _MISSING:
+            base_commit_oid = None
+        if base_tree_oid is _MISSING:
+            base_tree_oid = None
+        if candidate_commit_oid is _MISSING:
+            candidate_commit_oid = None
+        if candidate_tree_oid is _MISSING:
+            candidate_tree_oid = None
+        if entries is _MISSING:
+            entries = None
+        for name, value in (
+            ("schema_version", schema_version),
+            ("repository_object_format", repository_object_format),
+            ("base_commit_oid", base_commit_oid),
+            ("base_tree_oid", base_tree_oid),
+            ("candidate_commit_oid", candidate_commit_oid),
+            ("candidate_tree_oid", candidate_tree_oid),
+            ("entries", entries),
+            ("record_digest", record_digest),
+        ):
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_legacy_mode", legacy)
+        object.__setattr__(
+            self,
+            "_legacy_repository",
+            None if repository is _MISSING else repository,
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        _require_text(self.repository, "Candidate diff repository")
-        _require_text(self.object_format, "Candidate diff object format")
-        if self.object_format not in {"sha1", "sha256"}:
-            raise CandidateGateError(
-                "CANDIDATE_GATE_DIFF_INVALID",
-                "Candidate diff object format is outside the closed union",
-            )
-        for value, label in (
-            (self.base_commit_oid, "base_commit_oid"),
-            (self.base_tree_oid, "base_tree_oid"),
-            (self.candidate_commit_oid, "candidate_commit_oid"),
-            (self.candidate_tree_oid, "candidate_tree_oid"),
-        ):
-            _require_object_id(value, label)
-        if self.schema_version != "gwo.candidate-diff.v1":
+        if self._legacy_mode:
+            expected_schema = "gwo.candidate-diff.v1"
+        else:
+            expected_schema = "CandidateDiffRecordV1"
+        if self.schema_version != expected_schema:
             raise CandidateGateError(
                 "CANDIDATE_GATE_DIFF_INVALID",
                 "Candidate diff schema version is invalid",
             )
+        if self.repository_object_format not in {"sha1", "sha256"}:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_DIFF_INVALID",
+                "Candidate diff repository object format is invalid",
+            )
+        for field_name in (
+            "base_commit_oid",
+            "base_tree_oid",
+            "candidate_commit_oid",
+            "candidate_tree_oid",
+        ):
+            _require_object_id(getattr(self, field_name), field_name)
         if type(self.entries) is not tuple or any(
             type(entry) is not CandidateDiffEntryV1 for entry in self.entries
         ):
             raise CandidateGateError(
                 "CANDIDATE_GATE_DIFF_INVALID",
-                "Candidate diff entries are not an immutable typed tuple",
+                "Candidate diff entries are not an exact immutable tuple",
             )
+        if self._legacy_mode:
+            if any(not entry._legacy_mode for entry in self.entries):
+                raise CandidateGateError(
+                    "CANDIDATE_GATE_DIFF_INVALID",
+                    "legacy Candidate diff entries are not explicit legacy values",
+                )
+        elif any(entry._legacy_mode for entry in self.entries):
+            raise CandidateGateError(
+                "CANDIDATE_GATE_DIFF_INVALID",
+                "exact CandidateDiffRecordV1 cannot contain legacy entries",
+            )
+
+        def path_key(token: str | None, entry: CandidateDiffEntryV1) -> tuple[int, bytes]:
+            if token is None:
+                return (0, b"")
+            if self._legacy_mode:
+                return (1, token.encode("utf-8"))
+            return (1, _decode_candidate_path_token(token, "entry path"))
+
         ordered = tuple(
             sorted(
                 self.entries,
                 key=lambda entry: (
-                    entry.side,
-                    entry.path,
-                    entry.mode,
-                    entry.object_type,
-                    entry.object_oid,
+                    path_key(entry.old_path, entry),
+                    path_key(entry.new_path, entry),
+                    entry.change_kind,
                 ),
             )
         )
-        if ordered != self.entries or len(set(entry.canonical().__repr__() for entry in self.entries)) != len(self.entries):
+        if self.entries != ordered or len(
+            {canonical_bytes(entry.canonical()) for entry in self.entries}
+        ) != len(self.entries):
             raise CandidateGateError(
                 "CANDIDATE_GATE_DIFF_INVALID",
                 "Candidate diff entries are not canonical and unique",
             )
-        expected = digest_value(self._body())
+        expected = digest_bytes(
+            b"gwo.candidate-diff-record.v1\x00" + canonical_bytes(self._body())
+        )
         if self.record_digest is None:
             object.__setattr__(self, "record_digest", expected)
-        else:
-            _validate_stored_digest(self.record_digest, self._body(), code="CANDIDATE_GATE_DIFF_INVALID", detail="Candidate diff record digest changed")
+        elif self.record_digest != expected:
+            raise CandidateGateError(
+                "CANDIDATE_GATE_DIFF_INVALID",
+                "Candidate diff record digest changed",
+            )
 
-    def _body(self) -> dict[str, Any]:
-        return {
-            "schema_version": self.schema_version,
-            "kind": "candidate_diff_record.v1",
-            "repository": self.repository,
-            "object_format": self.object_format,
-            "base_commit_oid": self.base_commit_oid,
-            "base_tree_oid": self.base_tree_oid,
-            "candidate_commit_oid": self.candidate_commit_oid,
-            "candidate_tree_oid": self.candidate_tree_oid,
-            "entries": [entry.canonical() for entry in self.entries],
-        }
+    @classmethod
+    def from_tree_entries(
+        cls,
+        *,
+        repository_object_format: str,
+        base_commit_oid: str,
+        base_tree_oid: str,
+        candidate_commit_oid: str,
+        candidate_tree_oid: str,
+        base_entries: Mapping[bytes, tuple[str, str, str]],
+        candidate_entries: Mapping[bytes, tuple[str, str, str]],
+    ) -> "CandidateDiffRecordV1":
+        """Build add/delete/modify/type-change entries without rename inference."""
+
+        def encode_path(raw_path: bytes) -> str:
+            return base64.urlsafe_b64encode(raw_path).decode("ascii").rstrip("=")
+
+        entries: list[CandidateDiffEntryV1] = []
+        for raw_path in sorted(set(base_entries) | set(candidate_entries)):
+            old = base_entries.get(raw_path)
+            new = candidate_entries.get(raw_path)
+            if old is None:
+                change_kind = "add"
+            elif new is None:
+                change_kind = "delete"
+            elif old[1] != new[1]:
+                change_kind = "type-change"
+            elif old != new:
+                change_kind = "modify"
+            else:
+                continue
+            entries.append(
+                CandidateDiffEntryV1(
+                    old_path=None if old is None else encode_path(raw_path),
+                    new_path=None if new is None else encode_path(raw_path),
+                    change_kind=change_kind,
+                    old_mode=None if old is None else old[0],
+                    new_mode=None if new is None else new[0],
+                    old_object_type=None if old is None else old[1],
+                    new_object_type=None if new is None else new[1],
+                    old_oid=None if old is None else old[2],
+                    new_oid=None if new is None else new[2],
+                )
+            )
+        return cls(
+            schema_version="CandidateDiffRecordV1",
+            repository_object_format=repository_object_format,
+            base_commit_oid=base_commit_oid,
+            base_tree_oid=base_tree_oid,
+            candidate_commit_oid=candidate_commit_oid,
+            candidate_tree_oid=candidate_tree_oid,
+            entries=tuple(entries),
+        )
+
+    @property
+    def changed_path_tokens(self) -> tuple[str, ...]:
+        ordered: list[str] = []
+        for entry in self.entries:
+            for token in (entry.old_path, entry.new_path):
+                if token is not None and token not in ordered:
+                    ordered.append(token)
+        return tuple(ordered)
 
     @property
     def digest(self) -> str:
@@ -400,9 +861,45 @@ class CandidateDiffRecordV1:
 
     @property
     def changed_paths(self) -> tuple[str, ...]:
-        return tuple(sorted({entry.path for entry in self.entries}))
+        """Read-only migration spelling for predecessor tests."""
+        return self.changed_path_tokens
 
-    def canonical(self) -> dict[str, Any]:
+    @property
+    def repository(self) -> str | None:
+        return self._legacy_repository if self._legacy_mode else None
+
+    @property
+    def object_format(self) -> str:
+        return self.repository_object_format
+
+    def _body(self) -> dict[str, object]:
+        if self._legacy_mode:
+            return {
+                "schema_version": self.schema_version,
+                "kind": "candidate_diff_record.v1",
+                "repository": self.repository,
+                "object_format": self.repository_object_format,
+                "base_commit_oid": self.base_commit_oid,
+                "base_tree_oid": self.base_tree_oid,
+                "candidate_commit_oid": self.candidate_commit_oid,
+                "candidate_tree_oid": self.candidate_tree_oid,
+                "entries": [entry.canonical() for entry in self.entries],
+            }
+        return {
+            "schema_version": self.schema_version,
+            "repository_object_format": self.repository_object_format,
+            "base": {
+                "commit_oid": self.base_commit_oid,
+                "tree_oid": self.base_tree_oid,
+            },
+            "candidate": {
+                "commit_oid": self.candidate_commit_oid,
+                "tree_oid": self.candidate_tree_oid,
+            },
+            "entries": [entry.canonical() for entry in self.entries],
+        }
+
+    def canonical(self) -> dict[str, object]:
         return {**self._body(), "record_digest": self.digest}
 
 
@@ -414,21 +911,34 @@ class CandidateReadback:
     candidate: CandidateIdentity
     diff_record: CandidateDiffRecordV1
     readback_digest: str | None = None
+    _legacy_compatibility: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _require_text(self.repository, "Candidate readback repository")
-        if type(self.candidate) is not CandidateIdentity or type(self.diff_record) is not CandidateDiffRecordV1:
+        if type(self.candidate) is not CandidateIdentity or type(
+            self.diff_record
+        ) is not CandidateDiffRecordV1:
             raise CandidateGateError(
                 "CANDIDATE_GATE_READBACK_INVALID",
                 "Candidate readback has an invalid typed identity",
             )
+        object.__setattr__(
+            self,
+            "_legacy_compatibility",
+            self.diff_record._legacy_mode,
+        )
         if (
-            self.diff_record.repository != self.repository
-            or self.diff_record.base_commit_oid != self.candidate.base_commit_oid
+            self.diff_record.base_commit_oid != self.candidate.base_commit_oid
             or self.diff_record.base_tree_oid != self.candidate.base_tree_oid
             or self.diff_record.candidate_commit_oid != self.candidate.candidate_commit_oid
             or self.diff_record.candidate_tree_oid != self.candidate.candidate_tree_oid
-            or self.diff_record.changed_paths != self.candidate.changed_paths
+            or self.diff_record.changed_path_tokens
+            != self.candidate.changed_path_tokens
         ):
             raise CandidateGateError(
                 "CANDIDATE_GATE_READBACK_INVALID",
@@ -455,6 +965,186 @@ class CandidateReadback:
 
     def canonical(self) -> dict[str, Any]:
         return {**self._body(), "readback_digest": self.digest}
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateReceipt:
+    """The private authoritative Candidate receipt persisted by ExecutionKernel."""
+
+    parent_digest: str
+    repository: str
+    campaign_key: str
+    campaign_handle: str
+    plan_revision_digest: str
+    work_run_key: str
+    ticket_key: str
+    reported_reference: str
+    base_commit_oid: str
+    base_tree_oid: str
+    candidate_commit_oid: str
+    candidate_tree_oid: str
+    diff_schema_version: str
+    diff_record_digest: str
+    authority_subtree_digest: str
+    runtime_subject_digest: str
+    receipt_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "parent_digest",
+            "plan_revision_digest",
+            "authority_subtree_digest",
+            "runtime_subject_digest",
+        ):
+            _require_digest(getattr(self, field_name), field_name)
+        for field_name in (
+            "repository",
+            "campaign_key",
+            "campaign_handle",
+            "work_run_key",
+            "ticket_key",
+            "reported_reference",
+            "diff_schema_version",
+        ):
+            _require_text(getattr(self, field_name), field_name)
+        for field_name in (
+            "base_commit_oid",
+            "base_tree_oid",
+            "candidate_commit_oid",
+            "candidate_tree_oid",
+        ):
+            _require_object_id(getattr(self, field_name), field_name)
+        _require_digest(self.diff_record_digest, "diff_record_digest")
+        if self.diff_schema_version != "CandidateDiffRecordV1":
+            raise CandidateGateError(
+                "CANDIDATE_RECEIPT_INVALID",
+                "CandidateReceipt diff schema is not CandidateDiffRecordV1",
+            )
+        expected = digest_value(self._body())
+        if self.receipt_digest is None:
+            object.__setattr__(self, "receipt_digest", expected)
+        else:
+            _validate_stored_digest(
+                self.receipt_digest,
+                self._body(),
+                code="CANDIDATE_RECEIPT_INVALID",
+                detail="CandidateReceipt digest changed",
+            )
+
+    @classmethod
+    def from_readback(
+        cls,
+        *,
+        parent: CandidateGateParent,
+        reported_reference: str,
+        readback: CandidateReadback,
+    ) -> "CandidateReceipt":
+        subject = parent.runtime_subject
+        candidate = readback.candidate
+        return cls(
+            parent_digest=parent.digest,
+            repository=readback.repository,
+            campaign_key=subject.campaign_key,
+            campaign_handle=subject.campaign_handle,
+            plan_revision_digest=subject.plan_revision_digest,
+            work_run_key=subject.work_run_key,
+            ticket_key=subject.ticket_key,
+            reported_reference=reported_reference,
+            base_commit_oid=candidate.base_commit_oid,
+            base_tree_oid=candidate.base_tree_oid,
+            candidate_commit_oid=candidate.candidate_commit_oid,
+            candidate_tree_oid=candidate.candidate_tree_oid,
+            diff_schema_version=readback.diff_record.schema_version,
+            diff_record_digest=readback.diff_record.digest,
+            authority_subtree_digest=subject.authority_subtree_digest,
+            runtime_subject_digest=subject.digest,
+        )
+
+    @classmethod
+    def from_canonical(cls, value: Mapping[str, Any]) -> "CandidateReceipt":
+        expected_keys = frozenset(
+            {
+                "kind",
+                "parent_digest",
+                "repository",
+                "campaign_key",
+                "campaign_handle",
+                "plan_revision_digest",
+                "work_run_key",
+                "ticket_key",
+                "reported_reference",
+                "base_commit_oid",
+                "base_tree_oid",
+                "candidate_commit_oid",
+                "candidate_tree_oid",
+                "diff_schema_version",
+                "diff_record_digest",
+                "authority_subtree_digest",
+                "runtime_subject_digest",
+                "receipt_digest",
+            }
+        )
+        if not isinstance(value, Mapping) or frozenset(value) != expected_keys:
+            raise CandidateGateError(
+                "CANDIDATE_RECEIPT_INVALID",
+                "CandidateReceipt canonical keys are not exact",
+            )
+        if value["kind"] != "candidate_receipt.v1":
+            raise CandidateGateError(
+                "CANDIDATE_RECEIPT_INVALID",
+                "CandidateReceipt kind is invalid",
+            )
+        try:
+            return cls(
+                parent_digest=value["parent_digest"],
+                repository=value["repository"],
+                campaign_key=value["campaign_key"],
+                campaign_handle=value["campaign_handle"],
+                plan_revision_digest=value["plan_revision_digest"],
+                work_run_key=value["work_run_key"],
+                ticket_key=value["ticket_key"],
+                reported_reference=value["reported_reference"],
+                base_commit_oid=value["base_commit_oid"],
+                base_tree_oid=value["base_tree_oid"],
+                candidate_commit_oid=value["candidate_commit_oid"],
+                candidate_tree_oid=value["candidate_tree_oid"],
+                diff_schema_version=value["diff_schema_version"],
+                diff_record_digest=value["diff_record_digest"],
+                authority_subtree_digest=value["authority_subtree_digest"],
+                runtime_subject_digest=value["runtime_subject_digest"],
+                receipt_digest=value["receipt_digest"],
+            )
+        except CandidateGateError as error:
+            raise CandidateGateError("CANDIDATE_RECEIPT_INVALID", error.detail) from error
+
+    def _body(self) -> dict[str, object]:
+        return {
+            "kind": "candidate_receipt.v1",
+            "parent_digest": self.parent_digest,
+            "repository": self.repository,
+            "campaign_key": self.campaign_key,
+            "campaign_handle": self.campaign_handle,
+            "plan_revision_digest": self.plan_revision_digest,
+            "work_run_key": self.work_run_key,
+            "ticket_key": self.ticket_key,
+            "reported_reference": self.reported_reference,
+            "base_commit_oid": self.base_commit_oid,
+            "base_tree_oid": self.base_tree_oid,
+            "candidate_commit_oid": self.candidate_commit_oid,
+            "candidate_tree_oid": self.candidate_tree_oid,
+            "diff_schema_version": self.diff_schema_version,
+            "diff_record_digest": self.diff_record_digest,
+            "authority_subtree_digest": self.authority_subtree_digest,
+            "runtime_subject_digest": self.runtime_subject_digest,
+        }
+
+    @property
+    def digest(self) -> str:
+        assert self.receipt_digest is not None
+        return self.receipt_digest
+
+    def canonical(self) -> dict[str, object]:
+        return {**self._body(), "receipt_digest": self.digest}
 
 
 @dataclass(frozen=True)
@@ -582,6 +1272,12 @@ class CandidateAuditReport:
     check_evidence_digests: tuple[str, ...] = ()
     assurance_requirement: str = "standard"
     report_digest: str | None = None
+    _legacy_compatibility: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _require_digest(self.parent_digest, "parent_digest")
@@ -596,6 +1292,11 @@ class CandidateAuditReport:
                     "CANDIDATE_GATE_EVIDENCE_INVALID",
                     "Candidate audit diff record is not the exact V1 type",
                 )
+            object.__setattr__(
+                self,
+                "_legacy_compatibility",
+                self.diff_record._legacy_mode,
+            )
             if self.diff_record.changed_paths != self.candidate.changed_paths:
                 raise CandidateGateError(
                     "CANDIDATE_GATE_EVIDENCE_INVALID",
@@ -2245,6 +2946,7 @@ __all__ = [
     "CandidateIdentity",
     "CandidateReadback",
     "CandidateReadbackPort",
+    "CandidateReceipt",
     "DeterministicAuditFailure",
     "FormalReviewer",
     "FormalReviewFinding",

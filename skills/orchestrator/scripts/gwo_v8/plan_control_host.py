@@ -25,6 +25,12 @@ from .plan_control import (
     _ready_refs,
     _validate_preflight,
 )
+from .campaign_watchdog import (
+    CampaignWatchdog,
+    WatchdogEventSource,
+    WatchdogWake,
+    WatchdogWakePage,
+)
 from .runtime_gateway import (
     ArtifactStore,
     CampaignStartRuntimeOverrides,
@@ -59,6 +65,31 @@ if TYPE_CHECKING:
 
 
 _GatewayBuilder = Callable[..., Any]
+
+
+class RuntimeGatewayWatchdogEventSource:
+    def __init__(self, gateway: Any) -> None:
+        if not callable(getattr(gateway, "_read_watchdog_events", None)):
+            raise PlanControlError(
+                "PLAN_CONTROL_COMPOSITION_INVALID",
+                "RuntimeGateway must expose private Watchdog event readback",
+            )
+        self._gateway = gateway
+
+    def read(self, after_cursor: str | None) -> WatchdogWakePage:
+        page = self._gateway._read_watchdog_events(after_cursor)
+        return WatchdogWakePage(
+            events=tuple(
+                WatchdogWake(
+                    cursor=event.cursor,
+                    campaign=CampaignHandle(event.repository, event.campaign_key),
+                    source=event.source,
+                    source_identity=event.stable_action_id,
+                )
+                for event in page.events
+            ),
+            next_cursor=page.next_cursor,
+        )
 
 
 class _PlanControlGateway:
@@ -597,6 +628,74 @@ class ProductionPlanControlStartHost:
             effects=effects,
             configuration=configuration,
         )
+
+    def install_campaign_watchdog(
+        self,
+        *,
+        store_path: Path,
+        execution_kernel: ExecutionKernel,
+        hosted_check_source: WatchdogEventSource | None = None,
+        _runtime_event_source: WatchdogEventSource | None = None,
+    ) -> CampaignWatchdog:
+        from .execution_kernel import ExecutionKernel
+
+        if (
+            type(execution_kernel) is not ExecutionKernel
+            or execution_kernel._plan_control is not self
+        ):
+            raise PlanControlError(
+                "PLAN_CONTROL_COMPOSITION_INVALID",
+                "execution_kernel must be installed by this exact host",
+            )
+        for label, source in (
+            ("runtime_gateway", _runtime_event_source),
+            ("hosted_check", hosted_check_source),
+        ):
+            if source is not None and not callable(getattr(source, "read", None)):
+                raise PlanControlError(
+                    "PLAN_CONTROL_COMPOSITION_INVALID",
+                    f"{label} source must expose read(after_cursor)",
+                )
+
+        runtime_source = _runtime_event_source
+        if runtime_source is None:
+            effect_dispatch_factory = getattr(
+                self._repository,
+                "planning_effect_dispatch",
+                None,
+            )
+            try:
+                gateway = self._gateway_builder(
+                    gateway_store_path=self._gateway_store_path,
+                    configuration=self._configuration,
+                    repository_contexts=self._repository_contexts,
+                    artifacts=self._artifacts,
+                    planning_effect_dispatch=(
+                        effect_dispatch_factory()
+                        if callable(effect_dispatch_factory)
+                        else None
+                    ),
+                )
+            except (TypeError, RuntimeGatewayError, ValueError) as error:
+                raise PlanControlError(
+                    "PLAN_CONTROL_COMPOSITION_INVALID",
+                    "RuntimeGateway Watchdog composition failed",
+                ) from error
+            runtime_source = RuntimeGatewayWatchdogEventSource(gateway)
+
+        sources: dict[str, WatchdogEventSource] = {
+            "runtime_gateway": runtime_source,
+        }
+        if hosted_check_source is not None:
+            sources["hosted_check"] = hosted_check_source
+        watchdog = CampaignWatchdog(
+            store_path=store_path,
+            event_sources=sources,
+            campaign_source=execution_kernel,
+            advancer=execution_kernel,
+        )
+        watchdog.rebuild_due_queue()
+        return watchdog
 
 
 def install_plan_control_start(

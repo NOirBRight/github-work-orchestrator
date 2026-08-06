@@ -10,13 +10,18 @@ nor Runtime/provider policy.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import json
 from pathlib import Path
 import re
 import sqlite3
 import threading
-from typing import Any, Mapping, Protocol
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol
+
+if TYPE_CHECKING:
+    from .campaign_watchdog import WatchdogCampaignSnapshot
 
 from ._canonical import (
     CanonicalJsonError,
@@ -34,6 +39,7 @@ from .plan_control import (
     PlanInvalidationDisposition,
     TicketClaimProof,
 )
+from .candidate_gate import CandidateGateError, CandidateReceipt
 from .human_gate import (
     HumanDecisionChoice,
     HumanDecisionRecord,
@@ -166,6 +172,498 @@ class CampaignStatus(str, Enum):
     BLOCKED = "Blocked"
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class StaleReadbackState(str, Enum):
+    TERMINAL = "terminal"
+    IDLE = "idle"
+    PERMISSION_WAITING = "permission_waiting"
+    CANDIDATE_RECEIVED = "candidate_received"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    AMBIGUOUS_RUNNING = "ambiguous_running"
+
+
+class StaleDiagnosisDisposition(str, Enum):
+    CONTINUE = "continue"
+    GUIDE_SAME_WORKER = "guide_same_worker"
+    RECOVER_SAME_BINDING = "recover_same_binding"
+    DECISION = "decision"
+
+
+_STALE_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_STALE_MAX_TEXT = 256
+_STALE_MAX_STATE_TEXT = 64
+
+
+def _validate_stale_digest(value: object, label: str) -> None:
+    if type(value) is not str or _STALE_DIGEST_PATTERN.fullmatch(value) is None:
+        raise ExecutionKernelError(
+            "EFFECT_READBACK_INVALID",
+            f"{label} must be a SHA-256 digest",
+        )
+
+
+def _validate_binding_id(value: object, label: str) -> None:
+    if type(value) is not str or not value:
+        raise ExecutionKernelError(
+            "EFFECT_READBACK_INVALID",
+            f"{label} must be non-empty exact text",
+        )
+
+
+def _validate_bounded_text(
+    value: object,
+    label: str,
+    *,
+    maximum: int = _STALE_MAX_TEXT,
+) -> None:
+    if (
+        type(value) is not str
+        or not value
+        or "\x00" in value
+        or "\r" in value
+        or "\n" in value
+        or len(value) > maximum
+    ):
+        raise ExecutionKernelError(
+            "EFFECT_READBACK_INVALID",
+            f"{label} must be bounded exact text",
+        )
+
+
+@dataclass(frozen=True)
+class TerminalBindingEvidence:
+    """Read-backed proof that one established Runtime Binding is terminal."""
+
+    prior_action_id: str
+    prior_runtime_binding_id: str
+    agent_id: str
+    session_id: str
+    workspace_id: str
+    terminal_state: str
+    fence_digest: str
+    checkpoint_digest: str
+    evidence_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self) is not TerminalBindingEvidence:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "terminal binding Evidence must be an exact value",
+            )
+        for value, label in (
+            (self.prior_action_id, "terminal prior action identity"),
+            (self.prior_runtime_binding_id, "terminal prior Runtime Binding"),
+            (self.agent_id, "terminal Agent identity"),
+            (self.session_id, "terminal session identity"),
+            (self.workspace_id, "terminal workspace identity"),
+            (self.terminal_state, "terminal state"),
+        ):
+            _validate_bounded_text(value, label, maximum=_STALE_MAX_STATE_TEXT)
+        if self.terminal_state != "terminal":
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "terminal binding Evidence does not prove a terminal state",
+            )
+        _validate_stale_digest(self.fence_digest, "terminal binding fence")
+        _validate_stale_digest(self.checkpoint_digest, "terminal binding checkpoint")
+        expected = digest_value(self._body())
+        if self.evidence_digest is None:
+            object.__setattr__(self, "evidence_digest", expected)
+        elif self.evidence_digest != expected:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "terminal binding Evidence digest changed",
+            )
+
+    def _body(self) -> dict[str, str]:
+        return {
+            "kind": "terminal-binding-evidence.v1",
+            "prior_action_id": self.prior_action_id,
+            "prior_runtime_binding_id": self.prior_runtime_binding_id,
+            "agent_id": self.agent_id,
+            "session_id": self.session_id,
+            "workspace_id": self.workspace_id,
+            "terminal_state": self.terminal_state,
+            "fence_digest": self.fence_digest,
+            "checkpoint_digest": self.checkpoint_digest,
+        }
+
+    @property
+    def digest(self) -> str:
+        assert self.evidence_digest is not None
+        return self.evidence_digest
+
+    def canonical(self) -> dict[str, str]:
+        return {**self._body(), "evidence_digest": self.digest}
+
+    @classmethod
+    def from_canonical(cls, value: Mapping[str, Any]) -> "TerminalBindingEvidence":
+        expected = {
+            "kind",
+            "prior_action_id",
+            "prior_runtime_binding_id",
+            "agent_id",
+            "session_id",
+            "workspace_id",
+            "terminal_state",
+            "fence_digest",
+            "checkpoint_digest",
+            "evidence_digest",
+        }
+        if type(value) is not dict or set(value) != expected or value.get("kind") != "terminal-binding-evidence.v1":
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "terminal binding Evidence canonical schema is not exact",
+            )
+        try:
+            return cls(
+                prior_action_id=value["prior_action_id"],
+                prior_runtime_binding_id=value["prior_runtime_binding_id"],
+                agent_id=value["agent_id"],
+                session_id=value["session_id"],
+                workspace_id=value["workspace_id"],
+                terminal_state=value["terminal_state"],
+                fence_digest=value["fence_digest"],
+                checkpoint_digest=value["checkpoint_digest"],
+                evidence_digest=value["evidence_digest"],
+            )
+        except ExecutionKernelError:
+            raise
+        except Exception as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "terminal binding Evidence canonical value is invalid",
+            ) from error
+
+
+class StaleFollowUpKind(str, Enum):
+    GUIDANCE = "guidance"
+    SAME_BINDING_RECOVERY = "same_binding_recovery"
+
+
+@dataclass(frozen=True)
+class StaleDiagnosisPacket:
+    """Bounded, non-transcript stale context sent to one Coordinator action."""
+
+    MAX_TRANSCRIPT_ITEMS = 8
+    MAX_TRANSCRIPT_ITEM_BYTES = 512
+    MAX_TRANSCRIPT_BYTES = 2048
+    MAX_CANDIDATE_IDENTITIES = 3
+
+    repository: str
+    campaign_key: str
+    plan_revision_digest: str
+    ticket_key: str
+    work_run_key: str
+    work_subject_digest: str
+    ticket_contract_digest: str
+    authority_subtree_digest: str
+    policy_witness_digest: str
+    runtime_binding_id: str
+    candidate_count: int
+    binding_count: int
+    candidate_identities: tuple[str, ...]
+    lifecycle_state: str
+    process_state: str
+    workspace_state: str
+    check_state: str
+    transcript_tail: tuple[str, ...] = ()
+    packet_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self) is not StaleDiagnosisPacket:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale diagnosis packet must be an exact value",
+            )
+        for value, label in (
+            (self.repository, "stale packet repository"),
+            (self.campaign_key, "stale packet Campaign"),
+            (self.ticket_key, "stale packet Ticket"),
+            (self.work_run_key, "stale packet Work Run"),
+            (self.runtime_binding_id, "stale packet Runtime Binding"),
+        ):
+            _validate_bounded_text(value, label)
+        for value, label in (
+            (self.plan_revision_digest, "stale packet Plan Revision"),
+            (self.work_subject_digest, "stale packet Work Subject"),
+            (self.ticket_contract_digest, "stale packet Ticket contract"),
+            (self.authority_subtree_digest, "stale packet authority"),
+            (self.policy_witness_digest, "stale packet Policy Witness"),
+        ):
+            _validate_stale_digest(value, label)
+        for value, label in (
+            (self.lifecycle_state, "stale packet lifecycle state"),
+            (self.process_state, "stale packet process state"),
+            (self.workspace_state, "stale packet workspace state"),
+            (self.check_state, "stale packet check state"),
+        ):
+            _validate_bounded_text(value, label, maximum=_STALE_MAX_STATE_TEXT)
+        for value, label, maximum in (
+            (self.candidate_count, "stale packet Candidate count", 3),
+            (self.binding_count, "stale packet binding count", 2),
+        ):
+            if type(value) is not int or isinstance(value, bool) or not 0 <= value <= maximum:
+                raise ExecutionKernelError(
+                    "EFFECT_READBACK_INVALID",
+                    f"{label} is outside its bound",
+                )
+        if self.binding_count < 1:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale packet binding count must include the current binding",
+            )
+        if type(self.candidate_identities) is not tuple or len(self.candidate_identities) > self.MAX_CANDIDATE_IDENTITIES:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale packet Candidate identities exceed their bound",
+            )
+        if self.candidate_identities != tuple(sorted(set(self.candidate_identities))):
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale packet Candidate identities are not canonical",
+            )
+        for value in self.candidate_identities:
+            _validate_bounded_text(value, "stale packet Candidate identity")
+        if type(self.transcript_tail) is not tuple or len(self.transcript_tail) > self.MAX_TRANSCRIPT_ITEMS:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale packet transcript tail exceeds its item bound",
+            )
+        total_bytes = 0
+        for value in self.transcript_tail:
+            _validate_bounded_text(
+                value,
+                "stale packet transcript item",
+                maximum=self.MAX_TRANSCRIPT_ITEM_BYTES,
+            )
+            total_bytes += len(value.encode("utf-8"))
+        if total_bytes > self.MAX_TRANSCRIPT_BYTES:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale packet transcript tail exceeds its byte bound",
+            )
+        expected = digest_value(self._body())
+        if self.packet_digest is None:
+            object.__setattr__(self, "packet_digest", expected)
+        elif self.packet_digest != expected:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale diagnosis packet digest changed",
+            )
+
+    def _body(self) -> dict[str, Any]:
+        return {
+            "kind": "stale-diagnosis-packet.v1",
+            "repository": self.repository,
+            "campaign_key": self.campaign_key,
+            "plan_revision_digest": self.plan_revision_digest,
+            "ticket_key": self.ticket_key,
+            "work_run_key": self.work_run_key,
+            "work_subject_digest": self.work_subject_digest,
+            "ticket_contract_digest": self.ticket_contract_digest,
+            "authority_subtree_digest": self.authority_subtree_digest,
+            "policy_witness_digest": self.policy_witness_digest,
+            "runtime_binding_id": self.runtime_binding_id,
+            "candidate_count": self.candidate_count,
+            "binding_count": self.binding_count,
+            "candidate_identities": list(self.candidate_identities),
+            "lifecycle_state": self.lifecycle_state,
+            "process_state": self.process_state,
+            "workspace_state": self.workspace_state,
+            "check_state": self.check_state,
+            "transcript_tail": list(self.transcript_tail),
+        }
+
+    @property
+    def digest(self) -> str:
+        assert self.packet_digest is not None
+        return self.packet_digest
+
+    @property
+    def identity(self) -> str:
+        return f"stale-diagnosis-packet:{self.digest[:32]}"
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            **self._body(),
+            "packet_digest": self.digest,
+            "packet_identity": self.identity,
+        }
+
+    @classmethod
+    def from_canonical(cls, value: Mapping[str, Any]) -> "StaleDiagnosisPacket":
+        expected = {
+            "kind",
+            "repository",
+            "campaign_key",
+            "plan_revision_digest",
+            "ticket_key",
+            "work_run_key",
+            "work_subject_digest",
+            "ticket_contract_digest",
+            "authority_subtree_digest",
+            "policy_witness_digest",
+            "runtime_binding_id",
+            "candidate_count",
+            "binding_count",
+            "candidate_identities",
+            "lifecycle_state",
+            "process_state",
+            "workspace_state",
+            "check_state",
+            "transcript_tail",
+            "packet_digest",
+            "packet_identity",
+        }
+        if type(value) is not dict or set(value) != expected or value.get("kind") != "stale-diagnosis-packet.v1":
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stale diagnosis packet canonical schema is not exact",
+            )
+        if (
+            type(value["candidate_identities"]) is not list
+            or type(value["transcript_tail"]) is not list
+        ):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stale diagnosis packet arrays are not exact JSON arrays",
+            )
+        try:
+            packet = cls(
+                repository=value["repository"],
+                campaign_key=value["campaign_key"],
+                plan_revision_digest=value["plan_revision_digest"],
+                ticket_key=value["ticket_key"],
+                work_run_key=value["work_run_key"],
+                work_subject_digest=value["work_subject_digest"],
+                ticket_contract_digest=value["ticket_contract_digest"],
+                authority_subtree_digest=value["authority_subtree_digest"],
+                policy_witness_digest=value["policy_witness_digest"],
+                runtime_binding_id=value["runtime_binding_id"],
+                candidate_count=value["candidate_count"],
+                binding_count=value["binding_count"],
+                candidate_identities=tuple(value["candidate_identities"]),
+                lifecycle_state=value["lifecycle_state"],
+                process_state=value["process_state"],
+                workspace_state=value["workspace_state"],
+                check_state=value["check_state"],
+                transcript_tail=tuple(value["transcript_tail"]),
+                packet_digest=value["packet_digest"],
+            )
+        except ExecutionKernelError:
+            raise
+        except Exception as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stale diagnosis packet canonical value is invalid",
+            ) from error
+        if value["packet_identity"] != packet.identity:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stale diagnosis packet identity changed",
+            )
+        return packet
+
+
+@dataclass(frozen=True)
+class StaleBindingObservation:
+    stable_action_id: str
+    runtime_binding_id: str
+    state: StaleReadbackState
+    runtime_readback_digest: str
+    process_readback_digest: str
+    workspace_readback_digest: str
+    campaign_readback_digest: str
+    receipt_digest: str
+    candidate_receipt: CandidateReceipt | None = None
+
+    def __post_init__(self) -> None:
+        if type(self) is not StaleBindingObservation:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale binding observations must be exact values",
+            )
+        _validate_binding_id(self.stable_action_id, "stale readback action identity")
+        _validate_binding_id(self.runtime_binding_id, "stale runtime binding identity")
+        if type(self.state) is not StaleReadbackState:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale readback state is not closed",
+            )
+        for value, label in (
+            (self.runtime_readback_digest, "runtime readback"),
+            (self.process_readback_digest, "process readback"),
+            (self.workspace_readback_digest, "workspace readback"),
+            (self.campaign_readback_digest, "Campaign readback"),
+            (self.receipt_digest, "stale readback receipt"),
+        ):
+            _validate_stale_digest(value, label)
+        if self.candidate_receipt is not None and type(self.candidate_receipt) is not CandidateReceipt:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale Candidate progress is not an exact CandidateReceipt",
+            )
+        if (
+            self.state is StaleReadbackState.CANDIDATE_RECEIVED
+            and self.candidate_receipt is not None
+            and self.receipt_digest != self.candidate_receipt.digest
+        ):
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale Candidate readback receipt does not bind CandidateReceipt",
+            )
+
+
+@dataclass(frozen=True)
+class StaleDiagnosisObservation:
+    stable_action_id: str
+    runtime_binding_id: str
+    disposition: StaleDiagnosisDisposition
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self) is not StaleDiagnosisObservation:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale diagnosis observations must be exact values",
+            )
+        _validate_binding_id(self.stable_action_id, "stale diagnosis action identity")
+        _validate_binding_id(self.runtime_binding_id, "stale diagnosis runtime binding identity")
+        if type(self.disposition) is not StaleDiagnosisDisposition:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale diagnosis disposition is not closed",
+            )
+        _validate_stale_digest(self.receipt_digest, "stale diagnosis receipt")
+
+
+@dataclass(frozen=True)
+class StaleFollowUpObservation:
+    stable_action_id: str
+    runtime_binding_id: str
+    kind: StaleFollowUpKind
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self) is not StaleFollowUpObservation:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale follow-up observations must be exact values",
+            )
+        _validate_binding_id(self.stable_action_id, "stale follow-up action identity")
+        _validate_binding_id(self.runtime_binding_id, "stale follow-up Runtime Binding")
+        if type(self.kind) is not StaleFollowUpKind:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale follow-up kind is not closed",
+            )
+        _validate_stale_digest(self.receipt_digest, "stale follow-up receipt")
+
+
 @dataclass(frozen=True)
 class CampaignOutcome:
     status: CampaignStatus
@@ -188,6 +686,7 @@ class WorkRunSummary:
     candidate_identity: str | None = None
     result_digest: str | None = None
     evidence_digests: tuple[str, ...] = ()
+    last_wake_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -231,6 +730,8 @@ class ExecutionKernelConfiguration:
 
     host_worker_slots: int = 4
     repository_worker_slots: dict[str, int] | None = None
+    host_stale_after_seconds: int = 1800
+    repository_stale_after_seconds: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         overrides = self.repository_worker_slots
@@ -245,6 +746,44 @@ class ExecutionKernelConfiguration:
             "repository_worker_slots",
             None if overrides is None else dict(overrides),
         )
+        if (
+            type(self.host_stale_after_seconds) is not int
+            or isinstance(self.host_stale_after_seconds, bool)
+            or self.host_stale_after_seconds <= 0
+        ):
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "host stale threshold must be a positive exact integer",
+            )
+        stale_overrides = self.repository_stale_after_seconds
+        if stale_overrides is not None and type(stale_overrides) is not dict:
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "repository stale thresholds must be an exact mapping",
+            )
+        if stale_overrides is not None:
+            copied: dict[str, int] = {}
+            for repository, seconds in stale_overrides.items():
+                if type(repository) is not str or not repository.strip():
+                    raise ExecutionKernelError(
+                        "STALE_CONFIGURATION_INVALID",
+                        "repository stale threshold keys must be non-empty exact text",
+                    )
+                if (
+                    type(seconds) is not int
+                    or isinstance(seconds, bool)
+                    or seconds <= 0
+                ):
+                    raise ExecutionKernelError(
+                        "STALE_CONFIGURATION_INVALID",
+                        "repository stale thresholds must be positive exact integers",
+                    )
+                copied[repository] = seconds
+            object.__setattr__(
+                self,
+                "repository_stale_after_seconds",
+                MappingProxyType(copied),
+            )
 
     def worker_slots_for(self, repository: str) -> int:
         configured = (self.repository_worker_slots or {}).get(
@@ -258,6 +797,26 @@ class ExecutionKernelConfiguration:
             raise ExecutionKernelError(
                 "WORKER_SLOT_CONFIGURATION_INVALID",
                 "Worker Slot capacity must be a positive exact integer",
+            )
+        return configured
+
+    def stale_after_seconds_for(self, repository: str) -> int:
+        if type(repository) is not str or not repository.strip():
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "repository must be non-empty exact text",
+            )
+        configured = (self.repository_stale_after_seconds or {}).get(
+            repository, self.host_stale_after_seconds
+        )
+        if (
+            type(configured) is not int
+            or isinstance(configured, bool)
+            or configured <= 0
+        ):
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "stale threshold must be a positive exact integer",
             )
         return configured
 
@@ -275,6 +834,27 @@ class WorkRunAction:
     semantic_action_id: str
     work_run_key: str = ""
     work_subject_digest: str = ""
+    runtime_binding_id: str | None = None
+    stale_diagnosis_packet: StaleDiagnosisPacket | None = None
+    stale_follow_up_kind: StaleFollowUpKind | None = None
+
+    def __post_init__(self) -> None:
+        if self.stale_diagnosis_packet is not None:
+            if type(self.stale_diagnosis_packet) is not StaleDiagnosisPacket or self.kind != "stale_diagnosis":
+                raise ExecutionKernelError(
+                    "EFFECT_READBACK_INVALID",
+                    "stale diagnosis packet is bound to the wrong action kind",
+                )
+        if self.stale_follow_up_kind is not None:
+            expected = {
+                StaleFollowUpKind.GUIDANCE: "stale_guidance",
+                StaleFollowUpKind.SAME_BINDING_RECOVERY: "stale_same_binding_recovery",
+            }
+            if type(self.stale_follow_up_kind) is not StaleFollowUpKind or expected.get(self.stale_follow_up_kind) != self.kind:
+                raise ExecutionKernelError(
+                    "EFFECT_READBACK_INVALID",
+                    "stale follow-up kind is bound to the wrong action kind",
+                )
 
 
 @dataclass(frozen=True)
@@ -295,6 +875,12 @@ class WorkRunObservation:
     candidate_identity: str | None = None
     result_digest: str | None = None
     evidence_digests: tuple[str, ...] = ()
+    candidate_receipt: CandidateReceipt | None = None
+    runtime_binding_id: str | None = None
+    agent_id: str | None = None
+    session_id: str | None = None
+    workspace_id: str | None = None
+    terminal_binding_evidence: TerminalBindingEvidence | None = None
 
     _PHASES = frozenset(
         {
@@ -321,6 +907,32 @@ class WorkRunObservation:
         if type(self.stable_action_id) is not str or not self.stable_action_id:
             raise ExecutionKernelError(
                 "WORK_RUN_OBSERVATION_INVALID", "Work Run action identity is missing"
+            )
+        if self.runtime_binding_id is not None:
+            _validate_binding_id(self.runtime_binding_id, "runtime binding identity")
+        identity_values = (self.agent_id, self.session_id, self.workspace_id)
+        if any(value is not None for value in identity_values):
+            if self.runtime_binding_id is None or any(value is None for value in identity_values):
+                raise ExecutionKernelError(
+                    "WORK_RUN_OBSERVATION_INVALID",
+                    "Agent, session, and workspace identities must be complete",
+                )
+            for value, label in zip(
+                identity_values,
+                ("Agent identity", "session identity", "workspace identity"),
+            ):
+                _validate_bounded_text(value, label)
+        if self.terminal_binding_evidence is not None and type(
+            self.terminal_binding_evidence
+        ) is not TerminalBindingEvidence:
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "terminal binding Evidence is not typed",
+            )
+        if self.terminal_binding_evidence is not None and self.runtime_binding_id is None:
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "terminal binding Evidence has no replacement binding",
             )
         if (
             type(self.receipt_digest) is not str
@@ -364,6 +976,21 @@ class WorkRunObservation:
             raise ExecutionKernelError(
                 "WORK_RUN_OBSERVATION_INVALID",
                 "Evidence identities are not canonical",
+            )
+        if self.candidate_receipt is not None and type(
+            self.candidate_receipt
+        ) is not CandidateReceipt:
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "candidate_receipt is not an exact CandidateReceipt",
+            )
+        if (
+            self.candidate_receipt is not None
+            and self.receipt_digest != self.candidate_receipt.digest
+        ):
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "effect receipt digest does not bind CandidateReceipt",
             )
 
     @classmethod
@@ -641,9 +1268,13 @@ class PlanInvalidationClassifier(Protocol):
 class WorkRunEffects(Protocol):
     """The readback-first seam for RuntimeGateway/CandidateGate/BatchIntegrator."""
 
-    def readback(self, action: WorkRunAction) -> WorkRunObservation | None: ...
+    def readback(
+        self, action: WorkRunAction
+    ) -> WorkRunObservation | StaleBindingObservation | StaleDiagnosisObservation | StaleFollowUpObservation | None: ...
 
-    def execute(self, action: WorkRunAction) -> WorkRunObservation: ...
+    def execute(
+        self, action: WorkRunAction
+    ) -> WorkRunObservation | StaleBindingObservation | StaleDiagnosisObservation | StaleFollowUpObservation: ...
 
 
 class ExecutionKernel:
@@ -656,11 +1287,19 @@ class ExecutionKernel:
         plan_control: ActivePlanReader,
         effects: WorkRunEffects,
         configuration: ExecutionKernelConfiguration | None = None,
+        _clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self._store_path = Path(store_path)
         self._plan_control = plan_control
         self._effects = effects
         self._configuration = configuration or ExecutionKernelConfiguration()
+        self._campaign_row_versions: dict[tuple[str, str], int | None] = {}
+        if not callable(_clock):
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "ExecutionKernel clock must be callable",
+            )
+        self._clock = _clock
         with self._connect() as connection:
             connection.execute(
                 """
@@ -668,10 +1307,22 @@ class ExecutionKernel:
                     repository TEXT NOT NULL,
                     campaign_key TEXT NOT NULL,
                     state_json TEXT NOT NULL,
+                    state_version INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (repository, campaign_key)
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(v8_execution_kernel_campaigns)"
+                ).fetchall()
+            }
+            if "state_version" not in columns:
+                connection.execute(
+                    "ALTER TABLE v8_execution_kernel_campaigns "
+                    "ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"
+                )
 
     def advance(
         self,
@@ -748,8 +1399,26 @@ class ExecutionKernel:
                 )
                 if due is None:
                     break
-                self._perform_due_effect(active, state, due, wake_ref=wake_ref)
+                progressed = self._perform_due_effect(
+                    active, state, due, wake_ref=wake_ref
+                )
                 state = self._load(active.handle)
+                if not progressed:
+                    # A durable intent may exist without an authoritative
+                    # readback (for example after a provider timeout).  The
+                    # next advance may read that exact identity again, but it
+                    # must not execute it a second time.  A semantic wake
+                    # readback with no lifecycle change is nevertheless
+                    # consumed for this wake, so continue the fair scan and
+                    # let released capacity refill pending Tickets.
+                    current_run = state.get("runs", {}).get(due)
+                    if (
+                        wake_ref is not None
+                        and type(current_run) is dict
+                        and current_run.get("last_wake_ref") == wake_ref
+                    ):
+                        continue
+                    break
 
             return self._outcome(active.handle, state)
 
@@ -811,6 +1480,126 @@ class ExecutionKernel:
             human_gate=self._human_gate_summary(state),
         )
 
+    def active_campaigns(self) -> tuple[CampaignHandle, ...]:
+        """Return persisted non-terminal Campaigns without hydrating a Plan."""
+
+        try:
+            with self._connect_read_only() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT repository, campaign_key
+                    FROM v8_execution_kernel_campaigns
+                    ORDER BY repository, campaign_key
+                    """
+                ).fetchall()
+        except ExecutionKernelError:
+            raise
+        except sqlite3.Error as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Execution store schema is unreadable",
+            ) from error
+        active: list[CampaignHandle] = []
+        for row in rows:
+            handle = CampaignHandle(row["repository"], row["campaign_key"])
+            state = self._read_persisted_campaign_without_migration(handle)
+            if self._status_from_persisted_state(state) is not CampaignStatus.COMPLETE:
+                active.append(handle)
+        return tuple(active)
+
+    def watchdog_snapshot(self, handle: CampaignHandle) -> "WatchdogCampaignSnapshot":
+        state = self._read_persisted_campaign_without_migration(handle)
+        from .campaign_watchdog import WatchdogCampaignSnapshot
+
+        return WatchdogCampaignSnapshot(
+            campaign=handle,
+            status=self._status_from_persisted_state(state),
+            trusted_progress_digest=self._trusted_progress_digest(state, handle),
+            next_check_at=self._snapshot_next_check_at(state),
+            active_binding_ids=self._snapshot_active_binding_ids(state),
+            diagnosed_binding_ids=self._snapshot_diagnosed_binding_ids(state),
+            candidate_receipt_digests=tuple(
+                sorted(
+                    receipt.digest
+                    for _ticket_key, receipt in self._candidate_receipt_records(
+                        state, handle
+                    )
+                )
+            ),
+            last_wake_refs=tuple(sorted(state.get("last_wake_refs", ()))),
+        )
+
+    def read_candidate_receipt(
+        self,
+        campaign_handle: CampaignHandle,
+        ticket_key: str,
+    ) -> CandidateReceipt | None:
+        state = self._load(campaign_handle)
+        if state is None:
+            return None
+        runs = state.get("runs")
+        if type(runs) is not dict or type(ticket_key) is not str:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel run state is not a ticket-keyed mapping",
+            )
+        run = runs.get(ticket_key)
+        if run is None:
+            return None
+        if type(run) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel Work Run state is not a mapping",
+            )
+        stored = run.get("candidate_receipt")
+        if stored is None:
+            return None
+        try:
+            receipt = CandidateReceipt.from_canonical(stored)
+        except CandidateGateError as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stored CandidateReceipt failed canonical readback",
+            ) from error
+        if (
+            receipt.repository != campaign_handle.repository
+            or receipt.campaign_key != campaign_handle.campaign_key
+            or receipt.campaign_handle != campaign_handle.campaign_key
+            or receipt.plan_revision_digest != state.get("plan_revision_digest")
+            or receipt.ticket_key != ticket_key
+            or receipt.work_run_key != run.get("work_run_key")
+        ):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stored CandidateReceipt is bound to another Campaign or Work Run",
+            )
+        if run.get("candidate_receipt_digest") != receipt.digest:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stored CandidateReceipt digest changed during readback",
+            )
+        return receipt
+
+    def read_candidate_receipts(
+        self,
+        campaign_handle: CampaignHandle,
+    ) -> tuple[tuple[str, CandidateReceipt], ...]:
+        state = self._load(campaign_handle)
+        if state is None:
+            return ()
+        runs = state.get("runs")
+        if type(runs) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel run state is not a mapping",
+            )
+        values: list[tuple[str, CandidateReceipt]] = []
+        for ticket_key in sorted(runs):
+            receipt = self.read_candidate_receipt(campaign_handle, ticket_key)
+            if receipt is not None:
+                values.append((ticket_key, receipt))
+        return tuple(values)
+
     @staticmethod
     def _run_summary(
         ticket_key: str,
@@ -856,13 +1645,14 @@ class ExecutionKernel:
             next_check_at=run.get("next_check_at"),
             plan_invalidation=diagnostic,
             work_run_key=run.get("work_run_key", ""),
-            runtime_binding_id=run.get("semantic_action_id"),
+            runtime_binding_id=run.get("runtime_binding_id") or run.get("semantic_action_id"),
             claim_state=run.get("claim_state", "unclaimed"),
             exclusive_resources=tuple(run.get("exclusive_resources", ())),
             work_subject_digest=run.get("work_subject_digest", ""),
             candidate_identity=run.get("candidate_identity"),
             result_digest=run.get("result_digest"),
             evidence_digests=tuple(run.get("evidence_digests", ())),
+            last_wake_ref=run.get("last_wake_ref"),
         )
 
     def _replan_budget_defaults(
@@ -2249,8 +3039,32 @@ class ExecutionKernel:
                     "reason": None,
                     "last_action_id": None,
                     "semantic_action_id": None,
+                    "runtime_binding_id": None,
                     "resume_ordinal": 0,
                     "next_check_at": None,
+                    "last_trusted_progress_at": None,
+                    "stale_due_at": None,
+                    "stale_readback_action_id": None,
+                     "stale_diagnosis_action_id": None,
+                     "stale_disposition": None,
+                     "diagnosed_binding_ids": [],
+                     "stale_slot_release_pending": False,
+                     "binding_replacement_ordinal": 0,
+                     "terminal_binding_evidence": None,
+                     "runtime_agent_id": None,
+                     "runtime_session_id": None,
+                     "runtime_workspace_id": None,
+                     "candidate_submission_count": 0,
+                     "process_state": "unknown",
+                     "workspace_state": "unknown",
+                     "check_state": "unknown",
+                     "transcript_tail": [],
+                     "stale_diagnosis_packet": None,
+                     "stale_diagnosis_packet_digest": None,
+                     "stale_diagnosis_packet_identity": None,
+                     "stale_follow_up_action_id": None,
+                     "stale_follow_up_kind": None,
+                     "stale_follow_up_completed": True,
                     "work_subject_digest": subject_digest,
                     "work_run_key": (
                         work_run_key(key, subject_digest)
@@ -2260,6 +3074,9 @@ class ExecutionKernel:
                     "exclusive_resources": list(work[key].get("exclusive_resources", [])),
                     "claim_state": "unclaimed",
                     "candidate_identity": None,
+                    "candidate_receipt": None,
+                    "candidate_receipt_digest": None,
+                    "trusted_progress_revision": 0,
                     "result_digest": None,
                     "evidence_digests": [],
                     "plan_invalidation": None,
@@ -2272,6 +3089,12 @@ class ExecutionKernel:
                 "runs": runs,
                 "effects": {},
                 "wake_refs": [],
+                "last_wake_refs": [],
+                "trusted_progress_revision": 0,
+                "diagnosed_binding_ids": [],
+                "normalized_permission_receipts": [],
+                "candidate_receipts": [],
+                "delivery_receipts": [],
                 "plan_invalidation": {},
                 "plan_invalidation_resolutions": {},
                 "plan_invalidation_classifications": {},
@@ -2292,11 +3115,23 @@ class ExecutionKernel:
                 "CAMPAIGN_REVISION_CHANGED",
                 "a successor Plan Revision requires its own durable execution state",
             )
-        state.setdefault("plan_invalidation", {})
-        state.setdefault("plan_invalidation_resolutions", {})
-        state.setdefault("plan_invalidation_classifications", {})
-        state.setdefault("accepted_results", [])
-        state.setdefault("revision_lineage", [])
+        dirty = False
+        for field, default in (
+            ("plan_invalidation", {}),
+            ("plan_invalidation_resolutions", {}),
+            ("plan_invalidation_classifications", {}),
+            ("accepted_results", []),
+            ("revision_lineage", []),
+            ("last_wake_refs", []),
+            ("trusted_progress_revision", 0),
+            ("diagnosed_binding_ids", []),
+            ("normalized_permission_receipts", []),
+            ("candidate_receipts", []),
+            ("delivery_receipts", []),
+        ):
+            if field not in state:
+                state[field] = default
+                dirty = True
         if type(state["revision_lineage"]) is not list:
             raise ExecutionKernelError(
                 "EXECUTION_STORE_INVALID",
@@ -2307,7 +3142,6 @@ class ExecutionKernel:
             raise ExecutionKernelError(
                 "EXECUTION_STORE_INVALID", "ExecutionKernel effects are not a mapping"
             )
-        dirty = False
         if budget_defaults is None:
             if "replan_budgets" in state:
                 raise ExecutionKernelError(
@@ -2377,6 +3211,98 @@ class ExecutionKernel:
             if "candidate_identity" not in run:
                 run["candidate_identity"] = None
                 dirty = True
+            if "candidate_receipt" not in run:
+                run.setdefault("candidate_receipt", None)
+                dirty = True
+            if "candidate_receipt_digest" not in run:
+                run["candidate_receipt_digest"] = None
+                dirty = True
+            if "trusted_progress_revision" not in run:
+                run["trusted_progress_revision"] = 0
+                dirty = True
+            for field, default in (
+                ("runtime_binding_id", None),
+                ("last_trusted_progress_at", None),
+                ("stale_due_at", None),
+                ("stale_readback_action_id", None),
+                ("stale_diagnosis_action_id", None),
+                ("stale_disposition", None),
+                ("diagnosed_binding_ids", []),
+                ("stale_slot_release_pending", False),
+                ("binding_replacement_ordinal", 0),
+                ("terminal_binding_evidence", None),
+                ("runtime_agent_id", None),
+                ("runtime_session_id", None),
+                ("runtime_workspace_id", None),
+                ("candidate_submission_count", 0),
+                ("process_state", "unknown"),
+                ("workspace_state", "unknown"),
+                ("check_state", "unknown"),
+                ("transcript_tail", []),
+                ("stale_diagnosis_packet", None),
+                ("stale_diagnosis_packet_digest", None),
+                ("stale_diagnosis_packet_identity", None),
+                ("stale_follow_up_action_id", None),
+                ("stale_follow_up_kind", None),
+                ("stale_follow_up_completed", True),
+            ):
+                if field not in run:
+                    run[field] = default.copy() if isinstance(default, list) else default
+                    dirty = True
+            if run.get("phase") in _SLOT_PHASES:
+                last_progress = run.get("last_trusted_progress_at")
+                stale_due = run.get("stale_due_at")
+                if last_progress is None and stale_due is None:
+                    now = self._clock_value()
+                    run["last_trusted_progress_at"] = self._timestamp(now)
+                    run["stale_due_at"] = self._timestamp(
+                        now
+                        + timedelta(
+                            seconds=self._configuration.stale_after_seconds_for(
+                                active.handle.repository
+                            )
+                        )
+                    )
+                    dirty = True
+                elif (
+                    (last_progress is None) != (stale_due is None)
+                    and not (
+                        last_progress is not None
+                        and stale_due is None
+                        and run.get("stale_disposition") is not None
+                    )
+                ):
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_INVALID",
+                        "stale progress timestamp pair is incomplete",
+                    )
+                for timestamp, label in (
+                    (run.get("last_trusted_progress_at"), "last trusted progress time"),
+                    (run.get("stale_due_at"), "stale due time"),
+                ):
+                    if timestamp is None:
+                        continue
+                    if type(timestamp) is not str:
+                        raise ExecutionKernelError(
+                            "EXECUTION_STORE_INVALID",
+                            f"{label} is not canonical text",
+                        )
+                    try:
+                        parsed_timestamp = datetime.fromisoformat(timestamp)
+                    except ValueError as error:
+                        raise ExecutionKernelError(
+                            "EXECUTION_STORE_INVALID",
+                            f"{label} is unreadable",
+                        ) from error
+                    if (
+                        parsed_timestamp.tzinfo is None
+                        or parsed_timestamp.utcoffset() != timedelta(0)
+                        or parsed_timestamp.isoformat() != timestamp
+                    ):
+                        raise ExecutionKernelError(
+                            "EXECUTION_STORE_INVALID",
+                            f"{label} is not canonical UTC text",
+                        )
             if "result_digest" not in run:
                 run["result_digest"] = None
                 dirty = True
@@ -2388,6 +3314,27 @@ class ExecutionKernel:
                 dirty = True
             if "resume_after_invalidation" not in run:
                 run["resume_after_invalidation"] = False
+                dirty = True
+
+        if state["candidate_receipts"] == []:
+            existing_receipts = [
+                run["candidate_receipt"]
+                for _ticket_key, run in sorted(state["runs"].items())
+                if type(run) is dict and run.get("candidate_receipt") is not None
+            ]
+            if existing_receipts:
+                state["candidate_receipts"] = existing_receipts
+                dirty = True
+        if state["last_wake_refs"] == []:
+            existing_wakes = sorted(
+                {
+                    run.get("last_wake_ref")
+                    for run in state["runs"].values()
+                    if type(run) is dict and run.get("last_wake_ref") is not None
+                }
+            )
+            if existing_wakes:
+                state["last_wake_refs"] = existing_wakes
                 dirty = True
 
         # Re-key any historical effect referenced by the Work Run's last
@@ -2411,13 +3358,43 @@ class ExecutionKernel:
             resume_action_id = self._effect_action_id(
                 active, ticket_key, run, resuming=True
             )
-            if legacy_action_id in {execution_action_id, resume_action_id}:
+            # Typed stale effects already carry their own stable identity.
+            # They are not legacy semantic effects and must never be inferred
+            # as a resume merely because their identity differs from the
+            # semantic binding.  Keeping the key also preserves readback
+            # recovery after a restart.
+            if type(effect.get("kind")) is str:
                 revision_bound_action_id = legacy_action_id
             else:
-                resuming = legacy_action_id != run.get("semantic_action_id")
-                revision_bound_action_id = self._effect_action_id(
-                    active, ticket_key, run, resuming=resuming
+                revision_bound_action_id = None
+            # A successful resume increments ``resume_ordinal`` before the
+            # next advance persists the run.  Therefore ``last_action_id``
+            # can legitimately be the resume identity for the immediately
+            # preceding ordinal, not the current one.  Treat both identities
+            # as already revision-bound; otherwise this migration would
+            # rewrite a completed resume receipt as the next resume intent
+            # and suppress the next real replacement attempt.
+            resume_action_ids = {resume_action_id}
+            resume_ordinal = run.get("resume_ordinal")
+            if type(resume_ordinal) is int and resume_ordinal > 0:
+                previous_resume_run = dict(run)
+                previous_resume_run["resume_ordinal"] = resume_ordinal - 1
+                resume_action_ids.add(
+                    self._effect_action_id(
+                        active,
+                        ticket_key,
+                        previous_resume_run,
+                        resuming=True,
+                    )
                 )
+            if revision_bound_action_id is None:
+                if legacy_action_id == execution_action_id or legacy_action_id in resume_action_ids:
+                    revision_bound_action_id = legacy_action_id
+                else:
+                    resuming = legacy_action_id != run.get("semantic_action_id")
+                    revision_bound_action_id = self._effect_action_id(
+                        active, ticket_key, run, resuming=resuming
+                    )
             effect_identity = {
                 "plan_revision_digest": active.current_revision_digest,
                 "work_run_key": run["work_run_key"],
@@ -3119,6 +4096,12 @@ class ExecutionKernel:
             "runs": successor_runs,
             "effects": {},
             "wake_refs": [],
+            "last_wake_refs": [],
+            "trusted_progress_revision": 0,
+            "diagnosed_binding_ids": [],
+            "normalized_permission_receipts": [],
+            "candidate_receipts": [],
+            "delivery_receipts": [],
             "plan_invalidation": {},
             "plan_invalidation_resolutions": {},
             "plan_invalidation_classifications": {},
@@ -3174,13 +4157,40 @@ class ExecutionKernel:
             "reason": None,
             "last_action_id": None,
             "semantic_action_id": None,
+            "runtime_binding_id": None,
             "resume_ordinal": 0,
             "next_check_at": None,
+            "last_trusted_progress_at": None,
+            "stale_due_at": None,
+            "stale_readback_action_id": None,
+            "stale_diagnosis_action_id": None,
+            "stale_disposition": None,
+            "diagnosed_binding_ids": [],
+            "stale_slot_release_pending": False,
+            "binding_replacement_ordinal": 0,
+            "terminal_binding_evidence": None,
+            "runtime_agent_id": None,
+            "runtime_session_id": None,
+            "runtime_workspace_id": None,
+            "candidate_submission_count": 0,
+            "process_state": "unknown",
+            "workspace_state": "unknown",
+            "check_state": "unknown",
+            "transcript_tail": [],
+            "stale_diagnosis_packet": None,
+            "stale_diagnosis_packet_digest": None,
+            "stale_diagnosis_packet_identity": None,
+            "stale_follow_up_action_id": None,
+            "stale_follow_up_kind": None,
+            "stale_follow_up_completed": True,
             "work_subject_digest": subject_digest,
             "work_run_key": _work_run_key_for_kernel(plan, work_item, subject_digest),
             "exclusive_resources": list(work_item.get("exclusive_resources", [])),
             "claim_state": "unclaimed",
             "candidate_identity": None,
+            "candidate_receipt": None,
+            "candidate_receipt_digest": None,
+            "trusted_progress_revision": 0,
             "result_digest": None,
             "evidence_digests": [],
             "plan_invalidation": None,
@@ -3341,6 +4351,758 @@ class ExecutionKernel:
             }
         )
 
+    @staticmethod
+    def _trusted_lifecycle_projection(run: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (
+            run.get("phase"),
+            run.get("reason"),
+            run.get("next_check_at"),
+            run.get("slot_held"),
+            run.get("claim_state"),
+            run.get("candidate_identity"),
+            run.get("result_digest"),
+            tuple(run.get("evidence_digests", ())),
+            run.get("runtime_binding_id"),
+        )
+
+    def _clock_value(self) -> datetime:
+        try:
+            value = self._clock()
+        except Exception as error:
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "ExecutionKernel clock did not return a timestamp",
+            ) from error
+        if type(value) is not datetime or value.tzinfo is None or value.utcoffset() != timedelta(0):
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "ExecutionKernel clock must return an aware UTC datetime",
+            )
+        return value
+
+    @staticmethod
+    def _timestamp(value: datetime) -> str:
+        rendered = value.isoformat()
+        try:
+            parsed = datetime.fromisoformat(rendered)
+        except ValueError as error:  # pragma: no cover - datetime.isoformat is valid
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "ExecutionKernel clock produced a noncanonical timestamp",
+            ) from error
+        if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0) or parsed.isoformat() != rendered:
+            raise ExecutionKernelError(
+                "STALE_CONFIGURATION_INVALID",
+                "ExecutionKernel clock produced a noncanonical UTC timestamp",
+            )
+        return rendered
+
+    def _record_trusted_progress(
+        self,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        *,
+        repository: str,
+    ) -> None:
+        state_revision = state.get("trusted_progress_revision", 0)
+        run_revision = run.get("trusted_progress_revision", 0)
+        if (
+            type(state_revision) is not int
+            or isinstance(state_revision, bool)
+            or state_revision < 0
+            or type(run_revision) is not int
+            or isinstance(run_revision, bool)
+            or run_revision < 0
+        ):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "trusted progress revision is not a non-negative integer",
+            )
+        state["trusted_progress_revision"] = state_revision + 1
+        run["trusted_progress_revision"] = run_revision + 1
+        now = self._clock_value()
+        run["last_trusted_progress_at"] = self._timestamp(now)
+        run["stale_due_at"] = self._timestamp(
+            now + timedelta(seconds=self._configuration.stale_after_seconds_for(repository))
+        )
+
+    @staticmethod
+    def _stale_binding_id(run: Mapping[str, Any]) -> str:
+        binding = run.get("runtime_binding_id") or run.get("semantic_action_id")
+        _validate_binding_id(binding, "active runtime binding identity")
+        return binding
+
+    @staticmethod
+    def _stale_action_identity(
+        active: ActivePlanReadback,
+        ticket_key: str,
+        run: Mapping[str, Any],
+        *,
+        binding_id: str,
+        trusted_progress_digest: str,
+    ) -> str:
+        return (
+            f"stale-readback:{active.handle.campaign_key}:{run['work_run_key']}"
+            f":{binding_id}:{trusted_progress_digest}"
+        )
+
+    @staticmethod
+    def _stale_diagnosis_identity(
+        active: ActivePlanReadback,
+        run: Mapping[str, Any],
+        *,
+        binding_id: str,
+    ) -> str:
+        return f"stale-diagnosis:{active.handle.campaign_key}:{run['work_run_key']}:{binding_id}"
+
+    @staticmethod
+    def _stale_follow_up_identity(
+        active: ActivePlanReadback,
+        run: Mapping[str, Any],
+        *,
+        binding_id: str,
+        kind: StaleFollowUpKind,
+    ) -> str:
+        return (
+            f"stale-follow-up:{kind.value}:{active.handle.campaign_key}:"
+            f"{run['work_run_key']}:{binding_id}"
+        )
+
+    def _persist_action_intent(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        action: WorkRunAction,
+    ) -> None:
+        effect_identity = {
+            "kind": action.kind,
+            "ticket_key": action.ticket_key,
+            "runtime_binding_id": action.runtime_binding_id,
+            "plan_revision_digest": action.plan_revision_digest,
+            "work_run_key": action.work_run_key,
+            "work_subject_digest": action.work_subject_digest,
+        }
+        if action.stale_diagnosis_packet is not None:
+            effect_identity.update(
+                {
+                    "packet_digest": action.stale_diagnosis_packet.digest,
+                    "packet_identity": action.stale_diagnosis_packet.identity,
+                }
+            )
+        if action.stale_follow_up_kind is not None:
+            effect_identity["follow_up_kind"] = action.stale_follow_up_kind.value
+        effects = state.setdefault("effects", {})
+        if type(effects) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel effects are not a mapping",
+            )
+        prior = effects.get(action.stable_action_id)
+        if prior is not None:
+            if type(prior) is not dict or any(
+                field in prior and prior[field] != value
+                for field, value in effect_identity.items()
+            ):
+                raise ExecutionKernelError(
+                    "EFFECT_READBACK_INVALID",
+                    "stale effect intent is not bound to its exact action identity",
+                )
+            if prior.get("state") not in {"intent", "read_back"}:
+                raise ExecutionKernelError(
+                    "EFFECT_READBACK_INVALID",
+                    "stale effect intent has an unknown durable state",
+                )
+            return
+        effects[action.stable_action_id] = {
+            "state": "intent",
+            "execute_attempted": False,
+            **effect_identity,
+        }
+        self._save(active.handle, state)
+
+    def _persist_effect_readback(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        action: WorkRunAction,
+        observation: StaleBindingObservation | StaleDiagnosisObservation | StaleFollowUpObservation,
+    ) -> None:
+        effect = state["effects"].get(action.stable_action_id)
+        if type(effect) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stale effect intent disappeared before readback",
+            )
+        receipt_digest = observation.receipt_digest
+        if effect.get("state") == "read_back" and effect.get("receipt_digest") != receipt_digest:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale effect receipt changed during readback",
+            )
+        effect.update({"state": "read_back", "receipt_digest": receipt_digest})
+        self._save(active.handle, state)
+
+    def _read_or_execute_once(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        action: WorkRunAction,
+        *,
+        fence_execute: bool = False,
+    ) -> object | None:
+        prior = state.get("effects", {}).get(action.stable_action_id)
+        self._persist_action_intent(active, state, action)
+        readback = self._effects.readback(action)
+        if readback is not None:
+            return readback
+        if type(prior) is dict and prior.get("state") == "read_back":
+            return None
+        if fence_execute and type(prior) is dict and prior.get("execute_attempted") is True:
+            return None
+        if fence_execute:
+            effect = state["effects"].get(action.stable_action_id)
+            if type(effect) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "effect intent disappeared before execution fence",
+                )
+            effect["execute_attempted"] = True
+            self._save(active.handle, state)
+        return self._effects.execute(action)
+
+    @staticmethod
+    def _validate_stale_readback(
+        action: WorkRunAction,
+        observation: object,
+        binding_id: str,
+    ) -> StaleBindingObservation:
+        if (
+            type(observation) is not StaleBindingObservation
+            or observation.stable_action_id != action.stable_action_id
+            or observation.runtime_binding_id != binding_id
+            or action.runtime_binding_id != binding_id
+        ):
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale readback is not bound to its exact action and Runtime Binding",
+            )
+        return observation
+
+    @staticmethod
+    def _validate_stale_diagnosis(
+        action: WorkRunAction,
+        observation: object,
+        binding_id: str,
+    ) -> StaleDiagnosisObservation:
+        if (
+            type(observation) is not StaleDiagnosisObservation
+            or observation.stable_action_id != action.stable_action_id
+            or observation.runtime_binding_id != binding_id
+            or action.runtime_binding_id != binding_id
+            or type(observation.disposition) is not StaleDiagnosisDisposition
+        ):
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale diagnosis is not bound to its exact action and Runtime Binding",
+            )
+        return observation
+
+    @staticmethod
+    def _validate_stale_follow_up(
+        action: WorkRunAction,
+        observation: object,
+        binding_id: str,
+        kind: StaleFollowUpKind,
+    ) -> StaleFollowUpObservation:
+        if (
+            type(observation) is not StaleFollowUpObservation
+            or observation.stable_action_id != action.stable_action_id
+            or observation.runtime_binding_id != binding_id
+            or action.runtime_binding_id != binding_id
+            or observation.kind is not kind
+        ):
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "stale follow-up is not bound to its exact action and Runtime Binding",
+            )
+        return observation
+
+    @staticmethod
+    def _record_diagnosed_binding(
+        state: dict[str, Any],
+        run: dict[str, Any],
+        binding_id: str,
+    ) -> None:
+        for target in (state.setdefault("diagnosed_binding_ids", []), run.setdefault("diagnosed_binding_ids", [])):
+            if type(target) is not list:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "diagnosed Runtime Binding identities are not a list",
+                )
+            if binding_id not in target:
+                target.append(binding_id)
+                target.sort()
+
+    def _stale_diagnosis_packet(
+        self,
+        active: ActivePlanReadback,
+        state: Mapping[str, Any],
+        run: Mapping[str, Any],
+        ticket_key: str,
+        binding_id: str,
+    ) -> StaleDiagnosisPacket:
+        plan = load_canonical_json(active.plan_spec_bytes)
+        if type(plan) is not dict or type(plan.get("work")) is not list:
+            raise ExecutionKernelError(
+                "ACTIVE_PLAN_INVALID",
+                "stale diagnosis packet has no frozen Ticket plan",
+            )
+        work_item = next(
+            (item for item in plan["work"] if type(item) is dict and item.get("key") == ticket_key),
+            None,
+        )
+        if work_item is None:
+            raise ExecutionKernelError(
+                "ACTIVE_PLAN_INVALID",
+                "stale diagnosis packet Ticket is not in the active Plan Revision",
+            )
+        authority = work_item.get("authority")
+        worker_authority = authority.get("worker") if type(authority) is dict else None
+        authority_subtree_digest = (
+            worker_authority.get("subtree_digest")
+            if type(worker_authority) is dict
+            else None
+        )
+        if type(authority_subtree_digest) is not str:
+            authority_subtree_digest = digest_value(authority)
+        policy = plan.get("policy")
+        policy_witness_digest = (
+            policy.get("digest") if type(policy) is dict else None
+        )
+        if type(policy_witness_digest) is not str:
+            policy_witness_digest = digest_value(policy)
+        candidate_count = run.get("candidate_submission_count", 0)
+        if run.get("candidate_receipt") is not None and candidate_count == 0:
+            candidate_count = 1
+        candidate_identity = run.get("candidate_identity")
+        candidate_identities = (candidate_identity,) if type(candidate_identity) is str else ()
+        transcript_tail = run.get("transcript_tail", [])
+        if type(transcript_tail) is not list:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stale diagnosis transcript tail is not a list",
+            )
+        return StaleDiagnosisPacket(
+            repository=active.handle.repository,
+            campaign_key=active.handle.campaign_key,
+            plan_revision_digest=active.current_revision_digest,
+            ticket_key=ticket_key,
+            work_run_key=run["work_run_key"],
+            work_subject_digest=run["work_subject_digest"],
+            ticket_contract_digest=digest_value(work_item.get("contract")),
+            authority_subtree_digest=authority_subtree_digest,
+            policy_witness_digest=policy_witness_digest,
+            runtime_binding_id=binding_id,
+            candidate_count=candidate_count,
+            binding_count=1 + run.get("binding_replacement_ordinal", 0),
+            candidate_identities=candidate_identities,
+            lifecycle_state=run.get("phase", "unknown"),
+            process_state=run.get("process_state", "unknown"),
+            workspace_state=run.get("workspace_state", "unknown"),
+            check_state=run.get("check_state", "unknown"),
+            transcript_tail=tuple(transcript_tail),
+        )
+
+    def _persist_candidate_receipt(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        ticket_key: str,
+        receipt: CandidateReceipt,
+    ) -> bool:
+        if (
+            type(receipt) is not CandidateReceipt
+            or receipt.repository != active.handle.repository
+            or receipt.campaign_key != active.handle.campaign_key
+            or receipt.campaign_handle != active.handle.campaign_key
+            or receipt.plan_revision_digest != active.current_revision_digest
+            or receipt.work_run_key != run["work_run_key"]
+            or receipt.ticket_key != ticket_key
+            or receipt.runtime_subject_digest != run["work_subject_digest"]
+        ):
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "CandidateReceipt is not bound to the current Campaign, Ticket, Work Run, or subject",
+            )
+        receipt_canonical = receipt.canonical()
+        changed = run.get("candidate_receipt") != receipt_canonical
+        run["candidate_receipt"] = receipt_canonical
+        run["candidate_receipt_digest"] = receipt.digest
+        run["candidate_identity"] = f"candidate:{receipt.candidate_commit_oid}"
+        if changed:
+            count = run.get("candidate_submission_count", 0)
+            if type(count) is not int or isinstance(count, bool) or count < 0:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Candidate submission count is invalid",
+                )
+            run["candidate_submission_count"] = min(3, count + 1)
+            self._record_trusted_progress(
+                state,
+                run,
+                repository=active.handle.repository,
+            )
+        state["candidate_receipts"] = [
+            value["candidate_receipt"]
+            for _key, value in sorted(state["runs"].items())
+            if type(value) is dict and value.get("candidate_receipt") is not None
+        ]
+        self._save(active.handle, state)
+        persisted = self._load(active.handle)
+        if persisted is None:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "CandidateReceipt disappeared during persistence",
+            )
+        persisted_run = persisted["runs"].get(ticket_key)
+        try:
+            persisted_receipt = CandidateReceipt.from_canonical(
+                persisted_run["candidate_receipt"]
+            )
+        except (CandidateGateError, TypeError, KeyError) as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "persisted CandidateReceipt failed canonical readback",
+            ) from error
+        if persisted_receipt != receipt:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "persisted CandidateReceipt changed during readback",
+            )
+        state.clear()
+        state.update(persisted)
+        return changed
+
+    def _apply_mechanical_stale_readback(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        observation: StaleBindingObservation,
+        *,
+        progress_already_recorded: bool = False,
+    ) -> None:
+        phase_by_state = {
+            StaleReadbackState.TERMINAL: ("completed", "RuntimeTerminal"),
+            StaleReadbackState.IDLE: ("wait", "RuntimeIdle"),
+            StaleReadbackState.PERMISSION_WAITING: ("wait", "PermissionWaiting"),
+            StaleReadbackState.CANDIDATE_RECEIVED: ("candidate_checks", "CandidateReceiptReceived"),
+            StaleReadbackState.PROVIDER_UNAVAILABLE: ("runtime_unavailable", "ProviderUnavailable"),
+        }
+        if observation.state not in phase_by_state:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "unclassified stale readback must use the diagnosis path",
+            )
+        phase, reason = phase_by_state[observation.state]
+        run["phase"] = phase
+        run["reason"] = reason
+        run["stale_slot_release_pending"] = observation.state in {
+            StaleReadbackState.PERMISSION_WAITING,
+            StaleReadbackState.PROVIDER_UNAVAILABLE,
+        }
+        run["slot_held"] = (
+            phase in _SLOT_PHASES or run["stale_slot_release_pending"]
+        )
+        run["claim_state"] = "held" if run["slot_held"] else "released"
+        run["stale_due_at"] = None
+        run["stale_disposition"] = observation.state.value
+        if not progress_already_recorded:
+            self._record_trusted_progress(
+                state,
+                run,
+                repository=active.handle.repository,
+            )
+        run["stale_due_at"] = None
+        self._save(active.handle, state)
+
+    def _apply_stale_diagnosis(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        observation: StaleDiagnosisObservation,
+    ) -> None:
+        dispositions = {
+            StaleDiagnosisDisposition.CONTINUE: ("running", "StaleSuppressed", True),
+            StaleDiagnosisDisposition.GUIDE_SAME_WORKER: (
+                "running",
+                "StaleWorkerGuidance",
+                True,
+            ),
+            StaleDiagnosisDisposition.RECOVER_SAME_BINDING: (
+                "running",
+                "StaleBindingRecovery",
+                True,
+            ),
+            StaleDiagnosisDisposition.DECISION: ("decision", "RuntimeBindingStale", False),
+        }
+        if observation.disposition not in dispositions:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "unknown stale diagnosis disposition",
+            )
+        phase, reason, slot_held = dispositions[observation.disposition]
+        run["phase"] = phase
+        run["reason"] = reason
+        run["slot_held"] = slot_held
+        run["claim_state"] = "held" if slot_held else "released"
+        run["stale_slot_release_pending"] = False
+        run["stale_due_at"] = None
+        run["stale_disposition"] = observation.disposition.value
+        if observation.disposition is StaleDiagnosisDisposition.GUIDE_SAME_WORKER:
+            follow_up_kind = StaleFollowUpKind.GUIDANCE
+        elif observation.disposition is StaleDiagnosisDisposition.RECOVER_SAME_BINDING:
+            follow_up_kind = StaleFollowUpKind.SAME_BINDING_RECOVERY
+        else:
+            follow_up_kind = None
+        if follow_up_kind is None:
+            run["stale_follow_up_action_id"] = None
+            run["stale_follow_up_kind"] = None
+            run["stale_follow_up_completed"] = True
+        else:
+            run["stale_follow_up_action_id"] = self._stale_follow_up_identity(
+                active,
+                run,
+                binding_id=self._stale_binding_id(run),
+                kind=follow_up_kind,
+            )
+            run["stale_follow_up_kind"] = follow_up_kind.value
+            run["stale_follow_up_completed"] = False
+        self._record_trusted_progress(
+            state,
+            run,
+            repository=active.handle.repository,
+        )
+        run["stale_due_at"] = None
+        self._save(active.handle, state)
+
+    def _perform_stale_effect(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        ticket_key: str,
+    ) -> bool:
+        run = state["runs"][ticket_key]
+        binding_id = self._stale_binding_id(run)
+        trusted_progress_digest = self._trusted_progress_digest(state, active.handle)
+        readback_id = run.get("stale_readback_action_id")
+        if readback_id is None:
+            readback_id = self._stale_action_identity(
+                active,
+                ticket_key,
+                run,
+                binding_id=binding_id,
+                trusted_progress_digest=trusted_progress_digest,
+            )
+            run["stale_readback_action_id"] = readback_id
+        action = WorkRunAction(
+            stable_action_id=readback_id,
+            repository=active.handle.repository,
+            campaign_key=active.handle.campaign_key,
+            plan_revision_digest=active.current_revision_digest,
+            ticket_key=ticket_key,
+            kind="stale_readback",
+            semantic_action_id=run.get("semantic_action_id") or binding_id,
+            work_run_key=run["work_run_key"],
+            work_subject_digest=run["work_subject_digest"],
+            runtime_binding_id=binding_id,
+        )
+        observation = self._read_or_execute_once(active, state, action)
+        if observation is None:
+            return False
+        stale_readback = self._validate_stale_readback(action, observation, binding_id)
+        if (
+            stale_readback.state is StaleReadbackState.CANDIDATE_RECEIVED
+            and stale_readback.candidate_receipt is None
+        ):
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "CANDIDATE_RECEIVED stale readback lacks an exact CandidateReceipt",
+            )
+        candidate_progress_recorded = False
+        if stale_readback.candidate_receipt is not None:
+            if stale_readback.state is not StaleReadbackState.CANDIDATE_RECEIVED:
+                raise ExecutionKernelError(
+                    "EFFECT_READBACK_INVALID",
+                    "CandidateReceipt is attached to a non-Candidate stale state",
+                )
+            candidate_progress_recorded = self._persist_candidate_receipt(
+                active,
+                state,
+                state["runs"][ticket_key],
+                ticket_key,
+                stale_readback.candidate_receipt,
+            )
+        self._persist_effect_readback(active, state, action, stale_readback)
+        run["last_action_id"] = action.stable_action_id
+        if stale_readback.state in {
+            StaleReadbackState.TERMINAL,
+            StaleReadbackState.IDLE,
+            StaleReadbackState.PERMISSION_WAITING,
+            StaleReadbackState.CANDIDATE_RECEIVED,
+            StaleReadbackState.PROVIDER_UNAVAILABLE,
+        }:
+            self._apply_mechanical_stale_readback(
+                active,
+                state,
+                run,
+                stale_readback,
+                progress_already_recorded=candidate_progress_recorded,
+            )
+            return True
+        if stale_readback.state is not StaleReadbackState.AMBIGUOUS_RUNNING:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "unknown stale readback state",
+            )
+        diagnosis_id = run.get("stale_diagnosis_action_id")
+        if diagnosis_id is None:
+            diagnosis_id = self._stale_diagnosis_identity(
+                active,
+                run,
+                binding_id=binding_id,
+            )
+            run["stale_diagnosis_action_id"] = diagnosis_id
+        self._record_diagnosed_binding(state, run, binding_id)
+        packet_record = run.get("stale_diagnosis_packet")
+        if packet_record is None:
+            packet = self._stale_diagnosis_packet(
+                active,
+                state,
+                run,
+                ticket_key,
+                binding_id,
+            )
+            run["stale_diagnosis_packet"] = packet.canonical()
+            run["stale_diagnosis_packet_digest"] = packet.digest
+            run["stale_diagnosis_packet_identity"] = packet.identity
+        else:
+            packet = StaleDiagnosisPacket.from_canonical(packet_record)
+            if (
+                packet.runtime_binding_id != binding_id
+                or run.get("stale_diagnosis_packet_digest") != packet.digest
+                or run.get("stale_diagnosis_packet_identity") != packet.identity
+            ):
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "persisted stale diagnosis packet is not bound to the current Runtime Binding",
+                )
+        diagnosis = WorkRunAction(
+            stable_action_id=diagnosis_id,
+            repository=active.handle.repository,
+            campaign_key=active.handle.campaign_key,
+            plan_revision_digest=active.current_revision_digest,
+            ticket_key=ticket_key,
+            kind="stale_diagnosis",
+            semantic_action_id=run.get("semantic_action_id") or binding_id,
+            work_run_key=run["work_run_key"],
+            work_subject_digest=run["work_subject_digest"],
+            runtime_binding_id=binding_id,
+            stale_diagnosis_packet=packet,
+        )
+        diagnosis_observation = self._read_or_execute_once(
+            active,
+            state,
+            diagnosis,
+            fence_execute=True,
+        )
+        if diagnosis_observation is None:
+            self._save(active.handle, state)
+            return False
+        stale_diagnosis = self._validate_stale_diagnosis(
+            diagnosis,
+            diagnosis_observation,
+            binding_id,
+        )
+        self._persist_effect_readback(active, state, diagnosis, stale_diagnosis)
+        run["last_action_id"] = diagnosis.stable_action_id
+        self._apply_stale_diagnosis(active, state, run, stale_diagnosis)
+        return True
+
+    def _perform_stale_follow_up(
+        self,
+        active: ActivePlanReadback,
+        state: dict[str, Any],
+        ticket_key: str,
+    ) -> bool:
+        run = state["runs"][ticket_key]
+        if run.get("stale_follow_up_completed") is True:
+            return True
+        binding_id = self._stale_binding_id(run)
+        try:
+            kind = StaleFollowUpKind(run["stale_follow_up_kind"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stale follow-up kind is not closed",
+            ) from error
+        action_kind = {
+            StaleFollowUpKind.GUIDANCE: "stale_guidance",
+            StaleFollowUpKind.SAME_BINDING_RECOVERY: "stale_same_binding_recovery",
+        }[kind]
+        action_id = run.get("stale_follow_up_action_id")
+        expected_id = self._stale_follow_up_identity(
+            active,
+            run,
+            binding_id=binding_id,
+            kind=kind,
+        )
+        if action_id != expected_id:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "stale follow-up identity changed",
+            )
+        action = WorkRunAction(
+            stable_action_id=action_id,
+            repository=active.handle.repository,
+            campaign_key=active.handle.campaign_key,
+            plan_revision_digest=active.current_revision_digest,
+            ticket_key=ticket_key,
+            kind=action_kind,
+            semantic_action_id=run.get("semantic_action_id") or binding_id,
+            work_run_key=run["work_run_key"],
+            work_subject_digest=run["work_subject_digest"],
+            runtime_binding_id=binding_id,
+            stale_follow_up_kind=kind,
+        )
+        observation = self._read_or_execute_once(
+            active,
+            state,
+            action,
+            fence_execute=True,
+        )
+        if observation is None:
+            return False
+        follow_up = self._validate_stale_follow_up(
+            action,
+            observation,
+            binding_id,
+            kind,
+        )
+        self._persist_effect_readback(active, state, action, follow_up)
+        run["last_action_id"] = action.stable_action_id
+        run["stale_follow_up_completed"] = True
+        self._record_trusted_progress(
+            state,
+            run,
+            repository=active.handle.repository,
+        )
+        run["stale_due_at"] = None
+        self._save(active.handle, state)
+        return True
+
     def _next_due_run(
         self,
         state: dict[str, Any],
@@ -3351,6 +5113,61 @@ class ExecutionKernel:
     ) -> str | None:
         capacity = self._configuration.worker_slots_for(active.handle.repository)
         held = sum(1 for run in state["runs"].values() if run["slot_held"])
+        # Follow-up effects are durable deterministic work and outrank every
+        # semantic action, including a wake hint.
+        for ticket_key in sorted(work):
+            run = state["runs"][ticket_key]
+            if (
+                run.get("stale_follow_up_action_id") is not None
+                and run.get("stale_follow_up_completed") is not True
+            ):
+                return ticket_key
+
+        # A due stale binding always receives zero-LLM readback before a wake
+        # can select ordinary semantic work.  The timer and wake paths share
+        # this exact deadline gate.
+        now = self._clock_value()
+        for ticket_key in sorted(work):
+            run = state["runs"][ticket_key]
+            if run["phase"] not in _SLOT_PHASES:
+                continue
+            due_at = run.get("stale_due_at")
+            if due_at is None:
+                continue
+            if type(due_at) is not str:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "stale due time is not canonical text",
+                )
+            try:
+                due_value = datetime.fromisoformat(due_at)
+            except ValueError as error:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "stale due time is unreadable",
+                ) from error
+            if (
+                due_value.tzinfo is None
+                or due_value.utcoffset() != timedelta(0)
+                or due_value.isoformat() != due_at
+            ):
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "stale due time is not canonical UTC text",
+                )
+            if due_value > now:
+                continue
+            binding_id = self._stale_binding_id(run)
+            diagnosed = state.get("diagnosed_binding_ids", [])
+            if type(diagnosed) is not list:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "diagnosed Runtime Binding identities are not a list",
+                )
+            if binding_id in diagnosed and run.get("stale_disposition") is not None:
+                continue
+            return ticket_key
+
         # A wake never starts a second semantic action: it grants one bounded
         # authoritative readback of each already-active Work Run.  No-wake
         # calls are admission/refill only, so they cannot become LLM polling.
@@ -3358,7 +5175,7 @@ class ExecutionKernel:
             for ticket_key in sorted(work):
                 run = state["runs"][ticket_key]
                 if (
-                    run["phase"] in _SLOT_PHASES
+                    (run["phase"] in _SLOT_PHASES or run.get("slot_held") is True)
                     and run.get("last_wake_ref") != wake_ref
                 ):
                     return ticket_key
@@ -4251,8 +6068,36 @@ class ExecutionKernel:
         ticket_key: str,
         *,
         wake_ref: str | None,
-    ) -> None:
+    ) -> bool:
         run = state["runs"][ticket_key]
+        prior_action_id = run.get("last_action_id")
+        if (
+            run.get("stale_follow_up_action_id") is not None
+            and run.get("stale_follow_up_completed") is not True
+        ):
+            return self._perform_stale_follow_up(active, state, ticket_key)
+        if (
+            run["phase"] in _SLOT_PHASES
+            and run.get("stale_due_at") is not None
+            and run.get("stale_disposition") is None
+        ):
+            due_at = run["stale_due_at"]
+            if type(due_at) is not str:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "stale due time is not canonical text",
+                )
+            try:
+                due_value = datetime.fromisoformat(due_at)
+            except ValueError as error:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "stale due time is unreadable",
+                ) from error
+            if due_value <= self._clock_value():
+                return self._perform_stale_effect(active, state, ticket_key)
+        trusted_before = self._trusted_lifecycle_projection(run)
+        trusted_progress_recorded = False
         resuming = run["phase"] == "parked" or bool(
             run.get("resume_after_invalidation")
         )
@@ -4271,6 +6116,7 @@ class ExecutionKernel:
             semantic_action_id=semantic_action_id,
             work_run_key=run["work_run_key"],
             work_subject_digest=run["work_subject_digest"],
+            runtime_binding_id=run.get("runtime_binding_id"),
         )
         # The intent becomes durable before the external boundary.  A restart
         # observes this same identity through the effect owner before retry.
@@ -4308,20 +6154,162 @@ class ExecutionKernel:
                 # Reissuing the semantic effect here would create polling and
                 # would undermine the stable-action recovery contract.
                 run["last_wake_ref"] = wake_ref
+                if wake_ref is not None:
+                    state.setdefault("last_wake_refs", [])
+                    if wake_ref not in state["last_wake_refs"]:
+                        state["last_wake_refs"].append(wake_ref)
+                        state["last_wake_refs"].sort()
                 self._save(active.handle, state)
-                return
+                return False
             observation = self._effects.execute(action)
         if type(observation) is not WorkRunObservation or observation.stable_action_id != action_id:
             raise ExecutionKernelError(
                 "EFFECT_READBACK_INVALID",
                 "effect result does not bind its stable action identity",
             )
+        if observation.runtime_binding_id is not None:
+            binding_changed = (
+                run.get("runtime_binding_id") is not None
+                and run.get("runtime_binding_id") != observation.runtime_binding_id
+            )
+            if binding_changed:
+                evidence = observation.terminal_binding_evidence
+                ordinal = run.get("binding_replacement_ordinal", 0)
+                if (
+                    action.kind != "semantic_resume"
+                    or run.get("phase") != "parked"
+                    or type(ordinal) is not int
+                    or isinstance(ordinal, bool)
+                    or ordinal >= 1
+                    or type(evidence) is not TerminalBindingEvidence
+                    or type(prior_action_id) is not str
+                    or not prior_action_id
+                    or evidence.prior_action_id != prior_action_id
+                    or evidence.prior_runtime_binding_id != run.get("runtime_binding_id")
+                    or evidence.agent_id != run.get("runtime_agent_id")
+                    or evidence.session_id != run.get("runtime_session_id")
+                    or evidence.workspace_id != run.get("runtime_workspace_id")
+                    or observation.agent_id is None
+                    or observation.session_id is None
+                    or observation.workspace_id is None
+                ):
+                    raise ExecutionKernelError(
+                        "EFFECT_READBACK_INVALID",
+                        "Runtime Binding replacement lacks one terminal-binding Evidence and allowance",
+                    )
+                run["binding_replacement_ordinal"] = ordinal + 1
+                run["terminal_binding_evidence"] = evidence.canonical()
+                run["runtime_agent_id"] = observation.agent_id
+                run["runtime_session_id"] = observation.session_id
+                run["runtime_workspace_id"] = observation.workspace_id
+                run["stale_readback_action_id"] = None
+                run["stale_diagnosis_action_id"] = None
+                run["stale_diagnosis_packet"] = None
+                run["stale_diagnosis_packet_digest"] = None
+                run["stale_diagnosis_packet_identity"] = None
+                run["stale_disposition"] = None
+                run["stale_follow_up_action_id"] = None
+                run["stale_follow_up_kind"] = None
+                run["stale_follow_up_completed"] = True
+            elif (
+                action.runtime_binding_id is not None
+                and action.runtime_binding_id != observation.runtime_binding_id
+            ):
+                raise ExecutionKernelError(
+                    "EFFECT_READBACK_INVALID",
+                    "Work Run observation is not bound to its action Runtime Binding",
+                )
+            if observation.agent_id is not None:
+                for field, value in (
+                    ("runtime_agent_id", observation.agent_id),
+                    ("runtime_session_id", observation.session_id),
+                    ("runtime_workspace_id", observation.workspace_id),
+                ):
+                    existing = run.get(field)
+                    if existing is not None and existing != value:
+                        raise ExecutionKernelError(
+                            "EFFECT_READBACK_INVALID",
+                            "Runtime identity changed without a Runtime Binding replacement",
+                        )
+                    run[field] = value
+            run["runtime_binding_id"] = observation.runtime_binding_id
+        run.setdefault("candidate_receipt", None)
+        receipt = observation.candidate_receipt
+        if receipt is not None:
+            if (
+                receipt.repository != active.handle.repository
+                or receipt.campaign_key != active.handle.campaign_key
+                or receipt.campaign_handle != active.handle.campaign_key
+                or receipt.plan_revision_digest != active.current_revision_digest
+                or receipt.work_run_key != run["work_run_key"]
+                or receipt.ticket_key != ticket_key
+                or receipt.runtime_subject_digest != run["work_subject_digest"]
+            ):
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "CandidateReceipt is bound to another Campaign or Work Run",
+                )
+            receipt_canonical = receipt.canonical()
+            receipt_changed = run.get("candidate_receipt") != receipt_canonical
+            run["candidate_receipt"] = receipt_canonical
+            run["candidate_receipt_digest"] = receipt.digest
+            state["candidate_receipts"] = [
+                value["candidate_receipt"]
+                for _key, value in sorted(state["runs"].items())
+                if type(value) is dict and value.get("candidate_receipt") is not None
+            ]
+            if receipt_changed:
+                self._record_trusted_progress(
+                    state,
+                    run,
+                    repository=active.handle.repository,
+                )
+                trusted_progress_recorded = True
+            self._save(active.handle, state)
+            persisted_state = self._load(active.handle)
+            if persisted_state is None:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Campaign state disappeared after CandidateReceipt persistence",
+                )
+            persisted_run = persisted_state.get("runs", {}).get(ticket_key)
+            if type(persisted_run) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "CandidateReceipt Work Run disappeared during readback",
+                )
+            try:
+                persisted_receipt = CandidateReceipt.from_canonical(
+                    persisted_run.get("candidate_receipt")
+                )
+            except CandidateGateError as error:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "persisted CandidateReceipt failed canonical readback",
+                ) from error
+            if persisted_receipt != receipt:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "persisted CandidateReceipt changed during readback",
+                )
+            state.clear()
+            state.update(persisted_state)
+            run = state["runs"][ticket_key]
         run["phase"] = observation.phase
         run["reason"] = observation.reason
         run["next_check_at"] = observation.next_check_at
-        run["slot_held"] = observation.phase in _SLOT_PHASES
+        run["slot_held"] = observation.phase in _SLOT_PHASES or (
+            observation.phase == "wait"
+            and observation.binding_established
+            and observation.runtime_binding_id is not None
+        )
         run["claim_state"] = "held" if run["slot_held"] else "released"
         run["last_wake_ref"] = wake_ref
+        if wake_ref is not None:
+            state.setdefault("last_wake_refs", [])
+            if wake_ref not in state["last_wake_refs"]:
+                state["last_wake_refs"].append(wake_ref)
+                state["last_wake_refs"].sort()
         run["resume_after_invalidation"] = False
         if observation.candidate_identity is not None:
             run["candidate_identity"] = observation.candidate_identity
@@ -4360,7 +6348,21 @@ class ExecutionKernel:
             state["accepted_results"].sort(key=lambda value: value["ticket_key"])
             run["result_digest"] = binding.result_digest
             run["evidence_digests"] = list(binding.evidence_digests)
+        if (
+            not trusted_progress_recorded
+            and (
+            prior_effect is None
+            or prior_effect.get("state") != "read_back"
+            or self._trusted_lifecycle_projection(run) != trusted_before
+            )
+        ):
+            self._record_trusted_progress(
+                state,
+                run,
+                repository=active.handle.repository,
+            )
         self._save(active.handle, state)
+        return True
 
     def _outcome(self, handle: CampaignHandle, state: dict[str, Any] | None) -> CampaignOutcome:
         if state is None:
@@ -4480,22 +6482,259 @@ class ExecutionKernel:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def _connect_read_only(self) -> sqlite3.Connection:
+        try:
+            connection = sqlite3.connect(
+                f"{self._store_path.resolve().as_uri()}?mode=ro",
+                uri=True,
+            )
+        except sqlite3.Error as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Execution store is not readable",
+            ) from error
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _read_persisted_campaign_without_migration(
+        self, handle: CampaignHandle
+    ) -> dict[str, Any]:
+        if type(handle) is not CampaignHandle:
+            raise ExecutionKernelError(
+                "CAMPAIGN_HANDLE_INVALID",
+                "Campaign handle must be an exact CampaignHandle",
+            )
+        state = self._load_read_only(handle)
+        if state is None:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign state does not exist",
+            )
+        return state
+
+    def _load_read_only(self, handle: CampaignHandle) -> dict[str, Any] | None:
+        try:
+            with self._connect_read_only() as connection:
+                row = connection.execute(
+                    """
+                    SELECT state_json FROM v8_execution_kernel_campaigns
+                    WHERE repository = ? AND campaign_key = ?
+                    """,
+                    (handle.repository, handle.campaign_key),
+                ).fetchone()
+        except ExecutionKernelError:
+            raise
+        except sqlite3.Error as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Execution store schema is unreadable",
+            ) from error
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["state_json"])
+        except json.JSONDecodeError as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID", "Campaign state is unreadable"
+            ) from error
+        if type(value) is not dict:
+            raise ExecutionKernelError("EXECUTION_STORE_INVALID", "Campaign state is invalid")
+        return value
+
+    def _status_from_persisted_state(self, state: Mapping[str, Any]) -> CampaignStatus:
+        if type(state) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign state is not an object",
+            )
+        try:
+            return self._outcome(CampaignHandle("", ""), state).status
+        except ExecutionKernelError:
+            raise
+        except (KeyError, TypeError, ValueError) as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign state cannot derive its status",
+            ) from error
+
+    def _trusted_progress_digest(
+        self,
+        state: Mapping[str, Any],
+        handle: CampaignHandle | None = None,
+    ) -> str:
+        if handle is None:
+            candidate_receipts: object = state.get("candidate_receipts", [])
+        else:
+            candidate_receipts = [
+                receipt.canonical()
+                for _ticket_key, receipt in self._candidate_receipt_records(state, handle)
+            ]
+        return digest_value(
+            {
+                "kernel_transition_revision": state.get("trusted_progress_revision", 0),
+                "permission_receipts": state.get("normalized_permission_receipts", []),
+                "candidate_receipts": candidate_receipts,
+                "delivery_receipts": state.get("delivery_receipts", []),
+            }
+        )
+
+    def _candidate_receipt_records(
+        self,
+        state: Mapping[str, Any],
+        handle: CampaignHandle,
+    ) -> tuple[tuple[str, CandidateReceipt], ...]:
+        runs = state.get("runs")
+        if type(runs) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel Work Runs are not a mapping",
+            )
+        records: list[tuple[str, CandidateReceipt]] = []
+        for ticket_key in sorted(runs):
+            run = runs[ticket_key]
+            if type(run) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "ExecutionKernel Work Run is not a mapping",
+                )
+            stored = run.get("candidate_receipt")
+            if stored is None:
+                continue
+            try:
+                receipt = CandidateReceipt.from_canonical(stored)
+            except Exception as error:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "persisted CandidateReceipt failed canonical readback",
+                ) from error
+            if (
+                receipt.repository != handle.repository
+                or receipt.campaign_key != handle.campaign_key
+                or receipt.campaign_handle != handle.campaign_key
+                or receipt.plan_revision_digest != state.get("plan_revision_digest")
+                or receipt.ticket_key != ticket_key
+                or receipt.work_run_key != run.get("work_run_key")
+                or receipt.runtime_subject_digest != run.get("work_subject_digest")
+            ):
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "CandidateReceipt is bound to another Campaign or Work Run",
+                )
+            stored_digest = run.get("candidate_receipt_digest")
+            if stored_digest != receipt.digest:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "CandidateReceipt digest changed during readback",
+                )
+            records.append((ticket_key, receipt))
+        canonical_records = [receipt.canonical() for _ticket_key, receipt in records]
+        if "candidate_receipts" in state:
+            stored_records = state["candidate_receipts"]
+            if type(stored_records) is not list or stored_records != canonical_records:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "CandidateReceipt projection changed during readback",
+                )
+        return tuple(records)
+
+    @staticmethod
+    def _snapshot_next_check_at(state: Mapping[str, Any]) -> str | None:
+        value = state.get("next_check_at")
+        if value is not None:
+            if type(value) is not str or not value:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Campaign next_check_at is invalid",
+                )
+            return value
+        values: list[object] = []
+        for run in state.get("runs", {}).values():
+            if type(run) is not dict:
+                continue
+            if run.get("next_check_at") is not None:
+                values.append(run.get("next_check_at"))
+            if run.get("phase") in _SLOT_PHASES and run.get("stale_due_at") is not None:
+                values.append(run.get("stale_due_at"))
+        if any(type(item) is not str or not item for item in values):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Work Run next_check_at is invalid",
+            )
+        return min(values) if values else None
+
+    @staticmethod
+    def _snapshot_text_tuple(
+        value: object,
+        label: str,
+    ) -> tuple[str, ...]:
+        if type(value) not in {list, tuple}:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                f"{label} is not a string collection",
+            )
+        if any(type(item) is not str or not item for item in value):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                f"{label} contains invalid text",
+            )
+        return tuple(sorted(set(value)))
+
+    def _snapshot_active_binding_ids(
+        self, state: Mapping[str, Any]
+    ) -> tuple[str, ...]:
+        if "active_binding_ids" in state:
+            return self._snapshot_text_tuple(
+                state["active_binding_ids"], "active binding identities"
+            )
+        values: list[str] = []
+        for run in state.get("runs", {}).values():
+            if type(run) is not dict:
+                continue
+            if not (run.get("slot_held") or run.get("phase") in _SLOT_PHASES):
+                continue
+            binding = run.get("runtime_binding_id") or run.get("semantic_action_id")
+            if binding is not None:
+                values.append(binding)
+        return self._snapshot_text_tuple(values, "active binding identities")
+
+    def _snapshot_diagnosed_binding_ids(
+        self, state: Mapping[str, Any]
+    ) -> tuple[str, ...]:
+        if "diagnosed_binding_ids" in state:
+            return self._snapshot_text_tuple(
+                state["diagnosed_binding_ids"], "diagnosed binding identities"
+            )
+        values: list[str] = []
+        for run in state.get("runs", {}).values():
+            if type(run) is dict and type(run.get("diagnosed_binding_ids")) is list:
+                values.extend(run["diagnosed_binding_ids"])
+        return self._snapshot_text_tuple(values, "diagnosed binding identities")
+
     def _campaign_lock(self, handle: CampaignHandle) -> threading.RLock:
         key = f"{self._store_path.resolve()}::{handle.repository}::{handle.campaign_key}"
         with _KERNEL_LOCKS_GUARD:
             return _KERNEL_LOCKS.setdefault(key, threading.RLock())
 
     def _load(self, handle: CampaignHandle) -> dict[str, Any] | None:
+        key = (handle.repository, handle.campaign_key)
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT state_json FROM v8_execution_kernel_campaigns
+                SELECT state_json, state_version FROM v8_execution_kernel_campaigns
                 WHERE repository = ? AND campaign_key = ?
                 """,
                 (handle.repository, handle.campaign_key),
             ).fetchone()
         if row is None:
+            self._campaign_row_versions[key] = None
             return None
+        version = row["state_version"]
+        if type(version) is not int or isinstance(version, bool) or version < 0:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign durable state version is invalid",
+            )
+        self._campaign_row_versions[key] = version
         try:
             value = json.loads(row["state_json"])
         except json.JSONDecodeError as error:
@@ -4506,15 +6745,43 @@ class ExecutionKernel:
 
     def _save(self, handle: CampaignHandle, state: dict[str, Any]) -> None:
         rendered = json.dumps(state, separators=(",", ":"), sort_keys=True)
+        key = (handle.repository, handle.campaign_key)
+        expected = self._campaign_row_versions.get(key)
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO v8_execution_kernel_campaigns (repository, campaign_key, state_json)
-                VALUES (?, ?, ?)
-                ON CONFLICT(repository, campaign_key) DO UPDATE SET state_json = excluded.state_json
-                """,
-                (handle.repository, handle.campaign_key, rendered),
-            )
+            try:
+                if expected is None:
+                    connection.execute(
+                        """
+                        INSERT INTO v8_execution_kernel_campaigns
+                            (repository, campaign_key, state_json, state_version)
+                        VALUES (?, ?, ?, 0)
+                        """,
+                        (handle.repository, handle.campaign_key, rendered),
+                    )
+                    next_version = 0
+                else:
+                    cursor = connection.execute(
+                        """
+                        UPDATE v8_execution_kernel_campaigns
+                        SET state_json = ?, state_version = state_version + 1
+                        WHERE repository = ? AND campaign_key = ? AND state_version = ?
+                        """,
+                        (rendered, handle.repository, handle.campaign_key, expected),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ExecutionKernelError(
+                            "EXECUTION_STORE_CONFLICT",
+                            "Campaign state changed concurrently",
+                        )
+                    next_version = expected + 1
+            except ExecutionKernelError:
+                raise
+            except sqlite3.IntegrityError as error:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_CONFLICT",
+                    "Campaign state changed concurrently",
+                ) from error
+        self._campaign_row_versions[key] = next_version
 
 
 _default_execution_kernel: ExecutionKernel | None = None
