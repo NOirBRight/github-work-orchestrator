@@ -1030,6 +1030,30 @@ class DelayedPlanningStartHost:
         self._planning_passes = 0
         self._planning_store = self.root / "planning-continuation.json"
         self._planning_gateway_calls = 0
+        if self._planning_store.exists():
+            persisted = json.loads(
+                self._planning_store.read_text(encoding="utf-8")
+            )
+            campaign = persisted["campaign"]
+            handle = CampaignHandle(
+                campaign["repository"], campaign["campaign_key"]
+            )
+            continuation = PlanningContinuation(
+                campaign=handle,
+                ready_refs=tuple(persisted["ready_refs"]),
+                expected_previous_revision_digest=persisted[
+                    "expected_previous_revision_digest"
+                ],
+                snapshot_artifact_digest=persisted["snapshot_artifact_digest"],
+                planning_request_artifact_digest=persisted[
+                    "planning_request_artifact_digest"
+                ],
+                stable_action_id=persisted["stable_action_id"],
+                compilation_record_artifact_digest=persisted[
+                    "compilation_record_artifact_digest"
+                ],
+            )
+            self._continuations[handle] = continuation
 
     def start(
         self,
@@ -1056,7 +1080,11 @@ class DelayedPlanningStartHost:
                         "campaign_key": handle.campaign_key,
                     },
                     "ready_refs": list(continuation.ready_refs),
+                    "expected_previous_revision_digest": continuation.expected_previous_revision_digest,
+                    "snapshot_artifact_digest": continuation.snapshot_artifact_digest,
+                    "planning_request_artifact_digest": continuation.planning_request_artifact_digest,
                     "stable_action_id": continuation.stable_action_id,
+                    "compilation_record_artifact_digest": continuation.compilation_record_artifact_digest,
                 },
                 sort_keys=True,
             ),
@@ -1117,6 +1145,7 @@ class DelayedPlanningStartHost:
         )
         self._active[handle] = active
         self._continuations.pop(handle)
+        self._planning_store.unlink(missing_ok=True)
         return handle
 
     def install_execution_kernel(
@@ -1185,7 +1214,7 @@ class PlanningHostFixture:
         return dict(self.arguments)
 
     def reinstall(self, root: Path) -> "PlanningHostFixture":
-        start_host = self.start_host
+        start_host = DelayedPlanningStartHost(root)
         arguments = dict(self.arguments)
         arguments["start_host"] = start_host
         host = ProductionGwoHost.install(**arguments)

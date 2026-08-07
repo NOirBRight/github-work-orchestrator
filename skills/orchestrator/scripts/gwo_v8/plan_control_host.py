@@ -609,13 +609,25 @@ class ProductionPlanControlStartHost:
                 "PLANNING_CONTINUATION_INVALID",
                 "the persisted planning attempt has the wrong predecessor identity",
             )
-        if attempt.compilation_record_artifact_digest is not None:
-            return None
         if attempt.revision is not None:
-            raise ProductionCompositionError(
-                "PLANNING_CONTINUATION_INVALID",
-                "the pending planning attempt already has a Plan Revision",
-            )
+            # A Plan Revision can be durable before Activation publishes its
+            # receipt.  When the active receipt is absent this is still the
+            # same initial Planning continuation and must be recoverable.
+            if attempt.compilation_record_artifact_digest is None:
+                raise ProductionCompositionError(
+                    "PLANNING_CONTINUATION_INVALID",
+                    "the persisted Plan Revision has no compilation record",
+                )
+            if expected is not None:
+                return None
+        # This seam is only the initial Planning continuation.  Successor
+        # replanning has its own explicit invalidation/Decision boundary and
+        # must never be resumed as if it were the first Planning pass.
+        if (
+            attempt.expected_previous_revision_digest is not None
+            or attempt.planning_protocol_id != PLANNING_OUTPUT_PROTOCOL_ID
+        ):
+            return None
         if (
             type(attempt.ready_refs) is not tuple
             or type(attempt.snapshot_bytes) is not bytes
@@ -747,7 +759,13 @@ class ProductionPlanControlStartHost:
         ready_refs: Sequence[str],
     ) -> CampaignHandle:
         continuation = self.read_planning_continuation(handle)
-        refs = tuple(ready_refs)
+        raw_refs = _ready_refs(ready_refs)
+        canonicalizer = getattr(self._source, "canonical_ready_refs", None)
+        refs = (
+            _ready_refs(canonicalizer(handle.repository, raw_refs))
+            if callable(canonicalizer)
+            else raw_refs
+        )
         if continuation is None or refs != continuation.ready_refs:
             raise ProductionCompositionError(
                 "PLANNING_CONTINUATION_MISMATCH",
