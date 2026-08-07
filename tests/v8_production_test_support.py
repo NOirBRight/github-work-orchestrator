@@ -44,6 +44,7 @@ from gwo_v8.execution_kernel import (
     WorkRunAction,
     WorkRunEffects,
     WorkRunObservation,
+    WorkRunSummary,
 )
 from gwo_v8.plan_control import ActivePlanReadback, CampaignHandle
 from gwo_v8.runtime_gateway import (
@@ -65,6 +66,7 @@ from gwo_v8.production_host import (
     ProductionGwoHost,
     ProductionHostConfiguration,
 )
+from gwo_v8.production_effects import ProductionWorkRunEffects
 from v8_successor_test_support import _StaticPlanReader, _minimal_active_campaign
 
 
@@ -1257,3 +1259,539 @@ def reinstall_production_host(
     planning_host: PlanningHostFixture,
 ) -> PlanningHostFixture:
     return planning_host.reinstall(root)
+
+
+@dataclass
+class ReopenedRuntimeGateway:
+    calls: list[str] = field(default_factory=list)
+
+    def progress(
+        self,
+        subject: WorkRunSubject,
+        *,
+        wake_cursor: str | None,
+    ) -> RuntimeProgressReceipt:
+        self.calls.append(subject.stable_action_id)
+        return RuntimeProgressReceipt(
+            subject_digest=subject.digest,
+            stable_action_id=subject.stable_action_id,
+            status="completed",
+            receipt_digest=digest_value(
+                {
+                    "kind": "reopened-137-runtime.v1",
+                    "subject_digest": subject.digest,
+                    "wake_cursor": wake_cursor,
+                }
+            ),
+            output_artifact_digest="4" * 64,
+        )
+
+
+def _reopened_invalidation_receipt(
+    report: PlanInvalidationReport,
+    source_evidence_digests: tuple[str, ...],
+) -> PlanInvalidationReceipt:
+    proof = CapabilityPolicyProof(
+        capability_policy=CapabilityPolicy(worker_can_edit_issues=False),
+        authority_record_digest="f" * 64,
+    )
+    observation = {
+        "kind": "plan_invalidation_observation.v1",
+        "repository": report.repository,
+        "campaign_key": report.campaign_key,
+        "plan_revision_digest": report.plan_revision_digest,
+        "ticket_key": report.ticket_key,
+        "work_run_key": report.work_run_key,
+        "runtime_binding_id": report.runtime_binding_id,
+        "authority_subtree_digest": report.authority_subtree_digest,
+        "reporter_role": report.reporter_role,
+        "report_digest": report.digest,
+        "evidence_digest": report.evidence_digest,
+        "dedup_identity": report.dedup_identity,
+        "invalidated_obligation": report.invalidated_obligation,
+        "required_effects": list(report.required_effects),
+        "workspace_identity": report.workspace_identity,
+        "source_evidence_digests": list(source_evidence_digests),
+    }
+    return PlanInvalidationReceipt(
+        report_digest=report.digest,
+        receipt_digest=digest_value(observation),
+        capability_policy_proof=proof,
+        observation=observation,
+    )
+
+
+def make_reopened_plan_invalidation_result(
+    subject: WorkRunSubject,
+    *,
+    source_kind: str,
+    reproduction: str,
+) -> CandidateGateResult:
+    if source_kind not in {
+        "scope_audit",
+        "formal_review",
+        "repair_verification",
+    }:
+        raise AssertionError(f"unsupported reopened #137 source: {source_kind}")
+    source_digest = digest_value(
+        {
+            "kind": "reopened-137-source.v1",
+            "ticket_key": subject.ticket_key,
+            "source_kind": source_kind,
+            "reproduction": reproduction,
+        }
+    )
+    evidence = PlanInvalidationEvidence(
+        runtime_subject=subject,
+        parent_digest="c" * 64,
+        candidate_digest="d" * 64,
+        source_kind=source_kind,
+        source_evidence_digest=source_digest,
+        invalidated_obligation="ticket scope",
+        required_effects=("read tracker",),
+        workspace_identity=f"workspace:{subject.ticket_key}",
+        discovered_facts=("scope=outside",),
+        reproduction=reproduction,
+    )
+    report = PlanInvalidationReport(
+        repository=subject.repository,
+        campaign_key=subject.campaign_key,
+        plan_revision_digest=subject.plan_revision_digest,
+        ticket_key=subject.ticket_key,
+        work_run_key=subject.work_run_key,
+        runtime_binding_id=subject.stable_action_id,
+        authority_subtree_digest=subject.authority_subtree_digest,
+        reporter_role="worker",
+        evidence_digest=evidence.digest,
+        dedup_identity=f"reopened:137:{subject.ticket_key}:{source_kind}",
+        invalidated_obligation=evidence.invalidated_obligation,
+        required_effects=evidence.required_effects,
+        workspace_identity=evidence.workspace_identity,
+    )
+    return CandidateGateResult(
+        status=CandidateGateStatus.PLAN_INVALIDATION_REPORTED,
+        evidence=(evidence,),
+        plan_invalidation_receipt=_reopened_invalidation_receipt(
+            report,
+            evidence.source_evidence_digests,
+        ),
+        plan_invalidation_report=report,
+    )
+
+
+@dataclass
+class ReopenedCandidateGate:
+    queued_cases: dict[str, tuple[str, str]] = field(default_factory=dict)
+    results: dict[str, CandidateGateResult] = field(default_factory=dict)
+    candidate_calls_by_ticket: dict[str, int] = field(default_factory=dict)
+    reviewer_calls: int = 0
+    formal_review_calls: int = 0
+    repair_verification_calls: int = 0
+    reporter_calls: int = 0
+
+    def queue(
+        self,
+        ticket_key: str,
+        *,
+        mode: str,
+        reported_reference: str = "refs/heads/candidate",
+    ) -> None:
+        if mode not in {
+            "deterministic",
+            "formal_review",
+            "repair",
+            "ordinary",
+        }:
+            raise AssertionError(f"unsupported reopened #137 mode: {mode}")
+        if ticket_key in self.queued_cases:
+            raise AssertionError(f"case already queued for {ticket_key}")
+        self.queued_cases[ticket_key] = (mode, reported_reference)
+
+    def _invalidation(
+        self,
+        subject: WorkRunSubject,
+        *,
+        source_kind: str,
+        reproduction: str,
+    ) -> CandidateGateResult:
+        self.reporter_calls += 1
+        return make_reopened_plan_invalidation_result(
+            subject,
+            source_kind=source_kind,
+            reproduction=reproduction,
+        )
+
+    def _record(
+        self,
+        ticket_key: str,
+        result: CandidateGateResult,
+    ) -> CandidateGateResult:
+        existing = self.results.get(ticket_key)
+        if existing is not None and existing != result:
+            raise AssertionError(f"changed CandidateGate result for {ticket_key}")
+        self.results[ticket_key] = result
+        return result
+
+    def gate_candidate(
+        self,
+        parent: CandidateGateParent,
+        reported_reference: str,
+    ) -> CandidateGateResult:
+        ticket_key = parent.runtime_subject.ticket_key
+        self.candidate_calls_by_ticket[ticket_key] = (
+            self.candidate_calls_by_ticket.get(ticket_key, 0) + 1
+        )
+        mode, expected_reference = self.queued_cases.pop(
+            ticket_key,
+            ("ordinary", reported_reference),
+        )
+        if reported_reference != expected_reference:
+            raise AssertionError(
+                f"candidate reference changed for {ticket_key}: "
+                f"{reported_reference!r}"
+            )
+        if mode == "ordinary":
+            result = CandidateGateResult(
+                status=CandidateGateStatus.ORDINARY_REJECTED,
+                evidence=(),
+            )
+        elif mode == "deterministic":
+            result = self._invalidation(
+                parent.runtime_subject,
+                source_kind="scope_audit",
+                reproduction="deterministic scope escape",
+            )
+        elif mode == "formal_review":
+            self.reviewer_calls += 1
+            self.formal_review_calls += 1
+            result = self._invalidation(
+                parent.runtime_subject,
+                source_kind="formal_review",
+                reproduction="formal Review scope escape",
+            )
+        else:
+            self.repair_verification_calls += 1
+            result = self._invalidation(
+                parent.runtime_subject,
+                source_kind="repair_verification",
+                reproduction="bounded Repair Verification scope escape",
+            )
+        return self._record(ticket_key, result)
+
+    def verify_repair(
+        self,
+        parent: CandidateGateParent,
+        packet: RepairPacket,
+        candidate: CandidateIdentity,
+    ) -> CandidateGateResult:
+        self.repair_verification_calls += 1
+        result = self._invalidation(
+            parent.runtime_subject,
+            source_kind="repair_verification",
+            reproduction=(
+                "bounded Repair Verification scope escape for "
+                f"{packet.digest}:{candidate.digest}"
+            ),
+        )
+        return self._record(parent.runtime_subject.ticket_key, result)
+
+    def replay_plan_invalidation(
+        self,
+        parent: CandidateGateParent,
+        evidence: PlanInvalidationEvidence,
+        report: PlanInvalidationReport,
+    ) -> CandidateGateResult:
+        if evidence.runtime_subject.digest != parent.runtime_subject.digest:
+            raise AssertionError("replayed invalidation changed Runtime Subject")
+        if report.evidence_digest != evidence.digest:
+            raise AssertionError("replayed invalidation changed Evidence lineage")
+        self.reporter_calls += 1
+        result = CandidateGateResult(
+            status=CandidateGateStatus.PLAN_INVALIDATION_REPORTED,
+            evidence=(evidence,),
+            plan_invalidation_receipt=_reopened_invalidation_receipt(
+                report,
+                evidence.source_evidence_digests,
+            ),
+            plan_invalidation_report=report,
+        )
+        return self._record(parent.runtime_subject.ticket_key, result)
+
+    def result_for(self, ticket_key: str) -> CandidateGateResult:
+        try:
+            return self.results[ticket_key]
+        except KeyError as error:
+            raise AssertionError(
+                f"CandidateGate has no result for {ticket_key}"
+            ) from error
+
+
+@dataclass
+class ReopenedSubjectSource:
+    authority_subtree_digests: dict[str, str] = field(default_factory=dict)
+
+    def for_action(self, action: WorkRunAction) -> WorkRunSubject:
+        subject = make_test_subject(action)
+        authority_digest = self.authority_subtree_digests.get(action.ticket_key)
+        if authority_digest is not None:
+            subject = replace(
+                subject,
+                authority_subtree_digest=authority_digest,
+            )
+        return subject
+
+
+@dataclass
+class ReopenedParentSource:
+    def for_action(
+        self,
+        action: WorkRunAction,
+        subject: WorkRunSubject,
+    ) -> CandidateGateParent:
+        return CandidateGateParent(
+            runtime_subject=subject,
+            ticket_contract_digest="c" * 64,
+            policy_witness_digest="d" * 64,
+            workspace_identity=f"workspace:{action.ticket_key}",
+        )
+
+
+@dataclass
+class ReopenedReferenceReader:
+    def read(self, output_artifact_digest: str, *, subject: WorkRunSubject) -> str:
+        return "refs/heads/candidate"
+
+
+class ReopenedNoDeliveryBatch:
+    def prepare(self, request: BatchDeliveryRequest) -> BatchDeliveryAction:
+        raise AssertionError("scope-escape revalidation must not prepare a Batch")
+
+    def readback(self, action: BatchDeliveryAction) -> BatchDeliveryObservation | None:
+        raise AssertionError("scope-escape revalidation must not read a Batch")
+
+    def execute(self, action: BatchDeliveryAction) -> BatchDeliveryObservation:
+        raise AssertionError("scope-escape revalidation must not execute a Batch")
+
+
+@dataclass
+class ReopenedStartHost:
+    active: ActivePlanReadback
+
+    def start(
+        self,
+        repository: str,
+        ready_refs: tuple[str, ...],
+        options: object = None,
+    ) -> CampaignHandle:
+        return self.active.handle
+
+    def read_planning_continuation(self, handle: CampaignHandle) -> None:
+        return None
+
+    def read_active_or_none(self, handle: CampaignHandle) -> ActivePlanReadback:
+        if handle != self.active.handle:
+            raise AssertionError(handle)
+        return self.active
+
+    def read_active(self, handle: CampaignHandle) -> ActivePlanReadback:
+        return self.read_active_or_none(handle)
+
+    def install_execution_kernel(
+        self,
+        *,
+        store_path: Path,
+        effects: WorkRunEffects,
+        configuration: ExecutionKernelConfiguration | None,
+    ) -> ExecutionKernel:
+        return ExecutionKernel(
+            store_path=store_path,
+            plan_control=self,
+            effects=effects,
+            configuration=configuration,
+        )
+
+
+@dataclass
+class ReopenedWatchdog:
+    def run_once(self, now: str) -> tuple[CampaignOutcome, ...]:
+        return ()
+
+
+@dataclass
+class Reopened137HostFixture:
+    host: ProductionGwoHost
+    handle: CampaignHandle
+    start_host: ReopenedStartHost
+    gate: ReopenedCandidateGate
+    root: Path
+
+    def candidate_calls_for(self, ticket_key: str) -> int:
+        return self.gate.candidate_calls_by_ticket.get(ticket_key, 0)
+
+    @property
+    def reviewer_calls(self) -> int:
+        return self.gate.reviewer_calls
+
+    @property
+    def formal_review_calls(self) -> int:
+        return self.gate.formal_review_calls
+
+    @property
+    def repair_verification_calls(self) -> int:
+        return self.gate.repair_verification_calls
+
+    @property
+    def reporter_calls(self) -> int:
+        return self.gate.reporter_calls
+
+    def submit_candidate(
+        self,
+        ticket_key: str,
+        reported_reference: str,
+    ) -> None:
+        self.gate.queue(
+            ticket_key,
+            mode="deterministic",
+            reported_reference=reported_reference,
+        )
+
+    def submit_formal_review_scope_escape(self, ticket_key: str) -> None:
+        self.gate.queue(ticket_key, mode="formal_review")
+
+    def submit_repair_scope_escape(self, ticket_key: str) -> None:
+        self.gate.queue(ticket_key, mode="repair")
+
+    def submit_ordinary_unauthorized_candidate(self, ticket_key: str) -> None:
+        self.gate.queue(ticket_key, mode="ordinary")
+
+    def result_for(self, ticket_key: str) -> CandidateGateResult:
+        return self.gate.result_for(ticket_key)
+
+    def run_for(self, ticket_key: str) -> WorkRunSummary:
+        matches = tuple(
+            run
+            for run in self.host.inspect(self.handle).work_runs
+            if run.ticket_key == ticket_key
+        )
+        if len(matches) != 1:
+            raise AssertionError(
+                f"expected one Work Run for {ticket_key}, found {len(matches)}"
+            )
+        return matches[0]
+
+    def advance(
+        self,
+        handle: CampaignHandle,
+        wake_ref: str | None = None,
+    ) -> CampaignOutcome:
+        return self.host.advance(handle, wake_ref)
+
+    def inspect(self, handle: CampaignHandle) -> Diagnostics:
+        return self.host.inspect(handle)
+
+    def restart(self) -> "Reopened137HostFixture":
+        return install_reopened_137_host(
+            root=self.root,
+            start_host=self.start_host,
+            gate=self.gate,
+            handle=self.handle,
+        )
+
+
+def make_reopened_137_effects(
+    root: Path,
+    gate: ReopenedCandidateGate,
+    authority_subtree_digests: dict[str, str],
+) -> ProductionWorkRunEffects:
+    runtime_factory = RecordingRuntimeGatewayFactory(
+        store_path=root / "runtime.sqlite3",
+        provider_command="recording-provider --no-dispatch",
+        repository_root=root,
+        gateway=ReopenedRuntimeGateway(),
+    )
+    return ProductionWorkRunEffects(
+        store_path=root / "production-effects.sqlite3",
+        runtime_gateways=runtime_factory,
+        runtime_stale_readbacks=RecordingRuntimeStaleReadback(),
+        work_run_subjects=ReopenedSubjectSource(authority_subtree_digests),
+        candidate_references=ReopenedReferenceReader(),
+        candidate_parents=ReopenedParentSource(),
+        candidate_gate=gate,
+        batch_requests=RecordingBatchRequestSource(
+            target_path=root / "target",
+            runtime_factory=runtime_factory,
+        ),
+        batch_integrator=ReopenedNoDeliveryBatch(),
+    )
+
+
+def install_reopened_137_host(
+    *,
+    root: Path,
+    start_host: ReopenedStartHost,
+    gate: ReopenedCandidateGate,
+    handle: CampaignHandle,
+) -> Reopened137HostFixture:
+    target = root / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    from gwo_v8._canonical import load_canonical_json
+
+    plan = load_canonical_json(start_host.active.plan_spec_bytes)
+    authority_subtree_digests = {
+        item["key"]: item["authority"]["worker"]["subtree_digest"]
+        for item in plan["work"]
+    }
+    host = ProductionGwoHost.install(
+        start_host=start_host,
+        store_path=root / "execution.sqlite3",
+        effects=make_reopened_137_effects(
+            root,
+            gate,
+            authority_subtree_digests,
+        ),
+        configuration=None,
+        host_configuration=ProductionHostConfiguration(
+            preview_mode="beta2_isolated_preview",
+            target_isolation_root=root,
+            writer_activation_enabled=False,
+        ),
+        target_path=target,
+        watchdog_store_path=root / "watchdog.sqlite3",
+        watchdog=ReopenedWatchdog(),
+        writer_generation_reader=PlanningWriterGenerationReader(),
+    )
+    return Reopened137HostFixture(host, handle, start_host, gate, root)
+
+
+def make_reopened_137_host(root: Path) -> Reopened137HostFixture:
+    active, handle = _minimal_active_campaign(("issue:108", "issue:109"))
+    from gwo_v8._canonical import canonical_bytes, digest_bytes, load_canonical_json
+
+    plan = load_canonical_json(active.plan_spec_bytes)
+    plan["campaign"]["key"] = handle.campaign_key
+    plan_bytes = canonical_bytes(plan)
+    revision_digest = digest_bytes(plan_bytes)
+    active = replace(
+        active,
+        current_revision_digest=revision_digest,
+        plan_spec_bytes=plan_bytes,
+        activation_receipt=replace(
+            active.activation_receipt,
+            revision_digest=revision_digest,
+        ),
+        claim_proofs=tuple(
+            replace(proof, plan_revision_digest=revision_digest)
+            for proof in active.claim_proofs
+        ),
+    )
+    return install_reopened_137_host(
+        root=root,
+        start_host=ReopenedStartHost(active),
+        gate=ReopenedCandidateGate(),
+        handle=handle,
+    )
+
+
+@pytest.fixture
+def reopened_137_host(tmp_path: Path) -> Reopened137HostFixture:
+    return make_reopened_137_host(tmp_path)
