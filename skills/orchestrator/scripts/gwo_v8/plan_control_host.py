@@ -16,10 +16,12 @@ from .plan_control import (
     ActivePlanReadback,
     CampaignHandle,
     CampaignSnapshotSource,
+    CampaignPlanningSubject,
     PlanControl,
     PlanControlError,
     PlanInvalidationClassification,
     PlanControlRepository,
+    _PlanningAttempt,
     _handle_ref,
     _install_start_host,
     _ready_refs,
@@ -37,10 +39,11 @@ from .runtime_gateway import (
     ProfileMapping,
     RuntimeConfiguration,
     RuntimeGatewayError,
+    RuntimeGateway,
     RuntimeRepositoryContext,
     build_runtime_gateway,
 )
-from ._canonical import digest_value
+from ._canonical import digest_bytes, digest_value, load_canonical_json
 from .activation import GitHubCliContentClient, GitHubContentClient
 from .github_snapshot import (
     GitHubCliIssueReadClient,
@@ -55,6 +58,13 @@ from .plan_control_github import (
     WriterGenerationReadback,
     validate_github_plan_control_paths,
 )
+from .production_effects import ProductionCompositionError
+from .planning_protocol import (
+    PLANNING_OUTPUT_PROTOCOL_ID,
+    REPLANNING_OUTPUT_PROTOCOL_ID,
+    planning_prompt,
+    replanning_prompt,
+)
 
 if TYPE_CHECKING:
     from .execution_kernel import (
@@ -62,6 +72,7 @@ if TYPE_CHECKING:
         ExecutionKernelConfiguration,
         WorkRunEffects,
     )
+    from .production_host import PlanningContinuation
 
 
 _GatewayBuilder = Callable[..., Any]
@@ -540,6 +551,221 @@ class ProductionPlanControlStartHost:
                 "CampaignHandle belongs to another configured repository",
             )
         return self._existing_control(handle).read_active(handle)
+
+    def runtime_gateway_for(self, handle: CampaignHandle) -> RuntimeGateway:
+        """Return the composed Gateway for one exact Campaign identity."""
+
+        assertion_key = (
+            handle.repository,
+            handle.campaign_key,
+            _handle_ref(handle),
+        )
+        assertion = self._configuration.campaign_assertions.get(assertion_key)
+        effect_dispatch_factory = getattr(
+            self._repository,
+            "planning_effect_dispatch",
+            None,
+        )
+        try:
+            gateway = self._gateway_builder(
+                gateway_store_path=self._gateway_store_path,
+                configuration=self._runtime_configuration_for(handle, assertion),
+                repository_contexts=self._repository_contexts,
+                artifacts=self._artifacts,
+                planning_effect_dispatch=(
+                    effect_dispatch_factory()
+                    if callable(effect_dispatch_factory)
+                    else None
+                ),
+            )
+        except (TypeError, RuntimeGatewayError, ValueError) as error:
+            raise ProductionCompositionError(
+                "PLAN_CONTROL_RUNTIME_GATEWAY_INVALID",
+                "the host Runtime factory returned no exact RuntimeGateway",
+            ) from error
+        if not isinstance(gateway, RuntimeGateway):
+            raise ProductionCompositionError(
+                "PLAN_CONTROL_RUNTIME_GATEWAY_INVALID",
+                "the host Runtime factory returned no exact RuntimeGateway",
+            )
+        return gateway
+
+    def _read_planning_attempt(
+        self,
+        handle: CampaignHandle,
+    ) -> _PlanningAttempt | None:
+        active = self._repository.active_receipt(handle)
+        expected = None if active is None else active.revision_digest
+        attempt = self._repository.read_attempt(handle, expected)
+        if attempt is None:
+            return None
+        if type(attempt) is not _PlanningAttempt or attempt.handle != handle:
+            raise ProductionCompositionError(
+                "PLANNING_CONTINUATION_INVALID",
+                "the persisted planning attempt has the wrong Campaign identity",
+            )
+        if attempt.expected_previous_revision_digest != expected:
+            raise ProductionCompositionError(
+                "PLANNING_CONTINUATION_INVALID",
+                "the persisted planning attempt has the wrong predecessor identity",
+            )
+        if attempt.compilation_record_artifact_digest is not None:
+            return None
+        if attempt.revision is not None:
+            raise ProductionCompositionError(
+                "PLANNING_CONTINUATION_INVALID",
+                "the pending planning attempt already has a Plan Revision",
+            )
+        if (
+            type(attempt.ready_refs) is not tuple
+            or type(attempt.snapshot_bytes) is not bytes
+            or type(attempt.subject) is not CampaignPlanningSubject
+            or attempt.subject.repository != handle.repository
+            or attempt.subject.campaign_key != handle.campaign_key
+            or attempt.subject.campaign_handle != _handle_ref(handle)
+            or attempt.subject.expected_previous_plan_revision_digest != expected
+            or attempt.subject.snapshot_artifact_digest
+            != attempt.snapshot_artifact_digest
+            or attempt.subject.planning_request_artifact_digest
+            != attempt.planning_request_artifact_digest
+            or type(attempt.subject.stable_action_id) is not str
+            or not attempt.subject.stable_action_id
+        ):
+            raise ProductionCompositionError(
+                "PLANNING_CONTINUATION_INVALID",
+                "the persisted planning attempt has a changed subject identity",
+            )
+        expected_action = "planning:" + digest_value(
+            {
+                "handle": handle.__dict__,
+                "snapshot_digest": attempt.snapshot_artifact_digest,
+                "policy_witness_digest": attempt.policy_witness_digest,
+                "expected_previous_revision_digest": expected,
+            }
+        )
+        if attempt.planning_protocol_id == PLANNING_OUTPUT_PROTOCOL_ID:
+            action_valid = attempt.subject.stable_action_id == expected_action
+        elif attempt.planning_protocol_id == REPLANNING_OUTPUT_PROTOCOL_ID:
+            action_valid = attempt.subject.stable_action_id.startswith("replan:")
+        else:
+            action_valid = False
+        if not action_valid:
+            raise ProductionCompositionError(
+                "PLANNING_CONTINUATION_INVALID",
+                "the persisted planning attempt has a changed stable action",
+            )
+        try:
+            if digest_bytes(attempt.snapshot_bytes) != attempt.snapshot_artifact_digest:
+                raise ValueError("snapshot digest")
+            snapshot = load_canonical_json(attempt.snapshot_bytes)
+            if type(snapshot) is not dict:
+                raise ValueError("snapshot")
+            if self._artifacts.read_bytes(attempt.snapshot_artifact_digest) != attempt.snapshot_bytes:
+                raise ValueError("snapshot artifact")
+            policy_key = (
+                "policy"
+                if attempt.planning_protocol_id == PLANNING_OUTPUT_PROTOCOL_ID
+                else "policy_witness"
+            )
+            policy = snapshot.get(policy_key)
+            if type(policy) is not dict:
+                raise ValueError("policy witness")
+            witness = {key: value for key, value in policy.items() if key != "digest"}
+            if digest_value(witness) != attempt.policy_witness_digest:
+                raise ValueError("policy witness digest")
+            if load_canonical_json(
+                self._artifacts.read_bytes(attempt.policy_witness_digest)
+            ) != witness:
+                raise ValueError("policy witness artifact")
+            request = load_canonical_json(
+                self._artifacts.read_bytes(attempt.planning_request_artifact_digest)
+            )
+            prompt_builder = (
+                planning_prompt
+                if attempt.planning_protocol_id == PLANNING_OUTPUT_PROTOCOL_ID
+                else replanning_prompt
+            )
+            expected_request = prompt_builder(
+                subject_digest=attempt.subject.prompt_binding_digest,
+                authority_digest=attempt.policy_witness_digest,
+                snapshot_artifact_digest=attempt.snapshot_artifact_digest,
+                policy_witness_artifact_digest=attempt.policy_witness_digest,
+            )
+            if request != expected_request:
+                raise ValueError("planning request artifact")
+            tickets = snapshot.get("tickets")
+            if type(tickets) is not list:
+                raise ValueError("tickets")
+            source_refs = tuple(
+                sorted(ticket["source"]["ref"] for ticket in tickets)
+            )
+            if attempt.ready_refs != source_refs:
+                raise ValueError("ready-ref snapshot binding")
+        except (
+            AttributeError,
+            KeyError,
+            IndexError,
+            RuntimeGatewayError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise ProductionCompositionError(
+                "PLANNING_CONTINUATION_INVALID",
+                "the persisted planning attempt artifacts do not read back exactly",
+            ) from error
+        return attempt
+
+    def read_planning_continuation(
+        self,
+        handle: CampaignHandle,
+    ) -> PlanningContinuation | None:
+        from .production_host import PlanningContinuation
+
+        attempt = self._read_planning_attempt(handle)
+        if attempt is None:
+            return None
+        return PlanningContinuation(
+            campaign=handle,
+            ready_refs=attempt.ready_refs,
+            expected_previous_revision_digest=(
+                attempt.expected_previous_revision_digest
+            ),
+            snapshot_artifact_digest=attempt.snapshot_artifact_digest,
+            planning_request_artifact_digest=(
+                attempt.planning_request_artifact_digest
+            ),
+            stable_action_id=attempt.subject.stable_action_id,
+            compilation_record_artifact_digest=(
+                attempt.compilation_record_artifact_digest
+            ),
+        )
+
+    def continue_start(
+        self,
+        handle: CampaignHandle,
+        ready_refs: Sequence[str],
+    ) -> CampaignHandle:
+        continuation = self.read_planning_continuation(handle)
+        refs = tuple(ready_refs)
+        if continuation is None or refs != continuation.ready_refs:
+            raise ProductionCompositionError(
+                "PLANNING_CONTINUATION_MISMATCH",
+                "a wake must resume the exact persisted ready-ref tuple",
+            )
+        return self._existing_control(handle).start(
+            handle.repository,
+            refs,
+            campaign_key=handle.campaign_key,
+        )
+
+    def read_active_or_none(
+        self,
+        handle: CampaignHandle,
+    ) -> ActivePlanReadback | None:
+        if self.read_planning_continuation(handle) is not None:
+            return None
+        return self.read_active(handle)
 
     def classify_plan_invalidations(
         self,

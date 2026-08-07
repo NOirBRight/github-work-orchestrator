@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import json
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,10 @@ from gwo_v8.candidate_gate import (
     ReviewSubject,
 )
 from gwo_v8.execution_kernel import (
+    CampaignOutcome,
+    Diagnostics,
+    ExecutionKernel,
+    ExecutionKernelConfiguration,
     ResultIntegrityProof,
     StaleBindingObservation,
     StaleDiagnosisObservation,
@@ -55,6 +60,11 @@ from gwo_v8.runtime_gateway import (
     WorkRunSubject,
 )
 from gwo_v8.runtime_profile import RuntimeProfile
+from gwo_v8.production_host import (
+    PlanningContinuation,
+    ProductionGwoHost,
+    ProductionHostConfiguration,
+)
 from v8_successor_test_support import _StaticPlanReader, _minimal_active_campaign
 
 
@@ -999,3 +1009,222 @@ def make_production_effects(
         batch_requests=support.batch_requests,
         batch_integrator=support.batch,
     )
+
+
+@dataclass(frozen=True)
+class PlanningWriterGenerationReader:
+    generation: str = "v6.1"
+
+    def read(self) -> str:
+        return self.generation
+
+
+@dataclass
+class DelayedPlanningStartHost:
+    root: Path
+
+    def __post_init__(self) -> None:
+        self._continuations: dict[CampaignHandle, PlanningContinuation] = {}
+        self._active: dict[CampaignHandle, ActivePlanReadback] = {}
+        self._planning_action_ids: list[str] = []
+        self._planning_passes = 0
+        self._planning_store = self.root / "planning-continuation.json"
+        self._planning_gateway_calls = 0
+
+    def start(
+        self,
+        repository: str,
+        ready_refs: tuple[str, ...],
+        options: object = None,
+    ) -> CampaignHandle:
+        handle = CampaignHandle(repository, "campaign:successor-kernel")
+        continuation = PlanningContinuation(
+            campaign=handle,
+            ready_refs=tuple(ready_refs),
+            expected_previous_revision_digest=None,
+            snapshot_artifact_digest="1" * 64,
+            planning_request_artifact_digest="2" * 64,
+            stable_action_id="planning:campaign:planning",
+            compilation_record_artifact_digest=None,
+        )
+        self._continuations[handle] = continuation
+        self._planning_store.write_text(
+            json.dumps(
+                {
+                    "campaign": {
+                        "repository": handle.repository,
+                        "campaign_key": handle.campaign_key,
+                    },
+                    "ready_refs": list(continuation.ready_refs),
+                    "stable_action_id": continuation.stable_action_id,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return handle
+
+    def read_planning_continuation(
+        self,
+        handle: CampaignHandle,
+    ) -> PlanningContinuation | None:
+        return self._continuations.get(handle)
+
+    def read_active_or_none(
+        self,
+        handle: CampaignHandle,
+    ) -> ActivePlanReadback | None:
+        return self._active.get(handle)
+
+    def read_active(self, handle: CampaignHandle) -> ActivePlanReadback:
+        active = self._active.get(handle)
+        if active is None:
+            raise AssertionError("active Plan was read before planning continuation")
+        return active
+
+    def continue_start(
+        self,
+        handle: CampaignHandle,
+        ready_refs: tuple[str, ...],
+    ) -> CampaignHandle:
+        continuation = self._continuations[handle]
+        if tuple(ready_refs) != continuation.ready_refs:
+            raise AssertionError("planning wake changed ready refs")
+        self._planning_gateway_calls += 1
+        self._planning_passes += 1
+        self._planning_action_ids.append(continuation.stable_action_id)
+        active, _old_handle = _minimal_active_campaign(continuation.ready_refs)
+        plan = json.loads(active.plan_spec_bytes)
+        plan["campaign"]["key"] = handle.campaign_key
+        from gwo_v8._canonical import canonical_bytes, digest_bytes
+
+        plan_bytes = canonical_bytes(plan)
+        revision_digest = digest_bytes(plan_bytes)
+        active = replace(
+            active,
+            current_revision_digest=revision_digest,
+            plan_spec_bytes=plan_bytes,
+            activation_receipt=replace(
+                active.activation_receipt,
+                revision_digest=revision_digest,
+                ready_refs=continuation.ready_refs,
+                ticket_keys=continuation.ready_refs,
+            ),
+            claim_proofs=tuple(
+                replace(proof, plan_revision_digest=revision_digest)
+                for proof in active.claim_proofs
+            ),
+        )
+        self._active[handle] = active
+        self._continuations.pop(handle)
+        return handle
+
+    def install_execution_kernel(
+        self,
+        *,
+        store_path: Path,
+        effects: WorkRunEffects,
+        configuration: ExecutionKernelConfiguration | None,
+    ) -> ExecutionKernel:
+        return ExecutionKernel(
+            store_path=store_path,
+            plan_control=self,
+            effects=effects,
+            configuration=configuration,
+        )
+
+    def planning_gateway_calls(self) -> int:
+        return self._planning_gateway_calls
+
+    def planning_action_ids(self) -> list[str]:
+        return list(self._planning_action_ids)
+
+    def planning_pass_count(self) -> int:
+        return self._planning_passes
+
+
+@dataclass
+class PlanningWatchdog:
+    def run_once(self, now: str) -> tuple[CampaignOutcome, ...]:
+        return ()
+
+
+@dataclass
+class PlanningHostFixture:
+    root: Path
+    start_host: DelayedPlanningStartHost
+    host: ProductionGwoHost
+    arguments: dict[str, object]
+
+    def start(self, repository: str, ready_refs: tuple[str, ...]) -> CampaignHandle:
+        return self.host.start(repository, ready_refs)
+
+    def advance(
+        self,
+        handle: CampaignHandle,
+        wake_ref: str | None = None,
+    ) -> CampaignOutcome:
+        return self.host.advance(handle, wake_ref)
+
+    def inspect(self, handle: CampaignHandle) -> Diagnostics:
+        return self.host.inspect(handle)
+
+    def planning_gateway_calls(self) -> int:
+        return self.start_host.planning_gateway_calls()
+
+    def planning_action_ids(self) -> list[str]:
+        return self.start_host.planning_action_ids()
+
+    def planning_pass_count(self) -> int:
+        return self.start_host.planning_pass_count()
+
+    def store_bytes(self) -> bytes:
+        return Path(self.arguments["store_path"]).read_bytes()
+
+    def install_arguments(self) -> dict[str, object]:
+        return dict(self.arguments)
+
+    def reinstall(self, root: Path) -> "PlanningHostFixture":
+        start_host = self.start_host
+        arguments = dict(self.arguments)
+        arguments["start_host"] = start_host
+        host = ProductionGwoHost.install(**arguments)
+        return PlanningHostFixture(root, start_host, host, arguments)
+
+
+def make_pending_planning_host(root: Path) -> PlanningHostFixture:
+    target = root / "isolated-target"
+    target.mkdir(parents=True, exist_ok=True)
+    start_host = DelayedPlanningStartHost(root)
+    store_path = root / "execution-kernel.sqlite3"
+    effects = NoopRunningEffects()
+    configuration = ProductionHostConfiguration(
+        preview_mode="beta2_isolated_preview",
+        target_isolation_root=root,
+        writer_activation_enabled=False,
+    )
+    arguments: dict[str, object] = {
+        "start_host": start_host,
+        "store_path": store_path,
+        "effects": effects,
+        "configuration": None,
+        "host_configuration": configuration,
+        "target_path": target,
+        "watchdog_store_path": root / "watchdog.sqlite3",
+        "watchdog": PlanningWatchdog(),
+        "writer_generation_reader": PlanningWriterGenerationReader(),
+    }
+    host = ProductionGwoHost.install(**arguments)
+    return PlanningHostFixture(root, start_host, host, arguments)
+
+
+@pytest.fixture
+def planning_host(tmp_path: Path) -> PlanningHostFixture:
+    return make_pending_planning_host(tmp_path)
+
+
+def reinstall_production_host(
+    root: Path,
+    planning_host: PlanningHostFixture,
+) -> PlanningHostFixture:
+    return planning_host.reinstall(root)
