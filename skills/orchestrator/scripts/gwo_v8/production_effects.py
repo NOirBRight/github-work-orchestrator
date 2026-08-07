@@ -475,11 +475,11 @@ class ProductionWorkRunEffects:
 
     @staticmethod
     def _runtime_binding_id(runtime: RuntimeProgressReceipt) -> str:
-        binding_id = getattr(runtime, "runtime_binding_id", None)
+        binding_id = runtime.stable_action_id
         if type(binding_id) is not str or not binding_id:
             raise ProductionCompositionError(
                 "PRODUCTION_RUNTIME_RECEIPT_INVALID",
-                "trusted Runtime readback omitted runtime_binding_id",
+                "trusted Runtime readback omitted its stable action identity",
             )
         return binding_id
 
@@ -748,13 +748,20 @@ class ProductionWorkRunEffects:
             or candidate.plan_revision_digest != action.plan_revision_digest
             or candidate.ticket_key != action.ticket_key
             or candidate.work_run_key != action.work_run_key
+            or candidate.runtime_subject_digest != action.work_subject_digest
             or accepted.repository != action.repository
             or accepted.campaign_key != action.campaign_key
             or accepted.plan_revision_digest != action.plan_revision_digest
             or accepted.ticket_key != action.ticket_key
-            or accepted.work_run_key != candidate.work_run_key
+            or accepted.work_run_key != action.work_run_key
+            or accepted.base_sha != candidate.base_commit_oid
+            or accepted.base_tree_oid != candidate.base_tree_oid
+            or accepted.candidate_sha != candidate.candidate_commit_oid
+            or accepted.candidate_tree_oid != candidate.candidate_tree_oid
             or accepted.candidate_receipt_digest != candidate.digest
+            or accepted.diff_schema_version != candidate.diff_schema_version
             or accepted.diff_record_digest != candidate.diff_record_digest
+            or accepted.authority_subtree_digest != candidate.authority_subtree_digest
         ):
             raise ProductionCompositionError(
                 "CANDIDATE_GATE_READBACK_INVALID",
@@ -921,6 +928,17 @@ class ProductionWorkRunEffects:
                 raise ProductionCompositionError(
                     "EFFECT_READBACK_INVALID",
                     "effect observation phase is outside its action mapping",
+                )
+            if observation.phase == "quiescent":
+                if type(observation.plan_invalidation) is not PlanInvalidationObservation:
+                    raise ProductionCompositionError(
+                        "EFFECT_READBACK_INVALID",
+                        "quiescent effect observation omitted its Plan Invalidation",
+                    )
+                ProductionWorkRunEffects._validate_plan_invalidation(
+                    action,
+                    observation.plan_invalidation,
+                    observation_binding,
                 )
             if observation.phase == "completed":
                 proof = observation.result_integrity

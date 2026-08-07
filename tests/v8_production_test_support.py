@@ -762,7 +762,6 @@ class ProductionEffectsSupport:
             receipt_digest="3" * 64,
             output_artifact_digest="4" * 64,
         )
-        object.__setattr__(receipt, "runtime_binding_id", "binding:test")
         return receipt
 
     def accepted_candidate_result(self, action: WorkRunAction) -> CandidateGateResult:
@@ -876,7 +875,7 @@ class ProductionEffectsSupport:
             plan_revision_digest=action.plan_revision_digest,
             ticket_key=action.ticket_key,
             work_run_key=action.work_run_key or f"work-run:{action.ticket_key}",
-            runtime_binding_id="binding:test",
+            runtime_binding_id=action.stable_action_id,
             authority_subtree_digest="2" * 64,
             reporter_role="worker",
             evidence_digest=evidence.digest,

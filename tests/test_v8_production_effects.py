@@ -51,6 +51,7 @@ def test_runtime_completion_enters_candidate_gate_not_completed_result(
     observation = effects.execute(action)
 
     assert observation.phase == "accepted_awaiting_delivery"
+    assert observation.runtime_binding_id == action.stable_action_id
     assert (
         observation.accepted_candidate_receipt_digest
         == support.candidate.result.accepted_candidate_receipt.digest
@@ -60,6 +61,52 @@ def test_runtime_completion_enters_candidate_gate_not_completed_result(
     assert support.runtime.calls == [("progress", action.stable_action_id)]
     assert support.candidate.calls == [(action.stable_action_id, "gate_candidate")]
     assert support.batch.prepare_calls == 0
+
+
+def test_candidate_commit_mismatch_is_rejected_before_batch_side_effects(
+    tmp_path,
+    action,
+    support,
+):
+    support.runtime.receipt = support.runtime_completed_receipt(action)
+    result = support.accepted_candidate_result(action)
+    assert result.accepted_candidate_receipt is not None
+    support.candidate.result = replace(
+        result,
+        accepted_candidate_receipt=replace(
+            result.accepted_candidate_receipt,
+            candidate_sha="6" * 40,
+        ),
+    )
+    effects = make_production_effects(tmp_path, support)
+
+    from gwo_v8.production_effects import ProductionCompositionError
+
+    with pytest.raises(ProductionCompositionError) as raised:
+        effects.execute(action)
+
+    assert raised.value.code == "CANDIDATE_GATE_READBACK_INVALID"
+    assert support.batch.prepare_calls == 0
+    assert support.batch.execute_calls == 0
+
+
+def test_quiescent_semantic_observation_requires_plan_invalidation(
+    action,
+):
+    from gwo_v8.execution_kernel import WorkRunObservation
+    from gwo_v8.production_effects import ProductionCompositionError, ProductionWorkRunEffects
+
+    observation = WorkRunObservation(
+        phase="quiescent",
+        stable_action_id=action.stable_action_id,
+        runtime_binding_id=action.stable_action_id,
+        receipt_digest="1" * 64,
+    )
+
+    with pytest.raises(ProductionCompositionError) as raised:
+        ProductionWorkRunEffects._validate_effect_observation(action, observation)
+
+    assert raised.value.code == "EFFECT_READBACK_INVALID"
 
 
 def test_batch_delivery_maps_only_exact_complete_receipt_to_completed(
