@@ -58,6 +58,41 @@ def test_inspect_does_not_write_or_migrate_campaign_state(
     assert after == before
 
 
+def test_inspect_projects_missing_historical_diagnostic_fields_without_writing(
+    tmp_path,
+    handle,
+    active_plan,
+    make_kernel,
+):
+    kernel = make_kernel(tmp_path / "kernel.sqlite3", active_plan)
+    kernel.advance(handle)
+    readback = kernel._read_state(handle)
+    historical = dict(readback.state)
+    historical.pop("effects")
+    run = historical["runs"][next(iter(historical["runs"]))]
+    for field in (
+        "phase",
+        "slot_held",
+        "work_subject_digest",
+        "work_run_key",
+        "exclusive_resources",
+        "claim_state",
+        "candidate_identity",
+        "result_digest",
+        "evidence_digests",
+    ):
+        run.pop(field, None)
+    kernel._save(handle, historical, expected_version=readback.version)
+
+    before = (tmp_path / "kernel.sqlite3").read_bytes()
+    diagnostics = kernel.inspect(handle)
+    after = (tmp_path / "kernel.sqlite3").read_bytes()
+
+    assert diagnostics.campaign == handle
+    assert diagnostics.work_runs
+    assert after == before
+
+
 def test_raw_wake_cas_does_not_advance_trusted_progress_or_reset_staleness(
     tmp_path,
     handle,

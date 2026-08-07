@@ -3079,10 +3079,13 @@ class ExecutionKernel:
                 "EXECUTION_STORE_INVALID",
                 "ExecutionKernel run state is not a mapping",
             )
+        projected.setdefault("effects", {})
         for ticket_key, run in runs.items():
             work_item = work.get(ticket_key)
             if type(run) is not dict or work_item is None:
                 continue
+            run.setdefault("phase", "pending")
+            run.setdefault("slot_held", False)
             subject_digest = _work_subject_digest_for_kernel(plan, work_item)
             run.setdefault("work_subject_digest", subject_digest)
             run.setdefault(
