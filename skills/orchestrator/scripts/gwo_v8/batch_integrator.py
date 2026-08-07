@@ -647,6 +647,26 @@ class TargetDeltaReadback:
         return body
 
 
+def _validate_hosted_receipt_identity(
+    receipt: object,
+    action: BatchDeliveryAction,
+    suite: HostedSuiteDefinition,
+) -> None:
+    if (
+        not hasattr(receipt, "stable_action_id")
+        or not hasattr(receipt, "batch_sha")
+        or not hasattr(receipt, "suite_id")
+        or not hasattr(receipt, "provider_check_id")
+        or receipt.stable_action_id != action.stable_action_id
+        or receipt.batch_sha != action.batch_sha
+        or receipt.suite_id != suite.suite_id
+        or receipt.provider_check_id != "check:1"
+    ):
+        raise DeliveryIdentityMismatch(
+            "hosted receipt did not match action, Batch SHA, suite, and provider check"
+        )
+
+
 def form_batch_members(
     candidates: tuple[AcceptedCandidateReceipt, ...],
     target: BatchTarget,
@@ -1125,6 +1145,123 @@ class BatchIntegrator:
             version=record.version + 1,
         )
 
+    def _read_or_persist_hosted_result(
+        self,
+        action: BatchDeliveryAction,
+        request: BatchDeliveryRequest,
+        suite: HostedSuiteDefinition,
+    ):
+        from ._batch_integrator_store import HostedResultReceipt
+
+        persisted = self.journal.read_terminal_hosted_result(
+            action.stable_action_id,
+            action.batch_sha,
+            suite.suite_id,
+        )
+        if persisted is not None:
+            _validate_hosted_receipt_identity(persisted, action, suite)
+            return persisted
+
+        observed = self.hosted.read_hosted_result(
+            request.repository,
+            action.batch_sha,
+            suite,
+        )
+        if observed.outcome == "pending":
+            return None
+        if (
+            observed.repository != request.repository
+            or observed.batch_sha != action.batch_sha
+            or observed.suite_id != suite.suite_id
+            or observed.provider_check_id != "check:1"
+        ):
+            raise DeliveryIdentityMismatch(
+                "provider observation did not match repository, Batch SHA, suite, and check"
+            )
+        receipt = HostedResultReceipt.create(
+            stable_action_id=action.stable_action_id,
+            batch_sha=action.batch_sha,
+            suite_id=observed.suite_id,
+            provider_check_id=observed.provider_check_id,
+            outcome=observed.outcome,
+            observation_digest=observed.observation_digest,
+            source_ref=observed.source_ref,
+        )
+        if receipt.outcome == "infrastructure_failure":
+            return receipt
+        return self.journal.persist_hosted_result(receipt)
+
+    def _advance_hosted_result(
+        self,
+        record: object,
+        action: BatchDeliveryAction,
+        request: BatchDeliveryRequest,
+        state: dict[str, object],
+    ) -> object:
+        suite = request.hosted_suites[0]
+        receipt = self._read_or_persist_hosted_result(action, request, suite)
+        if receipt is None:
+            return self._next_record(
+                record,
+                phase="wait",
+                reason="HostedResultPending",
+                state=state,
+            )
+
+        _validate_hosted_receipt_identity(receipt, action, suite)
+        state["hosted_receipt"] = {
+            **receipt.body(),
+            "receipt_digest": receipt.receipt_digest,
+        }
+        if receipt.outcome == "infrastructure_failure":
+            target = self.git.read_target(request.target)
+            if target != request.target:
+                raise DeliveryIdentityMismatch(
+                    "target facts changed before unchanged-SHA infrastructure retry"
+                )
+            state["next_check"] = {
+                "stable_action_id": action.stable_action_id,
+                "batch_sha": action.batch_sha,
+                "suite_id": suite.suite_id,
+                "provider_check_id": receipt.provider_check_id,
+            }
+            if record.retry_count >= self.configuration.infrastructure_retry_limit:
+                return self._next_record(
+                    record,
+                    phase="blocked",
+                    reason="InfrastructureRetryLimitExceeded",
+                    state=state,
+                )
+            self.hosted.retry_hosted(
+                request.repository,
+                action.batch_sha,
+                receipt.provider_check_id,
+            )
+            return replace(
+                self._next_record(
+                    record,
+                    phase="wait",
+                    reason="InfrastructureRetryScheduled",
+                    state=state,
+                ),
+                retry_count=record.retry_count + 1,
+            )
+
+        if receipt.outcome == "code_failure":
+            return self._classify_failure(
+                record,
+                action,
+                request,
+                receipt.outcome,
+                state,
+            )
+        return self._next_record(
+            record,
+            phase="hosted",
+            reason="hosted_receipt_verified",
+            state=state,
+        )
+
     def _advance_one_delivery_step(
         self,
         record: object,
@@ -1135,6 +1272,26 @@ class BatchIntegrator:
         from ._batch_integrator_store import HostedResultReceipt
 
         state = self._decode_state(record)
+        if record.phase == "wait" and isinstance(state.get("next_check"), dict):
+            next_check = state["next_check"]
+            expected_check = {
+                "stable_action_id": action.stable_action_id,
+                "batch_sha": action.batch_sha,
+                "suite_id": request.hosted_suites[0].suite_id,
+                "provider_check_id": "check:1",
+            }
+            if next_check != expected_check:
+                raise DeliveryIdentityMismatch(
+                    "next hosted check identity changed before retry"
+                )
+            state.pop("next_check", None)
+            state.pop("hosted_receipt", None)
+            return self._next_record(
+                record,
+                phase="published",
+                reason="InfrastructureRetryReady",
+                state=state,
+            )
         if record.phase == "prepared":
             local_receipt = self.local.run(action.batch_sha, request.local_suite)
             if (
@@ -1199,43 +1356,7 @@ class BatchIntegrator:
                 )
             state["pull_request"] = asdict(pull_request)
 
-            suite = request.hosted_suites[0]
-            hosted_result = self.hosted.read_hosted_result(
-                request.repository, action.batch_sha, suite
-            )
-            if not isinstance(hosted_result, HostedResultObservation) or (
-                hosted_result.repository != request.repository
-                or hosted_result.batch_sha != action.batch_sha
-                or hosted_result.suite_id != suite.suite_id
-                or hosted_result.provider_check_id != "check:1"
-            ):
-                raise DeliveryIdentityMismatch(
-                    "hosted readback did not match suite identity"
-                )
-            if hosted_result.outcome != "passed":
-                raise BatchIntegratorError(
-                    "BATCH_HOSTED_CHECK_FAILED",
-                    "exact hosted check did not pass",
-                )
-            hosted_receipt = self.journal.persist_hosted_result(
-                HostedResultReceipt.create(
-                    stable_action_id=action.stable_action_id,
-                    batch_sha=hosted_result.batch_sha,
-                    suite_id=hosted_result.suite_id,
-                    provider_check_id=hosted_result.provider_check_id,
-                    outcome=hosted_result.outcome,
-                    observation_digest=hosted_result.observation_digest,
-                    source_ref=hosted_result.source_ref,
-                )
-            )
-            state["hosted_result"] = asdict(hosted_result)
-            state["hosted_receipt"] = asdict(hosted_receipt)
-            return self._next_record(
-                record,
-                phase="hosted",
-                reason="hosted check passed",
-                state=state,
-            )
+            return self._advance_hosted_result(record, action, request, state)
 
         if record.phase == "hosted":
             publication = self._publication_from_state(state)

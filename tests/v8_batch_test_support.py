@@ -25,6 +25,7 @@ from gwo_v8._batch_integrator_drivers import (
 from gwo_v8.batch_integrator import (
     AncestorReadback,
     BatchDeliveryAction,
+    BatchDeliveryObservation,
     BatchDeliveryRequest,
     BatchIntegrator,
     BatchIntegratorConfiguration,
@@ -416,6 +417,11 @@ class RecordingGitBatchDriver:
         self.compose_calls = 0
         self.clean_base_advance_calls: list[str] = []
         self.recomputed_patch_digest: str | None = None
+        self.created_batch_member_sets: list[tuple[str, ...]] = []
+        self.preserved_evidence_digests: list[tuple[str, ...]] = []
+        self.singleton_member_candidate_shas: list[str] = []
+        self.singleton_member_evidence_digests: list[tuple[str, ...]] = []
+        self.resume_directives: list[tuple[str, str]] = []
         self.tree_paths: dict[str, set[str]] = {}
 
     def read_target(self, target: BatchTarget) -> BatchTarget:
@@ -459,6 +465,16 @@ class RecordingGitBatchDriver:
         target: BatchTarget,
         members: tuple[AcceptedCandidateReceipt, ...],
     ) -> str:
+        self.created_batch_member_sets.append(
+            tuple(member.ticket_key for member in members)
+        )
+        if len(members) > 1:
+            self.preserved_evidence_digests.extend(
+                member.evidence_digests for member in members
+            )
+        if len(members) == 1:
+            self.singleton_member_candidate_shas.append(members[0].candidate_sha)
+            self.singleton_member_evidence_digests.append(members[0].evidence_digests)
         for member in members:
             if (
                 member.base_sha != target.target_head_sha
@@ -752,6 +768,26 @@ class RecordingDriverSet:
     def target_mutations(self) -> list[str]:
         return self.hosted.target_mutations  # type: ignore[attr-defined]
 
+    @property
+    def created_batch_member_sets(self) -> list[tuple[str, ...]]:
+        return self.git.created_batch_member_sets  # type: ignore[attr-defined]
+
+    @property
+    def preserved_evidence_digests(self) -> list[tuple[str, ...]]:
+        return self.git.preserved_evidence_digests  # type: ignore[attr-defined]
+
+    @property
+    def singleton_member_candidate_shas(self) -> list[str]:
+        return self.git.singleton_member_candidate_shas  # type: ignore[attr-defined]
+
+    @property
+    def singleton_member_evidence_digests(self) -> list[tuple[str, ...]]:
+        return self.git.singleton_member_evidence_digests  # type: ignore[attr-defined]
+
+    @property
+    def resume_directives(self) -> list[tuple[str, str]]:
+        return self.git.resume_directives  # type: ignore[attr-defined]
+
 
 def make_integrator(
     repository: Path,
@@ -834,3 +870,54 @@ def make_composition_integrator(
         configuration=BatchIntegratorConfiguration(),
     )
     return integrator, CompositionDriverSet(git=git, local=local)
+
+
+class BatchRecoveryHarness:
+    """Small deterministic owner harness for the #117 recovery contract."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+        self.integrator: BatchIntegrator | None = None
+        self.drivers: RecordingDriverSet | None = None
+        self.action: BatchDeliveryAction | None = None
+
+    @property
+    def retry_shas(self) -> tuple[str, ...]:
+        if self.drivers is None:
+            return ()
+        return tuple(self.drivers.hosted.retry_shas)  # type: ignore[attr-defined]
+
+    def run_outcomes(
+        self, *outcomes: str
+    ) -> tuple[BatchDeliveryObservation, ...]:
+        integrator, drivers = make_integrator(
+            self.root,
+            hosted_outcomes=tuple(outcomes),  # type: ignore[arg-type]
+        )
+        action = integrator.prepare(
+            make_batch_request(accepted_candidates=make_three_standard_receipts())
+        )
+        observations = tuple(integrator.execute(action) for _ in outcomes)
+        self.integrator = integrator
+        self.drivers = drivers
+        self.action = action
+        return observations
+
+    def run_successful_singleton_fallback(self) -> BatchDeliveryObservation:
+        integrator, drivers = make_integrator(
+            self.root,
+            hosted_outcomes=(
+                "code_failure",
+                "passed",
+                "passed",
+                "passed",
+            ),
+        )
+        action = integrator.prepare(
+            make_batch_request(accepted_candidates=make_three_standard_receipts())
+        )
+        observations = tuple(integrator.execute(action) for _ in range(4))
+        self.integrator = integrator
+        self.drivers = drivers
+        self.action = action
+        return observations[-1]

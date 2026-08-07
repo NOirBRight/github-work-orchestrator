@@ -13,6 +13,7 @@ from ._canonical import digest_value
 from .batch_integrator import (
     BatchDeliveryAction,
     BatchIntegratorError,
+    DeliveryAttributionAmbiguous,
     DeliveryIdentityMismatch,
 )
 
@@ -166,6 +167,13 @@ class BatchDeliveryJournal(Protocol):
         batch_sha: str,
         suite_id: str,
         provider_check_id: str,
+    ) -> HostedResultReceipt | None: ...
+
+    def read_terminal_hosted_result(
+        self,
+        stable_action_id: str,
+        batch_sha: str,
+        suite_id: str,
     ) -> HostedResultReceipt | None: ...
 
     def persist_hosted_result(
@@ -553,6 +561,35 @@ class SqliteBatchDeliveryJournal:
         if row is None:
             return None
         receipt = HostedResultReceipt(**dict(row))
+        self._validate_hosted_receipt_digest(receipt)
+        return receipt
+
+    def read_terminal_hosted_result(
+        self,
+        stable_action_id: str,
+        batch_sha: str,
+        suite_id: str,
+    ) -> HostedResultReceipt | None:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                  FROM v8_batch_hosted_receipts
+                 WHERE stable_action_id=?
+                   AND batch_sha=?
+                   AND suite_id=?
+                   AND outcome IN ('passed', 'code_failure')
+                 ORDER BY provider_check_id
+                """,
+                (stable_action_id, batch_sha, suite_id),
+            ).fetchall()
+        if len(rows) > 1:
+            raise DeliveryAttributionAmbiguous(
+                "multiple terminal hosted receipts matched one action, Batch SHA, and suite"
+            )
+        if not rows:
+            return None
+        receipt = HostedResultReceipt(**dict(rows[0]))
         self._validate_hosted_receipt_digest(receipt)
         return receipt
 
