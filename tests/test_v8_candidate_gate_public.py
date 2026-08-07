@@ -514,7 +514,9 @@ def test_public_repair_scope_escape_fails_before_repair_verifier(tmp_path):
         CandidateReadback,
         FormalReviewFinding,
         FormalReviewResult,
+        PlanInvalidationEvidence,
         RepairVerificationResult,
+        RepairVerificationEvidence,
         ReviewFindingDisposition,
     )
     from gwo_v8._canonical import digest_value
@@ -598,10 +600,10 @@ def test_public_repair_scope_escape_fails_before_repair_verifier(tmp_path):
         )
 
         def __init__(self):
-            self.calls = 0
+            self.calls = []
 
         def verify(self, request):
-            self.calls += 1
+            self.calls.append(request)
             # Deliberately omit the escape: CandidateGate must derive it from
             # the authoritative repaired Candidate delta, not trust the port.
             return RepairVerificationResult(
@@ -731,16 +733,30 @@ def test_public_repair_scope_escape_fails_before_repair_verifier(tmp_path):
         reason="the bounded repair is ready for verification",
     )
     packet = reviewed.repair_packet.with_ledger(complete_ledger.entries)
-    with pytest.raises(CandidateGateError) as raised:
-        gate.verify_repair(parent, packet, repaired)
+    result = gate.verify_repair(parent, packet, repaired)
+    repair_evidence = next(
+        item for item in result.evidence if type(item) is RepairVerificationEvidence
+    )
+    plan_evidence = next(
+        item for item in result.evidence if type(item) is PlanInvalidationEvidence
+    )
 
-    assert raised.value.code == "CANDIDATE_GATE_REPAIR_SCOPE_INVALID"
+    assert result.status.name == "PLAN_INVALIDATION_REPORTED"
+    assert repair_evidence.scope_escape_paths == (outside_path,)
+    assert plan_evidence.source_kind == "repair_verification"
+    assert plan_evidence.source_evidence_digest == repair_evidence.digest
+    assert result.plan_invalidation_receipt is not None
+    assert result.plan_invalidation_report is not None
+    assert (
+        result.plan_invalidation_receipt.report_digest
+        == result.plan_invalidation_report.digest
+    )
     assert reader.calls == [
         (parent.runtime_subject.repository, "refs/heads/candidate"),
         (parent.runtime_subject.repository, "refs/heads/repaired"),
     ]
-    assert verifier.calls == 0
-    assert reporter.calls == 0
+    assert verifier.calls == []
+    assert reporter.calls == 1
 
 
 def test_public_candidate_invalidation_duplicate_advance_and_restart_does_not_repeat_transitions(

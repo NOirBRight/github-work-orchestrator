@@ -31,7 +31,9 @@ from gwo_v8.candidate_gate import (  # noqa: E402
     DeterministicAuditFailure,
     FormalReviewFinding,
     FormalReviewResult,
+    PlanInvalidationEvidence,
     RepairPacket,
+    RepairVerificationEvidence,
     RepairVerificationResult,
     ReviewFindingDisposition,
     ReviewSubject,
@@ -39,6 +41,7 @@ from gwo_v8.candidate_gate import (  # noqa: E402
 from gwo_v8.runtime_gateway import (  # noqa: E402
     CapabilityPolicy,
     CapabilityPolicyProof,
+    PlanInvalidationReceipt,
     WorkRunPurpose,
     WorkRunSubject,
 )
@@ -49,8 +52,46 @@ OUTSIDE_PATH = "c3JjL291dHNpZGUucHk"
 
 
 class _Reporter:
-    def report_plan_invalidation(self, _subject, _evidence, _report):
-        raise AssertionError("repair verification fixtures do not report invalidation")
+    def __init__(self):
+        self.calls = []
+
+    def report_plan_invalidation(self, subject, evidence, report):
+        self.calls.append((subject, evidence, report))
+        proof = CapabilityPolicyProof(
+            capability_policy=CapabilityPolicy(worker_can_edit_issues=False),
+            authority_record_digest="a" * 64,
+        )
+        observation = {
+            "kind": "plan_invalidation_observation.v1",
+            "repository": report.repository,
+            "campaign_key": report.campaign_key,
+            "plan_revision_digest": report.plan_revision_digest,
+            "ticket_key": report.ticket_key,
+            "work_run_key": report.work_run_key,
+            "runtime_binding_id": report.runtime_binding_id,
+            "authority_subtree_digest": report.authority_subtree_digest,
+            "reporter_role": report.reporter_role,
+            "report_digest": report.digest,
+            "evidence_digest": report.evidence_digest,
+            "dedup_identity": report.dedup_identity,
+            "invalidated_obligation": report.invalidated_obligation,
+            "required_effects": list(report.required_effects),
+            "workspace_identity": report.workspace_identity,
+            "source_evidence_digests": list(evidence.source_evidence_digests),
+        }
+        return PlanInvalidationReceipt(
+            report_digest=report.digest,
+            receipt_digest=digest_value(
+                {
+                    "kind": "plan_invalidation_receipt.v1",
+                    "report_digest": report.digest,
+                    "subject_digest": subject.digest,
+                    "authority_record_digest": proof.authority_record_digest,
+                }
+            ),
+            capability_policy_proof=proof,
+            observation=observation,
+        )
 
 
 class _DiffStore:
@@ -161,7 +202,7 @@ class _Verifier:
     )
 
     def __init__(self):
-        self.requests = []
+        self.calls = self.requests = []
 
     def verify(self, request):
         self.requests.append(request)
@@ -382,11 +423,28 @@ def test_repair_requires_disposition_for_every_prior_finding(unresolved_repair):
 
 
 def test_repair_scope_escape_fails_before_verifier(scope_escape_repair):
-    gate, verifier, parent, packet, candidate = scope_escape_repair
-    with pytest.raises(CandidateGateError) as raised:
-        gate.verify_repair(parent, packet, candidate)
-    assert raised.value.code == "CANDIDATE_GATE_REPAIR_SCOPE_INVALID"
-    assert verifier.requests == []
+    gate, repair_verifier, parent, packet, candidate = scope_escape_repair
+    result = gate.verify_repair(parent, packet, candidate)
+    repair_evidence = next(
+        item
+        for item in result.evidence
+        if type(item) is RepairVerificationEvidence
+    )
+    plan_evidence = next(
+        item for item in result.evidence if type(item) is PlanInvalidationEvidence
+    )
+
+    assert result.status is CandidateGateStatus.PLAN_INVALIDATION_REPORTED
+    assert repair_evidence.scope_escape_paths == (OUTSIDE_PATH,)
+    assert plan_evidence.source_kind == "repair_verification"
+    assert plan_evidence.source_evidence_digest == repair_evidence.digest
+    assert result.plan_invalidation_receipt is not None
+    assert result.plan_invalidation_report is not None
+    assert (
+        result.plan_invalidation_receipt.report_digest
+        == result.plan_invalidation_report.digest
+    )
+    assert repair_verifier.calls == []
 
 
 def test_repair_rejects_duplicate_check_ids_before_verifier():

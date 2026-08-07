@@ -4492,10 +4492,76 @@ class CandidateGate:
             )
         )
         if escaped_paths:
-            raise CandidateGateError(
-                "CANDIDATE_GATE_REPAIR_SCOPE_INVALID",
-                "repaired Candidate changed paths outside Repair Packet scope: "
-                + ",".join(escaped_paths),
+            scope_request = {
+                "kind": "complete-repair-scope-escape.v1",
+                "parent_digest": parent.digest,
+                "repair_packet_digest": packet.digest,
+                "candidate_digest": readback.candidate.digest,
+                "candidate_receipt_digest": repaired_receipt.digest,
+                "candidate_diff_record_digest": repaired_record.digest,
+                "repair_delta_digest": delta.digest,
+                "escaped_paths": list(escaped_paths),
+            }
+            scope_request_digest = digest_value(scope_request)
+            canonical_scope_request = {
+                **scope_request,
+                "request_digest": scope_request_digest,
+            }
+            verification_evidence = RepairVerificationEvidence(
+                parent_digest=parent.digest,
+                candidate_digest=readback.candidate.digest,
+                repair_packet_digest=packet.digest,
+                request_digest=scope_request_digest,
+                accepted=False,
+                scope_escape_paths=escaped_paths,
+                details=(
+                    "repaired Candidate changed paths outside Repair Packet scope",
+                    *(f"escaped_path={path}" for path in escaped_paths),
+                ),
+            )
+            plan_evidence = PlanInvalidationEvidence(
+                runtime_subject=parent.runtime_subject,
+                parent_digest=parent.digest,
+                candidate_digest=readback.candidate.digest,
+                source_kind="repair_verification",
+                source_evidence_digest=verification_evidence.digest,
+                source_evidence_digests=(verification_evidence.digest,),
+                invalidated_obligation=(
+                    "apply the approved Repair Packet without changing paths "
+                    "outside allowed_path_tokens"
+                ),
+                required_effects=_unique_sorted(
+                    [
+                        *packet.required_effects,
+                        *(f"replan_required_path:{path}" for path in escaped_paths),
+                    ]
+                ),
+                workspace_identity=parent.workspace_identity,
+                discovered_facts=tuple(
+                    f"escaped_path={path}" for path in escaped_paths
+                ),
+                reproduction=(
+                    "repair_verification:scope_escape="
+                    f"{scope_request_digest}"
+                ),
+                lineage_artifacts=(
+                    packet.canonical(),
+                    prior_receipt.canonical(),
+                    prior_record.canonical(),
+                    repaired_receipt.canonical(),
+                    repaired_record.canonical(),
+                    delta.canonical(),
+                    canonical_scope_request,
+                    readback.canonical(),
+                    verification_evidence.canonical(),
+                ),
+            )
+            receipt, report = self._report_invalidation(parent, plan_evidence)
+            return CandidateGateResult(
+                status=CandidateGateStatus.PLAN_INVALIDATION_REPORTED,
+                evidence=(verification_evidence, plan_evidence),
+                plan_invalidation_receipt=receipt,
+                plan_invalidation_report=report,
             )
 
         check_runner = self._check_runner
