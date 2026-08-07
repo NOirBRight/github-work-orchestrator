@@ -4487,7 +4487,11 @@ class CandidateGate:
             )
         escaped_paths = tuple(
             sorted(
-                set(repaired_record.changed_path_tokens)
+                {
+                    *delta.added_path_tokens,
+                    *delta.removed_path_tokens,
+                    *delta.changed_path_tokens,
+                }
                 - set(packet.allowed_path_tokens)
             )
         )

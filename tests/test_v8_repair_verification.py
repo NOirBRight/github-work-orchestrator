@@ -245,7 +245,13 @@ def _record(
     )
 
 
-def _make_fixture(*, scope_escape=False, check_runner=None, base_mismatch=False):
+def _make_fixture(
+    *,
+    scope_escape=False,
+    removed_scope_escape=False,
+    check_runner=None,
+    base_mismatch=False,
+):
     runtime_subject = WorkRunSubject(
         repository="owner/repository",
         campaign_key="campaign:one",
@@ -265,10 +271,15 @@ def _make_fixture(*, scope_escape=False, check_runner=None, base_mismatch=False)
         workspace_identity="workspace:one",
     )
     requirement = _Policy().derive(parent, None, ())
+    prior_paths = (
+        (PROTOCOL_PATH, OUTSIDE_PATH)
+        if removed_scope_escape
+        else (PROTOCOL_PATH,)
+    )
     prior_record = _record(
         candidate_commit_oid="a" * 40,
         candidate_tree_oid="b" * 40,
-        path_tokens=(PROTOCOL_PATH,),
+        path_tokens=prior_paths,
     )
     prior_candidate = CandidateIdentity(
         reported_reference="refs/heads/repaired",
@@ -318,12 +329,15 @@ def _make_fixture(*, scope_escape=False, check_runner=None, base_mismatch=False)
         subject_digest=subject.digest,
         findings=(finding,),
     )
+    allowed_path_tokens = (
+        (PROTOCOL_PATH,) if removed_scope_escape else prior_record.changed_path_tokens
+    )
     packet = RepairPacket.from_review(
         parent=parent,
         candidate_receipt=prior_receipt,
         subject=subject,
         result=review_result,
-        allowed_path_tokens=prior_record.changed_path_tokens,
+        allowed_path_tokens=allowed_path_tokens,
         required_check_ids=requirement.required_check_ids,
         repair_instructions=("fix the named finding",),
     )
@@ -444,6 +458,22 @@ def test_repair_scope_escape_fails_before_verifier(scope_escape_repair):
         result.plan_invalidation_receipt.report_digest
         == result.plan_invalidation_report.digest
     )
+    assert repair_verifier.calls == []
+
+
+def test_repair_scope_escape_detects_removed_path_before_verifier():
+    gate, repair_verifier, _reviewer, parent, _packet, packet, candidate = _make_fixture(
+        removed_scope_escape=True
+    )
+    result = gate.verify_repair(parent, packet, candidate)
+
+    repair_evidence = next(
+        item
+        for item in result.evidence
+        if type(item) is RepairVerificationEvidence
+    )
+    assert result.status is CandidateGateStatus.PLAN_INVALIDATION_REPORTED
+    assert repair_evidence.scope_escape_paths == (OUTSIDE_PATH,)
     assert repair_verifier.calls == []
 
 
