@@ -896,7 +896,7 @@ def test_campaign_save_uses_durable_compare_and_swap_across_kernel_instances(tmp
 
     with pytest.raises(ExecutionKernelError) as raised:
         second._save(campaign, loser)
-    assert raised.value.code == "EXECUTION_STORE_CONFLICT"
+    assert raised.value.code == "EXECUTION_STORE_CAS_CONFLICT"
     persisted = first._load(campaign)
     assert persisted is not None
     assert persisted["race_marker"] == "winner"

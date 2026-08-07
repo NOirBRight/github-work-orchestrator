@@ -7015,13 +7015,30 @@ class ExecutionKernel:
         handle: CampaignHandle,
         state: dict[str, Any],
         *,
-        expected_version: int,
+        expected_version: int | None = None,
     ) -> int:
         if type(handle) is not CampaignHandle:
             raise ExecutionKernelError(
                 "CAMPAIGN_HANDLE_INVALID",
                 "Campaign handle must be an exact CampaignHandle",
             )
+        key = (handle.repository, handle.campaign_key)
+        if expected_version is None:
+            # Preserve the pre-CAS private seam for existing local callers,
+            # but never turn it into an unconditional write.  Established
+            # callers have a version from _load/_read_state; a caller with no
+            # readback may only create a previously absent row.
+            if key not in self._campaign_row_versions:
+                readback = self._read_state(handle)
+                if readback is not None:
+                    raise ExecutionKernelError(
+                        "EXECUTION_STORE_CAS_CONFLICT",
+                        "Legacy Campaign save omitted an authoritative version",
+                    )
+                expected_version = 0
+            else:
+                cached_version = self._campaign_row_versions[key]
+                expected_version = 0 if cached_version is None else cached_version
         if (
             type(state) is not dict
             or type(expected_version) is not int
@@ -7034,7 +7051,6 @@ class ExecutionKernel:
             )
         rendered = json.dumps(state, separators=(",", ":"), sort_keys=True)
         state_digest = digest_bytes(rendered.encode("utf-8"))
-        key = (handle.repository, handle.campaign_key)
         next_version: int | None = None
         try:
             with self._connect() as connection:
