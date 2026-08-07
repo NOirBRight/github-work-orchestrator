@@ -52,6 +52,10 @@ class ProductionCompositionError(RuntimeError):
         super().__init__(f"{code}: {detail}")
 
 
+class _ProductionReplayDeferred(RuntimeError):
+    """Stop one fair scan after replaying a durable semantic effect."""
+
+
 class RuntimeGatewayFactory(Protocol):
     def for_campaign(self, handle: CampaignHandle) -> RuntimeGateway: ...
 
@@ -191,6 +195,9 @@ class ProductionWorkRunEffects:
         self._candidate_gate = candidate_gate
         self._batch_requests = batch_requests
         self._batch_integrator = batch_integrator
+        self._public_advance_active = False
+        self._replayed_effect: tuple[str, str] | None = None
+        self._suppress_replay_tracking = False
         self._store_path.parent.mkdir(parents=True, exist_ok=True)
         with _ledger_connection(self._store_path) as connection:
             connection.execute(
@@ -215,6 +222,14 @@ class ProductionWorkRunEffects:
                     "ALTER TABLE v8_production_effect_receipts "
                     "ADD COLUMN accepted_candidate_receipt_json TEXT"
                 )
+
+    def _begin_public_advance(self) -> None:
+        self._public_advance_active = True
+        self._replayed_effect = None
+
+    def _end_public_advance(self) -> None:
+        self._public_advance_active = False
+        self._replayed_effect = None
 
     def bind_batch_delivery_request_digest(self, action: WorkRunAction) -> str:
         """Read the exact parent Batch request identity without delivering it."""
@@ -282,7 +297,19 @@ class ProductionWorkRunEffects:
         if row is None:
             return None
         action_json, observation_json, observation_digest, accepted_json = row
-        if action_json != expected_action_json:
+        try:
+            recorded_action = self._decode_recorded_action(action_json)
+            requested_action = self._decode_recorded_action(expected_action_json)
+        except ProductionCompositionError:
+            raise
+        except Exception as error:
+            raise ProductionCompositionError(
+                "EFFECT_READBACK_INVALID",
+                "effect ledger action identity is not exact",
+            ) from error
+        recorded_action.pop("wake_ref", None)
+        requested_action.pop("wake_ref", None)
+        if recorded_action != requested_action:
             raise ProductionCompositionError(
                 "EFFECT_READBACK_INVALID",
                 "effect ledger action identity changed for the stable action",
@@ -348,6 +375,8 @@ class ProductionWorkRunEffects:
                         "EFFECT_READBACK_INVALID",
                         "Batch observation changed its persisted Candidate identity",
                     )
+            if self._public_advance_active and not self._suppress_replay_tracking:
+                self._replayed_effect = (action.stable_action_id, action.kind)
             return observation
         except ProductionCompositionError:
             raise
@@ -542,6 +571,7 @@ class ProductionWorkRunEffects:
                     candidate_diff_record_digest=accepted.diff_record_digest,
                     result_digest=None,
                     result_integrity=None,
+                    next_check_at=getattr(runtime, "next_check_at", None),
                 ),
                 accepted,
             )
@@ -610,6 +640,11 @@ class ProductionWorkRunEffects:
         )
 
     def _execute_batch(self, action: WorkRunAction) -> WorkRunObservation:
+        if self._replayed_effect is not None and self._replayed_effect[1] in {
+            "semantic_execution",
+            "semantic_resume",
+        }:
+            raise _ProductionReplayDeferred()
         accepted_digest = action.accepted_candidate_receipt_digest
         if not accepted_digest:
             raise ProductionCompositionError(
@@ -640,7 +675,17 @@ class ProductionWorkRunEffects:
             )
         batch_observation = self._batch_integrator.readback(batch_action)
         if batch_observation is None:
-            batch_observation = self._batch_integrator.execute(batch_action)
+            executed_observation = self._batch_integrator.execute(batch_action)
+            batch_observation = self._batch_integrator.readback(batch_action)
+            if (
+                type(executed_observation) is not BatchDeliveryObservation
+                or type(batch_observation) is not BatchDeliveryObservation
+                or batch_observation != executed_observation
+            ):
+                raise ProductionCompositionError(
+                    "BATCH_READBACK_INVALID",
+                    "Batch terminal readback did not exactly match execute",
+                )
         if type(batch_observation) is not BatchDeliveryObservation:
             raise ProductionCompositionError(
                 "BATCH_READBACK_INVALID",
@@ -1216,7 +1261,12 @@ class ProductionWorkRunEffects:
                 "EFFECT_READBACK_INVALID",
                 "effect ledger observation could not be durably recorded",
             ) from error
-        saved = self.readback(action)
+        previous_suppression = self._suppress_replay_tracking
+        self._suppress_replay_tracking = True
+        try:
+            saved = self.readback(action)
+        finally:
+            self._suppress_replay_tracking = previous_suppression
         if saved is None:
             raise ProductionCompositionError(
                 "EFFECT_READBACK_INVALID",
