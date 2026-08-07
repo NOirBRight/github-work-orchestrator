@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -179,6 +180,15 @@ class BatchDeliveryJournal(Protocol):
     def persist_hosted_result(
         self, receipt: HostedResultReceipt
     ) -> HostedResultReceipt: ...
+
+    def persist_member_evidence(
+        self,
+        stable_action_id: str,
+        ticket_key: str,
+        candidate_sha: str,
+        evidence_digests: tuple[str, ...],
+        review_finding_ledger_digest: str,
+    ) -> BatchJournalRecord: ...
 
     def acquire_integration_lease(
         self,
@@ -624,6 +634,45 @@ class SqliteBatchDeliveryJournal:
                 "action was not readable after creation",
             )
         return existing
+
+    def persist_member_evidence(
+        self,
+        stable_action_id: str,
+        ticket_key: str,
+        candidate_sha: str,
+        evidence_digests: tuple[str, ...],
+        review_finding_ledger_digest: str,
+    ) -> BatchJournalRecord:
+        record = self.read_action(stable_action_id)
+        if record is None:
+            raise BatchIntegratorError(
+                "BATCH_ACTION_MISSING",
+                "cannot preserve evidence for a missing Batch action",
+            )
+        try:
+            state = json.loads(record.state_json or "{}")
+        except json.JSONDecodeError as error:
+            raise DeliveryIdentityMismatch(
+                "journal action state is not canonical JSON"
+            ) from error
+        if not isinstance(state, dict):
+            raise DeliveryIdentityMismatch("journal action state is not an object")
+        state.setdefault("member_evidence", {})[ticket_key] = {
+            "candidate_sha": candidate_sha,
+            "evidence_digests": list(evidence_digests),
+            "review_finding_ledger_digest": review_finding_ledger_digest,
+        }
+        next_record = replace(
+            record,
+            state_json=json.dumps(state, sort_keys=True, separators=(",", ":")),
+            version=record.version + 1,
+        )
+        return self.compare_and_swap_action(
+            stable_action_id,
+            expected_version=record.version,
+            expected_phase=record.phase,
+            next_record=next_record,
+        )
 
     def advance_action(
         self, record: BatchJournalRecord, *, phase: str, reason: str

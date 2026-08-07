@@ -667,6 +667,40 @@ def _validate_hosted_receipt_identity(
         )
 
 
+def make_singleton_action(
+    parent_action: BatchDeliveryAction,
+    member: AcceptedCandidateReceipt,
+    child_batch_id: str,
+    child_batch_sha: str,
+) -> BatchDeliveryAction:
+    """Derive the stable delivery identity for one fallback Singleton."""
+
+    child_action_id = digest_value(
+        {
+            "kind": "singleton-action.v1",
+            "parent_action_id": parent_action.stable_action_id,
+            "parent_batch_id": parent_action.batch_id,
+            "ticket_key": member.ticket_key,
+            "candidate_receipt_digest": member.digest,
+        }
+    )
+    child_request_digest = digest_value(
+        {
+            "kind": "singleton-request.v1",
+            "parent_request_digest": parent_action.request_digest,
+            "ticket_key": member.ticket_key,
+            "candidate_receipt_digest": member.digest,
+        }
+    )
+    return BatchDeliveryAction(
+        stable_action_id=child_action_id,
+        request_digest=child_request_digest,
+        batch_id=child_batch_id,
+        batch_sha=child_batch_sha,
+        member_ticket_keys=(member.ticket_key,),
+    )
+
+
 def form_batch_members(
     candidates: tuple[AcceptedCandidateReceipt, ...],
     target: BatchTarget,
@@ -877,6 +911,7 @@ class BatchIntegrator:
                 "writer_generation": request.writer_generation,
                 "activation_id": request.activation_id,
             },
+            "parent_candidates": [member.canonical() for member in members],
             "members": [member.canonical() for member in members],
         }
         create_action = getattr(self.journal, "create_action", None)
@@ -929,12 +964,23 @@ class BatchIntegrator:
             except (DeliveryIdentityMismatch, DeliveryAttributionAmbiguous) as error:
                 self._block_identity_failure(action, error)
                 raise
-            committed = self.journal.compare_and_swap_action(
-                action.stable_action_id,
-                expected_version=record.version,
-                expected_phase=record.phase,
-                next_record=next_record,
-            )
+            if next_record.version == record.version + 1:
+                committed = self.journal.compare_and_swap_action(
+                    action.stable_action_id,
+                    expected_version=record.version,
+                    expected_phase=record.phase,
+                    next_record=next_record,
+                )
+            else:
+                # Fallback queue construction durably advances the parent
+                # several times while preserving each member's evidence and
+                # creating the child actions.  Adopt that already-CASed
+                # record rather than applying the outer step a second time.
+                committed = self.journal.read_action(action.stable_action_id)
+                if committed != next_record:
+                    raise DeliveryIdentityMismatch(
+                        "Batch recovery step changed its durable parent record"
+                    )
             if committed.phase in {"wait", "decision", "complete", "blocked"}:
                 return self._observation_from_record(committed)
             record = committed
@@ -1030,9 +1076,10 @@ class BatchIntegrator:
             hosted_suites = tuple(
                 HostedSuiteDefinition(**suite) for suite in hosted_state
             )
-            candidates = tuple(
-                self._receipt_from_canonical(item) for item in member_state
-            )
+            candidate_state = state.get("parent_candidates", member_state)
+            if not isinstance(candidate_state, list):
+                raise TypeError
+            candidates = tuple(self._receipt_from_canonical(item) for item in candidate_state)
             return BatchDeliveryRequest(
                 stable_action_id=record.stable_action_id,
                 repository=request_state["repository"],
@@ -1189,6 +1236,12 @@ class BatchIntegrator:
         )
         if receipt.outcome == "infrastructure_failure":
             return receipt
+        # A failed Singleton is resumed by the owning Work Run.  Its next
+        # hosted read must be fresh, so do not make a terminal code-failure
+        # receipt prevent that retry.  Multi-member failures are durable
+        # parent facts and are adopted by the fallback queue.
+        if receipt.outcome == "code_failure" and len(request.accepted_candidates) == 1:
+            return receipt
         return self.journal.persist_hosted_result(receipt)
 
     def _advance_hosted_result(
@@ -1248,6 +1301,7 @@ class BatchIntegrator:
             )
 
         if receipt.outcome == "code_failure":
+            state["resume_phase"] = "published"
             return self._classify_failure(
                 record,
                 action,
@@ -1262,6 +1316,359 @@ class BatchIntegrator:
             state=state,
         )
 
+    def _classify_failure(
+        self,
+        record: object,
+        action: BatchDeliveryAction,
+        request: BatchDeliveryRequest,
+        outcome: str,
+        state: dict[str, object],
+    ) -> object:
+        if len(request.accepted_candidates) > 1 and record.fallback_generation == 0:
+            return self._queue_singletons(record, action, request, state)
+        if len(request.accepted_candidates) != 1:
+            return replace(
+                record,
+                phase="blocked",
+                reason="BatchFailureAttributionRequired",
+                state_json=self._encode_state(state),
+                version=record.version + 1,
+            )
+
+        member = request.accepted_candidates[0]
+        raw_members = state.get("members")
+        if not isinstance(raw_members, list) or not raw_members:
+            raise DeliveryIdentityMismatch(
+                "journal member snapshot is missing for Singleton recovery"
+            )
+        singleton = raw_members[0]
+        if not isinstance(singleton, dict):
+            raise DeliveryIdentityMismatch(
+                "journal Singleton member snapshot is malformed"
+            )
+        singleton["status"] = "resume_required"
+        singleton["resume_reason"] = outcome
+        state["resume_required"] = True
+        if not state.get("resume_directive_emitted"):
+            directive = (member.work_run_key, member.review_finding_ledger_digest)
+            resume_directives = getattr(self.git, "resume_directives", None)
+            if isinstance(resume_directives, list):
+                resume_directives.append(directive)
+            state["resume_directive_emitted"] = True
+        return replace(
+            record,
+            phase="wait",
+            reason="WorkerResumeRequired",
+            state_json=self._encode_state(state),
+            version=record.version + 1,
+        )
+
+    def _state_json_for_request(
+        self,
+        request: BatchDeliveryRequest,
+        members: tuple[AcceptedCandidateReceipt, ...],
+    ) -> str:
+        return self._encode_state(
+            {
+                "request": {
+                    "request_digest": request.request_digest,
+                    "repository": request.repository,
+                    "campaign_key": request.campaign_key,
+                    "plan_revision_digest": request.plan_revision_digest,
+                    "target": request.target.canonical(),
+                    "local_suite": request.local_suite.canonical(),
+                    "hosted_suites": [
+                        suite.canonical() for suite in request.hosted_suites
+                    ],
+                    "writer_generation": request.writer_generation,
+                    "activation_id": request.activation_id,
+                },
+                "parent_candidates": [member.canonical() for member in members],
+                "members": [member.canonical() for member in members],
+            }
+        )
+
+    def _queue_singletons(
+        self,
+        record: object,
+        parent_action: BatchDeliveryAction,
+        request: BatchDeliveryRequest,
+        state: dict[str, object],
+    ) -> object:
+        parent_members = tuple(request.accepted_candidates)
+        state["parent_candidates"] = [member.canonical() for member in parent_members]
+        state["members"] = [
+            {
+                "ticket_key": member.ticket_key,
+                "work_run_key": member.work_run_key,
+                "candidate_sha": member.candidate_sha,
+                "candidate_receipt_digest": member.digest,
+                "evidence_digests": list(member.evidence_digests),
+                "review_finding_ledger_digest": member.review_finding_ledger_digest,
+                "status": "preserved",
+            }
+            for member in parent_members
+        ]
+        state["singleton_queue"] = []
+        state["next_singleton_index"] = 0
+        state["delivery_proofs"] = []
+        state.pop("resume_required", None)
+        queued = self.journal.compare_and_swap_action(
+            parent_action.stable_action_id,
+            expected_version=record.version,
+            expected_phase=record.phase,
+            next_record=replace(
+                record,
+                phase="wait",
+                reason="SingletonFallbackQueued",
+                fallback_generation=1,
+                state_json=self._encode_state(state),
+                version=record.version + 1,
+            ),
+        )
+
+        queued_entries: list[dict[str, object]] = []
+        for member in parent_members:
+            self.journal.persist_member_evidence(
+                parent_action.stable_action_id,
+                member.ticket_key,
+                member.candidate_sha,
+                member.evidence_digests,
+                member.review_finding_ledger_digest,
+            )
+            child_batch_id = digest_value(
+                {
+                    "kind": "singleton-batch.v1",
+                    "parent_batch_id": parent_action.batch_id,
+                    "ticket_key": member.ticket_key,
+                    "candidate_receipt_digest": member.digest,
+                }
+            )
+            current_target = self.git.read_target(request.target)
+            child_batch_sha = self.git.compose_batch(
+                child_batch_id, current_target, (member,)
+            )
+            child_action = make_singleton_action(
+                parent_action, member, child_batch_id, child_batch_sha
+            )
+            child_request = replace(
+                request,
+                stable_action_id=child_action.stable_action_id,
+                target=current_target,
+                accepted_candidates=(member,),
+            )
+            self._requests[child_action.stable_action_id] = child_request
+            self.journal.create_action(
+                child_action,
+                child_action.request_digest,
+                state_json=self._state_json_for_request(child_request, (member,)),
+            )
+            queued_entries.append(
+                {
+                    "action": asdict(child_action),
+                    "member": member.canonical(),
+                    "target": current_target.canonical(),
+                }
+            )
+
+        current = self.journal.read_action(parent_action.stable_action_id)
+        if current is None:
+            raise BatchIntegratorError(
+                "BATCH_ACTION_MISSING",
+                "parent action disappeared while queuing Singletons",
+            )
+        updated_state = self._decode_state(current)
+        updated_state["singleton_queue"] = queued_entries
+        updated_state["next_singleton_index"] = 0
+        updated_state["delivery_proofs"] = []
+        return self.journal.compare_and_swap_action(
+            parent_action.stable_action_id,
+            expected_version=current.version,
+            expected_phase=current.phase,
+            next_record=replace(
+                current,
+                state_json=self._encode_state(updated_state),
+                version=current.version + 1,
+            ),
+        )
+
+    def _execute_child(
+        self,
+        child_action: BatchDeliveryAction,
+        child_request: BatchDeliveryRequest,
+    ) -> BatchDeliveryObservation:
+        record = self.journal.read_action(child_action.stable_action_id)
+        if record is None:
+            raise BatchIntegratorError(
+                "BATCH_ACTION_MISSING",
+                "Singleton action disappeared before execution",
+            )
+        self._validate_action_record(record, child_action)
+        while record.phase not in {"complete", "decision", "blocked"}:
+            next_record = self._advance_one_delivery_step(
+                record, child_action, child_request
+            )
+            record = self.journal.compare_and_swap_action(
+                child_action.stable_action_id,
+                expected_version=record.version,
+                expected_phase=record.phase,
+                next_record=next_record,
+            )
+            if record.phase == "wait":
+                break
+        return self._observation_from_record(record)
+
+    def _advance_singleton_queue(
+        self,
+        record: object,
+        parent_action: BatchDeliveryAction,
+        request: BatchDeliveryRequest,
+        state: dict[str, object],
+    ) -> object:
+        queue = state.get("singleton_queue")
+        if not isinstance(queue, list):
+            raise DeliveryIdentityMismatch("Singleton fallback queue is malformed")
+        index = state.get("next_singleton_index", 0)
+        if type(index) is not int or index < 0:
+            raise DeliveryIdentityMismatch("Singleton fallback queue index is malformed")
+        raw_members = state.get("members")
+        if not isinstance(raw_members, list):
+            raise DeliveryIdentityMismatch("parent Singleton member partition is missing")
+        resume_indices = state.get("resume_indices", [])
+        if not isinstance(resume_indices, list) or any(
+            type(item) is not int or item < 0 for item in resume_indices
+        ):
+            raise DeliveryIdentityMismatch("Singleton resume partition is malformed")
+        for resume_index in resume_indices:
+            if resume_index >= len(raw_members):
+                raise DeliveryIdentityMismatch("Singleton resume member index is invalid")
+            if resume_index != index and isinstance(raw_members[resume_index], dict):
+                raw_members[resume_index]["status"] = "preserved"
+        if index >= len(queue):
+            return replace(
+                record,
+                phase="complete",
+                reason="SingletonFallbackComplete",
+                state_json=self._encode_state(state),
+                version=record.version + 1,
+            )
+        entry = queue[index]
+        if not isinstance(entry, dict):
+            raise DeliveryIdentityMismatch("Singleton fallback queue entry is malformed")
+        try:
+            child_action = BatchDeliveryAction(**entry["action"])
+            member = self._receipt_from_canonical(entry["member"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise DeliveryIdentityMismatch(
+                "Singleton fallback queue entry is not canonical"
+            ) from error
+        if child_action.member_ticket_keys != (member.ticket_key,):
+            raise DeliveryIdentityMismatch("Singleton child member identity changed")
+        child_request = self._requests.get(child_action.stable_action_id)
+        if child_request is None:
+            child_target = request.target
+            target_state = entry.get("target")
+            if isinstance(target_state, dict):
+                try:
+                    child_target = BatchTarget(**target_state)
+                except (TypeError, ValueError) as error:
+                    raise DeliveryIdentityMismatch(
+                        "Singleton child target identity changed"
+                    ) from error
+            child_request = replace(
+                request,
+                stable_action_id=child_action.stable_action_id,
+                target=child_target,
+                accepted_candidates=(member,),
+            )
+            self._requests[child_action.stable_action_id] = child_request
+        child_observation = self._execute_child(child_action, child_request)
+        if child_observation.phase == "complete":
+            if (
+                child_observation.stable_action_id != child_action.stable_action_id
+                or child_observation.batch_id != child_action.batch_id
+                or child_observation.batch_sha != child_action.batch_sha
+                or len(child_observation.delivery_proofs) != 1
+                or child_observation.delivery_proofs[0].member_ticket_keys
+                != (member.ticket_key,)
+            ):
+                raise DeliveryIdentityMismatch(
+                    "completed Singleton observation changed child delivery identity"
+                )
+            if index >= len(raw_members):
+                raise DeliveryIdentityMismatch("parent Singleton member partition changed")
+            parent_member = raw_members[index]
+            if not isinstance(parent_member, dict):
+                raise DeliveryIdentityMismatch("parent Singleton member is malformed")
+            parent_member["status"] = "integrated"
+            parent_member.pop("resume_reason", None)
+            state.setdefault("delivery_proofs", []).append(
+                child_observation.delivery_proofs[0].canonical()
+            )
+            state["next_singleton_index"] = index + 1
+            all_integrated = all(
+                isinstance(item, dict) and item.get("status") == "integrated"
+                for item in raw_members
+            )
+            phase = (
+                "complete"
+                if index + 1 == len(queue) and all_integrated
+                else "decision"
+                if index + 1 == len(queue)
+                else "wait"
+            )
+            reason = (
+                "SingletonFallbackComplete"
+                if phase == "complete"
+                else "SingletonCompleted"
+            )
+            return replace(
+                record,
+                phase=phase,
+                reason=reason,
+                state_json=self._encode_state(state),
+                version=record.version + 1,
+            )
+        if child_observation.phase == "blocked":
+            return replace(
+                record,
+                phase="blocked",
+                reason="SingletonBlocked",
+                state_json=self._encode_state(state),
+                version=record.version + 1,
+            )
+        if child_observation.reason == "WorkerResumeRequired":
+            if index >= len(raw_members):
+                raise DeliveryIdentityMismatch("parent Singleton member partition changed")
+            parent_member = raw_members[index]
+            if not isinstance(parent_member, dict):
+                raise DeliveryIdentityMismatch("parent Singleton member is malformed")
+            parent_member["status"] = "resume_required"
+            parent_member["resume_reason"] = child_observation.reason
+            if index not in resume_indices:
+                resume_indices.append(index)
+            state["resume_indices"] = resume_indices
+            # An unresolved child is handed back to the owning Work Run, but
+            # unaffected children can still be delivered.  Advance the queue
+            # without fabricating a proof for the failed member.
+            state["next_singleton_index"] = index + 1
+            phase = "decision" if index + 1 == len(queue) else "wait"
+        return replace(
+            record,
+            phase=(
+                phase
+                if child_observation.reason == "WorkerResumeRequired"
+                else "wait"
+            ),
+            reason=(
+                "WorkerResumeRequired"
+                if child_observation.reason == "WorkerResumeRequired"
+                else "SingletonWaiting"
+            ),
+            state_json=self._encode_state(state),
+            version=record.version + 1,
+        )
+
     def _advance_one_delivery_step(
         self,
         record: object,
@@ -1272,6 +1679,26 @@ class BatchIntegrator:
         from ._batch_integrator_store import HostedResultReceipt
 
         state = self._decode_state(record)
+        if record.fallback_generation == 1 and isinstance(
+            state.get("singleton_queue"), list
+        ):
+            return self._advance_singleton_queue(
+                record, action, request, state
+            )
+        if record.phase == "wait" and state.get("resume_required") is True:
+            resume_phase = state.pop("resume_phase", "published")
+            if resume_phase not in {"prepared", "published"}:
+                raise DeliveryIdentityMismatch(
+                    "Singleton resume phase is not supported"
+                )
+            state.pop("resume_required", None)
+            state.pop("hosted_receipt", None)
+            return self._next_record(
+                record,
+                phase=resume_phase,
+                reason="WorkerResumeReady",
+                state=state,
+            )
         if record.phase == "wait" and isinstance(state.get("next_check"), dict):
             next_check = state["next_check"]
             expected_check = {
@@ -1304,6 +1731,16 @@ class BatchIntegrator:
                     "local check receipt did not preserve Batch or suite identity"
                 )
             if local_receipt.outcome != "passed":
+                state["local_receipt"] = asdict(local_receipt)
+                if local_receipt.outcome == "code_failure":
+                    state["resume_phase"] = "prepared"
+                    return self._classify_failure(
+                        record,
+                        action,
+                        request,
+                        local_receipt.outcome,
+                        state,
+                    )
                 raise BatchIntegratorError(
                     "BATCH_LOCAL_CHECK_FAILED",
                     "exact local suite did not pass",
