@@ -500,6 +500,10 @@ class _ScriptedEffects:
     def observe(self, ticket_key, phase):
         self.observed[ticket_key] = phase
 
+    def bind_batch_delivery_request_digest(self, action):
+        assert action.kind == "batch_delivery"
+        return "0" * 64
+
     def readback(self, action):
         if action.kind == "semantic_resume":
             return None
@@ -512,6 +516,7 @@ class _ScriptedEffects:
             phase,
             action.stable_action_id,
             binding_established=self.binding_established.get(action.ticket_key, True),
+            action=action,
         )
 
     def execute(self, action):
@@ -521,6 +526,7 @@ class _ScriptedEffects:
             self.initial_phases.get(action.ticket_key, "running"),
             action.stable_action_id,
             binding_established=self.binding_established.get(action.ticket_key, True),
+            action=action,
         )
 
 
@@ -556,9 +562,36 @@ class _BlockingEffects(_ScriptedEffects):
             return super().execute(action)
 
 
-def _observation(phase, action_id, *, binding_established=True):
+def _observation(
+    phase,
+    action_id,
+    *,
+    binding_established=True,
+    action=None,
+):
     from gwo_v8._canonical import digest_value
     from gwo_v8.execution_kernel import WorkRunObservation
+
+    if phase == "completed":
+        if action is None or action.kind != "batch_delivery":
+            from v8_production_test_support import (
+                make_accepted_candidate_receipt,
+                make_candidate_receipt,
+            )
+
+            candidate = make_candidate_receipt(action)
+            accepted = make_accepted_candidate_receipt(action, candidate)
+            return WorkRunObservation(
+                phase="accepted_awaiting_delivery",
+                stable_action_id=action_id,
+                receipt_digest=candidate.digest,
+                candidate_receipt=candidate,
+                accepted_candidate_receipt_digest=accepted.digest,
+                candidate_diff_record_digest=candidate.diff_record_digest,
+            )
+        from v8_production_test_support import make_completed_observation
+
+        return make_completed_observation(action)
 
     return WorkRunObservation(
         phase=phase,
@@ -592,6 +625,7 @@ def _active_campaign(ticket_keys, *, work_facts=None):
     spec = {
         "schema_version": 3,
         "repository": handle.repository,
+        "target_branch": "main",
         "campaign": {"key": handle.campaign_key},
         "work": work,
     }

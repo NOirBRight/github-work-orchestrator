@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 import sys
 from pathlib import Path
 
@@ -24,7 +24,9 @@ from gwo_v8.batch_integrator import (
     MemberDeliveryObservation,
 )
 from gwo_v8.execution_kernel import (
+    CampaignStatus,
     ExecutionKernelError,
+    PlanInvalidationObservation,
     ResultIntegrityProof,
     StaleBindingObservation,
     StaleDiagnosisDisposition,
@@ -44,6 +46,125 @@ from v8_production_test_support import (
 
 def _dataclass_field_names(value_type: type[object]) -> tuple[str, ...]:
     return tuple(item.name for item in fields(value_type))
+
+
+@dataclass
+class CompletedWithoutProofEffects:
+    candidate_only: bool
+    observations: dict[str, WorkRunObservation] = field(default_factory=dict)
+
+    def readback(self, action: WorkRunAction):
+        return self.observations.get(action.stable_action_id)
+
+    def execute(self, action: WorkRunAction):
+        if self.candidate_only:
+            candidate = make_candidate_receipt(action)
+            accepted = make_accepted_candidate_receipt(action, candidate)
+            observation = WorkRunObservation(
+                phase="completed",
+                stable_action_id=action.stable_action_id,
+                runtime_binding_id=action.stable_action_id,
+                receipt_digest=candidate.digest,
+                candidate_receipt=candidate,
+                accepted_candidate_receipt_digest=accepted.digest,
+                candidate_diff_record_digest=accepted.diff_record_digest,
+            )
+        else:
+            observation = WorkRunObservation(
+                phase="completed",
+                stable_action_id=action.stable_action_id,
+                receipt_digest="a" * 64,
+                result_digest="b" * 64,
+                evidence_digests=("c" * 64,),
+            )
+        self.observations[action.stable_action_id] = observation
+        return observation
+
+
+@dataclass
+class PlanInvalidationReadbackEffects:
+    authority_subtree_digest: str
+    observations: dict[str, WorkRunObservation] = field(default_factory=dict)
+    batch_delivery_actions: list[str] = field(default_factory=list)
+
+    def readback(self, action: WorkRunAction):
+        return self.observations.get(action.stable_action_id)
+
+    def execute(self, action: WorkRunAction):
+        if action.kind == "batch_delivery":
+            self.batch_delivery_actions.append(action.stable_action_id)
+            observation = WorkRunObservation(
+                phase="wait",
+                stable_action_id=action.stable_action_id,
+                runtime_binding_id=action.runtime_binding_id,
+                receipt_digest="d" * 64,
+            )
+        else:
+            candidate = make_candidate_receipt(action)
+            accepted = make_accepted_candidate_receipt(action, candidate)
+            invalidation = PlanInvalidationObservation(
+                repository=action.repository,
+                campaign_key=action.campaign_key,
+                plan_revision_digest=action.plan_revision_digest,
+                ticket_key=action.ticket_key,
+                work_run_key=action.work_run_key,
+                runtime_binding_id=action.stable_action_id,
+                authority_subtree_digest=self.authority_subtree_digest,
+                reporter_role="worker",
+                report_digest="e" * 64,
+                evidence_digest="f" * 64,
+                dedup_identity="effect-invalidation:one",
+                invalidated_obligation="the Candidate scope is no longer valid",
+                required_effects=("workspace.write.v1",),
+                workspace_identity="workspace:invalidation",
+            )
+            observation = WorkRunObservation(
+                phase="accepted_awaiting_delivery",
+                stable_action_id=action.stable_action_id,
+                runtime_binding_id=action.stable_action_id,
+                receipt_digest=candidate.digest,
+                candidate_receipt=candidate,
+                accepted_candidate_receipt_digest=accepted.digest,
+                candidate_diff_record_digest=accepted.diff_record_digest,
+                plan_invalidation=invalidation,
+            )
+        self.observations[action.stable_action_id] = observation
+        return observation
+
+
+@dataclass
+class BatchRequestTamperEffects(OneCandidateOnlyEffects):
+    emit_tampered_batch: bool = False
+
+    def execute(self, action: WorkRunAction):
+        if action.kind != "batch_delivery" or not self.emit_tampered_batch:
+            return super().execute(action)
+        candidate = make_candidate_receipt(action)
+        accepted = make_accepted_candidate_receipt(action, candidate)
+        proof = make_result_integrity_proof(
+            action,
+            accepted,
+            target_contains_batch_sha=True,
+        )
+        proof = replace(
+            proof,
+            batch_delivery_request_digest="f" * 64,
+        )
+        proof = replace(proof, result_digest=proof.expected_result_digest())
+        observation = WorkRunObservation(
+            phase="completed",
+            stable_action_id=action.stable_action_id,
+            runtime_binding_id=action.runtime_binding_id,
+            receipt_digest="9" * 64,
+            candidate_receipt=candidate,
+            accepted_candidate_receipt_digest=accepted.digest,
+            candidate_diff_record_digest=accepted.diff_record_digest,
+            delivery_receipt_digest="1" * 64,
+            result_digest=proof.result_digest,
+            result_integrity=proof,
+        )
+        self.observations[action.stable_action_id] = observation
+        return observation
 
 
 def test_observation_serializers_preserve_merged_dataclass_fields():
@@ -140,6 +261,56 @@ def test_completed_observation_without_integrity_proof_is_rejected():
     assert raised.value.code == "RESULT_INTEGRITY_REQUIRED"
 
 
+@pytest.mark.parametrize("candidate_only", (False, True))
+def test_completed_non_proof_observation_cannot_publicly_complete(
+    tmp_path,
+    handle,
+    active_plan,
+    make_kernel,
+    candidate_only,
+):
+    kernel = make_kernel(
+        tmp_path / "kernel.sqlite3",
+        active_plan,
+        effects=CompletedWithoutProofEffects(candidate_only),
+    )
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.advance(handle)
+
+    assert raised.value.code == "RESULT_INTEGRITY_REQUIRED"
+    assert kernel.inspect(handle).status is not CampaignStatus.COMPLETE
+    assert kernel._load(handle)["accepted_results"] == []
+
+
+def test_plan_invalidation_readback_quiesces_before_candidate_or_batch(
+    tmp_path,
+    handle,
+    active_plan,
+    make_kernel,
+):
+    from gwo_v8._canonical import load_canonical_json
+
+    plan = load_canonical_json(active_plan.plan_spec_bytes)
+    authority_digest = plan["work"][0]["authority"]["worker"]["subtree_digest"]
+    effects = PlanInvalidationReadbackEffects(authority_digest)
+    kernel = make_kernel(tmp_path / "kernel.sqlite3", active_plan, effects=effects)
+
+    outcome = kernel.advance(handle)
+
+    summary = kernel.inspect(handle).work_runs[0]
+    state = kernel._load(handle)
+    run = state["runs"][summary.ticket_key]
+    assert outcome.status is CampaignStatus.DECISION
+    assert summary.phase == "quiescent"
+    assert summary.claim_state == "released"
+    assert summary.plan_invalidation is not None
+    assert run["candidate_receipt"] is None
+    assert run["accepted_candidate_receipt_digest"] is None
+    assert state["accepted_results"] == []
+    assert effects.batch_delivery_actions == []
+
+
 def test_accepted_candidate_receipt_alone_cannot_create_a_code_result(
     tmp_path,
     handle,
@@ -157,6 +328,67 @@ def test_accepted_candidate_receipt_alone_cannot_create_a_code_result(
         item["ticket_key"] == run.ticket_key
         for item in kernel._load(handle)["accepted_results"]
     )
+
+
+def test_kernel_batch_ingestion_binds_parent_request_digest(
+    tmp_path,
+    handle,
+    active_plan,
+    make_kernel,
+):
+    effects = BatchRequestTamperEffects(emit_tampered_batch=True)
+    kernel = make_kernel(tmp_path / "kernel.sqlite3", active_plan, effects=effects)
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.advance(handle)
+
+    assert raised.value.code == "RESULT_INTEGRITY_INVALID"
+    run = next(iter(kernel._load(handle)["runs"].values()))
+    assert run["batch_delivery_request_digest"] == "0" * 64
+    assert run["batch_delivery_request_digest"] != "f" * 64
+
+
+def test_nested_result_integrity_unknown_key_is_typed_rejection():
+    action = WorkRunAction(
+        stable_action_id="action:nested-proof",
+        repository="owner/repository",
+        campaign_key="campaign:nested-proof",
+        plan_revision_digest="a" * 64,
+        ticket_key="issue:nested-proof",
+        kind="batch_delivery",
+        semantic_action_id="semantic:nested-proof",
+        work_run_key="work-run:nested-proof",
+        work_subject_digest="b" * 64,
+        runtime_binding_id="binding:nested-proof",
+        wake_ref="candidate:accepted",
+        accepted_candidate_receipt_digest=None,
+        batch_delivery_request_digest="0" * 64,
+    )
+    candidate = make_candidate_receipt(action)
+    accepted = make_accepted_candidate_receipt(action, candidate)
+    proof = make_result_integrity_proof(
+        action,
+        accepted,
+        target_contains_batch_sha=True,
+    )
+    observation = WorkRunObservation(
+        phase="completed",
+        stable_action_id=action.stable_action_id,
+        receipt_digest="9" * 64,
+        candidate_receipt=candidate,
+        accepted_candidate_receipt_digest=accepted.digest,
+        candidate_diff_record_digest=accepted.diff_record_digest,
+        delivery_receipt_digest="1" * 64,
+        result_digest=proof.result_digest,
+        result_integrity=proof,
+    )
+    encoded = observation.canonical()
+    encoded["result_integrity"]["unexpected"] = True
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        WorkRunObservation.from_canonical(encoded)
+
+    assert raised.value.code == "WORK_RUN_OBSERVATION_INVALID"
 
 
 def test_completed_result_requires_exact_batch_and_target_readback(
@@ -212,6 +444,7 @@ def test_any_exact_delivery_proof_field_tamper_fails_closed(
         runtime_binding_id="binding:integrity",
         wake_ref="candidate:accepted",
         accepted_candidate_receipt_digest=None,
+        batch_delivery_request_digest="0" * 64,
     )
     candidate = make_candidate_receipt(action)
     accepted = make_accepted_candidate_receipt(action, candidate)

@@ -191,6 +191,13 @@ class OneCandidateOnlyEffects:
     ) -> WorkRunObservation | StaleBindingObservation | StaleDiagnosisObservation | None:
         return self.observations.get(action.stable_action_id)
 
+    def bind_batch_delivery_request_digest(self, action: WorkRunAction) -> str:
+        if action.kind != "batch_delivery":
+            raise AssertionError(
+                "parent Batch request binding is only valid for Batch delivery"
+            )
+        return "0" * 64
+
     def execute(
         self,
         action: WorkRunAction,
@@ -219,9 +226,14 @@ def make_result_integrity_proof(
     *,
     target_contains_batch_sha: bool,
 ) -> ResultIntegrityProof:
+    request_digest = action.batch_delivery_request_digest
+    if type(request_digest) is not str:
+        raise AssertionError(
+            "test Batch delivery proof requires a bound parent request digest"
+        )
     delivery = BatchDeliveryProof.create(
         delivery_stable_action_id=action.stable_action_id,
-        delivery_request_digest="0" * 64,
+        delivery_request_digest=request_digest,
         batch_id="2" * 64,
         batch_sha="2" * 40,
         member_ticket_keys=(action.ticket_key,),
@@ -245,7 +257,7 @@ def make_result_integrity_proof(
         candidate_diff_record_digest=accepted.diff_record_digest,
         batch_delivery_receipt_digest="1" * 64,
         batch_delivery_stable_action_id=action.stable_action_id,
-        batch_delivery_request_digest="0" * 64,
+        batch_delivery_request_digest=request_digest,
         batch_delivery_batch_id=delivery.batch_id,
         batch_delivery_batch_sha=delivery.batch_sha,
         batch_delivery_proof_digest=delivery.proof_digest,
@@ -270,6 +282,37 @@ def make_result_integrity_proof(
         evidence_digests=accepted.evidence_digests,
     )
     return replace(proof, result_digest=proof.expected_result_digest())
+
+
+def make_completed_observation(
+    action: WorkRunAction,
+    *,
+    target_contains_batch_sha: bool = True,
+    evidence_digests: tuple[str, ...] | None = None,
+) -> WorkRunObservation:
+    candidate = make_candidate_receipt(action)
+    accepted = make_accepted_candidate_receipt(action, candidate)
+    proof = make_result_integrity_proof(
+        action,
+        accepted,
+        target_contains_batch_sha=target_contains_batch_sha,
+    )
+    if evidence_digests is not None:
+        proof = replace(proof, evidence_digests=tuple(evidence_digests))
+        proof = replace(proof, result_digest=proof.expected_result_digest())
+    return WorkRunObservation(
+        phase="completed",
+        stable_action_id=action.stable_action_id,
+        runtime_binding_id=action.runtime_binding_id,
+        receipt_digest="9" * 64,
+        candidate_receipt=candidate,
+        accepted_candidate_receipt_digest=accepted.digest,
+        candidate_diff_record_digest=accepted.diff_record_digest,
+        delivery_receipt_digest=proof.batch_delivery_receipt_digest,
+        result_digest=proof.result_digest,
+        evidence_digests=proof.evidence_digests,
+        result_integrity=proof,
+    )
 
 
 @dataclass

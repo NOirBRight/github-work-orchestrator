@@ -64,8 +64,9 @@ def test_completed_readback_persists_exact_result_and_evidence_binding(tmp_path)
 
     diagnostics = kernel.inspect(handle)
     run = diagnostics.work_runs[0]
-    assert run.result_digest == "7" * 64
-    assert run.evidence_digests == ("8" * 64,)
+    assert effects.completed_observation is not None
+    assert run.result_digest == effects.completed_observation.result_digest
+    assert run.evidence_digests == effects.completed_observation.evidence_digests
     plan = load_canonical_json(active.plan_spec_bytes)
     expected_target_facts_digest = digest_value(
         {
@@ -80,8 +81,8 @@ def test_completed_readback_persists_exact_result_and_evidence_binding(tmp_path)
         {
             "kind": "accepted_result_binding.v1",
             "ticket_key": "issue:108",
-            "result_digest": "7" * 64,
-            "evidence_digests": ["8" * 64],
+            "result_digest": effects.completed_observation.result_digest,
+            "evidence_digests": list(effects.completed_observation.evidence_digests),
             "work_subject_digest": run.work_subject_digest,
             "target_facts_digest": expected_target_facts_digest,
         }
@@ -173,14 +174,15 @@ def test_execution_snapshot_retains_exact_accepted_result_binding(tmp_path):
     from gwo_v8.execution_kernel import ExecutionKernel
 
     active, handle = _active_campaign(("issue:108",))
+    effects = _Effects(
+        phase="completed",
+        result_digest="7" * 64,
+        evidence_digests=("8" * 64,),
+    )
     kernel = ExecutionKernel(
         store_path=tmp_path / "execution.sqlite3",
         plan_control=_Plans(active),
-        effects=_Effects(
-            phase="completed",
-            result_digest="7" * 64,
-            evidence_digests=("8" * 64,),
-        ),
+        effects=effects,
     )
 
     kernel.advance(handle)
@@ -190,11 +192,12 @@ def test_execution_snapshot_retains_exact_accepted_result_binding(tmp_path):
     snapshot = kernel._execution_snapshot(active, state, work)
 
     assert snapshot["accepted_results"] == state["accepted_results"]
+    assert effects.completed_observation is not None
     assert snapshot["accepted_results"][0] == {
         "kind": "accepted_result_binding.v1",
         "ticket_key": "issue:108",
-        "result_digest": "7" * 64,
-        "evidence_digests": ["8" * 64],
+        "result_digest": effects.completed_observation.result_digest,
+        "evidence_digests": list(effects.completed_observation.evidence_digests),
         "work_subject_digest": state["runs"]["issue:108"]["work_subject_digest"],
         "target_facts_digest": snapshot["accepted_results"][0]["target_facts_digest"],
     }
@@ -990,6 +993,10 @@ class _SuccessorEffects:
         self.executed = []
         self.stale_action_id = None
 
+    def bind_batch_delivery_request_digest(self, action):
+        assert action.kind == "batch_delivery"
+        return "0" * 64
+
     def readback(self, action):
         if self.stale_action_id is None:
             return None
@@ -1007,6 +1014,7 @@ class _SuccessorEffects:
                 action.stable_action_id,
                 result_digest="7" * 64,
                 evidence_digests=("8" * 64,),
+                action=action,
             )
         return _observation(
             "running",
@@ -1016,6 +1024,7 @@ class _SuccessorEffects:
                 if action.plan_revision_digest != self.successor_digest
                 else None
             ),
+            action=action,
         )
 
 
@@ -1044,19 +1053,28 @@ class _Effects:
         self.evidence_digests = evidence_digests
         self.readback_observation = readback_observation
         self.executed = []
+        self.completed_observation = None
 
     def readback(self, _action):
         return self.readback_observation
 
+    def bind_batch_delivery_request_digest(self, action):
+        assert action.kind == "batch_delivery"
+        return "0" * 64
+
     def execute(self, action):
         self.executed.append(action)
-        return _observation(
+        observation = _observation(
             self.phase,
             action.stable_action_id,
             candidate_identity=self.candidate_identity,
             result_digest=self.result_digest,
             evidence_digests=self.evidence_digests,
+            action=action,
         )
+        if observation.phase == "completed":
+            self.completed_observation = observation
+        return observation
 
 
 class _ReadBackOnlyEffects:
@@ -1078,9 +1096,34 @@ def _observation(
     candidate_identity=None,
     result_digest=None,
     evidence_digests=(),
+    action=None,
 ):
     from gwo_v8._canonical import digest_value
     from gwo_v8.execution_kernel import WorkRunObservation
+
+    if phase == "completed":
+        if action is None or action.kind != "batch_delivery":
+            from v8_production_test_support import (
+                make_accepted_candidate_receipt,
+                make_candidate_receipt,
+            )
+
+            candidate = make_candidate_receipt(action)
+            accepted = make_accepted_candidate_receipt(action, candidate)
+            return WorkRunObservation(
+                phase="accepted_awaiting_delivery",
+                stable_action_id=action_id,
+                receipt_digest=candidate.digest,
+                candidate_receipt=candidate,
+                accepted_candidate_receipt_digest=accepted.digest,
+                candidate_diff_record_digest=candidate.diff_record_digest,
+            )
+        from v8_production_test_support import make_completed_observation
+
+        return make_completed_observation(
+            action,
+            evidence_digests=tuple(evidence_digests),
+        )
 
     return WorkRunObservation(
         phase=phase,

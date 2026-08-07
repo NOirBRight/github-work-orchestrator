@@ -1153,6 +1153,7 @@ class RevisionBoundEffects:
         self.executed: list[Any] = []
         self._readbacks: dict[str, Any] = {}
         self.completed_results: dict[str, tuple[str, tuple[str, ...]]] = {}
+        self.batch_delivery_request_digests: dict[str, str] = {}
         self.candidate_identities: dict[str, str] = {}
         self._replay_ticket: str | None = None
         self._crash_boundary: str | None = None
@@ -1165,8 +1166,47 @@ class RevisionBoundEffects:
     def readback(self, action):
         return self._readbacks.get(action.stable_action_id)
 
+    def bind_batch_delivery_request_digest(self, action):
+        if action.kind != "batch_delivery":
+            raise AssertionError(
+                "parent Batch request binding is only valid for Batch delivery"
+            )
+        digest = "0" * 64
+        self.batch_delivery_request_digests[action.stable_action_id] = digest
+        return digest
+
     def _make_observation(self, action, phase: str, *, candidate: str | None = None):
         from gwo_v8.execution_kernel import WorkRunObservation
+
+        if phase == "completed":
+            from v8_production_test_support import (
+                make_accepted_candidate_receipt,
+                make_candidate_receipt,
+                make_completed_observation,
+            )
+
+            if action.kind != "batch_delivery":
+                candidate_receipt = make_candidate_receipt(action)
+                accepted = make_accepted_candidate_receipt(action, candidate_receipt)
+                return WorkRunObservation(
+                    phase="accepted_awaiting_delivery",
+                    stable_action_id=action.stable_action_id,
+                    receipt_digest=candidate_receipt.digest,
+                    candidate_receipt=candidate_receipt,
+                    accepted_candidate_receipt_digest=accepted.digest,
+                    candidate_diff_record_digest=candidate_receipt.diff_record_digest,
+                )
+
+            evidence_digests = self.evidence_digests or ("8" * 64,)
+            observation = make_completed_observation(
+                action,
+                evidence_digests=evidence_digests,
+            )
+            self.completed_results[action.ticket_key] = (
+                observation.result_digest,
+                observation.evidence_digests,
+            )
+            return observation
 
         receipt = _digest(
             {
@@ -1184,11 +1224,9 @@ class RevisionBoundEffects:
         if "candidate_identity" in fields:
             values["candidate_identity"] = candidate
         if "result_digest" in fields:
-            values["result_digest"] = self.result_digest if phase == "completed" else None
+            values["result_digest"] = None
         if "evidence_digests" in fields:
-            values["evidence_digests"] = (
-                self.evidence_digests if phase == "completed" else ()
-            )
+            values["evidence_digests"] = ()
         return WorkRunObservation(**values)
 
     def execute(self, action):
@@ -1235,11 +1273,6 @@ class RevisionBoundEffects:
         self._readbacks[action.stable_action_id] = observation
         if candidate is not None:
             self.candidate_identities[ticket] = candidate
-        if phase == "completed":
-            self.completed_results[ticket] = (
-                self.result_digest or "7" * 64,
-                self.evidence_digests or ("8" * 64,),
-            )
         return observation
 
     def replay_predecessor_candidate(self, ticket_key: str):

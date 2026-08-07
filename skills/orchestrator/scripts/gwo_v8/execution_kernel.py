@@ -947,6 +947,7 @@ class WorkRunAction:
     runtime_binding_id: str | None = None
     wake_ref: str | None = None
     accepted_candidate_receipt_digest: str | None = None
+    batch_delivery_request_digest: str | None = None
     stale_diagnosis_packet: StaleDiagnosisPacket | None = None
     stale_follow_up_kind: StaleFollowUpKind | None = None
 
@@ -967,6 +968,11 @@ class WorkRunAction:
                     "EFFECT_READBACK_INVALID",
                     "stale follow-up kind is bound to the wrong action kind",
                 )
+        if self.batch_delivery_request_digest is not None:
+            _validate_stale_digest(
+                self.batch_delivery_request_digest,
+                "Batch delivery request identity",
+            )
 
 
 @dataclass(frozen=True)
@@ -1326,6 +1332,15 @@ class ResultIntegrityProof:
                 "RESULT_INTEGRITY_INVALID",
                 "Result changed a field copied from the Batch delivery proof",
             )
+        if (
+            type(action.batch_delivery_request_digest) is not str
+            or self.batch_delivery_request_digest
+            != action.batch_delivery_request_digest
+        ):
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Result proof is not bound to the parent Batch request identity",
+            )
         if self.target_branch != target_branch:
             raise ExecutionKernelError(
                 "RESULT_INTEGRITY_INVALID",
@@ -1596,9 +1611,6 @@ class WorkRunObservation:
                 or self.delivery_receipt_digest is None
                 or self.result_integrity is None
                 or self.result_digest is None
-            ) and not (
-                (self.result_digest is None and not self.evidence_digests)
-                or (self.result_digest is not None and self.evidence_digests)
             ):
                 raise ExecutionKernelError(
                     "RESULT_INTEGRITY_REQUIRED",
@@ -1660,6 +1672,12 @@ class WorkRunObservation:
             )
         if isinstance(data.get("result_integrity"), dict):
             proof = dict(data["result_integrity"])
+            expected_proof_fields = {item.name for item in fields(ResultIntegrityProof)}
+            if set(proof) != expected_proof_fields:
+                raise ExecutionKernelError(
+                    "WORK_RUN_OBSERVATION_INVALID",
+                    "Result integrity proof fields are not exact",
+                )
             proof["evidence_digests"] = tuple(proof["evidence_digests"])
             proof["delivery_member_ticket_keys"] = tuple(
                 proof["delivery_member_ticket_keys"]
@@ -1944,6 +1962,8 @@ class PlanInvalidationClassifier(Protocol):
 class WorkRunEffects(Protocol):
     """The readback-first seam for RuntimeGateway/CandidateGate/BatchIntegrator."""
 
+    def bind_batch_delivery_request_digest(self, action: WorkRunAction) -> str: ...
+
     def readback(
         self, action: WorkRunAction
     ) -> WorkRunObservation | StaleBindingObservation | StaleDiagnosisObservation | StaleFollowUpObservation | None: ...
@@ -2108,7 +2128,7 @@ class ExecutionKernel:
                 if due is None:
                     break
                 progressed = self._perform_due_effect(
-                    active, state, due, wake_ref=wake_ref
+                    active, state, work, due, wake_ref=wake_ref
                 )
                 state = self._load(active.handle)
                 if not progressed:
@@ -3830,6 +3850,7 @@ class ExecutionKernel:
                      "accepted_candidate_receipt_digest": None,
                      "candidate_diff_record_digest": None,
                      "delivery_receipt_digest": None,
+                     "batch_delivery_request_digest": None,
                      "result_integrity": None,
                      "candidate_commit_oids": [],
                     "candidate_receipt_digests": [],
@@ -3978,6 +3999,7 @@ class ExecutionKernel:
                 "accepted_candidate_receipt_digest",
                 "candidate_diff_record_digest",
                 "delivery_receipt_digest",
+                "batch_delivery_request_digest",
                 "result_integrity",
             ):
                 if field not in run:
@@ -4965,6 +4987,7 @@ class ExecutionKernel:
             "accepted_candidate_receipt_digest": None,
             "candidate_diff_record_digest": None,
             "delivery_receipt_digest": None,
+            "batch_delivery_request_digest": None,
             "result_integrity": None,
             "candidate_commit_oids": [],
             "candidate_receipt_digests": [],
@@ -5155,6 +5178,7 @@ class ExecutionKernel:
             run.get("accepted_candidate_receipt_digest"),
             run.get("candidate_diff_record_digest"),
             run.get("delivery_receipt_digest"),
+            run.get("batch_delivery_request_digest"),
             run.get("result_digest"),
             tuple(run.get("evidence_digests", ())),
             run.get("runtime_binding_id"),
@@ -6955,6 +6979,7 @@ class ExecutionKernel:
         self,
         active: ActivePlanReadback,
         state: dict[str, Any],
+        work: dict[str, dict[str, Any]],
         ticket_key: str,
         *,
         wake_ref: str | None,
@@ -7067,6 +7092,9 @@ class ExecutionKernel:
             if resuming
             else "semantic_execution"
         )
+        batch_delivery_request_digest = run.get(
+            "batch_delivery_request_digest"
+        )
         action_id = self._effect_action_id(
             active, ticket_key, run, resuming=resuming
         )
@@ -7086,7 +7114,45 @@ class ExecutionKernel:
             accepted_candidate_receipt_digest=run.get(
                 "accepted_candidate_receipt_digest"
             ),
+            batch_delivery_request_digest=batch_delivery_request_digest,
         )
+        if is_batch_delivery and batch_delivery_request_digest is None:
+            binder = getattr(self._effects, "bind_batch_delivery_request_digest", None)
+            if not callable(binder):
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    "Batch delivery parent request identity was not bound before proof readback",
+                )
+            try:
+                bound_request_digest = binder(action)
+            except ExecutionKernelError:
+                raise
+            except Exception as error:
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    "Batch delivery parent request identity could not be bound",
+                ) from error
+            if type(bound_request_digest) is not str or re.fullmatch(
+                r"[0-9a-f]{64}", bound_request_digest
+            ) is None:
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    "Batch delivery parent request identity is invalid",
+                )
+            run["batch_delivery_request_digest"] = bound_request_digest
+            self._save_state(active.handle, state)
+            state = self._load(active.handle)
+            if state is None or type(state.get("runs", {}).get(ticket_key)) is not dict:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Work Run disappeared after Batch request identity binding",
+                )
+            run = state["runs"][ticket_key]
+            batch_delivery_request_digest = bound_request_digest
+            action = replace(
+                action,
+                batch_delivery_request_digest=bound_request_digest,
+            )
         # The intent becomes durable before the external boundary.  A restart
         # observes this same identity through the effect owner before retry.
         prior_effect = state["effects"].get(action_id)
@@ -7095,6 +7161,10 @@ class ExecutionKernel:
             "work_run_key": run["work_run_key"],
             "work_subject_digest": run["work_subject_digest"],
         }
+        if is_batch_delivery and batch_delivery_request_digest is not None:
+            effect_identity["batch_delivery_request_digest"] = (
+                batch_delivery_request_digest
+            )
         if prior_effect is not None and any(
             field in prior_effect and prior_effect[field] != value
             for field, value in effect_identity.items()
@@ -7103,6 +7173,11 @@ class ExecutionKernel:
                 "EFFECT_READBACK_INVALID",
                 "durable effect intent is not bound to the current revision and Work Run",
             )
+        if is_batch_delivery and batch_delivery_request_digest is not None:
+            if type(prior_effect) is dict:
+                prior_effect["batch_delivery_request_digest"] = (
+                    batch_delivery_request_digest
+                )
         state["effects"].setdefault(
             action_id,
             {
@@ -7202,6 +7277,43 @@ class ExecutionKernel:
                         )
                     run[field] = value
             run["runtime_binding_id"] = observation.runtime_binding_id
+        if observation.plan_invalidation is not None:
+            if run["phase"] == "pending":
+                run["phase"] = "running"
+            self._apply_plan_invalidation(
+                active,
+                state,
+                work,
+                observation.plan_invalidation,
+            )
+            readback = self._load(active.handle)
+            if readback is None:
+                raise ExecutionKernelError(
+                    "EXECUTION_STORE_INVALID",
+                    "Campaign state disappeared after Plan Invalidation readback",
+                )
+            state.clear()
+            state.update(readback)
+            run = state["runs"][ticket_key]
+            run["last_wake_ref"] = wake_ref
+            if wake_ref is not None:
+                state.setdefault("last_wake_refs", [])
+                if wake_ref not in state["last_wake_refs"]:
+                    state["last_wake_refs"].append(wake_ref)
+                    state["last_wake_refs"].sort()
+            state["effects"][action_id] = {
+                "state": "read_back",
+                "ticket_key": ticket_key,
+                "receipt_digest": observation.receipt_digest,
+                **effect_identity,
+            }
+            self._record_trusted_progress(
+                state,
+                run,
+                repository=active.handle.repository,
+            )
+            self._save_state(active.handle, state)
+            return True
         run.setdefault("candidate_receipt", None)
         receipt = observation.candidate_receipt
         candidate_budget_exhausted = False
@@ -7325,36 +7437,6 @@ class ExecutionKernel:
         if (
             not candidate_budget_exhausted
             and observation.phase == "completed"
-            and action.kind != "batch_delivery"
-        ):
-            if observation.result_digest is not None:
-                try:
-                    plan = load_canonical_json(active.plan_spec_bytes)
-                except CanonicalJsonError as error:  # pragma: no cover - validated earlier
-                    raise ExecutionKernelError(
-                        "ACTIVE_PLAN_INVALID", "PlanSpec bytes are not canonical"
-                    ) from error
-                binding = AcceptedResultBinding(
-                    ticket_key=ticket_key,
-                    result_digest=observation.result_digest,
-                    evidence_digests=observation.evidence_digests,
-                    work_subject_digest=run["work_subject_digest"],
-                    target_facts_digest=_target_facts_digest_for_kernel(plan),
-                )
-                state["accepted_results"] = [
-                    value
-                    for value in state["accepted_results"]
-                    if value["ticket_key"] != ticket_key
-                ] + [binding.canonical()]
-                state["accepted_results"].sort(
-                    key=lambda value: value["ticket_key"]
-                )
-                run["result_digest"] = binding.result_digest
-                run["evidence_digests"] = list(binding.evidence_digests)
-        if (
-            not candidate_budget_exhausted
-            and observation.phase == "completed"
-            and action.kind == "batch_delivery"
         ):
             try:
                 plan = load_canonical_json(active.plan_spec_bytes)
@@ -7368,6 +7450,17 @@ class ExecutionKernel:
                     "RESULT_INTEGRITY_REQUIRED",
                     "completed Work Run observations require a Batch delivery proof",
                 )
+            bound_request_digest = action.batch_delivery_request_digest
+            if bound_request_digest is None:
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    "Batch delivery parent request identity was not bound before proof readback",
+                )
+            if proof.batch_delivery_request_digest != bound_request_digest:
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    "Result proof changed the parent Batch request identity",
+                )
             try:
                 proof.validate_for(action, plan["target_branch"])
             except ExecutionKernelError:
@@ -7377,6 +7470,7 @@ class ExecutionKernel:
                     "RESULT_INTEGRITY_INVALID",
                     "Result integrity proof failed exact validation",
                 ) from error
+            run["batch_delivery_request_digest"] = bound_request_digest
             candidate = observation.candidate_receipt
             if candidate is None:
                 raise ExecutionKernelError(
