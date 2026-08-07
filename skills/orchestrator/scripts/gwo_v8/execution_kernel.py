@@ -10,7 +10,7 @@ nor Runtime/provider policy.
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import json
@@ -19,7 +19,7 @@ import re
 import sqlite3
 import threading
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol
 
 if TYPE_CHECKING:
     from .campaign_watchdog import WatchdogCampaignSnapshot
@@ -41,6 +41,13 @@ from .plan_control import (
     TicketClaimProof,
 )
 from .candidate_gate import CandidateGateError, CandidateReceipt
+from .candidate_gate import AcceptedCandidateReceipt
+from .batch_integrator import (
+    BatchDeliveryAction,
+    BatchDeliveryObservation,
+    BatchDeliveryRequest,
+    DeliveryIdentityMismatch,
+)
 from .human_gate import (
     HumanDecisionChoice,
     HumanDecisionRecord,
@@ -155,6 +162,27 @@ class ExecutionKernelError(RuntimeError):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+
+
+def _canonical_value(value: object) -> object:
+    if hasattr(value, "canonical") and callable(value.canonical):
+        return value.canonical()
+    if isinstance(value, Enum):
+        return value.value
+    if type(value) is tuple:
+        return [_canonical_value(item) for item in value]
+    if type(value) is list:
+        return [_canonical_value(item) for item in value]
+    if type(value) is dict:
+        return {key: _canonical_value(item) for key, item in sorted(value.items())}
+    return value
+
+
+def _dataclass_fields(value: object) -> dict[str, object]:
+    return {
+        item.name: _canonical_value(getattr(value, item.name))
+        for item in fields(value)
+    }
 
 
 @dataclass(frozen=True)
@@ -587,7 +615,30 @@ class StaleBindingObservation:
     workspace_readback_digest: str
     campaign_readback_digest: str
     receipt_digest: str
-    candidate_receipt: CandidateReceipt | None = None
+
+    def __init__(
+        self,
+        stable_action_id: str,
+        runtime_binding_id: str,
+        state: StaleReadbackState,
+        runtime_readback_digest: str,
+        process_readback_digest: str,
+        workspace_readback_digest: str,
+        campaign_readback_digest: str,
+        receipt_digest: str,
+        *,
+        candidate_receipt: CandidateReceipt | None = None,
+    ) -> None:
+        object.__setattr__(self, "stable_action_id", stable_action_id)
+        object.__setattr__(self, "runtime_binding_id", runtime_binding_id)
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "runtime_readback_digest", runtime_readback_digest)
+        object.__setattr__(self, "process_readback_digest", process_readback_digest)
+        object.__setattr__(self, "workspace_readback_digest", workspace_readback_digest)
+        object.__setattr__(self, "campaign_readback_digest", campaign_readback_digest)
+        object.__setattr__(self, "receipt_digest", receipt_digest)
+        object.__setattr__(self, "candidate_receipt", candidate_receipt)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if type(self) is not StaleBindingObservation:
@@ -625,6 +676,30 @@ class StaleBindingObservation:
                 "stale Candidate readback receipt does not bind CandidateReceipt",
             )
 
+    def canonical(self) -> dict[str, object]:
+        return {"kind": "stale_binding_observation.v1", **_dataclass_fields(self)}
+
+    @classmethod
+    def from_canonical(
+        cls,
+        value: Mapping[str, object],
+    ) -> "StaleBindingObservation":
+        if value.get("kind") != "stale_binding_observation.v1":
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "Stale binding observation kind is not exact",
+            )
+        data = dict(value)
+        data.pop("kind")
+        expected = {item.name for item in fields(cls)}
+        if set(data) != expected:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "Stale binding observation fields are not exact",
+            )
+        data["state"] = StaleReadbackState(data["state"])
+        return cls(**data)
+
 
 @dataclass(frozen=True)
 class StaleDiagnosisObservation:
@@ -647,6 +722,30 @@ class StaleDiagnosisObservation:
                 "stale diagnosis disposition is not closed",
             )
         _validate_stale_digest(self.receipt_digest, "stale diagnosis receipt")
+
+    def canonical(self) -> dict[str, object]:
+        return {"kind": "stale_diagnosis_observation.v1", **_dataclass_fields(self)}
+
+    @classmethod
+    def from_canonical(
+        cls,
+        value: Mapping[str, object],
+    ) -> "StaleDiagnosisObservation":
+        if value.get("kind") != "stale_diagnosis_observation.v1":
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "Stale diagnosis observation kind is not exact",
+            )
+        data = dict(value)
+        data.pop("kind")
+        expected = {item.name for item in fields(cls)}
+        if set(data) != expected:
+            raise ExecutionKernelError(
+                "EFFECT_READBACK_INVALID",
+                "Stale diagnosis observation fields are not exact",
+            )
+        data["disposition"] = StaleDiagnosisDisposition(data["disposition"])
+        return cls(**data)
 
 
 @dataclass(frozen=True)
@@ -692,6 +791,9 @@ class WorkRunSummary:
     exclusive_resources: tuple[str, ...] = ()
     work_subject_digest: str = ""
     candidate_identity: str | None = None
+    accepted_candidate_receipt_digest: str | None = None
+    candidate_diff_record_digest: str | None = None
+    delivery_receipt_digest: str | None = None
     result_digest: str | None = None
     evidence_digests: tuple[str, ...] = ()
     last_wake_ref: str | None = None
@@ -843,6 +945,8 @@ class WorkRunAction:
     work_run_key: str = ""
     work_subject_digest: str = ""
     runtime_binding_id: str | None = None
+    wake_ref: str | None = None
+    accepted_candidate_receipt_digest: str | None = None
     stale_diagnosis_packet: StaleDiagnosisPacket | None = None
     stale_follow_up_kind: StaleFollowUpKind | None = None
 
@@ -866,6 +970,407 @@ class WorkRunAction:
 
 
 @dataclass(frozen=True)
+class ResultIntegrityProof:
+    accepted_candidate_receipt_digest: str
+    candidate_commit_oid: str
+    candidate_tree_oid: str
+    candidate_diff_record_digest: str
+    batch_delivery_receipt_digest: str
+    batch_delivery_stable_action_id: str
+    batch_delivery_request_digest: str
+    batch_delivery_batch_id: str
+    batch_delivery_batch_sha: str
+    batch_delivery_proof_digest: str
+    delivery_stable_action_id: str
+    delivery_request_digest: str
+    batch_id: str
+    batch_sha: str
+    delivery_member_ticket_keys: tuple[str, ...]
+    local_check_receipt_digest: str
+    publication_receipt_digest: str
+    pull_request_number: int
+    pull_request_head_sha: str
+    hosted_result_receipt_digest: str
+    integration_lease_digest: str
+    target_branch: str
+    target_head_sha: str
+    target_readback_digest: str
+    target_contains_batch_sha: bool
+    pull_request_merge_target_sha: str
+    merge_method: Literal["merge"]
+    result_digest: str
+    evidence_digests: tuple[str, ...]
+
+    def canonical(self) -> dict[str, object]:
+        return {
+            "accepted_candidate_receipt_digest": self.accepted_candidate_receipt_digest,
+            "candidate_commit_oid": self.candidate_commit_oid,
+            "candidate_tree_oid": self.candidate_tree_oid,
+            "candidate_diff_record_digest": self.candidate_diff_record_digest,
+            "batch_delivery_receipt_digest": self.batch_delivery_receipt_digest,
+            "batch_delivery_stable_action_id": self.batch_delivery_stable_action_id,
+            "batch_delivery_request_digest": self.batch_delivery_request_digest,
+            "batch_delivery_batch_id": self.batch_delivery_batch_id,
+            "batch_delivery_batch_sha": self.batch_delivery_batch_sha,
+            "batch_delivery_proof_digest": self.batch_delivery_proof_digest,
+            "delivery_stable_action_id": self.delivery_stable_action_id,
+            "delivery_request_digest": self.delivery_request_digest,
+            "batch_id": self.batch_id,
+            "batch_sha": self.batch_sha,
+            "delivery_member_ticket_keys": list(self.delivery_member_ticket_keys),
+            "local_check_receipt_digest": self.local_check_receipt_digest,
+            "publication_receipt_digest": self.publication_receipt_digest,
+            "pull_request_number": self.pull_request_number,
+            "pull_request_head_sha": self.pull_request_head_sha,
+            "hosted_result_receipt_digest": self.hosted_result_receipt_digest,
+            "integration_lease_digest": self.integration_lease_digest,
+            "target_branch": self.target_branch,
+            "target_head_sha": self.target_head_sha,
+            "target_readback_digest": self.target_readback_digest,
+            "target_contains_batch_sha": self.target_contains_batch_sha,
+            "pull_request_merge_target_sha": self.pull_request_merge_target_sha,
+            "merge_method": self.merge_method,
+            "result_digest": self.result_digest,
+            "evidence_digests": list(self.evidence_digests),
+        }
+
+    def delivery_proof_body(self) -> dict[str, object]:
+        return {
+            "delivery_stable_action_id": self.delivery_stable_action_id,
+            "delivery_request_digest": self.delivery_request_digest,
+            "batch_id": self.batch_id,
+            "batch_sha": self.batch_sha,
+            "member_ticket_keys": list(self.delivery_member_ticket_keys),
+            "local_check_receipt_digest": self.local_check_receipt_digest,
+            "publication_receipt_digest": self.publication_receipt_digest,
+            "pull_request_number": self.pull_request_number,
+            "pull_request_head_sha": self.pull_request_head_sha,
+            "hosted_result_receipt_digest": self.hosted_result_receipt_digest,
+            "integration_lease_digest": self.integration_lease_digest,
+            "target_branch": self.target_branch,
+            "target_head_sha": self.target_head_sha,
+            "target_readback_digest": self.target_readback_digest,
+            "target_contains_batch_sha": self.target_contains_batch_sha,
+            "pull_request_merge_target_sha": self.pull_request_merge_target_sha,
+            "merge_method": self.merge_method,
+        }
+
+    def canonical_without_result_digest(self) -> dict[str, object]:
+        value = self.canonical()
+        value.pop("result_digest")
+        return value
+
+    @classmethod
+    def from_batch_observation(
+        cls,
+        action: BatchDeliveryAction,
+        request: BatchDeliveryRequest,
+        observation: BatchDeliveryObservation,
+        accepted_candidate: AcceptedCandidateReceipt,
+    ) -> "ResultIntegrityProof":
+        if observation.phase != "complete":
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "only a terminal complete Batch observation can prove a Result",
+            )
+        try:
+            observation.canonical()
+        except DeliveryIdentityMismatch as error:
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Batch observation failed its exact proof-partition receipt",
+            ) from error
+        if observation.receipt_digest != digest_value(
+            {"kind": "batch-observation.v1", **observation.body()}
+        ):
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Batch observation receipt does not cover its exact proof partition",
+            )
+        if (
+            action.stable_action_id != request.stable_action_id
+            or action.request_digest != request.request_digest
+            or observation.stable_action_id != action.stable_action_id
+            or observation.batch_id != action.batch_id
+            or observation.batch_sha != action.batch_sha
+            or tuple(action.member_ticket_keys)
+            != tuple(member.ticket_key for member in observation.members)
+        ):
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Batch parent action, request, or observation identity changed",
+            )
+        proof_ticket_keys = tuple(
+            ticket_key
+            for delivery_proof in observation.delivery_proofs
+            for ticket_key in delivery_proof.member_ticket_keys
+        )
+        if (
+            proof_ticket_keys != tuple(action.member_ticket_keys)
+            or len(set(proof_ticket_keys)) != len(proof_ticket_keys)
+            or any(member.status != "integrated" for member in observation.members)
+            or len(
+                {
+                    delivery_proof.delivery_stable_action_id
+                    for delivery_proof in observation.delivery_proofs
+                }
+            )
+            != len(observation.delivery_proofs)
+            or len(
+                {delivery_proof.batch_id for delivery_proof in observation.delivery_proofs}
+            )
+            != len(observation.delivery_proofs)
+            or len(
+                {delivery_proof.batch_sha for delivery_proof in observation.delivery_proofs}
+            )
+            != len(observation.delivery_proofs)
+        ):
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Batch delivery proofs do not partition integrated members exactly",
+            )
+        request_matches = tuple(
+            candidate
+            for candidate in request.accepted_candidates
+            if candidate.ticket_key == accepted_candidate.ticket_key
+        )
+        if len(request_matches) != 1 or request_matches[0] != accepted_candidate:
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "accepted Candidate is not the exact member of this Batch request",
+            )
+        member_matches = tuple(
+            member
+            for member in observation.members
+            if member.ticket_key == accepted_candidate.ticket_key
+        )
+        if (
+            len(member_matches) != 1
+            or member_matches[0].work_run_key != accepted_candidate.work_run_key
+            or member_matches[0].candidate_sha != accepted_candidate.candidate_sha
+            or member_matches[0].status != "integrated"
+            or member_matches[0].evidence_digests
+            != accepted_candidate.evidence_digests
+        ):
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Batch member readback changed Candidate or Evidence identity",
+            )
+        selected = tuple(
+            delivery_proof
+            for delivery_proof in observation.delivery_proofs
+            if accepted_candidate.ticket_key in delivery_proof.member_ticket_keys
+        )
+        if len(selected) != 1:
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Candidate does not map to exactly one delivery proof",
+            )
+        delivery_proof = selected[0]
+        try:
+            delivery_proof.canonical()
+        except DeliveryIdentityMismatch as error:
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "selected Batch delivery proof failed canonical validation",
+            ) from error
+        if observation.fallback_generation == 0:
+            if (
+                delivery_proof.delivery_stable_action_id != action.stable_action_id
+                or delivery_proof.delivery_request_digest != action.request_digest
+                or delivery_proof.batch_id != action.batch_id
+                or delivery_proof.batch_sha != action.batch_sha
+            ):
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    "direct delivery proof differs from the parent Batch action",
+                )
+        elif observation.fallback_generation == 1:
+            if (
+                delivery_proof.delivery_stable_action_id == action.stable_action_id
+                or delivery_proof.member_ticket_keys
+                != (accepted_candidate.ticket_key,)
+            ):
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    "fallback Result did not select its exact Singleton proof",
+                )
+        else:
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "completed Batch has an invalid fallback generation",
+            )
+        members_by_ticket = {member.ticket_key: member for member in observation.members}
+        proof_members = tuple(
+            members_by_ticket[ticket_key]
+            for ticket_key in delivery_proof.member_ticket_keys
+        )
+        evidence_digests = tuple(
+            sorted(
+                digest
+                for member in proof_members
+                for digest in member.evidence_digests
+            )
+        )
+        if not evidence_digests:
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "selected delivery proof has no canonical member Evidence",
+            )
+        proof = cls(
+            accepted_candidate_receipt_digest=accepted_candidate.digest,
+            candidate_commit_oid=accepted_candidate.candidate_sha,
+            candidate_tree_oid=accepted_candidate.candidate_tree_oid,
+            candidate_diff_record_digest=accepted_candidate.diff_record_digest,
+            batch_delivery_receipt_digest=observation.receipt_digest,
+            batch_delivery_stable_action_id=observation.stable_action_id,
+            batch_delivery_request_digest=action.request_digest,
+            batch_delivery_batch_id=observation.batch_id,
+            batch_delivery_batch_sha=observation.batch_sha,
+            batch_delivery_proof_digest=delivery_proof.proof_digest,
+            delivery_stable_action_id=delivery_proof.delivery_stable_action_id,
+            delivery_request_digest=delivery_proof.delivery_request_digest,
+            batch_id=delivery_proof.batch_id,
+            batch_sha=delivery_proof.batch_sha,
+            delivery_member_ticket_keys=delivery_proof.member_ticket_keys,
+            local_check_receipt_digest=delivery_proof.local_check_receipt_digest,
+            publication_receipt_digest=delivery_proof.publication_receipt_digest,
+            pull_request_number=delivery_proof.pull_request_number,
+            pull_request_head_sha=delivery_proof.pull_request_head_sha,
+            hosted_result_receipt_digest=delivery_proof.hosted_result_receipt_digest,
+            integration_lease_digest=delivery_proof.integration_lease_digest,
+            target_branch=delivery_proof.target_branch,
+            target_head_sha=delivery_proof.target_head_sha,
+            target_readback_digest=delivery_proof.target_readback_digest,
+            target_contains_batch_sha=delivery_proof.target_contains_batch_sha,
+            pull_request_merge_target_sha=delivery_proof.pull_request_merge_target_sha,
+            merge_method=delivery_proof.merge_method,
+            result_digest="",
+            evidence_digests=evidence_digests,
+        )
+        return replace(proof, result_digest=proof.expected_result_digest())
+
+    def expected_result_digest(self) -> str:
+        return digest_value(
+            {
+                "kind": "gwo.result.v1",
+                **self.canonical_without_result_digest(),
+            }
+        )
+
+    def expected_batch_delivery_proof_digest(self) -> str:
+        return digest_value(
+            {
+                "kind": "batch-delivery-proof.v1",
+                **self.delivery_proof_body(),
+            }
+        )
+
+    def validate_for(self, action: WorkRunAction, target_branch: str) -> None:
+        digest_pattern = re.compile(r"[0-9a-f]{64}\Z")
+        object_pattern = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+        for name, value in self.canonical().items():
+            if name.endswith("digest") and (
+                not isinstance(value, str) or digest_pattern.fullmatch(value) is None
+            ):
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    f"{name} is not a lowercase SHA-256 digest",
+                )
+        for name in (
+            "candidate_commit_oid",
+            "candidate_tree_oid",
+            "batch_delivery_batch_sha",
+            "batch_sha",
+            "pull_request_head_sha",
+            "target_head_sha",
+            "pull_request_merge_target_sha",
+        ):
+            if object_pattern.fullmatch(getattr(self, name)) is None:
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    f"{name} is not a lowercase Git object identity",
+                )
+        if (
+            not isinstance(self.batch_delivery_stable_action_id, str)
+            or not self.batch_delivery_stable_action_id
+            or not isinstance(self.delivery_stable_action_id, str)
+            or not self.delivery_stable_action_id
+            or not isinstance(self.batch_delivery_batch_id, str)
+            or not self.batch_delivery_batch_id
+            or not isinstance(self.batch_id, str)
+            or not self.batch_id
+            or digest_pattern.fullmatch(self.batch_delivery_batch_id) is None
+            or digest_pattern.fullmatch(self.batch_id) is None
+            or type(self.pull_request_number) is not int
+            or self.pull_request_number <= 0
+            or type(self.delivery_member_ticket_keys) is not tuple
+            or not self.delivery_member_ticket_keys
+            or any(
+                not isinstance(ticket_key, str) or not ticket_key
+                for ticket_key in self.delivery_member_ticket_keys
+            )
+            or len(set(self.delivery_member_ticket_keys))
+            != len(self.delivery_member_ticket_keys)
+            or action.ticket_key not in self.delivery_member_ticket_keys
+        ):
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Result delivery action, PR, Batch, or member identity is invalid",
+            )
+        if (
+            self.batch_delivery_proof_digest
+            != self.expected_batch_delivery_proof_digest()
+        ):
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Result changed a field copied from the Batch delivery proof",
+            )
+        if self.target_branch != target_branch:
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Result target branch differs from the active PlanSpec target",
+            )
+        if self.target_contains_batch_sha is not True:
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "target readback does not prove the Batch SHA",
+            )
+        if self.pull_request_head_sha != self.batch_sha:
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "pull request head is not the exact Batch SHA",
+            )
+        if self.pull_request_merge_target_sha != self.target_head_sha:
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "pull request merge target is not the target readback head",
+            )
+        if self.merge_method != "merge":
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Result delivery did not use an identity-preserving merge",
+            )
+        if not self.evidence_digests or tuple(self.evidence_digests) != tuple(
+            sorted(self.evidence_digests)
+        ):
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Result Evidence is empty or not canonical",
+            )
+        if any(digest_pattern.fullmatch(digest) is None for digest in self.evidence_digests):
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Result Evidence contains a non-SHA-256 digest",
+            )
+        if self.result_digest != self.expected_result_digest():
+            raise ExecutionKernelError(
+                "RESULT_INTEGRITY_INVALID",
+                "Result digest does not cover the exact delivery proof",
+            )
+
+
+@dataclass(frozen=True)
 class WorkRunObservation:
     """A durable readback emitted by the deep module owning an effect.
 
@@ -885,10 +1390,11 @@ class WorkRunObservation:
     evidence_digests: tuple[str, ...] = ()
     candidate_receipt: CandidateReceipt | None = None
     runtime_binding_id: str | None = None
-    agent_id: str | None = None
-    session_id: str | None = None
-    workspace_id: str | None = None
-    terminal_binding_evidence: TerminalBindingEvidence | None = None
+    accepted_candidate_receipt_digest: str | None = None
+    candidate_diff_record_digest: str | None = None
+    delivery_receipt_digest: str | None = None
+    result_integrity: ResultIntegrityProof | None = None
+    plan_invalidation: PlanInvalidationObservation | None = None
 
     _PHASES = frozenset(
         {
@@ -906,6 +1412,60 @@ class WorkRunObservation:
             "quiescent",
         }
     )
+
+    def __init__(
+        self,
+        phase: str,
+        stable_action_id: str,
+        receipt_digest: str,
+        reason: str | None = None,
+        next_check_at: str | None = None,
+        binding_established: bool = True,
+        candidate_identity: str | None = None,
+        result_digest: str | None = None,
+        evidence_digests: tuple[str, ...] = (),
+        candidate_receipt: CandidateReceipt | None = None,
+        runtime_binding_id: str | None = None,
+        accepted_candidate_receipt_digest: str | None = None,
+        candidate_diff_record_digest: str | None = None,
+        delivery_receipt_digest: str | None = None,
+        result_integrity: ResultIntegrityProof | None = None,
+        plan_invalidation: PlanInvalidationObservation | None = None,
+        *,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        workspace_id: str | None = None,
+        terminal_binding_evidence: TerminalBindingEvidence | None = None,
+    ) -> None:
+        object.__setattr__(self, "phase", phase)
+        object.__setattr__(self, "stable_action_id", stable_action_id)
+        object.__setattr__(self, "receipt_digest", receipt_digest)
+        object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "next_check_at", next_check_at)
+        object.__setattr__(self, "binding_established", binding_established)
+        object.__setattr__(self, "candidate_identity", candidate_identity)
+        object.__setattr__(self, "result_digest", result_digest)
+        object.__setattr__(self, "evidence_digests", evidence_digests)
+        object.__setattr__(self, "candidate_receipt", candidate_receipt)
+        object.__setattr__(self, "runtime_binding_id", runtime_binding_id)
+        object.__setattr__(
+            self,
+            "accepted_candidate_receipt_digest",
+            accepted_candidate_receipt_digest,
+        )
+        object.__setattr__(
+            self,
+            "candidate_diff_record_digest",
+            candidate_diff_record_digest,
+        )
+        object.__setattr__(self, "delivery_receipt_digest", delivery_receipt_digest)
+        object.__setattr__(self, "result_integrity", result_integrity)
+        object.__setattr__(self, "plan_invalidation", plan_invalidation)
+        object.__setattr__(self, "agent_id", agent_id)
+        object.__setattr__(self, "session_id", session_id)
+        object.__setattr__(self, "workspace_id", workspace_id)
+        object.__setattr__(self, "terminal_binding_evidence", terminal_binding_evidence)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if self.phase not in self._PHASES:
@@ -994,12 +1554,120 @@ class WorkRunObservation:
             )
         if (
             self.candidate_receipt is not None
+            and self.phase != "completed"
             and self.receipt_digest != self.candidate_receipt.digest
         ):
             raise ExecutionKernelError(
                 "WORK_RUN_OBSERVATION_INVALID",
                 "effect receipt digest does not bind CandidateReceipt",
             )
+        for digest, label in (
+            (self.accepted_candidate_receipt_digest, "accepted Candidate receipt"),
+            (self.candidate_diff_record_digest, "Candidate diff record"),
+            (self.delivery_receipt_digest, "delivery receipt"),
+        ):
+            if digest is not None and (
+                type(digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise ExecutionKernelError(
+                    "WORK_RUN_OBSERVATION_INVALID",
+                    f"{label} digest is invalid",
+                )
+        if self.result_integrity is not None and type(
+            self.result_integrity
+        ) is not ResultIntegrityProof:
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "Result integrity proof is not an exact ResultIntegrityProof",
+            )
+        if self.plan_invalidation is not None and type(
+            self.plan_invalidation
+        ) is not PlanInvalidationObservation:
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "Plan Invalidation observation is not exact",
+            )
+        if self.phase == "completed":
+            if (
+                self.candidate_receipt is None
+                or self.accepted_candidate_receipt_digest is None
+                or self.candidate_diff_record_digest is None
+                or self.delivery_receipt_digest is None
+                or self.result_integrity is None
+                or self.result_digest is None
+            ) and not (
+                (self.result_digest is None and not self.evidence_digests)
+                or (self.result_digest is not None and self.evidence_digests)
+            ):
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_REQUIRED",
+                    "completed Work Run observations require exact Result integrity",
+                )
+        elif self.phase == "accepted_awaiting_delivery":
+            if (
+                self.candidate_receipt is not None
+                or self.accepted_candidate_receipt_digest is not None
+                or self.candidate_diff_record_digest is not None
+            ) and (
+                self.candidate_receipt is None
+                or self.accepted_candidate_receipt_digest is None
+                or self.candidate_diff_record_digest is None
+            ):
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_REQUIRED",
+                    "accepted Candidate observations require exact Candidate receipts",
+                )
+            if (
+                self.result_digest is not None
+                or self.evidence_digests
+                or self.delivery_receipt_digest is not None
+                or self.result_integrity is not None
+            ):
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    "accepted Candidate observations cannot carry a Result",
+                )
+
+    def canonical(self) -> dict[str, object]:
+        return {"kind": "work_run_observation.v1", **_dataclass_fields(self)}
+
+    @classmethod
+    def from_canonical(
+        cls,
+        value: Mapping[str, object],
+    ) -> "WorkRunObservation":
+        if value.get("kind") != "work_run_observation.v1":
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "WorkRun observation kind is not exact",
+            )
+        data = dict(value)
+        data.pop("kind")
+        expected = {item.name for item in fields(cls)}
+        if set(data) != expected:
+            raise ExecutionKernelError(
+                "WORK_RUN_OBSERVATION_INVALID",
+                "Work Run observation fields are not exact",
+            )
+        if isinstance(data.get("candidate_receipt"), dict):
+            data["candidate_receipt"] = CandidateReceipt.from_canonical(
+                data["candidate_receipt"]
+            )
+        if isinstance(data.get("plan_invalidation"), dict):
+            data["plan_invalidation"] = PlanInvalidationObservation.from_canonical(
+                data["plan_invalidation"]
+            )
+        if isinstance(data.get("result_integrity"), dict):
+            proof = dict(data["result_integrity"])
+            proof["evidence_digests"] = tuple(proof["evidence_digests"])
+            proof["delivery_member_ticket_keys"] = tuple(
+                proof["delivery_member_ticket_keys"]
+            )
+            data["result_integrity"] = ResultIntegrityProof(**proof)
+        if isinstance(data.get("evidence_digests"), list):
+            data["evidence_digests"] = tuple(data["evidence_digests"])
+        return cls(**data)
 
     @classmethod
     def running(cls, stable_action_id: str) -> "WorkRunObservation":
@@ -1690,6 +2358,11 @@ class ExecutionKernel:
             exclusive_resources=tuple(run.get("exclusive_resources", ())),
             work_subject_digest=run.get("work_subject_digest", ""),
             candidate_identity=run.get("candidate_identity"),
+            accepted_candidate_receipt_digest=run.get(
+                "accepted_candidate_receipt_digest"
+            ),
+            candidate_diff_record_digest=run.get("candidate_diff_record_digest"),
+            delivery_receipt_digest=run.get("delivery_receipt_digest"),
             result_digest=run.get("result_digest"),
             evidence_digests=tuple(run.get("evidence_digests", ())),
             last_wake_ref=run.get("last_wake_ref"),
@@ -3151,10 +3824,14 @@ class ExecutionKernel:
                     ),
                     "exclusive_resources": list(work[key].get("exclusive_resources", [])),
                     "claim_state": "unclaimed",
-                    "candidate_identity": None,
-                    "candidate_receipt": None,
-                    "candidate_receipt_digest": None,
-                    "candidate_commit_oids": [],
+                     "candidate_identity": None,
+                     "candidate_receipt": None,
+                     "candidate_receipt_digest": None,
+                     "accepted_candidate_receipt_digest": None,
+                     "candidate_diff_record_digest": None,
+                     "delivery_receipt_digest": None,
+                     "result_integrity": None,
+                     "candidate_commit_oids": [],
                     "candidate_receipt_digests": [],
                     "trusted_progress_revision": 0,
                     "result_digest": None,
@@ -3297,6 +3974,15 @@ class ExecutionKernel:
             if "candidate_receipt_digest" not in run:
                 run["candidate_receipt_digest"] = None
                 dirty = True
+            for field in (
+                "accepted_candidate_receipt_digest",
+                "candidate_diff_record_digest",
+                "delivery_receipt_digest",
+                "result_integrity",
+            ):
+                if field not in run:
+                    run[field] = None
+                    dirty = True
             if "candidate_commit_oids" not in run:
                 run.setdefault("candidate_commit_oids", [])
                 dirty = True
@@ -4276,6 +4962,10 @@ class ExecutionKernel:
             "candidate_identity": None,
             "candidate_receipt": None,
             "candidate_receipt_digest": None,
+            "accepted_candidate_receipt_digest": None,
+            "candidate_diff_record_digest": None,
+            "delivery_receipt_digest": None,
+            "result_integrity": None,
             "candidate_commit_oids": [],
             "candidate_receipt_digests": [],
             "trusted_progress_revision": 0,
@@ -4425,6 +5115,20 @@ class ExecutionKernel:
         *,
         resuming: bool,
     ) -> str:
+        if run["phase"] == "accepted_awaiting_delivery":
+            return digest_value(
+                {
+                    "kind": "work-run.batch-delivery.v1",
+                    "repository": active.handle.repository,
+                    "campaign_key": active.handle.campaign_key,
+                    "plan_revision_digest": active.current_revision_digest,
+                    "ticket_key": ticket_key,
+                    "work_run_key": run["work_run_key"],
+                    "accepted_candidate_receipt_digest": run[
+                        "accepted_candidate_receipt_digest"
+                    ],
+                }
+            )
         kind = "semantic_resume" if resuming else "semantic_execution"
         return digest_value(
             {
@@ -4448,6 +5152,9 @@ class ExecutionKernel:
             run.get("slot_held"),
             run.get("claim_state"),
             run.get("candidate_identity"),
+            run.get("accepted_candidate_receipt_digest"),
+            run.get("candidate_diff_record_digest"),
+            run.get("delivery_receipt_digest"),
             run.get("result_digest"),
             tuple(run.get("evidence_digests", ())),
             run.get("runtime_binding_id"),
@@ -5351,6 +6058,29 @@ class ExecutionKernel:
                     continue
                 run["reason"] = None
                 return ticket_key
+        for ticket_key in sorted(work):
+            run = state["runs"][ticket_key]
+            if run["phase"] != "accepted_awaiting_delivery":
+                continue
+            if (
+                run.get("accepted_candidate_receipt_digest") is None
+                or run.get("candidate_diff_record_digest") is None
+                or run.get("candidate_receipt") is None
+            ):
+                continue
+            action_id = self._effect_action_id(
+                active, ticket_key, run, resuming=False
+            )
+            effect = state["effects"].get(action_id)
+            if (
+                wake_ref is None
+                and run.get("last_action_id") == action_id
+                and type(effect) is dict
+                and effect.get("state") == "read_back"
+            ):
+                continue
+            run["reason"] = None
+            return ticket_key
         for ticket_key in sorted(work):
             run = state["runs"][ticket_key]
             # A durable invalidation record fences this Work Run even if the
@@ -6326,10 +7056,17 @@ class ExecutionKernel:
                 return self._perform_stale_effect(active, state, ticket_key)
         trusted_before = self._trusted_lifecycle_projection(run)
         trusted_progress_recorded = False
+        is_batch_delivery = run["phase"] == "accepted_awaiting_delivery"
         resuming = run["phase"] == "parked" or bool(
             run.get("resume_after_invalidation")
         )
-        kind = "semantic_resume" if resuming else "semantic_execution"
+        kind = (
+            "batch_delivery"
+            if is_batch_delivery
+            else "semantic_resume"
+            if resuming
+            else "semantic_execution"
+        )
         action_id = self._effect_action_id(
             active, ticket_key, run, resuming=resuming
         )
@@ -6345,6 +7082,10 @@ class ExecutionKernel:
             work_run_key=run["work_run_key"],
             work_subject_digest=run["work_subject_digest"],
             runtime_binding_id=run.get("runtime_binding_id"),
+            wake_ref=wake_ref,
+            accepted_candidate_receipt_digest=run.get(
+                "accepted_candidate_receipt_digest"
+            ),
         )
         # The intent becomes durable before the external boundary.  A restart
         # observes this same identity through the effect owner before retry.
@@ -6528,6 +7269,21 @@ class ExecutionKernel:
             state.clear()
             state.update(persisted_state)
             run = state["runs"][ticket_key]
+        for field in (
+            "accepted_candidate_receipt_digest",
+            "candidate_diff_record_digest",
+            "delivery_receipt_digest",
+        ):
+            value = getattr(observation, field)
+            if value is None:
+                continue
+            existing = run.get(field)
+            if existing is not None and existing != value:
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    f"{field} changed during Work Run readback",
+                )
+            run[field] = value
         if candidate_budget_exhausted:
             self._mark_candidate_budget_exhausted(run, ticket_key)
         else:
@@ -6566,17 +7322,89 @@ class ExecutionKernel:
             "receipt_digest": observation.receipt_digest,
             **effect_identity,
         }
-        if not candidate_budget_exhausted and observation.phase == "completed":
+        if (
+            not candidate_budget_exhausted
+            and observation.phase == "completed"
+            and action.kind != "batch_delivery"
+        ):
+            if observation.result_digest is not None:
+                try:
+                    plan = load_canonical_json(active.plan_spec_bytes)
+                except CanonicalJsonError as error:  # pragma: no cover - validated earlier
+                    raise ExecutionKernelError(
+                        "ACTIVE_PLAN_INVALID", "PlanSpec bytes are not canonical"
+                    ) from error
+                binding = AcceptedResultBinding(
+                    ticket_key=ticket_key,
+                    result_digest=observation.result_digest,
+                    evidence_digests=observation.evidence_digests,
+                    work_subject_digest=run["work_subject_digest"],
+                    target_facts_digest=_target_facts_digest_for_kernel(plan),
+                )
+                state["accepted_results"] = [
+                    value
+                    for value in state["accepted_results"]
+                    if value["ticket_key"] != ticket_key
+                ] + [binding.canonical()]
+                state["accepted_results"].sort(
+                    key=lambda value: value["ticket_key"]
+                )
+                run["result_digest"] = binding.result_digest
+                run["evidence_digests"] = list(binding.evidence_digests)
+        if (
+            not candidate_budget_exhausted
+            and observation.phase == "completed"
+            and action.kind == "batch_delivery"
+        ):
             try:
                 plan = load_canonical_json(active.plan_spec_bytes)
             except CanonicalJsonError as error:  # pragma: no cover - validated earlier
                 raise ExecutionKernelError(
                     "ACTIVE_PLAN_INVALID", "PlanSpec bytes are not canonical"
                 ) from error
+            proof = observation.result_integrity
+            if action.kind != "batch_delivery" or proof is None:
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_REQUIRED",
+                    "completed Work Run observations require a Batch delivery proof",
+                )
+            try:
+                proof.validate_for(action, plan["target_branch"])
+            except ExecutionKernelError:
+                raise
+            except Exception as error:
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    "Result integrity proof failed exact validation",
+                ) from error
+            candidate = observation.candidate_receipt
+            if candidate is None:
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_REQUIRED",
+                    "completed Work Run observations require the Candidate receipt",
+                )
+            if (
+                proof.batch_delivery_stable_action_id != action.stable_action_id
+                or proof.accepted_candidate_receipt_digest
+                != run.get("accepted_candidate_receipt_digest")
+                or proof.candidate_diff_record_digest
+                != run.get("candidate_diff_record_digest")
+                or proof.batch_delivery_receipt_digest
+                != observation.delivery_receipt_digest
+                or proof.candidate_commit_oid != candidate.candidate_commit_oid
+                or proof.candidate_tree_oid != candidate.candidate_tree_oid
+                or proof.candidate_diff_record_digest != candidate.diff_record_digest
+                or observation.result_digest != proof.result_digest
+            ):
+                raise ExecutionKernelError(
+                    "RESULT_INTEGRITY_INVALID",
+                    "Result proof is not bound to the exact Candidate and delivery readback",
+                )
+            run["result_integrity"] = proof.canonical()
             binding = AcceptedResultBinding(
                 ticket_key=ticket_key,
-                result_digest=observation.result_digest or observation.receipt_digest,
-                evidence_digests=observation.evidence_digests,
+                result_digest=proof.result_digest,
+                evidence_digests=proof.evidence_digests,
                 work_subject_digest=run["work_subject_digest"],
                 target_facts_digest=_target_facts_digest_for_kernel(plan),
             )

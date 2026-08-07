@@ -9,17 +9,27 @@ from gwo_v8._canonical import digest_value
 from gwo_v8.batch_integrator import (
     BatchDeliveryAction,
     BatchDeliveryObservation,
+    BatchDeliveryProof,
     BatchDeliveryRequest,
 )
 from gwo_v8.candidate_gate import (
     AcceptedCandidateReceipt,
+    AssuranceMode,
+    AssuranceRequirement,
+    CandidateDiffRecordV1,
     CandidateGateParent,
     CandidateGateResult,
+    CandidateGateStatus,
     CandidateIdentity,
+    CandidateReceipt,
+    InteractionClassification,
+    InteractionKey,
     PlanInvalidationEvidence,
     RepairPacket,
+    ReviewSubject,
 )
 from gwo_v8.execution_kernel import (
+    ResultIntegrityProof,
     StaleBindingObservation,
     StaleDiagnosisObservation,
     WorkRunAction,
@@ -38,6 +48,259 @@ from gwo_v8.runtime_gateway import (
 )
 from gwo_v8.runtime_profile import RuntimeProfile
 from v8_successor_test_support import _StaticPlanReader, _minimal_active_campaign
+
+
+def make_candidate_receipt(action: WorkRunAction) -> CandidateReceipt:
+    diff_record = CandidateDiffRecordV1(
+        schema_version="CandidateDiffRecordV1",
+        repository_object_format="sha1",
+        base_commit_oid="2" * 40,
+        base_tree_oid="3" * 40,
+        candidate_commit_oid="4" * 40,
+        candidate_tree_oid="5" * 40,
+        entries=(),
+    )
+    return CandidateReceipt(
+        parent_digest="1" * 64,
+        repository=action.repository,
+        campaign_key=action.campaign_key,
+        campaign_handle=action.campaign_key,
+        plan_revision_digest=action.plan_revision_digest,
+        work_run_key=action.work_run_key or f"work-run:{action.ticket_key}",
+        ticket_key=action.ticket_key,
+        reported_reference="refs/heads/candidate",
+        base_commit_oid="2" * 40,
+        base_tree_oid="3" * 40,
+        candidate_commit_oid="4" * 40,
+        candidate_tree_oid="5" * 40,
+        diff_schema_version="CandidateDiffRecordV1",
+        diff_record_digest=diff_record.digest,
+        authority_subtree_digest="7" * 64,
+        runtime_subject_digest=action.work_subject_digest or "8" * 64,
+    )
+
+
+def _candidate_gate_identity(
+    candidate: CandidateReceipt,
+) -> tuple[CandidateDiffRecordV1, AssuranceRequirement, ReviewSubject]:
+    record = CandidateDiffRecordV1(
+        schema_version="CandidateDiffRecordV1",
+        repository_object_format="sha1",
+        base_commit_oid=candidate.base_commit_oid,
+        base_tree_oid=candidate.base_tree_oid,
+        candidate_commit_oid=candidate.candidate_commit_oid,
+        candidate_tree_oid=candidate.candidate_tree_oid,
+        entries=(),
+        record_digest=candidate.diff_record_digest,
+    )
+    requirement = AssuranceRequirement(
+        policy_id="test-policy",
+        policy_version="v1",
+        mode=AssuranceMode.STANDARD,
+        required_check_ids=("candidate-check",),
+        standards=(),
+    )
+    subject = ReviewSubject(
+        parent_digest=candidate.parent_digest,
+        candidate_receipt_digest=candidate.digest,
+        runtime_subject_digest=candidate.runtime_subject_digest,
+        candidate_digest="a" * 64,
+        candidate_audit_digest="b" * 64,
+        ticket_contract_digest="c" * 64,
+        policy_witness_digest="9" * 64,
+        base_commit_oid=candidate.base_commit_oid,
+        base_tree_oid=candidate.base_tree_oid,
+        candidate_commit_oid=candidate.candidate_commit_oid,
+        candidate_tree_oid=candidate.candidate_tree_oid,
+        diff_schema_version=candidate.diff_schema_version,
+        diff_record_digest=record.digest,
+        standards=(),
+        check_evidence_digests=(),
+        assurance_requirement_digest=requirement.digest,
+    )
+    return record, requirement, subject
+
+
+def make_accepted_candidate_receipt(
+    action: WorkRunAction,
+    candidate: CandidateReceipt | None = None,
+) -> AcceptedCandidateReceipt:
+    candidate = candidate or make_candidate_receipt(action)
+    record, requirement, subject = _candidate_gate_identity(candidate)
+    return AcceptedCandidateReceipt(
+        repository=action.repository,
+        campaign_key=action.campaign_key,
+        plan_revision_digest=action.plan_revision_digest,
+        target_branch="main",
+        ticket_key=action.ticket_key,
+        work_run_key=candidate.work_run_key,
+        integration_node_key=f"integration:{action.ticket_key}",
+        accepted_sequence=1,
+        base_sha=candidate.base_commit_oid,
+        base_tree_oid=candidate.base_tree_oid,
+        candidate_sha=candidate.candidate_commit_oid,
+        candidate_tree_oid=candidate.candidate_tree_oid,
+        candidate_receipt_digest=candidate.digest,
+        diff_schema_version=candidate.diff_schema_version,
+        diff_record_digest=record.digest,
+        authority_subtree_digest=candidate.authority_subtree_digest,
+        policy_witness_digest="9" * 64,
+        review_subject_digest=subject.digest,
+        assurance="standard",
+        assurance_requirement_digest=requirement.digest,
+        check_environment_digest="c" * 64,
+        delivery_identity_digest="d" * 64,
+        interaction_keys=(
+            InteractionKey(
+                "candidate-path",
+                "src/main.py",
+                InteractionClassification.ORDINARY,
+            ),
+        ),
+        protected_surfaces=(),
+        gitlink_change=False,
+        evidence_digests=("e" * 64,),
+        review_finding_ledger_digest="f" * 64,
+    )
+
+
+def accepted_candidate_result(action: WorkRunAction) -> CandidateGateResult:
+    candidate = make_candidate_receipt(action)
+    record, requirement, subject = _candidate_gate_identity(candidate)
+    return CandidateGateResult(
+        status=CandidateGateStatus.REVIEW_ACCEPTED,
+        evidence=(),
+        candidate_receipt=candidate,
+        candidate_diff_record=record,
+        assurance_requirement=requirement,
+        review_subject=subject,
+        accepted_candidate_receipt=make_accepted_candidate_receipt(action, candidate),
+    )
+
+
+@dataclass
+class OneCandidateOnlyEffects:
+    observations: dict[
+        str,
+        WorkRunObservation | StaleBindingObservation | StaleDiagnosisObservation,
+    ] = field(default_factory=dict)
+
+    def readback(
+        self,
+        action: WorkRunAction,
+    ) -> WorkRunObservation | StaleBindingObservation | StaleDiagnosisObservation | None:
+        return self.observations.get(action.stable_action_id)
+
+    def execute(
+        self,
+        action: WorkRunAction,
+    ) -> WorkRunObservation | StaleBindingObservation | StaleDiagnosisObservation:
+        if action.kind not in {"semantic_execution", "batch_delivery"}:
+            raise AssertionError(f"OneCandidateOnlyEffects received {action.kind}")
+        result = accepted_candidate_result(action)
+        observation = WorkRunObservation(
+            phase="accepted_awaiting_delivery",
+            stable_action_id=action.stable_action_id,
+            runtime_binding_id="binding:test",
+            receipt_digest=result.candidate_receipt.digest,
+            candidate_receipt=result.candidate_receipt,
+            accepted_candidate_receipt_digest=result.accepted_candidate_receipt.digest,
+            candidate_diff_record_digest=result.candidate_receipt.diff_record_digest,
+            result_integrity=None,
+            result_digest=None,
+        )
+        self.observations[action.stable_action_id] = observation
+        return observation
+
+
+def make_result_integrity_proof(
+    action: WorkRunAction,
+    accepted: AcceptedCandidateReceipt,
+    *,
+    target_contains_batch_sha: bool,
+) -> ResultIntegrityProof:
+    delivery = BatchDeliveryProof.create(
+        delivery_stable_action_id=action.stable_action_id,
+        delivery_request_digest="0" * 64,
+        batch_id="2" * 64,
+        batch_sha="2" * 40,
+        member_ticket_keys=(action.ticket_key,),
+        local_check_receipt_digest="3" * 64,
+        publication_receipt_digest="4" * 64,
+        pull_request_number=17,
+        pull_request_head_sha="2" * 40,
+        hosted_result_receipt_digest="5" * 64,
+        integration_lease_digest="6" * 64,
+        target_branch="main",
+        target_head_sha="7" * 40,
+        target_readback_digest="8" * 64,
+        target_contains_batch_sha=target_contains_batch_sha,
+        pull_request_merge_target_sha="7" * 40,
+        merge_method="merge",
+    )
+    proof = ResultIntegrityProof(
+        accepted_candidate_receipt_digest=accepted.digest,
+        candidate_commit_oid=accepted.candidate_sha,
+        candidate_tree_oid=accepted.candidate_tree_oid,
+        candidate_diff_record_digest=accepted.diff_record_digest,
+        batch_delivery_receipt_digest="1" * 64,
+        batch_delivery_stable_action_id=action.stable_action_id,
+        batch_delivery_request_digest="0" * 64,
+        batch_delivery_batch_id=delivery.batch_id,
+        batch_delivery_batch_sha=delivery.batch_sha,
+        batch_delivery_proof_digest=delivery.proof_digest,
+        delivery_stable_action_id=delivery.delivery_stable_action_id,
+        delivery_request_digest=delivery.delivery_request_digest,
+        batch_id=delivery.batch_id,
+        batch_sha=delivery.batch_sha,
+        delivery_member_ticket_keys=delivery.member_ticket_keys,
+        local_check_receipt_digest=delivery.local_check_receipt_digest,
+        publication_receipt_digest=delivery.publication_receipt_digest,
+        pull_request_number=delivery.pull_request_number,
+        pull_request_head_sha=delivery.pull_request_head_sha,
+        hosted_result_receipt_digest=delivery.hosted_result_receipt_digest,
+        integration_lease_digest=delivery.integration_lease_digest,
+        target_branch=delivery.target_branch,
+        target_head_sha=delivery.target_head_sha,
+        target_readback_digest=delivery.target_readback_digest,
+        target_contains_batch_sha=delivery.target_contains_batch_sha,
+        pull_request_merge_target_sha=delivery.pull_request_merge_target_sha,
+        merge_method=delivery.merge_method,
+        result_digest="",
+        evidence_digests=accepted.evidence_digests,
+    )
+    return replace(proof, result_digest=proof.expected_result_digest())
+
+
+@dataclass
+class TamperedDeliveryEffects(OneCandidateOnlyEffects):
+    def execute(
+        self,
+        action: WorkRunAction,
+    ) -> WorkRunObservation | StaleBindingObservation | StaleDiagnosisObservation:
+        if action.kind != "batch_delivery":
+            return super().execute(action)
+        candidate = make_candidate_receipt(action)
+        accepted = make_accepted_candidate_receipt(action, candidate)
+        proof = make_result_integrity_proof(
+            action,
+            accepted,
+            target_contains_batch_sha=False,
+        )
+        observation = WorkRunObservation(
+            phase="completed",
+            stable_action_id=action.stable_action_id,
+            runtime_binding_id=action.runtime_binding_id,
+            receipt_digest="9" * 64,
+            candidate_receipt=candidate,
+            accepted_candidate_receipt_digest=accepted.digest,
+            candidate_diff_record_digest=accepted.diff_record_digest,
+            delivery_receipt_digest="1" * 64,
+            result_digest=proof.result_digest,
+            result_integrity=proof,
+        )
+        self.observations[action.stable_action_id] = observation
+        return observation
 
 
 @dataclass

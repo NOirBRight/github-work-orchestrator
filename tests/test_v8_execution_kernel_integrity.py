@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import fields, is_dataclass, replace
 import sys
 from pathlib import Path
 
@@ -11,7 +12,392 @@ sys.path.insert(0, str(SCRIPTS))
 
 pytest_plugins = ("v8_production_test_support",)
 
-from gwo_v8.execution_kernel import ExecutionKernelError
+from gwo_v8._canonical import digest_value
+from gwo_v8.batch_integrator import (
+    BatchDeliveryAction,
+    BatchDeliveryObservation,
+    BatchDeliveryProof,
+    BatchDeliveryRequest,
+    BatchTarget,
+    HostedSuiteDefinition,
+    LocalSuiteDefinition,
+    MemberDeliveryObservation,
+)
+from gwo_v8.execution_kernel import (
+    ExecutionKernelError,
+    ResultIntegrityProof,
+    StaleBindingObservation,
+    StaleDiagnosisDisposition,
+    StaleDiagnosisObservation,
+    StaleReadbackState,
+    WorkRunAction,
+    WorkRunObservation,
+)
+from v8_production_test_support import (
+    OneCandidateOnlyEffects,
+    TamperedDeliveryEffects,
+    make_accepted_candidate_receipt,
+    make_candidate_receipt,
+    make_result_integrity_proof,
+)
+
+
+def _dataclass_field_names(value_type: type[object]) -> tuple[str, ...]:
+    return tuple(item.name for item in fields(value_type))
+
+
+def test_observation_serializers_preserve_merged_dataclass_fields():
+    for value_type in (
+        WorkRunObservation,
+        StaleBindingObservation,
+        StaleDiagnosisObservation,
+    ):
+        assert is_dataclass(value_type)
+        params = getattr(value_type, "__dataclass_params__", None)
+        assert params is not None
+        assert params.frozen is True
+
+    assert "__post_init__" in WorkRunObservation.__dict__
+    assert "running" in WorkRunObservation.__dict__
+
+    assert _dataclass_field_names(WorkRunObservation) == (
+        "phase",
+        "stable_action_id",
+        "receipt_digest",
+        "reason",
+        "next_check_at",
+        "binding_established",
+        "candidate_identity",
+        "result_digest",
+        "evidence_digests",
+        "candidate_receipt",
+        "runtime_binding_id",
+        "accepted_candidate_receipt_digest",
+        "candidate_diff_record_digest",
+        "delivery_receipt_digest",
+        "result_integrity",
+        "plan_invalidation",
+    )
+    assert _dataclass_field_names(StaleBindingObservation) == (
+        "stable_action_id",
+        "runtime_binding_id",
+        "state",
+        "runtime_readback_digest",
+        "process_readback_digest",
+        "workspace_readback_digest",
+        "campaign_readback_digest",
+        "receipt_digest",
+    )
+    assert _dataclass_field_names(StaleDiagnosisObservation) == (
+        "stable_action_id",
+        "runtime_binding_id",
+        "disposition",
+        "receipt_digest",
+    )
+
+
+def test_observation_serializers_round_trip_merged_union_members():
+    work_run = WorkRunObservation(
+        phase="running",
+        stable_action_id="action:running",
+        receipt_digest="a" * 64,
+        runtime_binding_id="binding:test",
+    )
+    stale_binding = StaleBindingObservation(
+        stable_action_id="action:stale-readback",
+        runtime_binding_id="binding:test",
+        state=StaleReadbackState.IDLE,
+        runtime_readback_digest="b" * 64,
+        process_readback_digest="c" * 64,
+        workspace_readback_digest="d" * 64,
+        campaign_readback_digest="e" * 64,
+        receipt_digest="f" * 64,
+    )
+    stale_diagnosis = StaleDiagnosisObservation(
+        stable_action_id="action:stale-diagnosis",
+        runtime_binding_id="binding:test",
+        disposition=StaleDiagnosisDisposition.CONTINUE,
+        receipt_digest="1" * 64,
+    )
+
+    assert WorkRunObservation.from_canonical(work_run.canonical()) == work_run
+    assert StaleBindingObservation.from_canonical(
+        stale_binding.canonical()
+    ) == stale_binding
+    assert StaleDiagnosisObservation.from_canonical(
+        stale_diagnosis.canonical()
+    ) == stale_diagnosis
+
+
+def test_completed_observation_without_integrity_proof_is_rejected():
+    with pytest.raises(ExecutionKernelError) as raised:
+        WorkRunObservation(
+            phase="completed",
+            stable_action_id="action:completed",
+            receipt_digest="a" * 64,
+            result_digest="b" * 64,
+        )
+    assert raised.value.code == "RESULT_INTEGRITY_REQUIRED"
+
+
+def test_accepted_candidate_receipt_alone_cannot_create_a_code_result(
+    tmp_path,
+    handle,
+    active_plan,
+    make_kernel,
+):
+    effects = OneCandidateOnlyEffects()
+    kernel = make_kernel(tmp_path / "kernel.sqlite3", active_plan, effects=effects)
+    kernel.advance(handle)
+    diagnostics = kernel.inspect(handle)
+    run = diagnostics.work_runs[0]
+    assert run.phase == "accepted_awaiting_delivery"
+    assert run.result_digest is None
+    assert not any(
+        item["ticket_key"] == run.ticket_key
+        for item in kernel._load(handle)["accepted_results"]
+    )
+
+
+def test_completed_result_requires_exact_batch_and_target_readback(
+    tmp_path,
+    handle,
+    active_plan,
+    make_kernel,
+):
+    effects = TamperedDeliveryEffects()
+    kernel = make_kernel(tmp_path / "kernel.sqlite3", active_plan, effects=effects)
+    with pytest.raises(ExecutionKernelError) as raised:
+        kernel.advance(handle)
+    assert raised.value.code == "RESULT_INTEGRITY_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "tampered_value"),
+    (
+        ("batch_delivery_proof_digest", "f" * 64),
+        ("delivery_stable_action_id", "action:changed"),
+        ("delivery_request_digest", "f" * 64),
+        ("batch_id", "batch:changed"),
+        ("batch_sha", "f" * 40),
+        ("delivery_member_ticket_keys", ("issue:changed",)),
+        ("local_check_receipt_digest", "f" * 64),
+        ("publication_receipt_digest", "f" * 64),
+        ("pull_request_number", 99),
+        ("pull_request_head_sha", "f" * 40),
+        ("hosted_result_receipt_digest", "f" * 64),
+        ("integration_lease_digest", "f" * 64),
+        ("target_branch", "release"),
+        ("target_head_sha", "f" * 40),
+        ("target_readback_digest", "f" * 64),
+        ("target_contains_batch_sha", False),
+        ("pull_request_merge_target_sha", "f" * 40),
+        ("merge_method", "squash"),
+    ),
+)
+def test_any_exact_delivery_proof_field_tamper_fails_closed(
+    field_name,
+    tampered_value,
+):
+    action = WorkRunAction(
+        stable_action_id="action:integrity",
+        repository="owner/repository",
+        campaign_key="campaign:integrity",
+        plan_revision_digest="a" * 64,
+        ticket_key="issue:integrity",
+        kind="batch_delivery",
+        semantic_action_id="semantic:integrity",
+        work_run_key="work-run:integrity",
+        work_subject_digest="b" * 64,
+        runtime_binding_id="binding:integrity",
+        wake_ref="candidate:accepted",
+        accepted_candidate_receipt_digest=None,
+    )
+    candidate = make_candidate_receipt(action)
+    accepted = make_accepted_candidate_receipt(action, candidate)
+    proof = make_result_integrity_proof(
+        action,
+        accepted,
+        target_contains_batch_sha=True,
+    )
+    proof.validate_for(action, "main")
+
+    with pytest.raises(ExecutionKernelError) as raised:
+        replace(proof, **{field_name: tampered_value}).validate_for(action, "main")
+
+    assert raised.value.code == "RESULT_INTEGRITY_INVALID"
+
+
+def test_fallback_result_selects_exact_singleton_proof_and_keeps_parent_receipt():
+    work_action = WorkRunAction(
+        stable_action_id="work-action:1",
+        repository="owner/repository",
+        campaign_key="campaign:fallback",
+        plan_revision_digest="a" * 64,
+        ticket_key="issue:1",
+        kind="batch_delivery",
+        semantic_action_id="semantic:1",
+        work_run_key="work-run:1",
+        work_subject_digest="b" * 64,
+        runtime_binding_id="binding:1",
+        wake_ref="candidate:accepted",
+        accepted_candidate_receipt_digest=None,
+    )
+    candidate = make_candidate_receipt(work_action)
+    first = make_accepted_candidate_receipt(work_action, candidate)
+    second = replace(
+        first,
+        ticket_key="issue:2",
+        work_run_key="work-run:2",
+        integration_node_key="integration:issue:2",
+        accepted_sequence=2,
+        candidate_sha="c" * 40,
+        candidate_tree_oid="d" * 40,
+        candidate_receipt_digest="e" * 64,
+        diff_record_digest="f" * 64,
+        evidence_digests=("2" * 64,),
+    )
+    request = BatchDeliveryRequest(
+        stable_action_id="parent-delivery:fallback",
+        repository=work_action.repository,
+        campaign_key=work_action.campaign_key,
+        plan_revision_digest=work_action.plan_revision_digest,
+        target=BatchTarget(
+            repository=work_action.repository,
+            target_branch="main",
+            target_head_sha="9" * 40,
+            target_tree_oid="8" * 40,
+            target_facts_digest="7" * 64,
+        ),
+        accepted_candidates=(first, second),
+        local_suite=LocalSuiteDefinition(
+            suite_id="local:fallback",
+            definition_digest="6" * 64,
+            command=("py", "-3.13", "-m", "pytest", "-q"),
+        ),
+        hosted_suites=(
+            HostedSuiteDefinition(
+                suite_id="hosted:fallback",
+                hosted_name="GWO CI",
+                definition_digest="5" * 64,
+            ),
+        ),
+        writer_generation="v6.1",
+        activation_id="activation:fallback",
+    )
+    parent_action = BatchDeliveryAction(
+        stable_action_id=request.stable_action_id,
+        request_digest=request.request_digest,
+        batch_id="4" * 64,
+        batch_sha="4" * 40,
+        member_ticket_keys=(first.ticket_key, second.ticket_key),
+    )
+    first_delivery = BatchDeliveryProof.create(
+        delivery_stable_action_id="singleton-delivery:1",
+        delivery_request_digest="1" * 64,
+        batch_id="1" * 64,
+        batch_sha="1" * 40,
+        member_ticket_keys=(first.ticket_key,),
+        local_check_receipt_digest="a" * 64,
+        publication_receipt_digest="b" * 64,
+        pull_request_number=31,
+        pull_request_head_sha="1" * 40,
+        hosted_result_receipt_digest="c" * 64,
+        integration_lease_digest="d" * 64,
+        target_branch="main",
+        target_head_sha="3" * 40,
+        target_readback_digest="e" * 64,
+        target_contains_batch_sha=True,
+        pull_request_merge_target_sha="3" * 40,
+        merge_method="merge",
+    )
+    second_delivery = BatchDeliveryProof.create(
+        delivery_stable_action_id="singleton-delivery:2",
+        delivery_request_digest="2" * 64,
+        batch_id="2" * 64,
+        batch_sha="2" * 40,
+        member_ticket_keys=(second.ticket_key,),
+        local_check_receipt_digest="b" * 64,
+        publication_receipt_digest="c" * 64,
+        pull_request_number=32,
+        pull_request_head_sha="2" * 40,
+        hosted_result_receipt_digest="d" * 64,
+        integration_lease_digest="e" * 64,
+        target_branch="main",
+        target_head_sha="4" * 40,
+        target_readback_digest="f" * 64,
+        target_contains_batch_sha=True,
+        pull_request_merge_target_sha="4" * 40,
+        merge_method="merge",
+    )
+    members = (
+        MemberDeliveryObservation(
+            ticket_key=first.ticket_key,
+            work_run_key=first.work_run_key,
+            candidate_sha=first.candidate_sha,
+            status="integrated",
+            evidence_digests=first.evidence_digests,
+        ),
+        MemberDeliveryObservation(
+            ticket_key=second.ticket_key,
+            work_run_key=second.work_run_key,
+            candidate_sha=second.candidate_sha,
+            status="integrated",
+            evidence_digests=second.evidence_digests,
+        ),
+    )
+    observation_body = {
+        "stable_action_id": parent_action.stable_action_id,
+        "batch_id": parent_action.batch_id,
+        "batch_sha": parent_action.batch_sha,
+        "phase": "complete",
+        "reason": "SingletonFallbackComplete",
+        "retry_count": 0,
+        "fallback_generation": 1,
+        "members": [
+            {
+                "ticket_key": member.ticket_key,
+                "work_run_key": member.work_run_key,
+                "candidate_sha": member.candidate_sha,
+                "status": member.status,
+                "evidence_digests": list(member.evidence_digests),
+                "resume_reason": member.resume_reason,
+            }
+            for member in members
+        ],
+        "delivery_proofs": [
+            first_delivery.canonical(),
+            second_delivery.canonical(),
+        ],
+    }
+    observation = BatchDeliveryObservation(
+        stable_action_id=parent_action.stable_action_id,
+        batch_id=parent_action.batch_id,
+        batch_sha=parent_action.batch_sha,
+        phase="complete",
+        reason="SingletonFallbackComplete",
+        receipt_digest=digest_value(
+            {"kind": "batch-observation.v1", **observation_body}
+        ),
+        retry_count=0,
+        fallback_generation=1,
+        members=members,
+        delivery_proofs=(first_delivery, second_delivery),
+    )
+
+    first_result = ResultIntegrityProof.from_batch_observation(
+        parent_action, request, observation, first
+    )
+    second_result = ResultIntegrityProof.from_batch_observation(
+        parent_action, request, observation, second
+    )
+
+    assert first_result.batch_delivery_receipt_digest == observation.receipt_digest
+    assert second_result.batch_delivery_receipt_digest == observation.receipt_digest
+    assert first_result.delivery_proof_body() == first_delivery.body()
+    assert second_result.delivery_proof_body() == second_delivery.body()
+    assert first_result.batch_sha != parent_action.batch_sha
+    assert second_result.batch_sha != parent_action.batch_sha
 
 
 def test_sqlite_campaign_state_rejects_stale_writer_without_overwriting(
