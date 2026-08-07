@@ -115,5 +115,3 @@ def test_crash_after_terminal_batch_readback_reopens_owner_journal_once(
     assert restarted.batch.execute_calls == 1
     assert restarted.batch.target_integration_calls == 1
     assert restarted.effect_ledger_row_count() >= 1
-
-
