@@ -580,7 +580,10 @@ class RecordingHostedBatchDriver:
     def __init__(
         self,
         *,
-        outcomes: tuple[Literal["passed", "code_failure", "infrastructure_failure"], ...],
+        outcomes: tuple[
+            Literal["pending", "passed", "code_failure", "infrastructure_failure"],
+            ...,
+        ],
         publication_batch_sha: str | None,
         identity_mismatch: Literal["suite", "provider"] | None,
         target_merge_method: Literal["merge", "squash", "rebase", "unknown"],
@@ -600,6 +603,7 @@ class RecordingHostedBatchDriver:
         self.hosted_read_calls = 0
         self.integrate_calls = 0
         self.retry_calls = 0
+        self.retry_idempotency_keys: set[str] = set()
         self.published_shas: list[str] = []
         self.hosted_read_shas: list[str] = []
         self.pull_request_heads: list[str] = []
@@ -706,6 +710,18 @@ class RecordingHostedBatchDriver:
         self.retry_calls += 1
         self.retry_shas.append(batch_sha)
 
+    def retry_hosted_idempotent(
+        self,
+        repository: str,
+        batch_sha: str,
+        provider_check_id: str,
+        idempotency_key: str,
+    ) -> None:
+        if idempotency_key in self.retry_idempotency_keys:
+            return
+        self.retry_idempotency_keys.add(idempotency_key)
+        self.retry_hosted(repository, batch_sha, provider_check_id)
+
     def integrate_serially(
         self,
         repository: str,
@@ -793,7 +809,7 @@ def make_integrator(
     repository: Path,
     *,
     hosted_outcomes: tuple[
-        Literal["passed", "code_failure", "infrastructure_failure"], ...
+        Literal["pending", "passed", "code_failure", "infrastructure_failure"], ...
     ] = (),
     publication_batch_sha: str | None = None,
     hosted_identity_mismatch: Literal["suite", "provider"] | None = None,

@@ -284,7 +284,9 @@ def _write_local_verification(
     temporary.replace(LOCAL_EVIDENCE_STATE)
 
 
-def _read_local_verification() -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+def _read_local_verification(
+    *, validate_receipts: bool = True
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     if not LOCAL_EVIDENCE_STATE.is_file():
         raise SystemExit(f"local verification manifest is missing: {LOCAL_EVIDENCE_STATE}")
     payload = json.loads(LOCAL_EVIDENCE_STATE.read_text(encoding="utf-8"))
@@ -295,6 +297,8 @@ def _read_local_verification() -> tuple[dict[str, dict[str, Any]], list[dict[str
     if set(focused) != set(FOCUSED_TESTS):
         raise SystemExit("local verification focused suites are not exact")
     focused = {label: focused[label] for label in FOCUSED_TESTS}
+    if not validate_receipts:
+        return focused, gates
     manifest_digest = _file_digest(
         ROOT / "skills" / "orchestrator" / ".skill-package.json"
     )
@@ -373,6 +377,14 @@ def _validate_batch_readback(
     )
 
 
+def _require_exact_object(
+    name: str, value: Any, required: set[str]
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != required:
+        raise SystemExit(f"{name} fields differ from the exact Beta2 schema")
+    return value
+
+
 def _validate_readbacks(readbacks: Any, object_id_length: int) -> dict[str, Any]:
     _reject_remote_urls(readbacks)
     if not isinstance(readbacks, dict):
@@ -399,38 +411,53 @@ def _validate_readbacks(readbacks: Any, object_id_length: int) -> dict[str, Any]
     _validate_batch_readback(
         "strict_batch", readbacks["strict_batch"], 1, object_id_length
     )
+    standard = readbacks["standard_batch"]
+    strict = readbacks["strict_batch"]
+    standard_candidate_shas = standard["candidate_shas"]
+    standard_member_ticket_keys = standard["member_ticket_keys"]
+    if strict["candidate_shas"] != [strict["batch_sha"]]:
+        raise SystemExit(
+            "strict Singleton Candidate SHA does not bind to its Batch SHA"
+        )
 
-    retry = readbacks["infrastructure_retry"]
+    retry = _require_exact_object(
+        "infrastructure_retry",
+        readbacks["infrastructure_retry"],
+        {"batch_sha", "retry_count", "retry_shas"},
+    )
     retry_sha = _require_object_id(
         "infrastructure_retry.batch_sha",
-        retry.get("batch_sha"),
+        retry["batch_sha"],
         object_id_length,
     )
-    retry_shas = retry.get("retry_shas")
-    retry_count = retry.get("retry_count")
+    retry_shas = retry["retry_shas"]
+    retry_count = retry["retry_count"]
     if (
-        not isinstance(retry_count, int)
-        or not 0 <= retry_count <= 2
+        type(retry_count) is not int
+        or retry_count != 2
         or not isinstance(retry_shas, list)
-        or len(retry_shas) != retry_count
+        or len(retry_shas) != 2
     ):
-        raise SystemExit("infrastructure retry count and readbacks are inconsistent")
+        raise SystemExit("infrastructure retry evidence must contain exactly two retries")
     for observed in retry_shas:
         if _require_object_id(
             "infrastructure_retry.retry_sha", observed, object_id_length
         ) != retry_sha:
             raise SystemExit("infrastructure retry changed the Batch SHA")
+    if retry_sha != standard["batch_sha"]:
+        raise SystemExit("infrastructure retry Batch SHA is not the standard Batch SHA")
 
-    successful = readbacks["successful_fallback"]
-    successful_required = {
-        "parent_phase",
-        "parent_fallback_generation",
-        "parent_receipt_digest",
-        "member_ticket_keys",
-        "delivery_proofs",
-    }
-    if not isinstance(successful, dict) or set(successful) != successful_required:
-        raise SystemExit("successful fallback fields differ from the exact schema")
+    successful = _require_exact_object(
+        "successful_fallback",
+        readbacks["successful_fallback"],
+        {
+            "parent_phase",
+            "parent_fallback_generation",
+            "parent_receipt_digest",
+            "member_ticket_keys",
+            "delivery_proofs",
+        },
+    )
     successful_ticket_keys = successful["member_ticket_keys"]
     successful_proofs = successful["delivery_proofs"]
     if (
@@ -445,6 +472,7 @@ def _validate_readbacks(readbacks: Any, object_id_length: int) -> dict[str, Any]
         or len(set(successful_ticket_keys)) != 3
         or not isinstance(successful_proofs, list)
         or len(successful_proofs) != 3
+        or successful_ticket_keys != standard_member_ticket_keys
     ):
         raise SystemExit("successful fallback is not a three-Singleton completion")
     _require_digest(
@@ -473,8 +501,12 @@ def _validate_readbacks(readbacks: Any, object_id_length: int) -> dict[str, Any]
     ):
         raise SystemExit("successful fallback reused a child action or Batch SHA")
 
-    fallback = readbacks["singleton_fallback"]
-    singleton_shas = fallback.get("singleton_candidate_shas")
+    fallback = _require_exact_object(
+        "singleton_fallback",
+        readbacks["singleton_fallback"],
+        {"resume_directives", "singleton_candidate_shas", "unaffected_evidence"},
+    )
+    singleton_shas = fallback["singleton_candidate_shas"]
     if not isinstance(singleton_shas, list) or len(singleton_shas) != 3:
         raise SystemExit("Singleton fallback must preserve exactly three Candidate SHAs")
     for observed in singleton_shas:
@@ -483,7 +515,15 @@ def _validate_readbacks(readbacks: Any, object_id_length: int) -> dict[str, Any]
             observed,
             object_id_length,
         )
-    unaffected = fallback.get("unaffected_evidence")
+    if singleton_shas != standard_candidate_shas:
+        raise SystemExit(
+            "Singleton fallback Candidate partition differs from the standard Batch"
+        )
+    if successful_batch_shas != singleton_shas:
+        raise SystemExit(
+            "Singleton proof Batch SHAs do not bind to the Candidate partition"
+        )
+    unaffected = fallback["unaffected_evidence"]
     if not isinstance(unaffected, dict) or set(unaffected) != {"issue:2", "issue:3"}:
         raise SystemExit("Singleton fallback unaffected Evidence mapping is not exact")
     for ticket_key, digests in unaffected.items():
@@ -491,7 +531,7 @@ def _validate_readbacks(readbacks: Any, object_id_length: int) -> dict[str, Any]
             raise SystemExit(f"{ticket_key} has no preserved Evidence digests")
         for digest in digests:
             _require_digest(f"{ticket_key} Evidence digest", digest)
-    directives = fallback.get("resume_directives")
+    directives = fallback["resume_directives"]
     if not isinstance(directives, list) or len(directives) != 1:
         raise SystemExit("Singleton fallback must contain one fixed resume directive")
     directive = directives[0]
@@ -503,14 +543,23 @@ def _validate_readbacks(readbacks: Any, object_id_length: int) -> dict[str, Any]
         raise SystemExit("Singleton fallback resume directive named the wrong Work Run")
     _require_digest("Singleton fallback Review Finding ledger", directive[1])
 
-    adoption = readbacks["restart_adoption"]
+    adoption = _require_exact_object(
+        "restart_adoption",
+        readbacks["restart_adoption"],
+        {"batch_sha", "provider_rereads", "receipt_digest"},
+    )
+    standard_proof = standard["delivery_proofs"][0]
     _require_object_id(
         "restart_adoption.batch_sha",
-        adoption.get("batch_sha"),
+        adoption["batch_sha"],
         object_id_length,
     )
-    _require_digest("restart_adoption.receipt_digest", adoption.get("receipt_digest"))
-    if adoption.get("provider_rereads") != 0:
+    if adoption["batch_sha"] != standard["batch_sha"]:
+        raise SystemExit("restart adoption Batch SHA is not the standard Batch SHA")
+    _require_digest("restart_adoption.receipt_digest", adoption["receipt_digest"])
+    if adoption["receipt_digest"] != standard_proof["hosted_result_receipt_digest"]:
+        raise SystemExit("restart adoption receipt is not the standard hosted receipt")
+    if type(adoption["provider_rereads"]) is not int or adoption["provider_rereads"] != 0:
         raise SystemExit("restart adoption performed a provider reread")
 
     expected_negative = {
@@ -610,6 +659,45 @@ def _required(name: str, value: str | None) -> str:
     return value
 
 
+def _document_merged_shas(path: Path) -> dict[str, str]:
+    try:
+        document = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SystemExit(f"canonical evidence document is unreadable: {path}") from error
+    try:
+        table = document.split("## Merged Results", 1)[1].split(
+            "## Focused pytest Receipts", 1
+        )[0]
+    except IndexError as error:
+        raise SystemExit("canonical evidence document has no merged-results table") from error
+    merged: dict[str, str] = {}
+    for line in table.splitlines():
+        match = re.fullmatch(r"\|\s*(#(?:115|116|117))\s*\|\s*`([0-9a-f]+)`\s*\|", line)
+        if match:
+            merged[match.group(1)] = match.group(2)
+    if set(merged) != {"#115", "#116", "#117"}:
+        raise SystemExit("canonical evidence document has an incomplete merged-results table")
+    return merged
+
+
+def _document_readbacks(path: Path) -> dict[str, Any]:
+    try:
+        document = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SystemExit(f"canonical evidence document is unreadable: {path}") from error
+    try:
+        fenced = document.split(
+            "## Exact Git, CI, Target, Recovery, and Receipt Readbacks", 1
+        )[1]
+        payload = fenced.split("```json\n", 1)[1].split("\n```", 1)[0]
+        value = json.loads(payload)
+    except (IndexError, json.JSONDecodeError) as error:
+        raise SystemExit("canonical evidence document has no valid readback JSON") from error
+    if not isinstance(value, dict):
+        raise SystemExit("canonical evidence readbacks are not a JSON object")
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -629,20 +717,30 @@ def main() -> int:
     args = parser.parse_args()
 
     object_id_length = _object_id_length()
+    document_path = args.output.resolve()
+    canonical_merged = (
+        _document_merged_shas(document_path) if args.check else {}
+    )
     merged_shas = {
         "#115": _require_object_id(
             "#115 merged commit",
-            _required("issue 115 merged SHA", args.issue_115_sha),
+            args.issue_115_sha
+            or canonical_merged.get("#115")
+            or _required("issue 115 merged SHA", args.issue_115_sha),
             object_id_length,
         ),
         "#116": _require_object_id(
             "#116 merged commit",
-            _required("issue 116 merged SHA", args.issue_116_sha),
+            args.issue_116_sha
+            or canonical_merged.get("#116")
+            or _required("issue 116 merged SHA", args.issue_116_sha),
             object_id_length,
         ),
         "#117": _require_object_id(
             "#117 merged commit",
-            _required("issue 117 merged SHA", args.issue_117_sha),
+            args.issue_117_sha
+            or canonical_merged.get("#117")
+            or _required("issue 117 merged SHA", args.issue_117_sha),
             object_id_length,
         ),
     }
@@ -652,23 +750,40 @@ def main() -> int:
         _require_merged(sha)
     subject = _subject_readback(merged_shas["#117"], object_id_length)
 
-    readback_path = Path(_required("readback artifact", args.readbacks)).resolve()
-    readbacks = _validate_readbacks(
-        json.loads(readback_path.read_text(encoding="utf-8")),
-        object_id_length,
-    )
+    if args.readbacks:
+        readbacks = json.loads(
+            Path(args.readbacks).resolve().read_text(encoding="utf-8")
+        )
+    elif args.check:
+        readbacks = _document_readbacks(document_path)
+    else:
+        readback_path = Path(
+            _required("readback artifact", args.readbacks)
+        ).resolve()
+        readbacks = json.loads(readback_path.read_text(encoding="utf-8"))
+    readbacks = _validate_readbacks(readbacks, object_id_length)
     if args.check:
-        focused, gates = _read_local_verification()
+        focused, gates = _read_local_verification(
+            validate_receipts=os.environ.get("GWO_BATCH_EVIDENCE_WRITING") != "1"
+        )
     else:
         LOCAL_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
-        focused = {
-            label: _run_pytest_receipt(
-                label,
-                targets,
-                LOCAL_EVIDENCE_DIR / f"{label.lower().replace(' ', '-')}.xml",
-            )
-            for label, targets in FOCUSED_TESTS.items()
-        }
+        previous_marker = os.environ.get("GWO_BATCH_EVIDENCE_WRITING")
+        os.environ["GWO_BATCH_EVIDENCE_WRITING"] = "1"
+        try:
+            focused = {
+                label: _run_pytest_receipt(
+                    label,
+                    targets,
+                    LOCAL_EVIDENCE_DIR / f"{label.lower().replace(' ', '-')}.xml",
+                )
+                for label, targets in FOCUSED_TESTS.items()
+            }
+        finally:
+            if previous_marker is None:
+                os.environ.pop("GWO_BATCH_EVIDENCE_WRITING", None)
+            else:
+                os.environ["GWO_BATCH_EVIDENCE_WRITING"] = previous_marker
         gates = [
             _gate_receipt(
                 ["py", "-3.13", "scripts/quick_validate.py"],

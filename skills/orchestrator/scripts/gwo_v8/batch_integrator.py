@@ -667,15 +667,10 @@ def _validate_hosted_receipt_identity(
         )
 
 
-def make_singleton_action(
-    parent_action: BatchDeliveryAction,
-    member: AcceptedCandidateReceipt,
-    child_batch_id: str,
-    child_batch_sha: str,
-) -> BatchDeliveryAction:
-    """Derive the stable delivery identity for one fallback Singleton."""
-
-    child_action_id = digest_value(
+def _singleton_action_id(
+    parent_action: BatchDeliveryAction, member: AcceptedCandidateReceipt
+) -> str:
+    return digest_value(
         {
             "kind": "singleton-action.v1",
             "parent_action_id": parent_action.stable_action_id,
@@ -684,17 +679,30 @@ def make_singleton_action(
             "candidate_receipt_digest": member.digest,
         }
     )
-    child_request_digest = digest_value(
-        {
-            "kind": "singleton-request.v1",
-            "parent_request_digest": parent_action.request_digest,
-            "ticket_key": member.ticket_key,
-            "candidate_receipt_digest": member.digest,
-        }
-    )
+
+
+def make_singleton_action(
+    parent_action: BatchDeliveryAction,
+    member: AcceptedCandidateReceipt,
+    child_batch_id: str,
+    child_batch_sha: str,
+    *,
+    request_digest: str | None = None,
+) -> BatchDeliveryAction:
+    """Derive the stable delivery identity for one fallback Singleton."""
+
+    child_action_id = _singleton_action_id(parent_action, member)
     return BatchDeliveryAction(
         stable_action_id=child_action_id,
-        request_digest=child_request_digest,
+        request_digest=request_digest
+        or digest_value(
+            {
+                "kind": "singleton-request.v1",
+                "parent_request_digest": parent_action.request_digest,
+                "ticket_key": member.ticket_key,
+                "candidate_receipt_digest": member.digest,
+            }
+        ),
         batch_id=child_batch_id,
         batch_sha=child_batch_sha,
         member_ticket_keys=(member.ticket_key,),
@@ -867,29 +875,126 @@ class BatchIntegrator:
             self._requests[request.stable_action_id] = request
             return action
 
-        self.formation_calls += 1
-        target = self.git.read_target(request.target)
-        members = form_batch_members(
-            request.accepted_candidates,
-            target,
-            member_limit=self.configuration.member_limit_for(request.repository),
+        read_preparation = getattr(self.journal, "read_preparation", None)
+        preparation = (
+            read_preparation(request.stable_action_id)
+            if callable(read_preparation)
+            else None
         )
+        if preparation is not None:
+            if preparation.request_digest != request.request_digest:
+                raise DeliveryIdentityMismatch(
+                    "durable Batch preparation request digest differs from the new request"
+                )
+            preparation_state = self._decode_state(preparation)
+            try:
+                preparation_request = preparation_state["request"]
+                target_state = preparation_request["target"]
+                selected_state = preparation_state["parent_candidates"]
+                if not isinstance(preparation_request, dict) or not isinstance(
+                    target_state, dict
+                ) or not isinstance(selected_state, list):
+                    raise TypeError
+                target = BatchTarget(**target_state)
+                members = tuple(
+                    self._receipt_from_canonical(item) for item in selected_state
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise DeliveryIdentityMismatch(
+                    "durable Batch preparation snapshot is malformed"
+                ) from error
+            if target != request.target:
+                raise DeliveryIdentityMismatch(
+                    "durable Batch preparation target differs from the request"
+                )
+            batch_id = preparation.batch_id
+            state = preparation_state
+        else:
+            self.formation_calls += 1
+            target = self.git.read_target(request.target)
+            if target != request.target:
+                raise DeliveryIdentityMismatch(
+                    "Batch target changed while freezing the selected members"
+                )
+            members = form_batch_members(
+                request.accepted_candidates,
+                target,
+                member_limit=self.configuration.member_limit_for(request.repository),
+            )
+            state = json.loads(self._state_json_for_request(request, members))
+            batch_id = digest_value(
+                {
+                    "kind": "batch-id.v1",
+                    "campaign_key": request.campaign_key,
+                    "plan_revision_digest": request.plan_revision_digest,
+                    "target": target.target_facts_digest,
+                    "members": [member.digest for member in members],
+                    "local_suite": request.local_suite.definition_digest,
+                    "hosted_suites": [
+                        suite.definition_digest for suite in request.hosted_suites
+                    ],
+                }
+            )
+            persist_preparation = getattr(self.journal, "persist_preparation", None)
+            if callable(persist_preparation):
+                persist_preparation(
+                    request.stable_action_id,
+                    request.request_digest,
+                    batch_id,
+                    self._encode_state(state),
+                )
         if not members:
             raise BatchIntegratorError("BATCH_EMPTY", "no eligible accepted Candidate")
-        batch_id = digest_value(
-            {
-                "kind": "batch-id.v1",
-                "campaign_key": request.campaign_key,
-                "plan_revision_digest": request.plan_revision_digest,
-                "target": target.target_facts_digest,
-                "members": [member.digest for member in members],
-                "local_suite": request.local_suite.definition_digest,
-                "hosted_suites": [
-                    suite.definition_digest for suite in request.hosted_suites
-                ],
-            }
-        )
-        batch_sha = self.git.compose_batch(batch_id, target, members)
+        try:
+            batch_sha = self.git.compose_batch(batch_id, target, members)
+        except BatchIntegratorError as error:
+            if error.code not in {
+                "BATCH_COMPOSITION_CONFLICT",
+                "BATCH_CLEAN_BASE_COMPOSITION_CONFLICT",
+            } or len(members) <= 1:
+                raise
+            batch_sha = digest_value(
+                {
+                    "kind": "failed-composition-parent.v1",
+                    "batch_id": batch_id,
+                    "request_digest": request.request_digest,
+                }
+            )
+            state["composition_failure"] = error.code
+            action = BatchDeliveryAction(
+                stable_action_id=request.stable_action_id,
+                request_digest=request.request_digest,
+                batch_id=batch_id,
+                batch_sha=batch_sha,
+                member_ticket_keys=tuple(member.ticket_key for member in members),
+            )
+            create_action = getattr(self.journal, "create_action", None)
+            if not callable(create_action):
+                raise BatchIntegratorError(
+                    "BATCH_ACTION_PERSISTENCE_FAILED",
+                    "composition failure cannot persist its selected members",
+                )
+            create_action(
+                action,
+                action.request_digest,
+                phase="prepared",
+                reason="composition failure requires Singleton fallback",
+                retry_count=0,
+                fallback_generation=0,
+                state_json=self._encode_state(state),
+            )
+            record = self.journal.read_action(action.stable_action_id)
+            if record is None:
+                raise BatchIntegratorError(
+                    "BATCH_ACTION_PERSISTENCE_FAILED",
+                    "composition failure action was not readable after creation",
+                )
+            self._requests[request.stable_action_id] = request
+            self._queue_singletons(record, action, request, state)
+            clear_preparation = getattr(self.journal, "clear_preparation", None)
+            if callable(clear_preparation):
+                clear_preparation(request.stable_action_id)
+            return action
         action = BatchDeliveryAction(
             stable_action_id=request.stable_action_id,
             request_digest=request.request_digest,
@@ -897,23 +1002,6 @@ class BatchIntegrator:
             batch_sha=batch_sha,
             member_ticket_keys=tuple(member.ticket_key for member in members),
         )
-        state = {
-            "request": {
-                "request_digest": request.request_digest,
-                "repository": request.repository,
-                "campaign_key": request.campaign_key,
-                "plan_revision_digest": request.plan_revision_digest,
-                "target": target.canonical(),
-                "local_suite": request.local_suite.canonical(),
-                "hosted_suites": [
-                    suite.canonical() for suite in request.hosted_suites
-                ],
-                "writer_generation": request.writer_generation,
-                "activation_id": request.activation_id,
-            },
-            "parent_candidates": [member.canonical() for member in members],
-            "members": [member.canonical() for member in members],
-        }
         create_action = getattr(self.journal, "create_action", None)
         if callable(create_action):
             create_action(
@@ -925,6 +1013,9 @@ class BatchIntegrator:
                 fallback_generation=0,
                 state_json=self._encode_state(state),
             )
+        clear_preparation = getattr(self.journal, "clear_preparation", None)
+        if callable(clear_preparation):
+            clear_preparation(request.stable_action_id)
         self._requests[request.stable_action_id] = request
         return action
 
@@ -955,6 +1046,10 @@ class BatchIntegrator:
         if request is None:
             request = self._request_for_action(record)
             self._requests[action.stable_action_id] = request
+        if request.request_digest != action.request_digest:
+            raise DeliveryIdentityMismatch(
+                "delivery action request digest differs from its durable request"
+            )
 
         while True:
             try:
@@ -1076,11 +1171,13 @@ class BatchIntegrator:
             hosted_suites = tuple(
                 HostedSuiteDefinition(**suite) for suite in hosted_state
             )
-            candidate_state = state.get("parent_candidates", member_state)
+            candidate_state = state.get(
+                "request_candidates", state.get("parent_candidates", member_state)
+            )
             if not isinstance(candidate_state, list):
                 raise TypeError
             candidates = tuple(self._receipt_from_canonical(item) for item in candidate_state)
-            return BatchDeliveryRequest(
+            request = BatchDeliveryRequest(
                 stable_action_id=record.stable_action_id,
                 repository=request_state["repository"],
                 campaign_key=request_state["campaign_key"],
@@ -1092,6 +1189,11 @@ class BatchIntegrator:
                 writer_generation=request_state["writer_generation"],
                 activation_id=request_state["activation_id"],
             )
+            if request.request_digest != record.request_digest:
+                raise DeliveryIdentityMismatch(
+                    "journal request snapshot digest does not match the action"
+                )
+            return request
         except (KeyError, TypeError, ValueError) as error:
             raise DeliveryIdentityMismatch(
                 "journal request snapshot is not a valid delivery request"
@@ -1236,13 +1338,30 @@ class BatchIntegrator:
         )
         if receipt.outcome == "infrastructure_failure":
             return receipt
-        # A failed Singleton is resumed by the owning Work Run.  Its next
-        # hosted read must be fresh, so do not make a terminal code-failure
-        # receipt prevent that retry.  Multi-member failures are durable
-        # parent facts and are adopted by the fallback queue.
-        if receipt.outcome == "code_failure" and len(request.accepted_candidates) == 1:
-            return receipt
         return self.journal.persist_hosted_result(receipt)
+
+    @staticmethod
+    def _frozen_members(
+        state: dict[str, object], action: BatchDeliveryAction
+    ) -> tuple[AcceptedCandidateReceipt, ...]:
+        raw_members = state.get("parent_candidates")
+        if not isinstance(raw_members, list):
+            raise DeliveryIdentityMismatch(
+                "journal selected Candidate snapshot is missing"
+            )
+        try:
+            members = tuple(
+                BatchIntegrator._receipt_from_canonical(item) for item in raw_members
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise DeliveryIdentityMismatch(
+                "journal selected Candidate snapshot is malformed"
+            ) from error
+        if tuple(member.ticket_key for member in members) != action.member_ticket_keys:
+            raise DeliveryIdentityMismatch(
+                "journal selected Candidate snapshot differs from the action"
+            )
+        return members
 
     def _advance_hosted_result(
         self,
@@ -1254,6 +1373,12 @@ class BatchIntegrator:
         suite = request.hosted_suites[0]
         receipt = self._read_or_persist_hosted_result(action, request, suite)
         if receipt is None:
+            state["hosted_pending"] = {
+                "stable_action_id": action.stable_action_id,
+                "batch_sha": action.batch_sha,
+                "suite_id": suite.suite_id,
+                "provider_check_id": "check:1",
+            }
             return self._next_record(
                 record,
                 phase="wait",
@@ -1285,23 +1410,37 @@ class BatchIntegrator:
                     reason="InfrastructureRetryLimitExceeded",
                     state=state,
                 )
-            self.hosted.retry_hosted(
-                request.repository,
-                action.batch_sha,
-                receipt.provider_check_id,
+            retry_number = record.retry_count + 1
+            idempotency_key = digest_value(
+                {
+                    "kind": "batch-hosted-retry.v1",
+                    "stable_action_id": action.stable_action_id,
+                    "batch_sha": action.batch_sha,
+                    "suite_id": suite.suite_id,
+                    "provider_check_id": receipt.provider_check_id,
+                    "retry_number": retry_number,
+                }
             )
+            state["retry_intent"] = {
+                "stable_action_id": action.stable_action_id,
+                "batch_sha": action.batch_sha,
+                "suite_id": suite.suite_id,
+                "provider_check_id": receipt.provider_check_id,
+                "retry_number": retry_number,
+                "idempotency_key": idempotency_key,
+                "target_facts_digest": request.target.target_facts_digest,
+            }
             return replace(
                 self._next_record(
                     record,
                     phase="wait",
-                    reason="InfrastructureRetryScheduled",
+                    reason="InfrastructureRetryIntentPersisted",
                     state=state,
                 ),
                 retry_count=record.retry_count + 1,
             )
 
         if receipt.outcome == "code_failure":
-            state["resume_phase"] = "published"
             return self._classify_failure(
                 record,
                 action,
@@ -1316,6 +1455,67 @@ class BatchIntegrator:
             state=state,
         )
 
+    def _perform_retry_intent(
+        self,
+        record: object,
+        action: BatchDeliveryAction,
+        request: BatchDeliveryRequest,
+        state: dict[str, object],
+    ) -> object:
+        intent = state.get("retry_intent")
+        if not isinstance(intent, dict):
+            raise DeliveryIdentityMismatch("durable infrastructure retry intent is malformed")
+        expected = {
+            "stable_action_id": action.stable_action_id,
+            "batch_sha": action.batch_sha,
+            "suite_id": request.hosted_suites[0].suite_id,
+            "provider_check_id": "check:1",
+            "retry_number": record.retry_count,
+            "target_facts_digest": request.target.target_facts_digest,
+        }
+        for key, value in expected.items():
+            if intent.get(key) != value:
+                raise DeliveryIdentityMismatch(
+                    "durable infrastructure retry intent identity changed"
+                )
+        idempotency_key = intent.get("idempotency_key")
+        if not isinstance(idempotency_key, str) or idempotency_key != digest_value(
+            {
+                "kind": "batch-hosted-retry.v1",
+                "stable_action_id": action.stable_action_id,
+                "batch_sha": action.batch_sha,
+                "suite_id": request.hosted_suites[0].suite_id,
+                "provider_check_id": "check:1",
+                "retry_number": record.retry_count,
+            }
+        ):
+            raise DeliveryIdentityMismatch(
+                "durable infrastructure retry idempotency identity changed"
+            )
+        retry_idempotent = getattr(self.hosted, "retry_hosted_idempotent", None)
+        if callable(retry_idempotent):
+            retry_idempotent(
+                request.repository,
+                action.batch_sha,
+                intent["provider_check_id"],
+                idempotency_key,
+            )
+        else:
+            self.hosted.retry_hosted(
+                request.repository,
+                action.batch_sha,
+                intent["provider_check_id"],
+            )
+        state.pop("retry_intent", None)
+        state.pop("hosted_receipt", None)
+        state["retry_idempotency_key"] = idempotency_key
+        return self._next_record(
+            record,
+            phase="published",
+            reason="InfrastructureRetryReady",
+            state=state,
+        )
+
     def _classify_failure(
         self,
         record: object,
@@ -1324,9 +1524,10 @@ class BatchIntegrator:
         outcome: str,
         state: dict[str, object],
     ) -> object:
-        if len(request.accepted_candidates) > 1 and record.fallback_generation == 0:
+        members = self._frozen_members(state, action)
+        if len(members) > 1 and record.fallback_generation == 0:
             return self._queue_singletons(record, action, request, state)
-        if len(request.accepted_candidates) != 1:
+        if len(members) != 1:
             return replace(
                 record,
                 phase="blocked",
@@ -1335,7 +1536,7 @@ class BatchIntegrator:
                 version=record.version + 1,
             )
 
-        member = request.accepted_candidates[0]
+        member = members[0]
         raw_members = state.get("members")
         if not isinstance(raw_members, list) or not raw_members:
             raise DeliveryIdentityMismatch(
@@ -1357,7 +1558,7 @@ class BatchIntegrator:
             state["resume_directive_emitted"] = True
         return replace(
             record,
-            phase="wait",
+            phase="decision",
             reason="WorkerResumeRequired",
             state_json=self._encode_state(state),
             version=record.version + 1,
@@ -1383,6 +1584,9 @@ class BatchIntegrator:
                     "writer_generation": request.writer_generation,
                     "activation_id": request.activation_id,
                 },
+                "request_candidates": [
+                    member.canonical() for member in request.accepted_candidates
+                ],
                 "parent_candidates": [member.canonical() for member in members],
                 "members": [member.canonical() for member in members],
             }
@@ -1395,7 +1599,7 @@ class BatchIntegrator:
         request: BatchDeliveryRequest,
         state: dict[str, object],
     ) -> object:
-        parent_members = tuple(request.accepted_candidates)
+        parent_members = self._frozen_members(state, parent_action)
         state["parent_candidates"] = [member.canonical() for member in parent_members]
         state["members"] = [
             {
@@ -1410,8 +1614,18 @@ class BatchIntegrator:
             for member in parent_members
         ]
         state["singleton_queue"] = []
+        state["singleton_materialization_complete"] = False
+        state["singleton_materialization_index"] = 0
         state["next_singleton_index"] = 0
         state["delivery_proofs"] = []
+        state["member_evidence"] = {
+            member.ticket_key: {
+                "candidate_sha": member.candidate_sha,
+                "evidence_digests": list(member.evidence_digests),
+                "review_finding_ledger_digest": member.review_finding_ledger_digest,
+            }
+            for member in parent_members
+        }
         state.pop("resume_required", None)
         queued = self.journal.compare_and_swap_action(
             parent_action.stable_action_id,
@@ -1426,16 +1640,170 @@ class BatchIntegrator:
                 version=record.version + 1,
             ),
         )
+        return self._materialize_singleton_queue(
+            queued, parent_action, request
+        )
 
-        queued_entries: list[dict[str, object]] = []
-        for member in parent_members:
-            self.journal.persist_member_evidence(
-                parent_action.stable_action_id,
-                member.ticket_key,
-                member.candidate_sha,
-                member.evidence_digests,
-                member.review_finding_ledger_digest,
+    def _materialize_singleton_queue(
+        self,
+        record: object,
+        parent_action: BatchDeliveryAction,
+        request: BatchDeliveryRequest,
+    ) -> object:
+        state = self._decode_state(record)
+        queue = state.get("singleton_queue")
+        raw_members = state.get("parent_candidates")
+        if not isinstance(queue, list) or not isinstance(raw_members, list):
+            raise DeliveryIdentityMismatch(
+                "Singleton fallback materialization snapshot is malformed"
             )
+        try:
+            parent_members = tuple(
+                self._receipt_from_canonical(item) for item in raw_members
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise DeliveryIdentityMismatch(
+                "Singleton fallback parent Candidate snapshot is malformed"
+            ) from error
+        if tuple(member.ticket_key for member in parent_members) != parent_action.member_ticket_keys:
+            raise DeliveryIdentityMismatch(
+                "Singleton fallback parent Candidate partition changed"
+            )
+        complete = state.get("singleton_materialization_complete")
+        if type(complete) is not bool:
+            raise DeliveryIdentityMismatch(
+                "Singleton fallback materialization completion is malformed"
+            )
+        index = state.get("singleton_materialization_index", 0)
+        if type(index) is not int or not 0 <= index <= len(parent_members):
+            raise DeliveryIdentityMismatch(
+                "Singleton fallback materialization index is malformed"
+            )
+        while True:
+            intent = state.get("singleton_materialization_intent")
+            if intent is not None:
+                if not isinstance(intent, dict):
+                    raise DeliveryIdentityMismatch(
+                        "Singleton fallback materialization intent is malformed"
+                    )
+                required_intent = {
+                    "index",
+                    "member",
+                    "target",
+                    "child_batch_id",
+                    "child_action_id",
+                }
+                if set(intent) != required_intent or intent.get("index") != index:
+                    raise DeliveryIdentityMismatch(
+                        "Singleton fallback materialization intent identity changed"
+                    )
+                try:
+                    member = self._receipt_from_canonical(intent["member"])
+                    current_target = BatchTarget(**intent["target"])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise DeliveryIdentityMismatch(
+                        "Singleton fallback materialization intent is not canonical"
+                    ) from error
+                if member != parent_members[index]:
+                    raise DeliveryIdentityMismatch(
+                        "Singleton fallback materialization member changed"
+                    )
+                child_batch_id = intent["child_batch_id"]
+                if not isinstance(child_batch_id, str) or digest_value(
+                    {
+                        "kind": "singleton-batch.v1",
+                        "parent_batch_id": parent_action.batch_id,
+                        "ticket_key": member.ticket_key,
+                        "candidate_receipt_digest": member.digest,
+                    }
+                ) != child_batch_id:
+                    raise DeliveryIdentityMismatch(
+                        "Singleton fallback child Batch identity changed"
+                    )
+                child_action_id = _singleton_action_id(parent_action, member)
+                if intent["child_action_id"] != child_action_id:
+                    raise DeliveryIdentityMismatch(
+                        "Singleton fallback child action identity changed"
+                    )
+                child_batch_sha = self.git.compose_batch(
+                    child_batch_id, current_target, (member,)
+                )
+                child_request = replace(
+                    request,
+                    stable_action_id=child_action_id,
+                    target=current_target,
+                    accepted_candidates=(member,),
+                )
+                child_action = make_singleton_action(
+                    parent_action,
+                    member,
+                    child_batch_id,
+                    child_batch_sha,
+                    request_digest=child_request.request_digest,
+                )
+                self._requests[child_action.stable_action_id] = child_request
+                self.journal.create_action(
+                    child_action,
+                    child_request.request_digest,
+                    state_json=self._state_json_for_request(child_request, (member,)),
+                )
+                entry = json.loads(
+                    self._encode_state(
+                        {
+                            "action": asdict(child_action),
+                            "member": member.canonical(),
+                            "target": current_target.canonical(),
+                        }
+                    )
+                )
+                if len(queue) == index:
+                    queue.append(entry)
+                elif len(queue) == index + 1 and queue[index] == entry:
+                    pass
+                else:
+                    raise DeliveryIdentityMismatch(
+                        "Singleton fallback child queue entry changed or has a gap"
+                    )
+                state.pop("singleton_materialization_intent", None)
+                index += 1
+                state["singleton_materialization_index"] = index
+                record = self.journal.compare_and_swap_action(
+                    parent_action.stable_action_id,
+                    expected_version=record.version,
+                    expected_phase=record.phase,
+                    next_record=replace(
+                        record,
+                        state_json=self._encode_state(state),
+                        version=record.version + 1,
+                    ),
+                )
+                state = self._decode_state(record)
+                queue = state["singleton_queue"]
+                continue
+
+            if index >= len(parent_members):
+                if not queue or len(queue) != len(parent_members):
+                    raise DeliveryIdentityMismatch(
+                        "Singleton fallback cannot complete with an empty or partial queue"
+                    )
+                if complete:
+                    return record
+                state["singleton_materialization_complete"] = True
+                state["next_singleton_index"] = 0
+                state["delivery_proofs"] = []
+                return self.journal.compare_and_swap_action(
+                    parent_action.stable_action_id,
+                    expected_version=record.version,
+                    expected_phase=record.phase,
+                    next_record=replace(
+                        record,
+                        reason="SingletonFallbackReady",
+                        state_json=self._encode_state(state),
+                        version=record.version + 1,
+                    ),
+                )
+
+            member = parent_members[index]
             child_batch_id = digest_value(
                 {
                     "kind": "singleton-batch.v1",
@@ -1445,58 +1813,39 @@ class BatchIntegrator:
                 }
             )
             current_target = self.git.read_target(request.target)
-            child_batch_sha = self.git.compose_batch(
-                child_batch_id, current_target, (member,)
+            if current_target != request.target:
+                raise DeliveryIdentityMismatch(
+                    "Singleton fallback target changed before child materialization"
+                )
+            state["singleton_materialization_intent"] = {
+                "index": index,
+                "member": member.canonical(),
+                "target": current_target.canonical(),
+                "child_batch_id": child_batch_id,
+                "child_action_id": _singleton_action_id(parent_action, member),
+            }
+            record = self.journal.compare_and_swap_action(
+                parent_action.stable_action_id,
+                expected_version=record.version,
+                expected_phase=record.phase,
+                next_record=replace(
+                    record,
+                    state_json=self._encode_state(state),
+                    version=record.version + 1,
+                ),
             )
-            child_action = make_singleton_action(
-                parent_action, member, child_batch_id, child_batch_sha
-            )
-            child_request = replace(
-                request,
-                stable_action_id=child_action.stable_action_id,
-                target=current_target,
-                accepted_candidates=(member,),
-            )
-            self._requests[child_action.stable_action_id] = child_request
-            self.journal.create_action(
-                child_action,
-                child_action.request_digest,
-                state_json=self._state_json_for_request(child_request, (member,)),
-            )
-            queued_entries.append(
-                {
-                    "action": asdict(child_action),
-                    "member": member.canonical(),
-                    "target": current_target.canonical(),
-                }
-            )
-
-        current = self.journal.read_action(parent_action.stable_action_id)
-        if current is None:
-            raise BatchIntegratorError(
-                "BATCH_ACTION_MISSING",
-                "parent action disappeared while queuing Singletons",
-            )
-        updated_state = self._decode_state(current)
-        updated_state["singleton_queue"] = queued_entries
-        updated_state["next_singleton_index"] = 0
-        updated_state["delivery_proofs"] = []
-        return self.journal.compare_and_swap_action(
-            parent_action.stable_action_id,
-            expected_version=current.version,
-            expected_phase=current.phase,
-            next_record=replace(
-                current,
-                state_json=self._encode_state(updated_state),
-                version=current.version + 1,
-            ),
-        )
+            state = self._decode_state(record)
+            queue = state["singleton_queue"]
 
     def _execute_child(
         self,
         child_action: BatchDeliveryAction,
         child_request: BatchDeliveryRequest,
     ) -> BatchDeliveryObservation:
+        if child_request.request_digest != child_action.request_digest:
+            raise DeliveryIdentityMismatch(
+                "Singleton child action does not bind its actual request"
+            )
         record = self.journal.read_action(child_action.stable_action_id)
         if record is None:
             raise BatchIntegratorError(
@@ -1528,12 +1877,20 @@ class BatchIntegrator:
         queue = state.get("singleton_queue")
         if not isinstance(queue, list):
             raise DeliveryIdentityMismatch("Singleton fallback queue is malformed")
+        if state.get("singleton_materialization_complete") is not True:
+            raise DeliveryIdentityMismatch(
+                "Singleton fallback queue was used before materialization completed"
+            )
         index = state.get("next_singleton_index", 0)
         if type(index) is not int or index < 0:
             raise DeliveryIdentityMismatch("Singleton fallback queue index is malformed")
         raw_members = state.get("members")
         if not isinstance(raw_members, list):
             raise DeliveryIdentityMismatch("parent Singleton member partition is missing")
+        if not queue or len(queue) != len(raw_members):
+            raise DeliveryIdentityMismatch(
+                "Singleton fallback queue does not exactly cover the parent members"
+            )
         resume_indices = state.get("resume_indices", [])
         if not isinstance(resume_indices, list) or any(
             type(item) is not int or item < 0 for item in resume_indices
@@ -1545,6 +1902,17 @@ class BatchIntegrator:
             if resume_index != index and isinstance(raw_members[resume_index], dict):
                 raw_members[resume_index]["status"] = "preserved"
         if index >= len(queue):
+            if not all(
+                isinstance(item, dict) and item.get("status") == "integrated"
+                for item in raw_members
+            ):
+                return replace(
+                    record,
+                    phase="decision",
+                    reason="WorkerResumeRequired",
+                    state_json=self._encode_state(state),
+                    version=record.version + 1,
+                )
             return replace(
                 record,
                 phase="complete",
@@ -1564,24 +1932,22 @@ class BatchIntegrator:
             ) from error
         if child_action.member_ticket_keys != (member.ticket_key,):
             raise DeliveryIdentityMismatch("Singleton child member identity changed")
-        child_request = self._requests.get(child_action.stable_action_id)
-        if child_request is None:
-            child_target = request.target
-            target_state = entry.get("target")
-            if isinstance(target_state, dict):
-                try:
-                    child_target = BatchTarget(**target_state)
-                except (TypeError, ValueError) as error:
-                    raise DeliveryIdentityMismatch(
-                        "Singleton child target identity changed"
-                    ) from error
-            child_request = replace(
-                request,
-                stable_action_id=child_action.stable_action_id,
-                target=child_target,
-                accepted_candidates=(member,),
-            )
-            self._requests[child_action.stable_action_id] = child_request
+        child_target = request.target
+        target_state = entry.get("target")
+        if isinstance(target_state, dict):
+            try:
+                child_target = BatchTarget(**target_state)
+            except (TypeError, ValueError) as error:
+                raise DeliveryIdentityMismatch(
+                    "Singleton child target identity changed"
+                ) from error
+        child_request = replace(
+            request,
+            stable_action_id=child_action.stable_action_id,
+            target=child_target,
+            accepted_candidates=(member,),
+        )
+        self._requests[child_action.stable_action_id] = child_request
         child_observation = self._execute_child(child_action, child_request)
         if child_observation.phase == "complete":
             if (
@@ -1637,7 +2003,10 @@ class BatchIntegrator:
                 state_json=self._encode_state(state),
                 version=record.version + 1,
             )
-        if child_observation.reason == "WorkerResumeRequired":
+        if (
+            child_observation.reason == "WorkerResumeRequired"
+            or child_observation.phase == "decision"
+        ):
             if index >= len(raw_members):
                 raise DeliveryIdentityMismatch("parent Singleton member partition changed")
             parent_member = raw_members[index]
@@ -1679,24 +2048,43 @@ class BatchIntegrator:
         from ._batch_integrator_store import HostedResultReceipt
 
         state = self._decode_state(record)
-        if record.fallback_generation == 1 and isinstance(
-            state.get("singleton_queue"), list
+        if record.fallback_generation == 1 and (
+            isinstance(state.get("singleton_queue"), list)
+            or state.get("singleton_materialization_complete") is False
         ):
+            if state.get("singleton_materialization_complete") is not True:
+                return self._materialize_singleton_queue(
+                    record, action, request
+                )
             return self._advance_singleton_queue(
                 record, action, request, state
             )
         if record.phase == "wait" and state.get("resume_required") is True:
-            resume_phase = state.pop("resume_phase", "published")
-            if resume_phase not in {"prepared", "published"}:
-                raise DeliveryIdentityMismatch(
-                    "Singleton resume phase is not supported"
-                )
-            state.pop("resume_required", None)
-            state.pop("hosted_receipt", None)
             return self._next_record(
                 record,
-                phase=resume_phase,
-                reason="WorkerResumeReady",
+                phase="decision",
+                reason="WorkerResumeRequired",
+                state=state,
+            )
+        if record.phase == "wait" and isinstance(state.get("retry_intent"), dict):
+            return self._perform_retry_intent(record, action, request, state)
+        if record.phase == "wait" and isinstance(state.get("hosted_pending"), dict):
+            pending = state["hosted_pending"]
+            expected_pending = {
+                "stable_action_id": action.stable_action_id,
+                "batch_sha": action.batch_sha,
+                "suite_id": request.hosted_suites[0].suite_id,
+                "provider_check_id": "check:1",
+            }
+            if pending != expected_pending:
+                raise DeliveryIdentityMismatch(
+                    "pending hosted check identity changed before reread"
+                )
+            state.pop("hosted_pending", None)
+            return self._next_record(
+                record,
+                phase="published",
+                reason="HostedResultCheckReady",
                 state=state,
             )
         if record.phase == "wait" and isinstance(state.get("next_check"), dict):
@@ -1707,7 +2095,9 @@ class BatchIntegrator:
                 "suite_id": request.hosted_suites[0].suite_id,
                 "provider_check_id": "check:1",
             }
-            if next_check != expected_check:
+            if not isinstance(next_check, dict) or any(
+                next_check.get(key) != value for key, value in expected_check.items()
+            ):
                 raise DeliveryIdentityMismatch(
                     "next hosted check identity changed before retry"
                 )

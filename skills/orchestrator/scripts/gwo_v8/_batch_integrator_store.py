@@ -59,6 +59,14 @@ class BatchJournalRecord:
 
 
 @dataclass(frozen=True)
+class BatchPreparationRecord:
+    stable_action_id: str
+    request_digest: str
+    batch_id: str
+    state_json: str
+
+
+@dataclass(frozen=True)
 class IntegrationLeaseReceipt:
     repository: str
     holder: str
@@ -148,6 +156,20 @@ class BatchDeliveryJournal(Protocol):
     """Persistence boundary consumed by the BatchIntegrator action loop."""
 
     def read_action(self, stable_action_id: str) -> BatchJournalRecord | None: ...
+
+    def read_preparation(
+        self, stable_action_id: str
+    ) -> BatchPreparationRecord | None: ...
+
+    def persist_preparation(
+        self,
+        stable_action_id: str,
+        request_digest: str,
+        batch_id: str,
+        state_json: str,
+    ) -> BatchPreparationRecord: ...
+
+    def clear_preparation(self, stable_action_id: str) -> None: ...
 
     def create_action(
         self, action: BatchDeliveryAction, request_digest: str, **kwargs: object
@@ -244,6 +266,12 @@ class SqliteBatchDeliveryJournal:
                     state_json TEXT NOT NULL,
                     version INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS v8_batch_preparations (
+                    stable_action_id TEXT PRIMARY KEY,
+                    request_digest TEXT NOT NULL,
+                    batch_id TEXT NOT NULL,
+                    state_json TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS v8_batch_hosted_receipts (
                     stable_action_id TEXT NOT NULL,
                     batch_sha TEXT NOT NULL,
@@ -273,6 +301,56 @@ class SqliteBatchDeliveryJournal:
             ).fetchone()
         return None if row is None else BatchJournalRecord(**dict(row))
 
+    def read_preparation(
+        self, stable_action_id: str
+    ) -> BatchPreparationRecord | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM v8_batch_preparations WHERE stable_action_id=?",
+                (stable_action_id,),
+            ).fetchone()
+        return None if row is None else BatchPreparationRecord(**dict(row))
+
+    def persist_preparation(
+        self,
+        stable_action_id: str,
+        request_digest: str,
+        batch_id: str,
+        state_json: str,
+    ) -> BatchPreparationRecord:
+        record = BatchPreparationRecord(
+            stable_action_id=stable_action_id,
+            request_digest=request_digest,
+            batch_id=batch_id,
+            state_json=state_json,
+        )
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO v8_batch_preparations
+                    (stable_action_id, request_digest, batch_id, state_json)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(stable_action_id) DO NOTHING
+                """,
+                (
+                    record.stable_action_id,
+                    record.request_digest,
+                    record.batch_id,
+                    record.state_json,
+                ),
+            )
+        existing = self.read_preparation(stable_action_id)
+        if existing != record:
+            raise DeliveryIdentityMismatch("batch preparation identity changed")
+        return existing
+
+    def clear_preparation(self, stable_action_id: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "DELETE FROM v8_batch_preparations WHERE stable_action_id=?",
+                (stable_action_id,),
+            )
+
     def _insert_action_if_absent(self, record: BatchJournalRecord) -> None:
         with self._connection() as connection:
             connection.execute(
@@ -286,7 +364,11 @@ class SqliteBatchDeliveryJournal:
                 tuple(record.body().values()),
             )
         existing = self.read_action(record.stable_action_id)
-        if existing != record:
+        if existing is None or (
+            existing.request_digest != record.request_digest
+            or existing.batch_id != record.batch_id
+            or existing.batch_sha != record.batch_sha
+        ):
             raise DeliveryIdentityMismatch("batch action identity changed")
 
     def compare_and_swap_action(
@@ -585,23 +667,35 @@ class SqliteBatchDeliveryJournal:
                 """
                 SELECT *
                   FROM v8_batch_hosted_receipts
-                 WHERE stable_action_id=?
-                   AND batch_sha=?
-                   AND suite_id=?
-                   AND outcome IN ('passed', 'code_failure')
+                 WHERE stable_action_id=? OR batch_sha=?
                  ORDER BY provider_check_id
                 """,
-                (stable_action_id, batch_sha, suite_id),
+                (stable_action_id, batch_sha),
             ).fetchall()
-        if len(rows) > 1:
+        receipts = [HostedResultReceipt(**dict(row)) for row in rows]
+        for receipt in receipts:
+            self._validate_hosted_receipt_digest(receipt)
+            if (
+                receipt.stable_action_id != stable_action_id
+                or receipt.batch_sha != batch_sha
+                or receipt.suite_id != suite_id
+                or receipt.provider_check_id != "check:1"
+            ):
+                raise DeliveryIdentityMismatch(
+                    "durable hosted receipt identity differs before provider read"
+                )
+        terminal = [
+            receipt
+            for receipt in receipts
+            if receipt.outcome in {"passed", "code_failure"}
+        ]
+        if len(terminal) > 1:
             raise DeliveryAttributionAmbiguous(
                 "multiple terminal hosted receipts matched one action, Batch SHA, and suite"
             )
-        if not rows:
+        if not terminal:
             return None
-        receipt = HostedResultReceipt(**dict(rows[0]))
-        self._validate_hosted_receipt_digest(receipt)
-        return receipt
+        return terminal[0]
 
     def create_action(
         self,
@@ -633,6 +727,12 @@ class SqliteBatchDeliveryJournal:
                 "BATCH_ACTION_PERSISTENCE_FAILED",
                 "action was not readable after creation",
             )
+        if (
+            existing.request_digest != request_digest
+            or existing.batch_id != action.batch_id
+            or existing.batch_sha != action.batch_sha
+        ):
+            raise DeliveryIdentityMismatch("batch action identity changed")
         return existing
 
     def persist_member_evidence(

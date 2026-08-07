@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import copy
+import json
+import subprocess
 import sys
 
 import pytest
@@ -17,6 +20,15 @@ from v8_batch_test_support import (
     make_integrator,
     make_three_standard_receipts,
 )
+
+
+def _document_readbacks() -> dict[str, object]:
+    document = (ROOT / "docs" / "e2e" / "gwo-v8-batch-integrator.md").read_text(
+        encoding="utf-8"
+    )
+    fenced = document.split("## Exact Git, CI, Target, Recovery, and Receipt Readbacks", 1)[1]
+    payload = fenced.split("```json\n", 1)[1].split("\n```", 1)[0]
+    return json.loads(payload)
 
 
 def test_beta2_evidence_schema_rejects_unknown_readback_keys():
@@ -40,6 +52,83 @@ def test_beta2_evidence_rejects_remote_repository_check_urls():
             {"repository_check_url": "https://github.com/owner/repo/actions"},
             40,
         )
+
+
+@pytest.mark.parametrize(
+    "section",
+    (
+        "infrastructure_retry",
+        "successful_fallback",
+        "singleton_fallback",
+        "restart_adoption",
+    ),
+)
+def test_beta2_evidence_rejects_unknown_nested_keys(section):
+    from write_v8_batch_evidence import _validate_readbacks
+
+    readbacks = _document_readbacks()
+    readbacks[section]["unexpected"] = True
+
+    with pytest.raises(SystemExit, match="exact|fields"):
+        _validate_readbacks(readbacks, 40)
+
+
+def test_beta2_evidence_binds_fallback_candidates_to_standard_partition():
+    from write_v8_batch_evidence import _validate_readbacks
+
+    readbacks = _document_readbacks()
+    readbacks["singleton_fallback"]["singleton_candidate_shas"][0] = "0" * 40
+
+    with pytest.raises(SystemExit, match="Candidate|partition|standard"):
+        _validate_readbacks(readbacks, 40)
+
+
+def test_beta2_evidence_binds_restart_and_retry_to_standard_batch():
+    from write_v8_batch_evidence import _validate_readbacks
+
+    readbacks = _document_readbacks()
+    readbacks["restart_adoption"]["batch_sha"] = readbacks["strict_batch"]["batch_sha"]
+
+    with pytest.raises(SystemExit, match="standard|Batch SHA|batch"):
+        _validate_readbacks(readbacks, 40)
+
+
+def test_beta2_check_rejects_tampered_readback_input(tmp_path):
+    readbacks = _document_readbacks()
+    readbacks["standard_batch"]["batch_sha"] = "0" * 40
+    tampered = tmp_path / "tampered-readbacks.json"
+    tampered.write_text(json.dumps(readbacks), encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            "py",
+            "-3.13",
+            "scripts/write_v8_batch_evidence.py",
+            "--check",
+            "--readbacks",
+            str(tampered),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert any(
+        token in (completed.stderr + completed.stdout)
+        for token in ("Batch SHA", "batch", "standard")
+    )
+
+
+def test_beta2_evidence_check_is_self_contained_without_arguments():
+    completed = subprocess.run(
+        ["py", "-3.13", "scripts/write_v8_batch_evidence.py", "--check"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 def test_beta2_batch_boundary_has_three_standard_members_and_one_strict_singleton(

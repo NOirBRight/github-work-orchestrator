@@ -28,9 +28,9 @@
 
 | Suite | Command | Command digest | Log digest | Manifest digest | Tests | Failures | Errors | Skipped |
 | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |
-| BatchIntegrator | `py -3.13 -m pytest tests/test_v8_batch_integrator.py -q` | `62ea428936895106685235430893a4afc88a14ec43c923fab4386b60bc82078d` | `cfde602c0f50db3d3eb55a768ff06cfa080287e8a6cee1c499539be4e0dcb360` | `6660c69c00c04c5ee9cede403abea2d44aa2aa9d3394b3cbf48fc65ac7ef6c87` | 47 | 0 | 0 | 0 |
-| Batch recovery | `py -3.13 -m pytest tests/test_v8_batch_recovery.py -q` | `1ecb90d072f65f7177a38d10a8b17d3d9beb6bf7f879241af3969e60d00a69e1` | `d4de9e27fd9229afa5c79e83dfc932abf30e1319fb1b0daa6ccb82449549de3b` | `6660c69c00c04c5ee9cede403abea2d44aa2aa9d3394b3cbf48fc65ac7ef6c87` | 12 | 0 | 0 | 0 |
-| Beta2 boundary | `py -3.13 -m pytest tests/test_v8_batch_beta2.py -q` | `25a3dc3161d79784912b80f18f034167722ed42d921f668afb67a7779e64b98a` | `d129965865ecc820ac89e646c348bb3e68dcb0296d23a43dceb73be249448da4` | `6660c69c00c04c5ee9cede403abea2d44aa2aa9d3394b3cbf48fc65ac7ef6c87` | 6 | 0 | 0 | 0 |
+| BatchIntegrator | `py -3.13 -m pytest tests/test_v8_batch_integrator.py -q` | `62ea428936895106685235430893a4afc88a14ec43c923fab4386b60bc82078d` | `c89134745fe8b606623d2b700345d3e4bb9192166b5abbc77439ff6fcad2534f` | `d5e56c7868d5b31e6e4011cfbcfc4e0a89441da55753d297bbf695d288da6c7f` | 47 | 0 | 0 | 0 |
+| Batch recovery | `py -3.13 -m pytest tests/test_v8_batch_recovery.py -q` | `1ecb90d072f65f7177a38d10a8b17d3d9beb6bf7f879241af3969e60d00a69e1` | `5a0ce7542b4af234423e96beae9a3e954431f24b9a189a150acc7c3882f1b7be` | `d5e56c7868d5b31e6e4011cfbcfc4e0a89441da55753d297bbf695d288da6c7f` | 20 | 0 | 0 | 0 |
+| Beta2 boundary | `py -3.13 -m pytest tests/test_v8_batch_beta2.py -q` | `25a3dc3161d79784912b80f18f034167722ed42d921f668afb67a7779e64b98a` | `f0d032eeeb134e1c0564aa9947b772db06368e94e6604b2e9b7b4d76038541b0` | `d5e56c7868d5b31e6e4011cfbcfc4e0a89441da55753d297bbf695d288da6c7f` | 14 | 0 | 0 | 0 |
 - `py -3.13 scripts/quick_validate.py`: exit 0.
 - `py -3.13 scripts/sync_orchestrator.py`: exit 0.
 - `py -3.13 scripts/sync_orchestrator.py --check`: exit 0.
