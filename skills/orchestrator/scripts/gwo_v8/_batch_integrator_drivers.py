@@ -60,7 +60,9 @@ def _require_text(name: str, value: str) -> None:
 
 
 class GitBatchDriver(Protocol):
-    def read_target(self, target: "BatchTarget") -> "BatchTarget": ...
+    def read_target(
+        self, target: "BatchTarget", *, allow_advance: bool = False
+    ) -> "BatchTarget": ...
 
     def read_ancestor(
         self, ancestor_sha: str, descendant_sha: str
@@ -590,7 +592,9 @@ class GitCliBatchDriver:
             )
         return candidate_tree
 
-    def read_target(self, target: "BatchTarget") -> "BatchTarget":
+    def read_target(
+        self, target: "BatchTarget", *, allow_advance: bool = False
+    ) -> "BatchTarget":
         from .batch_integrator import BatchIntegratorError, BatchTarget
 
         _require_text("target branch", target.target_branch)
@@ -614,7 +618,13 @@ class GitCliBatchDriver:
         assert isinstance(head, str) and isinstance(tree, str)
         actual_head = head.strip()
         actual_tree = tree.strip()
-        if actual_head != target.target_head_sha or actual_tree != target.target_tree_oid:
+        if (
+            not allow_advance
+            and (
+                actual_head != target.target_head_sha
+                or actual_tree != target.target_tree_oid
+            )
+        ):
             raise _batch_error(
                 "BATCH_TARGET_READBACK_MISMATCH",
                 "target branch head or tree changed before composition",

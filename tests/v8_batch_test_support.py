@@ -424,7 +424,9 @@ class RecordingGitBatchDriver:
         self.resume_directives: list[tuple[str, str]] = []
         self.tree_paths: dict[str, set[str]] = {}
 
-    def read_target(self, target: BatchTarget) -> BatchTarget:
+    def read_target(
+        self, target: BatchTarget, *, allow_advance: bool = False
+    ) -> BatchTarget:
         return target
 
     def read_ancestor(self, ancestor_sha: str, descendant_sha: str) -> AncestorReadback:

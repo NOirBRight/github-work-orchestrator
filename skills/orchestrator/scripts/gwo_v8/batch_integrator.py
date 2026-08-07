@@ -1813,7 +1813,7 @@ class BatchIntegrator:
                     "candidate_receipt_digest": member.digest,
                 }
             )
-            current_target = self.git.read_target(request.target)
+            current_target = self.git.read_target(request.target, allow_advance=True)
             state["singleton_materialization_intent"] = {
                 "index": index,
                 "member": member.canonical(),

@@ -336,6 +336,38 @@ def test_infrastructure_retry_passes_durable_idempotency_key_to_declared_driver(
     assert idempotency_key == state["retry_idempotency_key"]
 
 
+def test_restart_reuses_persisted_retry_idempotency_key_with_fresh_driver(tmp_path):
+    integrator, _drivers = make_integrator(
+        tmp_path,
+        hosted_outcomes=("infrastructure_failure", "infrastructure_failure"),
+    )
+    action = integrator.prepare(
+        make_batch_request(accepted_candidates=make_three_standard_receipts())
+    )
+    assert integrator.execute(action).phase == "wait"
+    durable = integrator.journal.read_action(action.stable_action_id)
+    assert durable is not None
+    expected_key = json.loads(durable.state_json)["retry_intent"]["idempotency_key"]
+
+    restarted, restarted_drivers = make_integrator(
+        tmp_path,
+        hosted_outcomes=("infrastructure_failure", "passed"),
+    )
+    retry_keys = []
+    retry = restarted_drivers.hosted.retry_hosted_idempotent
+
+    def capture_retry_key(repository, batch_sha, provider_check_id, idempotency_key):
+        retry_keys.append(idempotency_key)
+        return retry(repository, batch_sha, provider_check_id, idempotency_key)
+
+    restarted_drivers.hosted.retry_hosted_idempotent = capture_retry_key
+    observation = restarted.execute(action)
+
+    assert observation.phase == "wait"
+    assert retry_keys == [expected_key]
+    assert restarted_drivers.hosted.retry_shas == [action.batch_sha]
+
+
 def test_singleton_fallback_materializes_against_authoritative_advanced_target(
     tmp_path,
 ):
@@ -351,11 +383,13 @@ def test_singleton_fallback_materializes_against_authoritative_advanced_target(
         target_tree_oid="d" * 40,
     )
     read_count = 0
+    allow_advance_values = []
 
-    def read_target_with_advance(target):
+    def read_target_with_advance(target, *, allow_advance=False):
         nonlocal read_count
         read_count += 1
-        return advanced_target
+        allow_advance_values.append(allow_advance)
+        return advanced_target if allow_advance else target
 
     drivers.git.read_target = read_target_with_advance
 
@@ -369,6 +403,7 @@ def test_singleton_fallback_materializes_against_authoritative_advanced_target(
     assert [
         entry["target"]["target_head_sha"] for entry in state["singleton_queue"]
     ] == [advanced_target.target_head_sha] * 3
+    assert True in allow_advance_values
     assert drivers.git.clean_base_advance_calls[-3:] == [
         "issue:1",
         "issue:2",
