@@ -245,7 +245,7 @@ def test_historical_effect_intent_is_migrated_to_revision_bound_key_once(tmp_pat
             "receipt_digest": "9" * 64,
         }
     }
-    kernel._save(handle, state)
+    kernel._save_state(handle, state)
 
     kernel.advance(handle, "historical-effect-readback")
 
@@ -301,7 +301,7 @@ def test_inspect_backfills_historical_subject_but_retains_legacy_key_without_eff
     historical = state["runs"]["issue:109"]
     historical["work_run_key"] = "work-run:issue:109"
     historical.pop("work_subject_digest", None)
-    kernel._save(handle, state)
+    kernel._save_state(handle, state)
 
     first = kernel.inspect(handle)
     second = kernel.inspect(handle)
@@ -362,7 +362,7 @@ def test_historical_invalidation_record_keeps_legacy_work_run_key_on_advance(tmp
     record["observation_digest"] = observation.digest
     dedup_key = kernel._scoped_dedup_key(observation)
     state["plan_invalidation"] = {dedup_key: record}
-    kernel._save(handle, state)
+    kernel._save_state(handle, state)
 
     first = kernel.inspect(handle)
     assert first.work_runs[0].work_run_key == legacy_work_run

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+import pytest
 
 from gwo_v8._canonical import digest_value
 from gwo_v8.batch_integrator import (
@@ -21,8 +23,10 @@ from gwo_v8.execution_kernel import (
     StaleBindingObservation,
     StaleDiagnosisObservation,
     WorkRunAction,
+    WorkRunEffects,
+    WorkRunObservation,
 )
-from gwo_v8.plan_control import CampaignHandle
+from gwo_v8.plan_control import ActivePlanReadback, CampaignHandle
 from gwo_v8.runtime_gateway import (
     PlanInvalidationReport,
     ProfileMapping,
@@ -33,6 +37,84 @@ from gwo_v8.runtime_gateway import (
     WorkRunSubject,
 )
 from gwo_v8.runtime_profile import RuntimeProfile
+from v8_successor_test_support import _StaticPlanReader, _minimal_active_campaign
+
+
+@dataclass
+class NoopRunningEffects:
+    observations: dict[str, WorkRunObservation] = field(default_factory=dict)
+
+    def readback(
+        self,
+        action: WorkRunAction,
+    ) -> WorkRunObservation | StaleBindingObservation | StaleDiagnosisObservation | None:
+        return self.observations.get(action.stable_action_id)
+
+    def execute(
+        self,
+        action: WorkRunAction,
+    ) -> WorkRunObservation | StaleBindingObservation | StaleDiagnosisObservation:
+        if action.kind not in {"semantic_execution", "semantic_resume"}:
+            raise AssertionError(f"unexpected kernel test action: {action.kind}")
+        observation = WorkRunObservation(
+            phase="running",
+            stable_action_id=action.stable_action_id,
+            runtime_binding_id="binding:test",
+            receipt_digest=digest_value(
+                {"kind": "test-running", "action": action.stable_action_id}
+            ),
+        )
+        self.observations[action.stable_action_id] = observation
+        return observation
+
+
+@pytest.fixture
+def handle() -> CampaignHandle:
+    _active, handle = _minimal_active_campaign(("issue:109",))
+    return handle
+
+
+@pytest.fixture
+def active_plan() -> ActivePlanReadback:
+    from gwo_v8._canonical import canonical_bytes, digest_bytes, load_canonical_json
+
+    active, handle = _minimal_active_campaign(("issue:109",))
+    plan = load_canonical_json(active.plan_spec_bytes)
+    plan["campaign"]["key"] = handle.campaign_key
+    payload = canonical_bytes(plan)
+    revision = digest_bytes(payload)
+    return replace(
+        active,
+        current_revision_digest=revision,
+        plan_spec_bytes=payload,
+        activation_receipt=replace(
+            active.activation_receipt,
+            revision_digest=revision,
+        ),
+        claim_proofs=tuple(
+            replace(proof, plan_revision_digest=revision)
+            for proof in active.claim_proofs
+        ),
+    )
+
+
+@pytest.fixture
+def make_kernel():
+    def build(
+        store_path: Path,
+        active: ActivePlanReadback,
+        *,
+        effects: WorkRunEffects | None = None,
+    ):
+        from gwo_v8.execution_kernel import ExecutionKernel
+
+        return ExecutionKernel(
+            store_path=Path(store_path),
+            plan_control=_StaticPlanReader(active),
+            effects=effects or NoopRunningEffects(),
+        )
+
+    return build
 
 
 @dataclass

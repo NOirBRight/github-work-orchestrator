@@ -723,8 +723,12 @@ def test_plan_invalidation_reconciles_after_report_save_crash(tmp_path):
     original_save = kernel._save
     crashed = {"value": False}
 
-    def save_then_crash(handle_value, state):
-        original_save(handle_value, state)
+    def save_then_crash(handle_value, state, *, expected_version):
+        original_save(
+            handle_value,
+            state,
+            expected_version=expected_version,
+        )
         if not crashed["value"]:
             crashed["value"] = True
             raise RuntimeError("after plan invalidation record")

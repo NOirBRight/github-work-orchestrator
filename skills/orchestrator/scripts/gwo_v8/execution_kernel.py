@@ -9,6 +9,7 @@ nor Runtime/provider policy.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -154,6 +155,13 @@ class ExecutionKernelError(RuntimeError):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+
+
+@dataclass(frozen=True)
+class KernelStateReadback:
+    state: dict[str, Any]
+    version: int
+    state_digest: str
 
 
 from .revision_identity import (
@@ -1306,8 +1314,9 @@ class ExecutionKernel:
                 CREATE TABLE IF NOT EXISTS v8_execution_kernel_campaigns (
                     repository TEXT NOT NULL,
                     campaign_key TEXT NOT NULL,
+                    state_version INTEGER NOT NULL,
                     state_json TEXT NOT NULL,
-                    state_version INTEGER NOT NULL DEFAULT 0,
+                    state_digest TEXT NOT NULL,
                     PRIMARY KEY (repository, campaign_key)
                 )
                 """
@@ -1321,7 +1330,38 @@ class ExecutionKernel:
             if "state_version" not in columns:
                 connection.execute(
                     "ALTER TABLE v8_execution_kernel_campaigns "
-                    "ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"
+                    "ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1"
+                )
+            if "state_digest" not in columns:
+                connection.execute(
+                    "ALTER TABLE v8_execution_kernel_campaigns "
+                    "ADD COLUMN state_digest TEXT NOT NULL DEFAULT ''"
+                )
+            connection.execute(
+                """
+                UPDATE v8_execution_kernel_campaigns
+                   SET state_version = 1
+                 WHERE state_version < 1
+                """
+            )
+            for row in connection.execute(
+                """
+                SELECT repository, campaign_key, state_json, state_digest
+                FROM v8_execution_kernel_campaigns
+                WHERE state_digest IS NULL OR state_digest = ''
+                """
+            ).fetchall():
+                connection.execute(
+                    """
+                    UPDATE v8_execution_kernel_campaigns
+                       SET state_digest = ?
+                     WHERE repository = ? AND campaign_key = ?
+                    """,
+                    (
+                        digest_bytes(row["state_json"].encode("utf-8")),
+                        row["repository"],
+                        row["campaign_key"],
+                    ),
                 )
 
     def advance(
@@ -1383,7 +1423,7 @@ class ExecutionKernel:
                 if wake_ref not in seen:
                     state["wake_refs"].append(wake_ref)
                     is_new_wake = True
-                    self._save(active.handle, state)
+                    self._save_state(active.handle, state)
 
             # A bounded full fair scan gives every currently eligible Ticket
             # the same chance, then repeats after releases so refill needs no
@@ -1426,8 +1466,8 @@ class ExecutionKernel:
         """Mechanically explain the durable Campaign state; it sends no effect."""
 
         active, work = self._authoritative_active(campaign_handle)
-        state = self._load(active.handle)
-        if state is None:
+        readback = self._read_state(active.handle)
+        if readback is None:
             return Diagnostics(
                 status=CampaignStatus.BLOCKED,
                 reason="CampaignNotAdvanced",
@@ -1441,16 +1481,16 @@ class ExecutionKernel:
                 work_runs=(),
                 outstanding_effect_ids=(),
             )
+        state = readback.state
         migration_due = state.get("plan_revision_digest") != active.current_revision_digest
         if migration_due:
             if not self._human_successor_activation_crossed(active, state):
                 self._validate_successor_state_match(active, state)
             outcome = CampaignOutcome(CampaignStatus.WAIT, "SuccessorMigrationDue")
         else:
-            # Reuse the same identity backfill as advance, but do not admit or
-            # execute an effect.  Historical inspect must not expose an empty or
-            # Ticket-shaped Work Run identity after an upgrade.
-            state = self._load_or_initialize(active, work)
+            # Historical inspection may project missing identity fields, but
+            # it never persists that projection or invokes effect ownership.
+            state = self._inspect_projection(active, work, state)
             outcome = self._outcome(active.handle, state)
         classification = self._current_classification(
             state,
@@ -2005,7 +2045,7 @@ class ExecutionKernel:
         active: ActivePlanReadback,
         state: dict[str, Any],
     ) -> None:
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
         persisted = self._load(active.handle)
         if persisted is None or persisted.get("human_gate") != state.get("human_gate"):
             raise ExecutionKernelError(
@@ -2493,7 +2533,7 @@ class ExecutionKernel:
                 source_readback=readback,
                 repeated_invalidations=summary.repeated_invalidations,
             )
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
         persisted = self._load(active.handle)
         if persisted is None or persisted.get("human_gate") != state.get("human_gate"):
             raise ExecutionKernelError(
@@ -2669,7 +2709,7 @@ class ExecutionKernel:
             successor_revision_digest=fresh.current_revision_digest,
             repeated_invalidations=summary.repeated_invalidations,
         )
-        self._save(predecessor.handle, state)
+        self._save_state(predecessor.handle, state)
         persisted = self._load(predecessor.handle)
         if persisted is None or persisted.get("human_successor_transition") != transition:
             raise ExecutionKernelError(
@@ -3016,6 +3056,41 @@ class ExecutionKernel:
             )
         return active, work
 
+    def _inspect_projection(
+        self,
+        active: ActivePlanReadback,
+        work: dict[str, dict[str, Any]],
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return a read-only diagnostic projection of historical state."""
+
+        try:
+            plan = load_canonical_json(active.plan_spec_bytes)
+        except CanonicalJsonError as error:
+            raise ExecutionKernelError(
+                "ACTIVE_PLAN_INVALID", "PlanSpec bytes are not canonical"
+            ) from error
+        if type(plan) is not dict:
+            raise ExecutionKernelError("ACTIVE_PLAN_INVALID", "active PlanSpec is not an object")
+        projected = deepcopy(state)
+        runs = projected.get("runs")
+        if type(runs) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "ExecutionKernel run state is not a mapping",
+            )
+        for ticket_key, run in runs.items():
+            work_item = work.get(ticket_key)
+            if type(run) is not dict or work_item is None:
+                continue
+            subject_digest = _work_subject_digest_for_kernel(plan, work_item)
+            run.setdefault("work_subject_digest", subject_digest)
+            run.setdefault(
+                "work_run_key",
+                _work_run_key_for_kernel(plan, work_item, subject_digest),
+            )
+        return projected
+
     def _load_or_initialize(
         self, active: ActivePlanReadback, work: dict[str, dict[str, Any]]
     ) -> dict[str, Any]:
@@ -3105,7 +3180,7 @@ class ExecutionKernel:
             }
             if budget_defaults is not None:
                 state["replan_budgets"] = budget_defaults
-            self._save(active.handle, state)
+            self._save_state(active.handle, state)
             return state
         if (
             state.get("plan_revision_digest") != active.current_revision_digest
@@ -3431,7 +3506,7 @@ class ExecutionKernel:
                 state["effects"][revision_bound_action_id] = migrated_effect
                 dirty = True
         if dirty:
-            self._save(active.handle, state)
+            self._save_state(active.handle, state)
         return state
 
     def _load_initialize_or_reconcile_successor(
@@ -3698,7 +3773,7 @@ class ExecutionKernel:
         state["successor_previous_writer_generation"] = (
             active.activation_receipt.writer_generation
         )
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
         persisted = self._load(active.handle)
         if persisted is None or persisted.get("successor_transition") != transition:
             raise ExecutionKernelError(
@@ -4141,7 +4216,7 @@ class ExecutionKernel:
                 phase="active_successor",
             ).canonical()
             new_state["human_gate"] = new_gate
-        self._save(active.handle, new_state)
+        self._save_state(active.handle, new_state)
         readback = self._load(active.handle)
         if readback != new_state:
             raise ExecutionKernelError(
@@ -4528,7 +4603,7 @@ class ExecutionKernel:
             "execute_attempted": False,
             **effect_identity,
         }
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
 
     def _persist_effect_readback(
         self,
@@ -4550,7 +4625,7 @@ class ExecutionKernel:
                 "stale effect receipt changed during readback",
             )
         effect.update({"state": "read_back", "receipt_digest": receipt_digest})
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
 
     def _read_or_execute_once(
         self,
@@ -4577,7 +4652,7 @@ class ExecutionKernel:
                     "effect intent disappeared before execution fence",
                 )
             effect["execute_attempted"] = True
-            self._save(active.handle, state)
+            self._save_state(active.handle, state)
         return self._effects.execute(action)
 
     @staticmethod
@@ -4831,7 +4906,7 @@ class ExecutionKernel:
             for _key, value in sorted(state["runs"].items())
             if type(value) is dict and value.get("candidate_receipt") is not None
         ]
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
         persisted = self._load(active.handle)
         if persisted is None:
             raise ExecutionKernelError(
@@ -4898,7 +4973,7 @@ class ExecutionKernel:
                 repository=active.handle.repository,
             )
         run["stale_due_at"] = None
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
 
     def _apply_stale_diagnosis(
         self,
@@ -4959,7 +5034,7 @@ class ExecutionKernel:
             repository=active.handle.repository,
         )
         run["stale_due_at"] = None
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
 
     def _perform_stale_effect(
         self,
@@ -5027,7 +5102,7 @@ class ExecutionKernel:
             self._mark_candidate_budget_exhausted(run, ticket_key)
             run["stale_due_at"] = None
             run["stale_disposition"] = stale_readback.state.value
-            self._save(active.handle, state)
+            self._save_state(active.handle, state)
             return True
         if stale_readback.state in {
             StaleReadbackState.TERMINAL,
@@ -5101,7 +5176,7 @@ class ExecutionKernel:
             fence_execute=True,
         )
         if diagnosis_observation is None:
-            self._save(active.handle, state)
+            self._save_state(active.handle, state)
             return False
         stale_diagnosis = self._validate_stale_diagnosis(
             diagnosis,
@@ -5182,7 +5257,7 @@ class ExecutionKernel:
             repository=active.handle.repository,
         )
         run["stale_due_at"] = None
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
         return True
 
     def _next_due_run(
@@ -5309,7 +5384,7 @@ class ExecutionKernel:
                 continue
             run["reason"] = None
             return ticket_key
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
         return None
 
     @staticmethod
@@ -5494,7 +5569,7 @@ class ExecutionKernel:
             run,
         )
         # Persist the observation before changing any Work Run field.
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
         self._reconcile_plan_invalidations(active, state, work)
 
     @staticmethod
@@ -5770,7 +5845,7 @@ class ExecutionKernel:
         state["plan_invalidation_classifications"] = {
             classification.action_id: classification.canonical()
         }
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
         readback = self._load(active.handle)
         if readback is None:
             raise ExecutionKernelError(
@@ -5837,7 +5912,7 @@ class ExecutionKernel:
                 is PlanInvalidationDisposition.REQUIRE_HUMAN_DECISION
             ):
                 self._ensure_human_gate(active, state, classification)
-                self._save(active.handle, state)
+                self._save_state(active.handle, state)
             return
         records = state.get("plan_invalidation", {})
         resolutions = state.setdefault("plan_invalidation_resolutions", {})
@@ -5874,7 +5949,7 @@ class ExecutionKernel:
                 "action_id": classification.action_id,
                 "disposition": classification.disposition.value,
             }
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
         readback = self._load(active.handle)
         if readback is None:
             raise ExecutionKernelError(
@@ -6117,7 +6192,7 @@ class ExecutionKernel:
                 run["last_action_id"] = None
                 run["next_check_at"] = None
                 run["claim_state"] = "held" if run.get("slot_held") else "released"
-                self._save(active.handle, state)
+                self._save_state(active.handle, state)
                 readback = self._load(active.handle)
                 if readback is None:
                     raise ExecutionKernelError(
@@ -6141,7 +6216,7 @@ class ExecutionKernel:
             if run.get("slot_held"):
                 run["slot_held"] = False
                 run["claim_state"] = "released"
-                self._save(active.handle, state)
+                self._save_state(active.handle, state)
 
     def _perform_due_effect(
         self,
@@ -6214,11 +6289,11 @@ class ExecutionKernel:
                 history_changed = True
             if len(candidate_commit_oids) > 3:
                 self._mark_candidate_budget_exhausted(run, ticket_key)
-                self._save(active.handle, state)
+                self._save_state(active.handle, state)
                 return
 
         if history_changed:
-            self._save(active.handle, state)
+            self._save_state(active.handle, state)
 
         prior_action_id = run.get("last_action_id")
         if (
@@ -6296,7 +6371,7 @@ class ExecutionKernel:
         run["semantic_action_id"] = semantic_action_id
         run["slot_held"] = True
         run["claim_state"] = "held"
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
         observation = self._effects.readback(action)
         if observation is None:
             if prior_effect is not None and prior_effect.get("state") == "read_back":
@@ -6309,7 +6384,7 @@ class ExecutionKernel:
                     if wake_ref not in state["last_wake_refs"]:
                         state["last_wake_refs"].append(wake_ref)
                         state["last_wake_refs"].sort()
-                self._save(active.handle, state)
+                self._save_state(active.handle, state)
                 return False
             observation = self._effects.execute(action)
         if type(observation) is not WorkRunObservation or observation.stable_action_id != action_id:
@@ -6420,7 +6495,7 @@ class ExecutionKernel:
                     repository=active.handle.repository,
                 )
                 trusted_progress_recorded = True
-            self._save(active.handle, state)
+            self._save_state(active.handle, state)
             persisted_state = self._load(active.handle)
             if persisted_state is None:
                 raise ExecutionKernelError(
@@ -6523,7 +6598,7 @@ class ExecutionKernel:
                 run,
                 repository=active.handle.repository,
             )
-        self._save(active.handle, state)
+        self._save_state(active.handle, state)
         return True
 
     def _outcome(self, handle: CampaignHandle, state: dict[str, Any] | None) -> CampaignOutcome:
@@ -6675,33 +6750,8 @@ class ExecutionKernel:
         return state
 
     def _load_read_only(self, handle: CampaignHandle) -> dict[str, Any] | None:
-        try:
-            with self._connect_read_only() as connection:
-                row = connection.execute(
-                    """
-                    SELECT state_json FROM v8_execution_kernel_campaigns
-                    WHERE repository = ? AND campaign_key = ?
-                    """,
-                    (handle.repository, handle.campaign_key),
-                ).fetchone()
-        except ExecutionKernelError:
-            raise
-        except sqlite3.Error as error:
-            raise ExecutionKernelError(
-                "EXECUTION_STORE_INVALID",
-                "Execution store schema is unreadable",
-            ) from error
-        if row is None:
-            return None
-        try:
-            value = json.loads(row["state_json"])
-        except json.JSONDecodeError as error:
-            raise ExecutionKernelError(
-                "EXECUTION_STORE_INVALID", "Campaign state is unreadable"
-            ) from error
-        if type(value) is not dict:
-            raise ExecutionKernelError("EXECUTION_STORE_INVALID", "Campaign state is invalid")
-        return value
+        readback = self._read_state(handle)
+        return None if readback is None else readback.state
 
     def _status_from_persisted_state(self, state: Mapping[str, Any]) -> CampaignStatus:
         if type(state) is not dict:
@@ -6877,73 +6927,177 @@ class ExecutionKernel:
         with _KERNEL_LOCKS_GUARD:
             return _KERNEL_LOCKS.setdefault(key, threading.RLock())
 
-    def _load(self, handle: CampaignHandle) -> dict[str, Any] | None:
+    def _read_state(self, handle: CampaignHandle) -> KernelStateReadback | None:
+        if type(handle) is not CampaignHandle:
+            raise ExecutionKernelError(
+                "CAMPAIGN_HANDLE_INVALID",
+                "Campaign handle must be an exact CampaignHandle",
+            )
         key = (handle.repository, handle.campaign_key)
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT state_json, state_version FROM v8_execution_kernel_campaigns
-                WHERE repository = ? AND campaign_key = ?
-                """,
-                (handle.repository, handle.campaign_key),
-            ).fetchone()
+        try:
+            with self._connect_read_only() as connection:
+                row = connection.execute(
+                    """
+                    SELECT state_json, state_version, state_digest
+                    FROM v8_execution_kernel_campaigns
+                    WHERE repository = ? AND campaign_key = ?
+                    """,
+                    (handle.repository, handle.campaign_key),
+                ).fetchone()
+        except ExecutionKernelError:
+            raise
+        except sqlite3.Error as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Execution store schema is unreadable",
+            ) from error
         if row is None:
             self._campaign_row_versions[key] = None
             return None
+        state_json = row["state_json"]
+        state_digest = row["state_digest"]
         version = row["state_version"]
-        if type(version) is not int or isinstance(version, bool) or version < 0:
+        if (
+            type(state_json) is not str
+            or type(state_digest) is not str
+            or type(version) is not int
+            or isinstance(version, bool)
+            or version < 1
+        ):
             raise ExecutionKernelError(
                 "EXECUTION_STORE_INVALID",
-                "Campaign durable state version is invalid",
+                "Campaign durable state envelope is invalid",
             )
-        self._campaign_row_versions[key] = version
         try:
-            value = json.loads(row["state_json"])
+            state = json.loads(state_json)
         except json.JSONDecodeError as error:
-            raise ExecutionKernelError("EXECUTION_STORE_INVALID", "Campaign state is unreadable") from error
-        if type(value) is not dict:
-            raise ExecutionKernelError("EXECUTION_STORE_INVALID", "Campaign state is invalid")
-        return value
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID", "Campaign state is unreadable"
+            ) from error
+        if type(state) is not dict:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID", "Campaign state is invalid"
+            )
+        observed_digest = digest_bytes(state_json.encode("utf-8"))
+        if state_digest != observed_digest:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign state digest changed during readback",
+            )
+        readback = KernelStateReadback(
+            state=state,
+            version=version,
+            state_digest=state_digest,
+        )
+        self._campaign_row_versions[key] = version
+        return readback
 
-    def _save(self, handle: CampaignHandle, state: dict[str, Any]) -> None:
-        rendered = json.dumps(state, separators=(",", ":"), sort_keys=True)
+    def _load(self, handle: CampaignHandle) -> dict[str, Any] | None:
+        readback = self._read_state(handle)
+        return None if readback is None else readback.state
+
+    def _save_state(self, handle: CampaignHandle, state: dict[str, Any]) -> int:
         key = (handle.repository, handle.campaign_key)
-        expected = self._campaign_row_versions.get(key)
-        with self._connect() as connection:
-            try:
-                if expected is None:
-                    connection.execute(
+        if key not in self._campaign_row_versions:
+            readback = self._read_state(handle)
+            expected_version = 0 if readback is None else readback.version
+        else:
+            cached_version = self._campaign_row_versions[key]
+            expected_version = 0 if cached_version is None else cached_version
+        return self._save(
+            handle,
+            state,
+            expected_version=expected_version,
+        )
+
+    def _save(
+        self,
+        handle: CampaignHandle,
+        state: dict[str, Any],
+        *,
+        expected_version: int,
+    ) -> int:
+        if type(handle) is not CampaignHandle:
+            raise ExecutionKernelError(
+                "CAMPAIGN_HANDLE_INVALID",
+                "Campaign handle must be an exact CampaignHandle",
+            )
+        if (
+            type(state) is not dict
+            or type(expected_version) is not int
+            or isinstance(expected_version, bool)
+            or expected_version < 0
+        ):
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign state save envelope is invalid",
+            )
+        rendered = json.dumps(state, separators=(",", ":"), sort_keys=True)
+        state_digest = digest_bytes(rendered.encode("utf-8"))
+        key = (handle.repository, handle.campaign_key)
+        next_version: int | None = None
+        try:
+            with self._connect() as connection:
+                if expected_version == 0:
+                    cursor = connection.execute(
                         """
                         INSERT INTO v8_execution_kernel_campaigns
-                            (repository, campaign_key, state_json, state_version)
-                        VALUES (?, ?, ?, 0)
+                            (repository, campaign_key, state_version, state_json, state_digest)
+                        VALUES (?, ?, 1, ?, ?)
                         """,
-                        (handle.repository, handle.campaign_key, rendered),
+                        (
+                            handle.repository,
+                            handle.campaign_key,
+                            rendered,
+                            state_digest,
+                        ),
                     )
-                    next_version = 0
+                    if cursor.rowcount != 1:
+                        raise sqlite3.IntegrityError("Campaign state insert did not persist")
+                    next_version = 1
                 else:
                     cursor = connection.execute(
                         """
                         UPDATE v8_execution_kernel_campaigns
-                        SET state_json = ?, state_version = state_version + 1
-                        WHERE repository = ? AND campaign_key = ? AND state_version = ?
+                           SET state_version = state_version + 1,
+                               state_json = ?,
+                               state_digest = ?
+                         WHERE repository = ? AND campaign_key = ?
+                           AND state_version = ?
                         """,
-                        (rendered, handle.repository, handle.campaign_key, expected),
+                        (
+                            rendered,
+                            state_digest,
+                            handle.repository,
+                            handle.campaign_key,
+                            expected_version,
+                        ),
                     )
-                    if cursor.rowcount != 1:
-                        raise ExecutionKernelError(
-                            "EXECUTION_STORE_CONFLICT",
-                            "Campaign state changed concurrently",
-                        )
-                    next_version = expected + 1
-            except ExecutionKernelError:
-                raise
-            except sqlite3.IntegrityError as error:
-                raise ExecutionKernelError(
-                    "EXECUTION_STORE_CONFLICT",
-                    "Campaign state changed concurrently",
-                ) from error
+                    if cursor.rowcount == 1:
+                        next_version = expected_version + 1
+        except sqlite3.IntegrityError:
+            next_version = None
+        except sqlite3.Error as error:
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_INVALID",
+                "Campaign state could not be durably written",
+            ) from error
+
+        if next_version is None:
+            current = self._read_state(handle)
+            if (
+                current is not None
+                and current.state_digest == state_digest
+                and current.state == state
+            ):
+                self._campaign_row_versions[key] = current.version
+                return current.version
+            raise ExecutionKernelError(
+                "EXECUTION_STORE_CAS_CONFLICT",
+                "Campaign state version changed before the durable write",
+            )
         self._campaign_row_versions[key] = next_version
+        return next_version
 
 
 _default_execution_kernel: ExecutionKernel | None = None
