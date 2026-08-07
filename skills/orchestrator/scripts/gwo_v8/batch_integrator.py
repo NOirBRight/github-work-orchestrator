@@ -1505,6 +1505,7 @@ class BatchIntegrator:
                 request.repository,
                 action.batch_sha,
                 intent["provider_check_id"],
+                idempotency_key,
             )
         state.pop("retry_intent", None)
         state.pop("hosted_receipt", None)
@@ -1813,10 +1814,6 @@ class BatchIntegrator:
                 }
             )
             current_target = self.git.read_target(request.target)
-            if current_target != request.target:
-                raise DeliveryIdentityMismatch(
-                    "Singleton fallback target changed before child materialization"
-                )
             state["singleton_materialization_intent"] = {
                 "index": index,
                 "member": member.canonical(),

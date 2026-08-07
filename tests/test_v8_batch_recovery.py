@@ -302,6 +302,80 @@ def test_retry_intent_is_persisted_before_external_retry_crash(tmp_path):
     assert len(set(drivers.hosted.retry_shas)) == 1
 
 
+def test_infrastructure_retry_passes_durable_idempotency_key_to_declared_driver(
+    tmp_path,
+):
+    integrator, drivers = make_integrator(
+        tmp_path,
+        hosted_outcomes=("infrastructure_failure", "infrastructure_failure"),
+    )
+    action = integrator.prepare(
+        make_batch_request(accepted_candidates=make_three_standard_receipts())
+    )
+    retry_keys = []
+
+    def retry_with_key(repository, batch_sha, provider_check_id, idempotency_key):
+        retry_keys.append((repository, batch_sha, provider_check_id, idempotency_key))
+
+    drivers.hosted.retry_hosted_idempotent = None
+    drivers.hosted.retry_hosted = retry_with_key
+
+    waiting = integrator.execute(action)
+    assert waiting.phase == "wait"
+    resumed = integrator.execute(action)
+
+    assert resumed.phase == "wait"
+    assert len(retry_keys) == 1
+    repository, batch_sha, provider_check_id, idempotency_key = retry_keys[0]
+    assert repository == "owner/repo"
+    assert batch_sha == action.batch_sha
+    assert provider_check_id == "check:1"
+    durable = integrator.journal.read_action(action.stable_action_id)
+    assert durable is not None
+    state = json.loads(durable.state_json)
+    assert idempotency_key == state["retry_idempotency_key"]
+
+
+def test_singleton_fallback_materializes_against_authoritative_advanced_target(
+    tmp_path,
+):
+    integrator, drivers = make_integrator(
+        tmp_path,
+        hosted_outcomes=("code_failure", "passed", "passed", "passed"),
+    )
+    request = make_batch_request(accepted_candidates=make_three_standard_receipts())
+    action = integrator.prepare(request)
+    advanced_target = replace(
+        request.target,
+        target_head_sha="c" * 40,
+        target_tree_oid="d" * 40,
+    )
+    read_count = 0
+
+    def read_target_with_advance(target):
+        nonlocal read_count
+        read_count += 1
+        return advanced_target
+
+    drivers.git.read_target = read_target_with_advance
+
+    observation = integrator.execute(action)
+
+    assert observation.fallback_generation == 1
+    parent = integrator.journal.read_action(action.stable_action_id)
+    assert parent is not None
+    state = json.loads(parent.state_json)
+    assert read_count >= 1
+    assert [
+        entry["target"]["target_head_sha"] for entry in state["singleton_queue"]
+    ] == [advanced_target.target_head_sha] * 3
+    assert drivers.git.clean_base_advance_calls[-3:] == [
+        "issue:1",
+        "issue:2",
+        "issue:3",
+    ]
+
+
 def test_singleton_child_action_binds_actual_child_request_digest(tmp_path):
     integrator, _drivers = make_integrator(
         tmp_path, hosted_outcomes=("code_failure", "passed", "passed", "passed")

@@ -567,7 +567,9 @@ class NoopHostedDriver:
     def read_hosted_result(self, repository, batch_sha, suite):
         raise AssertionError("hosted driver is not part of Task 5")
 
-    def retry_hosted(self, repository, batch_sha, provider_check_id):
+    def retry_hosted(
+        self, repository, batch_sha, provider_check_id, idempotency_key
+    ):
         raise AssertionError("hosted driver is not part of Task 5")
 
     def integrate_serially(self, repository, batch_sha, target, pull_request):
@@ -705,8 +707,15 @@ class RecordingHostedBatchDriver:
         )
 
     def retry_hosted(
-        self, repository: str, batch_sha: str, provider_check_id: str
+        self,
+        repository: str,
+        batch_sha: str,
+        provider_check_id: str,
+        idempotency_key: str,
     ) -> None:
+        if idempotency_key in self.retry_idempotency_keys:
+            return
+        self.retry_idempotency_keys.add(idempotency_key)
         self.retry_calls += 1
         self.retry_shas.append(batch_sha)
 
@@ -719,8 +728,7 @@ class RecordingHostedBatchDriver:
     ) -> None:
         if idempotency_key in self.retry_idempotency_keys:
             return
-        self.retry_idempotency_keys.add(idempotency_key)
-        self.retry_hosted(repository, batch_sha, provider_check_id)
+        self.retry_hosted(repository, batch_sha, provider_check_id, idempotency_key)
 
     def integrate_serially(
         self,

@@ -118,7 +118,11 @@ class HostedBatchDriver(Protocol):
     ) -> "HostedResultObservation": ...
 
     def retry_hosted(
-        self, repository: str, batch_sha: str, provider_check_id: str
+        self,
+        repository: str,
+        batch_sha: str,
+        provider_check_id: str,
+        idempotency_key: str,
     ) -> None: ...
 
     def integrate_serially(
