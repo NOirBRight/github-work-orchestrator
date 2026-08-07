@@ -11,6 +11,10 @@ from gwo_v8.batch_integrator import (
     BatchDeliveryObservation,
     BatchDeliveryProof,
     BatchDeliveryRequest,
+    BatchTarget,
+    HostedSuiteDefinition,
+    LocalSuiteDefinition,
+    MemberDeliveryObservation,
 )
 from gwo_v8.candidate_gate import (
     AcceptedCandidateReceipt,
@@ -38,12 +42,16 @@ from gwo_v8.execution_kernel import (
 )
 from gwo_v8.plan_control import ActivePlanReadback, CampaignHandle
 from gwo_v8.runtime_gateway import (
+    CapabilityPolicy,
+    CapabilityPolicyProof,
     PlanInvalidationReport,
+    PlanInvalidationReceipt,
     ProfileMapping,
     RuntimeConfiguration,
     RuntimeGateway,
     RuntimeProgressReceipt,
     RuntimeRepositoryContext,
+    WorkRunPurpose,
     WorkRunSubject,
 )
 from gwo_v8.runtime_profile import RuntimeProfile
@@ -434,7 +442,7 @@ class RecordingRuntimeGateway:
         *,
         wake_cursor: str | None,
     ) -> RuntimeProgressReceipt:
-        self.calls.append(("progress", subject.work_run_key))
+        self.calls.append(("progress", subject.stable_action_id))
         if self.receipt is None:
             raise AssertionError("RecordingRuntimeGateway.receipt must be configured")
         return self.receipt
@@ -488,7 +496,9 @@ class RecordingSubjectSource:
         self.calls.append(action.stable_action_id)
         if self.subject is None:
             raise AssertionError("RecordingSubjectSource.subject must be configured")
-        return self.subject
+        if self.subject.stable_action_id == action.stable_action_id:
+            return self.subject
+        return replace(self.subject, stable_action_id=action.stable_action_id)
 
 
 @dataclass
@@ -518,7 +528,13 @@ class RecordingCandidateParentSource:
             raise AssertionError(
                 "RecordingCandidateParentSource.parent must be configured"
             )
-        return self.parent
+        if self.parent.runtime_subject == subject:
+            return self.parent
+        return replace(
+            self.parent,
+            runtime_subject=subject,
+            parent_digest=None,
+        )
 
 
 @dataclass
@@ -583,6 +599,7 @@ class RecordingBatchIntegrator:
     action: BatchDeliveryAction | None = None
     observation: BatchDeliveryObservation | None = None
     prepare_calls: int = 0
+    readback_calls: int = 0
     execute_calls: int = 0
     target_integration_calls: int = 0
     suppress_callbacks: bool = False
@@ -594,6 +611,9 @@ class RecordingBatchIntegrator:
         return self.action
 
     def readback(self, action: BatchDeliveryAction) -> BatchDeliveryObservation | None:
+        self.readback_calls += 1
+        if self.execute_calls == 0:
+            return None
         return self.observation
 
     def execute(self, action: BatchDeliveryAction) -> BatchDeliveryObservation:
@@ -643,3 +663,340 @@ def make_recording_repository_contexts(
             "refs/heads/main",
         )
     }
+
+
+def make_test_subject(action: WorkRunAction) -> WorkRunSubject:
+    return WorkRunSubject(
+        repository=action.repository,
+        campaign_key=action.campaign_key,
+        campaign_handle=f"{action.repository}:{action.campaign_key}",
+        plan_revision_digest=action.plan_revision_digest,
+        work_run_key=action.work_run_key or f"work-run:{action.ticket_key}",
+        ticket_key=action.ticket_key,
+        purpose=WorkRunPurpose.implementation(),
+        prompt_artifact_digest="1" * 64,
+        authority_subtree_digest="2" * 64,
+        stable_action_id=action.stable_action_id,
+    )
+
+
+def make_batch_delivery_request(action: WorkRunAction) -> BatchDeliveryRequest:
+    accepted = make_accepted_candidate_receipt(action)
+    return BatchDeliveryRequest(
+        stable_action_id=action.stable_action_id,
+        repository=action.repository,
+        campaign_key=action.campaign_key,
+        plan_revision_digest=action.plan_revision_digest,
+        target=BatchTarget(
+            repository=action.repository,
+            target_branch="main",
+            target_head_sha="5" * 40,
+            target_tree_oid="6" * 40,
+            target_facts_digest="7" * 64,
+        ),
+        accepted_candidates=(accepted,),
+        local_suite=LocalSuiteDefinition(
+            suite_id="local:production",
+            definition_digest="8" * 64,
+            command=("py", "-3.13", "-m", "pytest", "-q"),
+        ),
+        hosted_suites=(
+            HostedSuiteDefinition(
+                suite_id="hosted:ci",
+                hosted_name="GWO CI",
+                definition_digest="9" * 64,
+            ),
+        ),
+        writer_generation="v6.1",
+        activation_id="activation:test",
+    )
+
+
+@dataclass
+class ProductionEffectsSupport:
+    root: Path
+
+    def __post_init__(self) -> None:
+        self.runtime = RecordingRuntimeGateway()
+        self.runtime_factory = RecordingRuntimeGatewayFactory(
+            store_path=self.root / "runtime.sqlite3",
+            provider_command="recording-provider --no-dispatch",
+            repository_root=self.root,
+            gateway=self.runtime,
+        )
+        self.runtime_stale = RecordingRuntimeStaleReadback()
+        self.subjects = RecordingSubjectSource()
+        self.references = RecordingCandidateReferenceReader(
+            reference="refs/heads/candidate"
+        )
+        self.parents = RecordingCandidateParentSource()
+        self.candidate = RecordingCandidateGate()
+        self.batch_requests = RecordingBatchRequestSource(
+            target_path=self.root / "target",
+            runtime_factory=self.runtime_factory,
+        )
+        self.batch = RecordingBatchIntegrator(
+            store_path=self.root / "batch.sqlite3",
+            target_path=self.root / "target",
+        )
+
+    @property
+    def all_calls(self) -> list[object]:
+        return [
+            *self.runtime.calls,
+            *self.runtime_stale.calls,
+            *self.subjects.calls,
+            *self.references.calls,
+            *self.candidate.calls,
+        ]
+
+    def runtime_completed_receipt(
+        self,
+        action: WorkRunAction,
+    ) -> RuntimeProgressReceipt:
+        subject = make_test_subject(action)
+        receipt = RuntimeProgressReceipt(
+            subject_digest=subject.digest,
+            stable_action_id=action.stable_action_id,
+            status="completed",
+            receipt_digest="3" * 64,
+            output_artifact_digest="4" * 64,
+        )
+        object.__setattr__(receipt, "runtime_binding_id", "binding:test")
+        return receipt
+
+    def accepted_candidate_result(self, action: WorkRunAction) -> CandidateGateResult:
+        return accepted_candidate_result(action)
+
+    def batch_delivery_request(
+        self,
+        action: WorkRunAction,
+    ) -> BatchDeliveryRequest:
+        return make_batch_delivery_request(action)
+
+    def complete_batch_observation(
+        self,
+        action: WorkRunAction,
+    ) -> BatchDeliveryObservation:
+        candidate = make_candidate_receipt(action)
+        accepted = make_accepted_candidate_receipt(action, candidate)
+        request = make_batch_delivery_request(action)
+        batch_action = BatchDeliveryAction(
+            stable_action_id=action.stable_action_id,
+            request_digest=request.request_digest,
+            batch_id="1" * 64,
+            batch_sha=accepted.candidate_sha,
+            member_ticket_keys=(accepted.ticket_key,),
+        )
+        members = (
+            MemberDeliveryObservation(
+                ticket_key=accepted.ticket_key,
+                work_run_key=accepted.work_run_key,
+                candidate_sha=accepted.candidate_sha,
+                status="integrated",
+                evidence_digests=accepted.evidence_digests,
+            ),
+        )
+        delivery_proof = BatchDeliveryProof.create(
+            delivery_stable_action_id=batch_action.stable_action_id,
+            delivery_request_digest=batch_action.request_digest,
+            batch_id=batch_action.batch_id,
+            batch_sha=batch_action.batch_sha,
+            member_ticket_keys=batch_action.member_ticket_keys,
+            local_check_receipt_digest="a" * 64,
+            publication_receipt_digest="b" * 64,
+            pull_request_number=19,
+            pull_request_head_sha=batch_action.batch_sha,
+            hosted_result_receipt_digest="c" * 64,
+            integration_lease_digest="d" * 64,
+            target_branch=request.target.target_branch,
+            target_head_sha="e" * 40,
+            target_readback_digest="f" * 64,
+            target_contains_batch_sha=True,
+            pull_request_merge_target_sha="e" * 40,
+            merge_method="merge",
+        )
+        observation_body = {
+            "stable_action_id": batch_action.stable_action_id,
+            "batch_id": batch_action.batch_id,
+            "batch_sha": batch_action.batch_sha,
+            "phase": "complete",
+            "reason": "target integrated",
+            "retry_count": 0,
+            "fallback_generation": 0,
+            "members": [
+                {
+                    "ticket_key": member.ticket_key,
+                    "work_run_key": member.work_run_key,
+                    "candidate_sha": member.candidate_sha,
+                    "status": member.status,
+                    "evidence_digests": list(member.evidence_digests),
+                    "resume_reason": member.resume_reason,
+                }
+                for member in members
+            ],
+            "delivery_proofs": [delivery_proof.canonical()],
+        }
+        observation = BatchDeliveryObservation(
+            stable_action_id=batch_action.stable_action_id,
+            batch_id=batch_action.batch_id,
+            batch_sha=batch_action.batch_sha,
+            phase="complete",
+            reason="target integrated",
+            receipt_digest=digest_value(
+                {"kind": "batch-observation.v1", **observation_body}
+            ),
+            retry_count=0,
+            fallback_generation=0,
+            members=members,
+            delivery_proofs=(delivery_proof,),
+        )
+        self.batch_requests.request = request
+        self.batch.action = batch_action
+        self.batch.observation = observation
+        return observation
+
+    def plan_invalidation_result(self, action: WorkRunAction) -> CandidateGateResult:
+        subject = make_test_subject(action)
+        evidence = PlanInvalidationEvidence(
+            runtime_subject=subject,
+            parent_digest="c" * 64,
+            candidate_digest="d" * 64,
+            source_kind="scope_audit",
+            source_evidence_digest="e" * 64,
+            invalidated_obligation="ticket scope",
+            required_effects=("read tracker",),
+            workspace_identity="workspace:test",
+            discovered_facts=("scope=outside",),
+            reproduction="deterministic scope escape",
+        )
+        report = PlanInvalidationReport(
+            repository=action.repository,
+            campaign_key=action.campaign_key,
+            plan_revision_digest=action.plan_revision_digest,
+            ticket_key=action.ticket_key,
+            work_run_key=action.work_run_key or f"work-run:{action.ticket_key}",
+            runtime_binding_id="binding:test",
+            authority_subtree_digest="2" * 64,
+            reporter_role="worker",
+            evidence_digest=evidence.digest,
+            dedup_identity="invalidation:test",
+            invalidated_obligation="ticket scope",
+            required_effects=("read tracker",),
+            workspace_identity="workspace:test",
+        )
+        proof = CapabilityPolicyProof(
+            capability_policy=CapabilityPolicy(worker_can_edit_issues=False),
+            authority_record_digest="f" * 64,
+        )
+        receipt = PlanInvalidationReceipt(
+            report_digest=report.digest,
+            receipt_digest="0" * 64,
+            capability_policy_proof=proof,
+            observation={
+                "kind": "plan_invalidation_observation.v1",
+                "repository": report.repository,
+                "campaign_key": report.campaign_key,
+                "plan_revision_digest": report.plan_revision_digest,
+                "ticket_key": report.ticket_key,
+                "work_run_key": report.work_run_key,
+                "runtime_binding_id": report.runtime_binding_id,
+                "authority_subtree_digest": report.authority_subtree_digest,
+                "reporter_role": report.reporter_role,
+                "report_digest": report.digest,
+                "evidence_digest": report.evidence_digest,
+                "dedup_identity": report.dedup_identity,
+                "invalidated_obligation": report.invalidated_obligation,
+                "required_effects": list(report.required_effects),
+                "workspace_identity": report.workspace_identity,
+            },
+        )
+        return CandidateGateResult(
+            status=CandidateGateStatus.PLAN_INVALIDATION_REPORTED,
+            evidence=(evidence,),
+            plan_invalidation_receipt=receipt,
+            plan_invalidation_report=report,
+        )
+
+
+@pytest.fixture
+def action() -> WorkRunAction:
+    return WorkRunAction(
+        stable_action_id="action:109",
+        repository="owner/repository",
+        campaign_key="campaign:successor-kernel",
+        plan_revision_digest="a" * 64,
+        ticket_key="issue:109",
+        kind="semantic_execution",
+        semantic_action_id="semantic:109",
+        work_run_key="work-run:issue:109",
+        work_subject_digest="b" * 64,
+        runtime_binding_id=None,
+        wake_ref="runtime:initial",
+        accepted_candidate_receipt_digest=None,
+    )
+
+
+@pytest.fixture
+def delivery_action(action: WorkRunAction) -> WorkRunAction:
+    delivery = WorkRunAction(
+        stable_action_id="action:109:batch",
+        repository=action.repository,
+        campaign_key=action.campaign_key,
+        plan_revision_digest=action.plan_revision_digest,
+        ticket_key=action.ticket_key,
+        kind="batch_delivery",
+        semantic_action_id=action.semantic_action_id,
+        work_run_key=action.work_run_key,
+        work_subject_digest=action.work_subject_digest,
+        runtime_binding_id="binding:test",
+        wake_ref="candidate:accepted",
+        accepted_candidate_receipt_digest=make_accepted_candidate_receipt(action).digest,
+    )
+    request = make_batch_delivery_request(delivery)
+    return replace(delivery, batch_delivery_request_digest=request.request_digest)
+
+
+@pytest.fixture
+def support(tmp_path: Path) -> ProductionEffectsSupport:
+    return ProductionEffectsSupport(tmp_path)
+
+
+def make_production_effects(
+    tmp_path: Path,
+    support: ProductionEffectsSupport,
+):
+    from gwo_v8.production_effects import ProductionWorkRunEffects
+
+    support.subjects.subject = make_test_subject(
+        WorkRunAction(
+            stable_action_id="subject:seed",
+            repository="owner/repository",
+            campaign_key="campaign:successor-kernel",
+            plan_revision_digest="a" * 64,
+            ticket_key="issue:109",
+            kind="semantic_execution",
+            semantic_action_id="semantic:109",
+            work_run_key="work-run:issue:109",
+            work_subject_digest="b" * 64,
+            wake_ref=None,
+            accepted_candidate_receipt_digest=None,
+        )
+    )
+    support.parents.parent = CandidateGateParent(
+        runtime_subject=support.subjects.subject,
+        ticket_contract_digest="c" * 64,
+        policy_witness_digest="d" * 64,
+        workspace_identity="workspace:test",
+    )
+    return ProductionWorkRunEffects(
+        store_path=tmp_path / "effects.sqlite3",
+        runtime_gateways=support.runtime_factory,
+        runtime_stale_readbacks=support.runtime_stale,
+        work_run_subjects=support.subjects,
+        candidate_references=support.references,
+        candidate_parents=support.parents,
+        candidate_gate=support.candidate,
+        batch_requests=support.batch_requests,
+        batch_integrator=support.batch,
+    )
