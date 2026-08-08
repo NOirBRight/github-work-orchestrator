@@ -29,6 +29,25 @@ FOCUSED_TESTS = {
     "Batch recovery": ("tests/test_v8_batch_recovery.py",),
     "Beta2 boundary": ("tests/test_v8_batch_beta2.py",),
 }
+LOCAL_VERIFICATION_FIELDS = {"focused", "gates"}
+FOCUSED_RECEIPT_FIELDS = {
+    "command",
+    "command_digest",
+    "junit_path",
+    "log_digest",
+    "manifest_digest",
+    "tests",
+    "failures",
+    "errors",
+    "skipped",
+}
+GATE_RECEIPT_FIELDS = {"command", "exit_code", "manifest_digest"}
+GATE_COMMANDS = (
+    ("py", "-3.13", "scripts/quick_validate.py"),
+    ("py", "-3.13", "scripts/sync_orchestrator.py"),
+    ("py", "-3.13", "scripts/sync_orchestrator.py", "--check"),
+    ("git", "diff", "--check"),
+)
 RELEASE_STATEMENT = (
     "Beta2 feature-complete preview; no V3 writer cutover and no GA admission."
 )
@@ -295,7 +314,7 @@ def _write_local_verification(
     focused: dict[str, dict[str, Any]], gates: list[dict[str, Any]]
 ) -> None:
     LOCAL_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"focused": focused, "gates": gates}
+    payload = _local_verification_payload(focused, gates)
     temporary = LOCAL_EVIDENCE_STATE.with_suffix(".tmp")
     temporary.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -310,31 +329,118 @@ def _read_local_verification(
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     if not LOCAL_EVIDENCE_STATE.is_file():
         raise SystemExit(f"local verification manifest is missing: {LOCAL_EVIDENCE_STATE}")
-    payload = json.loads(LOCAL_EVIDENCE_STATE.read_text(encoding="utf-8"))
-    focused = payload.get("focused")
-    gates = payload.get("gates")
-    if not isinstance(focused, dict) or not isinstance(gates, list):
-        raise SystemExit("local verification manifest is malformed")
-    if set(focused) != set(FOCUSED_TESTS):
+    try:
+        payload = json.loads(LOCAL_EVIDENCE_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit("local verification manifest is malformed") from error
+    return _validate_local_verification(payload, validate_files=validate_receipts)
+
+
+def _local_verification_payload(
+    focused: dict[str, dict[str, Any]], gates: list[dict[str, Any]]
+) -> dict[str, Any]:
+    return {"focused": focused, "gates": gates}
+
+
+def _expected_focused_command(label: str) -> list[str]:
+    return ["py", "-3.13", "-m", "pytest", *FOCUSED_TESTS[label], "-q"]
+
+
+def _expected_focused_junit_path(label: str) -> str:
+    return (
+        LOCAL_EVIDENCE_DIR
+        / f"{label.lower().replace(' ', '-')}.xml"
+    ).relative_to(ROOT).as_posix()
+
+
+def _validate_focused_receipt(
+    label: str,
+    value: Any,
+    *,
+    manifest_digest: str,
+    validate_files: bool,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != FOCUSED_RECEIPT_FIELDS:
+        raise SystemExit(f"{label} receipt fields differ from the exact schema")
+    expected_command = _expected_focused_command(label)
+    if value["command"] != _display(expected_command):
+        raise SystemExit(f"{label} receipt command is not exact")
+    _require_digest(f"{label} receipt command_digest", value["command_digest"])
+    if value["command_digest"] != _digest_value(expected_command):
+        raise SystemExit(f"{label} receipt command digest is stale")
+    if value["junit_path"] != _expected_focused_junit_path(label):
+        raise SystemExit(f"{label} receipt JUnit path is not exact")
+    for field in ("log_digest", "manifest_digest"):
+        _require_digest(f"{label} receipt {field}", value[field])
+    if validate_files and value["manifest_digest"] != manifest_digest:
+        raise SystemExit(f"{label} receipt manifest digest is stale")
+    for field in ("tests", "failures", "errors", "skipped"):
+        if type(value[field]) is not int or value[field] < 0:
+            raise SystemExit(f"{label} receipt {field} count is not exact")
+    if value["failures"] or value["errors"]:
+        raise SystemExit(f"{label} receipt does not describe a passing suite")
+    if validate_files:
+        junit_path = ROOT / value["junit_path"]
+        if not junit_path.is_file() or _file_digest(junit_path) != value["log_digest"]:
+            raise SystemExit("focused receipt log digest is stale")
+    return value
+
+
+def _validate_gate_receipt(
+    index: int,
+    value: Any,
+    *,
+    manifest_digest: str,
+    validate_files: bool,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != GATE_RECEIPT_FIELDS:
+        raise SystemExit(f"gate receipt {index} fields differ from the exact schema")
+    expected_command = list(GATE_COMMANDS[index])
+    if value["command"] != _display(expected_command):
+        raise SystemExit(f"gate receipt {index} command is not exact")
+    if type(value["exit_code"]) is not int or value["exit_code"] != 0:
+        raise SystemExit(f"gate receipt {index} exit code is not exact")
+    _require_digest(f"gate receipt {index} manifest_digest", value["manifest_digest"])
+    if validate_files and value["manifest_digest"] != manifest_digest:
+        raise SystemExit(f"gate receipt {index} manifest digest is stale")
+    return value
+
+
+def _validate_local_verification(
+    payload: Any,
+    *,
+    validate_files: bool,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    if not isinstance(payload, dict) or set(payload) != LOCAL_VERIFICATION_FIELDS:
+        raise SystemExit("local verification fields differ from the exact schema")
+    focused = payload["focused"]
+    gates = payload["gates"]
+    if not isinstance(focused, dict) or set(focused) != set(FOCUSED_TESTS):
         raise SystemExit("local verification focused suites are not exact")
-    focused = {label: focused[label] for label in FOCUSED_TESTS}
-    if not validate_receipts:
-        return focused, gates
+    if not isinstance(gates, list) or len(gates) != len(GATE_COMMANDS):
+        raise SystemExit("local verification gates are not exact")
     manifest_digest = _file_digest(
         ROOT / "skills" / "orchestrator" / ".skill-package.json"
     )
-    for receipt in focused.values():
-        if receipt.get("manifest_digest") != manifest_digest:
-            raise SystemExit("focused receipt manifest digest is stale")
-        junit_path = ROOT / receipt.get("junit_path", "")
-        if not junit_path.is_file() or _file_digest(junit_path) != receipt.get(
-            "log_digest"
-        ):
-            raise SystemExit("focused receipt log digest is stale")
-    for receipt in gates:
-        if receipt.get("manifest_digest") != manifest_digest:
-            raise SystemExit("gate receipt manifest digest is stale")
-    return focused, gates
+    ordered_focused = {
+        label: _validate_focused_receipt(
+            label,
+            focused[label],
+            manifest_digest=manifest_digest,
+            validate_files=validate_files,
+        )
+        for label in FOCUSED_TESTS
+    }
+    ordered_gates = [
+        _validate_gate_receipt(
+            index,
+            receipt,
+            manifest_digest=manifest_digest,
+            validate_files=validate_files,
+        )
+        for index, receipt in enumerate(gates)
+    ]
+    return ordered_focused, ordered_gates
 
 
 def _validate_batch_readback(
@@ -666,6 +772,16 @@ def _render(
     lines.extend(
         [
             "",
+            "## Local Verification Receipts",
+            "",
+            "```json",
+            json.dumps(
+                _local_verification_payload(focused, gates),
+                indent=2,
+                sort_keys=True,
+            ),
+            "```",
+            "",
             "## Exact Git, CI, Target, Recovery, and Receipt Readbacks",
             "",
             "```json",
@@ -729,6 +845,26 @@ def _document_publication_subject(path: Path) -> dict[str, Any] | None:
         raise SystemExit(
             "canonical evidence document has no valid publication subject"
         )
+    return value
+
+
+def _document_local_verification(path: Path) -> dict[str, Any]:
+    try:
+        document = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SystemExit(f"canonical evidence document is unreadable: {path}") from error
+    try:
+        section = document.split("## Local Verification Receipts", 1)[1].split(
+            "## Exact Git, CI, Target, Recovery, and Receipt Readbacks", 1
+        )[0]
+        payload = section.split("```json\n", 1)[1].split("\n```", 1)[0]
+        value = json.loads(payload)
+    except (IndexError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            "canonical evidence document has no valid local verification receipts"
+        ) from error
+    if not isinstance(value, dict):
+        raise SystemExit("canonical local verification receipts are not a JSON object")
     return value
 
 
@@ -842,9 +978,27 @@ def main() -> int:
         readbacks = json.loads(readback_path.read_text(encoding="utf-8"))
     readbacks = _validate_readbacks(readbacks, object_id_length)
     if args.check:
-        focused, gates = _read_local_verification(
-            validate_receipts=os.environ.get("GWO_BATCH_EVIDENCE_WRITING") != "1"
-        )
+        if LOCAL_EVIDENCE_STATE.is_file():
+            focused, gates = _read_local_verification(
+                validate_receipts=os.environ.get("GWO_BATCH_EVIDENCE_WRITING") != "1"
+            )
+            embedded = _document_local_verification(document_path)
+            embedded_focused, embedded_gates = _validate_local_verification(
+                embedded,
+                validate_files=False,
+            )
+            if _local_verification_payload(focused, gates) != _local_verification_payload(
+                embedded_focused, embedded_gates
+            ):
+                raise SystemExit(
+                    "canonical embedded local verification receipts differ from the scratch manifest"
+                )
+        else:
+            embedded = _document_local_verification(document_path)
+            focused, gates = _validate_local_verification(
+                embedded,
+                validate_files=False,
+            )
     else:
         LOCAL_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
         previous_marker = os.environ.get("GWO_BATCH_EVIDENCE_WRITING")

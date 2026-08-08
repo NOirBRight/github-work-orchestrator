@@ -10,10 +10,10 @@
 ```json
 {
   "parents": [
-    "514f1162fe563f27edd35b4d6683df2786b7dcc0"
+    "bcc7e719ecd5176f29d496e7ec6d7c3819c96439"
   ],
-  "sha": "bcc7e719ecd5176f29d496e7ec6d7c3819c96439",
-  "tree": "81dca3a6296aa02182141975ae3d402ebd16c7ff"
+  "sha": "e4173c00e4b889ad6144af078ede9fb1303262fe",
+  "tree": "9ea47abbaffd92eb2249c04e7514141ecb1f8b66"
 }
 ```
 
@@ -29,13 +29,77 @@
 
 | Suite | Command | Command digest | Log digest | Manifest digest | Tests | Failures | Errors | Skipped |
 | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |
-| BatchIntegrator | `py -3.13 -m pytest tests/test_v8_batch_integrator.py -q` | `62ea428936895106685235430893a4afc88a14ec43c923fab4386b60bc82078d` | `6ebe437b685c2ef0e5789e283c099e2fac6ae994ba2116824fad3bdb20579136` | `844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e` | 47 | 0 | 0 | 0 |
-| Batch recovery | `py -3.13 -m pytest tests/test_v8_batch_recovery.py -q` | `1ecb90d072f65f7177a38d10a8b17d3d9beb6bf7f879241af3969e60d00a69e1` | `8458e8a4ea2bff24fcb7f779f25c7730c4304d221531743d7f8ea5f951f37563` | `844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e` | 23 | 0 | 0 | 0 |
-| Beta2 boundary | `py -3.13 -m pytest tests/test_v8_batch_beta2.py -q` | `25a3dc3161d79784912b80f18f034167722ed42d921f668afb67a7779e64b98a` | `bb44becf96252a393eea1874b5078150423a5b2f1e65cf9e24266ea72585a7f8` | `844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e` | 21 | 0 | 0 | 0 |
+| BatchIntegrator | `py -3.13 -m pytest tests/test_v8_batch_integrator.py -q` | `62ea428936895106685235430893a4afc88a14ec43c923fab4386b60bc82078d` | `a138e2d1c1d6273fbeb88aeda68565f9ce65135346907511183dac8df9f2558f` | `844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e` | 47 | 0 | 0 | 0 |
+| Batch recovery | `py -3.13 -m pytest tests/test_v8_batch_recovery.py -q` | `1ecb90d072f65f7177a38d10a8b17d3d9beb6bf7f879241af3969e60d00a69e1` | `ef2fe588d43c1f8e3e95a3c00dd9a00441f67b1f01521a86d4cd78a9a3b70fc7` | `844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e` | 23 | 0 | 0 | 0 |
+| Beta2 boundary | `py -3.13 -m pytest tests/test_v8_batch_beta2.py -q` | `25a3dc3161d79784912b80f18f034167722ed42d921f668afb67a7779e64b98a` | `86ddfe1a185d5727ff0f00f1cedaea4523e7c40c4def872ee1478434e4b54c5a` | `844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e` | 22 | 0 | 0 | 0 |
 - `py -3.13 scripts/quick_validate.py`: exit 0.
 - `py -3.13 scripts/sync_orchestrator.py`: exit 0.
 - `py -3.13 scripts/sync_orchestrator.py --check`: exit 0.
 - `git diff --check`: exit 0.
+
+## Local Verification Receipts
+
+```json
+{
+  "focused": {
+    "Batch recovery": {
+      "command": "py -3.13 -m pytest tests/test_v8_batch_recovery.py -q",
+      "command_digest": "1ecb90d072f65f7177a38d10a8b17d3d9beb6bf7f879241af3969e60d00a69e1",
+      "errors": 0,
+      "failures": 0,
+      "junit_path": ".superpowers/sdd/2026-08-06-gwo-v8-c2-beta2-feature-complete/batch-evidence/batch-recovery.xml",
+      "log_digest": "ef2fe588d43c1f8e3e95a3c00dd9a00441f67b1f01521a86d4cd78a9a3b70fc7",
+      "manifest_digest": "844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e",
+      "skipped": 0,
+      "tests": 23
+    },
+    "BatchIntegrator": {
+      "command": "py -3.13 -m pytest tests/test_v8_batch_integrator.py -q",
+      "command_digest": "62ea428936895106685235430893a4afc88a14ec43c923fab4386b60bc82078d",
+      "errors": 0,
+      "failures": 0,
+      "junit_path": ".superpowers/sdd/2026-08-06-gwo-v8-c2-beta2-feature-complete/batch-evidence/batchintegrator.xml",
+      "log_digest": "a138e2d1c1d6273fbeb88aeda68565f9ce65135346907511183dac8df9f2558f",
+      "manifest_digest": "844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e",
+      "skipped": 0,
+      "tests": 47
+    },
+    "Beta2 boundary": {
+      "command": "py -3.13 -m pytest tests/test_v8_batch_beta2.py -q",
+      "command_digest": "25a3dc3161d79784912b80f18f034167722ed42d921f668afb67a7779e64b98a",
+      "errors": 0,
+      "failures": 0,
+      "junit_path": ".superpowers/sdd/2026-08-06-gwo-v8-c2-beta2-feature-complete/batch-evidence/beta2-boundary.xml",
+      "log_digest": "86ddfe1a185d5727ff0f00f1cedaea4523e7c40c4def872ee1478434e4b54c5a",
+      "manifest_digest": "844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e",
+      "skipped": 0,
+      "tests": 22
+    }
+  },
+  "gates": [
+    {
+      "command": "py -3.13 scripts/quick_validate.py",
+      "exit_code": 0,
+      "manifest_digest": "b66be73e9b02bef8614cd98ff10edf8777c48b529630455bbcb26903c9245e38"
+    },
+    {
+      "command": "py -3.13 scripts/sync_orchestrator.py",
+      "exit_code": 0,
+      "manifest_digest": "844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e"
+    },
+    {
+      "command": "py -3.13 scripts/sync_orchestrator.py --check",
+      "exit_code": 0,
+      "manifest_digest": "844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e"
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "manifest_digest": "844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e"
+    }
+  ]
+}
+```
 
 ## Exact Git, CI, Target, Recovery, and Receipt Readbacks
 
