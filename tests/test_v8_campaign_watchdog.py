@@ -709,3 +709,178 @@ sys.stdin.read()
 
     assert competitor._try_acquire_due_lock(handle())
     competitor._release_due_lock(handle())
+
+
+def _fail_on_sqlite_connection_close(monkeypatch):
+    real_connect = sqlite3.connect
+
+    class CloseRaisingConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def close(self):
+            self._connection.close()
+            raise OSError("forced connection close failure")
+
+    def connect(*args, **kwargs):
+        return CloseRaisingConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+
+
+def test_claim_due_work_releases_acquired_lock_when_close_fails(tmp_path, monkeypatch):
+    campaigns = RecordingCampaignSource(
+        {handle(): make_snapshot(next_check_at="2026-08-03T09:59:00+00:00")}
+    )
+    first = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+    )
+    second = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+    )
+    first.rebuild_due_queue()
+    _fail_on_sqlite_connection_close(monkeypatch)
+
+    try:
+        with pytest.raises(OSError, match="forced connection close failure"):
+            first._claim_due_work(NOW)
+
+        assert second._try_acquire_due_lock(handle())
+    finally:
+        first._release_due_lock(handle())
+        second._release_due_lock(handle())
+
+
+def test_claim_due_work_preserves_store_error_when_close_also_fails(
+    tmp_path, monkeypatch
+):
+    campaigns = RecordingCampaignSource(
+        {handle(): make_snapshot(next_check_at="2026-08-03T09:59:00+00:00")}
+    )
+    first = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+    )
+    second = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+    )
+    first.rebuild_due_queue()
+    with sqlite3.connect(first._store_path) as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_due_claim_insert "
+            "BEFORE INSERT ON v8_watchdog_due_claims "
+            "BEGIN SELECT RAISE(ABORT, 'forced claim failure'); END"
+        )
+    _fail_on_sqlite_connection_close(monkeypatch)
+
+    try:
+        with pytest.raises(CampaignWatchdogError) as raised:
+            first._claim_due_work(NOW)
+
+        assert raised.value.code == "WATCHDOG_STORE_INVALID"
+        assert second._try_acquire_due_lock(handle())
+    finally:
+        first._release_due_lock(handle())
+        second._release_due_lock(handle())
+
+
+def test_pending_due_snapshot_is_revalidated_after_lock_acquisition(tmp_path):
+    campaigns = RecordingCampaignSource({handle(): make_snapshot()})
+    first_advancer = RecordingAdvancer()
+    second_advancer = RecordingAdvancer()
+    first = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+        advancer=first_advancer,
+    )
+    second = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+        advancer=second_advancer,
+    )
+    due_wake = WatchdogWake(
+        "1",
+        handle(),
+        "due",
+        "owner/repo:campaign:watchdog-test:2026-08-03T09:59:00+00:00",
+    )
+    first._record_due_wake(due_wake)
+
+    snapshot_read = threading.Event()
+    allow_second_to_continue = threading.Event()
+    original_read = second._read_pending_wakes
+
+    def read_then_pause():
+        pending = original_read()
+        snapshot_read.set()
+        if not allow_second_to_continue.wait(timeout=5):
+            raise AssertionError("timed out waiting for the first Watchdog")
+        return pending
+
+    second._read_pending_wakes = read_then_pause  # type: ignore[method-assign]
+    second_outcomes = []
+    second_errors = []
+
+    def drain_second():
+        try:
+            second._drain_pending_wakes(second_outcomes)
+        except BaseException as error:
+            second_errors.append(error)
+
+    thread = threading.Thread(target=drain_second)
+    thread.start()
+    assert snapshot_read.wait(timeout=5)
+    first_outcomes = []
+    first._drain_pending_wakes(first_outcomes)
+    allow_second_to_continue.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert second_errors == []
+    assert first_outcomes == [first_advancer.outcome]
+    assert second_outcomes == []
+    assert first_advancer.calls == [(handle(), due_wake.wake_ref)]
+    assert second_advancer.calls == []
+
+
+def test_restart_takes_over_unexpired_due_claim_after_process_lock_release(tmp_path):
+    due_at = "2026-08-03T09:59:00+00:00"
+    campaigns = RecordingCampaignSource(
+        {handle(): make_snapshot(next_check_at=due_at)}
+    )
+    first = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+    )
+    first.rebuild_due_queue()
+    claims = first._claim_due_work(NOW)
+    assert claims
+    first._release_due_lock(handle())
+
+    advancer = RecordingAdvancer()
+    restarted = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+        advancer=advancer,
+    )
+
+    outcomes = restarted.run_once(NOW)
+
+    expected_source_identity = f"{handle().repository}:{handle().campaign_key}:{due_at}"
+    expected_wake_ref = f"watchdog:due:1:{expected_source_identity}"
+    assert outcomes == (advancer.outcome,)
+    assert advancer.calls == [(handle(), expected_wake_ref)]
