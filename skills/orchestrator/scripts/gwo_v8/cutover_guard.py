@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
+import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
 from typing import Any, Callable, Literal, Mapping, Protocol
 
-from ._canonical import canonical_bytes, digest_value, load_canonical_json
+from ._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
 
 
 GUARD_SCHEMA = "gwo.cutover-guard.v1"
@@ -718,6 +721,227 @@ class CutoverGuardError(RuntimeError):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+
+
+def _audited_files(root: Path) -> tuple[Path, ...]:
+    candidates = [
+        root / "skills" / "implement-gwo" / "SKILL.md",
+        root / "skills" / "orchestrator" / "SKILL.md",
+        *(root / "skills" / "orchestrator" / "scripts" / "gwo_v8").rglob("*.py"),
+    ]
+    return tuple(
+        sorted(
+            (path for path in candidates if path.is_file()),
+            key=lambda path: path.relative_to(root).as_posix(),
+        )
+    )
+
+
+def source_tree_digest(package_root: Path) -> str:
+    digest = hashlib.sha256()
+    root = Path(package_root).resolve()
+    for path in _audited_files(root):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        content = path.read_bytes().replace(b"\r\n", b"\n")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+class ProductionPathScanner:
+    def __init__(self, package_root: Path) -> None:
+        self._root = Path(package_root).resolve()
+
+    def _module_path(self, module: str) -> Path:
+        return (
+            self._root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+            / Path(*module.split(".")[1:])
+        ).with_suffix(".py")
+
+    @staticmethod
+    def _relative_imports(module: str, tree: ast.AST) -> dict[str, str]:
+        aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level != 1:
+                continue
+            parent = module.rsplit(".", 1)[0]
+            imported_module = f"{parent}.{node.module}" if node.module else parent
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = f"{imported_module}:{alias.name}"
+        return aliases
+
+    @staticmethod
+    def _ast_refs(module: str, tree: ast.AST) -> tuple[str, ...]:
+        aliases = ProductionPathScanner._relative_imports(module, tree)
+        refs: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                value = node.func.value
+                if (
+                    isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Name)
+                    and value.func.id in aliases
+                ):
+                    refs.add(f"{aliases[value.func.id]}.{node.func.attr}")
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                target = aliases.get(node.func.id)
+                if target is not None:
+                    refs.add(target)
+        return tuple(sorted(refs))
+
+    @staticmethod
+    def _bucket(ref: str) -> str:
+        if ref.startswith("skills/implement-gwo:") or "PlanCompiler" in ref:
+            return "v2"
+        if "PaseoRuntimeAdapter" in ref or "Runtime" in ref:
+            return "v3"
+        return "legacy"
+
+    def read(self, subject: CutoverSubject) -> CompatibilityPathReadback:
+        observed_tree = source_tree_digest(self._root)
+        if observed_tree != subject.source_tree_digest:
+            raise CutoverGuardError(
+                "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                "production path audit tree digest does not match the subject",
+            )
+        forbidden = set(subject.forbidden_production_refs)
+        found: set[str] = set()
+        queue = [entry.split(":", 1)[0] for entry in subject.production_entry_refs if ":" in entry]
+        visited: set[str] = set()
+        while queue:
+            module = queue.pop()
+            if module in visited:
+                continue
+            visited.add(module)
+            path = self._module_path(module)
+            if not path.is_file():
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for ref in self._ast_refs(module, tree):
+                target = ref.split(":", 1)[1] if ":" in ref else ""
+                if (
+                    ref in forbidden
+                    or (
+                        (":LegacyWriter" in ref or ".legacy:" in ref)
+                        and "." in target
+                    )
+                ):
+                    found.add(ref)
+                if ":" in ref and ref.split(":", 1)[0].startswith("gwo_v8."):
+                    queue.append(ref.split(":", 1)[0])
+        for entry in subject.production_entry_refs:
+            if entry.startswith("skills/"):
+                path = self._root / entry
+                if path.is_file():
+                    text = path.read_text(encoding="utf-8")
+                    found.update(ref for ref in forbidden if ref in text)
+        buckets = {
+            "v2": tuple(sorted(ref for ref in found if self._bucket(ref) == "v2")),
+            "v3": tuple(sorted(ref for ref in found if self._bucket(ref) == "v3")),
+            "legacy": tuple(sorted(ref for ref in found if self._bucket(ref) == "legacy")),
+        }
+        proven = tuple(sorted(forbidden - found))
+        values: dict[str, Any] = {
+            "repository": subject.repository,
+            "source_commit": subject.source_commit,
+            "source_tree_digest": observed_tree,
+            "audit_version": "gwo.cutover-path-audit.v1",
+            "reachable_v2_projection_refs": buckets["v2"],
+            "reachable_v3_compatibility_refs": buckets["v3"],
+            "reachable_legacy_writer_refs": buckets["legacy"],
+            "proven_unreachable_refs": proven,
+        }
+        return CompatibilityPathReadback(**values, readback_digest=digest_value(values))
+
+
+class ReadOnlyPackageValidator:
+    def __init__(
+        self,
+        source_root: Path,
+        install_roots: Mapping[str, Path],
+    ) -> None:
+        if tuple(install_roots) != (".agents", ".codex", ".claude"):
+            raise CutoverGuardError(
+                "CUTOVER_PACKAGE_INVALID",
+                "package validator requires the three ordered install surfaces",
+            )
+        self._source_root = Path(source_root).resolve()
+        self._install_roots = {
+            surface: Path(path).resolve() for surface, path in install_roots.items()
+        }
+
+    @staticmethod
+    def _sync_module() -> Any:
+        script = Path(__file__).resolve().parents[4] / "scripts" / "sync_orchestrator.py"
+        spec = importlib.util.spec_from_file_location("gwo_sync_read_helpers", script)
+        if spec is None or spec.loader is None:
+            raise CutoverGuardError("CUTOVER_PACKAGE_INVALID", "sync helper is unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _package_path(self, name: str) -> Path:
+        in_skills = self._source_root / "skills" / name
+        return in_skills if in_skills.is_dir() else self._source_root / name
+
+    @staticmethod
+    def _identity(
+        package: Path,
+        name: str,
+        surface: str | None,
+        sync: Any,
+    ) -> PackageIdentity:
+        manifest_path = package / ".skill-package.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return PackageIdentity(
+            package_name=name,
+            version=manifest["version"],
+            content_digest=sync.package_digest(package),
+            manifest_content_digest=digest_bytes(manifest_path.read_bytes()),
+            install_surface=surface,
+        )
+
+    def read(self, subject: CutoverSubject) -> PackageReadback:
+        sync = self._sync_module()
+        source_packages: list[PackageIdentity] = []
+        installed_packages: list[PackageIdentity] = []
+        drift: set[str] = set()
+        for name in subject.package_names:
+            source = self._package_path(name)
+            try:
+                source_packages.append(self._identity(source, name, None, sync))
+                if sync.manifest_drift(source):
+                    drift.update({f"source:{name}", f"manifest:{name}"})
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                drift.add(f"source:{name}")
+            for surface, root in self._install_roots.items():
+                installed = root / name
+                try:
+                    installed_packages.append(self._identity(installed, name, surface, sync))
+                    if sync.install_drift(source, root):
+                        drift.add(f"installed:{surface}:{name}")
+                except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    drift.add(f"installed:{surface}:{name}")
+        values = {
+            "source_packages": tuple(source_packages),
+            "installed_packages": tuple(installed_packages),
+            "drift": tuple(sorted(drift)),
+        }
+        digest_values = {
+            "source_packages": tuple(
+                item.canonical() for item in source_packages
+            ),
+            "installed_packages": tuple(
+                item.canonical() for item in installed_packages
+            ),
+            "drift": tuple(sorted(drift)),
+        }
+        return PackageReadback(
+            **values,
+            readback_digest=digest_value(digest_values),
+        )
 
 
 _READ_ERROR_CODES = {
