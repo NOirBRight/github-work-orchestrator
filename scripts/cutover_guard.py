@@ -28,7 +28,10 @@ from gwo_v8.plan_control_host import (  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Read-only GWO V8 cutover evidence")
+    parser = argparse.ArgumentParser(
+        description="Read-only GWO V8 cutover evidence",
+        allow_abbrev=False,
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--bundle", type=Path)
     mode.add_argument("--live", action="store_true")

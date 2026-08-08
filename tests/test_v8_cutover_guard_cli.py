@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
+
 from conftest import load_module
 
 
@@ -108,6 +110,13 @@ def test_cli_parser_has_no_activation_or_install_option():
     options = {action.dest for action in cutover_cli.build_parser()._actions}
 
     assert {"activate", "install", "write", "rollback", "go"}.isdisjoint(options)
+
+
+def test_cli_parser_rejects_forbidden_install_abbreviation():
+    with pytest.raises(SystemExit):
+        cutover_cli.parse_args(
+            ["--bundle", "readback.json", "--install", "forbidden-root"]
+        )
 
 
 def test_cli_default_text_contains_every_check_and_digest(tmp_path, capsys):
