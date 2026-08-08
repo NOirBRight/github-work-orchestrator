@@ -77,6 +77,27 @@ def _require_object_id(name: str, value: Any, length: int) -> str:
     return value
 
 
+def _validate_subject(
+    name: str, value: Any, object_id_length: int
+) -> dict[str, Any]:
+    required = {"sha", "tree", "parents"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise SystemExit(f"{name} fields differ from the exact subject schema")
+    sha = _require_object_id(f"{name}.sha", value["sha"], object_id_length)
+    tree = _require_object_id(f"{name}.tree", value["tree"], object_id_length)
+    parents = value["parents"]
+    if not isinstance(parents, list):
+        raise SystemExit(f"{name}.parents is not an exact Git parent list")
+    return {
+        "sha": sha,
+        "tree": tree,
+        "parents": [
+            _require_object_id(f"{name}.parents[{index}]", parent, object_id_length)
+            for index, parent in enumerate(parents)
+        ],
+    }
+
+
 def _require_digest(name: str, value: Any) -> str:
     if (
         not isinstance(value, str)
@@ -597,6 +618,7 @@ def _render(
     focused: dict[str, dict[str, Any]],
     gates: list[dict[str, Any]],
     readbacks: dict[str, Any],
+    publication_mode: bool = False,
 ) -> str:
     lines = [
         "# GWO V8 BatchIntegrator Beta2 Evidence",
@@ -605,17 +627,23 @@ def _render(
         "",
         f"- Schema: `{BATCH_EVIDENCE_SCHEMA}`.",
         "- Mode: `Local Verification Only`.",
-        "- Subject:",
-        "",
-        "```json",
-        json.dumps(subject, indent=2, sort_keys=True),
-        "```",
-        "",
-        "## Merged Results",
-        "",
-        "| Issue | Merged commit |",
-        "| --- | --- |",
     ]
+    if publication_mode:
+        lines.extend(["", "## Publication Subject", ""])
+    else:
+        lines.extend(["- Subject:", ""])
+    lines.extend(
+        [
+            "```json",
+            json.dumps(subject, indent=2, sort_keys=True),
+            "```",
+            "",
+            "## Merged Results",
+            "",
+            "| Issue | Merged commit |",
+            "| --- | --- |",
+        ]
+    )
     lines.extend(
         f"| {issue} | `{sha}` |" for issue, sha in merged_shas.items()
     )
@@ -680,6 +708,30 @@ def _document_merged_shas(path: Path) -> dict[str, str]:
     return merged
 
 
+def _document_publication_subject(path: Path) -> dict[str, Any] | None:
+    try:
+        document = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SystemExit(f"canonical evidence document is unreadable: {path}") from error
+    if "## Publication Subject" not in document:
+        return None
+    try:
+        section = document.split("## Publication Subject", 1)[1].split(
+            "## Merged Results", 1
+        )[0]
+        payload = section.split("```json\n", 1)[1].split("\n```", 1)[0]
+        value = json.loads(payload)
+    except (IndexError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            "canonical evidence document has no valid publication subject"
+        ) from error
+    if value is None:
+        raise SystemExit(
+            "canonical evidence document has no valid publication subject"
+        )
+    return value
+
+
 def _document_readbacks(path: Path) -> dict[str, Any]:
     try:
         document = path.read_text(encoding="utf-8")
@@ -710,6 +762,9 @@ def main() -> int:
         "--issue-117-sha", default=os.environ.get("GWO_ISSUE_117_MERGED_SHA")
     )
     parser.add_argument(
+        "--publication-sha", default=os.environ.get("GWO_PUBLICATION_SHA")
+    )
+    parser.add_argument(
         "--readbacks", default=os.environ.get("GWO_BATCH_READBACK_JSON")
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -720,6 +775,9 @@ def main() -> int:
     document_path = args.output.resolve()
     canonical_merged = (
         _document_merged_shas(document_path) if args.check else {}
+    )
+    canonical_publication = (
+        _document_publication_subject(document_path) if args.check else None
     )
     merged_shas = {
         "#115": _require_object_id(
@@ -744,11 +802,32 @@ def main() -> int:
             object_id_length,
         ),
     }
+    publication_mode = canonical_publication is not None or (
+        not args.check and args.publication_sha is not None
+    )
     for issue, sha in merged_shas.items():
         if _resolve_commit(sha) != sha:
             raise SystemExit(f"{issue} merged SHA did not resolve to itself")
-        _require_merged(sha)
-    subject = _subject_readback(merged_shas["#117"], object_id_length)
+        if not publication_mode:
+            _require_merged(sha)
+    if canonical_publication is not None:
+        expected_subject = _validate_subject(
+            "canonical publication subject", canonical_publication, object_id_length
+        )
+        subject = _subject_readback(expected_subject["sha"], object_id_length)
+        _require_merged(subject["sha"])
+        if subject != expected_subject:
+            raise SystemExit(
+                "canonical publication subject differs from Git readback"
+            )
+    elif publication_mode:
+        publication_sha = _require_object_id(
+            "publication SHA", args.publication_sha, object_id_length
+        )
+        subject = _subject_readback(publication_sha, object_id_length)
+        _require_merged(subject["sha"])
+    else:
+        subject = _subject_readback(merged_shas["#117"], object_id_length)
 
     if args.readbacks:
         readbacks = json.loads(
@@ -805,7 +884,14 @@ def main() -> int:
         for receipt in focused.values():
             receipt["manifest_digest"] = final_manifest_digest
         _write_local_verification(focused, gates)
-    rendered = _render(merged_shas, subject, focused, gates, readbacks)
+    rendered = _render(
+        merged_shas,
+        subject,
+        focused,
+        gates,
+        readbacks,
+        publication_mode=publication_mode,
+    )
     output = args.output.resolve()
     if args.check:
         if not output.is_file() or output.read_text(encoding="utf-8") != rendered:
