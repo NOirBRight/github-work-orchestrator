@@ -2041,23 +2041,133 @@ class RecordingPlanControlRepository(InMemoryPlanRepository):
         super().__init__(writer_generation="writer:v6.1")
 
 
+_REPARSE_POINT_ATTRIBUTE = 0x0400
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return bool(attributes & _REPARSE_POINT_ATTRIBUTE)
+
+
+def _has_reparse_point(path: Path) -> bool:
+    current = path.absolute()
+    while True:
+        if _is_reparse_point(current):
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def _git_metadata_path(target: Path, value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = target / path
+    return path.resolve(strict=True)
+
+
 def assert_isolated_e2e_target(target: Path, root: Path) -> None:
-    target_resolved = target.resolve()
-    root_resolved = root.resolve()
+    target = Path(target)
+    root = Path(root)
+    if _has_reparse_point(target) or _has_reparse_point(root):
+        raise ProductionCompositionError(
+            "REAL_E2E_TARGET_NOT_ISOLATED",
+            "the E2E target and explicit isolation root cannot use reparse paths",
+        )
+    try:
+        target_resolved = target.resolve(strict=True)
+        root_resolved = root.resolve(strict=True)
+    except OSError as exc:
+        raise ProductionCompositionError(
+            "REAL_E2E_TARGET_NOT_ISOLATED",
+            "the E2E target and explicit isolation root must exist",
+        ) from exc
     if target_resolved == root_resolved or root_resolved not in target_resolved.parents:
         raise ProductionCompositionError(
             "REAL_E2E_TARGET_NOT_ISOLATED",
-            "the E2E target must be a strict child of the pytest temporary root",
+            "the E2E target must be a strict child of the explicit isolation root",
         )
-    if not target_resolved.is_dir() or not (target_resolved / ".git").exists():
+    git_entry = target_resolved / ".git"
+    if not target_resolved.is_dir() or not git_entry.is_dir():
         raise ProductionCompositionError(
             "REAL_E2E_TARGET_NOT_ISOLATED",
-            "the isolated E2E target must be an existing Git repository",
+            "the isolated E2E target must have its own .git directory",
         )
+    if _has_reparse_point(git_entry):
+        raise ProductionCompositionError(
+            "REAL_E2E_TARGET_NOT_ISOLATED",
+            "the isolated E2E target .git directory cannot be a reparse path",
+        )
+    try:
+        git_dir = subprocess.run(
+            ["git", "-C", str(target_resolved), "rev-parse", "--git-dir"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        git_common_dir = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(target_resolved),
+                "rev-parse",
+                "--git-common-dir",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        expected_git_dir = git_entry.resolve(strict=True)
+        resolved_git_dir = _git_metadata_path(target_resolved, git_dir)
+        resolved_common_dir = _git_metadata_path(target_resolved, git_common_dir)
+    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+        raise ProductionCompositionError(
+            "REAL_E2E_TARGET_NOT_ISOLATED",
+            "the isolated E2E target Git metadata could not be verified",
+        ) from exc
+    if (
+        resolved_git_dir != expected_git_dir
+        or resolved_common_dir != expected_git_dir
+        or _has_reparse_point(resolved_git_dir)
+        or _has_reparse_point(resolved_common_dir)
+    ):
+        raise ProductionCompositionError(
+            "REAL_E2E_TARGET_NOT_ISOLATED",
+            "the isolated E2E target must not share a Git common directory",
+        )
+
+
+def _safe_isolation_root(root: Path) -> Path:
+    root = Path(root)
+    if _has_reparse_point(root):
+        raise ProductionCompositionError(
+            "REAL_E2E_TARGET_NOT_ISOLATED",
+            "the explicit isolation root cannot use reparse paths",
+        )
+    if root.exists() and not root.is_dir():
+        raise ProductionCompositionError(
+            "REAL_E2E_TARGET_NOT_ISOLATED",
+            "the explicit isolation root must be a directory",
+        )
+    git_entry = root / ".git"
+    if git_entry.exists() or git_entry.is_symlink():
+        raise ProductionCompositionError(
+            "REAL_E2E_TARGET_NOT_ISOLATED",
+            "the explicit isolation root cannot itself be a Git worktree",
+        )
+    return root.resolve()
 
 
 def create_temporary_target(root: Path) -> Path:
-    root = root.resolve()
+    root = _safe_isolation_root(root)
     root.mkdir(parents=True, exist_ok=True)
     target = Path(
         tempfile.mkdtemp(prefix="gwo-v8-real-provider-", dir=str(root))
@@ -2098,9 +2208,10 @@ def create_temporary_target(root: Path) -> Path:
 def install_real_provider_composition(
     target: Path,
     *,
+    root: Path,
     evidence_dir: Path,
 ) -> ProductionCompositionHarness:
-    assert_isolated_e2e_target(target, target.parent)
+    assert_isolated_e2e_target(target, root)
     if os.environ.get("GWO_V8_REAL_PROVIDER_E2E") != "1":
         raise ProductionCompositionError(
             "REAL_PROVIDER_E2E_NOT_ENABLED",
@@ -2112,11 +2223,9 @@ def install_real_provider_composition(
             "REAL_PROVIDER_COMMAND_MISSING",
             "real-provider composition requires GWO_V8_REAL_PROVIDER_COMMAND",
         )
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    return ProductionCompositionHarness.from_real_provider_environment(
-        target_path=target.resolve(),
-        evidence_dir=evidence_dir.resolve(),
-        provider_command=command,
+    raise ProductionCompositionError(
+        "REAL_PROVIDER_UNSUPPORTED",
+        "no safe real-provider subprocess adapter is available; opt-in fails closed",
     )
 
 
@@ -2135,6 +2244,9 @@ _ISSUE_137_REVALIDATION_KEYS = {
 }
 
 
+_BETA2_COMPOSITION_FIXTURE_FILENAME = "beta2-composition-fixture.json"
+
+
 def write_beta2_evidence_bundle(
     root: Path,
     *,
@@ -2150,6 +2262,7 @@ def write_beta2_evidence_bundle(
     local_verification_manifest_digest: str,
     workflow_count: int,
 ) -> Path:
+    """Write a diagnostic partial fixture, never repository-wide GO evidence."""
     if (
         type(subject) is not dict
         or set(subject) != {"sha", "tree", "parents"}
@@ -2297,7 +2410,7 @@ def write_beta2_evidence_bundle(
                 "evidence is not canonical JSON",
             )
         temporary_digest = hashlib.sha256(temporary_bytes).hexdigest()
-        final_path = root / "beta2-evidence.json"
+        final_path = root / _BETA2_COMPOSITION_FIXTURE_FILENAME
         os.replace(temporary_path, final_path)
         temporary_path = None
         final_bytes = final_path.read_bytes()
@@ -2475,30 +2588,6 @@ class ProductionCompositionHarness:
             "watchdog": self.watchdog,
             "writer_generation_reader": self.writer_generation_reader,
         }
-
-    @classmethod
-    def from_real_provider_environment(
-        cls,
-        *,
-        target_path: Path,
-        evidence_dir: Path,
-        provider_command: str,
-    ) -> "ProductionCompositionHarness":
-        target_path = target_path.resolve()
-        evidence_dir.mkdir(parents=True, exist_ok=True)
-        harness = cls.from_task7_dependencies(
-            target_path=target_path,
-            evidence_dir=evidence_dir,
-            provider_command=provider_command,
-        )
-        arguments = harness.install_arguments()
-        arguments["host_configuration"] = ProductionHostConfiguration(
-            target_isolation_root=target_path.parent,
-            writer_activation_enabled=False,
-        )
-        arguments["target_path"] = target_path
-        harness.host = ProductionGwoHost.install(**arguments)
-        return harness
 
     @classmethod
     def from_task7_dependencies(

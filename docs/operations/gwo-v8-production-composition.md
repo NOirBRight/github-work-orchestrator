@@ -55,10 +55,13 @@ target_isolation_root and target are resolved before installation. The target
 must be a strict child of the root and must contain .git. A normal checkout,
 a real repository, the root itself, or a path outside the root is rejected with
 REAL_E2E_TARGET_NOT_ISOLATED before the host is installed. The source checkout
-must never be used as the E2E target.
+must never be used as the E2E target. create_temporary_target also rejects an
+explicit isolation root that is itself a canonical or linked Git worktree
+before calling mkdir or creating a child, and does not mutate that checkout.
 
 The default E2E uses the recording provider and the temporary target. The real
-provider harness is opt-in only. It skips unless both
+provider path is opt-in only and fail-closed: this repository has no safe real
+provider subprocess adapter. The implementation fails closed. It skips unless both
 GWO_V8_REAL_PROVIDER_E2E=1 and a non-empty GWO_V8_REAL_PROVIDER_COMMAND are
 present:
 
@@ -66,10 +69,13 @@ present:
     $env:GWO_V8_REAL_PROVIDER_COMMAND = '<approved provider command>'
     py -3.13 -m pytest tests/test_v8_production_composition_e2e.py -k real_provider -q
 
-An opt-in run still calls the same public start/advance/inspect path and uses
-create_temporary_target. It may observe the configured provider, but it must
-not target the source checkout, a normal real repository, GitHub, or a
-production writer. Provider completion text is not Evidence.
+An opt-in request still uses create_temporary_target. When opt-in is enabled,
+the installer rejects the request with REAL_PROVIDER_UNSUPPORTED and fails
+closed before creating an evidence directory or installing a host; it never
+executes an arbitrary command. The opt-in case is a diagnostic unsupported-
+path check, not a claim of provider identity or effect readback. It must not
+target the source checkout, a normal real repository, GitHub, or a production
+writer. Provider completion text is not Evidence.
 
 ## CAS, external effects, and restart
 
@@ -129,14 +135,16 @@ Campaign handle, Plan Revision digest, equal writer-generation readbacks,
 Result and Batch proof digests, the #137 revalidation digests, and the local
 verification manifest digest. workflow_count is exactly zero and
 writer_activation_enabled is exactly false. The full_gate keys are pytest,
-quick_validate, package_sync, diff_check, and clean_status.
+quick_validate, package_sync, diff_check, and clean_status; their fixture
+statuses do not prove that the repository-wide gates ran.
 
 The bundle is rendered as canonical sorted JSON with a final newline. The
 writer parses a same-directory temporary file before replacement, reloads the
 final file, and compares both the parsed object and SHA-256. It emits no CI
 URL, hosted repository-check field, or workflow-run field. There is no CI URL
-in the Beta2 bundle. The evidence bundle
-is diagnostic release evidence and is not writer activation.
+in the Beta2 bundle. The output filename is
+beta2-composition-fixture.json and identifies a partial composition artifact;
+it is not Task 10 GO evidence and is not writer activation.
 
 Run the following Local Verification Only commands from the isolated worktree:
 

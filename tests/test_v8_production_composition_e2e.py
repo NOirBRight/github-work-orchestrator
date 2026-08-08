@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -21,15 +22,109 @@ from v8_production_test_support import (
 
 
 def test_real_provider_e2e_refuses_a_non_temporary_target(tmp_path):
+    canonical = Path(__file__).resolve().parents[1]
     with pytest.raises(ProductionCompositionError) as raised:
         assert_isolated_e2e_target(
-            Path("D:/Workstation/github-work-orchestrator"),
+            canonical,
             tmp_path,
         )
     assert raised.value.code == "REAL_E2E_TARGET_NOT_ISOLATED"
 
 
-def test_real_provider_public_path_is_opt_in_and_uses_a_temporary_target(tmp_path):
+def _git_facts(repository: Path) -> tuple[str, str, str]:
+    status = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    head = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return status, head, tree
+
+
+def test_real_provider_installer_rejects_canonical_checkout_without_mutating_it(
+    tmp_path,
+):
+    canonical = Path(__file__).resolve().parents[1]
+    before = _git_facts(canonical)
+    with pytest.raises(ProductionCompositionError) as raised:
+        install_real_provider_composition(
+            canonical,
+            root=tmp_path,
+            evidence_dir=tmp_path / "evidence",
+        )
+    assert raised.value.code == "REAL_E2E_TARGET_NOT_ISOLATED"
+    assert not (tmp_path / "evidence").exists()
+    assert _git_facts(canonical) == before
+
+
+def test_isolated_target_rejects_a_linked_git_worktree(tmp_path):
+    target = create_temporary_target(tmp_path)
+    linked = tmp_path / "linked-worktree"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(target),
+            "worktree",
+            "add",
+            str(linked),
+            "HEAD",
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    with pytest.raises(ProductionCompositionError) as raised:
+        assert_isolated_e2e_target(linked, tmp_path)
+    assert raised.value.code == "REAL_E2E_TARGET_NOT_ISOLATED"
+
+
+def test_create_temporary_target_rejects_canonical_or_linked_root_before_mkdir(
+    tmp_path, monkeypatch
+):
+    canonical = Path(__file__).resolve().parents[1]
+    target = create_temporary_target(tmp_path)
+    linked = tmp_path / "linked-root"
+    subprocess.run(
+        ["git", "-C", str(target), "worktree", "add", str(linked), "HEAD"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    roots = (canonical, linked)
+    before = {root: _git_facts(root) for root in roots}
+
+    def unexpected_mkdir(*args, **kwargs):
+        raise AssertionError("isolation-root mkdir must not be reached")
+
+    monkeypatch.setattr(Path, "mkdir", unexpected_mkdir)
+    for root in roots:
+        with pytest.raises(ProductionCompositionError) as raised:
+            create_temporary_target(root)
+        assert raised.value.code == "REAL_E2E_TARGET_NOT_ISOLATED"
+        assert _git_facts(root) == before[root]
+
+
+def test_real_provider_public_path_fails_closed_without_a_safe_adapter(tmp_path):
     if (
         os.environ.get("GWO_V8_REAL_PROVIDER_E2E") != "1"
         or not os.environ.get("GWO_V8_REAL_PROVIDER_COMMAND", "").strip()
@@ -40,14 +135,14 @@ def test_real_provider_public_path_is_opt_in_and_uses_a_temporary_target(tmp_pat
         )
     target = create_temporary_target(tmp_path)
     assert_isolated_e2e_target(target, tmp_path)
-    harness = install_real_provider_composition(
-        target,
-        evidence_dir=tmp_path / "evidence",
-    )
-    handle = harness.host.start(harness.repository, harness.ready_refs)
-    harness.host.advance(handle, "real-provider:ready")
-    diagnostics = harness.host.inspect(handle)
-    assert diagnostics.campaign == handle
+    with pytest.raises(ProductionCompositionError) as raised:
+        install_real_provider_composition(
+            target,
+            root=tmp_path,
+            evidence_dir=tmp_path / "evidence",
+        )
+    assert raised.value.code == "REAL_PROVIDER_UNSUPPORTED"
+    assert not (tmp_path / "evidence").exists()
 
 
 def test_watchdog_runtime_wake_calls_the_same_public_advance_path(composition_harness):
