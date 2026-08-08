@@ -17,6 +17,21 @@ from .activation import (
     WriterAuthorityControl,
 )
 from .compiler import CompiledPlan, CompileError, PlanCompiler
+from .batch_integrator import (
+    BatchDeliveryAction,
+    BatchDeliveryObservation,
+    BatchDeliveryProof,
+    BatchDeliveryRequest,
+    BatchIntegrator,
+    BatchIntegratorConfiguration,
+    BatchIntegratorError,
+    BatchTarget,
+    DeliveryAttributionAmbiguous,
+    DeliveryIdentityMismatch,
+    HostedSuiteDefinition,
+    LocalSuiteDefinition,
+    MemberDeliveryObservation,
+)
 from .plan_control import (
     ActivePlanReadback,
     ActivationReceipt as PlanControlActivationReceipt,
@@ -53,6 +68,12 @@ from .execution_kernel import (
     advance,
     inspect,
     install_execution_kernel,
+)
+from .production_host import (
+    PlanningContinuation,
+    ProductionGwoHost,
+    ProductionHostConfiguration,
+    WriterGenerationReader,
 )
 from .entry import (
     ImplementGwoDecision,
@@ -152,12 +173,6 @@ from .kernel import (
     RecoveryDirective,
     RecoveryLadder,
 )
-from .integration_batch import (
-    GitIntegrationBatchAssembler,
-    IntegrationBatch,
-    IntegrationBatchError,
-    IntegrationBatchMember,
-)
 from .reconstruction import (
     AuthoritativeNodeReadback,
     AuthoritativeRepositoryReadback,
@@ -209,6 +224,14 @@ __all__ = [
     "ActiveTurnPools",
     "AuthoritativeNodeReadback",
     "AuthoritativeRepositoryReadback",
+    "BatchDeliveryAction",
+    "BatchDeliveryObservation",
+    "BatchDeliveryProof",
+    "BatchDeliveryRequest",
+    "BatchIntegrator",
+    "BatchIntegratorConfiguration",
+    "BatchIntegratorError",
+    "BatchTarget",
     "CanaryAcceptance",
     "CanaryEvidenceControl",
     "CanaryRunReadback",
@@ -220,6 +243,8 @@ __all__ = [
     "CompileError",
     "DeliveryControl",
     "DeliveryControlError",
+    "DeliveryAttributionAmbiguous",
+    "DeliveryIdentityMismatch",
     "Diagnostics",
     "HumanDecisionChoice",
     "HumanGateSummary",
@@ -228,6 +253,10 @@ __all__ = [
     "ExecutionKernel",
     "ExecutionKernelConfiguration",
     "ExecutionKernelError",
+    "PlanningContinuation",
+    "ProductionGwoHost",
+    "ProductionHostConfiguration",
+    "WriterGenerationReader",
     "PublicationEligibility",
     "ReviewGateDecision",
     "DurablePlanControl",
@@ -262,12 +291,9 @@ __all__ = [
     "GoalDriverStatus",
     "GoalSnapshot",
     "HostedCheckReadback",
+    "HostedSuiteDefinition",
     "IntegrationReadback",
     "inspect",
-    "IntegrationBatch",
-    "IntegrationBatchError",
-    "IntegrationBatchMember",
-    "GitIntegrationBatchAssembler",
     "InMemoryDeliveryControl",
     "InMemoryDurablePlanControl",
     "InMemoryDurableGoalControl",
@@ -291,6 +317,8 @@ __all__ = [
     "KernelPreviewAction",
     "KernelReconciliationPlan",
     "LocalPlanPublication",
+    "LocalSuiteDefinition",
+    "MemberDeliveryObservation",
     "LegacyWriterControl",
     "LegacyActivationReceipt",
     "LegacyWriterReadback",

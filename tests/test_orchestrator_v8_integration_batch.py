@@ -8,7 +8,7 @@ import sys
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from gwo_v8 import (  # noqa: E402
+from gwo_v8.integration_batch import (  # noqa: E402
     GitIntegrationBatchAssembler,
     IntegrationBatchMember,
 )

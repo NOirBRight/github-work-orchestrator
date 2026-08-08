@@ -1,0 +1,961 @@
+from __future__ import annotations
+
+import base64
+from dataclasses import asdict, replace
+from pathlib import Path
+import re
+import sys
+
+import pytest
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from gwo_v8.batch_integrator import (
+    AncestorReadback,
+    BatchIntegrator,
+    BatchIntegratorConfiguration,
+    BatchDeliveryObservation,
+    BatchDeliveryProof,
+    BatchIntegratorError,
+    CompatibilityDecision,
+    DeliveryIdentityMismatch,
+    MemberDeliveryObservation,
+    TargetDeltaReadback,
+    _pairwise_compatibility,
+    form_batch_members,
+)
+from gwo_v8.batch_patch_identity import patch_identity_v1, require_clean_base_advance
+from gwo_v8._canonical import digest_value
+from gwo_v8._batch_integrator_store import SqliteBatchDeliveryJournal
+from gwo_v8.candidate_gate import InteractionClassification
+from v8_batch_test_support import (
+    make_accepted_candidate_receipt,
+    make_batch_action,
+    make_batch_request,
+    make_ancestor_readback,
+    make_batch_target,
+    make_hosted_result_receipt,
+    make_interaction_key,
+    make_patch_entry,
+    make_three_standard_receipts,
+    make_target_delta,
+)
+
+
+def test_forms_oldest_pairwise_compatible_candidates_up_to_four_without_waiting():
+    queue = tuple(
+        make_accepted_candidate_receipt(
+            ticket_key=f"issue:{n}", accepted_sequence=n
+        )
+        for n in range(1, 6)
+    )
+    # The ordinary conflict is the exact same ordinary key as issue:1. Other
+    # ordinary keys are independent and must remain pairwise compatible.
+    queue = (
+        queue[0],
+        replace(queue[1], interaction_keys=queue[0].interaction_keys),
+        queue[2],
+        queue[3],
+        queue[4],
+    )
+
+    selected = form_batch_members(queue, make_batch_target(), member_limit=4)
+
+    assert [item.ticket_key for item in selected] == [
+        "issue:1",
+        "issue:3",
+        "issue:4",
+        "issue:5",
+    ]
+
+
+def test_formation_is_same_campaign_and_strict_or_gitlink_is_singleton():
+    seed = make_accepted_candidate_receipt(ticket_key="issue:1")
+    other_campaign = make_accepted_candidate_receipt(
+        ticket_key="issue:2", campaign_key="campaign:b", accepted_sequence=2
+    )
+    strict = make_accepted_candidate_receipt(
+        ticket_key="issue:3", assurance="strict", accepted_sequence=3
+    )
+    gitlink = make_accepted_candidate_receipt(
+        ticket_key="issue:4", gitlink_change=True, accepted_sequence=4
+    )
+
+    assert form_batch_members((seed, other_campaign), make_batch_target(), member_limit=4) == (seed,)
+    assert form_batch_members((seed, strict), make_batch_target(), member_limit=4) == (seed,)
+    assert form_batch_members((strict,), make_batch_target(), member_limit=4) == (strict,)
+    assert form_batch_members((seed, gitlink), make_batch_target(), member_limit=4) == (seed,)
+    assert form_batch_members((gitlink,), make_batch_target(), member_limit=4) == (gitlink,)
+
+
+def test_policy_classified_interaction_key_forces_singleton():
+    protected = make_accepted_candidate_receipt(
+        interaction_keys=(
+            make_interaction_key(
+                "schema:root", classification=InteractionClassification.PROTECTED
+            ),
+        )
+    )
+    ordinary = make_accepted_candidate_receipt(ticket_key="issue:2", accepted_sequence=2)
+
+    assert form_batch_members(
+        (protected, ordinary), make_batch_target(), member_limit=4
+    ) == (protected,)
+
+
+def test_member_limit_rejects_zero_or_more_than_four_and_accepts_repository_override():
+    with pytest.raises(BatchIntegratorError, match="member limit"):
+        BatchIntegratorConfiguration(host_member_limit=0)
+    with pytest.raises(BatchIntegratorError, match="member limit"):
+        BatchIntegratorConfiguration(host_member_limit=5)
+    configuration = BatchIntegratorConfiguration(
+        host_member_limit=4, repository_member_limits={"owner/repo": 2}
+    )
+    assert configuration.member_limit_for("owner/repo") == 2
+
+
+def test_pairwise_checks_later_members_before_accepting_clean_base_advance():
+    target = make_batch_target(target_head_sha="b" * 40, target_tree_oid="2" * 40)
+    first = make_accepted_candidate_receipt(
+        ticket_key="issue:1",
+        accepted_sequence=1,
+        base_sha="a" * 40,
+        base_tree_oid="1" * 40,
+        interaction_keys=(make_interaction_key("key-1"),),
+    )
+    second = make_accepted_candidate_receipt(
+        ticket_key="issue:2",
+        accepted_sequence=2,
+        base_sha="a" * 40,
+        base_tree_oid="1" * 40,
+        interaction_keys=(make_interaction_key("key-2"),),
+    )
+    conflicting_later_member = make_accepted_candidate_receipt(
+        ticket_key="issue:3",
+        accepted_sequence=3,
+        base_sha="b" * 40,
+        base_tree_oid="2" * 40,
+        interaction_keys=(make_interaction_key("key-2"),),
+    )
+
+    selected = form_batch_members(
+        (first, second, conflicting_later_member), target, member_limit=4
+    )
+
+    assert selected == (first, second)
+
+
+def test_pairwise_treats_base_tree_mismatch_as_clean_base_advance():
+    target = make_batch_target(target_head_sha="b" * 40, target_tree_oid="2" * 40)
+    first = make_accepted_candidate_receipt(
+        ticket_key="issue:1",
+        accepted_sequence=1,
+        base_sha="b" * 40,
+        base_tree_oid="1" * 40,
+        interaction_keys=(make_interaction_key("key-1"),),
+    )
+    candidate = make_accepted_candidate_receipt(
+        ticket_key="issue:2",
+        accepted_sequence=2,
+        base_sha="b" * 40,
+        base_tree_oid="1" * 40,
+        interaction_keys=(make_interaction_key("key-2"),),
+    )
+
+    assert _pairwise_compatibility(candidate, [first], target) == CompatibilityDecision.CLEAN_BASE_ADVANCE
+
+
+def test_formation_skips_oldest_candidate_outside_target_scope():
+    out_of_scope = make_accepted_candidate_receipt(
+        repository="other/repo", ticket_key="issue:1", accepted_sequence=1
+    )
+    eligible = make_accepted_candidate_receipt(ticket_key="issue:2", accepted_sequence=2)
+
+    assert form_batch_members(
+        (out_of_scope, eligible), make_batch_target(), member_limit=4
+    ) == (eligible,)
+
+
+def test_composes_three_members_without_moving_target_and_reads_exact_tree(tmp_path):
+    from v8_batch_test_support import make_composition_integrator, make_disjoint_git_candidates
+
+    repository, target_sha, candidates = make_disjoint_git_candidates(tmp_path, count=3)
+    integrator, drivers = make_composition_integrator(repository)
+    request = make_batch_request(
+        accepted_candidates=tuple(candidates),
+        target_head_sha=target_sha,
+    )
+
+    action = integrator.prepare(request)
+
+    assert drivers.git.read_target(request.target).target_head_sha == target_sha
+    assert drivers.git.tree_contains(action.batch_sha, "module-1.py")
+    assert drivers.git.tree_contains(action.batch_sha, "module-2.py")
+    assert drivers.git.tree_contains(action.batch_sha, "module-3.py")
+    assert (
+        drivers.git.read_ref(f"refs/gwo-v8/integration-batches/{action.batch_id}")
+        == action.batch_sha
+    )
+
+
+def test_existing_batch_ref_is_reused_without_a_second_merge(tmp_path):
+    from v8_batch_test_support import make_composition_integrator, make_disjoint_git_candidates
+
+    repository, target_sha, candidates = make_disjoint_git_candidates(tmp_path, count=2)
+    first, _drivers = make_composition_integrator(repository)
+    request = make_batch_request(
+        accepted_candidates=tuple(candidates), target_head_sha=target_sha
+    )
+    first_action = first.prepare(request)
+    second, restarted_drivers = make_composition_integrator(repository)
+
+    second_action = second.prepare(request)
+
+    assert second_action == first_action
+    assert restarted_drivers.git.compose_calls == 0
+
+
+def test_lost_batch_ref_recomposition_reuses_the_same_deterministic_commit_sha(tmp_path):
+    from v8_batch_test_support import (
+        drop_batch_ref,
+        make_composition_integrator,
+        make_disjoint_git_candidates,
+    )
+
+    repository, target_sha, candidates = make_disjoint_git_candidates(tmp_path, count=2)
+    first, _drivers = make_composition_integrator(repository)
+    request = make_batch_request(
+        accepted_candidates=tuple(candidates), target_head_sha=target_sha
+    )
+    first_action = first.prepare(request)
+
+    drop_batch_ref(repository, first_action.batch_id)
+    restarted, restarted_drivers = make_composition_integrator(repository)
+    second_action = restarted.prepare(request)
+
+    assert second_action.batch_sha == first_action.batch_sha
+    assert restarted_drivers.git.compose_calls == 1
+
+
+def test_clean_base_advance_requires_each_member_patch_identity_before_multi_member_compose(
+    tmp_path,
+):
+    from v8_batch_test_support import make_advanced_target_candidates, make_composition_integrator
+
+    repository, advanced_target_sha, candidates = make_advanced_target_candidates(
+        tmp_path, count=2
+    )
+    integrator, drivers = make_composition_integrator(repository)
+    request = make_batch_request(
+        accepted_candidates=tuple(candidates),
+        target_head_sha=advanced_target_sha,
+    )
+
+    action = integrator.prepare(request)
+
+    assert len(drivers.git.clean_base_advance_calls) == 2
+    assert action.batch_sha != advanced_target_sha
+
+
+def test_clean_base_advance_patch_identity_mismatch_fails_before_multi_member_compose(
+    tmp_path,
+):
+    from v8_batch_test_support import make_advanced_target_candidates, make_composition_integrator
+
+    repository, target_sha, candidates = make_advanced_target_candidates(tmp_path, count=2)
+    integrator, drivers = make_composition_integrator(repository)
+    drivers.git.recomputed_patch_digest = "f" * 64
+
+    with pytest.raises(BatchIntegratorError, match="CLEAN_BASE_PATCH_IDENTITY_MISMATCH"):
+        integrator.prepare(
+            make_batch_request(
+                accepted_candidates=tuple(candidates), target_head_sha=target_sha
+            )
+        )
+
+    assert drivers.git.compose_calls == 0
+
+
+def test_clean_base_advance_non_ancestor_fails_before_multi_member_compose(tmp_path):
+    from v8_batch_test_support import make_advanced_target_candidates, make_composition_integrator
+
+    repository, target_sha, candidates = make_advanced_target_candidates(tmp_path, count=2)
+    integrator, drivers = make_composition_integrator(
+        repository, ancestor_is_ancestor=False
+    )
+
+    with pytest.raises(BatchIntegratorError, match="CLEAN_BASE_ANCESTOR_REQUIRED"):
+        integrator.prepare(
+            make_batch_request(
+                accepted_candidates=tuple(candidates), target_head_sha=target_sha
+            )
+        )
+
+    assert drivers.git.compose_calls == 0
+
+
+def test_clean_base_advance_protected_target_delta_fails_before_multi_member_compose(
+    tmp_path,
+):
+    from v8_batch_test_support import (
+        make_advanced_target_candidates,
+        make_composition_integrator,
+    )
+
+    repository, target_sha, candidates = make_advanced_target_candidates(tmp_path, count=2)
+    protected = make_interaction_key(
+        "schema:root", classification=InteractionClassification.PROTECTED
+    )
+    integrator, drivers = make_composition_integrator(
+        repository, target_delta_interaction_keys=(protected,)
+    )
+
+    with pytest.raises(BatchIntegratorError, match="TARGET_DELTA_PROTECTED_INTERACTION"):
+        integrator.prepare(
+            make_batch_request(
+                accepted_candidates=tuple(candidates), target_head_sha=target_sha
+            )
+        )
+
+    assert drivers.git.compose_calls == 0
+
+
+def test_git_driver_maps_raw_protected_surfaces_to_canonical_target_path_keys():
+    from gwo_v8._batch_integrator_drivers import GitCliBatchDriver
+
+    member = make_accepted_candidate_receipt(
+        protected_surfaces=("protected/path",)
+    )
+    token = base64.urlsafe_b64encode(b"protected/path").decode("ascii").rstrip("=")
+    target_delta = make_target_delta(
+        member.base_sha,
+        "b" * 40,
+        interaction_keys=(make_interaction_key(token),),
+    )
+
+    mapped = GitCliBatchDriver._apply_member_policy(target_delta, member)
+
+    assert mapped.protected_interaction_keys == mapped.interaction_keys
+
+
+def test_git_driver_maps_raw_singleton_interactions_to_canonical_target_path_keys():
+    from gwo_v8._batch_integrator_drivers import GitCliBatchDriver
+
+    member = make_accepted_candidate_receipt(
+        interaction_keys=(
+            make_interaction_key(
+                "high-coupling/path",
+                classification=InteractionClassification.HIGH_COUPLING,
+            ),
+        )
+    )
+    token = base64.urlsafe_b64encode(b"high-coupling/path").decode("ascii").rstrip("=")
+    target_delta = make_target_delta(
+        member.base_sha,
+        "b" * 40,
+        interaction_keys=(make_interaction_key(token),),
+    )
+
+    mapped = GitCliBatchDriver._apply_member_policy(target_delta, member)
+
+    assert mapped.protected_interaction_keys == mapped.interaction_keys
+    assert (
+        mapped.interaction_keys[0].classification
+        == InteractionClassification.HIGH_COUPLING
+    )
+
+
+def test_crash_after_batch_ref_publication_is_recovered_by_exact_ref_readback(tmp_path):
+    from v8_batch_test_support import (
+        CrashInjected,
+        make_composition_integrator,
+        make_disjoint_git_candidates,
+    )
+
+    repository, target_sha, candidates = make_disjoint_git_candidates(tmp_path, count=2)
+    first, drivers = make_composition_integrator(
+        repository, crash_after="batch_ref_publication"
+    )
+    request = make_batch_request(
+        accepted_candidates=tuple(candidates), target_head_sha=target_sha
+    )
+
+    with pytest.raises(CrashInjected, match="batch_ref_publication"):
+        first.prepare(request)
+
+    restarted, restarted_drivers = make_composition_integrator(repository)
+    action = restarted.prepare(request)
+
+    assert (
+        action.batch_sha
+        == drivers.git.read_ref(f"refs/gwo-v8/integration-batches/{action.batch_id}")
+    )
+    assert restarted_drivers.git.compose_calls == 0
+
+
+def test_accepted_candidate_receipt_digest_binds_every_delivery_fact():
+    first = make_accepted_candidate_receipt(
+        ticket_key="issue:1", candidate_sha="a" * 40
+    )
+    changed = make_accepted_candidate_receipt(
+        ticket_key="issue:1",
+        candidate_sha="a" * 40,
+        delivery_identity_digest="b" * 64,
+    )
+
+    assert first.digest != changed.digest
+    assert first.canonical()["diff_schema_version"] == "CandidateDiffRecordV1"
+    assert (
+        first.canonical()["review_finding_ledger_digest"]
+        == first.review_finding_ledger_digest
+    )
+
+
+def test_accepted_candidate_receipt_rejects_noncanonical_evidence_and_sequence():
+    with pytest.raises(BatchIntegratorError, match="accepted_sequence"):
+        make_accepted_candidate_receipt(accepted_sequence=-1)
+    with pytest.raises(BatchIntegratorError, match="evidence_digests"):
+        make_accepted_candidate_receipt(evidence_digests=("f" * 64, "e" * 64))
+
+
+def test_batch_request_digest_changes_when_member_set_or_target_changes():
+    request = make_batch_request(
+        accepted_candidates=(
+            make_accepted_candidate_receipt(ticket_key="issue:1"),
+        )
+    )
+    changed_members = replace(
+        request,
+        accepted_candidates=(
+            request.accepted_candidates[0],
+            make_accepted_candidate_receipt(ticket_key="issue:2", accepted_sequence=2),
+        ),
+    )
+    changed_target = replace(
+        request,
+        target=replace(request.target, target_head_sha="b" * 40),
+    )
+
+    assert request.request_digest != changed_members.request_digest
+    assert request.request_digest != changed_target.request_digest
+
+
+def test_batch_action_preserves_oldest_first_member_order():
+    request = make_batch_request(
+        accepted_candidates=(
+            make_accepted_candidate_receipt(ticket_key="issue:z", accepted_sequence=1),
+            make_accepted_candidate_receipt(ticket_key="issue:a", accepted_sequence=2),
+        )
+    )
+    class FakeGit:
+        def read_target(self, target):
+            return target
+
+        def compose_batch(self, batch_id, target, members):
+            return members[0].candidate_sha
+
+    integrator = BatchIntegrator(
+        journal=object(),
+        git=FakeGit(),
+        local=object(),
+        hosted=object(),
+        configuration=BatchIntegratorConfiguration(),
+    )
+
+    action = integrator.prepare(request)
+
+    assert action.member_ticket_keys == ("issue:z", "issue:a")
+
+
+def test_batch_observation_preserves_exact_delivery_proof_partition():
+    proof = BatchDeliveryProof.create(
+        delivery_stable_action_id="delivery-action:1",
+        delivery_request_digest="1" * 64,
+        batch_id="2" * 64,
+        batch_sha="a" * 40,
+        member_ticket_keys=("issue:1",),
+        local_check_receipt_digest="3" * 64,
+        publication_receipt_digest="4" * 64,
+        pull_request_number=1,
+        pull_request_head_sha="a" * 40,
+        hosted_result_receipt_digest="5" * 64,
+        integration_lease_digest="6" * 64,
+        target_branch="main",
+        target_head_sha="b" * 40,
+        target_readback_digest="7" * 64,
+        target_contains_batch_sha=True,
+        pull_request_merge_target_sha="b" * 40,
+        merge_method="merge",
+    )
+    member = MemberDeliveryObservation(
+        ticket_key="issue:1",
+        work_run_key="work-run:1",
+        candidate_sha="a" * 40,
+        status="integrated",
+        evidence_digests=("8" * 64,),
+    )
+    body = {
+        "stable_action_id": "delivery-action:1",
+        "batch_id": "2" * 64,
+        "batch_sha": "a" * 40,
+        "phase": "complete",
+        "reason": "integrated",
+        "retry_count": 0,
+        "fallback_generation": 0,
+        "members": [asdict(member)],
+        "delivery_proofs": [proof.canonical()],
+    }
+    observation = BatchDeliveryObservation(
+        stable_action_id="delivery-action:1",
+        batch_id="2" * 64,
+        batch_sha="a" * 40,
+        phase="complete",
+        reason="integrated",
+        receipt_digest=digest_value({"kind": "batch-observation.v1", **body}),
+        retry_count=0,
+        fallback_generation=0,
+        members=(member,),
+        delivery_proofs=(proof,),
+    )
+
+    assert observation.canonical()["delivery_proofs"] == [proof.canonical()]
+
+
+def test_patch_identity_v1_is_independent_of_entry_input_order():
+    entries = (
+        make_patch_entry("b.txt", old_oid="1" * 40, new_oid="2" * 40),
+        make_patch_entry("a.txt", old_oid="3" * 40, new_oid="4" * 40),
+    )
+    assert patch_identity_v1("sha1", entries) == patch_identity_v1(
+        "sha1", tuple(reversed(entries))
+    )
+
+
+def test_patch_identity_v1_changes_for_mode_binary_and_gitlink_identity():
+    base = make_patch_entry("tool", old_mode="100644", new_mode="100755")
+    binary = make_patch_entry("image.bin", old_oid="1" * 40, new_oid="2" * 40)
+    gitlink = make_patch_entry(
+        "submodule",
+        old_mode="160000",
+        new_mode="160000",
+        old_oid="3" * 40,
+        new_oid="4" * 40,
+        old_object_type="gitlink",
+        new_object_type="gitlink",
+    )
+
+    assert len(
+        {patch_identity_v1("sha1", (entry,)) for entry in (base, binary, gitlink)}
+    ) == 3
+
+
+def test_clean_base_advance_rejects_recomputed_patch_identity_mismatch():
+    member = make_accepted_candidate_receipt()
+    with pytest.raises(BatchIntegratorError, match="PatchIdentityV1"):
+        require_clean_base_advance(
+            member=member,
+            original_patch_digest="a" * 64,
+            recomputed_patch_digest="b" * 64,
+            ancestor=make_ancestor_readback(member.base_sha, "b" * 40),
+            target_delta=make_target_delta(member.base_sha, "b" * 40),
+        )
+
+
+def test_clean_base_advance_requires_authoritative_original_base_ancestor():
+    member = make_accepted_candidate_receipt()
+    ancestor = make_ancestor_readback(member.base_sha, "b" * 40, is_ancestor=False)
+
+    with pytest.raises(BatchIntegratorError, match="CLEAN_BASE_ANCESTOR_REQUIRED"):
+        require_clean_base_advance(
+            member=member,
+            original_patch_digest=member.diff_record_digest,
+            recomputed_patch_digest=member.diff_record_digest,
+            ancestor=ancestor,
+            target_delta=make_target_delta(member.base_sha, "b" * 40),
+        )
+
+
+def test_clean_base_advance_rejects_protected_target_delta_interaction_key():
+    member = make_accepted_candidate_receipt()
+    protected = make_interaction_key(
+        "schema:root", classification=InteractionClassification.PROTECTED
+    )
+
+    with pytest.raises(
+        BatchIntegratorError, match="TARGET_DELTA_PROTECTED_INTERACTION"
+    ):
+        require_clean_base_advance(
+            member=member,
+            original_patch_digest=member.diff_record_digest,
+            recomputed_patch_digest=member.diff_record_digest,
+            ancestor=make_ancestor_readback(member.base_sha, "b" * 40),
+            target_delta=make_target_delta(
+                member.base_sha, "b" * 40, interaction_keys=(protected,)
+            ),
+        )
+
+
+def test_clean_base_advance_rejects_forged_protected_partition():
+    member = make_accepted_candidate_receipt()
+    protected = make_interaction_key(
+        "schema:root", classification=InteractionClassification.PROTECTED
+    )
+    body = {
+        "base_sha": member.base_sha,
+        "target_head_sha": "b" * 40,
+        "interaction_keys": [protected.canonical()],
+        "protected_interaction_keys": [],
+    }
+    forged_delta = TargetDeltaReadback(
+        base_sha=member.base_sha,
+        target_head_sha="b" * 40,
+        interaction_keys=(protected,),
+        protected_interaction_keys=(),
+        facts_digest=digest_value(body),
+        readback_digest=digest_value(
+            {"kind": "target-delta-readback.v1", **body}
+        ),
+    )
+
+    with pytest.raises(BatchIntegratorError, match="protected"):
+        require_clean_base_advance(
+            member=member,
+            original_patch_digest=member.diff_record_digest,
+            recomputed_patch_digest=member.diff_record_digest,
+            ancestor=make_ancestor_readback(member.base_sha, "b" * 40),
+            target_delta=forged_delta,
+        )
+
+
+def test_integration_lease_compare_and_swap_keeps_the_first_holder(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    first = journal.acquire_integration_lease(
+        "owner/repo", "action:one", "gen:1", "activation:1"
+    )
+
+    with pytest.raises(BatchIntegratorError, match="INTEGRATION_LEASE_UNAVAILABLE"):
+        journal.acquire_integration_lease(
+            "owner/repo", "action:two", "gen:1", "activation:1"
+        )
+
+    assert journal.read_integration_lease("owner/repo") == first
+
+
+def test_same_holder_new_generation_cannot_replace_current_integration_lease(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    first = journal.acquire_integration_lease(
+        "owner/repo", "action:one", "gen:1", "activation:1"
+    )
+
+    with pytest.raises(BatchIntegratorError, match="INTEGRATION_LEASE_UNAVAILABLE"):
+        journal.acquire_integration_lease(
+            "owner/repo", "action:one", "gen:2", "activation:2"
+        )
+
+    assert journal.read_integration_lease("owner/repo") == first
+
+
+def test_stale_lease_release_cannot_delete_reacquired_current_receipt(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    first = journal.acquire_integration_lease(
+        "owner/repo", "action:one", "gen:1", "activation:1"
+    )
+    journal.release_integration_lease("owner/repo", first)
+    current = journal.acquire_integration_lease(
+        "owner/repo", "action:one", "gen:2", "activation:2"
+    )
+
+    with pytest.raises(BatchIntegratorError, match="INTEGRATION_LEASE_OWNER_MISMATCH"):
+        journal.release_integration_lease("owner/repo", first)
+
+    assert journal.read_integration_lease("owner/repo") == current
+
+
+def test_batch_journal_record_and_integration_lease_receipt_have_exact_bodies(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    action = make_batch_action()
+    record = journal.create_action(action, action.request_digest)
+    lease = journal.acquire_integration_lease(
+        "owner/repo", "action:one", "gen:1", "activation:1"
+    )
+
+    assert record.body() == {
+        "stable_action_id": action.stable_action_id,
+        "request_digest": action.request_digest,
+        "batch_id": action.batch_id,
+        "batch_sha": action.batch_sha,
+        "phase": "prepared",
+        "reason": "prepared",
+        "retry_count": 0,
+        "fallback_generation": 0,
+        "state_json": "{}",
+        "version": 0,
+    }
+    assert lease.body() == {
+        "repository": "owner/repo",
+        "holder": "action:one",
+        "writer_generation": "gen:1",
+        "activation_id": "activation:1",
+    }
+    assert lease.lease_digest == digest_value(
+        {"kind": "integration-lease.v1", **lease.body()}
+    )
+
+
+def test_stale_batch_action_write_does_not_overwrite_newer_version(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    action = make_batch_action()
+    created = journal.create_action(action, action.request_digest)
+    newer = journal.advance_action(
+        created, phase="published", reason="publication read back"
+    )
+
+    with pytest.raises(BatchIntegratorError, match="BATCH_ACTION_CAS_CONFLICT"):
+        journal.compare_and_swap_action(
+            action.stable_action_id,
+            expected_version=created.version,
+            expected_phase="prepared",
+            next_record=replace(
+                newer, phase="integrating", version=created.version + 1
+            ),
+        )
+
+    assert journal.read_action(action.stable_action_id).phase == "published"
+
+
+def test_identical_terminal_hosted_receipt_replays_but_wrong_identity_fails(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    receipt = make_hosted_result_receipt()
+    assert journal.persist_hosted_result(receipt) == receipt
+    assert journal.persist_hosted_result(receipt) == receipt
+
+    with pytest.raises(DeliveryIdentityMismatch):
+        journal.persist_hosted_result(replace(receipt, batch_sha="b" * 40))
+
+
+def test_hosted_result_persistence_rejects_runtime_invalid_outcome(tmp_path):
+    journal = SqliteBatchDeliveryJournal(tmp_path / "v8.sqlite3")
+    forged = make_hosted_result_receipt(outcome="forged")  # type: ignore[arg-type]
+
+    with pytest.raises(DeliveryIdentityMismatch, match="outcome"):
+        journal.persist_hosted_result(forged)
+
+
+def test_local_suite_publication_pr_hosted_ci_and_target_name_one_batch_sha(tmp_path):
+    from v8_batch_test_support import make_integrator
+
+    integrator, drivers = make_integrator(tmp_path, hosted_outcomes=("passed",))
+    action = integrator.prepare(
+        make_batch_request(accepted_candidates=make_three_standard_receipts())
+    )
+
+    observation = integrator.execute(action)
+
+    assert observation.phase == "complete"
+    assert drivers.local.batch_shas == [action.batch_sha]
+    assert drivers.hosted.published_shas == [action.batch_sha]
+    assert drivers.hosted.hosted_read_shas == [action.batch_sha]
+    assert drivers.hosted.integrated_shas == [action.batch_sha]
+    assert drivers.hosted.pull_request_heads == [action.batch_sha]
+    assert len(observation.delivery_proofs) == 1
+    proof = observation.delivery_proofs[0]
+    assert proof.delivery_stable_action_id == action.stable_action_id
+    assert proof.delivery_request_digest == action.request_digest
+    assert proof.batch_id == action.batch_id
+    assert proof.batch_sha == action.batch_sha
+    assert proof.member_ticket_keys == action.member_ticket_keys
+    assert proof.pull_request_number == 1
+    assert proof.pull_request_head_sha == action.batch_sha
+    assert proof.target_branch == "main"
+    assert proof.target_contains_batch_sha is True
+    assert proof.pull_request_merge_target_sha == proof.target_head_sha
+    assert proof.merge_method == "merge"
+    for digest in (
+        proof.local_check_receipt_digest,
+        proof.publication_receipt_digest,
+        proof.hosted_result_receipt_digest,
+        proof.integration_lease_digest,
+        proof.target_readback_digest,
+        proof.proof_digest,
+    ):
+        assert re.fullmatch(r"[0-9a-f]{64}", digest)
+
+
+def test_complete_observation_rejects_any_tampered_delivery_proof(tmp_path):
+    from v8_batch_test_support import make_integrator
+
+    integrator, _drivers = make_integrator(tmp_path, hosted_outcomes=("passed",))
+    action = integrator.prepare(
+        make_batch_request(accepted_candidates=make_three_standard_receipts())
+    )
+    observation = integrator.execute(action)
+    assert len(observation.delivery_proofs) == 1
+
+    with pytest.raises(DeliveryIdentityMismatch):
+        replace(
+            observation,
+            delivery_proofs=(
+                replace(
+                    observation.delivery_proofs[0],
+                    target_head_sha="f" * 40,
+                ),
+            ),
+        )
+
+
+def test_publication_wrong_batch_sha_is_identity_failure_without_retry_or_resume(
+    tmp_path,
+):
+    from v8_batch_test_support import make_integrator
+
+    integrator, drivers = make_integrator(tmp_path, publication_batch_sha="f" * 40)
+    action = integrator.prepare(
+        make_batch_request(accepted_candidates=make_three_standard_receipts())
+    )
+
+    with pytest.raises(DeliveryIdentityMismatch):
+        integrator.execute(action)
+
+    assert drivers.hosted.publish_calls == 0
+    assert drivers.hosted.published_shas == []
+    assert drivers.hosted.retry_calls == 0
+
+
+def test_hosted_result_wrong_suite_or_provider_check_is_identity_failure(tmp_path):
+    from v8_batch_test_support import make_integrator
+
+    integrator, drivers = make_integrator(
+        tmp_path, hosted_identity_mismatch="suite"
+    )
+    action = integrator.prepare(
+        make_batch_request(accepted_candidates=make_three_standard_receipts())
+    )
+
+    with pytest.raises(DeliveryIdentityMismatch):
+        integrator.execute(action)
+
+    assert drivers.hosted.retry_calls == 0
+    assert integrator.readback(action) is not None
+
+
+def test_target_readback_accepts_merge_commit_only_when_batch_is_ancestor(tmp_path):
+    from v8_batch_test_support import make_integrator
+
+    integrator, drivers = make_integrator(
+        tmp_path,
+        target_merge_method="merge",
+        target_contains_batch=True,
+    )
+    action = integrator.prepare(
+        make_batch_request(accepted_candidates=make_three_standard_receipts())
+    )
+
+    assert integrator.execute(action).phase == "complete"
+    assert drivers.hosted.integrated_shas == [action.batch_sha]
+
+
+def test_target_readback_rejects_a_merge_mapping_not_equal_to_target_head(tmp_path):
+    from v8_batch_test_support import make_integrator
+
+    integrator, drivers = make_integrator(
+        tmp_path,
+        delivery_failure="wrong_merge_target",
+    )
+    action = integrator.prepare(
+        make_batch_request(accepted_candidates=make_three_standard_receipts())
+    )
+
+    with pytest.raises(DeliveryIdentityMismatch):
+        integrator.execute(action)
+
+    assert drivers.hosted.integrated_shas == [action.batch_sha]
+    readback = integrator.readback(action)
+    assert readback is None or readback.phase != "complete"
+
+
+@pytest.mark.parametrize("merge_method", ["squash", "rebase"])
+def test_target_readback_rejects_identity_rewriting_merge_methods(
+    tmp_path, merge_method
+):
+    from v8_batch_test_support import make_integrator
+
+    integrator, drivers = make_integrator(
+        tmp_path,
+        target_merge_method=merge_method,
+    )
+    action = integrator.prepare(
+        make_batch_request(accepted_candidates=make_three_standard_receipts())
+    )
+
+    with pytest.raises(DeliveryIdentityMismatch):
+        integrator.execute(action)
+
+    assert drivers.hosted.integrated_shas == []
+
+
+def test_duplicate_execute_does_not_repeat_publication_hosted_ci_or_target_mutation(
+    tmp_path,
+):
+    from v8_batch_test_support import make_integrator
+
+    integrator, drivers = make_integrator(tmp_path, hosted_outcomes=("passed",))
+    action = integrator.prepare(
+        make_batch_request(accepted_candidates=make_three_standard_receipts())
+    )
+
+    first = integrator.execute(action)
+    second = integrator.execute(action)
+
+    assert first == second
+    assert drivers.hosted.publish_calls == 1
+    assert drivers.hosted.hosted_read_calls == 1
+    assert drivers.hosted.integrate_calls == 1
+
+
+def test_terminal_journal_readback_returns_without_runtime_candidategate_or_provider_call(
+    tmp_path,
+):
+    from v8_batch_test_support import make_integrator
+
+    integrator, _drivers = make_integrator(tmp_path, hosted_outcomes=("passed",))
+    action = integrator.prepare(
+        make_batch_request(accepted_candidates=make_three_standard_receipts())
+    )
+    expected = integrator.execute(action)
+    restarted, restarted_drivers = make_integrator(tmp_path)
+
+    actual = restarted.readback(action)
+
+    assert actual == expected
+    assert restarted_drivers.hosted.hosted_read_calls == 0
+    assert restarted_drivers.forbidden_boundary_calls == 0
+
+
+def test_batch_observation_preserves_each_work_run_and_evidence_identity(tmp_path):
+    from v8_batch_test_support import make_integrator
+
+    integrator, _drivers = make_integrator(tmp_path, hosted_outcomes=("passed",))
+    action = integrator.prepare(
+        make_batch_request(accepted_candidates=make_three_standard_receipts())
+    )
+
+    observation = integrator.execute(action)
+
+    assert [
+        (member.ticket_key, member.work_run_key) for member in observation.members
+    ] == [
+        ("issue:1", "work-run:1"),
+        ("issue:2", "work-run:2"),
+        ("issue:3", "work-run:3"),
+    ]
+    assert all(member.evidence_digests for member in observation.members)
+
+
+def test_v3_batch_integrator_has_no_import_or_call_path_to_legacy_integration_batch():
+    source = Path(
+        "skills/orchestrator/scripts/gwo_v8/batch_integrator.py"
+    ).read_text(encoding="utf-8")
+    assert "integration_batch" not in source
+    assert "reconcile_once" not in source

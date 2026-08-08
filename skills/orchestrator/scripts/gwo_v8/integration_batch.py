@@ -1,3 +1,10 @@
+"""Predecessor V2 Integration Batch adapter kept for direct compatibility tests.
+
+The V3 BatchIntegrator owns the public delivery boundary and must not import
+this module.  This adapter remains reachable only through its direct legacy
+tests until the later cutover task removes the predecessor writer path.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

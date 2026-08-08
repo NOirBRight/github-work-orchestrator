@@ -282,3 +282,40 @@ The following rules produced the approved Ticket graph:
 Those instructions are retained as publication provenance. Future mechanics
 changes must follow the normative hierarchy rather than recovering decisions
 from this dated record or from chat history.
+
+## Candidate assurance normative requirements
+
+- Candidate identity MUST come from authoritative Git read-back of the
+  frozen base and reported reference, including exact commit and tree OIDs.
+- CandidateDiffRecordV1 MUST contain complete old/new raw-tree identity,
+  MUST encode paths as unpadded base64url raw bytes, and MUST disable rename
+  and copy inference.
+- ExecutionKernel MUST persist CandidateReceipt.canonical() directly at
+  state["runs"][ticket_key]["candidate_receipt"] and MUST validate exact
+  read-back before applying the observation phase.
+- Deterministic scope, protected-surface, authority, and affected-check
+  failure MUST stop before Formal Review.
+- STANDARD MUST execute exactly one formal_review. STRICT MUST execute one
+  formal_review and at most one policy-selected specialist_review, or
+  return a typed Decision. InvalidReviewTransport MAY execute one
+  review_strong retry only when ReviewSubject.digest is unchanged.
+- Reviewer and RepairVerifier capability proof MUST be read-only and
+  non-delegating and MUST deny tracker mutation, merge, authority expansion,
+  and global planning.
+- ReviewFindingLedger MUST retain every hard and advisory Finding and every
+  typed disposition. repair_verify MUST require complete dispositions,
+  exact required-check Evidence, and a RepairDelta within RepairPacket path
+  scope before invoking RepairVerifier.verify.
+- One Work Run MUST NOT execute an external effect for a fourth distinct
+  Candidate commit OID. It MUST persist CandidateBudgetExhausted:
+  concatenated with the exact ticket_key, release the Slot, and preserve
+  CandidateReceipt digests first.
+  Repair, restart, resume, and one authorized terminal-binding replacement
+  MUST NOT reset Candidate or binding bounds.
+- CandidateGate MUST route proved Ticket-unsatisfiable escape only through
+  #137 PlanInvalidationReporter and MUST NOT classify a Campaign or create a
+  successor Plan Revision.
+- AcceptedCandidateReceipt MUST bind the private receipt, exact diff,
+  AssuranceRequirement, ReviewSubject, Policy Witness, complete Finding
+  ledger, Evidence, protected surfaces, and concrete InteractionKey values.
+  It MUST NOT contain result_digest.
