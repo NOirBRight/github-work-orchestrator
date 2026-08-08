@@ -69,6 +69,12 @@ from .execution_kernel import (
     inspect,
     install_execution_kernel,
 )
+from .production_host import (
+    PlanningContinuation,
+    ProductionGwoHost,
+    ProductionHostConfiguration,
+    WriterGenerationReader,
+)
 from .entry import (
     ImplementGwoDecision,
     ImplementGwoEntry,
@@ -247,6 +253,10 @@ __all__ = [
     "ExecutionKernel",
     "ExecutionKernelConfiguration",
     "ExecutionKernelError",
+    "PlanningContinuation",
+    "ProductionGwoHost",
+    "ProductionHostConfiguration",
+    "WriterGenerationReader",
     "PublicationEligibility",
     "ReviewGateDecision",
     "DurablePlanControl",
