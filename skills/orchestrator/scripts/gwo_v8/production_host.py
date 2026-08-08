@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol, Sequence
 
@@ -16,7 +16,11 @@ from .execution_kernel import (
 )
 from .plan_control import CampaignHandle
 from .plan_control_host import ProductionPlanControlStartHost
-from .production_effects import ProductionCompositionError, ProductionWorkRunEffects
+from .production_effects import (
+    ProductionCompositionError,
+    ProductionWorkRunEffects,
+    _ProductionReplayDeferred,
+)
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,47 @@ class WriterGenerationReader(Protocol):
     def read(self) -> str: ...
 
 
+_IMMEDIATE_BATCH_RECOVERY_DUE_AT = "1970-01-01T00:00:00+00:00"
+
+
+class _ForwardingWatchdogAdvancer:
+    def __init__(self, host: "ProductionGwoHost") -> None:
+        self._host = host
+
+    def advance(
+        self,
+        handle: CampaignHandle,
+        wake_ref: str | None = None,
+    ) -> CampaignOutcome:
+        return self._host.advance(handle, wake_ref)
+
+
+def _is_predecessor_batch_integrator(value: object) -> bool:
+    value_type = type(value)
+    return (
+        value_type.__name__ == "GitIntegrationBatchAssembler"
+        and value_type.__module__ == "gwo_v8.integration_batch"
+    )
+
+
+def _validate_batch_integrator(value: object | None) -> None:
+    if value is None:
+        return
+    if _is_predecessor_batch_integrator(value):
+        raise ProductionCompositionError(
+            "PRODUCTION_PREDECESSOR_PATH_REJECTED",
+            "the predecessor GitIntegrationBatchAssembler is not a V8 production port",
+        )
+    if any(
+        not callable(getattr(value, method, None))
+        for method in ("prepare", "readback", "execute")
+    ):
+        raise ProductionCompositionError(
+            "PRODUCTION_COMPOSITION_INPUT_INVALID",
+            "the production Batch integrator must expose prepare, readback, and execute",
+        )
+
+
 class ProductionGwoHost:
     def __init__(
         self,
@@ -52,10 +97,12 @@ class ProductionGwoHost:
         watchdog: CampaignWatchdog,
         writer_generation_reader: WriterGenerationReader,
         target_path: Path,
+        effects: object | None = None,
     ) -> None:
         self._start_host = start_host
         self._kernel = kernel
         self._watchdog = watchdog
+        self._effects = effects
         self._writer_generation_reader = writer_generation_reader
         self._target_path = target_path.resolve()
 
@@ -72,6 +119,7 @@ class ProductionGwoHost:
         watchdog_store_path: Path,
         watchdog: CampaignWatchdog,
         writer_generation_reader: WriterGenerationReader,
+        batch_integrator: object | None = None,
     ) -> "ProductionGwoHost":
         root = host_configuration.target_isolation_root
         try:
@@ -93,19 +141,34 @@ class ProductionGwoHost:
                 "V8_ISOLATED_PREVIEW_REQUIRED",
                 "target is not an isolated Beta2 target",
             )
+        configured_batch_integrator = (
+            batch_integrator
+            if batch_integrator is not None
+            else getattr(effects, "_batch_integrator", None)
+        )
+        _validate_batch_integrator(configured_batch_integrator)
+        if batch_integrator is not None:
+            effects._batch_integrator = batch_integrator
         writer_generation_reader.read()
         kernel = start_host.install_execution_kernel(
             store_path=store_path,
             effects=effects,
             configuration=configuration,
         )
-        return cls(
+        host = cls(
             start_host=start_host,
             kernel=kernel,
             watchdog=watchdog,
+            effects=effects,
             writer_generation_reader=writer_generation_reader,
             target_path=target,
         )
+        bind_advancer = getattr(watchdog, "bind_advancer", None)
+        if callable(bind_advancer):
+            bind_advancer(_ForwardingWatchdogAdvancer(host))
+        elif getattr(watchdog, "_advancer", None) is kernel:
+            watchdog._advancer = _ForwardingWatchdogAdvancer(host)
+        return host
 
     def start(
         self,
@@ -139,7 +202,18 @@ class ProductionGwoHost:
                     CampaignStatus.WAIT,
                     "PlanningContinuationPending",
                 )
-        return self._kernel.advance(campaign_handle, wake_ref)
+        begin_public_advance = getattr(self._effects, "_begin_public_advance", None)
+        if callable(begin_public_advance):
+            begin_public_advance()
+        end_public_advance = getattr(self._effects, "_end_public_advance", None)
+        try:
+            return self._kernel.advance(campaign_handle, wake_ref)
+        except _ProductionReplayDeferred:
+            diagnostics = self._kernel.inspect(campaign_handle)
+            return CampaignOutcome(diagnostics.status, diagnostics.reason)
+        finally:
+            if callable(end_public_advance):
+                end_public_advance()
 
     def inspect(self, campaign_handle: CampaignHandle) -> Diagnostics:
         continuation = self._start_host.read_planning_continuation(campaign_handle)
@@ -162,7 +236,29 @@ class ProductionGwoHost:
         self,
         campaign_handle: CampaignHandle,
     ) -> WatchdogCampaignSnapshot:
-        return self._kernel.watchdog_snapshot(campaign_handle)
+        snapshot = self._kernel.watchdog_snapshot(campaign_handle)
+        if (
+            snapshot.next_check_at is not None
+            or not snapshot.candidate_receipt_digests
+        ):
+            return snapshot
+        diagnostics = self._kernel.inspect(campaign_handle)
+        if (
+            snapshot.status is not CampaignStatus.COMPLETE
+            and diagnostics.outstanding_effect_ids
+            and any(
+                run.phase == "accepted_awaiting_delivery"
+                and run.slot_held
+                and run.accepted_candidate_receipt_digest is not None
+                and run.candidate_diff_record_digest is not None
+                for run in diagnostics.work_runs
+            )
+        ):
+            return replace(
+                snapshot,
+                next_check_at=_IMMEDIATE_BATCH_RECOVERY_DUE_AT,
+            )
+        return snapshot
 
     def run_watchdog_once(self, now: str) -> tuple[CampaignOutcome, ...]:
         return self._watchdog.run_once(now)

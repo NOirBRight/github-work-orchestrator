@@ -9,10 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import os
 import re
 from pathlib import Path
 import sqlite3
-from typing import Mapping, NoReturn, Protocol
+import sys
+from threading import Lock
+from typing import BinaryIO, Mapping, NoReturn, Protocol
 import uuid
 
 from ._canonical import digest_value
@@ -25,12 +28,16 @@ WATCHDOG_STORE_INVALID = "WATCHDOG_STORE_INVALID"
 WATCHDOG_CURSOR_CONFLICT = "WATCHDOG_CURSOR_CONFLICT"
 WATCHDOG_SOURCE_INVALID = "WATCHDOG_SOURCE_INVALID"
 
-_ALLOWED_SOURCES = frozenset({"runtime", "candidate", "review", "hosted_check"})
+_ALLOWED_SOURCES = frozenset(
+    {"runtime", "candidate", "review", "hosted_check", "due"}
+)
 _CURSOR_PATTERN = re.compile(r"[1-9][0-9]{0,18}\Z")
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_CURSOR = 2**63 - 1
 _DUE_CLAIM_LEASE = timedelta(minutes=5)
 _PATH_TYPE = type(Path())
+_DUE_LOCK_REGISTRY: set[Path] = set()
+_DUE_LOCK_REGISTRY_LOCK = Lock()
 
 
 class CampaignWatchdogError(RuntimeError):
@@ -354,6 +361,8 @@ class CampaignWatchdog:
         self._event_sources = dict(event_sources)
         self._campaign_source = campaign_source
         self._advancer = advancer
+        self._claim_owner = str(os.getpid())
+        self._due_locks: dict[CampaignHandle, tuple[Path, BinaryIO]] = {}
 
         connection: sqlite3.Connection | None = None
         try:
@@ -370,6 +379,77 @@ class CampaignWatchdog:
         finally:
             if connection is not None:
                 connection.close()
+
+    def bind_advancer(self, advancer: WatchdogAdvancer) -> None:
+        if not callable(getattr(advancer, "advance", None)):
+            _fail(WATCHDOG_SOURCE_INVALID, "advancer does not expose advance(handle, wake_ref)")
+        self._advancer = advancer
+
+    def _due_lock_path(self, handle: CampaignHandle) -> Path:
+        lock_root = self._store_path.parent / f".{self._store_path.name}.due-locks"
+        lock_root.mkdir(parents=True, exist_ok=True)
+        digest = digest_value(
+            {
+                "repository": handle.repository,
+                "campaign_key": handle.campaign_key,
+            }
+        )
+        return lock_root / f"{digest}.lock"
+
+    def _try_acquire_due_lock(self, handle: CampaignHandle) -> bool:
+        existing = self._due_locks.get(handle)
+        if existing is not None:
+            return True
+        lock_path = self._due_lock_path(handle)
+        with _DUE_LOCK_REGISTRY_LOCK:
+            if lock_path in _DUE_LOCK_REGISTRY:
+                return False
+            lock_file: BinaryIO | None = None
+            try:
+                lock_file = lock_path.open("a+b")
+                lock_file.seek(0, 2)
+                if lock_file.tell() == 0:
+                    lock_file.write(b"0")
+                    lock_file.flush()
+                lock_file.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (OSError, BlockingIOError):
+                if lock_file is not None:
+                    lock_file.close()
+                return False
+            assert lock_file is not None
+            _DUE_LOCK_REGISTRY.add(lock_path)
+            self._due_locks[handle] = (lock_path, lock_file)
+            return True
+
+    def _release_due_lock(self, handle: CampaignHandle) -> None:
+        held = self._due_locks.pop(handle, None)
+        if held is None:
+            return
+        lock_path, lock_file = held
+        try:
+            lock_file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            lock_file.close()
+            with _DUE_LOCK_REGISTRY_LOCK:
+                _DUE_LOCK_REGISTRY.discard(lock_path)
 
     @staticmethod
     def _verify_schema(connection: sqlite3.Connection) -> None:
@@ -449,6 +529,18 @@ class CampaignWatchdog:
             if connection is not None:
                 connection.close()
 
+    def _pending_wake_is_current(self, expected: WatchdogWake) -> bool:
+        for wake in self._read_pending_wakes():
+            if wake.wake_ref != expected.wake_ref:
+                continue
+            if wake != expected:
+                _fail(
+                    WATCHDOG_STORE_INVALID,
+                    "pending Watchdog wake payload changed",
+                )
+            return True
+        return False
+
     def _ack_pending_wake(self, wake_ref: str) -> None:
         connection: sqlite3.Connection | None = None
         try:
@@ -469,19 +561,91 @@ class CampaignWatchdog:
             if connection is not None:
                 connection.close()
 
-    def _drain_pending_wakes(self, outcomes: list[CampaignOutcome]) -> None:
+    def _drain_pending_wakes(
+        self,
+        outcomes: list[CampaignOutcome],
+        *,
+        replayed_due_handles: set[CampaignHandle] | None = None,
+        dispatch_due_handles: set[CampaignHandle] | None = None,
+    ) -> None:
         for wake in self._read_pending_wakes():
-            outcome = self._advancer.advance(wake.campaign, wake.wake_ref)
-            self._ack_pending_wake(wake.wake_ref)
-            outcomes.append(outcome)
+            acquired_due_lock = False
+            if wake.source == "due":
+                if (
+                    dispatch_due_handles is not None
+                    and wake.campaign in dispatch_due_handles
+                ):
+                    acquired_due_lock = False
+                else:
+                    if not self._try_acquire_due_lock(wake.campaign):
+                        continue
+                    acquired_due_lock = True
+            try:
+                if wake.source == "due" and not self._pending_wake_is_current(wake):
+                    continue
+                outcome = self._advancer.advance(wake.campaign, wake.wake_ref)
+                self._ack_pending_wake(wake.wake_ref)
+                if wake.source == "due" and replayed_due_handles is not None:
+                    replayed_due_handles.add(wake.campaign)
+                outcomes.append(outcome)
+            finally:
+                if acquired_due_lock:
+                    self._release_due_lock(wake.campaign)
+
+    def _record_due_wake(self, wake: WatchdogWake) -> None:
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(self._store_path)
+            connection.execute(
+                "INSERT OR IGNORE INTO v8_watchdog_wakes "
+                "(wake_ref, stream, cursor, repository, campaign_key, source, source_identity) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    wake.wake_ref,
+                    "due",
+                    wake.cursor,
+                    wake.campaign.repository,
+                    wake.campaign.campaign_key,
+                    wake.source,
+                    wake.source_identity,
+                ),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO v8_watchdog_pending_wakes "
+                "(wake_ref, stream, cursor, repository, campaign_key, source, source_identity) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    wake.wake_ref,
+                    "due",
+                    wake.cursor,
+                    wake.campaign.repository,
+                    wake.campaign.campaign_key,
+                    wake.source,
+                    wake.source_identity,
+                ),
+            )
+            connection.commit()
+        except (OSError, sqlite3.Error) as error:
+            self._rollback(connection)
+            raise CampaignWatchdogError(
+                WATCHDOG_STORE_INVALID,
+                "due Watchdog wake could not be persisted",
+            ) from error
+        finally:
+            if connection is not None:
+                connection.close()
 
     def _claim_due_work(
         self,
         now: str,
+        *,
+        skip_handles: set[CampaignHandle] | None = None,
     ) -> tuple[tuple[CampaignHandle, str], ...]:
         now_at = datetime.fromisoformat(now)
         claimed_until = (now_at + _DUE_CLAIM_LEASE).isoformat()
         connection: sqlite3.Connection | None = None
+        acquired_here: set[CampaignHandle] = set()
+        transaction_succeeded = False
         try:
             connection = sqlite3.connect(self._store_path)
             connection.execute("BEGIN IMMEDIATE")
@@ -493,6 +657,14 @@ class CampaignWatchdog:
             ).fetchall()
             claims: list[tuple[CampaignHandle, str]] = []
             for repository, campaign_key, next_check_at in due:
+                handle = CampaignHandle(repository, campaign_key)
+                if skip_handles is not None and handle in skip_handles:
+                    continue
+                was_held = handle in self._due_locks
+                if not self._try_acquire_due_lock(handle):
+                    continue
+                if not was_held:
+                    acquired_here.add(handle)
                 _validate_utc_timestamp(
                     next_check_at,
                     "saved due timestamp",
@@ -515,9 +687,9 @@ class CampaignWatchdog:
                         "saved due claim expiry",
                         code=WATCHDOG_STORE_INVALID,
                     )
-                    if datetime.fromisoformat(existing[1]) > now_at:
+                    if datetime.fromisoformat(existing[1]) > now_at and was_held:
                         continue
-                claim_token = uuid.uuid4().hex
+                claim_token = f"{self._claim_owner}:{uuid.uuid4().hex}"
                 connection.execute(
                     "INSERT INTO v8_watchdog_due_claims "
                     "(repository, campaign_key, claim_token, claimed_until) "
@@ -526,8 +698,9 @@ class CampaignWatchdog:
                     "claim_token=excluded.claim_token, claimed_until=excluded.claimed_until",
                     (repository, campaign_key, claim_token, claimed_until),
                 )
-                claims.append((CampaignHandle(repository, campaign_key), claim_token))
+                claims.append((handle, claim_token))
             connection.commit()
+            transaction_succeeded = True
             return tuple(claims)
         except CampaignWatchdogError:
             self._rollback(connection)
@@ -539,8 +712,23 @@ class CampaignWatchdog:
                 "Watchdog due claims could not be acquired",
             ) from error
         finally:
-            if connection is not None:
-                connection.close()
+            active_error = sys.exc_info()[1]
+            close_error: BaseException | None = None
+            try:
+                if connection is not None:
+                    connection.close()
+            except BaseException as error:
+                close_error = error
+            finally:
+                if (
+                    not transaction_succeeded
+                    or active_error is not None
+                    or close_error is not None
+                ):
+                    for handle in acquired_here:
+                        self._release_due_lock(handle)
+            if close_error is not None and active_error is None:
+                raise close_error
 
     def _release_due_claim(self, handle: CampaignHandle, claim_token: str) -> None:
         connection: sqlite3.Connection | None = None
@@ -560,8 +748,11 @@ class CampaignWatchdog:
                 "Watchdog due claim could not be released",
             ) from error
         finally:
-            if connection is not None:
-                connection.close()
+            try:
+                if connection is not None:
+                    connection.close()
+            finally:
+                self._release_due_lock(handle)
 
     def _ack_due_claim(self, handle: CampaignHandle, claim_token: str) -> None:
         connection: sqlite3.Connection | None = None
@@ -594,8 +785,11 @@ class CampaignWatchdog:
                 "Watchdog due claim could not be acknowledged",
             ) from error
         finally:
-            if connection is not None:
-                connection.close()
+            try:
+                if connection is not None:
+                    connection.close()
+            finally:
+                self._release_due_lock(handle)
 
     @staticmethod
     def _rollback(connection: sqlite3.Connection | None) -> None:
@@ -710,7 +904,11 @@ class CampaignWatchdog:
     def run_once(self, now: str) -> tuple[CampaignOutcome, ...]:
         _validate_utc_timestamp(now, "now")
         outcomes: list[CampaignOutcome] = []
-        self._drain_pending_wakes(outcomes)
+        replayed_due_handles: set[CampaignHandle] = set()
+        self._drain_pending_wakes(
+            outcomes,
+            replayed_due_handles=replayed_due_handles,
+        )
         for stream, source in sorted(self._event_sources.items()):
             after_cursor = self.read_cursor(stream)
             page = self._read_page(source, after_cursor)
@@ -821,10 +1019,16 @@ class CampaignWatchdog:
                 if connection is not None:
                     connection.close()
 
-            self._drain_pending_wakes(outcomes)
+            self._drain_pending_wakes(
+                outcomes,
+                replayed_due_handles=replayed_due_handles,
+            )
 
         self.rebuild_due_queue()
-        due_claims = self._claim_due_work(now)
+        due_claims = self._claim_due_work(
+            now,
+            skip_handles=replayed_due_handles,
+        )
         advanced_due_work = False
         for handle, claim_token in due_claims:
             try:
@@ -839,7 +1043,19 @@ class CampaignWatchdog:
                 ):
                     self._release_due_claim(handle, claim_token)
                     continue
-                outcome = self._advancer.advance(handle, None)
+                assert before.next_check_at is not None
+                due_wake = WatchdogWake(
+                    "1",
+                    handle,
+                    "due",
+                    f"{handle.repository}:{handle.campaign_key}:{before.next_check_at}",
+                )
+                self._record_due_wake(due_wake)
+                self._drain_pending_wakes(
+                    outcomes,
+                    replayed_due_handles=replayed_due_handles,
+                    dispatch_due_handles={handle},
+                )
                 advanced_due_work = True
                 after = _validate_snapshot_for_handle(
                     handle,
@@ -852,7 +1068,6 @@ class CampaignWatchdog:
                     self._ack_due_claim(handle, claim_token)
                 else:
                     self._release_due_claim(handle, claim_token)
-                outcomes.append(outcome)
             except Exception:
                 self._release_due_claim(handle, claim_token)
                 raise

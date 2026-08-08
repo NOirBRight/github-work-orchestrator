@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from copy import deepcopy
 import json
 from pathlib import Path
+import sqlite3
+from typing import Sequence
+import sqlite3
 
 import pytest
 
@@ -16,6 +20,12 @@ from gwo_v8.batch_integrator import (
     HostedSuiteDefinition,
     LocalSuiteDefinition,
     MemberDeliveryObservation,
+)
+from gwo_v8.campaign_watchdog import (
+    CampaignWatchdog,
+    WatchdogCampaignSnapshot,
+    WatchdogWake,
+    WatchdogWakePage,
 )
 from gwo_v8.candidate_gate import (
     AcceptedCandidateReceipt,
@@ -46,15 +56,29 @@ from gwo_v8.execution_kernel import (
     WorkRunObservation,
     WorkRunSummary,
 )
-from gwo_v8.plan_control import ActivePlanReadback, CampaignHandle
+from gwo_v8.plan_control import (
+    ActivePlanReadback,
+    CampaignHandle,
+    InMemoryPlanRepository,
+    frozen_ticket_contract_digest,
+)
+from gwo_v8.plan_control_host import ProductionPlanControlStartHost, install_plan_control_start
+from gwo_v8.campaign_watchdog import (
+    CampaignWatchdog,
+    WatchdogCampaignSnapshot,
+    WatchdogWake,
+    WatchdogWakePage,
+)
 from gwo_v8.runtime_gateway import (
     CapabilityPolicy,
     CapabilityPolicyProof,
     PlanInvalidationReport,
     PlanInvalidationReceipt,
     ProfileMapping,
+    PlanningReceipt,
     RuntimeConfiguration,
     RuntimeGateway,
+    PlanningPreflightReceipt,
     RuntimeProgressReceipt,
     RuntimeRepositoryContext,
     WorkRunPurpose,
@@ -66,8 +90,22 @@ from gwo_v8.production_host import (
     ProductionGwoHost,
     ProductionHostConfiguration,
 )
-from gwo_v8.production_effects import ProductionWorkRunEffects
-from v8_successor_test_support import _StaticPlanReader, _minimal_active_campaign
+from gwo_v8.production_effects import (
+    BatchIntegratorPort,
+    CandidateGateParentSource,
+    CandidateGatePort,
+    CandidateReferenceReader,
+    ProductionWorkRunEffects,
+    RuntimeGatewayFactory,
+    RuntimeStaleReadbackPort,
+    WorkRunSubjectSource,
+)
+from v8_successor_test_support import (
+    _StaticPlanReader,
+    _minimal_active_campaign,
+    active_plan_spec,
+    three_ticket_source_snapshot,
+)
 
 
 def make_candidate_receipt(action: WorkRunAction) -> CandidateReceipt:
@@ -447,16 +485,89 @@ def make_kernel():
 class RecordingRuntimeGateway:
     receipt: RuntimeProgressReceipt | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
+    auto_complete: bool = False
+    artifacts: object | None = None
+
+    def planning_preflight(self, subject) -> PlanningPreflightReceipt:
+        return PlanningPreflightReceipt(
+            subject_digest=subject.digest,
+            stable_action_id=subject.stable_action_id,
+            receipt_digest=digest_value(
+                {
+                    "kind": "recording-runtime-preflight.v1",
+                    "stable_action_id": subject.stable_action_id,
+                }
+            ),
+        )
 
     def progress(
         self,
-        subject: WorkRunSubject,
+        subject,
+        preflight: PlanningPreflightReceipt | None = None,
         *,
-        wake_cursor: str | None,
+        wake_cursor: str | None = None,
     ) -> RuntimeProgressReceipt:
+        if preflight is not None:
+            if self.artifacts is None:
+                raise AssertionError("RecordingRuntimeGateway.artifacts must be configured")
+            payload = {
+                "admitted_work": ["issue:109"],
+                "dependency_additions": [],
+                "exclusive_resources": {"issue:109": []},
+                "capability_requirements": {
+                    "issue:109": ["git", "local_check"]
+                },
+                "decision_requirements": [],
+            }
+            output = self.artifacts.put_canonical(
+                {
+                    "schema_version": "gwo.runtime.output.v1",
+                    "subject_digest": subject.digest,
+                    "stable_action_id": subject.stable_action_id,
+                    "authority_digest": subject.authority_digest,
+                    "payload": payload,
+                }
+            )
+            return PlanningReceipt(
+                subject_digest=subject.digest,
+                stable_action_id=subject.stable_action_id,
+                status="completed",
+                receipt_digest=digest_value(
+                    {
+                        "kind": "recording-runtime-planning-receipt.v1",
+                        "stable_action_id": subject.stable_action_id,
+                    }
+                ),
+                output_artifact_digest=output.digest,
+                planning_output_artifact_digest=output.digest,
+            )
         self.calls.append(("progress", subject.stable_action_id))
         if self.receipt is None:
-            raise AssertionError("RecordingRuntimeGateway.receipt must be configured")
+            if not self.auto_complete:
+                raise AssertionError("RecordingRuntimeGateway.receipt must be configured")
+            receipt = RuntimeProgressReceipt(
+                subject_digest=subject.digest,
+                stable_action_id=subject.stable_action_id,
+                status="completed",
+                receipt_digest=digest_value(
+                    {
+                        "kind": "recording-runtime-receipt.v1",
+                        "stable_action_id": subject.stable_action_id,
+                    }
+                ),
+                output_artifact_digest=digest_value(
+                    {
+                        "kind": "recording-runtime-output.v1",
+                        "stable_action_id": subject.stable_action_id,
+                    }
+                ),
+            )
+            # The composition fixture's clock is intentionally independent of
+            # the host clock.  Give the accepted-candidate recovery path a
+            # deterministic due time that the E2E watchdog invocation can
+            # consume after a simulated lost callback.
+            object.__setattr__(receipt, "next_check_at", "2026-08-03T10:00:00+00:00")
+            return receipt
         return self.receipt
 
 
@@ -479,6 +590,7 @@ class RecordingRuntimeGatewayFactory:
         return self.gateway
 
     def build(self, **_kwargs: object) -> RecordingRuntimeGateway:
+        self.gateway.artifacts = _kwargs.get("artifacts")
         return self.gateway
 
 
@@ -503,11 +615,17 @@ class RecordingRuntimeStaleReadback:
 class RecordingSubjectSource:
     subject: WorkRunSubject | None = None
     calls: list[str] = field(default_factory=list)
+    auto_generate: bool = False
+    actions: dict[str, WorkRunAction] | None = None
 
     def for_action(self, action: WorkRunAction) -> WorkRunSubject:
         self.calls.append(action.stable_action_id)
+        if self.actions is not None:
+            self.actions[action.stable_action_id] = action
         if self.subject is None:
-            raise AssertionError("RecordingSubjectSource.subject must be configured")
+            if not self.auto_generate:
+                raise AssertionError("RecordingSubjectSource.subject must be configured")
+            return make_test_subject(action)
         if self.subject.stable_action_id == action.stable_action_id:
             return self.subject
         return replace(self.subject, stable_action_id=action.stable_action_id)
@@ -516,29 +634,43 @@ class RecordingSubjectSource:
 @dataclass
 class RecordingCandidateReferenceReader:
     reference: str | None = None
+    auto_generate: bool = False
     calls: list[str] = field(default_factory=list)
 
     def read(self, output_artifact_digest: str, *, subject: WorkRunSubject) -> str:
         self.calls.append(output_artifact_digest)
         if self.reference is None:
-            raise AssertionError(
-                "RecordingCandidateReferenceReader.reference must be configured"
-            )
+            if not self.auto_generate:
+                raise AssertionError(
+                    "RecordingCandidateReferenceReader.reference must be configured"
+                )
+            return "refs/heads/candidate"
         return self.reference
 
 
 @dataclass
 class RecordingCandidateParentSource:
     parent: CandidateGateParent | None = None
+    auto_generate: bool = False
+    actions: dict[str, WorkRunAction] | None = None
 
     def for_action(
         self,
         action: WorkRunAction,
         subject: WorkRunSubject,
     ) -> CandidateGateParent:
+        if self.actions is not None:
+            self.actions[action.stable_action_id] = action
         if self.parent is None:
-            raise AssertionError(
-                "RecordingCandidateParentSource.parent must be configured"
+            if not self.auto_generate:
+                raise AssertionError(
+                    "RecordingCandidateParentSource.parent must be configured"
+                )
+            return CandidateGateParent(
+                runtime_subject=subject,
+                ticket_contract_digest="c" * 64,
+                policy_witness_digest="d" * 64,
+                workspace_identity="workspace:production-composition",
             )
         if self.parent.runtime_subject == subject:
             return self.parent
@@ -553,11 +685,34 @@ class RecordingCandidateParentSource:
 class RecordingCandidateGate:
     result: CandidateGateResult | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
+    auto_accept: bool = False
+    actions: dict[str, WorkRunAction] | None = None
 
-    def _result(self, operation: str, stable_action_id: str) -> CandidateGateResult:
+    def _result(
+        self,
+        operation: str,
+        stable_action_id: str,
+        subject: WorkRunSubject | None = None,
+    ) -> CandidateGateResult:
         self.calls.append((stable_action_id, operation))
         if self.result is None:
-            raise AssertionError("RecordingCandidateGate.result must be configured")
+            if not self.auto_accept:
+                raise AssertionError("RecordingCandidateGate.result must be configured")
+            action = (self.actions or {}).get(stable_action_id) or WorkRunAction(
+                stable_action_id=stable_action_id,
+                repository=subject.repository if subject is not None else "owner/repository",
+                campaign_key=subject.campaign_key if subject is not None else "campaign:successor-kernel",
+                plan_revision_digest=subject.plan_revision_digest if subject is not None else "a" * 64,
+                ticket_key=subject.ticket_key if subject is not None else "issue:109",
+                kind="semantic_execution",
+                semantic_action_id=f"semantic:{subject.ticket_key}" if subject is not None else "semantic:109",
+                work_run_key=subject.work_run_key if subject is not None else "work-run:issue:109",
+                work_subject_digest=subject.digest if subject is not None else "b" * 64,
+                runtime_binding_id=None,
+                wake_ref=None,
+                accepted_candidate_receipt_digest=None,
+            )
+            return accepted_candidate_result(action)
         return self.result
 
     def gate_candidate(
@@ -565,7 +720,11 @@ class RecordingCandidateGate:
         parent: CandidateGateParent,
         reported_reference: str,
     ) -> CandidateGateResult:
-        return self._result("gate_candidate", parent.runtime_subject.stable_action_id)
+        return self._result(
+            "gate_candidate",
+            parent.runtime_subject.stable_action_id,
+            parent.runtime_subject,
+        )
 
     def verify_repair(
         self,
@@ -573,7 +732,11 @@ class RecordingCandidateGate:
         packet: RepairPacket,
         candidate: CandidateIdentity,
     ) -> CandidateGateResult:
-        return self._result("verify_repair", parent.runtime_subject.stable_action_id)
+        return self._result(
+            "verify_repair",
+            parent.runtime_subject.stable_action_id,
+            parent.runtime_subject,
+        )
 
     def replay_plan_invalidation(
         self,
@@ -584,6 +747,7 @@ class RecordingCandidateGate:
         return self._result(
             "replay_plan_invalidation",
             parent.runtime_subject.stable_action_id,
+            parent.runtime_subject,
         )
 
 
@@ -592,6 +756,7 @@ class RecordingBatchRequestSource:
     target_path: Path
     runtime_factory: RecordingRuntimeGatewayFactory
     request: BatchDeliveryRequest | None = None
+    auto_generate: bool = False
 
     def for_action(
         self,
@@ -600,7 +765,9 @@ class RecordingBatchRequestSource:
         accepted_candidates: tuple[AcceptedCandidateReceipt, ...],
     ) -> BatchDeliveryRequest:
         if self.request is None:
-            raise AssertionError("RecordingBatchRequestSource.request must be configured")
+            if not self.auto_generate:
+                raise AssertionError("RecordingBatchRequestSource.request must be configured")
+            return make_batch_delivery_request(action)
         return self.request
 
 
@@ -1795,3 +1962,861 @@ def make_reopened_137_host(root: Path) -> Reopened137HostFixture:
 @pytest.fixture
 def reopened_137_host(tmp_path: Path) -> Reopened137HostFixture:
     return make_reopened_137_host(tmp_path)
+
+
+# --- C2 Task 7 Child 7 composition support ---
+
+class RecordingCampaignSnapshotSource:
+    def canonical_ready_refs(
+        self,
+        repository: str,
+        ready_refs: Sequence[str],
+    ) -> tuple[str, ...]:
+        return tuple(sorted(set(ready_refs)))
+
+    def snapshot(
+        self,
+        repository: str,
+        ready_refs: Sequence[str],
+    ) -> dict[str, object]:
+        source = three_ticket_source_snapshot()
+        selected = set(ready_refs)
+        rebound_tickets = []
+        repository_identity = {
+            "full_name": repository,
+            "url": f"https://api.github.com/repos/{repository}",
+        }
+        for original in source["tickets"]:
+            if original["key"] not in selected:
+                continue
+            ticket = deepcopy(original)
+            ticket["contract"]["repository"] = deepcopy(repository_identity)
+            for blocker in ticket["native_blockers"]:
+                blocker["repository"] = deepcopy(repository_identity)
+                blocker["source"]["digest"] = digest_value(
+                    {
+                        "key": blocker["key"],
+                        "state": blocker["state"],
+                        "repository": repository_identity,
+                    }
+                )
+            ticket["source"]["digest"] = frozen_ticket_contract_digest(
+                key=ticket["key"],
+                contract=ticket["contract"],
+                labels=ticket["labels"],
+                native_blockers=ticket["native_blockers"],
+            )
+            rebound_tickets.append(ticket)
+        campaign_source = deepcopy(source["campaign_source"])
+        campaign_source["repository"] = repository
+        campaign_source["digest"] = digest_value(
+            {
+                key: campaign_source[key]
+                for key in (
+                    "repository",
+                    "input_ref",
+                    "resolved_commit_oid",
+                    "tree_oid",
+                )
+            }
+        )
+        return {
+            "repository": repository,
+            "target_branch": source["target_branch"],
+            "campaign_source": campaign_source,
+            "policy": source["policy"],
+            "tickets": rebound_tickets,
+        }
+
+
+class RecordingPlanControlRepository(InMemoryPlanRepository):
+    def __init__(self, *, repository: str) -> None:
+        self.repository = repository
+        super().__init__(writer_generation="writer:v6.1")
+
+
+@dataclass
+class RecordingWriterGenerationReader:
+    generation: str
+
+    def read(self) -> str:
+        return self.generation
+
+@dataclass
+class ForwardingWatchdogAdvancer:
+    host: ProductionGwoHost | None = None
+    calls: list[tuple[CampaignHandle, str | None]] = field(default_factory=list)
+
+    def advance(
+        self,
+        handle: CampaignHandle,
+        wake_ref: str | None = None,
+    ) -> CampaignOutcome:
+        if self.host is None:
+            raise AssertionError("watchdog advancer was used before host binding")
+        self.calls.append((handle, wake_ref))
+        return self.host.advance(handle, wake_ref)
+
+
+@dataclass
+class DeferredProductionCampaignSource:
+    host: ProductionGwoHost | None = None
+    handle: CampaignHandle | None = None
+
+    def active_campaigns(self) -> tuple[CampaignHandle, ...]:
+        if self.host is None or self.handle is None:
+            return ()
+        return (self.handle,)
+
+    def watchdog_snapshot(
+        self,
+        handle: CampaignHandle,
+    ) -> WatchdogCampaignSnapshot:
+        if self.host is None or self.handle != handle:
+            raise AssertionError("campaign source was used before host binding")
+        return self.host.watchdog_snapshot(handle)
+
+
+def make_recording_plan_control_start_host(
+    *,
+    root: Path,
+    runtime_factory: RecordingRuntimeGatewayFactory,
+) -> ProductionPlanControlStartHost:
+    source = RecordingCampaignSnapshotSource()
+    repository = RecordingPlanControlRepository(repository="owner/isolated-composition")
+    return install_plan_control_start(
+        source=source,
+        repository=repository,
+        runtime_configuration=runtime_factory.runtime_configuration,
+        repository_contexts=runtime_factory.repository_contexts,
+        gateway_store_path=root / "runtime-gateway.sqlite3",
+        artifact_root=root / "artifacts",
+        _gateway_builder=runtime_factory.build,
+    )
+
+@dataclass
+class RecordingWakeSource:
+    pages: list[WatchdogWakePage]
+    calls: list[str | None] = field(default_factory=list)
+
+    def read(self, after_cursor: str | None) -> WatchdogWakePage:
+        self.calls.append(after_cursor)
+        if self.pages:
+            return self.pages.pop(0)
+        return WatchdogWakePage((), after_cursor)
+
+
+@dataclass
+class ProductionCompositionHarness:
+    host: ProductionGwoHost
+    start_host: ProductionPlanControlStartHost
+    store_path: Path
+    effects: ProductionWorkRunEffects
+    kernel_configuration: ExecutionKernelConfiguration | None
+    host_configuration: ProductionHostConfiguration
+    watchdog_store_path: Path
+    watchdog: CampaignWatchdog
+    writer_generation_reader: WriterGenerationReader
+    repository: str
+    ready_refs: tuple[str, ...]
+    handle: CampaignHandle
+    target: Path
+    batch: RecordingBatchIntegrator
+    advance_calls: list[tuple[CampaignHandle, str | None]]
+    runtime_wake_source: RecordingWakeSource
+    hosted_check_source: RecordingWakeSource
+    watchdog_advancer: "ForwardingWatchdogAdvancer"
+    evidence_dir: Path
+    provider_command: str
+    crashes: "CrashController"
+
+    def publish_runtime_wake(self, cursor: str, stable_action_id: str) -> None:
+        self.runtime_wake_source.pages.append(
+            WatchdogWakePage(
+                events=(
+                    WatchdogWake(
+                        cursor=cursor,
+                        campaign=self.handle,
+                        source="runtime",
+                        source_identity=stable_action_id,
+                    ),
+                ),
+                next_cursor=cursor,
+            )
+        )
+
+    def advance_to_accepted_candidate(self) -> None:
+        self.batch.suppress_callbacks = True
+        try:
+            for wake_ref in ("runtime:initial", "runtime:completed"):
+                self.host.advance(self.handle, wake_ref)
+        except BatchCallbackSuppressed:
+            pass
+        phase = self.host.inspect(self.handle).work_runs[0].phase
+        if phase != "accepted_awaiting_delivery":
+            raise AssertionError(
+                "the deterministic composition fixture did not reach "
+                "accepted_awaiting_delivery"
+            )
+
+    def kill_before_batch_callback(self) -> None:
+        self.batch.suppress_callbacks = True
+
+    def arm_crash(self, point: str) -> None:
+        self.crashes.arm(point)
+
+    def effect_ledger_row_count(self) -> int:
+        return count_durable_effect_rows(self.effects._store_path)
+
+    def advance_to_batch_delivery(self) -> None:
+        self.advance_to_accepted_candidate()
+        self.batch.suppress_callbacks = False
+
+    def restart(self) -> "ProductionCompositionHarness":
+        return type(self).from_task7_dependencies(
+            target_path=self.target,
+            evidence_dir=self.evidence_dir,
+            provider_command=self.provider_command,
+            store_path=self.store_path,
+            watchdog_store_path=self.watchdog_store_path,
+            existing_handle=self.handle,
+            existing_start_host=self.start_host,
+        )
+
+    def install_arguments(self) -> dict[str, object]:
+        return {
+            "start_host": self.start_host,
+            "store_path": self.store_path,
+            "effects": self.effects,
+            "configuration": self.kernel_configuration,
+            "host_configuration": self.host_configuration,
+            "target_path": self.target,
+            "watchdog_store_path": self.watchdog_store_path,
+            "watchdog": self.watchdog,
+            "writer_generation_reader": self.writer_generation_reader,
+        }
+
+    @classmethod
+    def from_real_provider_environment(
+        cls,
+        *,
+        target_path: Path,
+        evidence_dir: Path,
+        provider_command: str,
+    ) -> "ProductionCompositionHarness":
+        target_path = target_path.resolve()
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        harness = cls.from_task7_dependencies(
+            target_path=target_path,
+            evidence_dir=evidence_dir,
+            provider_command=provider_command,
+        )
+        arguments = harness.install_arguments()
+        arguments["host_configuration"] = ProductionHostConfiguration(
+            target_isolation_root=target_path.parent,
+            writer_activation_enabled=False,
+        )
+        arguments["target_path"] = target_path
+        harness.host = ProductionGwoHost.install(**arguments)
+        return harness
+
+    @classmethod
+    def from_task7_dependencies(
+        cls,
+        *,
+        target_path: Path,
+        evidence_dir: Path,
+        provider_command: str,
+        store_path: Path | None = None,
+        watchdog_store_path: Path | None = None,
+        existing_handle: CampaignHandle | None = None,
+        existing_start_host: ProductionPlanControlStartHost | None = None,
+    ) -> "ProductionCompositionHarness":
+        target_path = target_path.resolve()
+        evidence_dir = evidence_dir.resolve()
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        resolved_store_path = store_path or evidence_dir / "execution-kernel.sqlite3"
+        resolved_watchdog_store_path = (
+            watchdog_store_path or evidence_dir / "campaign-watchdog.sqlite3"
+        )
+        runtime_wake_source = RecordingWakeSource([])
+        hosted_check_source = RecordingWakeSource([])
+        watchdog_advancer = ForwardingWatchdogAdvancer()
+        crashes = CrashController()
+        runtime_factory = RecordingRuntimeGatewayFactory(
+            store_path=evidence_dir / "runtime-gateway.sqlite3",
+            provider_command=provider_command,
+            repository_root=target_path,
+        )
+        runtime_factory.gateway.auto_complete = True
+        runtime_stale_readbacks = RecordingRuntimeStaleReadback()
+        action_book: dict[str, WorkRunAction] = {}
+        work_run_subjects = RecordingSubjectSource(
+            auto_generate=True,
+            actions=action_book,
+        )
+        candidate_references = RecordingCandidateReferenceReader(auto_generate=True)
+        candidate_parents = RecordingCandidateParentSource(
+            auto_generate=True,
+            actions=action_book,
+        )
+        candidate_gate = RecordingCandidateGate(
+            auto_accept=True,
+            actions=action_book,
+        )
+        batch = RecordingBatchIntegrator(
+            store_path=evidence_dir / "batch-integrator.sqlite3",
+            target_path=target_path,
+        )
+        effects = CrashInjectingProductionWorkRunEffects(
+            crash_controller=crashes,
+            store_path=evidence_dir / "production-effects.sqlite3",
+            runtime_gateways=runtime_factory,
+            runtime_stale_readbacks=runtime_stale_readbacks,
+            work_run_subjects=work_run_subjects,
+            candidate_references=candidate_references,
+            candidate_parents=candidate_parents,
+            candidate_gate=candidate_gate,
+            batch_requests=RecordingBatchRequestSource(
+                target_path=target_path,
+                runtime_factory=runtime_factory,
+                auto_generate=True,
+            ),
+            batch_integrator=CrashReadbackBatchIntegrator(batch, crashes),
+        )
+        start_host = existing_start_host or make_recording_plan_control_start_host(
+            root=evidence_dir,
+            runtime_factory=runtime_factory,
+        )
+        campaign_source = DeferredProductionCampaignSource()
+        writer_generation_reader = RecordingWriterGenerationReader("v6.1")
+        watchdog = CampaignWatchdog(
+            store_path=resolved_watchdog_store_path,
+            event_sources={
+                "runtime_gateway": runtime_wake_source,
+                "hosted_check": hosted_check_source,
+            },
+            campaign_source=campaign_source,
+            advancer=watchdog_advancer,
+        )
+        host_configuration = ProductionHostConfiguration(
+            target_isolation_root=target_path.parent,
+            writer_activation_enabled=False,
+        )
+        host = ProductionGwoHost.install(
+            start_host=start_host,
+            store_path=resolved_store_path,
+            effects=effects,
+            configuration=None,
+            host_configuration=host_configuration,
+            target_path=target_path,
+            watchdog_store_path=resolved_watchdog_store_path,
+            watchdog=watchdog,
+            writer_generation_reader=writer_generation_reader,
+        )
+        watchdog_advancer.host = host
+        advance_calls: list[tuple[CampaignHandle, str | None]] = []
+        public_advance = host.advance
+
+        def record_public_advance(
+            campaign_handle: CampaignHandle,
+            wake_ref: str | None = None,
+        ) -> CampaignOutcome:
+            advance_calls.append((campaign_handle, wake_ref))
+            return public_advance(campaign_handle, wake_ref)
+
+        host.advance = record_public_advance  # type: ignore[method-assign]
+        campaign_source.host = host
+        repository = "owner/isolated-composition"
+        ready_refs = ("issue:109",)
+        handle = existing_handle or host.start(repository, ready_refs)
+        campaign_source.handle = handle
+        return cls(
+            host=host,
+            start_host=start_host,
+            store_path=resolved_store_path,
+            effects=effects,
+            kernel_configuration=None,
+            host_configuration=host_configuration,
+            watchdog_store_path=resolved_watchdog_store_path,
+            watchdog=watchdog,
+            writer_generation_reader=writer_generation_reader,
+            repository=repository,
+            ready_refs=ready_refs,
+            handle=handle,
+            target=target_path,
+            batch=batch,
+            advance_calls=advance_calls,
+            runtime_wake_source=runtime_wake_source,
+            hosted_check_source=hosted_check_source,
+            watchdog_advancer=watchdog_advancer,
+            evidence_dir=evidence_dir,
+            provider_command=provider_command,
+            crashes=crashes,
+        )
+
+class CompositionCrash(RuntimeError):
+    def __init__(self, point: str) -> None:
+        super().__init__(f"injected production-composition crash: {point}")
+        self.point = point
+
+
+class BatchCallbackSuppressed(RuntimeError):
+    """Test-only interruption for a lost callback before Batch execution."""
+
+
+@dataclass
+class CrashController:
+    armed: set[str] = field(default_factory=set)
+
+    def arm(self, point: str) -> None:
+        if point not in {
+            "after_effect_ledger_write",
+            "after_batch_terminal_readback",
+        }:
+            raise AssertionError(f"unknown composition crash point: {point}")
+        self.armed.add(point)
+
+    def hit(self, point: str) -> None:
+        if point in self.armed:
+            self.armed.remove(point)
+            raise CompositionCrash(point)
+
+
+@dataclass
+class RecordingBatchIntegrator:
+    store_path: Path
+    target_path: Path
+    action: BatchDeliveryAction | None = None
+    observation: BatchDeliveryObservation | None = None
+    suppress_callbacks: bool = False
+
+    def __post_init__(self) -> None:
+        self.store_path = Path(self.store_path)
+        self.target_path = Path(self.target_path)
+        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.store_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS v8_recording_batch_terminal(
+                    stable_action_id TEXT PRIMARY KEY,
+                    action_json TEXT NOT NULL,
+                    observation_json TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS v8_recording_batch_counters(
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    prepare_calls INTEGER NOT NULL,
+                    execute_calls INTEGER NOT NULL,
+                    target_integration_calls INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO v8_recording_batch_counters(
+                    singleton, prepare_calls, execute_calls,
+                    target_integration_calls
+                ) VALUES (1, 0, 0, 0)
+                ON CONFLICT(singleton) DO NOTHING
+                """
+            )
+
+    def _action_json(self, action: BatchDeliveryAction) -> str:
+        return json.dumps(
+            {
+                "stable_action_id": action.stable_action_id,
+                "request_digest": action.request_digest,
+                "batch_id": action.batch_id,
+                "batch_sha": action.batch_sha,
+                "member_ticket_keys": list(action.member_ticket_keys),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def _observation_json(self, observation: BatchDeliveryObservation) -> str:
+        return json.dumps(
+            {
+                "stable_action_id": observation.stable_action_id,
+                "batch_id": observation.batch_id,
+                "batch_sha": observation.batch_sha,
+                "phase": observation.phase,
+                "reason": observation.reason,
+                "receipt_digest": observation.receipt_digest,
+                "retry_count": observation.retry_count,
+                "fallback_generation": observation.fallback_generation,
+                "members": [
+                    {
+                        "ticket_key": member.ticket_key,
+                        "work_run_key": member.work_run_key,
+                        "candidate_sha": member.candidate_sha,
+                        "status": member.status,
+                        "evidence_digests": list(member.evidence_digests),
+                        "resume_reason": member.resume_reason,
+                    }
+                    for member in observation.members
+                ],
+                "delivery_proofs": [
+                    proof.canonical() for proof in observation.delivery_proofs
+                ],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def _decode_observation(self, rendered: str) -> BatchDeliveryObservation:
+        value = json.loads(rendered)
+        expected = {
+            "stable_action_id",
+            "batch_id",
+            "batch_sha",
+            "phase",
+            "reason",
+            "receipt_digest",
+            "retry_count",
+            "fallback_generation",
+            "members",
+            "delivery_proofs",
+        }
+        if type(value) is not dict or set(value) != expected:
+            raise AssertionError("recording Batch observation fields changed")
+        members = tuple(
+            MemberDeliveryObservation(
+                ticket_key=item["ticket_key"],
+                work_run_key=item["work_run_key"],
+                candidate_sha=item["candidate_sha"],
+                status=item["status"],
+                evidence_digests=tuple(item["evidence_digests"]),
+                resume_reason=item["resume_reason"],
+            )
+            for item in value["members"]
+        )
+        delivery_proofs = tuple(
+            BatchDeliveryProof(
+                **{
+                    **item,
+                    "member_ticket_keys": tuple(item["member_ticket_keys"]),
+                }
+            )
+            for item in value["delivery_proofs"]
+        )
+        return BatchDeliveryObservation(
+            stable_action_id=value["stable_action_id"],
+            batch_id=value["batch_id"],
+            batch_sha=value["batch_sha"],
+            phase=value["phase"],
+            reason=value["reason"],
+            receipt_digest=value["receipt_digest"],
+            retry_count=value["retry_count"],
+            fallback_generation=value["fallback_generation"],
+            members=members,
+            delivery_proofs=delivery_proofs,
+        )
+
+    def _bump(self, column: str) -> None:
+        if column not in {
+            "prepare_calls",
+            "execute_calls",
+            "target_integration_calls",
+        }:
+            raise AssertionError(column)
+        with sqlite3.connect(self.store_path) as connection:
+            connection.execute(
+                f"UPDATE v8_recording_batch_counters "
+                f"SET {column} = {column} + 1 WHERE singleton = 1"
+            )
+
+    def _counter(self, column: str) -> int:
+        with sqlite3.connect(self.store_path) as connection:
+            row = connection.execute(
+                f"SELECT {column} FROM v8_recording_batch_counters "
+                "WHERE singleton = 1"
+            ).fetchone()
+        if row is None:
+            raise AssertionError("recording Batch counters disappeared")
+        return int(row[0])
+
+    @property
+    def prepare_calls(self) -> int:
+        return self._counter("prepare_calls")
+
+    @property
+    def execute_calls(self) -> int:
+        return self._counter("execute_calls")
+
+    @property
+    def target_integration_calls(self) -> int:
+        return self._counter("target_integration_calls")
+
+    @property
+    def persisted_observation(self) -> BatchDeliveryObservation | None:
+        if self.action is None:
+            return None
+        return self.readback(self.action)
+
+    def prepare(self, request: BatchDeliveryRequest) -> BatchDeliveryAction:
+        self._bump("prepare_calls")
+        if not request.accepted_candidates:
+            raise AssertionError("recording Batch requires an accepted Candidate")
+        expected_action = self.action or BatchDeliveryAction(
+            stable_action_id=request.stable_action_id,
+            request_digest=request.request_digest,
+            batch_id=digest_value(
+                {
+                    "kind": "recording-batch.v1",
+                    "request_digest": request.request_digest,
+                }
+            ),
+            batch_sha=request.accepted_candidates[-1].candidate_sha,
+            member_ticket_keys=tuple(
+                item.ticket_key for item in request.accepted_candidates
+            ),
+        )
+        if (
+            expected_action.stable_action_id != request.stable_action_id
+            or expected_action.request_digest != request.request_digest
+            or expected_action.member_ticket_keys
+            != tuple(item.ticket_key for item in request.accepted_candidates)
+        ):
+            raise AssertionError("recording Batch action identity changed")
+        self.action = expected_action
+        if self.observation is not None:
+            if (
+                self.observation.stable_action_id != expected_action.stable_action_id
+                or self.observation.batch_id != expected_action.batch_id
+                or self.observation.batch_sha != expected_action.batch_sha
+                or tuple(
+                    member.ticket_key for member in self.observation.members
+                )
+                != expected_action.member_ticket_keys
+            ):
+                raise AssertionError("recording Batch observation identity changed")
+            return expected_action
+        members = tuple(
+            MemberDeliveryObservation(
+                ticket_key=item.ticket_key,
+                work_run_key=item.work_run_key,
+                candidate_sha=item.candidate_sha,
+                status="integrated",
+                evidence_digests=tuple(sorted(item.evidence_digests)),
+                resume_reason=None,
+            )
+            for item in request.accepted_candidates
+        )
+        delivery_proof = BatchDeliveryProof.create(
+            delivery_stable_action_id=expected_action.stable_action_id,
+            delivery_request_digest=expected_action.request_digest,
+            batch_id=expected_action.batch_id,
+            batch_sha=expected_action.batch_sha,
+            member_ticket_keys=expected_action.member_ticket_keys,
+            local_check_receipt_digest=digest_value(
+                {"kind": "recording-local-check.v1", "batch_sha": expected_action.batch_sha}
+            ),
+            publication_receipt_digest=digest_value(
+                {"kind": "recording-publication.v1", "batch_sha": expected_action.batch_sha}
+            ),
+            pull_request_number=1,
+            pull_request_head_sha=expected_action.batch_sha,
+            hosted_result_receipt_digest=digest_value(
+                {"kind": "recording-hosted-result.v1", "batch_sha": expected_action.batch_sha}
+            ),
+            integration_lease_digest=digest_value(
+                {"kind": "recording-integration-lease.v1", "batch_sha": expected_action.batch_sha}
+            ),
+            target_branch=request.target.target_branch,
+            target_head_sha=expected_action.batch_sha,
+            target_readback_digest=digest_value(
+                {"kind": "recording-target-readback.v1", "batch_sha": expected_action.batch_sha}
+            ),
+            target_contains_batch_sha=True,
+            pull_request_merge_target_sha=expected_action.batch_sha,
+            merge_method="merge",
+        )
+        receipt_body = {
+            "stable_action_id": expected_action.stable_action_id,
+            "batch_id": expected_action.batch_id,
+            "batch_sha": expected_action.batch_sha,
+            "phase": "complete",
+            "reason": "exact isolated target read-back",
+            "retry_count": 0,
+            "fallback_generation": 0,
+            "members": [
+                {
+                    "ticket_key": member.ticket_key,
+                    "work_run_key": member.work_run_key,
+                    "candidate_sha": member.candidate_sha,
+                    "status": member.status,
+                    "evidence_digests": list(member.evidence_digests),
+                    "resume_reason": member.resume_reason,
+                }
+                for member in members
+            ],
+            "delivery_proofs": [delivery_proof.canonical()],
+        }
+        receipt_digest = digest_value(
+            {"kind": "batch-observation.v1", **receipt_body}
+        )
+        expected_observation = BatchDeliveryObservation(
+            stable_action_id=expected_action.stable_action_id,
+            batch_id=expected_action.batch_id,
+            batch_sha=expected_action.batch_sha,
+            phase="complete",
+            reason="exact isolated target read-back",
+            receipt_digest=receipt_digest,
+            retry_count=0,
+            fallback_generation=0,
+            members=members,
+            delivery_proofs=(delivery_proof,),
+        )
+        self.observation = expected_observation
+        return expected_action
+
+    def readback(
+        self,
+        action: BatchDeliveryAction,
+    ) -> BatchDeliveryObservation | None:
+        with sqlite3.connect(self.store_path) as connection:
+            row = connection.execute(
+                """
+                SELECT action_json, observation_json
+                  FROM v8_recording_batch_terminal
+                 WHERE stable_action_id = ?
+                """,
+                (action.stable_action_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row[0] != self._action_json(action):
+            raise AssertionError("recording Batch durable action changed")
+        observation = self._decode_observation(row[1])
+        if (
+            observation.stable_action_id != action.stable_action_id
+            or observation.batch_id != action.batch_id
+            or observation.batch_sha != action.batch_sha
+            or observation.phase not in {"complete", "decision", "blocked"}
+        ):
+            raise AssertionError("recording Batch terminal readback changed")
+        return observation
+
+    def execute(self, action: BatchDeliveryAction) -> BatchDeliveryObservation:
+        persisted = self.readback(action)
+        if persisted is not None:
+            return persisted
+        if self.action != action or self.observation is None:
+            raise AssertionError("prepare must configure the recording Batch")
+        self._bump("execute_calls")
+        self._bump("target_integration_calls")
+        with sqlite3.connect(self.store_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO v8_recording_batch_terminal(
+                    stable_action_id, action_json, observation_json
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(stable_action_id) DO NOTHING
+                """,
+                (
+                    action.stable_action_id,
+                    self._action_json(action),
+                    self._observation_json(self.observation),
+                ),
+            )
+        saved = self.readback(action)
+        if saved != self.observation:
+            raise AssertionError("recording Batch exact readback differs from execute")
+        return saved
+
+
+@dataclass
+class CrashReadbackBatchIntegrator:
+    inner: RecordingBatchIntegrator
+    crashes: CrashController
+
+    def prepare(self, request: BatchDeliveryRequest) -> BatchDeliveryAction:
+        if self.inner.suppress_callbacks:
+            raise BatchCallbackSuppressed()
+        return self.inner.prepare(request)
+
+    def readback(
+        self,
+        action: BatchDeliveryAction,
+    ) -> BatchDeliveryObservation | None:
+        observation = self.inner.readback(action)
+        if observation is not None and observation.phase in {
+            "complete",
+            "decision",
+            "blocked",
+        }:
+            self.crashes.hit("after_batch_terminal_readback")
+        return observation
+
+    def execute(self, action: BatchDeliveryAction) -> BatchDeliveryObservation:
+        return self.inner.execute(action)
+
+
+class CrashInjectingProductionWorkRunEffects(ProductionWorkRunEffects):
+    def __init__(
+        self,
+        *,
+        crash_controller: CrashController,
+        store_path: Path,
+        runtime_gateways: RuntimeGatewayFactory,
+        runtime_stale_readbacks: RuntimeStaleReadbackPort,
+        work_run_subjects: WorkRunSubjectSource,
+        candidate_references: CandidateReferenceReader,
+        candidate_parents: CandidateGateParentSource,
+        candidate_gate: CandidateGatePort,
+        batch_requests: BatchRequestSource,
+        batch_integrator: BatchIntegratorPort,
+    ) -> None:
+        self._crash_controller = crash_controller
+        super().__init__(
+            store_path=store_path,
+            runtime_gateways=runtime_gateways,
+            runtime_stale_readbacks=runtime_stale_readbacks,
+            work_run_subjects=work_run_subjects,
+            candidate_references=candidate_references,
+            candidate_parents=candidate_parents,
+            candidate_gate=candidate_gate,
+            batch_requests=batch_requests,
+            batch_integrator=batch_integrator,
+        )
+
+    def _record(
+        self,
+        action: WorkRunAction,
+        observation: WorkRunEffectObservation,
+        *,
+        accepted_candidate: AcceptedCandidateReceipt | None = None,
+    ) -> WorkRunEffectObservation:
+        saved = super()._record(
+            action,
+            observation,
+            accepted_candidate=accepted_candidate,
+        )
+        self._crash_controller.hit("after_effect_ledger_write")
+        return saved
+
+
+def count_durable_effect_rows(store_path: Path) -> int:
+    with sqlite3.connect(store_path) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM v8_production_effect_receipts"
+        ).fetchone()
+    if row is None:
+        raise AssertionError("effect-ledger count readback disappeared")
+    return int(row[0])
+
+@pytest.fixture
+def composition_harness(tmp_path: Path) -> ProductionCompositionHarness:
+    target = tmp_path / "isolated-target"
+    target.mkdir(parents=True, exist_ok=False)
+    evidence_dir = tmp_path / "composition-evidence"
+    return ProductionCompositionHarness.from_task7_dependencies(
+        target_path=target,
+        evidence_dir=evidence_dir,
+        provider_command="recording-provider --no-dispatch",
+    )
