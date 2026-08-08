@@ -4,15 +4,16 @@
 
 - Schema: `gwo-v8-batch-beta2-evidence.v1`.
 - Mode: `Local Verification Only`.
-- Subject:
+
+## Publication Subject
 
 ```json
 {
   "parents": [
-    "0fc8bde8ecc433452fc07b24bb0f34a4465d9449"
+    "514f1162fe563f27edd35b4d6683df2786b7dcc0"
   ],
-  "sha": "c802171cb0262c32906c49e86403ec3567804a02",
-  "tree": "c02c8134c5bea36b9bc2cc7503595b8a5102308e"
+  "sha": "bcc7e719ecd5176f29d496e7ec6d7c3819c96439",
+  "tree": "81dca3a6296aa02182141975ae3d402ebd16c7ff"
 }
 ```
 
@@ -28,9 +29,9 @@
 
 | Suite | Command | Command digest | Log digest | Manifest digest | Tests | Failures | Errors | Skipped |
 | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |
-| BatchIntegrator | `py -3.13 -m pytest tests/test_v8_batch_integrator.py -q` | `62ea428936895106685235430893a4afc88a14ec43c923fab4386b60bc82078d` | `a3d85ac900607d9d52c9338ef31b4f51206e35310840d464563f5bf2f930e078` | `bd6b4117c9898429555bc67389aa603ebd4dadf66587bb646086d24184b499e9` | 47 | 0 | 0 | 0 |
-| Batch recovery | `py -3.13 -m pytest tests/test_v8_batch_recovery.py -q` | `1ecb90d072f65f7177a38d10a8b17d3d9beb6bf7f879241af3969e60d00a69e1` | `99c5e5a7fe37cd3a5c150db5547bbe4cb62d8b7be1fbcc5d79a3537c8099163b` | `bd6b4117c9898429555bc67389aa603ebd4dadf66587bb646086d24184b499e9` | 23 | 0 | 0 | 0 |
-| Beta2 boundary | `py -3.13 -m pytest tests/test_v8_batch_beta2.py -q` | `25a3dc3161d79784912b80f18f034167722ed42d921f668afb67a7779e64b98a` | `9ffee060e40ec0ebff4bce48515594b9bc3636c1debc984562d6567f6deb4341` | `bd6b4117c9898429555bc67389aa603ebd4dadf66587bb646086d24184b499e9` | 14 | 0 | 0 | 0 |
+| BatchIntegrator | `py -3.13 -m pytest tests/test_v8_batch_integrator.py -q` | `62ea428936895106685235430893a4afc88a14ec43c923fab4386b60bc82078d` | `6ebe437b685c2ef0e5789e283c099e2fac6ae994ba2116824fad3bdb20579136` | `844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e` | 47 | 0 | 0 | 0 |
+| Batch recovery | `py -3.13 -m pytest tests/test_v8_batch_recovery.py -q` | `1ecb90d072f65f7177a38d10a8b17d3d9beb6bf7f879241af3969e60d00a69e1` | `8458e8a4ea2bff24fcb7f779f25c7730c4304d221531743d7f8ea5f951f37563` | `844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e` | 23 | 0 | 0 | 0 |
+| Beta2 boundary | `py -3.13 -m pytest tests/test_v8_batch_beta2.py -q` | `25a3dc3161d79784912b80f18f034167722ed42d921f668afb67a7779e64b98a` | `bb44becf96252a393eea1874b5078150423a5b2f1e65cf9e24266ea72585a7f8` | `844592e931e55bb672fbdd07edfb21450130725d6f17b9d963b3c0947392ff1e` | 21 | 0 | 0 | 0 |
 - `py -3.13 scripts/quick_validate.py`: exit 0.
 - `py -3.13 scripts/sync_orchestrator.py`: exit 0.
 - `py -3.13 scripts/sync_orchestrator.py --check`: exit 0.

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import copy
 import json
+import os
 import subprocess
 import sys
 
@@ -29,6 +30,52 @@ def _document_readbacks() -> dict[str, object]:
     fenced = document.split("## Exact Git, CI, Target, Recovery, and Receipt Readbacks", 1)[1]
     payload = fenced.split("```json\n", 1)[1].split("\n```", 1)[0]
     return json.loads(payload)
+
+
+PUBLICATION_SUBJECT = {
+    "parents": ["514f1162fe563f27edd35b4d6683df2786b7dcc0"],
+    "sha": "bcc7e719ecd5176f29d496e7ec6d7c3819c96439",
+    "tree": "81dca3a6296aa02182141975ae3d402ebd16c7ff",
+}
+
+
+def _document_with_publication_subject(subject: dict[str, object]) -> str:
+    document = (ROOT / "docs" / "e2e" / "gwo-v8-batch-integrator.md").read_text(
+        encoding="utf-8"
+    )
+    prefix, merged_results = document.split("## Merged Results", 1)
+    title = prefix.split("## Verification Boundary", 1)[0]
+    return (
+        title
+        + "## Verification Boundary\n\n"
+        + "- Schema: `gwo-v8-batch-beta2-evidence.v1`.\n"
+        + "- Mode: `Local Verification Only`.\n\n"
+        + "## Publication Subject\n\n"
+        + "```json\n"
+        + json.dumps(subject, indent=2, sort_keys=True)
+        + "\n```\n\n"
+        + "## Merged Results"
+        + merged_results
+    )
+
+
+def _run_evidence_check(document: Path) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["GWO_BATCH_EVIDENCE_WRITING"] = "1"
+    return subprocess.run(
+        [
+            "py",
+            "-3.13",
+            "scripts/write_v8_batch_evidence.py",
+            "--check",
+            "--output",
+            str(document),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
 
 
 def test_beta2_evidence_schema_rejects_unknown_readback_keys():
@@ -118,6 +165,72 @@ def test_beta2_check_rejects_tampered_readback_input(tmp_path):
         token in (completed.stderr + completed.stdout)
         for token in ("Batch SHA", "batch", "standard")
     )
+
+
+def test_beta2_check_accepts_historical_sources_with_explicit_publication_subject(
+    tmp_path,
+):
+    canonical = tmp_path / "canonical.md"
+    canonical.write_text(
+        _document_with_publication_subject(PUBLICATION_SUBJECT), encoding="utf-8"
+    )
+
+    completed = _run_evidence_check(canonical)
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_beta2_legacy_renderer_keeps_the_original_subject_section():
+    from write_v8_batch_evidence import _render
+
+    rendered = _render({}, PUBLICATION_SUBJECT, {}, [], {})
+
+    assert "\n- Subject:\n" in rendered
+    assert "## Publication Subject" not in rendered
+
+
+def test_beta2_publication_subject_null_is_rejected(tmp_path):
+    from write_v8_batch_evidence import _document_publication_subject
+
+    canonical = tmp_path / "malformed.md"
+    canonical.write_text(
+        "## Publication Subject\n\n```json\nnull\n```\n\n"
+        "## Merged Results\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="valid publication subject"):
+        _document_publication_subject(canonical)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "sha", "tree", "parents"])
+def test_beta2_check_rejects_missing_or_tampered_publication_subject(
+    tmp_path, mutation
+):
+    subject = copy.deepcopy(PUBLICATION_SUBJECT)
+    canonical = _document_with_publication_subject(subject)
+    if mutation == "missing":
+        publication = (
+            "## Publication Subject\n\n```json\n"
+            + json.dumps(subject, indent=2, sort_keys=True)
+            + "\n```\n\n"
+        )
+        canonical = canonical.replace(publication, "")
+    elif mutation == "sha":
+        subject["sha"] = "c802171cb0262c32906c49e86403ec3567804a02"
+        canonical = _document_with_publication_subject(subject)
+    elif mutation == "tree":
+        subject["tree"] = "0" * 40
+        canonical = _document_with_publication_subject(subject)
+    else:
+        subject["parents"] = []
+        canonical = _document_with_publication_subject(subject)
+    path = tmp_path / f"{mutation}.md"
+    path.write_text(canonical, encoding="utf-8")
+
+    completed = _run_evidence_check(path)
+
+    assert completed.returncode != 0
 
 
 def test_beta2_evidence_check_is_self_contained_without_arguments():
