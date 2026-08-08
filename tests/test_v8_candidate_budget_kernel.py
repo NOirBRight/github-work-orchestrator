@@ -120,6 +120,7 @@ def candidate_sequence_kernel(tmp_path):
     kernel.advance(campaign)
 
     def run_sequence(candidate_oids: tuple[str, ...]):
+        _, work = kernel._authoritative_active(campaign)
         state = read_kernel_state(kernel, campaign)
         run = state["runs"][ticket_key]
         state["effects"] = {}
@@ -157,6 +158,7 @@ def candidate_sequence_kernel(tmp_path):
             kernel._perform_due_effect(
                 active,
                 state,
+                work,
                 ticket_key,
                 wake_ref=f"candidate-sequence:{ordinal}",
             )

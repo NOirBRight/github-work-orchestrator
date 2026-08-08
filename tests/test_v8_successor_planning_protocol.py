@@ -12,6 +12,21 @@ sys.path.insert(0, str(SCRIPTS))
 pytest_plugins = ("v8_successor_test_support",)
 
 
+def _expected_completed_result(effects, ticket_key: str):
+    from v8_production_test_support import make_completed_observation
+
+    action = next(
+        action
+        for action in effects.executed
+        if action.kind == "batch_delivery" and action.ticket_key == ticket_key
+    )
+    observation = make_completed_observation(
+        action,
+        evidence_digests=("8" * 64,),
+    )
+    return observation.result_digest, observation.evidence_digests
+
+
 def test_successor_schema_requires_closed_resource_additions():
     from gwo_v8.planning_protocol import replanning_output_payload_schema
 
@@ -386,8 +401,7 @@ def test_public_successor_fixture_installs_exported_start_advance_and_inspect(
     assert outcome.status == diagnostics.status
     assert runs["issue:108"].phase == "completed"
     assert public_successor.effects.completed_results["issue:108"] == (
-        "7" * 64,
-        ("8" * 64,),
+        _expected_completed_result(public_successor.effects, "issue:108")
     )
     assert public_successor.effects.candidate_identities["issue:109"] == (
         "candidate:r0:109"
@@ -421,8 +435,7 @@ def test_public_successor_reinstall_recomposes_host_and_exported_kernel(
     diagnostics = gwo_v8.inspect(public_successor.handle)
     runs = {run.ticket_key: run for run in diagnostics.work_runs}
     assert public_successor.effects.completed_results["issue:108"] == (
-        "7" * 64,
-        ("8" * 64,),
+        _expected_completed_result(public_successor.effects, "issue:108")
     )
     assert public_successor.effects.candidate_identities["issue:109"] == (
         "candidate:r0:109"
