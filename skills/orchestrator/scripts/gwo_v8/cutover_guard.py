@@ -720,6 +720,286 @@ class CutoverGuardError(RuntimeError):
         self.detail = detail
 
 
+_READ_ERROR_CODES = {
+    "legacy": "CUTOVER_LEGACY_READBACK_INVALID",
+    "durable_state": "CUTOVER_DURABLE_STATE_READBACK_INVALID",
+    "writer_fence": "CUTOVER_WRITER_FENCE_READBACK_INVALID",
+    "ownership": "CUTOVER_OWNERSHIP_READBACK_INVALID",
+    "compatibility": "CUTOVER_COMPATIBILITY_READBACK_INVALID",
+    "runtime": "CUTOVER_RUNTIME_READBACK_INVALID",
+    "packages": "CUTOVER_PACKAGES_READBACK_INVALID",
+}
+_READBACK_TYPES = {
+    "legacy": LegacyReadback,
+    "durable_state": DurableStateReadback,
+    "writer_fence": WriterFenceReadback,
+    "ownership": OwnershipReadback,
+    "compatibility": CompatibilityPathReadback,
+    "runtime": RuntimePreflightReadback,
+    "packages": PackageReadback,
+}
+_READBACK_FIELDS = {
+    "legacy": {
+        "repository",
+        "writer_generation",
+        "authority_state",
+        "active_dispatches",
+        "active_workers",
+        "integration_lease_owner",
+        "v2_execution_refs",
+        "v2_execution_state",
+        "original_decoder_readable",
+        "durable_state_digest",
+        "readback_digest",
+    },
+    "durable_state": {
+        "repository",
+        "generation_id",
+        "state_schema",
+        "compatible",
+        "active_plan_digests",
+        "pending_activation_ids",
+        "predecessor_identity_refs",
+        "readback_digest",
+    },
+    "writer_fence": {
+        "repository",
+        "writer_generation",
+        "authority_state",
+        "record_id",
+        "activation_id",
+        "control_ref_digest",
+        "readback_digest",
+    },
+    "ownership": {
+        "repository",
+        "active_admissions",
+        "active_attempts",
+        "integration_lease_owner",
+        "runtime_resource_refs",
+        "readback_digest",
+    },
+    "compatibility": {
+        "repository",
+        "source_commit",
+        "source_tree_digest",
+        "audit_version",
+        "reachable_v2_projection_refs",
+        "reachable_v3_compatibility_refs",
+        "reachable_legacy_writer_refs",
+        "proven_unreachable_refs",
+        "readback_digest",
+    },
+    "runtime": {
+        "repository",
+        "selectors",
+        "configuration_digest",
+        "provider_action_refs",
+        "persistence_write_refs",
+        "readback_digest",
+    },
+    "packages": {
+        "source_packages",
+        "installed_packages",
+        "drift",
+        "readback_digest",
+    },
+}
+_VALID_LEGACY_AUTHORITY_STATES = {
+    "active",
+    "authoritative_quiescent",
+    "stopped",
+}
+_VALID_V2_EXECUTION_STATES = {
+    "none",
+    "running",
+    "terminal",
+    "quiescent_read_only",
+}
+_VALID_WRITER_AUTHORITY_STATES = {"authoritative", "draining", "cut_over"}
+_VALID_RUNTIME_CONFIGURATION_SOURCES = {
+    "campaign_start",
+    "repository",
+    "host_global",
+}
+
+
+def _validate_readback_fields(name: str, value: object) -> None:
+    if type(value) is not _READBACK_TYPES[name]:
+        raise TypeError(f"{name} readback has the wrong exact type")
+
+    if name == "legacy":
+        _text_fields(
+            value,
+            LegacyReadback,
+            (
+                "repository",
+                "writer_generation",
+                "authority_state",
+                "v2_execution_state",
+                "durable_state_digest",
+                "readback_digest",
+            ),
+        )
+        _tuple_fields(value, LegacyReadback, ("active_dispatches", "active_workers", "v2_execution_refs"))
+        _optional_text_field(value, LegacyReadback, "integration_lease_owner")
+        _exact_type(value.original_decoder_readable, bool, "original_decoder_readable")
+        if value.authority_state not in _VALID_LEGACY_AUTHORITY_STATES:
+            raise ValueError("legacy authority state is invalid")
+        if value.v2_execution_state not in _VALID_V2_EXECUTION_STATES:
+            raise ValueError("legacy V2 execution state is invalid")
+        if not _valid_guard_digest(value.durable_state_digest):
+            raise ValueError("legacy durable state digest is invalid")
+        return
+
+    if name == "durable_state":
+        _text_fields(
+            value,
+            DurableStateReadback,
+            ("repository", "generation_id", "state_schema", "readback_digest"),
+        )
+        _tuple_fields(
+            value,
+            DurableStateReadback,
+            ("active_plan_digests", "pending_activation_ids", "predecessor_identity_refs"),
+        )
+        _exact_type(value.compatible, bool, "compatible")
+        return
+
+    if name == "writer_fence":
+        _text_fields(
+            value,
+            WriterFenceReadback,
+            (
+                "repository",
+                "writer_generation",
+                "authority_state",
+                "record_id",
+                "control_ref_digest",
+                "readback_digest",
+            ),
+        )
+        _optional_text_field(value, WriterFenceReadback, "activation_id")
+        if value.authority_state not in _VALID_WRITER_AUTHORITY_STATES:
+            raise ValueError("writer authority state is invalid")
+        if not _valid_guard_digest(value.control_ref_digest):
+            raise ValueError("writer control reference digest is invalid")
+        return
+
+    if name == "ownership":
+        _text_fields(value, OwnershipReadback, ("repository", "readback_digest"))
+        _tuple_fields(
+            value,
+            OwnershipReadback,
+            ("active_admissions", "active_attempts", "runtime_resource_refs"),
+        )
+        _optional_text_field(value, OwnershipReadback, "integration_lease_owner")
+        return
+
+    if name == "compatibility":
+        _text_fields(
+            value,
+            CompatibilityPathReadback,
+            (
+                "repository",
+                "source_commit",
+                "source_tree_digest",
+                "audit_version",
+                "readback_digest",
+            ),
+        )
+        _tuple_fields(
+            value,
+            CompatibilityPathReadback,
+            (
+                "reachable_v2_projection_refs",
+                "reachable_v3_compatibility_refs",
+                "reachable_legacy_writer_refs",
+                "proven_unreachable_refs",
+            ),
+        )
+        return
+
+    if name == "runtime":
+        _text_fields(
+            value,
+            RuntimePreflightReadback,
+            ("repository", "configuration_digest", "readback_digest"),
+        )
+        if type(value.selectors) is not tuple or any(
+            type(item) is not RuntimeSelectorReadback for item in value.selectors
+        ):
+            raise TypeError("runtime selectors must be an exact tuple of readbacks")
+        _tuple_fields(
+            value,
+            RuntimePreflightReadback,
+            ("provider_action_refs", "persistence_write_refs"),
+        )
+        if not _valid_guard_digest(value.configuration_digest):
+            raise ValueError("runtime configuration digest is invalid")
+        for selector in value.selectors:
+            _text_fields(
+                selector,
+                RuntimeSelectorReadback,
+                ("selector", "profile_digest", "configuration_source"),
+            )
+            _optional_text_field(selector, RuntimeSelectorReadback, "fallback_profile_digest")
+            if selector.configuration_source not in _VALID_RUNTIME_CONFIGURATION_SOURCES:
+                raise ValueError("runtime configuration source is invalid")
+            if not _valid_guard_digest(selector.profile_digest):
+                raise ValueError("runtime selector profile digest is invalid")
+            if selector.fallback_profile_digest is not None and not _valid_guard_digest(
+                selector.fallback_profile_digest
+            ):
+                raise ValueError("runtime selector fallback profile digest is invalid")
+        return
+
+    if name == "packages":
+        if type(value.source_packages) is not tuple or any(
+            type(item) is not PackageIdentity for item in value.source_packages
+        ):
+            raise TypeError("source packages must be an exact tuple of identities")
+        if type(value.installed_packages) is not tuple or any(
+            type(item) is not PackageIdentity for item in value.installed_packages
+        ):
+            raise TypeError("installed packages must be an exact tuple of identities")
+        _tuple_fields(value, PackageReadback, ("drift",))
+        for package in value.source_packages + value.installed_packages:
+            _text_fields(
+                package,
+                PackageIdentity,
+                (
+                    "package_name",
+                    "version",
+                    "content_digest",
+                    "manifest_content_digest",
+                ),
+            )
+            _optional_text_field(package, PackageIdentity, "install_surface")
+            if not _valid_guard_digest(package.content_digest):
+                raise ValueError("package content digest is invalid")
+            if not _valid_guard_digest(package.manifest_content_digest):
+                raise ValueError("package manifest digest is invalid")
+        return
+
+    raise ValueError(f"unknown readback {name}")
+
+
+def _validate_typed_readback(name: str, value: object) -> None:
+    _validate_readback_fields(name, value)
+    canonical = value.canonical()
+    if type(canonical) is not dict or set(canonical) != _READBACK_FIELDS[name]:
+        raise ValueError(f"{name} canonical projection has the wrong closed shape")
+    canonical_bytes(canonical)
+    readback_digest = canonical["readback_digest"]
+    if not _valid_guard_digest(readback_digest):
+        raise ValueError(f"{name} readback digest has the wrong shape")
+    body = dict(canonical)
+    del body["readback_digest"]
+    if digest_value(body) != readback_digest:
+        raise ValueError(f"{name} readback digest does not match its canonical body")
+
+
 class _ReplayReadPort:
     def __init__(self, value: object) -> None:
         self._value = value
@@ -779,16 +1059,62 @@ def _decode_readback(
     value_type: type,
     label: str,
 ) -> object:
+    try:
+        return _decode_readback_inner(
+            value,
+            expected_fields,
+            tuple_fields,
+            value_type,
+            label,
+        )
+    except CutoverGuardError as error:
+        if error.code == _READ_ERROR_CODES[label]:
+            raise
+        raise CutoverGuardError(
+            _READ_ERROR_CODES[label], f"{label} readback is malformed"
+        ) from error
+    except Exception as error:
+        raise CutoverGuardError(
+            _READ_ERROR_CODES[label], f"{label} readback is malformed"
+        ) from error
+
+
+def _decode_readback_inner(
+    value: object,
+    expected_fields: set[str],
+    tuple_fields: tuple[str, ...],
+    value_type: type,
+    label: str,
+) -> object:
     data = _exact_object(value, expected_fields, label)
     for name in tuple_fields:
         _tuple_field(data, name)
     try:
-        return value_type(**data)
-    except (TypeError, ValueError) as error:
-        raise CutoverGuardError("CUTOVER_BUNDLE_INVALID", f"{label} is malformed") from error
+        readback = value_type(**data)
+        _validate_typed_readback(label, readback)
+        return readback
+    except Exception as error:
+        raise CutoverGuardError(
+            _READ_ERROR_CODES[label], f"{label} readback is malformed"
+        ) from error
 
 
 def _decode_runtime(value: object) -> RuntimePreflightReadback:
+    try:
+        return _decode_runtime_inner(value)
+    except CutoverGuardError as error:
+        if error.code == _READ_ERROR_CODES["runtime"]:
+            raise
+        raise CutoverGuardError(
+            _READ_ERROR_CODES["runtime"], "runtime readback is malformed"
+        ) from error
+    except Exception as error:
+        raise CutoverGuardError(
+            _READ_ERROR_CODES["runtime"], "runtime readback is malformed"
+        ) from error
+
+
+def _decode_runtime_inner(value: object) -> RuntimePreflightReadback:
     data = _exact_object(
         value,
         {
@@ -819,12 +1145,31 @@ def _decode_runtime(value: object) -> RuntimePreflightReadback:
             ) from error
     data["selectors"] = tuple(selectors)
     try:
-        return RuntimePreflightReadback(**data)
-    except (TypeError, ValueError) as error:
-        raise CutoverGuardError("CUTOVER_BUNDLE_INVALID", "runtime is malformed") from error
+        runtime = RuntimePreflightReadback(**data)
+        _validate_typed_readback("runtime", runtime)
+        return runtime
+    except Exception as error:
+        raise CutoverGuardError(
+            _READ_ERROR_CODES["runtime"], "runtime readback is malformed"
+        ) from error
 
 
 def _decode_package(value: object) -> PackageReadback:
+    try:
+        return _decode_package_inner(value)
+    except CutoverGuardError as error:
+        if error.code == _READ_ERROR_CODES["packages"]:
+            raise
+        raise CutoverGuardError(
+            _READ_ERROR_CODES["packages"], "packages readback is malformed"
+        ) from error
+    except Exception as error:
+        raise CutoverGuardError(
+            _READ_ERROR_CODES["packages"], "packages readback is malformed"
+        ) from error
+
+
+def _decode_package_inner(value: object) -> PackageReadback:
     data = _exact_object(
         value,
         {"source_packages", "installed_packages", "drift", "readback_digest"},
@@ -855,9 +1200,13 @@ def _decode_package(value: object) -> PackageReadback:
                 ) from error
         data[key] = tuple(packages)
     try:
-        return PackageReadback(**data)
-    except (TypeError, ValueError) as error:
-        raise CutoverGuardError("CUTOVER_BUNDLE_INVALID", "packages are malformed") from error
+        packages = PackageReadback(**data)
+        _validate_typed_readback("packages", packages)
+        return packages
+    except Exception as error:
+        raise CutoverGuardError(
+            _READ_ERROR_CODES["packages"], "packages readback is malformed"
+        ) from error
 
 
 def _decode_bundle(value: object) -> CutoverReadbackBundle:
@@ -1007,26 +1356,6 @@ class JsonCutoverReadPorts:
         )
 
 
-_READ_ERROR_CODES = {
-    "legacy": "CUTOVER_LEGACY_READBACK_INVALID",
-    "durable_state": "CUTOVER_DURABLE_STATE_READBACK_INVALID",
-    "writer_fence": "CUTOVER_WRITER_FENCE_READBACK_INVALID",
-    "ownership": "CUTOVER_OWNERSHIP_READBACK_INVALID",
-    "compatibility": "CUTOVER_COMPATIBILITY_READBACK_INVALID",
-    "runtime": "CUTOVER_RUNTIME_READBACK_INVALID",
-    "packages": "CUTOVER_PACKAGES_READBACK_INVALID",
-}
-_READBACK_TYPES = {
-    "legacy": LegacyReadback,
-    "durable_state": DurableStateReadback,
-    "writer_fence": WriterFenceReadback,
-    "ownership": OwnershipReadback,
-    "compatibility": CompatibilityPathReadback,
-    "runtime": RuntimePreflightReadback,
-    "packages": PackageReadback,
-}
-
-
 class CutoverGuard:
     def __init__(self, sources: CutoverGuardSources) -> None:
         if type(sources) is not CutoverGuardSources:
@@ -1050,8 +1379,7 @@ class CutoverGuard:
         ) -> object | None:
             try:
                 value = operation()
-                if type(value) is not _READBACK_TYPES[name]:
-                    raise TypeError("readback has the wrong exact type")
+                _validate_typed_readback(name, value)
             except Exception as error:
                 code = _READ_ERROR_CODES[name]
                 detail = f"{type(error).__name__}: readback unavailable"
@@ -1160,6 +1488,7 @@ class CutoverGuard:
             and durable.generation_id == subject.store_generation
             and durable.state_schema == "gwo.v8.store.v1"
             and durable.compatible is True
+            and not durable.active_plan_digests
             and not durable.pending_activation_ids
             and not durable.predecessor_identity_refs
             and _valid_guard_digest(durable.readback_digest)
