@@ -19,20 +19,21 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "orchestrator" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from gwo_v8 import (  # noqa: E402
+from gwo_v8.activation import (  # noqa: E402
     ActivationError,
-    EvidenceVerifier,
     GitHubCliContentClient,
-    GitHubCliDeliveryControl,
     GitHubDurablePlanControl,
-    InMemoryRuntimeAdapter,
-    Kernel,
     LocalPlanPublication,
+)
+from gwo_v8.compiler import PlanCompiler  # noqa: E402
+from gwo_v8.evidence import EvidenceVerifier  # noqa: E402
+from gwo_v8.kernel import GitHubCliDeliveryControl, Kernel  # noqa: E402
+from gwo_v8.runtime import (  # noqa: E402
+    InMemoryRuntimeAdapter,
     PaseoCliClient,
     PaseoRuntimeAdapter,
-    PlanCompiler,
-    RuntimeProfile,
 )
+from gwo_v8.runtime_profile import RuntimeProfile  # noqa: E402
 import orch_core  # noqa: E402
 
 

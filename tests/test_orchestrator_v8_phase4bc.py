@@ -13,38 +13,42 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "orchestrator" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from gwo_v8 import (  # noqa: E402
+from gwo_v8.activation import (  # noqa: E402
     ActivationError,
+    GitHubContent,
+    InMemoryDurablePlanControl,
+    LocalPlanPublication,
+)
+from gwo_v8.compiler import PlanCompiler  # noqa: E402
+from gwo_v8.evidence import EvidenceVerifier, TypedEvidence  # noqa: E402
+from gwo_v8.kernel import Kernel, KernelError  # noqa: E402
+from gwo_v8.reconstruction import (  # noqa: E402
     AuthoritativeNodeReadback,
     AuthoritativeRepositoryReadback,
+    ExecutionBudgetReadback,
+    ReviewChildReadback,
+    ShadowEvaluator,
+    StoreReconstructor,
+)
+from gwo_v8.runtime import (  # noqa: E402
+    InMemoryRuntimeAdapter,
+    ReviewAxisBinding,
+    ReviewAxisObservation,
+    RuntimeBinding,
+    RuntimePrompt,
+)
+from gwo_v8.transition import (  # noqa: E402
     CanaryRunReadback,
     CanaryRunVerifier,
-    EvidenceVerifier,
-    ExecutionBudgetReadback,
     GitHubCanaryEvidenceControl,
-    GitHubContent,
     GitHubLegacyWriterControl,
     GitHubWriterTransitionControl,
     InMemoryCanaryEvidenceControl,
-    InMemoryDurablePlanControl,
     InMemoryLegacyWriterControl,
-    InMemoryRuntimeAdapter,
     InMemoryWriterTransitionControl,
     InMemoryV8OwnershipControl,
-    Kernel,
-    KernelError,
-    LocalPlanPublication,
     LegacyWriterReadback,
-    PlanCompiler,
-    ReviewAxisBinding,
-    ReviewAxisObservation,
-    ReviewChildReadback,
-    RuntimeBinding,
-    RuntimePrompt,
-    ShadowEvaluator,
     StoreV8OwnershipControl,
-    StoreReconstructor,
-    TypedEvidence,
     V8OwnershipReadback,
     WriterCutoverController,
 )

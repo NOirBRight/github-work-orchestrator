@@ -9,7 +9,7 @@ import pytest
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from gwo_v8 import (  # noqa: E402
+from gwo_v8.runtime_gateway import (  # noqa: E402
     CampaignPlanningSubject,
     PermissionRequired,
     PermissionResponse,
@@ -20,7 +20,7 @@ from gwo_v8 import (  # noqa: E402
     WorkRunPurpose,
     WorkRunSubject,
 )
-from gwo_v8.runtime import RuntimeProfile  # noqa: E402
+from gwo_v8.runtime_profile import RuntimeProfile  # noqa: E402
 from gwo_v8.planning_protocol import planning_prompt  # noqa: E402
 from gwo_v8.runtime_gateway import (  # noqa: E402
     ArtifactStore,

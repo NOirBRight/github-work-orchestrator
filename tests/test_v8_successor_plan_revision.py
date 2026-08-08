@@ -7,6 +7,9 @@ import pytest
 
 pytest_plugins = ("v8_successor_test_support",)
 
+from gwo_v8.execution_kernel import ExecutionKernelError, RevisionLineageSummary
+from gwo_v8.plan_control import PlanInvalidationExclusiveResource
+
 
 def test_public_existing_owner_successor_has_exact_readback_and_preserves_result(
     public_successor,
@@ -69,19 +72,19 @@ def test_public_existing_owner_successor_has_exact_readback_and_preserves_result
     assert "candidate:r0:109" in lineage.candidate_identities
 
     # These are public read-only types, not private activation machinery.
-    assert isinstance(lineage, gwo_v8.RevisionLineageSummary)
+    assert isinstance(lineage, RevisionLineageSummary)
 
 
 def test_public_successor_readback_types_are_exported():
     import gwo_v8
 
-    resource = gwo_v8.PlanInvalidationExclusiveResource(
+    resource = PlanInvalidationExclusiveResource(
         "issue:110",
         "repository.target.v1",
         "The existing owner needs the shared target resource.",
     )
     assert resource.ticket_key == "issue:110"
-    assert gwo_v8.RevisionLineageSummary.__name__ == "RevisionLineageSummary"
+    assert RevisionLineageSummary.__name__ == "RevisionLineageSummary"
 
 
 def test_public_approved_dependency_successor_replays_without_a_second_planning_pass(
@@ -169,7 +172,7 @@ def test_public_stale_predecessor_candidate_is_rejected_after_successor_activati
         )
 
     public_dependency_successor.effects.replay_predecessor_candidate("issue:109")
-    with pytest.raises(gwo_v8.ExecutionKernelError) as raised:
+    with pytest.raises(ExecutionKernelError) as raised:
         gwo_v8.advance(
             public_dependency_successor.handle,
             "candidate-gate:stale-predecessor",
@@ -193,7 +196,7 @@ def test_public_illegal_successor_output_fails_closed_without_partial_activation
     public_successor.set_successor_payload(
         successor_payload(owners=("issue:999",))
     )
-    with pytest.raises(gwo_v8.ExecutionKernelError):
+    with pytest.raises(ExecutionKernelError):
         gwo_v8.advance(
             public_successor.handle,
             plan_invalidation=public_successor.invalidation_for("issue:109"),
@@ -229,7 +232,7 @@ def test_public_source_or_policy_drift_fails_closed_before_successor_activation(
     )
     public_successor.mutate_source(field)
 
-    with pytest.raises(gwo_v8.ExecutionKernelError):
+    with pytest.raises(ExecutionKernelError):
         gwo_v8.advance(
             public_successor.handle,
             plan_invalidation=public_successor.invalidation_for("issue:109"),
@@ -262,7 +265,7 @@ def test_public_activation_cas_drift_retries_the_same_successor_pass(
     )
     public_successor.arm_cas_conflict()
 
-    with pytest.raises(gwo_v8.ExecutionKernelError):
+    with pytest.raises(ExecutionKernelError):
         gwo_v8.advance(
             public_successor.handle,
             plan_invalidation=public_successor.invalidation_for("issue:109"),

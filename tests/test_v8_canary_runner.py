@@ -12,7 +12,7 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
-from gwo_v8 import RuntimePrompt  # noqa: E402
+from gwo_v8.runtime import RuntimePrompt  # noqa: E402
 
 
 def test_smoke_plan_compiles_exact_hosted_boundary_contract():

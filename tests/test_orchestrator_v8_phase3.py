@@ -13,29 +13,30 @@ import pytest
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from gwo_v8 import (  # noqa: E402
-    CompileError,
-    EvidenceVerifier,
+from gwo_v8.activation import LocalPlanPublication  # noqa: E402
+from gwo_v8.compiler import CompileError, PlanCompiler  # noqa: E402
+from gwo_v8.evidence import EvidenceVerifier  # noqa: E402
+from gwo_v8.kernel import (  # noqa: E402
     GitHubCliDeliveryControl,
     InMemoryDeliveryControl,
-    InMemoryPaseoClient,
-    InMemoryRuntimeAdapter,
     Kernel,
     KernelError,
-    LocalPlanPublication,
-    PlanCompiler,
+    RecoveryLadder,
+)
+from gwo_v8.runtime import (  # noqa: E402
+    InMemoryPaseoClient,
+    InMemoryRuntimeAdapter,
     PaseoCliClient,
     PaseoAgentRecord,
     PaseoCreateRequest,
     PaseoRuntimeAdapter,
     ReviewAxisRequest,
-    RecoveryLadder,
     RuntimeAdmission,
     RuntimeAdapterError,
-    RuntimeProfile,
     RuntimePrompt,
     resolve_review_profile,
 )
+from gwo_v8.runtime_profile import RuntimeProfile  # noqa: E402
 import orch_core  # noqa: E402
 
 
