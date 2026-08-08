@@ -12,8 +12,7 @@ public host and does not activate repository writing.
 
 Accept only a Work Item already in `ready-for-agent`, an accepted parent
 Goal/spec with ready Work Items, or an explicit non-empty ready set. If the
-input is not ready, return the exact next action and never fall back to
-`/implement`.
+input is not ready, return the exact next action and never fall back to `/implement`.
 
 The public path is composed from these deep modules:
 
