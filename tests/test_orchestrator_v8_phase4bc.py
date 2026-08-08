@@ -49,6 +49,8 @@ from gwo_v8 import (  # noqa: E402
     WriterCutoverController,
 )
 from gwo_v8._canonical import canonical_bytes, digest_value  # noqa: E402
+from gwo_v8.plan_control_host import install_cutover_guard  # noqa: E402
+from tests.cutover_guard_test_support import GuardHarness  # noqa: E402
 
 
 class _GitHubContentClient:
@@ -1201,6 +1203,34 @@ def _verify_canary(readback: CanaryRunReadback):
     ).verify(readback)
 
 
+def _cutover_guard(compiled, writer_generation: str):
+    harness = GuardHarness.valid()
+    harness.subject = replace(
+        harness.subject,
+        repository=compiled.repository,
+        target_writer_generation=writer_generation,
+    )
+    for port in (
+        harness.legacy,
+        harness.durable,
+        harness.writer,
+        harness.ownership,
+        harness.compatibility,
+        harness.runtime,
+    ):
+        value = replace(port.value, repository=compiled.repository)
+        body = asdict(value)
+        body.pop("readback_digest")
+        port.value = replace(
+            value,
+            readback_digest=digest_value(body),
+        )
+    guard = install_cutover_guard(sources=harness.sources)
+    report = guard.check(harness.subject)
+    assert report.receipt is not None
+    return guard, harness.subject, report.receipt
+
+
 def test_canary_accepts_only_typed_durable_evidence():
     acceptance = _verify_canary(_accepted_canary())
 
@@ -1268,6 +1298,10 @@ def test_github_canary_manifest_readback_survives_adapter_restart():
 
 def _cutover_controller(tmp_path: Path, *, github=False, legacy=None):
     compiled = _compiled()
+    guard, guard_subject, guard_receipt = _cutover_guard(
+        compiled,
+        "v8-generation-1",
+    )
     durable = InMemoryDurablePlanControl()
     if github:
         client = _GitHubContentClient()
@@ -1288,19 +1322,38 @@ def _cutover_controller(tmp_path: Path, *, github=False, legacy=None):
         legacy=legacy or InMemoryLegacyWriterControl(),
         transitions=transitions,
         publication=publication,
+        guard=guard,
     )
-    return compiled, durable, transitions, publication, controller, client
+    return (
+        compiled,
+        durable,
+        transitions,
+        publication,
+        controller,
+        client,
+        guard_subject,
+        guard_receipt,
+    )
 
 
 def test_cutover_fences_v61_then_authorizes_exact_activation_and_capacity(tmp_path):
-    compiled, _durable, transitions, publication, controller, _client = (
-        _cutover_controller(tmp_path)
-    )
+    (
+        compiled,
+        _durable,
+        transitions,
+        publication,
+        controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
     acceptance = _verify_canary(_accepted_canary())
 
     outcome = controller.cutover(
         compiled,
         canary=acceptance,
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
         writer_generation="v8-generation-1",
         worker_capacity=8,
         coordinator_capacity=1,
@@ -1324,6 +1377,8 @@ def test_cutover_fences_v61_then_authorizes_exact_activation_and_capacity(tmp_pa
     repeated = controller.cutover(
         compiled,
         canary=acceptance,
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
         writer_generation="v8-generation-1",
         worker_capacity=8,
         coordinator_capacity=1,
@@ -1336,6 +1391,10 @@ def test_cutover_rolls_forward_from_durable_pending_after_final_cas_failure(
     tmp_path,
 ):
     compiled = _compiled()
+    guard, guard_subject, guard_receipt = _cutover_guard(
+        compiled,
+        "v8-generation-1",
+    )
     durable = InMemoryDurablePlanControl()
     transitions = _FailFinalTransitionOnce()
     publication = LocalPlanPublication(
@@ -1347,6 +1406,7 @@ def test_cutover_rolls_forward_from_durable_pending_after_final_cas_failure(
         legacy=InMemoryLegacyWriterControl(),
         transitions=transitions,
         publication=publication,
+        guard=guard,
     )
     acceptance = _verify_canary(_accepted_canary())
 
@@ -1354,6 +1414,8 @@ def test_cutover_rolls_forward_from_durable_pending_after_final_cas_failure(
         controller.cutover(
             compiled,
             canary=acceptance,
+            guard_subject=guard_subject,
+            guard_receipt=guard_receipt,
             writer_generation="v8-generation-1",
             worker_capacity=8,
             coordinator_capacity=1,
@@ -1371,6 +1433,8 @@ def test_cutover_rolls_forward_from_durable_pending_after_final_cas_failure(
     changed = controller.cutover(
         _compiled(count=4),
         canary=acceptance,
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
         writer_generation="v8-generation-1",
         worker_capacity=8,
         coordinator_capacity=1,
@@ -1382,6 +1446,8 @@ def test_cutover_rolls_forward_from_durable_pending_after_final_cas_failure(
     recovered = controller.cutover(
         compiled,
         canary=acceptance,
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
         writer_generation="v8-generation-1",
         worker_capacity=8,
         coordinator_capacity=1,
@@ -1393,9 +1459,16 @@ def test_cutover_rolls_forward_from_durable_pending_after_final_cas_failure(
 def test_failed_cutover_is_durable_without_activation_or_v61_precondition_stop(
     tmp_path,
 ):
-    compiled, _durable, transitions, publication, controller, _client = (
-        _cutover_controller(tmp_path)
-    )
+    (
+        compiled,
+        _durable,
+        transitions,
+        publication,
+        controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
     rejected = replace(
         _verify_canary(_accepted_canary()),
         accepted=False,
@@ -1406,6 +1479,8 @@ def test_failed_cutover_is_durable_without_activation_or_v61_precondition_stop(
     outcome = controller.cutover(
         compiled,
         canary=rejected,
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
         writer_generation="v8-generation-1",
         worker_capacity=7,
         coordinator_capacity=1,
@@ -1420,6 +1495,10 @@ def test_failed_cutover_is_durable_without_activation_or_v61_precondition_stop(
 
 def test_rollback_discards_pre_activation_pending_reservation(tmp_path):
     compiled = _compiled()
+    guard, guard_subject, guard_receipt = _cutover_guard(
+        compiled,
+        "v8-generation-1",
+    )
     durable = InMemoryDurablePlanControl()
     transitions = InMemoryWriterTransitionControl(initial_writer="v6.1")
 
@@ -1437,11 +1516,14 @@ def test_rollback_discards_pre_activation_pending_reservation(tmp_path):
         legacy=InMemoryLegacyWriterControl(),
         transitions=transitions,
         publication=publication,
+        guard=guard,
     )
     with pytest.raises(RuntimeError, match="pre-publication"):
         controller.cutover(
             compiled,
             canary=_verify_canary(_accepted_canary()),
+            guard_subject=guard_subject,
+            guard_receipt=guard_receipt,
             writer_generation="v8-generation-1",
             worker_capacity=8,
             coordinator_capacity=1,
@@ -1470,6 +1552,10 @@ def test_rollback_rolls_forward_receipt_backed_pending_before_compensation(
     tmp_path,
 ):
     compiled = _compiled()
+    guard, guard_subject, guard_receipt = _cutover_guard(
+        compiled,
+        "v8-generation-1",
+    )
     durable = InMemoryDurablePlanControl()
     transitions = InMemoryWriterTransitionControl(initial_writer="v6.1")
 
@@ -1487,11 +1573,14 @@ def test_rollback_rolls_forward_receipt_backed_pending_before_compensation(
         legacy=InMemoryLegacyWriterControl(),
         transitions=transitions,
         publication=publication,
+        guard=guard,
     )
     with pytest.raises(RuntimeError, match="post-receipt"):
         controller.cutover(
             compiled,
             canary=_verify_canary(_accepted_canary()),
+            guard_subject=guard_subject,
+            guard_receipt=guard_receipt,
             writer_generation="v8-generation-1",
             worker_capacity=8,
             coordinator_capacity=1,
@@ -1527,12 +1616,21 @@ def test_rollback_rolls_forward_receipt_backed_pending_before_compensation(
 
 
 def test_rollback_fences_v8_restores_v61_and_is_idempotent(tmp_path):
-    compiled, durable, transitions, publication, controller, _client = (
-        _cutover_controller(tmp_path)
-    )
+    (
+        compiled,
+        durable,
+        transitions,
+        publication,
+        controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
     cutover = controller.cutover(
         compiled,
         canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
         writer_generation="v8-generation-1",
         worker_capacity=8,
         coordinator_capacity=1,
@@ -1585,12 +1683,21 @@ def test_rollback_fences_v8_restores_v61_and_is_idempotent(tmp_path):
 
 
 def test_rollback_drains_and_rereads_ownership_before_restoring_v61(tmp_path):
-    compiled, _durable, transitions, publication, controller, _client = (
-        _cutover_controller(tmp_path)
-    )
+    (
+        compiled,
+        _durable,
+        transitions,
+        publication,
+        controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
     controller.cutover(
         compiled,
         canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
         writer_generation="v8-generation-1",
         worker_capacity=8,
         coordinator_capacity=1,
@@ -1734,12 +1841,21 @@ def test_integration_lease_acquisition_rechecks_local_drain_fence(tmp_path):
 
 
 def test_github_transition_control_survives_process_restart(tmp_path):
-    compiled, _durable, transitions, _publication, controller, client = (
-        _cutover_controller(tmp_path, github=True)
-    )
+    (
+        compiled,
+        _durable,
+        transitions,
+        _publication,
+        controller,
+        client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path, github=True)
     cutover = controller.cutover(
         compiled,
         canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
         writer_generation="v8-generation-1",
         worker_capacity=8,
         coordinator_capacity=1,

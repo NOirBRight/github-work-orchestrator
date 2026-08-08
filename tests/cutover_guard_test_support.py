@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
 from gwo_v8._canonical import digest_value
+from gwo_v8.activation import (
+    ActivationError,
+    ActivationReceipt,
+    InMemoryDurablePlanControl,
+    LocalPlanPublication,
+)
+from gwo_v8.compiler import CompiledPlan
 
 from gwo_v8.cutover_guard import (
     CompatibilityPathReadback,
@@ -28,6 +35,15 @@ from gwo_v8.plan_control_host import (
 )
 from gwo_v8.runtime_gateway import ProfileMapping, RuntimeConfiguration, RuntimeGateway
 from gwo_v8.runtime_profile import RuntimeProfile
+from gwo_v8.transition import (
+    CanaryAcceptance,
+    InMemoryLegacyWriterControl,
+    InMemoryV8OwnershipControl,
+    InMemoryWriterTransitionControl,
+    V8OwnershipReadback,
+    WriterCutoverController,
+    WriterTransitionRecord,
+)
 
 
 class MutationTripwire:
@@ -326,6 +342,162 @@ class _StartHostReadbackDouble:
 
 def valid_production_start_host(_tmp_path: Path) -> _StartHostReadbackDouble:
     return _StartHostReadbackDouble()
+
+
+class RecordingLegacyControl(InMemoryLegacyWriterControl):
+    def __init__(self, calls: list[str]) -> None:
+        super().__init__()
+        self._calls = calls
+
+    def stop(self, repository: str, *, action_key: str) -> None:
+        self._calls.append("legacy.stop")
+        super().stop(repository, action_key=action_key)
+
+    def restore(self, repository: str, *, action_key: str) -> None:
+        self._calls.append("legacy.restore")
+        super().restore(repository, action_key=action_key)
+
+    def readback(self, repository: str) -> SimpleNamespace:
+        readback = super().readback(repository)
+        return SimpleNamespace(
+            repository=readback.repository,
+            stopped=readback.stopped,
+            active_dispatches=readback.active_dispatches,
+            integration_lease=readback.integration_lease,
+            active_workers=readback.active_workers,
+            authority_state=(
+                "stopped" if readback.stopped else "authoritative_quiescent"
+            ),
+        )
+
+
+class RecordingTransitions(InMemoryWriterTransitionControl):
+    def __init__(self, calls: list[str]) -> None:
+        super().__init__(initial_writer="v6.1")
+        self._calls = calls
+
+    def publish(self, record: WriterTransitionRecord) -> None:
+        self._calls.append("transitions.publish")
+        super().publish(record)
+
+
+class RecordingPublication(LocalPlanPublication):
+    def __init__(self, *args: object, calls: list[str], **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._calls = calls
+
+    def publish_and_activate(self, *args: object, **kwargs: object) -> ActivationReceipt:
+        self._calls.append("publication.publish_and_activate")
+        return super().publish_and_activate(*args, **kwargs)
+
+    def read_active(self, repository: str) -> object | None:
+        try:
+            return super().read_active(repository)
+        except ActivationError as error:
+            if error.code != "ACTIVATION_PENDING":
+                raise
+            return None
+
+
+@dataclass
+class ActivationFixture:
+    repository: str
+    compiled_plan: CompiledPlan
+    accepted_canary: CanaryAcceptance
+    subject: CutoverSubject
+    guard: ProductionCutoverGuardHost
+    writer_readback: FakeReadPort
+    legacy: RecordingLegacyControl
+    transitions: RecordingTransitions
+    publication: RecordingPublication
+    ownership: InMemoryV8OwnershipControl
+    controller: WriterCutoverController
+    calls: list[str]
+
+    def mutation_calls(self) -> tuple[str, ...]:
+        return tuple(self.calls)
+
+
+def activation_fixture(
+    tmp_path: Path,
+    *,
+    fail_after: set[str] | frozenset[str] = frozenset(),
+) -> ActivationFixture:
+    from test_orchestrator_v8_phase4bc import _accepted_canary, _compiled, _verify_canary
+
+    calls: list[str] = []
+    harness = GuardHarness.valid()
+    compiled_plan = _compiled()
+    harness.subject = replace(
+        harness.subject,
+        repository=compiled_plan.repository,
+    )
+    for port in (
+        harness.legacy,
+        harness.durable,
+        harness.writer,
+        harness.ownership,
+        harness.compatibility,
+        harness.runtime,
+    ):
+        value = replace(port.value, repository=compiled_plan.repository)
+        body = asdict(value)
+        body.pop("readback_digest")
+        port.value = replace(
+            value,
+            readback_digest=digest_value(body),
+        )
+    accepted_canary = _verify_canary(_accepted_canary())
+    legacy = RecordingLegacyControl(calls)
+    transitions = RecordingTransitions(calls)
+
+    def checkpoint(name: str) -> None:
+        if name in fail_after:
+            raise RuntimeError(f"isolated rehearsal failure at {name}")
+
+    durable = InMemoryDurablePlanControl(
+        fail_once_after=(
+            {"publish_activation"}
+            if "publish_activation" in fail_after
+            else set()
+        )
+    )
+    publication = RecordingPublication(
+        tmp_path / "v8.sqlite3",
+        durable=durable,
+        writer_authority=transitions,
+        checkpoint=checkpoint,
+        calls=calls,
+    )
+    guard = install_cutover_guard(sources=harness.sources)
+    ownership = InMemoryV8OwnershipControl(
+        V8OwnershipReadback(
+            active_admissions=(),
+            active_attempts=(),
+            integration_lease=False,
+            runtime_resources=(),
+        )
+    )
+    controller = WriterCutoverController(
+        legacy=legacy,
+        transitions=transitions,
+        publication=publication,
+        guard=guard,
+    )
+    return ActivationFixture(
+        repository=compiled_plan.repository,
+        compiled_plan=compiled_plan,
+        accepted_canary=accepted_canary,
+        subject=harness.subject,
+        guard=guard,
+        writer_readback=harness.writer,
+        legacy=legacy,
+        transitions=transitions,
+        publication=publication,
+        ownership=ownership,
+        controller=controller,
+        calls=calls,
+    )
 
 
 class MutatingLegacyReader:
