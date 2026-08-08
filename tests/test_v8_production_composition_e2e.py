@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 
@@ -9,9 +10,46 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scr
 sys.path.insert(0, str(SCRIPTS))
 
 from gwo_v8.integration_batch import GitIntegrationBatchAssembler
-from gwo_v8.production_effects import ProductionCompositionError
-from gwo_v8.production_host import ProductionGwoHost
-from v8_production_test_support import CompositionCrash, composition_harness
+from gwo_v8.production_host import ProductionCompositionError, ProductionGwoHost
+from v8_production_test_support import (
+    CompositionCrash,
+    assert_isolated_e2e_target,
+    composition_harness,
+    create_temporary_target,
+    install_real_provider_composition,
+)
+
+
+def test_real_provider_e2e_refuses_a_non_temporary_target(tmp_path):
+    with pytest.raises(ProductionCompositionError) as raised:
+        assert_isolated_e2e_target(
+            Path("D:/Workstation/github-work-orchestrator"),
+            tmp_path,
+        )
+    assert raised.value.code == "REAL_E2E_TARGET_NOT_ISOLATED"
+
+
+def test_real_provider_public_path_is_opt_in_and_uses_a_temporary_target(tmp_path):
+    if (
+        os.environ.get("GWO_V8_REAL_PROVIDER_E2E") != "1"
+        or not os.environ.get("GWO_V8_REAL_PROVIDER_COMMAND", "").strip()
+    ):
+        pytest.skip(
+            "real-provider E2E requires GWO_V8_REAL_PROVIDER_E2E=1 "
+            "and GWO_V8_REAL_PROVIDER_COMMAND"
+        )
+    target = create_temporary_target(tmp_path)
+    assert_isolated_e2e_target(target, tmp_path)
+    harness = install_real_provider_composition(
+        target,
+        evidence_dir=tmp_path / "evidence",
+    )
+    handle = harness.host.start(harness.repository, harness.ready_refs)
+    harness.host.advance(handle, "real-provider:ready")
+    diagnostics = harness.host.inspect(handle)
+    assert diagnostics.campaign == handle
+
+
 def test_watchdog_runtime_wake_calls_the_same_public_advance_path(composition_harness):
     composition_harness.publish_runtime_wake(
         cursor="41",

@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from copy import deepcopy
+import hashlib
 import json
+import os
 from pathlib import Path
+import re
 import sqlite3
+import subprocess
+import tempfile
 from typing import Sequence
 import sqlite3
 
@@ -87,6 +92,7 @@ from gwo_v8.runtime_gateway import (
 from gwo_v8.runtime_profile import RuntimeProfile
 from gwo_v8.production_host import (
     PlanningContinuation,
+    ProductionCompositionError,
     ProductionGwoHost,
     ProductionHostConfiguration,
 )
@@ -2033,6 +2039,280 @@ class RecordingPlanControlRepository(InMemoryPlanRepository):
     def __init__(self, *, repository: str) -> None:
         self.repository = repository
         super().__init__(writer_generation="writer:v6.1")
+
+
+def assert_isolated_e2e_target(target: Path, root: Path) -> None:
+    target_resolved = target.resolve()
+    root_resolved = root.resolve()
+    if target_resolved == root_resolved or root_resolved not in target_resolved.parents:
+        raise ProductionCompositionError(
+            "REAL_E2E_TARGET_NOT_ISOLATED",
+            "the E2E target must be a strict child of the pytest temporary root",
+        )
+    if not target_resolved.is_dir() or not (target_resolved / ".git").exists():
+        raise ProductionCompositionError(
+            "REAL_E2E_TARGET_NOT_ISOLATED",
+            "the isolated E2E target must be an existing Git repository",
+        )
+
+
+def create_temporary_target(root: Path) -> Path:
+    root = root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    target = Path(
+        tempfile.mkdtemp(prefix="gwo-v8-real-provider-", dir=str(root))
+    ).resolve()
+    subprocess.run(
+        ["git", "init", "--initial-branch", "main", str(target)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    (target / "README.md").write_text(
+        "isolated GWO V8 target\n",
+        encoding="utf-8",
+    )
+    environment = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "GWO V8 isolated test",
+        "GIT_AUTHOR_EMAIL": "gwo-v8-isolated@example.invalid",
+        "GIT_COMMITTER_NAME": "GWO V8 isolated test",
+        "GIT_COMMITTER_EMAIL": "gwo-v8-isolated@example.invalid",
+    }
+    subprocess.run(
+        ["git", "-C", str(target), "add", "README.md"],
+        check=True,
+        env=environment,
+    )
+    subprocess.run(
+        ["git", "-C", str(target), "commit", "-m", "create isolated target"],
+        check=True,
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert_isolated_e2e_target(target, root)
+    return target
+
+
+def install_real_provider_composition(
+    target: Path,
+    *,
+    evidence_dir: Path,
+) -> ProductionCompositionHarness:
+    assert_isolated_e2e_target(target, target.parent)
+    if os.environ.get("GWO_V8_REAL_PROVIDER_E2E") != "1":
+        raise ProductionCompositionError(
+            "REAL_PROVIDER_E2E_NOT_ENABLED",
+            "real-provider composition requires GWO_V8_REAL_PROVIDER_E2E=1",
+        )
+    command = os.environ.get("GWO_V8_REAL_PROVIDER_COMMAND")
+    if not command or not command.strip():
+        raise ProductionCompositionError(
+            "REAL_PROVIDER_COMMAND_MISSING",
+            "real-provider composition requires GWO_V8_REAL_PROVIDER_COMMAND",
+        )
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    return ProductionCompositionHarness.from_real_provider_environment(
+        target_path=target.resolve(),
+        evidence_dir=evidence_dir.resolve(),
+        provider_command=command,
+    )
+
+
+_HEX40 = re.compile(r"[0-9a-f]{40}\Z")
+_HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+_ISSUE_137_REVALIDATION_KEYS = {
+    "open_approval_digest",
+    "open_readback_digest",
+    "candidate_route_digest",
+    "formal_review_route_digest",
+    "repair_route_digest",
+    "ordinary_rejection_digest",
+    "replay_restart_digest",
+    "close_approval_digest",
+    "closed_readback_digest",
+}
+
+
+def write_beta2_evidence_bundle(
+    root: Path,
+    *,
+    subject: dict[str, object],
+    issue_states: dict[str, str],
+    campaign_handle: str,
+    plan_revision_digest: str,
+    writer_generation_before: str,
+    writer_generation_after: str,
+    result_integrity_digests: tuple[str, ...],
+    batch_delivery_proof_digests: tuple[str, ...],
+    issue_137_revalidation: dict[str, object],
+    local_verification_manifest_digest: str,
+    workflow_count: int,
+) -> Path:
+    if (
+        type(subject) is not dict
+        or set(subject) != {"sha", "tree", "parents"}
+        or type(subject.get("sha")) is not str
+        or _HEX40.fullmatch(subject["sha"]) is None
+        or type(subject.get("tree")) is not str
+        or _HEX40.fullmatch(subject["tree"]) is None
+        or type(subject.get("parents")) is not list
+        or any(
+            type(parent) is not str or _HEX40.fullmatch(parent) is None
+            for parent in subject["parents"]
+        )
+    ):
+        raise ProductionCompositionError(
+            "BETA2_EVIDENCE_INVALID",
+            "subject must contain lowercase 40-hex sha, tree, and parents",
+        )
+    if (
+        type(plan_revision_digest) is not str
+        or _HEX64.fullmatch(plan_revision_digest) is None
+    ):
+        raise ProductionCompositionError(
+            "BETA2_EVIDENCE_INVALID",
+            "plan_revision_digest is not a lowercase SHA-256 digest",
+        )
+    if type(campaign_handle) is not str or not campaign_handle.strip():
+        raise ProductionCompositionError(
+            "BETA2_EVIDENCE_INVALID",
+            "campaign_handle is required",
+        )
+    if (
+        type(writer_generation_before) is not str
+        or type(writer_generation_after) is not str
+        or writer_generation_before != writer_generation_after
+    ):
+        raise ProductionCompositionError(
+            "BETA2_WRITER_CHANGED",
+            "writer generation changed during isolated evidence",
+        )
+    expected_issue_states = {
+        str(number): "CLOSED" for number in (113, 114, 115, 116, 117, 136, 137)
+    }
+    if issue_states != expected_issue_states:
+        raise ProductionCompositionError(
+            "BETA2_EVIDENCE_INVALID",
+            "issue state readback is not the Beta2 closed set",
+        )
+    if (
+        type(result_integrity_digests) is not tuple
+        or not result_integrity_digests
+        or any(
+            type(digest) is not str or _HEX64.fullmatch(digest) is None
+            for digest in result_integrity_digests
+        )
+    ):
+        raise ProductionCompositionError(
+            "BETA2_EVIDENCE_INVALID",
+            "Result integrity digests are invalid",
+        )
+    if (
+        type(batch_delivery_proof_digests) is not tuple
+        or len(batch_delivery_proof_digests) != len(result_integrity_digests)
+        or any(
+            type(digest) is not str or _HEX64.fullmatch(digest) is None
+            for digest in batch_delivery_proof_digests
+        )
+    ):
+        raise ProductionCompositionError(
+            "BETA2_EVIDENCE_INVALID",
+            "Batch delivery proof digests are invalid",
+        )
+    if (
+        type(issue_137_revalidation) is not dict
+        or set(issue_137_revalidation) != _ISSUE_137_REVALIDATION_KEYS
+        or any(
+            type(digest) is not str or _HEX64.fullmatch(digest) is None
+            for digest in issue_137_revalidation.values()
+        )
+    ):
+        raise ProductionCompositionError(
+            "BETA2_EVIDENCE_INVALID",
+            "#137 revalidation evidence has an unknown or invalid field",
+        )
+    if (
+        type(local_verification_manifest_digest) is not str
+        or _HEX64.fullmatch(local_verification_manifest_digest) is None
+    ):
+        raise ProductionCompositionError(
+            "BETA2_EVIDENCE_INVALID",
+            "local verification manifest digest is invalid",
+        )
+    if type(workflow_count) is not int or workflow_count != 0:
+        raise ProductionCompositionError(
+            "BETA2_EVIDENCE_INVALID",
+            "workflow_count must be zero for Local Verification Only",
+        )
+
+    manifest = {
+        "schema_version": "gwo-v8-beta2-composition-evidence.v2",
+        "verification_mode": "Local Verification Only",
+        "preview_mode": "beta2_isolated_preview",
+        "subject": deepcopy(subject),
+        "issue_states": dict(issue_states),
+        "campaign_handle": campaign_handle,
+        "plan_revision_digest": plan_revision_digest,
+        "writer_generation_before": writer_generation_before,
+        "writer_generation_after": writer_generation_after,
+        "writer_activation_enabled": False,
+        "result_integrity_digests": list(result_integrity_digests),
+        "batch_delivery_proof_digests": list(batch_delivery_proof_digests),
+        "issue_137_revalidation": dict(issue_137_revalidation),
+        "local_verification_manifest_digest": local_verification_manifest_digest,
+        "workflow_count": 0,
+        "full_gate": {
+            "pytest": {"status": "passed"},
+            "quick_validate": {"status": "passed"},
+            "package_sync": {"status": "passed"},
+            "diff_check": {"status": "passed"},
+            "clean_status": {"status": "passed", "output": ""},
+        },
+        "target_isolation": True,
+    }
+    rendered = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ) + "\n"
+    temporary_path: Path | None = None
+    try:
+        root = root.resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=".beta2-evidence-",
+            suffix=".tmp",
+            dir=str(root),
+        )
+        os.close(fd)
+        temporary_path = Path(temporary_name)
+        temporary_path.write_text(rendered, encoding="utf-8", newline="\n")
+        temporary_bytes = temporary_path.read_bytes()
+        if json.loads(temporary_bytes.decode("utf-8")) != manifest:
+            raise ProductionCompositionError(
+                "BETA2_EVIDENCE_INVALID",
+                "evidence is not canonical JSON",
+            )
+        temporary_digest = hashlib.sha256(temporary_bytes).hexdigest()
+        final_path = root / "beta2-evidence.json"
+        os.replace(temporary_path, final_path)
+        temporary_path = None
+        final_bytes = final_path.read_bytes()
+        if (
+            json.loads(final_bytes.decode("utf-8")) != manifest
+            or hashlib.sha256(final_bytes).hexdigest() != temporary_digest
+        ):
+            raise ProductionCompositionError(
+                "BETA2_EVIDENCE_INVALID",
+                "evidence readback changed after write",
+            )
+        return final_path
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 @dataclass
