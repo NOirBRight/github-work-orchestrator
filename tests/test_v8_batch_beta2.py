@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 
 import pytest
 
@@ -33,9 +34,9 @@ def _document_readbacks() -> dict[str, object]:
 
 
 PUBLICATION_SUBJECT = {
-    "parents": ["514f1162fe563f27edd35b4d6683df2786b7dcc0"],
-    "sha": "bcc7e719ecd5176f29d496e7ec6d7c3819c96439",
-    "tree": "81dca3a6296aa02182141975ae3d402ebd16c7ff",
+    "parents": ["bcc7e719ecd5176f29d496e7ec6d7c3819c96439"],
+    "sha": "e4173c00e4b889ad6144af078ede9fb1303262fe",
+    "tree": "9ea47abbaffd92eb2249c04e7514141ecb1f8b66",
 }
 
 
@@ -234,14 +235,53 @@ def test_beta2_check_rejects_missing_or_tampered_publication_subject(
 
 
 def test_beta2_evidence_check_is_self_contained_without_arguments():
-    completed = subprocess.run(
-        ["py", "-3.13", "scripts/write_v8_batch_evidence.py", "--check"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
+    from write_v8_batch_evidence import LOCAL_EVIDENCE_STATE
+
+    hidden_manifest = LOCAL_EVIDENCE_STATE.with_name(
+        f"verification.{uuid.uuid4().hex}.json"
     )
+    if LOCAL_EVIDENCE_STATE.is_file():
+        LOCAL_EVIDENCE_STATE.replace(hidden_manifest)
+    try:
+        completed = subprocess.run(
+            ["py", "-3.13", "scripts/write_v8_batch_evidence.py", "--check"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        if hidden_manifest.is_file():
+            hidden_manifest.replace(LOCAL_EVIDENCE_STATE)
 
     assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_beta2_check_rejects_unknown_embedded_local_receipt_fields(tmp_path):
+    document = (ROOT / "docs" / "e2e" / "gwo-v8-batch-integrator.md").read_text(
+        encoding="utf-8"
+    )
+    embedded = {
+        "focused": {},
+        "gates": [],
+        "unexpected": True,
+    }
+    tampered = document.replace(
+        "## Focused pytest Receipts",
+        "## Local Verification Receipts\n\n"
+        "```json\n"
+        + json.dumps(embedded, indent=2, sort_keys=True)
+        + "\n```\n\n"
+        + "## Focused pytest Receipts",
+        1,
+    )
+    canonical = tmp_path / "tampered-embedded.md"
+    canonical.write_text(tampered, encoding="utf-8")
+
+    completed = _run_evidence_check(canonical)
+
+    output = completed.stderr + completed.stdout
+    assert completed.returncode != 0
+    assert "local verification manifest is missing" not in output
 
 
 def test_beta2_batch_boundary_has_three_standard_members_and_one_strict_singleton(
