@@ -6,8 +6,6 @@ import sys
 
 import pytest
 
-from tests.cutover_guard_test_support import valid_cutover_read_adapter_resolver
-
 
 SCRIPTS = (
     Path(__file__).resolve().parents[1]
@@ -16,6 +14,8 @@ SCRIPTS = (
     / "scripts"
 )
 sys.path.insert(0, str(SCRIPTS))
+
+from tests.cutover_guard_test_support import valid_cutover_read_adapter_resolver
 
 
 class _RawGateway:
