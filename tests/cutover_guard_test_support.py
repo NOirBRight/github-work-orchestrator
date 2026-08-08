@@ -15,6 +15,8 @@ from gwo_v8.compiler import CompiledPlan
 
 from gwo_v8.cutover_guard import (
     CompatibilityPathReadback,
+    CutoverGuard,
+    CutoverGuardReport,
     CutoverGuardSources,
     CutoverSubject,
     DurableStateReadback,
@@ -526,3 +528,83 @@ def valid_cutover_read_adapter_resolver(
             else runtime_configuration
         ),
     )
+
+
+EXPECTED_CHECK_IDS = (
+    "source_writer",
+    "legacy_quiescence",
+    "durable_state",
+    "writer_and_lease",
+    "production_paths",
+    "runtime_configuration",
+    "package_installation",
+)
+
+
+def write_valid_bundle(path: Path, *, running_v2: bool = False) -> Path:
+    from dataclasses import asdict, replace
+    from gwo_v8._canonical import canonical_bytes, digest_value
+    from gwo_v8.cutover_guard import (
+        CutoverReadbackBundle,
+        READBACK_BUNDLE_SCHEMA,
+    )
+
+    harness = GuardHarness.valid()
+    if running_v2:
+        harness.legacy.value = replace(
+            harness.legacy.value,
+            v2_execution_refs=("v2:running",),
+            v2_execution_state="running",
+        )
+        legacy_body = asdict(harness.legacy.value)
+        legacy_body.pop("readback_digest")
+        harness.legacy.value = replace(
+            harness.legacy.value,
+            readback_digest=digest_value(legacy_body),
+        )
+    bundle = CutoverReadbackBundle(
+        schema=READBACK_BUNDLE_SCHEMA,
+        subject=harness.subject,
+        legacy=harness.legacy.value,
+        durable_state=harness.durable.value,
+        writer_fence=harness.writer.value,
+        ownership=harness.ownership.value,
+        compatibility=harness.compatibility.value,
+        runtime=harness.runtime.value,
+        packages=harness.packages.value,
+    )
+    path.write_bytes(canonical_bytes(bundle.canonical()))
+    return path
+
+
+class RecordingGuard:
+    def __init__(self, sources: CutoverGuardSources, calls: list[str]) -> None:
+        self._sources = sources
+        self._calls = calls
+
+    def evaluate(self, subject: CutoverSubject) -> CutoverGuardReport:
+        self._calls.append("evaluate")
+        return CutoverGuard(self._sources).evaluate(subject)
+
+
+class RecordingLiveHost:
+    def __init__(self, subject: CutoverSubject, calls: list[str]) -> None:
+        self._subject = subject
+        self._calls = calls
+
+    def check(self, subject: CutoverSubject) -> CutoverGuardReport:
+        self._calls.append("check")
+        if subject != self._subject:
+            raise AssertionError("live factory received a different subject")
+        harness = GuardHarness.valid()
+        compatibility = replace(
+            harness.compatibility.value,
+            source_tree_digest=subject.source_tree_digest,
+        )
+        compatibility_body = asdict(compatibility)
+        compatibility_body.pop("readback_digest")
+        harness.compatibility.value = replace(
+            compatibility,
+            readback_digest=digest_value(compatibility_body),
+        )
+        return CutoverGuard(harness.sources).evaluate(subject)
