@@ -12,6 +12,11 @@ import re
 from typing import Any, Callable, Literal, Mapping, Protocol
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
+from .runtime_gateway import (
+    RuntimeConfiguration,
+    RuntimeSelector,
+    _runtime_configuration_canonical,
+)
 
 
 GUARD_SCHEMA = "gwo.cutover-guard.v1"
@@ -424,6 +429,84 @@ class RuntimePreflightReadback(_CanonicalValue):
             "persistence_write_refs": list(self.persistence_write_refs),
             "readback_digest": self.readback_digest,
         }
+
+
+class RuntimeConfigurationReader:
+    def __init__(self, configuration: RuntimeConfiguration) -> None:
+        if type(configuration) is not RuntimeConfiguration:
+            raise CutoverGuardError(
+                "CUTOVER_RUNTIME_CONFIGURATION_INVALID",
+                "Runtime configuration is not one exact immutable host value",
+            )
+        self._configuration = configuration
+
+    def read(
+        self,
+        repository: str,
+        selectors: tuple[str, ...],
+    ) -> RuntimePreflightReadback:
+        try:
+            configuration_digest = digest_value(
+                _runtime_configuration_canonical(self._configuration)
+            )
+            repository_mappings = self._configuration.repository_mappings.get(
+                repository, {}
+            )
+            resolved: list[RuntimeSelectorReadback] = []
+            for selector_text in selectors:
+                selector = RuntimeSelector(selector_text)
+                mapping = repository_mappings.get(selector)
+                source = "repository"
+                if mapping is None:
+                    mapping = self._configuration.host_mappings.get(selector)
+                    source = "host_global"
+                if mapping is None:
+                    raise ValueError(f"missing Runtime mapping for {selector_text}")
+                primary = self._configuration.profiles.get(mapping.primary_profile_digest)
+                if primary is None or primary.digest != mapping.primary_profile_digest:
+                    raise ValueError(f"invalid primary Profile for {selector_text}")
+                fallback_digest = mapping.availability_fallback_profile_digest
+                fallback = (
+                    None
+                    if fallback_digest is None
+                    else self._configuration.profiles.get(fallback_digest)
+                )
+                if fallback_digest is not None and (
+                    fallback is None or fallback.digest != fallback_digest
+                ):
+                    raise ValueError(f"invalid fallback Profile for {selector_text}")
+                resolved.append(
+                    RuntimeSelectorReadback(
+                        selector=selector.value,
+                        profile_digest=primary.digest,
+                        fallback_profile_digest=(
+                            None if fallback is None else fallback.digest
+                        ),
+                        configuration_source=source,
+                    )
+                )
+            values = {
+                "repository": repository,
+                "selectors": tuple(resolved),
+                "configuration_digest": configuration_digest,
+                "provider_action_refs": (),
+                "persistence_write_refs": (),
+            }
+            digest_values = {
+                **values,
+                "selectors": [item.canonical() for item in resolved],
+            }
+            return RuntimePreflightReadback(
+                **values,
+                readback_digest=digest_value(digest_values),
+            )
+        except Exception as error:
+            if isinstance(error, CutoverGuardError):
+                raise
+            raise CutoverGuardError(
+                "CUTOVER_RUNTIME_CONFIGURATION_INVALID",
+                "required Runtime selector mapping or Profile identity is invalid",
+            ) from error
 
 
 @dataclass(frozen=True)

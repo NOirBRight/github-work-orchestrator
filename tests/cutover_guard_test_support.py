@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from gwo_v8._canonical import digest_value
 
@@ -20,6 +21,13 @@ from gwo_v8.cutover_guard import (
     DEFAULT_FORBIDDEN_PRODUCTION_REFS,
     REQUIRED_RUNTIME_SELECTORS,
 )
+from gwo_v8.plan_control_host import (
+    ProductionCutoverGuardHost,
+    ProductionCutoverReadAdapterResolver,
+    install_cutover_guard,
+)
+from gwo_v8.runtime_gateway import ProfileMapping, RuntimeConfiguration, RuntimeGateway
+from gwo_v8.runtime_profile import RuntimeProfile
 
 
 class MutationTripwire:
@@ -251,3 +259,98 @@ class GuardHarness:
 
     def mutation_calls(self) -> tuple[str, ...]:
         return tuple(self._tripwire.calls)
+
+
+def valid_runtime_configuration() -> RuntimeConfiguration:
+    profile = RuntimeProfile(
+        name="test-profile",
+        provider="test-provider",
+        model="test-model",
+        thinking="standard",
+        mode="batch",
+        features={},
+    )
+    mapping = {
+        selector: ProfileMapping(profile.digest)
+        for selector in REQUIRED_RUNTIME_SELECTORS
+    }
+    return RuntimeConfiguration(
+        profiles={profile.digest: profile},
+        host_mappings=mapping,
+        repository_mappings={"owner/repo": mapping},
+    )
+
+
+def runtime_configuration_without(selector: str) -> RuntimeConfiguration:
+    configuration = valid_runtime_configuration()
+    host_mappings = {
+        key: value
+        for key, value in configuration.host_mappings.items()
+        if getattr(key, "value", key) != selector
+    }
+    repository_mappings = {
+        repository: {
+            key: value
+            for key, value in mappings.items()
+            if getattr(key, "value", key) != selector
+        }
+        for repository, mappings in configuration.repository_mappings.items()
+    }
+    return RuntimeConfiguration(
+        profiles=dict(configuration.profiles),
+        host_mappings=host_mappings,
+        repository_mappings=repository_mappings,
+    )
+
+
+def forbidden_runtime_gateway_constructor(*_args: object, **_kwargs: object) -> None:
+    raise AssertionError("RuntimeConfigurationReader constructed RuntimeGateway")
+
+
+def forbidden_sqlite_connect(*_args: object, **_kwargs: object) -> None:
+    raise AssertionError("RuntimeConfigurationReader opened SQLite")
+
+
+class _StartHostReadbackDouble:
+    def __init__(self) -> None:
+        self.read_active = object()
+        self.start = object()
+
+    def install_cutover_guard(
+        self,
+        *,
+        sources: CutoverGuardSources,
+    ) -> ProductionCutoverGuardHost:
+        return install_cutover_guard(sources=sources)
+
+
+def valid_production_start_host(_tmp_path: Path) -> _StartHostReadbackDouble:
+    return _StartHostReadbackDouble()
+
+
+class MutatingLegacyReader:
+    def read(self, repository: str) -> LegacyReadback:
+        return GuardHarness.valid().legacy.read(repository)
+
+    def stop(self, repository: str) -> None:
+        raise AssertionError(f"unexpected stop({repository})")
+
+    def restore(self, repository: str) -> None:
+        raise AssertionError(f"unexpected restore({repository})")
+
+
+def valid_cutover_read_adapter_resolver(
+    runtime_configuration: RuntimeConfiguration | None = None,
+) -> ProductionCutoverReadAdapterResolver:
+    harness = GuardHarness.valid()
+    return ProductionCutoverReadAdapterResolver(
+        legacy=harness.legacy,
+        durable_state=harness.durable,
+        writer_fence=harness.writer,
+        ownership=harness.ownership,
+        runtime_configuration=(
+            valid_runtime_configuration()
+            if runtime_configuration is None
+            else runtime_configuration
+        ),
+    )

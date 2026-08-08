@@ -15,6 +15,8 @@ import sqlite3
 
 import pytest
 
+from tests.cutover_guard_test_support import valid_cutover_read_adapter_resolver
+
 from gwo_v8._canonical import digest_value
 from gwo_v8.batch_integrator import (
     BatchDeliveryAction,
@@ -2485,6 +2487,9 @@ def make_recording_plan_control_start_host(
         gateway_store_path=root / "runtime-gateway.sqlite3",
         artifact_root=root / "artifacts",
         _gateway_builder=runtime_factory.build,
+        cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(
+            runtime_factory.runtime_configuration
+        ),
     )
 
 @dataclass

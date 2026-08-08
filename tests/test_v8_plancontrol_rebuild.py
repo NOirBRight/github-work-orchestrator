@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.cutover_guard_test_support import valid_cutover_read_adapter_resolver
+
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -1407,6 +1409,7 @@ def test_installed_public_start_persists_exact_runtime_overrides_outside_planspe
         gateway_store_path=tmp_path / "gateway.json",
         artifact_root=tmp_path / "artifacts",
         _gateway_builder=gateway_builder,
+        cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
     )
     options = {
         "coordinator": {
@@ -1501,6 +1504,7 @@ def test_public_start_binds_explicit_empty_runtime_assertion_after_preflight(
         gateway_store_path=tmp_path / "gateway.json",
         artifact_root=tmp_path / "artifacts",
         _gateway_builder=builder,
+        cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
     )
 
     handle = host.start("owner/repository", ["issue:109"])
@@ -1544,6 +1548,7 @@ def test_production_start_host_forwards_only_exact_active_plan_readback(tmp_path
         gateway_store_path=tmp_path / "gateway.json",
         artifact_root=tmp_path / "artifacts",
         _gateway_builder=builder,
+        cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
     )
     handle = host.start("owner/repository", ["issue:109"])
     active = host.read_active(handle)
@@ -1599,6 +1604,7 @@ def test_public_start_never_binds_runtime_assertion_before_exact_preflight(
         gateway_store_path=tmp_path / "gateway.json",
         artifact_root=tmp_path / "artifacts",
         _gateway_builder=builder,
+        cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
     )
     options = {
         "coordinator": {
@@ -1908,6 +1914,7 @@ def test_production_github_installer_builds_real_source_and_durable_repository(
         _issue_client=issue_client,
         _writer_control=_WriterGeneration(),
         _gateway_builder=gateway_builder,
+        cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
     )
 
     options = {
