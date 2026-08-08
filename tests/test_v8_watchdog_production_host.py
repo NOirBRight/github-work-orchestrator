@@ -431,7 +431,11 @@ def test_reinstall_rebuilds_lost_due_work_without_native_callback(
     ) as advance_spy:
         outcomes = restarted.run_once(due_now.isoformat())
     assert len(outcomes) == 1
-    advance_spy.assert_called_once_with(public_successor.handle, None)
+    expected_wake_ref = (
+        f"watchdog:due:1:{public_successor.handle.repository}:"
+        f"{public_successor.handle.campaign_key}:{expected_due[0]}"
+    )
+    advance_spy.assert_called_once_with(public_successor.handle, expected_wake_ref)
 
 
 def test_older_runtime_callback_after_newer_is_a_noop(

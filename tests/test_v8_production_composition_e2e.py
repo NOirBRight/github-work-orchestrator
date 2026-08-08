@@ -29,6 +29,30 @@ def test_watchdog_runtime_wake_calls_the_same_public_advance_path(composition_ha
     ]
 
 
+def test_install_replaces_an_external_watchdog_advancer_with_the_public_host_path(
+    composition_harness,
+):
+    supplied_advancer = composition_harness.watchdog_advancer
+
+    assert composition_harness.watchdog._advancer is not supplied_advancer
+
+    composition_harness.publish_runtime_wake(
+        cursor="42",
+        stable_action_id="action:110",
+    )
+    composition_harness.host.run_watchdog_once(
+        "2026-08-03T10:00:00+00:00"
+    )
+
+    assert supplied_advancer.calls == []
+    assert composition_harness.advance_calls == [
+        (
+            composition_harness.handle,
+            "watchdog:runtime:42:action:110",
+        )
+    ]
+
+
 def test_lost_batch_callback_is_recovered_from_next_check_at_after_restart(
     composition_harness,
 ):

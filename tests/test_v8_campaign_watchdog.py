@@ -1,7 +1,9 @@
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -290,7 +292,98 @@ def test_restart_rebuilds_overdue_campaign_and_calls_advance_once(tmp_path):
     outcomes = restarted.run_once("2026-08-03T10:00:00+00:00")
 
     assert len(outcomes) == 1
-    assert advancer.calls == [(handle(), None)]
+    expected_source_identity = (
+        f"{handle().repository}:{handle().campaign_key}:"
+        "2026-08-03T09:59:00+00:00"
+    )
+    assert advancer.calls == [
+        (handle(), f"watchdog:due:1:{expected_source_identity}")
+    ]
+
+
+def test_due_work_is_persisted_as_a_stable_watchdog_wake(tmp_path):
+    due_at = "2026-08-03T09:59:00+00:00"
+    campaigns = RecordingCampaignSource(
+        {handle(): make_snapshot(next_check_at=due_at)}
+    )
+    advancer = RecordingAdvancer()
+    watchdog = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+        advancer=advancer,
+    )
+    watchdog.rebuild_due_queue()
+
+    watchdog.run_once(NOW)
+
+    expected_source_identity = f"{handle().repository}:{handle().campaign_key}:{due_at}"
+    expected_wake_ref = f"watchdog:due:1:{expected_source_identity}"
+    assert advancer.calls == [(handle(), expected_wake_ref)]
+    with sqlite3.connect(tmp_path / "watchdog.db") as connection:
+        assert connection.execute(
+            "SELECT wake_ref, cursor, repository, campaign_key, source, "
+            "source_identity FROM v8_watchdog_wakes"
+        ).fetchall() == [
+            (
+                expected_wake_ref,
+                "1",
+                "owner/repo",
+                handle().campaign_key,
+                "due",
+                expected_source_identity,
+            )
+        ]
+
+
+def test_due_wake_pending_row_replays_immediately_after_dispatch_crash(tmp_path):
+    due_at = "2026-08-03T09:59:00+00:00"
+    campaigns = RecordingCampaignSource(
+        {handle(): make_snapshot(next_check_at=due_at)}
+    )
+
+    class CrashOnceAdvancer(RecordingAdvancer):
+        def __init__(self):
+            super().__init__()
+            self.fail_once = True
+
+        def advance(self, campaign, wake_ref=None):
+            if self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("crash before due wake dispatch")
+            return super().advance(campaign, wake_ref)
+
+    advancer = CrashOnceAdvancer()
+    first = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+        advancer=advancer,
+    )
+    first.rebuild_due_queue()
+
+    with pytest.raises(RuntimeError, match="crash before due wake dispatch"):
+        first.run_once(NOW)
+
+    expected_source_identity = f"{handle().repository}:{handle().campaign_key}:{due_at}"
+    expected_wake_ref = f"watchdog:due:1:{expected_source_identity}"
+    with sqlite3.connect(tmp_path / "watchdog.db") as connection:
+        assert connection.execute(
+            "SELECT wake_ref FROM v8_watchdog_pending_wakes"
+        ).fetchall() == [(expected_wake_ref,)]
+
+    restarted = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+        advancer=advancer,
+    )
+    assert len(restarted.run_once(NOW)) == 1
+    assert advancer.calls == [(handle(), expected_wake_ref)]
+    with sqlite3.connect(tmp_path / "watchdog.db") as connection:
+        assert connection.execute(
+            "SELECT wake_ref FROM v8_watchdog_pending_wakes"
+        ).fetchall() == []
 
 
 def test_due_work_orders_by_timestamp_then_campaign_and_rebuilds_after_advance(tmp_path):
@@ -429,6 +522,8 @@ def test_concurrent_watchdogs_claim_overdue_campaign_once(tmp_path):
         campaign_source=campaigns,
         advancer=second_advancer,
     )
+    first._claim_owner = "owner:first"
+    second._claim_owner = "owner:second"
     first.rebuild_due_queue()
 
     first_outcomes = []
@@ -453,5 +548,164 @@ def test_concurrent_watchdogs_claim_overdue_campaign_once(tmp_path):
     assert first_errors == []
     assert len(first_outcomes) == 1
     assert second_outcomes == ()
-    assert first_advancer.calls == [(handle(), None)]
+    expected_source_identity = (
+        f"{handle().repository}:{handle().campaign_key}:"
+        "2026-08-03T09:59:00+00:00"
+    )
+    assert first_advancer.calls == [
+        (handle(), f"watchdog:due:1:{expected_source_identity}")
+    ]
     assert second_advancer.calls == []
+
+
+def test_release_due_claim_failure_releases_the_process_lock(tmp_path):
+    first = make_watchdog(tmp_path, source=RecordingWakeSource([]))
+    second = make_watchdog(tmp_path, source=RecordingWakeSource([]))
+    assert first._try_acquire_due_lock(handle())
+
+    with sqlite3.connect(first._store_path) as connection:
+        connection.execute(
+            "INSERT INTO v8_watchdog_due_claims "
+            "(repository, campaign_key, claim_token, claimed_until) "
+            "VALUES (?, ?, ?, ?)",
+            (handle().repository, handle().campaign_key, "claim:release", NOW),
+        )
+        connection.execute(
+            "CREATE TRIGGER fail_due_claim_release "
+            "BEFORE DELETE ON v8_watchdog_due_claims "
+            "BEGIN SELECT RAISE(ABORT, 'forced release failure'); END"
+        )
+
+    try:
+        with pytest.raises(CampaignWatchdogError) as raised:
+            first._release_due_claim(handle(), "claim:release")
+
+        assert raised.value.code == "WATCHDOG_STORE_INVALID"
+        assert second._try_acquire_due_lock(handle())
+    finally:
+        first._release_due_lock(handle())
+        second._release_due_lock(handle())
+
+
+def test_ack_due_claim_failure_releases_the_process_lock(tmp_path):
+    campaigns = RecordingCampaignSource(
+        {handle(): make_snapshot(next_check_at="2026-08-03T09:59:00+00:00")}
+    )
+    first = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+    )
+    second = make_watchdog(
+        tmp_path,
+        source=RecordingWakeSource([]),
+        campaign_source=campaigns,
+    )
+    first.rebuild_due_queue()
+    claims = first._claim_due_work(NOW)
+    assert claims
+    claimed_handle, claim_token = claims[0]
+
+    with sqlite3.connect(first._store_path) as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_due_ack "
+            "BEFORE DELETE ON v8_watchdog_due "
+            "BEGIN SELECT RAISE(ABORT, 'forced acknowledgement failure'); END"
+        )
+
+    try:
+        with pytest.raises(CampaignWatchdogError) as raised:
+            first._ack_due_claim(claimed_handle, claim_token)
+
+        assert raised.value.code == "WATCHDOG_STORE_INVALID"
+        assert second._try_acquire_due_lock(handle())
+    finally:
+        first._release_due_lock(handle())
+        second._release_due_lock(handle())
+
+
+def test_due_lock_is_exclusive_across_processes_and_releases_on_exit(tmp_path):
+    store_path = tmp_path / "watchdog.db"
+    make_watchdog(tmp_path, source=RecordingWakeSource([]))
+    competitor = make_watchdog(tmp_path, source=RecordingWakeSource([]))
+    ready_path = tmp_path / "child-ready"
+    child_script = """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[2])
+
+from gwo_v8.campaign_watchdog import CampaignWatchdog
+from gwo_v8.plan_control import CampaignHandle
+
+
+class EventSource:
+    def read(self, after_cursor):
+        raise AssertionError("event source should not be read")
+
+
+class CampaignSource:
+    def active_campaigns(self):
+        return ()
+
+    def watchdog_snapshot(self, handle):
+        raise AssertionError("campaign source should not be read")
+
+
+class Advancer:
+    def advance(self, handle, wake_ref=None):
+        raise AssertionError("advancer should not be called")
+
+
+watchdog = CampaignWatchdog(
+    store_path=Path(sys.argv[1]),
+    event_sources={"runtime_gateway": EventSource()},
+    campaign_source=CampaignSource(),
+    advancer=Advancer(),
+)
+campaign = CampaignHandle("owner/repo", "campaign:watchdog-test")
+if not watchdog._try_acquire_due_lock(campaign):
+    raise SystemExit("child could not acquire due lock")
+Path(sys.argv[3]).write_text("acquired", encoding="ascii")
+sys.stdin.read()
+"""
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            child_script,
+            str(store_path),
+            str(SCRIPTS),
+            str(ready_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    try:
+        deadline = time.monotonic() + 5
+        while not ready_path.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        if not ready_path.exists():
+            stdout, stderr = process.communicate(timeout=5)
+            pytest.fail(
+                f"child did not acquire due lock: stdout={stdout!r}, stderr={stderr!r}"
+            )
+
+        assert not competitor._try_acquire_due_lock(handle())
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=5)
+        competitor._release_due_lock(handle())
+
+    assert competitor._try_acquire_due_lock(handle())
+    competitor._release_due_lock(handle())

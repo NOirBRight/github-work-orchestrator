@@ -2315,6 +2315,17 @@ class ProductionCompositionHarness:
             writer_generation_reader=writer_generation_reader,
         )
         watchdog_advancer.host = host
+        advance_calls: list[tuple[CampaignHandle, str | None]] = []
+        public_advance = host.advance
+
+        def record_public_advance(
+            campaign_handle: CampaignHandle,
+            wake_ref: str | None = None,
+        ) -> CampaignOutcome:
+            advance_calls.append((campaign_handle, wake_ref))
+            return public_advance(campaign_handle, wake_ref)
+
+        host.advance = record_public_advance  # type: ignore[method-assign]
         campaign_source.host = host
         repository = "owner/isolated-composition"
         ready_refs = ("issue:109",)
@@ -2335,7 +2346,7 @@ class ProductionCompositionHarness:
             handle=handle,
             target=target_path,
             batch=batch,
-            advance_calls=watchdog_advancer.calls,
+            advance_calls=advance_calls,
             runtime_wake_source=runtime_wake_source,
             hosted_check_source=hosted_check_source,
             watchdog_advancer=watchdog_advancer,

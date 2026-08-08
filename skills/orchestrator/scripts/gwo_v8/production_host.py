@@ -163,7 +163,10 @@ class ProductionGwoHost:
             writer_generation_reader=writer_generation_reader,
             target_path=target,
         )
-        if getattr(watchdog, "_advancer", None) is kernel:
+        bind_advancer = getattr(watchdog, "bind_advancer", None)
+        if callable(bind_advancer):
+            bind_advancer(_ForwardingWatchdogAdvancer(host))
+        elif getattr(watchdog, "_advancer", None) is kernel:
             watchdog._advancer = _ForwardingWatchdogAdvancer(host)
         return host
 
