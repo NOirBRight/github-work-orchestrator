@@ -15,6 +15,7 @@ from gwo_v8._canonical import digest_value
 from gwo_v8.cutover_guard import CutoverGuardError, REQUIRED_RUNTIME_SELECTORS
 from gwo_v8.plan_control_host import (
     PlanControlError,
+    ProductionCutoverReadAdapterResolver,
     RuntimeConfigurationReader,
     install_cutover_guard,
 )
@@ -99,3 +100,19 @@ def test_guard_host_rejects_a_source_object_with_mutating_surfaces():
         install_cutover_guard(sources=harness.sources)
 
     assert error.value.code == "CUTOVER_GUARD_COMPOSITION_INVALID"
+
+
+def test_guard_resolver_rejects_a_mutating_read_adapter_instead_of_wrapping_it():
+    harness = GuardHarness.valid()
+
+    with pytest.raises(PlanControlError) as error:
+        ProductionCutoverReadAdapterResolver(
+            legacy=MutatingLegacyReader(),
+            durable_state=harness.durable,
+            writer_fence=harness.writer,
+            ownership=harness.ownership,
+            runtime_configuration=valid_runtime_configuration(),
+        )
+
+    assert error.value.code == "CUTOVER_GUARD_COMPOSITION_INVALID"
+    assert harness.mutation_calls() == ()

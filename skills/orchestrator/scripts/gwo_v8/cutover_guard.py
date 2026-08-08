@@ -49,6 +49,13 @@ DEFAULT_FORBIDDEN_PRODUCTION_REFS = (
     "skills/implement-gwo:LocalPlanPublication",
     "skills/implement-gwo:Kernel.reconcile_once",
 )
+REQUIRED_PRODUCTION_ENTRY_REFS = (
+    "gwo_v8.plan_control_host:ProductionPlanControlStartHost.start",
+    "gwo_v8.execution_kernel:advance",
+    "gwo_v8.execution_kernel:inspect",
+)
+REQUIRED_PACKAGE_NAMES = ("implement-gwo", "orchestrator")
+REQUIRED_INSTALL_SURFACES = (".agents", ".codex", ".claude")
 READBACK_BUNDLE_SCHEMA = "gwo.cutover-readback-bundle.v1"
 
 
@@ -85,6 +92,7 @@ def _tuple_fields(
     names: tuple[str, ...],
     *,
     item_type: type = str,
+    canonical_order: bool = True,
 ) -> None:
     for name in names:
         items = getattr(value, name)
@@ -92,6 +100,12 @@ def _tuple_fields(
             raise TypeError(
                 f"{expected.__name__}.{name} must be an exact tuple of "
                 f"{item_type.__name__}"
+            )
+        if canonical_order and (
+            len(set(items)) != len(items) or items != tuple(sorted(items))
+        ):
+            raise TypeError(
+                f"{expected.__name__}.{name} must be unique and canonically ordered"
             )
 
 
@@ -124,8 +138,8 @@ class CutoverSubject(_CanonicalValue):
     production_entry_refs: tuple[str, ...]
     forbidden_production_refs: tuple[str, ...] = DEFAULT_FORBIDDEN_PRODUCTION_REFS
     required_runtime_selectors: tuple[str, ...] = REQUIRED_RUNTIME_SELECTORS
-    package_names: tuple[str, ...] = ("implement-gwo", "orchestrator")
-    install_surfaces: tuple[str, ...] = (".agents", ".codex", ".claude")
+    package_names: tuple[str, ...] = REQUIRED_PACKAGE_NAMES
+    install_surfaces: tuple[str, ...] = REQUIRED_INSTALL_SURFACES
 
     def __post_init__(self) -> None:
         _text_fields(
@@ -152,6 +166,7 @@ class CutoverSubject(_CanonicalValue):
                 "package_names",
                 "install_surfaces",
             ),
+            canonical_order=False,
         )
 
     def canonical(self) -> dict[str, Any]:
@@ -540,6 +555,43 @@ class PackageIdentity(_CanonicalValue):
         }
 
 
+def _runtime_selector_tuple(items: object) -> None:
+    if type(items) is not tuple or any(
+        type(item) is not RuntimeSelectorReadback for item in items
+    ):
+        raise TypeError("RuntimePreflightReadback.selectors must be an exact tuple")
+    names = tuple(item.selector for item in items)
+    if names and names != REQUIRED_RUNTIME_SELECTORS:
+        raise TypeError(
+            "RuntimePreflightReadback.selectors must use the required canonical order"
+        )
+
+
+def _package_identity_tuple(items: object, label: str) -> None:
+    if type(items) is not tuple or any(
+        type(item) is not PackageIdentity for item in items
+    ):
+        raise TypeError(f"PackageReadback.{label} must be an exact tuple")
+    keys = tuple(_package_identity_sort_key(item) for item in items)
+    if len(set(keys)) != len(keys) or keys != tuple(sorted(keys)):
+        raise TypeError(
+            f"PackageReadback.{label} must be unique and canonically ordered"
+        )
+
+
+def _package_identity_sort_key(item: PackageIdentity) -> tuple[int, str]:
+    return (
+        -1
+        if item.install_surface is None
+        else (
+            REQUIRED_INSTALL_SURFACES.index(item.install_surface)
+            if item.install_surface in REQUIRED_INSTALL_SURFACES
+            else len(REQUIRED_INSTALL_SURFACES)
+        ),
+        item.package_name,
+    )
+
+
 @dataclass(frozen=True)
 class PackageReadback(_CanonicalValue):
     source_packages: tuple[PackageIdentity, ...]
@@ -548,14 +600,8 @@ class PackageReadback(_CanonicalValue):
     readback_digest: str
 
     def __post_init__(self) -> None:
-        if type(self.source_packages) is not tuple or any(
-            type(item) is not PackageIdentity for item in self.source_packages
-        ):
-            raise TypeError("PackageReadback.source_packages must be an exact tuple")
-        if type(self.installed_packages) is not tuple or any(
-            type(item) is not PackageIdentity for item in self.installed_packages
-        ):
-            raise TypeError("PackageReadback.installed_packages must be an exact tuple")
+        _package_identity_tuple(self.source_packages, "source_packages")
+        _package_identity_tuple(self.installed_packages, "installed_packages")
         _tuple_fields(self, PackageReadback, ("drift",))
         _text_fields(self, PackageReadback, ("readback_digest",))
 
@@ -806,6 +852,41 @@ class CutoverGuardError(RuntimeError):
         self.detail = detail
 
 
+def _validate_c3_subject_policy(subject: CutoverSubject) -> None:
+    try:
+        _tuple_fields(
+            subject,
+            CutoverSubject,
+            (
+                "production_entry_refs",
+                "forbidden_production_refs",
+                "required_runtime_selectors",
+                "package_names",
+                "install_surfaces",
+            ),
+            canonical_order=False,
+        )
+    except (AttributeError, TypeError) as error:
+        raise CutoverGuardError(
+            "CUTOVER_SUBJECT_POLICY_INVALID",
+            "C3 subject policy tuples are not closed exact tuples",
+        ) from error
+
+    required = {
+        "production_entry_refs": REQUIRED_PRODUCTION_ENTRY_REFS,
+        "forbidden_production_refs": DEFAULT_FORBIDDEN_PRODUCTION_REFS,
+        "required_runtime_selectors": REQUIRED_RUNTIME_SELECTORS,
+        "package_names": REQUIRED_PACKAGE_NAMES,
+        "install_surfaces": REQUIRED_INSTALL_SURFACES,
+    }
+    for name, expected in required.items():
+        if getattr(subject, name) != expected:
+            raise CutoverGuardError(
+                "CUTOVER_SUBJECT_POLICY_INVALID",
+                f"{name} must equal the immutable C3 policy tuple",
+            )
+
+
 def _audited_files(root: Path) -> tuple[Path, ...]:
     candidates = [
         root / "skills" / "implement-gwo" / "SKILL.md",
@@ -838,40 +919,251 @@ class ProductionPathScanner:
         self._root = Path(package_root).resolve()
 
     def _module_path(self, module: str) -> Path:
-        return (
-            self._root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
-            / Path(*module.split(".")[1:])
-        ).with_suffix(".py")
+        parts = module.split(".")
+        if len(parts) < 2 or parts[0] != "gwo_v8" or any(
+            not part.isidentifier() for part in parts
+        ):
+            raise CutoverGuardError(
+                "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                f"production path module is not resolvable: {module}",
+            )
+        package = self._root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+        path = (package / Path(*parts[1:])).with_suffix(".py")
+        if path.is_file():
+            return path
+        return package.joinpath(*parts[1:], "__init__.py")
+
+    def _require_module(self, module: str) -> Path:
+        path = self._module_path(module)
+        if not path.is_file():
+            raise CutoverGuardError(
+                "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                f"production path module is missing: {module}",
+            )
+        return path
 
     @staticmethod
-    def _relative_imports(module: str, tree: ast.AST) -> dict[str, str]:
+    def _relative_module(
+        module: str,
+        node: ast.ImportFrom,
+        imported_name: str | None = None,
+    ) -> str:
+        parts = module.split(".")
+        package = parts[:-1]
+        if node.level > len(package):
+            raise CutoverGuardError(
+                "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                f"relative import escapes the audited package: {module}",
+            )
+        base = package[: len(package) - node.level + 1]
+        suffix = [] if node.module is None else node.module.split(".")
+        if node.module is None:
+            if imported_name is None:
+                raise CutoverGuardError(
+                    "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                    "relative package import has no resolvable member",
+                )
+            suffix = [imported_name]
+        return ".".join(base + suffix)
+
+    @staticmethod
+    def _defined_names(tree: ast.Module) -> set[str]:
+        names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Import):
+                names.update(alias.asname or alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                names.update(
+                    alias.asname or alias.name
+                    for alias in node.names
+                    if alias.name != "*"
+                )
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        return names
+
+    def _read_tree(self, module: str) -> ast.Module:
+        path = self._require_module(module)
+        try:
+            return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError, UnicodeError) as error:
+            raise CutoverGuardError(
+                "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                f"production path module cannot be read: {module}",
+            ) from error
+
+    def _relative_imports(self, module: str, tree: ast.AST) -> dict[str, str]:
         aliases: dict[str, str] = {}
         for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom) or node.level != 1:
-                continue
-            parent = module.rsplit(".", 1)[0]
-            imported_module = f"{parent}.{node.module}" if node.module else parent
-            for alias in node.names:
-                aliases[alias.asname or alias.name] = f"{imported_module}:{alias.name}"
+            if isinstance(node, ast.ImportFrom) and node.level:
+                for alias in node.names:
+                    if alias.name == "*":
+                        raise CutoverGuardError(
+                            "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                            f"wildcard alias is unresolved in {module}",
+                        )
+                    imported_module = self._relative_module(
+                        module,
+                        node,
+                        alias.name if node.module is None else None,
+                    )
+                    target_path = self._require_module(imported_module)
+                    if node.module is None:
+                        aliases[alias.asname or alias.name] = imported_module
+                        continue
+                    target_tree = self._read_tree(imported_module)
+                    if alias.name not in self._defined_names(target_tree):
+                        raise CutoverGuardError(
+                            "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                            f"import alias is unresolved: {imported_module}:{alias.name}",
+                        )
+                    del target_path
+                    aliases[alias.asname or alias.name] = (
+                        f"{imported_module}:{alias.name}"
+                    )
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and node.module == "gwo_v8"
+                or isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and node.module.startswith("gwo_v8.")
+            ):
+                for alias in node.names:
+                    if alias.name == "*":
+                        raise CutoverGuardError(
+                            "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                            f"wildcard alias is unresolved in {module}",
+                        )
+                    imported_module = node.module
+                    target_path = self._require_module(imported_module)
+                    target_tree = self._read_tree(imported_module)
+                    if alias.name not in self._defined_names(target_tree):
+                        raise CutoverGuardError(
+                            "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                            f"import alias is unresolved: {imported_module}:{alias.name}",
+                        )
+                    del target_path
+                    aliases[alias.asname or alias.name] = (
+                        f"{imported_module}:{alias.name}"
+                    )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name != "gwo_v8" and not alias.name.startswith("gwo_v8."):
+                        continue
+                    self._require_module(alias.name)
+                    aliases[alias.asname or alias.name.rsplit(".", 1)[-1]] = alias.name
         return aliases
 
     @staticmethod
-    def _ast_refs(module: str, tree: ast.AST) -> tuple[str, ...]:
-        aliases = ProductionPathScanner._relative_imports(module, tree)
+    def _attribute_ref(expression: ast.AST, aliases: Mapping[str, str]) -> str | None:
+        if isinstance(expression, ast.Name):
+            return aliases.get(expression.id)
+        if isinstance(expression, ast.Attribute):
+            base = ProductionPathScanner._attribute_ref(expression.value, aliases)
+            if base is None:
+                return None
+            if ":" in base:
+                return f"{base}.{expression.attr}"
+            return f"{base}:{expression.attr}"
+        return None
+
+    @staticmethod
+    def _contains_alias(expression: ast.AST, aliases: Mapping[str, str]) -> bool:
+        return any(
+            isinstance(node, ast.Name) and node.id in aliases
+            for node in ast.walk(expression)
+        )
+
+    def _ast_refs(self, module: str, tree: ast.AST) -> tuple[str, ...]:
+        aliases = self._relative_imports(module, tree)
+        rebound_aliases: set[str] = set()
+        for assignment in ast.walk(tree):
+            value = (
+                assignment.value
+                if isinstance(assignment, (ast.Assign, ast.AnnAssign))
+                else None
+            )
+            if not isinstance(value, ast.Name) or value.id not in aliases:
+                continue
+            targets = (
+                assignment.targets
+                if isinstance(assignment, ast.Assign)
+                else (assignment.target,)
+            )
+            rebound_aliases.update(
+                target.id for target in targets if isinstance(target, ast.Name)
+            )
         refs: set[str] = set()
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name):
+                if node.func.id in rebound_aliases:
+                    raise CutoverGuardError(
+                        "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                        f"import alias is rebound dynamically in {module}",
+                    )
+                target = aliases.get(node.func.id)
+                if target is not None:
+                    if ":" not in target:
+                        raise CutoverGuardError(
+                            "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                            f"module alias is used as a callable in {module}",
+                        )
+                    refs.add(target)
+            elif isinstance(node.func, ast.Attribute):
                 value = node.func.value
                 if (
                     isinstance(value, ast.Call)
                     and isinstance(value.func, ast.Name)
                     and value.func.id in aliases
                 ):
-                    refs.add(f"{aliases[value.func.id]}.{node.func.attr}")
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                target = aliases.get(node.func.id)
-                if target is not None:
-                    refs.add(target)
+                    target = aliases[value.func.id]
+                    if ":" not in target:
+                        raise CutoverGuardError(
+                            "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                            f"module alias call edge is unresolved in {module}",
+                        )
+                    refs.add(f"{target}.{node.func.attr}")
+                else:
+                    if (
+                        isinstance(value, ast.Name)
+                        and value.id in rebound_aliases
+                    ):
+                        raise CutoverGuardError(
+                            "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                            f"import alias is rebound dynamically in {module}",
+                        )
+                    target = self._attribute_ref(node.func, aliases)
+                    if target is not None:
+                        refs.add(target)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in {"__import__", "eval", "exec", "import_module"}
+            ) or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"__import__", "import_module"}
+            ):
+                raise CutoverGuardError(
+                    "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                    f"dynamic module edge is unresolved in {module}",
+                )
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and any(self._contains_alias(argument, aliases) for argument in node.args)
+            ):
+                raise CutoverGuardError(
+                    "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                    f"dynamic alias edge is unresolved in {module}",
+                )
         return tuple(sorted(refs))
 
     @staticmethod
@@ -883,6 +1175,17 @@ class ProductionPathScanner:
         return "legacy"
 
     def read(self, subject: CutoverSubject) -> CompatibilityPathReadback:
+        package = self._root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+        if not package.is_dir():
+            raise CutoverGuardError(
+                "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                "production path audit module root is missing",
+            )
+        if not subject.production_entry_refs:
+            raise CutoverGuardError(
+                "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                "production path audit has no entry roots",
+            )
         observed_tree = source_tree_digest(self._root)
         if observed_tree != subject.source_tree_digest:
             raise CutoverGuardError(
@@ -891,17 +1194,36 @@ class ProductionPathScanner:
             )
         forbidden = set(subject.forbidden_production_refs)
         found: set[str] = set()
-        queue = [entry.split(":", 1)[0] for entry in subject.production_entry_refs if ":" in entry]
+        queue: list[str] = []
+        for entry in subject.production_entry_refs:
+            if entry.startswith("skills/"):
+                path = self._root / entry
+                if not path.is_file():
+                    raise CutoverGuardError(
+                        "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                        f"production path entry root is missing: {entry}",
+                    )
+                continue
+            if ":" not in entry:
+                raise CutoverGuardError(
+                    "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                    f"production path entry ref is unresolved: {entry}",
+                )
+            module, symbol = entry.split(":", 1)
+            if not symbol or not module.startswith("gwo_v8."):
+                raise CutoverGuardError(
+                    "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                    f"production path entry ref is unresolved: {entry}",
+                )
+            self._require_module(module)
+            queue.append(module)
         visited: set[str] = set()
         while queue:
             module = queue.pop()
             if module in visited:
                 continue
             visited.add(module)
-            path = self._module_path(module)
-            if not path.is_file():
-                continue
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            tree = self._read_tree(module)
             for ref in self._ast_refs(module, tree):
                 target = ref.split(":", 1)[1] if ":" in ref else ""
                 if (
@@ -913,13 +1235,19 @@ class ProductionPathScanner:
                 ):
                     found.add(ref)
                 if ":" in ref and ref.split(":", 1)[0].startswith("gwo_v8."):
+                    self._require_module(ref.split(":", 1)[0])
                     queue.append(ref.split(":", 1)[0])
         for entry in subject.production_entry_refs:
             if entry.startswith("skills/"):
                 path = self._root / entry
-                if path.is_file():
+                try:
                     text = path.read_text(encoding="utf-8")
-                    found.update(ref for ref in forbidden if ref in text)
+                except (OSError, UnicodeError) as error:
+                    raise CutoverGuardError(
+                        "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                        f"production path entry root cannot be read: {entry}",
+                    ) from error
+                found.update(ref for ref in forbidden if ref in text)
         buckets = {
             "v2": tuple(sorted(ref for ref in found if self._bucket(ref) == "v2")),
             "v3": tuple(sorted(ref for ref in found if self._bucket(ref) == "v3")),
@@ -1007,6 +1335,8 @@ class ReadOnlyPackageValidator:
                         drift.add(f"installed:{surface}:{name}")
                 except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
                     drift.add(f"installed:{surface}:{name}")
+        source_packages = sorted(source_packages, key=_package_identity_sort_key)
+        installed_packages = sorted(installed_packages, key=_package_identity_sort_key)
         values = {
             "source_packages": tuple(source_packages),
             "installed_packages": tuple(installed_packages),
@@ -1233,10 +1563,7 @@ def _validate_readback_fields(name: str, value: object) -> None:
             RuntimePreflightReadback,
             ("repository", "configuration_digest", "readback_digest"),
         )
-        if type(value.selectors) is not tuple or any(
-            type(item) is not RuntimeSelectorReadback for item in value.selectors
-        ):
-            raise TypeError("runtime selectors must be an exact tuple of readbacks")
+        _runtime_selector_tuple(value.selectors)
         _tuple_fields(
             value,
             RuntimePreflightReadback,
@@ -1262,14 +1589,8 @@ def _validate_readback_fields(name: str, value: object) -> None:
         return
 
     if name == "packages":
-        if type(value.source_packages) is not tuple or any(
-            type(item) is not PackageIdentity for item in value.source_packages
-        ):
-            raise TypeError("source packages must be an exact tuple of identities")
-        if type(value.installed_packages) is not tuple or any(
-            type(item) is not PackageIdentity for item in value.installed_packages
-        ):
-            raise TypeError("installed packages must be an exact tuple of identities")
+        _package_identity_tuple(value.source_packages, "source_packages")
+        _package_identity_tuple(value.installed_packages, "installed_packages")
         _tuple_fields(value, PackageReadback, ("drift",))
         for package in value.source_packages + value.installed_packages:
             _text_fields(
@@ -1321,10 +1642,22 @@ def _exact_object(value: object, expected: set[str], label: str) -> dict[str, ob
     return value
 
 
-def _tuple_field(data: dict[str, object], name: str) -> None:
+def _tuple_field(
+    data: dict[str, object],
+    name: str,
+    *,
+    canonical_order: bool = True,
+) -> None:
     value = data[name]
     if type(value) is not list:
         raise CutoverGuardError("CUTOVER_BUNDLE_INVALID", f"{name} must be an array")
+    if canonical_order and (
+        len(set(value)) != len(value) or value != sorted(value)
+    ):
+        raise CutoverGuardError(
+            "CUTOVER_BUNDLE_INVALID",
+            f"{name} members are not unique and canonically ordered",
+        )
     data[name] = tuple(value)
 
 
@@ -1352,7 +1685,7 @@ def _decode_subject(value: object) -> CutoverSubject:
         "package_names",
         "install_surfaces",
     ):
-        _tuple_field(data, name)
+        _tuple_field(data, name, canonical_order=False)
     try:
         return CutoverSubject(**data)
     except (TypeError, ValueError) as error:
@@ -1434,7 +1767,7 @@ def _decode_runtime_inner(value: object) -> RuntimePreflightReadback:
         },
         "runtime",
     )
-    _tuple_field(data, "selectors")
+    _tuple_field(data, "selectors", canonical_order=False)
     _tuple_field(data, "provider_action_refs")
     _tuple_field(data, "persistence_write_refs")
     selectors = []
@@ -1482,8 +1815,8 @@ def _decode_package_inner(value: object) -> PackageReadback:
         {"source_packages", "installed_packages", "drift", "readback_digest"},
         "packages",
     )
-    _tuple_field(data, "source_packages")
-    _tuple_field(data, "installed_packages")
+    _tuple_field(data, "source_packages", canonical_order=False)
+    _tuple_field(data, "installed_packages", canonical_order=False)
     _tuple_field(data, "drift")
     for key in ("source_packages", "installed_packages"):
         packages = []
@@ -1675,6 +2008,7 @@ class CutoverGuard:
                 "CUTOVER_SUBJECT_INVALID",
                 "Guard subject must be one exact CutoverSubject",
             )
+        _validate_c3_subject_policy(subject)
         readbacks: dict[str, object] = {}
         read_errors: dict[str, str] = {}
         blockers: list[CutoverBlocker] = []

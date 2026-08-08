@@ -28,6 +28,7 @@ def test_cutover_without_guard_token_returns_blocked_before_any_mutation(tmp_pat
     )
 
     assert outcome.status == "blocked"
+    assert outcome.writer_generation == "v6.1"
     assert outcome.blockers == ("CUTOVER_GUARD_REQUIRED",)
     assert fixture.mutation_calls() == ()
     assert fixture.transitions.history(fixture.repository) == ()
@@ -55,6 +56,7 @@ def test_stale_guard_token_returns_blocked_before_v61_stop_or_activation(tmp_pat
     )
 
     assert outcome.status == "blocked"
+    assert outcome.writer_generation == "v6.1"
     assert outcome.blockers == ("CUTOVER_GUARD_TOKEN_STALE",)
     assert fixture.mutation_calls() == ()
     assert fixture.legacy.readback(fixture.repository).authority_state == "authoritative_quiescent"

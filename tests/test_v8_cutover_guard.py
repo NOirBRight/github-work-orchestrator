@@ -14,6 +14,7 @@ from gwo_v8.cutover_guard import (
     CutoverGuard,
     CutoverGuardError,
     CutoverReadbackBundle,
+    DEFAULT_FORBIDDEN_PRODUCTION_REFS,
     JsonCutoverReadPorts,
     READBACK_BUNDLE_SCHEMA,
 )
@@ -57,6 +58,84 @@ def test_guard_success_returns_digest_bound_read_only_receipt_without_writes():
     )
     assert harness.mutation_calls() == ()
     assert all(call_count > 0 for call_count in harness.read_call_counts().values())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("forbidden_production_refs", ()),
+        ("required_runtime_selectors", ("worker",)),
+        ("package_names", ("implement-gwo",)),
+        ("install_surfaces", (".agents", ".codex")),
+        ("production_entry_refs", ()),
+    ),
+    ids=("forbidden", "selectors", "packages", "install-surfaces", "entries"),
+)
+def test_guard_rejects_caller_controlled_c3_policy_tuples(field, value):
+    harness = GuardHarness.valid()
+    subject = replace(harness.subject, **{field: value})
+
+    with pytest.raises(CutoverGuardError) as error:
+        CutoverGuard(harness.sources).evaluate(subject)
+
+    assert error.value.code == "CUTOVER_SUBJECT_POLICY_INVALID"
+    assert harness.mutation_calls() == ()
+
+
+@pytest.mark.parametrize(
+    "members",
+    (
+        tuple(reversed(DEFAULT_FORBIDDEN_PRODUCTION_REFS)),
+        DEFAULT_FORBIDDEN_PRODUCTION_REFS + (DEFAULT_FORBIDDEN_PRODUCTION_REFS[0],),
+    ),
+    ids=("unsorted", "duplicate"),
+)
+def test_guard_rejects_unsorted_or_duplicate_closed_tuples_with_named_readback_blocker(
+    members,
+):
+    harness = GuardHarness.valid()
+    object.__setattr__(harness.compatibility.value, "proven_unreachable_refs", members)
+    body = harness.compatibility.value.canonical()
+    body.pop("readback_digest")
+    object.__setattr__(
+        harness.compatibility.value,
+        "readback_digest",
+        digest_value(body),
+    )
+
+    report = CutoverGuard(harness.sources).evaluate(harness.subject)
+
+    assert report.decision == "NO_GO"
+    assert "CUTOVER_COMPATIBILITY_READBACK_INVALID" in {
+        blocker.code for blocker in report.blockers
+    }
+
+
+@pytest.mark.parametrize(
+    "members",
+    (
+        lambda value: tuple(reversed(value)),
+        lambda value: value + (value[0],),
+    ),
+    ids=("unsorted", "duplicate"),
+)
+def test_guard_rejects_unsorted_or_duplicate_package_tuples_with_named_readback_blocker(
+    members,
+):
+    harness = GuardHarness.valid()
+    package_value = harness.packages.value
+    source_packages = members(package_value.source_packages)
+    object.__setattr__(package_value, "source_packages", source_packages)
+    body = package_value.canonical()
+    body.pop("readback_digest")
+    object.__setattr__(package_value, "readback_digest", digest_value(body))
+
+    report = CutoverGuard(harness.sources).evaluate(harness.subject)
+
+    assert report.decision == "NO_GO"
+    assert "CUTOVER_PACKAGES_READBACK_INVALID" in {
+        blocker.code for blocker in report.blockers
+    }
 
 
 def test_guard_collects_named_blockers_without_short_circuiting_or_writing():

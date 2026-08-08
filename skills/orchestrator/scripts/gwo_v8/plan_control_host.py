@@ -312,9 +312,12 @@ def _adapt_guard_read_port(
     method_names: tuple[str, ...],
 ) -> object:
     surface = _declared_surface(value)
+    if _FORBIDDEN_SOURCE_NAMES.intersection(surface):
+        raise PlanControlError(
+            "CUTOVER_GUARD_COMPOSITION_INVALID",
+            f"{label} exposes a mutating surface alongside its Guard read",
+        )
     if "read" in surface and callable(getattr(value, "read", None)):
-        if _FORBIDDEN_SOURCE_NAMES.intersection(surface):
-            return _ReadOnlyGuardAdapter(value, "read")
         return value
     for method_name in method_names:
         if method_name in surface and callable(getattr(value, method_name, None)):

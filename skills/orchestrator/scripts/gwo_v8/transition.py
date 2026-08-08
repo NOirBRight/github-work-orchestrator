@@ -17,6 +17,7 @@ from .cutover_guard import (
     CutoverGuardError,
     CutoverGuardReceipt,
     CutoverSubject,
+    EXPECTED_SOURCE_WRITER_GENERATION,
     GuardActivationValidator,
 )
 from .evidence import TypedEvidence
@@ -1432,7 +1433,7 @@ class WriterCutoverController:
         return WriterTransitionOutcome(
             status="blocked",
             repository=repository,
-            writer_generation=writer_generation,
+            writer_generation=EXPECTED_SOURCE_WRITER_GENERATION,
             record_id=f"guard-blocked:{digest_value(subject.canonical())}",
             activation_id=None,
             worker_capacity=0,

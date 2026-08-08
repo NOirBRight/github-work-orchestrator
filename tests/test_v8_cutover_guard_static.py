@@ -3,12 +3,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 for scripts_path in (ROOT / "scripts", ROOT / "skills" / "orchestrator" / "scripts"):
     if str(scripts_path) not in sys.path:
         sys.path.insert(0, str(scripts_path))
 
 from gwo_v8.cutover_guard import (  # noqa: E402
+    CutoverGuardError,
     CutoverSubject,
     ProductionPathScanner,
     ReadOnlyPackageValidator,
@@ -35,6 +38,44 @@ def test_production_path_scanner_reports_a_reachable_predecessor_edge(tmp_path):
     assert readback.reachable_legacy_writer_refs == (
         "gwo_v8.legacy:LegacyWriter.write",
     )
+
+
+def test_production_path_scanner_rejects_a_missing_entry_module_fail_closed(tmp_path):
+    package = tmp_path / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+    package.mkdir(parents=True)
+    (package / "public.py").write_text(
+        "def start():\n    return None\n",
+        encoding="utf-8",
+    )
+    subject = scanned_subject(tmp_path, ("gwo_v8.missing:start",))
+
+    with pytest.raises(CutoverGuardError) as error:
+        ProductionPathScanner(package_root=tmp_path).read(subject)
+
+    assert error.value.code == "CUTOVER_COMPATIBILITY_AUDIT_INVALID"
+
+
+def test_production_path_scanner_rejects_an_unresolved_alias_edge_fail_closed(tmp_path):
+    package = tmp_path / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+    package.mkdir(parents=True)
+    (package / "public.py").write_text(
+        "from .legacy import LegacyWriter as Writer\n\n"
+        "def start():\n"
+        "    factory = Writer\n"
+        "    return factory().write()\n",
+        encoding="utf-8",
+    )
+    (package / "legacy.py").write_text(
+        "class LegacyWriter:\n"
+        "    def write(self):\n        return None\n",
+        encoding="utf-8",
+    )
+    subject = scanned_subject(tmp_path, ("gwo_v8.public:start",))
+
+    with pytest.raises(CutoverGuardError) as error:
+        ProductionPathScanner(package_root=tmp_path).read(subject)
+
+    assert error.value.code == "CUTOVER_COMPATIBILITY_AUDIT_INVALID"
 
 
 def test_package_validator_detects_manifest_drift_without_rewriting_any_file(tmp_path):
