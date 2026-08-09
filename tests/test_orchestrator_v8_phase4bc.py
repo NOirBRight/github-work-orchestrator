@@ -99,6 +99,42 @@ class _FailFinalTransitionOnce(InMemoryWriterTransitionControl):
         super().publish(record)
 
 
+_READBACK_UNSET = object()
+
+
+class _DurableReadbackOverride:
+    def __init__(
+        self,
+        durable,
+        *,
+        current=_READBACK_UNSET,
+        receipt=_READBACK_UNSET,
+        plan=_READBACK_UNSET,
+    ):
+        self._durable = durable
+        self._current = current
+        self._receipt = receipt
+        self._plan = plan
+
+    def read_current_activation(self, repository):
+        if self._current is not _READBACK_UNSET:
+            return self._current
+        return self._durable.read_current_activation(repository)
+
+    def read_activation(self, repository, activation_id):
+        if self._receipt is not _READBACK_UNSET:
+            return self._receipt
+        return self._durable.read_activation(repository, activation_id)
+
+    def read_plan(self, repository, plan_digest):
+        if self._plan is not _READBACK_UNSET:
+            return self._plan
+        return self._durable.read_plan(repository, plan_digest)
+
+    def __getattr__(self, name):
+        return getattr(self._durable, name)
+
+
 def test_production_legacy_writer_fence_survives_restart_and_preserves_readback():
     client = _GitHubContentClient()
     observed = LegacyWriterReadback(
@@ -1760,6 +1796,283 @@ def test_rollback_recovers_from_divergent_transition_activation_identity(
     assert outcome.status == "rolled_back"
     assert outcome.activation_id == authoritative.activation_id
     assert cutover.activation_id == authoritative.activation_id
+
+
+@pytest.mark.parametrize(
+    ("invalid_identity", "expected_code"),
+    (
+        ("missing_activation", "ROLLBACK_ACTIVATION_MISSING"),
+        ("malformed_receipt", "ROLLBACK_DURABLE_IDENTITY_MISMATCH"),
+        ("mismatched_receipt", "ROLLBACK_DURABLE_IDENTITY_MISMATCH"),
+        ("missing_plan", "ROLLBACK_DURABLE_IDENTITY_MISMATCH"),
+    ),
+)
+def test_rollback_rejects_invalid_durable_identity_before_transition_mutation(
+    tmp_path,
+    invalid_identity,
+    expected_code,
+):
+    (
+        compiled,
+        durable,
+        transitions,
+        publication,
+        controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
+    controller.cutover(
+        compiled,
+        canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
+        writer_generation="v8-generation-1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+    )
+    authoritative = durable.read_current_activation(compiled.repository)
+    assert authoritative is not None
+    if invalid_identity == "missing_activation":
+        publication.durable = _DurableReadbackOverride(durable, current=None)
+    elif invalid_identity == "malformed_receipt":
+        publication.durable = _DurableReadbackOverride(
+            durable,
+            current=replace(authoritative, plan_digest="malformed"),
+        )
+    elif invalid_identity == "mismatched_receipt":
+        publication.durable = _DurableReadbackOverride(
+            durable,
+            receipt=replace(authoritative, activation_id="activation:other"),
+        )
+    else:
+        publication.durable = _DurableReadbackOverride(durable, plan=None)
+
+    before = transitions.history(compiled.repository)
+    with pytest.raises(ActivationError) as error:
+        controller.rollback(
+            repository=compiled.repository,
+            ownership=InMemoryV8OwnershipControl(
+                V8OwnershipReadback(
+                    active_admissions=(),
+                    active_attempts=(),
+                    integration_lease=False,
+                    runtime_resources=(),
+                )
+            ),
+            restore_writer_generation="v6.1",
+            reason="reject invalid durable rollback identity",
+        )
+
+    assert error.value.code == expected_code
+    assert transitions.history(compiled.repository) == before
+
+
+def test_rollback_rejects_mismatched_local_active_plan_before_transition_mutation(
+    tmp_path,
+):
+    (
+        compiled,
+        durable,
+        transitions,
+        publication,
+        controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
+    controller.cutover(
+        compiled,
+        canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
+        writer_generation="v8-generation-1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+    )
+    authoritative = durable.read_current_activation(compiled.repository)
+    authoritative_record = durable.read_plan(
+        compiled.repository,
+        compiled.digest,
+    )
+    assert authoritative is not None
+    assert authoritative_record is not None
+    divergent = _compiled(count=4)
+    local_durable = InMemoryDurablePlanControl()
+    local_durable.publish_plan(authoritative_record)
+    local_durable.publish_activation(
+        authoritative,
+        expected_previous_digest=None,
+    )
+    LocalPlanPublication(
+        publication.store_path,
+        durable=local_durable,
+    ).publish_and_activate(
+        divergent,
+        expected_active_digest=authoritative.plan_digest,
+        writer_generation=authoritative.writer_generation,
+    )
+    publication.durable = durable
+
+    before = transitions.history(compiled.repository)
+    with pytest.raises(ActivationError) as error:
+        controller.rollback(
+            repository=compiled.repository,
+            ownership=InMemoryV8OwnershipControl(
+                V8OwnershipReadback(
+                    active_admissions=(),
+                    active_attempts=(),
+                    integration_lease=False,
+                    runtime_resources=(),
+                )
+            ),
+            restore_writer_generation="v6.1",
+            reason="reject mismatched local rollback identity",
+        )
+
+    assert error.value.code == "ROLLBACK_LOCAL_IDENTITY_MISMATCH"
+    assert transitions.history(compiled.repository) == before
+
+
+def test_rollback_rejects_mismatched_local_pending_reservation_before_drain(
+    tmp_path,
+):
+    (
+        compiled,
+        durable,
+        transitions,
+        publication,
+        controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
+    controller.cutover(
+        compiled,
+        canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
+        writer_generation="v8-generation-1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+    )
+    authoritative = durable.read_current_activation(compiled.repository)
+    assert authoritative is not None
+    divergent = _compiled(count=4)
+
+    def fail_after_pending_reservation(checkpoint):
+        if checkpoint == "pending_reserved":
+            raise RuntimeError("simulated pending reservation crash")
+
+    pending_publication = LocalPlanPublication(
+        publication.store_path,
+        durable=InMemoryDurablePlanControl(),
+        checkpoint=fail_after_pending_reservation,
+    )
+    with pytest.raises(RuntimeError, match="pending reservation"):
+        pending_publication.publish_and_activate(
+            divergent,
+            expected_active_digest=authoritative.plan_digest,
+            writer_generation=authoritative.writer_generation,
+        )
+
+    current = transitions.read_current(compiled.repository)
+    current_record = transitions.read(compiled.repository, current.record_id)
+    assert current_record is not None
+    transitions.publish(
+        replace(
+            current_record,
+            record_id="writer-transition:pending-local-divergence",
+            kind="cutover_pending",
+            status="pending",
+            activation_id=None,
+            plan_digest=divergent.digest,
+            worker_capacity=0,
+            coordinator_capacity=0,
+            reason=None,
+        )
+    )
+    before = transitions.history(compiled.repository)
+    with pytest.raises(ActivationError) as error:
+        controller.rollback(
+            repository=compiled.repository,
+            ownership=InMemoryV8OwnershipControl(
+                V8OwnershipReadback(
+                    active_admissions=(),
+                    active_attempts=(),
+                    integration_lease=False,
+                    runtime_resources=(),
+                )
+            ),
+            restore_writer_generation="v6.1",
+            reason="reject mismatched pending rollback identity",
+        )
+
+    assert error.value.code == "PENDING_FINALIZE_LOCAL_MISMATCH"
+    assert transitions.history(compiled.repository) == before
+
+
+@pytest.mark.parametrize("github", (False, True))
+def test_rollback_rejects_transition_writer_generation_divergence_before_correction(
+    tmp_path,
+    github,
+):
+    (
+        compiled,
+        durable,
+        transitions,
+        publication,
+        controller,
+        client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path, github=github)
+    controller.cutover(
+        compiled,
+        canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
+        writer_generation="v8-generation-1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+    )
+    current = transitions.read_current(compiled.repository)
+    current_record = transitions.read(compiled.repository, current.record_id)
+    assert current_record is not None
+    transitions.publish(
+        replace(
+            current_record,
+            record_id=f"writer-transition:writer-generation-{github}",
+            kind="drain",
+            status="draining",
+            writer_generation="v8-generation-2",
+            activation_id="activation:canary",
+            plan_digest=_compiled(count=4).digest,
+            reason="writer generation divergence",
+        )
+    )
+    before = transitions.history(compiled.repository)
+    writes_before = None if client is None else client.writes
+
+    with pytest.raises(ActivationError) as error:
+        controller.rollback(
+            repository=compiled.repository,
+            ownership=InMemoryV8OwnershipControl(
+                V8OwnershipReadback(
+                    active_admissions=(),
+                    active_attempts=(),
+                    integration_lease=False,
+                    runtime_resources=(),
+                )
+            ),
+            restore_writer_generation="v6.1",
+            reason="reject divergent writer generation",
+        )
+
+    assert error.value.code == "ROLLBACK_TRANSITION_IDENTITY_MISMATCH"
+    assert transitions.history(compiled.repository) == before
+    if client is not None:
+        assert client.writes == writes_before
 
 
 def test_rollback_drains_and_rereads_ownership_before_restoring_v61(tmp_path):

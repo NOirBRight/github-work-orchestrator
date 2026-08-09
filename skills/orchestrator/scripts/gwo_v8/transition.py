@@ -11,7 +11,7 @@ import sqlite3
 from typing import Any, Callable, Protocol
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
-from .activation import GitHubContentClient, LocalPlanPublication
+from .activation import ActivationError, GitHubContentClient, LocalPlanPublication
 from .compiler import CompiledPlan
 from .cutover_guard import (
     CutoverGuardError,
@@ -1690,6 +1690,15 @@ class WriterCutoverController:
                     )
                 )
                 authoritative_plan_digest = active_plan.plan_digest
+            if (
+                durable_activation is not None
+                and current.writer_generation
+                != durable_activation.writer_generation
+            ):
+                raise ActivationError(
+                    "ROLLBACK_TRANSITION_IDENTITY_MISMATCH",
+                    "current Writer transition does not match the durable Activation Receipt",
+                )
             activation_id = (
                 None
                 if durable_activation is None
@@ -1700,6 +1709,13 @@ class WriterCutoverController:
                 if authoritative_plan_digest is not None
                 else current_record.plan_digest
             )
+            if was_pending:
+                self.publication.validate_pending_activation(
+                    repository,
+                    writer_generation=current.writer_generation,
+                    plan_digest=drain_plan_digest,
+                    activation_id=activation_id,
+                )
             current_identity_matches = (
                 current_record.activation_id == activation_id
                 and current_record.plan_digest == drain_plan_digest

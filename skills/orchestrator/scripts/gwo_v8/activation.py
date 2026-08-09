@@ -1403,6 +1403,74 @@ class LocalPlanPublication:
             )
         return receipt, active
 
+    def validate_pending_activation(
+        self,
+        repository: str,
+        *,
+        writer_generation: str,
+        plan_digest: str,
+        activation_id: str | None,
+    ) -> None:
+        """Validate a local pending reservation without mutating the Store."""
+        with self._connect() as connection:
+            pending = connection.execute(
+                """
+                SELECT
+                    plan_digest,
+                    writer_generation,
+                    activation_id,
+                    receipt_json
+                FROM v8_pending_activations
+                WHERE repository = ?
+                """,
+                (repository,),
+            ).fetchone()
+            revision = connection.execute(
+                """
+                SELECT canonical_bytes, writer_generation
+                FROM v8_plan_revisions
+                WHERE repository = ? AND plan_digest = ?
+                """,
+                (repository, plan_digest),
+            ).fetchone()
+        try:
+            pending_receipt = (
+                None
+                if pending is None
+                else ActivationReceipt.from_dict(json.loads(pending["receipt_json"]))
+            )
+        except (ActivationError, TypeError, json.JSONDecodeError) as error:
+            raise ActivationError(
+                "PENDING_FINALIZE_LOCAL_MISMATCH",
+                "local pending Activation reservation is malformed",
+            ) from error
+        if (
+            pending is None
+            or pending_receipt is None
+            or pending["plan_digest"] != plan_digest
+            or pending["writer_generation"] != writer_generation
+            or pending["activation_id"] != pending_receipt.activation_id
+            or pending_receipt.repository != repository
+            or pending_receipt.plan_digest != plan_digest
+            or pending_receipt.writer_generation != writer_generation
+            or (
+                activation_id is not None
+                and pending_receipt.activation_id != activation_id
+            )
+            or revision is None
+            or revision["writer_generation"] != writer_generation
+            or digest_bytes(bytes(revision["canonical_bytes"])) != plan_digest
+            or (
+                activation_id is not None
+                and self.durable.read_activation(repository, activation_id)
+                != pending_receipt
+            )
+        ):
+            raise ActivationError(
+                "PENDING_FINALIZE_LOCAL_MISMATCH",
+                "local pending Activation reservation does not match rollback identity",
+            )
+
     def read_active(self, repository: str) -> PublishedPlan | None:
         published = self._read_active_unfenced(repository)
         if published is None:
