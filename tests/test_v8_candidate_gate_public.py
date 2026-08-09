@@ -12,6 +12,7 @@ pytest_plugins = ("v8_successor_test_support",)
 
 def _campaign(tmp_path, payload):
     import gwo_v8
+    from gwo_v8.execution_kernel import install_execution_kernel
     from gwo_v8.plan_control import _install_start_host
     from v8_successor_test_support import _direct_setup
 
@@ -19,7 +20,7 @@ def _campaign(tmp_path, payload):
         payload
     )
     _install_start_host(host)
-    kernel = gwo_v8.install_execution_kernel(
+    kernel = install_execution_kernel(
         store_path=tmp_path / "candidate-gate-public.sqlite3",
         plan_control=host,
         effects=harness.effects,
@@ -369,6 +370,7 @@ def test_candidate_gate_receipt_replay_is_idempotent_through_public_advance(
 ):
     import gwo_v8
     from gwo_v8.candidate_gate import CandidateGate
+    from gwo_v8.execution_kernel import install_execution_kernel
     from v8_successor_test_support import _direct_setup
 
     from gwo_v8.plan_control import _install_start_host
@@ -388,7 +390,7 @@ def test_candidate_gate_receipt_replay_is_idempotent_through_public_advance(
         payload
     )
     _install_start_host(host)
-    kernel = gwo_v8.install_execution_kernel(
+    kernel = install_execution_kernel(
         store_path=tmp_path / "candidate-gate-replay.sqlite3",
         plan_control=host,
         effects=harness.effects,
@@ -766,6 +768,7 @@ def test_public_candidate_invalidation_duplicate_advance_and_restart_does_not_re
 
     import gwo_v8
     from gwo_v8.candidate_gate import CandidateGate
+    from gwo_v8.execution_kernel import install_execution_kernel
 
     _control, _repository, gateway, _artifacts, _source, host, handle, harness = _campaign(
         tmp_path, _successor_payload()
@@ -801,7 +804,7 @@ def test_public_candidate_invalidation_duplicate_advance_and_restart_does_not_re
     assert reporter.calls == 1
     assert gateway.replan_progresses == 1
 
-    restarted = gwo_v8.install_execution_kernel(
+    restarted = install_execution_kernel(
         store_path=tmp_path / "candidate-gate-public.sqlite3",
         plan_control=host,
         effects=harness.effects,
@@ -825,6 +828,7 @@ def test_public_candidate_invalidation_duplicate_restart_does_not_consume_budget
 
     import gwo_v8
     from gwo_v8.candidate_gate import CandidateGate
+    from gwo_v8.execution_kernel import install_execution_kernel
 
     payload = {
         "evidence_digests": [],
@@ -865,7 +869,7 @@ def test_public_candidate_invalidation_duplicate_restart_does_not_consume_budget
     assert first_run.slot_held is False
     assert first_run.claim_state == "released"
 
-    restarted = gwo_v8.install_execution_kernel(
+    restarted = install_execution_kernel(
         store_path=tmp_path / "candidate-gate-public.sqlite3",
         plan_control=host,
         effects=harness.effects,

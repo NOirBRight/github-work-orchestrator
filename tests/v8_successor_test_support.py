@@ -23,6 +23,8 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scr
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+from tests.cutover_guard_test_support import valid_cutover_read_adapter_resolver
+
 
 def _canonical_bytes(value: Any) -> bytes:
     """Encode the small JSON domain used by these fixed test facts."""
@@ -1736,6 +1738,9 @@ def _public_harness(tmp_path, *, dependency: bool = True) -> SuccessorHarness:
             _issue_client=issue_client,
             _writer_control=writer_control,
             _gateway_builder=gateway_builder,
+            cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(
+                runtime_configuration
+            ),
         )
         if previous is not None:
             # Recompose a fresh production host over the exact durable seams.

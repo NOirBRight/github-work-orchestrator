@@ -15,14 +15,12 @@ SCRIPTS = (
 )
 sys.path.insert(0, str(SCRIPTS))
 
-from gwo_v8 import (  # noqa: E402
-    EvidenceVerifier,
-    CompileError,
+from gwo_v8.activation import LocalPlanPublication  # noqa: E402
+from gwo_v8.compiler import CompileError, PlanCompiler  # noqa: E402
+from gwo_v8.evidence import EvidenceVerifier, ResultClaim  # noqa: E402
+from gwo_v8.kernel import Kernel  # noqa: E402
+from gwo_v8.runtime import (  # noqa: E402
     InMemoryRuntimeAdapter,
-    Kernel,
-    LocalPlanPublication,
-    PlanCompiler,
-    ResultClaim,
     RuntimeAdmission,
     RuntimePrompt,
 )

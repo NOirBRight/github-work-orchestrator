@@ -13,6 +13,13 @@ from typing import Any, Callable, Protocol
 from ._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
 from .activation import GitHubContentClient, LocalPlanPublication
 from .compiler import CompiledPlan
+from .cutover_guard import (
+    CutoverGuardError,
+    CutoverGuardReceipt,
+    CutoverSubject,
+    EXPECTED_SOURCE_WRITER_GENERATION,
+    GuardActivationValidator,
+)
 from .evidence import TypedEvidence
 from .kernel import Kernel
 
@@ -1404,7 +1411,8 @@ class WriterCutoverController:
         legacy: LegacyWriterControl,
         transitions: WriterTransitionControl,
         publication: LocalPlanPublication,
-    ):
+        guard: GuardActivationValidator,
+    ) -> None:
         if publication.writer_authority is not transitions:
             raise ValueError(
                 "cutover publication must use the transition control as writer fence"
@@ -1412,17 +1420,66 @@ class WriterCutoverController:
         self.legacy = legacy
         self.transitions = transitions
         self.publication = publication
+        self.guard = guard
+
+    @staticmethod
+    def _blocked_before_mutation(
+        *,
+        repository: str,
+        subject: CutoverSubject,
+        writer_generation: str,
+        blocker: str,
+    ) -> WriterTransitionOutcome:
+        return WriterTransitionOutcome(
+            status="blocked",
+            repository=repository,
+            writer_generation=EXPECTED_SOURCE_WRITER_GENERATION,
+            record_id=f"guard-blocked:{digest_value(subject.canonical())}",
+            activation_id=None,
+            worker_capacity=0,
+            coordinator_capacity=0,
+            blockers=(blocker,),
+        )
 
     def cutover(
         self,
         compiled_plan: CompiledPlan,
         *,
         canary: CanaryAcceptance,
+        guard_subject: CutoverSubject,
+        guard_receipt: CutoverGuardReceipt | None,
         writer_generation: str,
         worker_capacity: int,
         coordinator_capacity: int,
     ) -> WriterTransitionOutcome:
         repository = compiled_plan.repository
+        if guard_receipt is None:
+            return self._blocked_before_mutation(
+                repository=repository,
+                subject=guard_subject,
+                writer_generation=writer_generation,
+                blocker="CUTOVER_GUARD_REQUIRED",
+            )
+        if (
+            guard_subject.repository != repository
+            or guard_subject.target_writer_generation != writer_generation
+        ):
+            return self._blocked_before_mutation(
+                repository=repository,
+                subject=guard_subject,
+                writer_generation=writer_generation,
+                blocker="CUTOVER_GUARD_TOKEN_STALE",
+            )
+        try:
+            self.guard.validate_activation(guard_subject, guard_receipt)
+        except CutoverGuardError:
+            return self._blocked_before_mutation(
+                repository=repository,
+                subject=guard_subject,
+                writer_generation=writer_generation,
+                blocker="CUTOVER_GUARD_TOKEN_STALE",
+            )
+
         current = self.transitions.read_current(repository)
         existing = self.transitions.read(repository, current.record_id)
         if current.writer_generation == writer_generation:

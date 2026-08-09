@@ -25,7 +25,7 @@ import gwo_v8  # noqa: E402
 import gwo_v8._canonical as canonical_module  # noqa: E402
 import gwo_v8.runtime_gateway as gateway_module  # noqa: E402
 from gwo_v8._canonical import digest_value  # noqa: E402
-from gwo_v8 import (  # noqa: E402
+from gwo_v8.runtime_gateway import (  # noqa: E402
     CampaignPlanningSubject,
     PermissionResponse,
     RuntimeCommand,
@@ -36,7 +36,7 @@ from gwo_v8 import (  # noqa: E402
     WorkRunSubject,
     build_runtime_gateway,
 )
-from gwo_v8.runtime import RuntimeProfile  # noqa: E402
+from gwo_v8.runtime_profile import RuntimeProfile  # noqa: E402
 from gwo_v8.runtime_gateway import (  # noqa: E402
     ArtifactStore,
     CampaignStartRuntimeOverrides,
@@ -347,8 +347,8 @@ def _repository_worktree(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def test_public_package_hides_raw_provider_seam_and_gateway_has_only_three_operations():
-    assert gwo_v8.build_runtime_gateway is build_runtime_gateway
-    assert gwo_v8.RuntimeRepositoryContext is RuntimeRepositoryContext
+    assert gateway_module.build_runtime_gateway is build_runtime_gateway
+    assert gateway_module.RuntimeRepositoryContext is RuntimeRepositoryContext
     assert not hasattr(gwo_v8, "build_paseo_runtime_gateway")
     assert not hasattr(gwo_v8, "PaseoRepositoryContext")
     assert all(

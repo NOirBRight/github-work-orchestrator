@@ -16,6 +16,8 @@ SCRIPTS = (
 )
 sys.path.insert(0, str(SCRIPTS))
 
+from tests.cutover_guard_test_support import valid_cutover_read_adapter_resolver
+
 
 def _policy():
     from gwo_v8._canonical import digest_value
@@ -996,6 +998,7 @@ def test_rp3_6_canonicalizes_refs_before_campaign_and_override_identity(
         gateway_store_path=tmp_path / "gateway.json",
         artifact_root=tmp_path / "artifacts",
         _gateway_builder=builder,
+        cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
     )
     options = {
         "ticket_overrides": [
@@ -1056,6 +1059,7 @@ def test_rp6_6_runtime_assertion_never_enters_plancontrol_state(
         gateway_store_path=tmp_path / "gateway.json",
         artifact_root=tmp_path / "artifacts",
         _gateway_builder=builder,
+        cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
     )
 
     handle = host.start("owner/repository", ["issue:109"])
@@ -1299,6 +1303,7 @@ def test_rp4_3_installed_host_supports_exact_successor_revisions(tmp_path):
             gateway_store_path=tmp_path / "gateway.json",
             artifact_root=artifact_root,
             _gateway_builder=builder,
+            cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
         )
 
     first_host = host(tmp_path / "artifacts")
@@ -1476,6 +1481,7 @@ def test_rp4_6_long_lived_host_hydrates_remote_campaign_on_demand(tmp_path):
             gateway_store_path=tmp_path / f"{name}.gateway.json",
             artifact_root=tmp_path / f"{name}.artifacts",
             _gateway_builder=builder,
+            cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
         )
 
     first = make_host("first")
@@ -1898,6 +1904,7 @@ def test_rp5_4_hydration_retries_one_stable_ref_and_rejects_changed_identity(tmp
             gateway_store_path=tmp_path / f"{name}.gateway.json",
             artifact_root=tmp_path / f"{name}.artifacts",
             _gateway_builder=lambda *, artifacts, **_kwargs: _PlanningGateway(artifacts),
+            cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
         )
 
     waiting = make_host("waiting")
@@ -2031,6 +2038,7 @@ def test_rp5_7_installed_github_successor_fences_invalid_lineage(tmp_path):
             _content_client=client,
             _issue_client=source,
             _gateway_builder=builder,
+            cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
         )
 
     first = host("first")
@@ -2459,6 +2467,7 @@ def test_rc6_6_successor_does_not_reparse_an_old_ticket_override(tmp_path):
         gateway_store_path=tmp_path / "gateway.json",
         artifact_root=tmp_path / "artifacts",
         _gateway_builder=lambda *, artifacts, **_kwargs: SelectedGateway(artifacts),
+        cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
     )
     options = {
         "coordinator": None,

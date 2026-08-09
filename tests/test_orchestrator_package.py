@@ -57,6 +57,27 @@ def test_phase_two_exposes_implement_gwo_and_one_release_alias_only():
     assert skill_files == [ENTRY_PACKAGE / "SKILL.md", PACKAGE / "SKILL.md"]
 
 
+def test_v8_package_root_and_cutover_cli_surfaces_are_closed():
+    package_root = (PACKAGE / "scripts" / "gwo_v8" / "__init__.py").read_text(
+        encoding="utf-8"
+    )
+    assert '__all__ = ("advance", "inspect", "start")' in package_root
+    for forbidden in (
+        "ImplementGwoEntry",
+        "ImplementGwoLauncher",
+        "GoalDriver",
+        "Kernel",
+        "StoreReconstructor",
+        "WriterCutoverController",
+        "LegacyWriterControl",
+        "V8OwnershipControl",
+    ):
+        assert forbidden not in package_root
+
+    cli_path = ROOT / "scripts" / "cutover_guard.py"
+    compile(cli_path.read_text(encoding="utf-8"), str(cli_path), "exec")
+
+
 def test_skill_description_uses_a_strict_yaml_safe_scalar():
     for package in (PACKAGE, ENTRY_PACKAGE):
         lines = (package / "SKILL.md").read_text(encoding="utf-8").splitlines()

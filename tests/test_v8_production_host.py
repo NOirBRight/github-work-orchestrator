@@ -14,6 +14,8 @@ SCRIPTS = (
 )
 sys.path.insert(0, str(SCRIPTS))
 
+from tests.cutover_guard_test_support import valid_cutover_read_adapter_resolver
+
 from gwo_v8._canonical import digest_value
 from gwo_v8.execution_kernel import CampaignOutcome, CampaignStatus
 from gwo_v8.plan_control import CampaignHandle
@@ -137,6 +139,7 @@ def test_revision_saved_before_activation_remains_a_planning_continuation(
         gateway_store_path=tmp_path / "gateway.sqlite3",
         artifact_root=tmp_path / "artifacts",
         _gateway_builder=lambda **kwargs: _Gateway(kwargs["artifacts"]),
+        cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
     )
     continuation = host.read_planning_continuation(handle)
     assert continuation is not None

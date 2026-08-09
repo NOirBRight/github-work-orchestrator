@@ -15,6 +15,8 @@ SCRIPTS = (
 )
 sys.path.insert(0, str(SCRIPTS))
 
+from tests.cutover_guard_test_support import valid_cutover_read_adapter_resolver
+
 
 class _RawGateway:
     def __init__(self, capability):
@@ -317,6 +319,7 @@ def production_successor_context(tmp_path):
         gateway_store_path=tmp_path / "runtime.json",
         artifact_root=tmp_path / "artifacts",
         _gateway_builder=builder,
+        cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
     )
     started = host.start(repository_name, ready_refs)
     assert started == handle
@@ -374,6 +377,7 @@ def host_context(tmp_path, monkeypatch):
         gateway_store_path=tmp_path / "gateway.json",
         artifact_root=tmp_path / "artifacts",
         _gateway_builder=builder,
+        cutover_read_adapter_resolver=valid_cutover_read_adapter_resolver(),
     )
     return host, handle, assertion, raw_gateway, builder_calls
 
@@ -485,6 +489,7 @@ def test_host_injects_read_only_human_source_into_each_recomposed_control(
         max_snapshot_bytes=host._max_snapshot_bytes,
         human_source=source,
         _gateway_builder=host._gateway_builder,
+        cutover_read_adapter_resolver=host._cutover_read_adapter_resolver,
     )
 
     composed_host.read_active(handle)

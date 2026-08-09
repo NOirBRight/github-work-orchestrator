@@ -16,7 +16,7 @@ SCRIPTS = (
 )
 sys.path.insert(0, str(SCRIPTS))
 
-from gwo_v8 import (  # noqa: E402
+from gwo_v8.activation import (  # noqa: E402
     ActivationCheckpointCrash,
     ActivationError,
     ActivationReceipt,
@@ -24,35 +24,37 @@ from gwo_v8 import (  # noqa: E402
     GitHubContent,
     GitHubCliContentClient,
     GitHubDurablePlanControl,
+    InMemoryDurablePlanControl,
+    LocalPlanPublication,
+)
+from gwo_v8.compiler import PlanCompiler  # noqa: E402
+from gwo_v8.entry import ImplementGwoEntry, ImplementGwoLauncher  # noqa: E402
+from gwo_v8.evidence import EvidenceVerifier  # noqa: E402
+from gwo_v8.goal_driver import (  # noqa: E402
     GitHubDurableGoalControl,
     CoordinatorSession,
     CoordinatorTurnObservation,
     DurableWake,
-    EvidenceVerifier,
     GoalDriver,
     GoalDriverError,
     GoalSnapshot,
     InMemoryDurableGoalControl,
-    InMemoryDurablePlanControl,
+    InMemoryCoordinatorRuntime,
+    PaseoCoordinatorRuntime,
+)
+from gwo_v8.kernel import Kernel, ReconcileOutcome  # noqa: E402
+from gwo_v8.runtime import (  # noqa: E402
     InMemoryRuntimeAdapter,
     InMemoryPaseoClient,
     InMemorySkillCatalog,
     InstalledSkillCatalog,
-    ImplementGwoEntry,
-    ImplementGwoLauncher,
-    Kernel,
-    LocalPlanPublication,
     PaseoRuntimeAdapter,
     PaseoCliClient,
-    PaseoCoordinatorRuntime,
-    PlanCompiler,
     RuntimeAdmission,
     RuntimeAdapterError,
-    RuntimeProfile,
     RuntimePrompt,
-    ReconcileOutcome,
-    InMemoryCoordinatorRuntime,
 )
+from gwo_v8.runtime_profile import RuntimeProfile  # noqa: E402
 
 
 class _MemoryGitHubContentClient:

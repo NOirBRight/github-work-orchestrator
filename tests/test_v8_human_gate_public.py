@@ -22,6 +22,7 @@ def _human_payload() -> dict[str, object]:
 
 def _public_direct_campaign(tmp_path):
     import gwo_v8
+    from gwo_v8.execution_kernel import install_execution_kernel
     from gwo_v8.plan_control import _install_start_host
     from v8_successor_test_support import _direct_setup
 
@@ -29,7 +30,7 @@ def _public_direct_campaign(tmp_path):
         _direct_setup(_human_payload())
     )
     _install_start_host(host)
-    kernel = gwo_v8.install_execution_kernel(
+    kernel = install_execution_kernel(
         store_path=tmp_path / "human-gate-public.sqlite3",
         plan_control=host,
         effects=harness.effects,
@@ -55,14 +56,15 @@ def _open_named_decision(gwo_v8, handle, harness):
     return diagnostics
 
 
-def test_public_human_gate_exports_only_choice_and_inspect_summary():
+def test_public_human_gate_types_remain_in_their_own_module():
     import gwo_v8
     from gwo_v8.human_gate import HumanDecisionChoice, HumanGateSummary
 
-    assert gwo_v8.HumanDecisionChoice is HumanDecisionChoice
-    assert gwo_v8.HumanGateSummary is HumanGateSummary
-    assert "HumanDecisionChoice" in gwo_v8.__all__
-    assert "HumanGateSummary" in gwo_v8.__all__
+    assert HumanDecisionChoice.__module__ == "gwo_v8.human_gate"
+    assert HumanGateSummary.__module__ == "gwo_v8.human_gate"
+    assert gwo_v8.__all__ == ("advance", "inspect", "start")
+    assert not hasattr(gwo_v8, "HumanDecisionChoice")
+    assert not hasattr(gwo_v8, "HumanGateSummary")
 
     for private_name in (
         "HumanDecisionRecord",
@@ -80,6 +82,7 @@ def test_public_advance_without_choice_returns_one_named_decision_and_inspect_ga
     tmp_path,
 ):
     import gwo_v8
+    from gwo_v8.human_gate import HumanGateSummary
 
     _control, _repository, gateway, _host, handle, harness = _public_direct_campaign(
         tmp_path
@@ -89,7 +92,7 @@ def test_public_advance_without_choice_returns_one_named_decision_and_inspect_ga
 
     assert diagnostics.human_gate.decision_id.startswith("decision:")
     assert diagnostics.human_gate.required_change == "authority"
-    assert isinstance(diagnostics.human_gate, gwo_v8.HumanGateSummary)
+    assert isinstance(diagnostics.human_gate, HumanGateSummary)
     assert gateway.replan_progresses == 1
 
 
@@ -107,6 +110,7 @@ class _PendingSource:
 
 def test_public_advance_typed_choice_exposes_pending_source_wait(tmp_path):
     import gwo_v8
+    from gwo_v8.human_gate import HumanDecisionChoice
     from test_v8_human_gate_plancontrol import _pending_readback
 
     control, repository, _gateway, _host, handle, harness = _public_direct_campaign(
@@ -122,7 +126,7 @@ def test_public_advance_typed_choice_exposes_pending_source_wait(tmp_path):
 
     outcome = gwo_v8.advance(
         handle,
-        human_decision=gwo_v8.HumanDecisionChoice(
+        human_decision=HumanDecisionChoice(
             decision_id=decision.decision_id,
             choice="approve",
             readback_ref="workflow://approval/one",
@@ -149,6 +153,7 @@ class _FixedSource:
 
 def test_public_approved_choice_activates_one_active_successor(tmp_path):
     import gwo_v8
+    from gwo_v8.human_gate import HumanDecisionChoice
     from test_v8_human_gate_plancontrol import _approved_readback
     from v8_successor_test_support import successor_payload
 
@@ -174,7 +179,7 @@ def test_public_approved_choice_activates_one_active_successor(tmp_path):
 
     outcome = gwo_v8.advance(
         handle,
-        human_decision=gwo_v8.HumanDecisionChoice(
+        human_decision=HumanDecisionChoice(
             decision.decision_id,
             "approve",
             "workflow://approval/one",

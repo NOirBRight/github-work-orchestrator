@@ -8,6 +8,7 @@ these assignment facts.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, fields
 from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
@@ -42,6 +43,20 @@ from .runtime_gateway import (
     RuntimeGateway,
     RuntimeRepositoryContext,
     build_runtime_gateway,
+)
+from .cutover_guard import (
+    CutoverGuard,
+    CutoverGuardReceipt,
+    CutoverGuardReport,
+    CutoverGuardSources,
+    CutoverSubject,
+    DurableStateReadPort,
+    LegacyReadPort,
+    OwnershipReadPort,
+    ProductionPathScanner,
+    ReadOnlyPackageValidator,
+    RuntimeConfigurationReader,
+    WriterFenceReadPort,
 )
 from ._canonical import digest_bytes, digest_value, load_canonical_json
 from .activation import GitHubCliContentClient, GitHubContentClient
@@ -251,6 +266,184 @@ def _production_gateway_builder(
     )
 
 
+@dataclass(frozen=True)
+class CutoverGuardRequest:
+    subject: CutoverSubject
+    package_root: Path
+    install_roots: tuple[Path, Path, Path]
+
+
+_FORBIDDEN_SOURCE_NAMES = frozenset(
+    {
+        "stop",
+        "restore",
+        "drain",
+        "publish",
+        "compare_and_swap",
+        "write",
+        "prepare",
+        "command",
+        "events",
+        "install",
+        "start",
+    }
+)
+
+
+def _declared_surface(value: object) -> set[str]:
+    names = set(vars(value)) if hasattr(value, "__dict__") else set()
+    for cls in type(value).__mro__:
+        names.update(vars(cls))
+    return names
+
+
+class _ReadOnlyGuardAdapter:
+    def __init__(self, control: object, method_name: str) -> None:
+        self._control = control
+        self._method_name = method_name
+
+    def read(self, *args: object, **kwargs: object) -> object:
+        return getattr(self._control, self._method_name)(*args, **kwargs)
+
+
+def _adapt_guard_read_port(
+    value: object,
+    label: str,
+    method_names: tuple[str, ...],
+) -> object:
+    surface = _declared_surface(value)
+    if _FORBIDDEN_SOURCE_NAMES.intersection(surface):
+        raise PlanControlError(
+            "CUTOVER_GUARD_COMPOSITION_INVALID",
+            f"{label} exposes a mutating surface alongside its Guard read",
+        )
+    if "read" in surface and callable(getattr(value, "read", None)):
+        return value
+    for method_name in method_names:
+        if method_name in surface and callable(getattr(value, method_name, None)):
+            return _ReadOnlyGuardAdapter(value, method_name)
+    raise PlanControlError(
+        "CUTOVER_GUARD_COMPOSITION_INVALID",
+        f"{label} does not expose an exact read-only Guard adapter",
+    )
+
+
+class ProductionCutoverReadAdapterResolver:
+    def __init__(
+        self,
+        *,
+        legacy: LegacyReadPort,
+        durable_state: DurableStateReadPort,
+        writer_fence: WriterFenceReadPort,
+        ownership: OwnershipReadPort,
+        runtime_configuration: RuntimeConfiguration,
+    ) -> None:
+        self._legacy = _adapt_guard_read_port(
+            legacy,
+            "legacy",
+            ("read", "readback"),
+        )
+        self._durable_state = _adapt_guard_read_port(
+            durable_state,
+            "durable_state",
+            ("read", "readback"),
+        )
+        self._writer_fence = _adapt_guard_read_port(
+            writer_fence,
+            "writer_fence",
+            ("read", "readback", "read_current"),
+        )
+        self._ownership = _adapt_guard_read_port(
+            ownership,
+            "ownership",
+            ("read", "readback"),
+        )
+        self._runtime_configuration = runtime_configuration
+
+    def resolve(
+        self,
+        *,
+        subject: CutoverSubject,
+        package_root: Path,
+        install_roots: tuple[Path, Path, Path],
+    ) -> CutoverGuardSources:
+        surfaces = dict(zip(subject.install_surfaces, install_roots, strict=True))
+        return CutoverGuardSources(
+            legacy=self._legacy,
+            durable_state=self._durable_state,
+            writer_fence=self._writer_fence,
+            ownership=self._ownership,
+            compatibility=ProductionPathScanner(package_root),
+            runtime=RuntimeConfigurationReader(self._runtime_configuration),
+            packages=ReadOnlyPackageValidator(package_root, surfaces),
+        )
+
+
+def make_production_cutover_read_adapter_resolver(
+    *,
+    v61_legacy_read: LegacyReadPort,
+    v8_store_read: DurableStateReadPort,
+    writer_generation_read: WriterFenceReadPort,
+    v8_ownership_read: OwnershipReadPort,
+    runtime_configuration: RuntimeConfiguration,
+) -> ProductionCutoverReadAdapterResolver:
+    """Bind the four already-composed V3 reads to the Guard resolver."""
+
+    return ProductionCutoverReadAdapterResolver(
+        legacy=v61_legacy_read,
+        durable_state=v8_store_read,
+        writer_fence=writer_generation_read,
+        ownership=v8_ownership_read,
+        runtime_configuration=runtime_configuration,
+    )
+
+
+class ProductionCutoverGuardHost:
+    def __init__(
+        self,
+        *,
+        guard: CutoverGuard,
+        sources: CutoverGuardSources,
+    ) -> None:
+        self._guard = guard
+        self._sources = sources
+
+    def check(self, subject: CutoverSubject) -> CutoverGuardReport:
+        return self._guard.evaluate(subject)
+
+    def validate_activation(
+        self,
+        subject: CutoverSubject,
+        receipt: CutoverGuardReceipt,
+    ) -> None:
+        self._guard.validate_activation_token(subject, receipt)
+
+
+def install_cutover_guard(*, sources: CutoverGuardSources) -> ProductionCutoverGuardHost:
+    if type(sources) is not CutoverGuardSources:
+        raise PlanControlError(
+            "CUTOVER_GUARD_COMPOSITION_INVALID",
+            "Guard composition must use one exact source value",
+        )
+    for field in fields(CutoverGuardSources):
+        source = getattr(sources, field.name)
+        surface = _declared_surface(source)
+        if "read" not in surface or _FORBIDDEN_SOURCE_NAMES.intersection(surface):
+            raise PlanControlError(
+                "CUTOVER_GUARD_COMPOSITION_INVALID",
+                f"{field.name} is not a read-only Guard adapter",
+            )
+        if not callable(getattr(source, "read", None)):
+            raise PlanControlError(
+                "CUTOVER_GUARD_COMPOSITION_INVALID",
+                f"{field.name}.read is not callable",
+            )
+    return ProductionCutoverGuardHost(
+        guard=CutoverGuard(sources),
+        sources=sources,
+    )
+
+
 class ProductionPlanControlStartHost:
     """Concrete host composition with one shared #111 ArtifactStore."""
 
@@ -267,7 +460,13 @@ class ProductionPlanControlStartHost:
         max_snapshot_bytes: int = 1_048_576,
         human_source: object | None = None,
         _gateway_builder: _GatewayBuilder | None = None,
+        cutover_read_adapter_resolver: ProductionCutoverReadAdapterResolver | None = None,
     ):
+        if type(cutover_read_adapter_resolver) is not ProductionCutoverReadAdapterResolver:
+            raise PlanControlError(
+                "CUTOVER_GUARD_COMPOSITION_INVALID",
+                "the start host requires one resolver-backed V3 read composition",
+            )
         if type(runtime_configuration) is not RuntimeConfiguration:
             raise PlanControlError(
                 "PLAN_CONTROL_COMPOSITION_INVALID",
@@ -292,6 +491,30 @@ class ProductionPlanControlStartHost:
             )
         self._human_source = human_source
         self._gateway_builder = _gateway_builder or _production_gateway_builder
+        self._cutover_read_adapter_resolver = cutover_read_adapter_resolver
+
+    def resolve_cutover_guard_sources(
+        self,
+        request: CutoverGuardRequest,
+    ) -> CutoverGuardSources:
+        resolver = getattr(self, "_cutover_read_adapter_resolver", None)
+        if type(resolver) is not ProductionCutoverReadAdapterResolver:
+            raise PlanControlError(
+                "CUTOVER_GUARD_COMPOSITION_INVALID",
+                "the installed start host has no exact Guard resolver",
+            )
+        return resolver.resolve(
+            subject=request.subject,
+            package_root=request.package_root,
+            install_roots=request.install_roots,
+        )
+
+    def install_cutover_guard(
+        self,
+        *,
+        sources: CutoverGuardSources,
+    ) -> ProductionCutoverGuardHost:
+        return install_cutover_guard(sources=sources)
 
     def _control_for(
         self,
@@ -942,6 +1165,106 @@ class ProductionPlanControlStartHost:
         return watchdog
 
 
+def production_start_host_constructor(
+    *,
+    source: CampaignSnapshotSource,
+    repository: PlanControlRepository,
+    runtime_configuration: RuntimeConfiguration,
+    repository_contexts: Mapping[str, RuntimeRepositoryContext],
+    gateway_store_path: Path,
+    artifact_root: Path,
+    maximum_artifact_bytes: int,
+    max_snapshot_bytes: int,
+    human_source: object | None,
+    gateway_builder: object | None,
+    cutover_read_adapter_resolver: ProductionCutoverReadAdapterResolver,
+) -> ProductionPlanControlStartHost:
+    host = ProductionPlanControlStartHost(
+        source=source,
+        repository=repository,
+        runtime_configuration=runtime_configuration,
+        repository_contexts=repository_contexts,
+        gateway_store_path=gateway_store_path,
+        artifact_root=artifact_root,
+        maximum_artifact_bytes=maximum_artifact_bytes,
+        max_snapshot_bytes=max_snapshot_bytes,
+        human_source=human_source,
+        _gateway_builder=gateway_builder,
+        cutover_read_adapter_resolver=cutover_read_adapter_resolver,
+    )
+    return host
+
+
+def install_production_start_host(
+    *,
+    source: CampaignSnapshotSource,
+    repository: PlanControlRepository,
+    runtime_configuration: RuntimeConfiguration,
+    repository_contexts: Mapping[str, RuntimeRepositoryContext],
+    gateway_store_path: Path,
+    artifact_root: Path,
+    maximum_artifact_bytes: int,
+    max_snapshot_bytes: int,
+    human_source: object | None,
+    gateway_builder: object | None,
+    v61_legacy_read: LegacyReadPort,
+    v8_store_read: DurableStateReadPort,
+    writer_generation_read: WriterFenceReadPort,
+    v8_ownership_read: OwnershipReadPort,
+) -> ProductionPlanControlStartHost:
+    resolver = make_production_cutover_read_adapter_resolver(
+        v61_legacy_read=v61_legacy_read,
+        v8_store_read=v8_store_read,
+        writer_generation_read=writer_generation_read,
+        v8_ownership_read=v8_ownership_read,
+        runtime_configuration=runtime_configuration,
+    )
+    return production_start_host_constructor(
+        source=source,
+        repository=repository,
+        runtime_configuration=runtime_configuration,
+        repository_contexts=repository_contexts,
+        gateway_store_path=gateway_store_path,
+        artifact_root=artifact_root,
+        maximum_artifact_bytes=maximum_artifact_bytes,
+        max_snapshot_bytes=max_snapshot_bytes,
+        human_source=human_source,
+        gateway_builder=gateway_builder,
+        cutover_read_adapter_resolver=resolver,
+    )
+
+
+def _installed_v3_start_host() -> ProductionPlanControlStartHost:
+    from .plan_control import _default_start_host
+
+    host = _default_start_host
+    if type(host) is not ProductionPlanControlStartHost:
+        raise PlanControlError(
+            "CUTOVER_GUARD_COMPOSITION_INVALID",
+            "the installed default host is not the composed V3 start host",
+        )
+    return host
+
+
+def load_production_cutover_guard(
+    request: CutoverGuardRequest,
+) -> ProductionCutoverGuardHost:
+    if type(request) is not CutoverGuardRequest:
+        raise PlanControlError(
+            "CUTOVER_GUARD_COMPOSITION_INVALID",
+            "the live Guard request must be one exact CutoverGuardRequest",
+        )
+    labels = tuple(path.parent.name for path in request.install_roots)
+    if labels != (".agents", ".codex", ".claude"):
+        raise PlanControlError(
+            "CUTOVER_GUARD_COMPOSITION_INVALID",
+            "live install roots must be .agents, .codex, .claude in order",
+        )
+    start_host = _installed_v3_start_host()
+    sources = start_host.resolve_cutover_guard_sources(request)
+    return start_host.install_cutover_guard(sources=sources)
+
+
 def install_plan_control_start(
     *,
     source: CampaignSnapshotSource,
@@ -954,6 +1277,7 @@ def install_plan_control_start(
     max_snapshot_bytes: int = 1_048_576,
     human_source: object | None = None,
     _gateway_builder: _GatewayBuilder | None = None,
+    cutover_read_adapter_resolver: ProductionCutoverReadAdapterResolver | None = None,
 ) -> ProductionPlanControlStartHost:
     """Install the concrete public Campaign-start composition."""
 
@@ -968,6 +1292,7 @@ def install_plan_control_start(
         max_snapshot_bytes=max_snapshot_bytes,
         human_source=human_source,
         _gateway_builder=_gateway_builder,
+        cutover_read_adapter_resolver=cutover_read_adapter_resolver,
     )
     _install_start_host(host)
     return host
@@ -993,6 +1318,7 @@ def install_github_plan_control_start(
     _human_approval_client: GitHubHumanApprovalReadClient | None = None,
     _writer_control: WriterGenerationReadback | None = None,
     _gateway_builder: _GatewayBuilder | None = None,
+    cutover_read_adapter_resolver: ProductionCutoverReadAdapterResolver | None = None,
 ) -> ProductionPlanControlStartHost:
     """Install the production GitHub-backed Campaign-start composition.
 
@@ -1065,4 +1391,5 @@ def install_github_plan_control_start(
         max_snapshot_bytes=max_snapshot_bytes,
         human_source=human_source,
         _gateway_builder=_gateway_builder,
+        cutover_read_adapter_resolver=cutover_read_adapter_resolver,
     )

@@ -14,27 +14,27 @@ import pytest
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from gwo_v8 import (  # noqa: E402
-    EvidenceVerifier,
+from gwo_v8.activation import LocalPlanPublication  # noqa: E402
+from gwo_v8.compiler import PlanCompiler  # noqa: E402
+from gwo_v8.evidence import EvidenceVerifier  # noqa: E402
+from gwo_v8.goal_driver import (  # noqa: E402
     GoalDriver,
     GoalDriverError,
     GoalSnapshot,
     InMemoryCoordinatorRuntime,
-    InMemoryDeliveryControl,
     InMemoryDurableGoalControl,
+)
+from gwo_v8.kernel import InMemoryDeliveryControl, Kernel, ReconcileOutcome  # noqa: E402
+from gwo_v8.runtime import (  # noqa: E402
     InMemoryPaseoClient,
     InMemoryRuntimeAdapter,
-    Kernel,
-    LocalPlanPublication,
-    PlanCompiler,
     PaseoRuntimeAdapter,
-    ReconcileOutcome,
     ReviewAxisBinding,
     ReviewAxisObservation,
     RuntimeAdapterError,
-    RuntimeProfile,
     resolve_active_turn_pools,
 )
+from gwo_v8.runtime_profile import RuntimeProfile  # noqa: E402
 import orch_core  # noqa: E402
 
 
