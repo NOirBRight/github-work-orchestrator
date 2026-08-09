@@ -1686,6 +1686,82 @@ def test_rollback_fences_v8_restores_v61_and_is_idempotent(tmp_path):
     assert rollback.imported_legacy_identity_count == 0
 
 
+@pytest.mark.parametrize("current_status", ("cut_over", "draining"))
+def test_rollback_recovers_from_divergent_transition_activation_identity(
+    tmp_path,
+    current_status,
+):
+    (
+        compiled,
+        durable,
+        transitions,
+        publication,
+        controller,
+        _client,
+        guard_subject,
+        guard_receipt,
+    ) = _cutover_controller(tmp_path)
+    cutover = controller.cutover(
+        compiled,
+        canary=_verify_canary(_accepted_canary()),
+        guard_subject=guard_subject,
+        guard_receipt=guard_receipt,
+        writer_generation="v8-generation-1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+    )
+    authoritative = durable.read_current_activation(compiled.repository)
+    assert authoritative is not None
+    active = publication.read_active(compiled.repository)
+    assert active is not None
+    assert active.plan_digest == authoritative.plan_digest
+    assert active.activation_id == authoritative.activation_id
+
+    current = transitions.read_current(compiled.repository)
+    current_record = transitions.read(compiled.repository, current.record_id)
+    assert current_record is not None
+    divergent = replace(
+        current_record,
+        record_id=f"writer-transition:canary-{current_status}",
+        kind="drain" if current_status == "draining" else "cutover",
+        status=current_status,
+        activation_id="activation:canary",
+        plan_digest=_compiled(count=4).digest,
+        reason="canary identity divergence",
+    )
+    transitions.publish(divergent)
+
+    outcome = controller.rollback(
+        repository=compiled.repository,
+        ownership=InMemoryV8OwnershipControl(
+            V8OwnershipReadback(
+                active_admissions=(),
+                active_attempts=(),
+                integration_lease=False,
+                runtime_resources=(),
+            )
+        ),
+        restore_writer_generation="v6.1",
+        reason="recover divergent rollback identity",
+    )
+
+    history = transitions.history(compiled.repository)
+    corrective = history[-2]
+    receipt = history[-1]
+    assert divergent in history
+    assert corrective.kind == "drain"
+    assert corrective.status == "draining"
+    assert corrective.activation_id == authoritative.activation_id
+    assert corrective.plan_digest == authoritative.plan_digest
+    assert "ROLLBACK_DRAIN_IDENTITY_CORRECTIVE" in (corrective.reason or "")
+    assert receipt.kind == "rollback"
+    assert receipt.activation_id == authoritative.activation_id
+    assert receipt.plan_digest == authoritative.plan_digest
+    assert outcome.status == "rolled_back"
+    assert outcome.activation_id == authoritative.activation_id
+    assert cutover.activation_id == authoritative.activation_id
+
+
 def test_rollback_drains_and_rereads_ownership_before_restoring_v61(tmp_path):
     (
         compiled,

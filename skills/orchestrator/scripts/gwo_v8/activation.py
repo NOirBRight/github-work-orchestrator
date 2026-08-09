@@ -1300,7 +1300,7 @@ class LocalPlanPublication:
             activation_id=receipt.activation_id,
         )
 
-    def read_active(self, repository: str) -> PublishedPlan | None:
+    def _read_active_unfenced(self, repository: str) -> PublishedPlan | None:
         with self._connect() as connection:
             pending = connection.execute(
                 """
@@ -1346,6 +1346,67 @@ class LocalPlanPublication:
             writer_generation=str(row["writer_generation"]),
             activation_id=str(row["activation_id"]),
         )
+        return published
+
+    def read_authoritative_durable_activation(
+        self,
+        repository: str,
+    ) -> tuple[ActivationReceipt, DurablePlanRecord] | None:
+        """Read and validate the immutable durable rollback identity."""
+        receipt = self.durable.read_current_activation(repository)
+        if receipt is None:
+            return None
+        record = self.durable.read_plan(repository, receipt.plan_digest)
+        if (
+            receipt.repository != repository
+            or self.durable.read_activation(
+                repository,
+                receipt.activation_id,
+            )
+            != receipt
+            or record is None
+            or record.repository != repository
+            or record.plan_digest != receipt.plan_digest
+            or record.record_ref != receipt.plan_record_ref
+            or digest_bytes(record.canonical_bytes) != record.plan_digest
+        ):
+            raise ActivationError(
+                "ROLLBACK_DURABLE_IDENTITY_MISMATCH",
+                "durable Activation Receipt and Plan do not agree",
+            )
+        return receipt, record
+
+    def read_authoritative_rollback_identity(
+        self,
+        repository: str,
+    ) -> tuple[ActivationReceipt, PublishedPlan]:
+        """Read the durable Receipt and its matching local active Plan."""
+        authority = self.read_authoritative_durable_activation(repository)
+        if authority is None:
+            raise ActivationError(
+                "ROLLBACK_ACTIVATION_MISSING",
+                "rollback requires a durable current Activation Receipt",
+            )
+        receipt, record = authority
+        active = self._read_active_unfenced(repository)
+        if (
+            active is None
+            or active.plan_digest != receipt.plan_digest
+            or active.writer_generation != receipt.writer_generation
+            or active.activation_id != receipt.activation_id
+            or active.canonical_bytes != record.canonical_bytes
+            or active.compilation_record != record.compilation_record
+        ):
+            raise ActivationError(
+                "ROLLBACK_LOCAL_IDENTITY_MISMATCH",
+                "local active Plan does not match the durable Activation Receipt",
+            )
+        return receipt, active
+
+    def read_active(self, repository: str) -> PublishedPlan | None:
+        published = self._read_active_unfenced(repository)
+        if published is None:
+            return None
         self.assert_writer(
             repository,
             writer_generation=published.writer_generation,

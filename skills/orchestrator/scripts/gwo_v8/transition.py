@@ -1669,23 +1669,47 @@ class WriterCutoverController:
             blockers.add("ROLLBACK_REASON_REQUIRED")
         if current.writer_generation == restore_writer_generation:
             blockers.add("ROLLBACK_SOURCE_WRITER_INVALID")
-        durable_activation = self.publication.durable.read_current_activation(
-            repository
-        )
-        activation_id = (
-            None
-            if current_record is None
-            else current_record.activation_id
-        ) or (
-            None
-            if durable_activation is None
-            else durable_activation.activation_id
-        )
+        durable_activation = None
+        activation_id = None
+        authoritative_plan_digest = None
         if current_record is None:
             blockers.add("ROLLBACK_TRANSITION_MISSING")
         if not blockers:
             was_pending = current_record.status == "pending"
-            if current_record.status != "draining":
+            if was_pending:
+                authority = self.publication.read_authoritative_durable_activation(
+                    repository
+                )
+                if authority is not None:
+                    durable_activation, _durable_plan = authority
+                    authoritative_plan_digest = durable_activation.plan_digest
+            else:
+                durable_activation, active_plan = (
+                    self.publication.read_authoritative_rollback_identity(
+                        repository
+                    )
+                )
+                authoritative_plan_digest = active_plan.plan_digest
+            activation_id = (
+                None
+                if durable_activation is None
+                else durable_activation.activation_id
+            )
+            drain_plan_digest = (
+                authoritative_plan_digest
+                if authoritative_plan_digest is not None
+                else current_record.plan_digest
+            )
+            current_identity_matches = (
+                current_record.activation_id == activation_id
+                and current_record.plan_digest == drain_plan_digest
+            )
+            if current_record.status != "draining" or not current_identity_matches:
+                drain_reason = (
+                    reason
+                    if current_identity_matches
+                    else f"{reason};ROLLBACK_DRAIN_IDENTITY_CORRECTIVE"
+                )
                 drain_record = _record(
                     repository=repository,
                     kind="drain",
@@ -1693,7 +1717,7 @@ class WriterCutoverController:
                     previous_writer_generation=current.writer_generation,
                     writer_generation=current.writer_generation,
                     activation_id=activation_id,
-                    plan_digest=current_record.plan_digest,
+                    plan_digest=drain_plan_digest,
                     canary_evidence_digest=(
                         current_record.canary_evidence_digest
                     ),
@@ -1701,7 +1725,7 @@ class WriterCutoverController:
                     canary_manifest_ref=current_record.canary_manifest_ref,
                     worker_capacity=0,
                     coordinator_capacity=0,
-                    reason=reason,
+                    reason=drain_reason,
                 )
                 try:
                     self.transitions.publish(drain_record)
@@ -1784,7 +1808,13 @@ class WriterCutoverController:
                 None if current_record is None else activation_id
             ),
             plan_digest=(
-                None if current_record is None else current_record.plan_digest
+                None
+                if current_record is None
+                else (
+                    authoritative_plan_digest
+                    if authoritative_plan_digest is not None
+                    else current_record.plan_digest
+                )
             ),
             canary_evidence_digest=None,
             canary_evidence_refs=(
