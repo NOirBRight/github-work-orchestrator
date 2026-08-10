@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 from dataclasses import replace
+import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -42,12 +44,137 @@ from gwo_v8.cutover_guard import (  # noqa: E402
     CutoverGuardReport,
     CutoverReadbackBundle,
 )
+import gwo_v8.activation as activation_module  # noqa: E402
+import gwo_v8.github_snapshot as github_snapshot_module  # noqa: E402
+import gwo_v8.plan_control_host as plan_control_host_module  # noqa: E402
+import gwo_v8.runtime as runtime_module  # noqa: E402
+import gwo_v8.runtime_gateway as runtime_gateway_module  # noqa: E402
+import gwo_v8.transition as transition_module  # noqa: E402
+import sync_orchestrator as sync_module  # noqa: E402
+
+
+_ALLOWED_REPLAY_IMPORTS = {
+    "__future__": {"annotations"},
+    "dataclasses": {"dataclass"},
+    "beta3_bootstrap_model": {
+        "AttestedCutoverBundle",
+        "BootstrapError",
+        "FrozenReadPort",
+        "digest_value",
+    },
+    "gwo_v8.cutover_guard": {
+        "CutoverBlocker",
+        "CutoverGuardReceipt",
+        "CutoverGuardReport",
+        "CutoverGuardSources",
+        "CutoverReadbackBundle",
+        "CutoverSubject",
+        "GuardCheck",
+    },
+    "gwo_v8.plan_control_host": {"install_cutover_guard"},
+}
+_FORBIDDEN_REPLAY_SURFACES = (
+    "subprocess",
+    "socket",
+    "sqlite3",
+    "requests",
+    "urllib",
+    "github",
+    "paseo",
+    "provider",
+    "RuntimeGateway",
+    "ProductionPlanControlStartHost",
+    "ArtifactStore",
+    "install_github_plan_control_start",
+    "transition",
+    "activation",
+    "compare_and_swap",
+    "publish",
+    "put",
+    "write",
+    "start",
+    "stop",
+    "restore",
+    "drain",
+)
+_REQUIRED_DYNAMIC_TRIPWIRES = {
+    "subprocess.run",
+    "subprocess.Popen",
+    "socket.socket",
+    "socket.create_connection",
+    "sqlite3.connect",
+    "github.issue_read",
+    "github.content_read",
+    "paseo.read",
+    "runtime.gateway.construct",
+    "runtime.gateway.planning_preflight",
+    "runtime.gateway.progress",
+    "runtime.provider.prepare",
+    "runtime.provider.command",
+    "runtime.provider.events",
+    "artifact.construct",
+    "artifact.put",
+    "host.construct",
+    "install.github",
+    "install.production",
+    "install.package",
+    "copy.tree",
+    "replace.path",
+    "transition.cutover",
+    "transition.rollback",
+    "cas.content",
+    "cas.ref",
+    "activation.guard",
+    "activation.publish",
+    "activation.start",
+}
+
+
+def _dotted(value):
+    if isinstance(value, ast.Name):
+        return value.id
+    if isinstance(value, ast.Attribute):
+        parent = _dotted(value.value)
+        return f"{parent}.{value.attr}" if parent else value.attr
+    return ""
+
+
+def _assert_replay_surface(source: str, *, filename: str) -> None:
+    tree = ast.parse(source, filename=filename)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert alias.name in {"dataclasses", "typing"}
+                assert not any(
+                    token in name
+                    for token in _FORBIDDEN_REPLAY_SURFACES
+                    for name in (alias.name, alias.asname or "")
+                )
+        elif isinstance(node, ast.ImportFrom):
+            allowed_symbols = _ALLOWED_REPLAY_IMPORTS.get(node.module)
+            assert allowed_symbols is not None
+            for alias in node.names:
+                assert alias.name in allowed_symbols
+                assert not any(
+                    token in name
+                    for token in _FORBIDDEN_REPLAY_SURFACES
+                    for name in (alias.name, alias.asname or "")
+                )
+        elif isinstance(node, ast.Call):
+            name = _dotted(node.func)
+            if name == "install_cutover_guard":
+                continue
+            assert not any(
+                token in name for token in _FORBIDDEN_REPLAY_SURFACES
+            ), name
 
 
 @pytest.fixture
 def tripwires(monkeypatch):
     class Tripwires:
-        external_calls: list[str] = []
+        def __init__(self):
+            self.external_calls = []
+            self.targets = {}
 
     tripwires = Tripwires()
 
@@ -58,15 +185,119 @@ def tripwires(monkeypatch):
 
         return record
 
-    monkeypatch.setattr(subprocess, "run", forbidden("subprocess.run"))
-    monkeypatch.setattr(subprocess, "Popen", forbidden("subprocess.Popen"))
-    monkeypatch.setattr(socket, "socket", forbidden("socket.socket"))
-    monkeypatch.setattr(
-        socket,
-        "create_connection",
-        forbidden("socket.create_connection"),
-    )
-    monkeypatch.setattr(sqlite3, "connect", forbidden("sqlite3.connect"))
+    def arm(owner, attribute, name):
+        recorder = forbidden(name)
+        monkeypatch.setattr(owner, attribute, recorder)
+        tripwires.targets[name] = (owner, attribute, recorder)
+
+    for owner, attribute, name in (
+        (subprocess, "run", "subprocess.run"),
+        (subprocess, "Popen", "subprocess.Popen"),
+        (socket, "socket", "socket.socket"),
+        (socket, "create_connection", "socket.create_connection"),
+        (sqlite3, "connect", "sqlite3.connect"),
+        (
+            github_snapshot_module.GitHubCliIssueReadClient,
+            "_run",
+            "github.issue_read",
+        ),
+        (
+            activation_module.GitHubCliContentClient,
+            "read",
+            "github.content_read",
+        ),
+        (runtime_module.PaseoCliClient, "_run", "paseo.read"),
+        (
+            runtime_gateway_module.RuntimeGateway,
+            "__init__",
+            "runtime.gateway.construct",
+        ),
+        (
+            runtime_gateway_module.RuntimeGateway,
+            "planning_preflight",
+            "runtime.gateway.planning_preflight",
+        ),
+        (
+            runtime_gateway_module.RuntimeGateway,
+            "progress",
+            "runtime.gateway.progress",
+        ),
+        (
+            runtime_gateway_module._PaseoRuntimeProviderAdapter,
+            "prepare",
+            "runtime.provider.prepare",
+        ),
+        (
+            runtime_gateway_module._PaseoRuntimeProviderAdapter,
+            "command",
+            "runtime.provider.command",
+        ),
+        (
+            runtime_gateway_module._PaseoRuntimeProviderAdapter,
+            "events",
+            "runtime.provider.events",
+        ),
+        (
+            runtime_gateway_module.ArtifactStore,
+            "__init__",
+            "artifact.construct",
+        ),
+        (runtime_gateway_module.ArtifactStore, "put", "artifact.put"),
+        (
+            plan_control_host_module.ProductionPlanControlStartHost,
+            "__init__",
+            "host.construct",
+        ),
+        (
+            plan_control_host_module,
+            "install_github_plan_control_start",
+            "install.github",
+        ),
+        (
+            plan_control_host_module,
+            "install_production_start_host",
+            "install.production",
+        ),
+        (sync_module, "install_atomic", "install.package"),
+        (shutil, "copytree", "copy.tree"),
+        (os, "replace", "replace.path"),
+        (
+            transition_module.WriterCutoverController,
+            "cutover",
+            "transition.cutover",
+        ),
+        (
+            transition_module.WriterCutoverController,
+            "rollback",
+            "transition.rollback",
+        ),
+        (
+            activation_module.GitHubCliContentClient,
+            "compare_and_swap",
+            "cas.content",
+        ),
+        (
+            activation_module.GitHubCliContentClient,
+            "compare_and_swap_ref",
+            "cas.ref",
+        ),
+        (
+            plan_control_host_module.ProductionCutoverGuardHost,
+            "validate_activation",
+            "activation.guard",
+        ),
+        (
+            activation_module.LocalPlanPublication,
+            "publish_and_activate",
+            "activation.publish",
+        ),
+        (
+            plan_control_host_module.ProductionPlanControlStartHost,
+            "start",
+            "activation.start",
+        ),
+    ):
+        arm(owner, attribute, name)
     return tripwires
 
 
@@ -247,56 +478,31 @@ def test_replay_rejects_guard_report_mismatch(valid_attested_bundle, monkeypatch
     assert error.value.code == "LIVE_GUARD_INVALID"
 
 
+def test_required_dynamic_tripwires_are_armed_on_real_surfaces(tripwires):
+    assert set(tripwires.targets) == _REQUIRED_DYNAMIC_TRIPWIRES
+    for name in sorted(tripwires.targets):
+        owner, attribute, recorder = tripwires.targets[name]
+        assert getattr(owner, attribute) is recorder
+        with pytest.raises(AssertionError):
+            getattr(owner, attribute)()
+    assert tripwires.external_calls == sorted(_REQUIRED_DYNAMIC_TRIPWIRES)
+
+
+@pytest.mark.parametrize(
+    "malicious",
+    (
+        "from gwo_v8.cutover_guard import RuntimeGateway as Harmless\n",
+        "from gwo_v8.cutover_guard import CutoverGuardReport as ArtifactStore\n",
+    ),
+)
+def test_static_gate_rejects_forbidden_symbol_from_allowlisted_module(malicious):
+    with pytest.raises(AssertionError):
+        _assert_replay_surface(malicious, filename="malicious_replay.py")
+
+
 def test_replay_module_has_only_the_frozen_guard_call_surface():
     path = REPO_ROOT / "scripts" / "beta3_replay_guard.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    allowed_modules = {
-        "dataclasses",
-        "beta3_bootstrap_model",
-        "gwo_v8.cutover_guard",
-        "gwo_v8.plan_control_host",
-    }
-    forbidden = (
-        "subprocess",
-        "socket",
-        "sqlite3",
-        "requests",
-        "urllib",
-        "github",
-        "paseo",
-        "provider",
-        "RuntimeGateway",
-        "ProductionPlanControlStartHost",
-        "ArtifactStore",
-        "install_github_plan_control_start",
-        "transition",
-        "activation",
-        "compare_and_swap",
-        "publish",
-        "put",
-        "write",
-        "start",
-        "stop",
-        "restore",
-        "drain",
+    _assert_replay_surface(
+        path.read_text(encoding="utf-8"),
+        filename=str(path),
     )
-
-    def dotted(value):
-        if isinstance(value, ast.Name):
-            return value.id
-        if isinstance(value, ast.Attribute):
-            parent = dotted(value.value)
-            return f"{parent}.{value.attr}" if parent else value.attr
-        return ""
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported = [alias.name for alias in node.names]
-            assert all(name in {"dataclasses"} for name in imported)
-        elif isinstance(node, ast.ImportFrom):
-            assert node.module in allowed_modules or node.module == "__future__"
-        elif isinstance(node, ast.Call):
-            name = dotted(node.func)
-            if name == "install_cutover_guard":
-                continue
-            assert not any(token in name for token in forbidden), name
