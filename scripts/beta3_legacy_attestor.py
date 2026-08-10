@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+import re
 import shlex
 from typing import Callable, Mapping
 
+import orch_core
 from gwo_v8._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
 from gwo_v8.cutover_guard import CutoverSubject, LegacyReadback
 
@@ -74,42 +76,69 @@ def _canonical_source_value(observation: object) -> _ObservedSource:
     )
 
 
-def _records_from_value(value: object, *, source: str) -> tuple[dict[str, object], ...]:
-    if type(value) is list:
-        raw = value
-    elif type(value) is dict:
-        raw = None
-        for key in ("records", "dispatches", "workers", "processes", "agents", "issues"):
-            candidate = value.get(key)
-            if type(candidate) is list:
-                raw = candidate
-                break
-        if raw is None:
-            if any(
-                key in value
-                for key in (
-                    "id",
-                    "Id",
-                    "agent_id",
-                    "worker_id",
-                    "ProcessId",
-                    "process_id",
-                    "dispatch_id",
-                    "status",
-                    "Status",
-                )
-            ):
-                raw = [value]
-            else:
-                raw = []
-    else:
-        _unavailable(f"{source} observation is not an object or list")
+def _dict_records(raw: object, *, source: str) -> tuple[dict[str, object], ...]:
+    if type(raw) is not list:
+        _unavailable(f"{source} observation records are not an exact list")
     records: list[dict[str, object]] = []
     for item in raw:
         if type(item) is not dict:
             _unavailable(f"{source} observation contains a non-object record")
         records.append(dict(item))
     return tuple(records)
+
+
+def _fixture_records(
+    value: object,
+    *,
+    source: str,
+    repository: str,
+) -> tuple[dict[str, object], ...]:
+    if (
+        type(value) is not dict
+        or set(value) != {"repository", "records"}
+        or value.get("repository") != repository
+    ):
+        _unavailable(f"{source} fixture observation has an unknown shape")
+    return _dict_records(value["records"], source=source)
+
+
+def _paseo_inventory_rows(value: object) -> tuple[dict[str, object], ...]:
+    if type(value) is list:
+        return _dict_records(value, source="Paseo")
+    if type(value) is not dict:
+        _unavailable("Paseo inventory is not an object or list")
+    wrapper_keys = [key for key in ("agents", "workers", "records") if key in value]
+    if wrapper_keys:
+        if len(wrapper_keys) != 1 or set(value) != {wrapper_keys[0]}:
+            _unavailable("Paseo inventory wrapper is ambiguous")
+        return _dict_records(value[wrapper_keys[0]], source="Paseo")
+    has_identity = any(key in value for key in ("id", "Id", "agent_id", "worker_id"))
+    has_state = any(key in value for key in ("status", "Status", "state"))
+    if not (has_identity and has_state):
+        _unavailable("Paseo inventory object is not a Worker row")
+    return (dict(value),)
+
+
+def _process_inventory_rows(value: object) -> tuple[dict[str, object], ...]:
+    if type(value) is list:
+        return _dict_records(value, source="process")
+    if type(value) is not dict:
+        _unavailable("process inventory is not an object or list")
+    wrapper_keys = [key for key in ("processes", "records") if key in value]
+    if wrapper_keys:
+        if len(wrapper_keys) != 1 or set(value) != {wrapper_keys[0]}:
+            _unavailable("process inventory wrapper is ambiguous")
+        return _dict_records(value[wrapper_keys[0]], source="process")
+    required = (
+        ("ProcessId", "process_id"),
+        ("ParentProcessId", "parent_process_id"),
+        ("CreationDate", "creation_date"),
+        ("ExecutablePath", "executable_path"),
+        ("CommandLine", "command_line"),
+    )
+    if not all(primary in value or alternate in value for primary, alternate in required):
+        _unavailable("process inventory object is not a complete CIM row")
+    return (dict(value),)
 
 
 def _source_observation(
@@ -128,7 +157,72 @@ def _source_observation(
     result = _canonical_source_value(observation)
     if result.record.repository != repository:
         _unavailable(f"{name} source repository differs from subject")
-    records = _records_from_value(result.value, source=name)
+    live_role = f"legacy.{name}"
+    fixture_role = f"fixture.{name}"
+    if result.record.role == live_role:
+        if result.record.read_mode != "COMPLETE_DOUBLE_READ":
+            _unavailable(f"{name} live source is not a complete double read")
+        if result.record.identity != (
+            ("observation_digest", result.record.content_sha256),
+        ):
+            _unavailable(f"{name} live source observation identity is not content-bound")
+    elif result.record.role == fixture_role:
+        if result.record.read_mode != "FIXTURE":
+            _unavailable(f"{name} fixture source read mode is invalid")
+        if (
+            len(result.record.identity) != 1
+            or result.record.identity[0][0] != "fixture"
+        ):
+            _unavailable(f"{name} fixture source identity is invalid")
+    else:
+        _unavailable(f"{name} source role is invalid")
+    if result.record.role == fixture_role:
+        records = _fixture_records(
+            result.value,
+            source=name,
+            repository=repository,
+        )
+    elif name == "dispatches":
+        _github_repository(result.value, repository)
+        records = ()
+    elif name == "workers":
+        value = result.value
+        if (
+            type(value) is not dict
+            or set(value) != {"repository", "workers", "inventory"}
+            or value.get("repository") != repository
+        ):
+            _unavailable("workers observation has an unknown normalized shape")
+        records = _dict_records(value["workers"], source=name)
+        inventory_rows = _paseo_inventory_rows(value["inventory"])
+        if len(records) != len(inventory_rows):
+            _unavailable("workers normalized observation omits inventory rows")
+        inventory_by_identity: dict[str, dict[str, object]] = {}
+        for row in inventory_rows:
+            identity = _record_identity(row, name="Worker")
+            if identity in inventory_by_identity:
+                _unavailable("workers inventory contains duplicate identity")
+            inventory_by_identity[identity] = row
+        for record in records:
+            if set(record) != {"id", "inventory", "inspect"}:
+                _unavailable("workers normalized record has an unknown shape")
+            identity = _record_identity(record, name="Worker")
+            if record["inventory"] != inventory_by_identity.get(identity):
+                _unavailable("workers normalized record differs from inventory row")
+    elif name == "processes":
+        records = _dict_records(result.value, source=name)
+        for record in records:
+            if set(record) != {
+                "ProcessId",
+                "ParentProcessId",
+                "CreationDate",
+                "ExecutablePath",
+                "CommandLine",
+                "integration_lease",
+            } or type(record["integration_lease"]) is not bool:
+                _unavailable("processes normalized record has an unknown shape")
+    else:
+        _unavailable(f"unknown legacy source: {name}")
     return replace(result, name=name, records=records)
 
 
@@ -194,32 +288,37 @@ def _dispatch_reference(record: Mapping[str, object]) -> str:
 
 
 def _dispatch_facts(source: _ObservedSource) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    dispatch_records: list[dict[str, object]] = []
-
-    def collect(value: object) -> None:
-        if type(value) is dict:
-            dispatch = value.get("dispatch")
-            if type(dispatch) is dict:
-                dispatch_records.append(dict(dispatch))
-            elif any(key in value for key in ("id", "reference", "status")):
-                dispatch_records.append(dict(value))
-            dispatches = value.get("dispatches")
-            if type(dispatches) is list:
-                for item in dispatches:
-                    if type(item) is dict:
-                        dispatch_records.append(dict(item))
-            for key, child in value.items():
-                if key not in {"dispatch", "dispatches"}:
-                    collect(child)
-        elif type(value) is list:
-            for child in value:
-                collect(child)
-
-    if source.records:
-        for item in source.records:
-            collect(item)
+    if type(source.value) is dict and "data" in source.value:
+        dispatch_records = list(
+            _normalized_github_dispatches(source.value, source.record.repository)
+        )
     else:
-        collect(source.value)
+        dispatch_records = []
+
+        def collect(value: object) -> None:
+            if type(value) is dict:
+                dispatch = value.get("dispatch")
+                if type(dispatch) is dict:
+                    dispatch_records.append(dict(dispatch))
+                elif any(key in value for key in ("id", "reference", "status")):
+                    dispatch_records.append(dict(value))
+                dispatches = value.get("dispatches")
+                if type(dispatches) is list:
+                    for item in dispatches:
+                        if type(item) is dict:
+                            dispatch_records.append(dict(item))
+                for key, child in value.items():
+                    if key not in {"dispatch", "dispatches"}:
+                        collect(child)
+            elif type(value) is list:
+                for child in value:
+                    collect(child)
+
+        if source.records:
+            for item in source.records:
+                collect(item)
+        else:
+            collect(source.value)
     active: dict[str, dict[str, object]] = {}
     v2_refs: set[str] = set()
     root = source.value
@@ -276,12 +375,7 @@ def _worker_facts(source: _ObservedSource, expected_repository: str) -> tuple[st
         state = inspection.get("status", inspection.get("Status"))
         if type(state) is not str or not state:
             _unavailable("Worker inspect state is absent")
-        archived = inspection.get("archived", inspection.get("Archived", False))
-        if type(archived) is not bool:
-            _unavailable("Worker inspect archived flag is malformed")
-        archived_at = inspection.get("archivedAt", inspection.get("archived_at"))
-        if archived_at is not None and (type(archived_at) is not str or not archived_at):
-            _unavailable("Worker inspect archived timestamp is malformed")
+        archived, archived_at = _worker_archive_evidence(inspection)
         if archived or archived_at is not None or state.casefold() in {"archived", "closed"}:
             continue
         reference = _worker_reference(item)
@@ -292,10 +386,56 @@ def _worker_facts(source: _ObservedSource, expected_repository: str) -> tuple[st
     return tuple(sorted(active))
 
 
+def _worker_archive_evidence(
+    inspection: Mapping[str, object],
+) -> tuple[bool, str | None]:
+    archived_keys = [key for key in ("archived", "Archived") if key in inspection]
+    timestamp_keys = [key for key in ("archivedAt", "archived_at") if key in inspection]
+    if len(archived_keys) > 1 or len(timestamp_keys) > 1:
+        _unavailable("Worker inspect archive evidence is ambiguous")
+    if not archived_keys and not timestamp_keys:
+        _unavailable("Worker inspect archive evidence is absent")
+    archived = False
+    if archived_keys:
+        value = inspection[archived_keys[0]]
+        if type(value) is not bool:
+            _unavailable("Worker inspect archived flag is malformed")
+        archived = value
+    archived_at = None
+    if timestamp_keys:
+        value = inspection[timestamp_keys[0]]
+        if value is not None and (type(value) is not str or not value):
+            _unavailable("Worker inspect archived timestamp is malformed")
+        archived_at = value
+    return archived, archived_at
+
+
+def _validate_decoder_record(
+    record: SourceRecord,
+    *,
+    reference: str,
+    repository: str,
+) -> None:
+    if record.repository != repository:
+        _unavailable("original decoder repository differs from subject")
+    if record.role == "legacy.decoder":
+        if record.read_mode != "COMPLETE_DOUBLE_READ":
+            _unavailable("original decoder is not a complete double read")
+        if record.identity != (
+            ("observation_digest", record.content_sha256),
+            ("reference", reference),
+        ):
+            _unavailable("original decoder identity is not reference/content-bound")
+    elif record.role == "fixture.decoder":
+        if record.read_mode != "FIXTURE" or record.identity != (
+            ("reference", reference),
+        ):
+            _unavailable("original decoder fixture identity is invalid")
+    else:
+        _unavailable("original decoder role is invalid")
+
+
 def _process_identity(record: Mapping[str, object]) -> str:
-    explicit = record.get("identity", record.get("lease_owner"))
-    if type(explicit) is str and explicit:
-        return explicit
     process_id = record.get("ProcessId", record.get("process_id"))
     creation = record.get("CreationDate", record.get("creation_date"))
     if type(process_id) not in {int, str} or type(creation) is not str or not creation:
@@ -351,10 +491,19 @@ class LegacyAttestor:
             _unavailable("attempt repository differs from subject")
         if attempt.cutover_subject_digest != digest_value(subject.canonical()):
             _unavailable("attempt does not bind subject")
+        if not writer.source_record_digests:
+            _unavailable("writer authority has no source record identities")
         sources = tuple(
             _source_observation(getattr(self._sources, name), subject.repository, name=name)
             for name in ("dispatches", "workers", "processes")
         )
+        if type(sources[0].value) is dict and "data" in sources[0].value:
+            github_repository = _github_repository(
+                sources[0].value,
+                subject.repository,
+            )
+            if github_repository["ref"]["target"]["oid"] != subject.source_commit:
+                _unavailable("GitHub snapshot base OID differs from cutover subject")
         source_records = tuple(sorted((item.record for item in sources), key=lambda item: item.digest))
         if len({record.digest for record in source_records}) != len(source_records):
             _unavailable("legacy source record identities are not unique")
@@ -390,6 +539,7 @@ class LegacyAttestor:
         else:
             _unavailable("legacy observations do not prove authoritative quiescence")
         decoder_proof: tuple[object, ...] = ()
+        decoder_records: list[SourceRecord] = []
         if v2_refs:
             if self._sources.decoder is None:
                 _unavailable("non-empty V2 references have no original decoder")
@@ -403,14 +553,23 @@ class LegacyAttestor:
                 if type(proof) is not SourceObservation or proof.complete is not True:
                     _unavailable("original decoder proof is incomplete")
                 parsed = _canonical_source_value(proof)
+                _validate_decoder_record(
+                    parsed.record,
+                    reference=reference,
+                    repository=subject.repository,
+                )
                 if parsed.record.producer_sha256 != attempt.attestor_sha256:
                     _unavailable("original decoder producer does not match attestor")
                 if type(parsed.value) is not dict or parsed.value.get("ref") != reference:
                     _unavailable("original decoder proof does not match V2 reference")
-                if parsed.value.get("readable") is not True or parsed.value.get("effectful") is True:
+                if (
+                    parsed.value.get("readable") is not True
+                    or parsed.value.get("effectful") is not False
+                ):
                     _unavailable("original decoder proof is not read-only")
                 proofs.append(parsed.value)
                 source_records += (parsed.record,)
+                decoder_records.append(parsed.record)
             decoder_proof = tuple(proofs)
             states = {str(proof.get("state")) for proof in proofs}
             if states == {"terminal"}:
@@ -465,16 +624,12 @@ class LegacyAttestor:
         legacy = replace(legacy, readback_digest=digest_value(body))
         all_records = tuple(sorted(source_record_values, key=lambda item: item.digest))
         source_digests = tuple(record.digest for record in all_records)
-        writer_digests = writer.source_record_digests or source_digests
+        writer_digests = writer.source_record_digests
         dispatch_digest = sources[0].record.digest
         worker_digest = sources[1].record.digest
         process_digest = sources[2].record.digest
-        decoder_digests = tuple(
-            record.digest
-            for record in source_record_values
-            if record.role.startswith("legacy.decoder") or record.role == "fixture.decoder"
-        )
-        decoder_bindings = decoder_digests or (dispatch_digest,)
+        decoder_digests = tuple(sorted(record.digest for record in decoder_records))
+        decoder_bindings = decoder_digests if v2_refs else (dispatch_digest,)
         authority_bindings = tuple(
             sorted(set(writer_digests + (dispatch_digest, worker_digest, process_digest)))
         )
@@ -503,6 +658,12 @@ class LegacyAttestor:
                 "canonical_digest",
             ),
         }
+        known_binding_digests = set(source_digests) | set(writer_digests)
+        if any(
+            not set(digests).issubset(known_binding_digests)
+            for digests, _ in field_sources.values()
+        ):
+            _unavailable("legacy field binding names an unknown source record")
         bindings = tuple(
             FieldBinding(
                 target=f"legacy.{field}",
@@ -517,6 +678,16 @@ class LegacyAttestor:
             field_bindings=bindings,
             writer_authority=writer,
         )
+
+
+def assert_same_legacy_observation(
+    before: ComponentObservation,
+    after: ComponentObservation,
+) -> None:
+    if type(before) is not ComponentObservation or type(after) is not ComponentObservation:
+        _drift("Legacy comparison received a non-component observation")
+    if canonical_bytes(before.canonical()) != canonical_bytes(after.canonical()):
+        _drift("Legacy complete observations differ")
 
 
 class _CommandReader:
@@ -577,7 +748,7 @@ class GitHubDispatchSnapshotReader(_CommandReader):
             repository=repository,
             payload_kind="github",
         )
-        _validate_github_snapshot(observation)
+        _validate_github_snapshot(observation, repository)
         return observation
 
 
@@ -601,7 +772,8 @@ class PaseoWorkerInventoryReader(_CommandReader):
             repository=repository,
             payload_kind="workers",
         )
-        rows = _records_from_value(first_value := load_canonical_json(first.canonical_payload), source="Paseo")
+        first_value = load_canonical_json(first.canonical_payload)
+        rows = _paseo_inventory_rows(first_value)
         identities: list[str] = []
         normalized: list[dict[str, object]] = []
         for row in rows:
@@ -622,10 +794,14 @@ class PaseoWorkerInventoryReader(_CommandReader):
             inspected_id = inspect_value.get("id", inspect_value.get("Id"))
             if inspected_id != identity:
                 _unavailable("Paseo Worker inspect identity differs from inventory")
-            if inspect_value.get("repository") not in {repository, None}:
+            if inspect_value.get("repository") != repository:
                 _unavailable("Paseo Worker inspect repository differs from query")
-            if inspect_value.get("role") not in {"worker", None}:
+            if inspect_value.get("role") != "worker":
                 _unavailable("Paseo Worker inspect role differs from query")
+            state = inspect_value.get("status", inspect_value.get("Status"))
+            if type(state) is not str or not state:
+                _unavailable("Paseo Worker inspect state is absent")
+            _worker_archive_evidence(inspect_value)
             normalized.append({"inventory": row, "inspect": inspect_value, "id": identity})
         payload = canonical_bytes({"repository": repository, "workers": normalized, "inventory": first_value})
         digest = digest_bytes(payload)
@@ -668,19 +844,17 @@ class CooperativeHostProcessReader(_CommandReader):
             payload_kind="processes",
         )
         value = load_canonical_json(observation.canonical_payload)
-        if type(value) is dict and not any(
-            key in value
-            for key in (
-                "records",
-                "processes",
-                "ProcessId",
-                "process_id",
-            )
-        ):
-            _unavailable("process inventory is not a complete CIM response")
-        rows = _records_from_value(value, source="process")
+        rows = _process_inventory_rows(value)
         normalized: list[dict[str, object]] = []
         for row in rows:
+            if set(row) != {
+                "ProcessId",
+                "ParentProcessId",
+                "CreationDate",
+                "ExecutablePath",
+                "CommandLine",
+            }:
+                _unavailable("process inventory row differs from the fixed CIM projection")
             _process_fields(row)
             item = dict(row)
             item["integration_lease"] = self._matches(repository, row)
@@ -708,23 +882,14 @@ class CooperativeHostProcessReader(_CommandReader):
         except ValueError as error:
             _unavailable("process command line is not parseable")
             raise AssertionError from error
-        normalized_tokens = {token.casefold() for token in tokens}
-        repository_token = repository.casefold()
-        has_repository = repository_token in normalized_tokens or any(
-            token.casefold().endswith(f"={repository_token}")
-            for token in tokens
-        )
-        action_tokens = {"integrate", "integration", "delivery", "deliver", "merge"}
-        legacy_tokens = {"v6.1", "v6_1", "v61", "legacy"}
-        has_action = bool(normalized_tokens & action_tokens)
-        has_legacy = bool(normalized_tokens & legacy_tokens)
+        token_set = set(tokens)
+        has_repository = repository in token_set or f"--repo={repository}" in token_set
+        has_action = bool(token_set & {"integrate", "deliver"})
+        has_legacy = "v6.1" in token_set
         if not (has_repository and has_action and has_legacy):
             return False
         if self._repository_path is None:
-            return True
-        explicit_path = row.get("RepositoryPath", row.get("repository_path"))
-        if explicit_path is not None:
-            return type(explicit_path) is str and explicit_path == self._repository_path
+            return False
         executable = row.get("ExecutablePath", row.get("executable_path"))
         if type(executable) is not str:
             return False
@@ -735,38 +900,249 @@ class CooperativeHostProcessReader(_CommandReader):
             return False
 
 
-def _validate_github_snapshot(observation: SourceObservation) -> None:
-    value = load_canonical_json(observation.canonical_payload)
+_HEX40 = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _github_connection(
+    parent: Mapping[str, object],
+    key: str,
+    *,
+    context: str,
+) -> list[dict[str, object]]:
+    connection = parent.get(key)
+    if type(connection) is not dict:
+        _unavailable(f"GitHub snapshot connection is missing: {context}.{key}")
+    nodes = connection.get("nodes")
+    if type(nodes) is not list:
+        _unavailable(f"GitHub snapshot nodes are missing: {context}.{key}")
+    page_info = connection.get("pageInfo")
+    if type(page_info) is not dict or page_info.get("hasNextPage") is not False:
+        _unavailable(f"GitHub snapshot pagination is incomplete: {context}.{key}")
+    total_count = connection.get("totalCount")
+    if type(total_count) is not int or total_count < 0 or total_count != len(nodes):
+        _unavailable(f"GitHub snapshot total count is invalid: {context}.{key}")
+    result: list[dict[str, object]] = []
+    for node in nodes:
+        if type(node) is not dict:
+            _unavailable(f"GitHub snapshot contains a non-object node: {context}.{key}")
+        result.append(dict(node))
+    return result
+
+
+def _validate_issue_node(node: Mapping[str, object], *, expected_label: str) -> None:
+    if type(node.get("id")) is not str or not node["id"]:
+        _unavailable("GitHub Issue node identity is missing")
+    if type(node.get("number")) is not int or node["number"] <= 0:
+        _unavailable("GitHub Issue number is invalid")
+    if node.get("state") != "OPEN":
+        _unavailable("GitHub Issue state is not exact OPEN")
+    if type(node.get("title")) is not str or not node["title"]:
+        _unavailable("GitHub Issue title is invalid")
+    if type(node.get("body")) is not str:
+        _unavailable("GitHub Issue body is invalid")
+    if type(node.get("updatedAt")) is not str or not node["updatedAt"]:
+        _unavailable("GitHub Issue update identity is invalid")
+    labels = _github_connection(node, "labels", context=f"Issue #{node['number']}")
+    label_names: list[str] = []
+    for label in labels:
+        name = label.get("name")
+        if type(name) is not str or not name:
+            _unavailable("GitHub Issue label identity is invalid")
+        label_names.append(name)
+    if expected_label not in label_names:
+        _unavailable("GitHub Issue does not match its queried orchestration label")
+    assignees = _github_connection(node, "assignees", context=f"Issue #{node['number']}")
+    if any(type(item.get("login")) is not str or not item["login"] for item in assignees):
+        _unavailable("GitHub Issue assignee identity is invalid")
+    comments = _github_connection(node, "comments", context=f"Issue #{node['number']}")
+    for comment in comments:
+        if type(comment.get("databaseId")) is not int or comment["databaseId"] <= 0:
+            _unavailable("GitHub Issue comment identity is invalid")
+        if type(comment.get("body")) is not str:
+            _unavailable("GitHub Issue comment body is invalid")
+        for field in ("createdAt", "updatedAt"):
+            if type(comment.get(field)) is not str or not comment[field]:
+                _unavailable("GitHub Issue comment time identity is invalid")
+        author = comment.get("author")
+        if author is not None and (
+            type(author) is not dict
+            or type(author.get("login")) is not str
+            or not author["login"]
+        ):
+            _unavailable("GitHub Issue comment author identity is invalid")
+
+
+def _validate_pr_node(node: Mapping[str, object]) -> None:
+    if type(node.get("id")) is not str or not node["id"]:
+        _unavailable("GitHub PR node identity is missing")
+    if type(node.get("number")) is not int or node["number"] <= 0:
+        _unavailable("GitHub PR number is invalid")
+    if node.get("state") != "OPEN":
+        _unavailable("GitHub PR state is not exact OPEN")
+    for field in ("title", "headRefName", "baseRefName", "updatedAt", "url"):
+        if type(node.get(field)) is not str or not node[field]:
+            _unavailable(f"GitHub PR identity field is invalid: {field}")
+    if type(node.get("body")) is not str:
+        _unavailable("GitHub PR body is invalid")
+    if type(node.get("headRefOid")) is not str or _HEX40.fullmatch(node["headRefOid"]) is None:
+        _unavailable("GitHub PR head OID is invalid")
+    if type(node.get("isDraft")) is not bool:
+        _unavailable("GitHub PR draft state is invalid")
+    for field in ("mergedAt", "reviewDecision"):
+        if node.get(field) is not None and type(node[field]) is not str:
+            _unavailable(f"GitHub PR optional field is invalid: {field}")
+    if type(node.get("mergeStateStatus")) is not str or not node["mergeStateStatus"]:
+        _unavailable("GitHub PR merge state is invalid")
+    reviews = _github_connection(node, "reviews", context=f"PR #{node['number']}")
+    files = _github_connection(node, "files", context=f"PR #{node['number']}")
+    commits = _github_connection(node, "commits", context=f"PR #{node['number']}")
+    if any(type(item.get("path")) is not str or not item["path"] for item in files):
+        _unavailable("GitHub PR changed path identity is invalid")
+    for review in reviews:
+        if type(review.get("state")) is not str or not review["state"]:
+            _unavailable("GitHub PR review state is invalid")
+    for commit_node in commits:
+        commit = commit_node.get("commit")
+        if type(commit) is not dict:
+            _unavailable("GitHub PR commit node is invalid")
+        rollup = commit.get("statusCheckRollup")
+        if rollup is not None:
+            if type(rollup) is not dict:
+                _unavailable("GitHub PR status rollup is invalid")
+            _github_connection(
+                rollup,
+                "contexts",
+                context=f"PR #{node['number']} status rollup",
+            )
+
+
+def _github_repository(value: object, expected_repository: str) -> dict[str, object]:
     if type(value) is not dict:
         _unavailable("GitHub snapshot is not an object")
-    repository = value.get("data", value).get("repository") if type(value.get("data", value)) is dict else None
+    if "errors" in value and value["errors"] != []:
+        _unavailable("GitHub snapshot contains GraphQL errors")
+    data = value.get("data")
+    if type(data) is not dict:
+        _unavailable("GitHub snapshot data is missing")
+    repository = data.get("repository")
     if type(repository) is not dict:
         _unavailable("GitHub repository snapshot is missing")
+    if type(repository.get("id")) is not str or not repository["id"]:
+        _unavailable("GitHub repository node identity is missing")
+    if repository.get("nameWithOwner") != expected_repository:
+        _unavailable("GitHub repository identity differs from subject")
     ref = repository.get("ref")
-    if type(ref) is not dict or type(ref.get("target")) is not dict or type(ref["target"].get("oid")) is not str:
+    oid = (ref.get("target") if type(ref) is dict else None)
+    oid = oid.get("oid") if type(oid) is dict else None
+    if type(oid) is not str or _HEX40.fullmatch(oid) is None:
         _unavailable("GitHub snapshot base OID is missing")
-    for key in ("readyIssues", "activeIssues", "blockedIssues", "pullRequests"):
-        connection = repository.get(key)
-        if type(connection) is not dict:
-            _unavailable(f"GitHub snapshot connection is missing: {key}")
-    def validate_pagination(item: object) -> None:
-        if type(item) is dict:
-            if "pageInfo" in item:
-                page = item.get("pageInfo")
-                if type(page) is not dict or page.get("hasNextPage") is not False:
-                    _unavailable("GitHub snapshot pagination is incomplete")
-            for child in item.values():
-                validate_pagination(child)
-        elif type(item) is list:
-            for child in item:
-                validate_pagination(child)
+    issue_ids: set[str] = set()
+    issue_numbers: set[int] = set()
+    for key, label in (
+        ("readyIssues", "orch:ready"),
+        ("activeIssues", "orch:active"),
+        ("blockedIssues", "orch:blocked"),
+    ):
+        for node in _github_connection(repository, key, context="repository"):
+            _validate_issue_node(node, expected_label=label)
+            if node["id"] in issue_ids or node["number"] in issue_numbers:
+                _unavailable("GitHub Issue identity occurs in multiple connections")
+            issue_ids.add(node["id"])
+            issue_numbers.add(node["number"])
+    pr_ids: set[str] = set()
+    pr_numbers: set[int] = set()
+    for node in _github_connection(repository, "pullRequests", context="repository"):
+        _validate_pr_node(node)
+        if node["id"] in pr_ids or node["number"] in pr_numbers:
+            _unavailable("GitHub PR identity is duplicated")
+        pr_ids.add(node["id"])
+        pr_numbers.add(node["number"])
+    return dict(repository)
 
-    validate_pagination(value)
+
+def _plain_github_issue(node: Mapping[str, object]) -> dict[str, object]:
+    return {
+        **node,
+        "labels": node["labels"]["nodes"],
+        "assignees": node["assignees"]["nodes"],
+        "comments": [
+            {**comment, "id": comment["databaseId"]}
+            for comment in node["comments"]["nodes"]
+        ],
+    }
+
+
+def _plain_github_pr(node: Mapping[str, object]) -> dict[str, object]:
+    commits = node["commits"]["nodes"]
+    rollup = None
+    if commits:
+        rollup = commits[-1]["commit"].get("statusCheckRollup")
+    contexts = [] if rollup is None else rollup["contexts"]["nodes"]
+    checks: list[dict[str, object]] = []
+    for context in contexts:
+        if context.get("state"):
+            state = str(context["state"]).upper()
+            checks.append(
+                {
+                    "status": "COMPLETED" if state in {"SUCCESS", "FAILURE", "ERROR"} else "PENDING",
+                    "conclusion": state,
+                }
+            )
+        else:
+            checks.append(dict(context))
+    return {
+        **node,
+        "statusCheckRollup": checks,
+        "reviews": node["reviews"]["nodes"],
+        "changedPaths": [item["path"] for item in node["files"]["nodes"]],
+        "filesTruncated": False,
+    }
+
+
+def _normalized_github_dispatches(
+    value: object,
+    expected_repository: str,
+) -> tuple[dict[str, object], ...]:
+    repository = _github_repository(value, expected_repository)
+    issues = [
+        _plain_github_issue(node)
+        for key in ("readyIssues", "activeIssues", "blockedIssues")
+        for node in repository[key]["nodes"]
+    ]
+    prs = [_plain_github_pr(node) for node in repository["pullRequests"]["nodes"]]
+    try:
+        normalized = orch_core.normalize_github_snapshot(expected_repository, issues, prs)
+    except orch_core.PolicyError as error:
+        _unavailable(f"GitHub Dispatch normalization failed: {error.code}")
+        raise AssertionError from error
+    dispatches: list[dict[str, object]] = []
+    for issue in normalized["issues"]:
+        dispatch = issue.get("dispatch")
+        labels = issue.get("labels")
+        requires_dispatch = type(labels) is list and bool(
+            {"orch:active", "orch:blocked"} & set(labels)
+        )
+        if dispatch:
+            if type(dispatch) is not dict:
+                _unavailable("normalized GitHub Dispatch is malformed")
+            dispatches.append(dict(dispatch))
+        elif requires_dispatch:
+            _unavailable("active GitHub Issue has no durable Dispatch record")
+    return tuple(dispatches)
+
+
+def _validate_github_snapshot(
+    observation: SourceObservation,
+    expected_repository: str,
+) -> None:
+    value = load_canonical_json(observation.canonical_payload)
+    _github_repository(value, expected_repository)
 
 
 _SNAPSHOT_QUERY = r"""
 query($owner:String!,$name:String!,$branch:String!){
   repository(owner:$owner,name:$name){
+    id nameWithOwner
     ref(qualifiedName:$branch){target{... on Commit{oid}}}
     readyIssues:issues(first:100,states:OPEN,labels:["orch:ready"],orderBy:{field:UPDATED_AT,direction:DESC}){
       totalCount pageInfo{hasNextPage}
@@ -787,19 +1163,19 @@ query($owner:String!,$name:String!,$branch:String!){
   }
 }
 fragment OrchIssue on Issue{
-  number title body updatedAt
-  labels(first:100){pageInfo{hasNextPage} nodes{name}}
+  id number state title body updatedAt
+  labels(first:100){totalCount pageInfo{hasNextPage} nodes{name}}
   milestone{title dueOn}
-  assignees(first:20){nodes{login}}
-  comments(first:100){pageInfo{hasNextPage} nodes{databaseId body createdAt updatedAt author{login}}}
+  assignees(first:20){totalCount pageInfo{hasNextPage} nodes{login}}
+  comments(first:100){totalCount pageInfo{hasNextPage} nodes{databaseId body createdAt updatedAt author{login}}}
 }
 """.replace(
     "__ORCH_PR_FIELDS__",
-    """number state title body headRefName headRefOid baseRefName isDraft updatedAt mergedAt
+    """id number state title body headRefName headRefOid baseRefName isDraft updatedAt mergedAt
 mergeStateStatus reviewDecision url
-reviews(first:100){pageInfo{hasNextPage} nodes{state body submittedAt author{login} commit{oid}}}
-files(first:100){pageInfo{hasNextPage} nodes{path}}
-commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{
+reviews(first:100){totalCount pageInfo{hasNextPage} nodes{state body submittedAt author{login} commit{oid}}}
+files(first:100){totalCount pageInfo{hasNextPage} nodes{path}}
+commits(last:1){totalCount pageInfo{hasNextPage} nodes{commit{statusCheckRollup{contexts(first:100){totalCount pageInfo{hasNextPage} nodes{
   ... on CheckRun{status conclusion}
   ... on StatusContext{state}
 }}}}}}
@@ -813,6 +1189,8 @@ _PROCESS_QUERY = (
     "ConvertTo-Json -Compress"
 )
 
+_PRODUCTION_REPOSITORY_PATH = r"D:\Workstation\github-work-orchestrator"
+
 
 def production_legacy_sources(
     *,
@@ -822,6 +1200,10 @@ def production_legacy_sources(
     return LegacySourceSet(
         dispatches=GitHubDispatchSnapshotReader(command_runner, producer_sha256),
         workers=PaseoWorkerInventoryReader(command_runner, producer_sha256),
-        processes=CooperativeHostProcessReader(command_runner, producer_sha256),
+        processes=CooperativeHostProcessReader(
+            command_runner,
+            producer_sha256,
+            repository_path=_PRODUCTION_REPOSITORY_PATH,
+        ),
         decoder=None,
     )

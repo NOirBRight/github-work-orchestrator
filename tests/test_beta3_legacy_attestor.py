@@ -23,6 +23,7 @@ from gwo_v8.cutover_guard import (  # noqa: E402
     CutoverSubject,
     LegacyReadback,
 )
+import orch_core  # noqa: E402
 from beta3_bootstrap_model import (  # noqa: E402
     AttemptIdentity,
     BootstrapError,
@@ -36,6 +37,7 @@ from beta3_legacy_attestor import (  # noqa: E402
     LegacyAttestor,
     LegacySourceSet,
     PaseoWorkerInventoryReader,
+    assert_same_legacy_observation,
     production_legacy_sources,
 )
 
@@ -46,6 +48,8 @@ class FakeSource:
     complete: bool = True
     typed_readback: object | None = None
     role: str = "fixture.source"
+    read_mode: str = "FIXTURE"
+    identity: tuple[tuple[str, str], ...] = (("fixture", "source"),)
 
     def read(self, repository: str) -> object:
         if self.typed_readback is not None:
@@ -55,8 +59,8 @@ class FakeSource:
             role=self.role,
             locator=f"fixture://{repository}",
             repository=repository,
-            read_mode="FIXTURE",
-            identity=(("fixture", "source"),),
+            read_mode=self.read_mode,
+            identity=self.identity,
             content_sha256=digest_value({"repository": repository, "records": self.records}),
             readback_digest=None,
             producer_sha256="8" * 64,
@@ -67,18 +71,48 @@ class FakeSource:
 @dataclass(frozen=True)
 class FakeDecoder:
     proofs: tuple[tuple[str, dict[str, object]], ...]
+    role: str = "fixture.decoder"
+    repository: str = "owner/repo"
+    read_mode: str = "FIXTURE"
+    live_identity: bool = False
 
     def read(self, reference: str) -> SourceObservation:
         values = dict(self.proofs)
         value = values[reference]
         payload = canonical_bytes(value)
+        identity = (("reference", reference),)
+        if self.live_identity:
+            identity = (
+                ("observation_digest", digest_value(value)),
+                ("reference", reference),
+            )
         record = SourceRecord(
-            role="fixture.decoder",
+            role=self.role,
             locator=f"fixture://decoder/{reference}",
-            repository="owner/repo",
-            read_mode="FIXTURE",
-            identity=(("reference", reference),),
+            repository=self.repository,
+            read_mode=self.read_mode,
+            identity=identity,
             content_sha256=digest_value(value),
+            readback_digest=None,
+            producer_sha256="8" * 64,
+        )
+        return SourceObservation(record, payload, True)
+
+
+@dataclass(frozen=True)
+class PayloadSource:
+    value: object
+    role: str
+
+    def read(self, repository: str) -> SourceObservation:
+        payload = canonical_bytes(self.value)
+        record = SourceRecord(
+            role=self.role,
+            locator=f"fixture://{repository}/payload",
+            repository=repository,
+            read_mode="FIXTURE",
+            identity=(("fixture", "payload"),),
+            content_sha256=digest_value(self.value),
             readback_digest=None,
             producer_sha256="8" * 64,
         )
@@ -313,6 +347,33 @@ def test_active_worker_requires_exact_inspect_identity(
     assert dict(observed.readbacks)["legacy"].active_workers == ("worker-1",)
 
 
+def test_running_worker_without_explicit_archive_evidence_is_unavailable(
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    sources = _sources(
+        workers=(
+            {
+                "id": "worker-1",
+                "inspect": {
+                    "id": "worker-1",
+                    "repository": subject.repository,
+                    "role": "worker",
+                    "status": "running",
+                },
+            },
+        )
+    )
+    with pytest.raises(BootstrapError) as error:
+        LegacyAttestor(sources).observe(
+            subject=subject,
+            attempt=attempt,
+            writer=writer,
+        )
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
 def test_archived_worker_is_excluded_after_exact_inspect_readback(
     subject: CutoverSubject,
     attempt: AttemptIdentity,
@@ -362,6 +423,30 @@ def test_multiple_integration_lease_owners_are_unavailable(
     assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
 
 
+def test_integration_lease_owner_uses_exact_process_creation_identity(
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    process = {
+        "ProcessId": 17,
+        "ParentProcessId": 1,
+        "CreationDate": "20260810000000.000000+000",
+        "ExecutablePath": r"D:\repo\.venv\Scripts\python.exe",
+        "CommandLine": "python -m orch integrate owner/repo v6.1",
+        "identity": "forged-owner",
+        "integration_lease": True,
+    }
+    observed = LegacyAttestor(_sources(processes=(process,))).observe(
+        subject=subject,
+        attempt=attempt,
+        writer=writer,
+    )
+    assert dict(observed.readbacks)["legacy"].integration_lease_owner == (
+        "process:17:20260810000000.000000+000"
+    )
+
+
 def test_legacy_digest_contains_source_record_identity_not_only_projection(
     subject: CutoverSubject,
     attempt: AttemptIdentity,
@@ -373,7 +458,11 @@ def test_legacy_digest_contains_source_record_identity_not_only_projection(
         writer=writer,
     )
     second_sources = LegacySourceSet(
-        dispatches=FakeSource(records=(), role="fixture.dispatches.changed"),
+        dispatches=FakeSource(
+            records=(),
+            role="fixture.dispatches",
+            identity=(("fixture", "changed"),),
+        ),
         workers=FakeSource(records=(), role="fixture.workers"),
         processes=FakeSource(records=(), role="fixture.processes"),
         decoder=None,
@@ -388,6 +477,263 @@ def test_legacy_digest_contains_source_record_identity_not_only_projection(
     assert first_readback.active_dispatches == second_readback.active_dispatches
     assert first_readback.durable_state_digest != second_readback.durable_state_digest
     assert first.source_records != second.source_records
+
+
+def test_legacy_rejects_missing_writer_source_record_identity(
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    with pytest.raises(BootstrapError) as error:
+        LegacyAttestor(_sources()).observe(
+            subject=subject,
+            attempt=attempt,
+            writer=replace(writer, source_record_digests=()),
+        )
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("source_name", ("dispatches", "workers", "processes"))
+def test_legacy_rejects_unknown_source_role(
+    source_name: str,
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    sources = _sources()
+    broken = replace(getattr(sources, source_name), role="fixture.unknown")
+    with pytest.raises(BootstrapError) as error:
+        LegacyAttestor(replace(sources, **{source_name: broken})).observe(
+            subject=subject,
+            attempt=attempt,
+            writer=writer,
+        )
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("mutation", ("read_mode", "identity"))
+def test_legacy_requires_live_complete_double_read_observation_identity(
+    mutation: str,
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    reader = GitHubDispatchSnapshotReader(
+        lambda command: canonical_bytes(_github_payload()),
+        "8" * 64,
+    )
+
+    class MutatedLiveSource:
+        def read(self, repository: str) -> SourceObservation:
+            observed = reader.read(repository)
+            record = observed.record
+            if mutation == "read_mode":
+                record = replace(record, read_mode="FIXTURE")
+            else:
+                record = replace(
+                    record,
+                    identity=(("observation_digest", "f" * 64),),
+                )
+            return SourceObservation(record, observed.canonical_payload, True)
+
+    with pytest.raises(BootstrapError) as error:
+        LegacyAttestor(
+            replace(_sources(), dispatches=MutatedLiveSource())
+        ).observe(subject=subject, attempt=attempt, writer=writer)
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    "decoder",
+    (
+        FakeDecoder(
+            proofs=(("v2:17", {"effectful": False, "readable": True, "ref": "v2:17", "state": "terminal"}),),
+            repository="other/repo",
+        ),
+        FakeDecoder(
+            proofs=(("v2:17", {"effectful": False, "readable": True, "ref": "v2:17", "state": "terminal"}),),
+            role="fixture.unknown-decoder",
+        ),
+        FakeDecoder(
+            proofs=(("v2:17", {"effectful": False, "readable": True, "ref": "v2:17", "state": "terminal"}),),
+            role="legacy.decoder",
+            read_mode="FIXTURE",
+            live_identity=True,
+        ),
+        FakeDecoder(
+            proofs=(("v2:17", {"effectful": False, "readable": True, "ref": "v2:17", "state": "terminal"}),),
+            role="legacy.decoder",
+            read_mode="COMPLETE_DOUBLE_READ",
+            live_identity=False,
+        ),
+        FakeDecoder(
+            proofs=(("v2:17", {"readable": True, "ref": "v2:17", "state": "terminal"}),),
+        ),
+    ),
+    ids=("repository", "role", "mode", "identity", "effectful-proof"),
+)
+def test_legacy_rejects_substituted_or_effectful_decoder_proof(
+    decoder: FakeDecoder,
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    sources = _sources(
+        dispatches=({"id": "17", "status": "running", "v2_execution_ref": "v2:17"},),
+        decoder=decoder,
+    )
+    with pytest.raises(BootstrapError) as error:
+        LegacyAttestor(sources).observe(
+            subject=subject,
+            attempt=attempt,
+            writer=writer,
+        )
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+def test_decoder_binding_names_exact_included_decoder_record(
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    decoder = FakeDecoder(
+        proofs=(
+            (
+                "v2:17",
+                {
+                    "effectful": False,
+                    "readable": True,
+                    "ref": "v2:17",
+                    "state": "terminal",
+                },
+            ),
+        )
+    )
+    observed = LegacyAttestor(
+        _sources(
+            dispatches=({"id": "17", "status": "running", "v2_execution_ref": "v2:17"},),
+            decoder=decoder,
+        )
+    ).observe(subject=subject, attempt=attempt, writer=writer)
+    decoder_record = next(
+        record for record in observed.source_records if record.role == "fixture.decoder"
+    )
+    bindings = {binding.target: binding for binding in observed.field_bindings}
+    assert bindings["legacy.v2_execution_state"].source_record_digests == (
+        decoder_record.digest,
+    )
+    assert bindings["legacy.original_decoder_readable"].source_record_digests == (
+        decoder_record.digest,
+    )
+
+
+def test_legacy_accepts_exact_live_decoder_identity_and_read_only_proof(
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    decoder = FakeDecoder(
+        proofs=(
+            (
+                "v2:17",
+                {
+                    "effectful": False,
+                    "readable": True,
+                    "ref": "v2:17",
+                    "state": "quiescent_read_only",
+                },
+            ),
+        ),
+        role="legacy.decoder",
+        read_mode="COMPLETE_DOUBLE_READ",
+        live_identity=True,
+    )
+    observed = LegacyAttestor(
+        _sources(
+            dispatches=(
+                {"id": "17", "status": "running", "v2_execution_ref": "v2:17"},
+            ),
+            decoder=decoder,
+        )
+    ).observe(subject=subject, attempt=attempt, writer=writer)
+    readback = dict(observed.readbacks)["legacy"]
+    assert readback.v2_execution_state == "quiescent_read_only"
+    assert any(record.role == "legacy.decoder" for record in observed.source_records)
+
+
+@pytest.mark.parametrize(
+    "drift_kind",
+    (
+        "observation_identity",
+        "process_creation",
+        "writer_source_identity",
+        "writer_record_identity",
+    ),
+)
+def test_legacy_comparison_rejects_complete_identity_drift(
+    drift_kind: str,
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    process = {
+        "ProcessId": 17,
+        "ParentProcessId": 1,
+        "CreationDate": "20260810000000.000000+000",
+        "ExecutablePath": r"D:\repo\.venv\Scripts\python.exe",
+        "CommandLine": "python -m orch reconcile owner/repo v6.1",
+        "integration_lease": False,
+    }
+    before_sources = _sources(processes=(process,))
+    after_sources = before_sources
+    after_writer = writer
+    if drift_kind == "observation_identity":
+        after_sources = replace(
+            before_sources,
+            dispatches=replace(
+                before_sources.dispatches,
+                identity=(("fixture", "substituted"),),
+            ),
+        )
+    elif drift_kind == "process_creation":
+        after_sources = _sources(
+            processes=({**process, "CreationDate": "20260810000001.000000+000"},)
+        )
+    elif drift_kind == "writer_source_identity":
+        after_writer = replace(writer, source_record_digests=("b" * 64,))
+    else:
+        after_writer = replace(writer, record_id="writer-record:substituted")
+
+    before = LegacyAttestor(before_sources).observe(
+        subject=subject,
+        attempt=attempt,
+        writer=writer,
+    )
+    after = LegacyAttestor(after_sources).observe(
+        subject=subject,
+        attempt=attempt,
+        writer=after_writer,
+    )
+    before_readback = dict(before.readbacks)["legacy"]
+    after_readback = dict(after.readbacks)["legacy"]
+    assert before_readback.active_dispatches == after_readback.active_dispatches
+    assert before_readback.integration_lease_owner == after_readback.integration_lease_owner
+    with pytest.raises(BootstrapError) as error:
+        assert_same_legacy_observation(before, after)
+    assert error.value.code == "LIVE_INPUT_DRIFT"
+
+
+def test_legacy_comparison_accepts_exact_same_complete_observation(
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    observed = LegacyAttestor(_sources()).observe(
+        subject=subject,
+        attempt=attempt,
+        writer=writer,
+    )
+    assert_same_legacy_observation(observed, observed)
 
 
 def test_legacy_rejects_unsafe_source_capability():
@@ -406,12 +752,77 @@ def test_legacy_rejects_unsafe_source_capability():
     assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
 
 
+def _github_connection(
+    nodes: list[dict[str, object]], *, has_next: bool = False
+) -> dict[str, object]:
+    return {
+        "totalCount": len(nodes),
+        "pageInfo": {"hasNextPage": has_next},
+        "nodes": nodes,
+    }
+
+
+def _github_issue_node(
+    *,
+    number: int,
+    label: str,
+    dispatch: dict[str, object] | None,
+) -> dict[str, object]:
+    comments: list[dict[str, object]] = []
+    if dispatch is not None:
+        comments.append(
+            {
+                "databaseId": number * 10,
+                "body": orch_core.render_issue_record({"dispatch": dispatch}),
+                "createdAt": "2026-08-10T00:00:00Z",
+                "updatedAt": "2026-08-10T00:00:00Z",
+                "author": {"login": "owner"},
+            }
+        )
+    return {
+        "id": f"I_{number}",
+        "number": number,
+        "state": "OPEN",
+        "title": f"Issue {number}",
+        "body": "",
+        "updatedAt": "2026-08-10T00:00:00Z",
+        "labels": _github_connection([{"name": label}]),
+        "milestone": None,
+        "assignees": _github_connection([]),
+        "comments": _github_connection(comments),
+    }
+
+
+def _github_pr_node(*, number: int, branch: str) -> dict[str, object]:
+    return {
+        "id": f"PR_{number}",
+        "number": number,
+        "state": "OPEN",
+        "title": f"PR {number}",
+        "body": "",
+        "headRefName": branch,
+        "headRefOid": "c" * 40,
+        "baseRefName": "main",
+        "isDraft": True,
+        "updatedAt": "2026-08-10T00:00:00Z",
+        "mergedAt": None,
+        "mergeStateStatus": "CLEAN",
+        "reviewDecision": None,
+        "url": f"https://github.test/owner/repo/pull/{number}",
+        "reviews": _github_connection([]),
+        "files": _github_connection([]),
+        "commits": _github_connection([]),
+    }
+
+
 def _github_payload(*, has_next: bool = False, base_oid: str | None = "a" * 40):
     repository: dict[str, object] = {
-        "readyIssues": {"pageInfo": {"hasNextPage": has_next}, "nodes": []},
-        "activeIssues": {"pageInfo": {"hasNextPage": has_next}, "nodes": []},
-        "blockedIssues": {"pageInfo": {"hasNextPage": has_next}, "nodes": []},
-        "pullRequests": {"pageInfo": {"hasNextPage": has_next}, "nodes": []},
+        "id": "R_owner_repo",
+        "nameWithOwner": "owner/repo",
+        "readyIssues": _github_connection([], has_next=has_next),
+        "activeIssues": _github_connection([], has_next=has_next),
+        "blockedIssues": _github_connection([], has_next=has_next),
+        "pullRequests": _github_connection([], has_next=has_next),
     }
     if base_oid is not None:
         repository["ref"] = {"target": {"oid": base_oid}}
@@ -429,8 +840,20 @@ def test_github_dispatch_reader_keeps_complete_response_digest_and_read_only_com
     reader = GitHubDispatchSnapshotReader(run, "8" * 64)
     observed = reader.read("owner/repo")
     assert len(calls) == 1
-    assert calls[0][:3] == ("gh", "api", "graphql")
-    assert calls[0][-1] == "branch=refs/heads/main"
+    assert calls[0][:4] == ("gh", "api", "graphql", "-f")
+    assert calls[0][5:] == (
+        "-F",
+        "owner=owner",
+        "-F",
+        "name=repo",
+        "-F",
+        "branch=refs/heads/main",
+    )
+    query = calls[0][4]
+    assert query.startswith("query=\nquery($owner:String!,$name:String!,$branch:String!){")
+    assert "id nameWithOwner" in query
+    assert "id number state title body updatedAt" in query
+    assert "id number state title body headRefName" in query
     assert observed.complete is True
     assert observed.record.read_mode == "COMPLETE_DOUBLE_READ"
     assert observed.record.identity == (("observation_digest", observed.record.content_sha256),)
@@ -443,26 +866,19 @@ def test_github_snapshot_dispatches_are_normalized_into_active_references(
 ):
     payload = _github_payload()
     payload["data"]["repository"]["activeIssues"]["nodes"] = [
-        {"dispatch": {"id": "17", "status": "running"}}
+        _github_issue_node(
+            number=17,
+            label="orch:active",
+            dispatch={"id": "17", "status": "running"},
+        )
     ]
-
-    class GitHubSource:
-        def read(self, repository: str) -> SourceObservation:
-            value = canonical_bytes(payload)
-            record = SourceRecord(
-                role="fixture.dispatches",
-                locator="fixture://github",
-                repository=repository,
-                read_mode="FIXTURE",
-                identity=(("observation_digest", digest_value(payload)),),
-                content_sha256=digest_value(payload),
-                readback_digest=None,
-                producer_sha256="8" * 64,
-            )
-            return SourceObservation(record, value, True)
+    payload["data"]["repository"]["activeIssues"]["totalCount"] = 1
 
     sources = LegacySourceSet(
-        dispatches=GitHubSource(),
+        dispatches=GitHubDispatchSnapshotReader(
+            lambda command: canonical_bytes(payload),
+            "8" * 64,
+        ),
         workers=FakeSource(records=(), role="fixture.workers"),
         processes=FakeSource(records=(), role="fixture.processes"),
     )
@@ -472,6 +888,114 @@ def test_github_snapshot_dispatches_are_normalized_into_active_references(
         writer=writer,
     )
     assert dict(observed.readbacks)["legacy"].active_dispatches == ("dispatch:17",)
+
+
+def test_legacy_rejects_github_base_oid_not_equal_to_cutover_subject(
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    sources = replace(
+        _sources(),
+        dispatches=GitHubDispatchSnapshotReader(
+            lambda command: canonical_bytes(_github_payload(base_oid="b" * 40)),
+            "8" * 64,
+        ),
+    )
+    with pytest.raises(BootstrapError) as error:
+        LegacyAttestor(sources).observe(
+            subject=subject,
+            attempt=attempt,
+            writer=writer,
+        )
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+def test_github_issue_and_pr_schema_feed_dispatch_normalization(
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    payload = _github_payload()
+    issue = _github_issue_node(
+        number=17,
+        label="orch:active",
+        dispatch={
+            "branch": "work/issue-17",
+            "id": "dispatch-issue-17-a1",
+            "status": "running",
+        },
+    )
+    payload["data"]["repository"]["activeIssues"] = _github_connection([issue])
+    payload["data"]["repository"]["pullRequests"] = _github_connection(
+        [_github_pr_node(number=31, branch="work/issue-17")]
+    )
+    observed = LegacyAttestor(
+        replace(
+            _sources(),
+            dispatches=GitHubDispatchSnapshotReader(
+                lambda command: canonical_bytes(payload),
+                "8" * 64,
+            ),
+        )
+    ).observe(subject=subject, attempt=attempt, writer=writer)
+    assert dict(observed.readbacks)["legacy"].active_dispatches == (
+        "dispatch:dispatch-issue-17-a1",
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "graphql_errors",
+        "missing_connection",
+        "missing_nodes",
+        "invalid_nodes",
+        "missing_page_info",
+        "invalid_page_info",
+        "invalid_base_oid",
+        "wrong_repository",
+        "malformed_issue_identity",
+        "malformed_issue_state",
+    ),
+)
+def test_github_dispatch_reader_rejects_partial_or_substituted_snapshot(case: str):
+    payload = _github_payload()
+    repository = payload["data"]["repository"]
+    if case == "graphql_errors":
+        payload["errors"] = [{"message": "partial response"}]
+    elif case == "missing_connection":
+        del repository["activeIssues"]
+    elif case == "missing_nodes":
+        del repository["activeIssues"]["nodes"]
+    elif case == "invalid_nodes":
+        repository["activeIssues"]["nodes"] = {}
+    elif case == "missing_page_info":
+        del repository["activeIssues"]["pageInfo"]
+    elif case == "invalid_page_info":
+        repository["activeIssues"]["pageInfo"] = []
+    elif case == "invalid_base_oid":
+        repository["ref"]["target"]["oid"] = "not-an-oid"
+    elif case == "wrong_repository":
+        repository["nameWithOwner"] = "other/repo"
+    else:
+        node = _github_issue_node(
+            number=17,
+            label="orch:active",
+            dispatch={"id": "17", "status": "running"},
+        )
+        if case == "malformed_issue_identity":
+            node["number"] = "17"
+        else:
+            node["state"] = "CLOSED"
+        repository["activeIssues"] = _github_connection([node])
+
+    with pytest.raises(BootstrapError) as error:
+        GitHubDispatchSnapshotReader(
+            lambda command: canonical_bytes(payload),
+            "8" * 64,
+        ).read("owner/repo")
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
 
 
 @pytest.mark.parametrize(
@@ -557,6 +1081,27 @@ def test_paseo_worker_reader_rejects_inspect_identity_substitution():
     assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
 
 
+@pytest.mark.parametrize("missing", ("repository", "role", "archived"))
+def test_paseo_worker_reader_requires_explicit_inspect_authority(missing: str):
+    inspection = {
+        "id": "worker-1",
+        "repository": "owner/repo",
+        "role": "worker",
+        "status": "running",
+        "archived": False,
+    }
+    del inspection[missing]
+
+    def run(command: tuple[str, ...]) -> bytes:
+        if command[1] == "ls":
+            return canonical_bytes([{"Id": "worker-1", "Status": "running"}])
+        return canonical_bytes(inspection)
+
+    with pytest.raises(BootstrapError) as error:
+        PaseoWorkerInventoryReader(run, "8" * 64).read("owner/repo")
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
 def test_paseo_worker_reader_accepts_one_json_object_without_dropping_it():
     calls: list[tuple[str, ...]] = []
 
@@ -580,7 +1125,25 @@ def test_paseo_worker_reader_accepts_one_json_object_without_dropping_it():
     assert calls[1] == ("paseo", "inspect", "worker-1", "--json")
 
 
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"unexpected": []},
+        {"agents": {}},
+        {"workers": "not-a-list"},
+    ),
+)
+def test_paseo_worker_reader_rejects_unknown_or_malformed_inventory_shape(payload):
+    with pytest.raises(BootstrapError) as error:
+        PaseoWorkerInventoryReader(
+            lambda command: canonical_bytes(payload),
+            "8" * 64,
+        ).read("owner/repo")
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
 def test_process_reader_requires_complete_cim_fields_and_marks_exact_lease_match():
+    calls: list[tuple[str, ...]] = []
     rows = [
         {
             "ProcessId": 17,
@@ -592,6 +1155,7 @@ def test_process_reader_requires_complete_cim_fields_and_marks_exact_lease_match
     ]
 
     def run(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
         return canonical_bytes(rows)
 
     reader = CooperativeHostProcessReader(
@@ -601,7 +1165,108 @@ def test_process_reader_requires_complete_cim_fields_and_marks_exact_lease_match
     )
     observed = reader.read("owner/repo")
     value = load_canonical_json(observed.canonical_payload)
+    assert calls == [
+        (
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process | Select-Object ProcessId, "
+            "ParentProcessId, CreationDate, ExecutablePath, CommandLine | "
+            "ConvertTo-Json -Compress",
+        )
+    ]
     assert value[0]["integration_lease"] is True
+
+
+@pytest.mark.parametrize(
+    ("command_line", "expected"),
+    (
+        ("python -m orch integrate owner/repo v6.1", True),
+        ("python -m orch deliver owner/repo v6.1", True),
+        ("python -m orch integration owner/repo v6.1", False),
+        ("python -m orch merge owner/repo v6.1", False),
+        ("python -m orch integrate owner/repo legacy", False),
+        ("python -m orch integrate owner/repo V6.1", False),
+        ("python -m orch integrate other/repo v6.1", False),
+    ),
+)
+def test_process_reader_requires_exact_repository_action_and_v61_tokens(
+    command_line: str,
+    expected: bool,
+):
+    row = {
+        "ProcessId": 17,
+        "ParentProcessId": 1,
+        "CreationDate": "20260810000000.000000+000",
+        "ExecutablePath": r"D:\repo\.venv\Scripts\python.exe",
+        "CommandLine": command_line,
+    }
+    observed = CooperativeHostProcessReader(
+        lambda command: canonical_bytes([row]),
+        "8" * 64,
+        repository_path=r"D:\repo",
+    ).read("owner/repo")
+    assert load_canonical_json(observed.canonical_payload)[0]["integration_lease"] is expected
+
+
+def test_production_process_reader_requires_fixed_production_repository_path():
+    rows = [
+        {
+            "ProcessId": index,
+            "ParentProcessId": 1,
+            "CreationDate": f"2026081000000{index}.000000+000",
+            "ExecutablePath": executable,
+            "CommandLine": "python -m orch integrate owner/repo v6.1",
+        }
+        for index, executable in (
+            (1, r"D:\other\.venv\Scripts\python.exe"),
+            (
+                2,
+                r"D:\Workstation\github-work-orchestrator\.venv\Scripts\python.exe",
+            ),
+        )
+    ]
+    reader = production_legacy_sources(
+        command_runner=lambda command: canonical_bytes(rows),
+        producer_sha256="8" * 64,
+    ).processes
+    observed = reader.read("owner/repo")
+    values = load_canonical_json(observed.canonical_payload)
+    assert [row["integration_lease"] for row in values] == [False, True]
+
+
+def test_process_reader_without_repository_path_cannot_match_lease_owner():
+    row = {
+        "ProcessId": 17,
+        "ParentProcessId": 1,
+        "CreationDate": "20260810000000.000000+000",
+        "ExecutablePath": r"D:\repo\.venv\Scripts\python.exe",
+        "CommandLine": "python -m orch integrate owner/repo v6.1",
+    }
+    observed = CooperativeHostProcessReader(
+        lambda command: canonical_bytes([row]),
+        "8" * 64,
+    ).read("owner/repo")
+    assert load_canonical_json(observed.canonical_payload)[0]["integration_lease"] is False
+
+
+def test_process_reader_rejects_unqueried_repository_path_claim():
+    row = {
+        "ProcessId": 17,
+        "ParentProcessId": 1,
+        "CreationDate": "20260810000000.000000+000",
+        "ExecutablePath": r"D:\other\.venv\Scripts\python.exe",
+        "CommandLine": "python -m orch integrate owner/repo v6.1",
+        "RepositoryPath": r"D:\repo",
+    }
+    with pytest.raises(BootstrapError) as error:
+        CooperativeHostProcessReader(
+            lambda command: canonical_bytes([row]),
+            "8" * 64,
+            repository_path=r"D:\repo",
+        ).read("owner/repo")
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
 
 
 def test_process_reader_accepts_one_cim_object_without_dropping_it():
@@ -626,6 +1291,119 @@ def test_process_reader_rejects_unparseable_complete_inventory():
             lambda command: canonical_bytes({"unexpected": []}),
             "8" * 64,
         ).read("owner/repo")
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"records": {}},
+        {"processes": "not-a-list"},
+    ),
+)
+def test_process_reader_rejects_non_list_inventory_wrapper(payload):
+    with pytest.raises(BootstrapError) as error:
+        CooperativeHostProcessReader(
+            lambda command: canonical_bytes(payload),
+            "8" * 64,
+        ).read("owner/repo")
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("source_name", ("workers", "processes"))
+def test_legacy_rejects_unknown_authoritative_payload_shape(
+    source_name: str,
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+):
+    sources = _sources()
+    malformed = PayloadSource(
+        value={"unexpected": []},
+        role=f"fixture.{source_name}",
+    )
+    with pytest.raises(BootstrapError) as error:
+        LegacyAttestor(replace(sources, **{source_name: malformed})).observe(
+            subject=subject,
+            attempt=attempt,
+            writer=writer,
+        )
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+def test_legacy_rejects_live_worker_inventory_omitted_from_normalized_records(
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    class OmittedWorkerSource:
+        def read(self, repository: str) -> SourceObservation:
+            value = {
+                "repository": repository,
+                "inventory": [{"Id": "worker-1", "Status": "running"}],
+                "workers": [],
+            }
+            payload = canonical_bytes(value)
+            digest = digest_value(value)
+            return SourceObservation(
+                SourceRecord(
+                    role="legacy.workers",
+                    locator="paseo://fixture/omitted",
+                    repository=repository,
+                    read_mode="COMPLETE_DOUBLE_READ",
+                    identity=(("observation_digest", digest),),
+                    content_sha256=digest,
+                    readback_digest=None,
+                    producer_sha256="8" * 64,
+                ),
+                payload,
+                True,
+            )
+
+    with pytest.raises(BootstrapError) as error:
+        LegacyAttestor(
+            replace(_sources(), workers=OmittedWorkerSource())
+        ).observe(subject=subject, attempt=attempt, writer=writer)
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+def test_legacy_rejects_live_process_record_without_match_derivation(
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    class UnderivedProcessSource:
+        def read(self, repository: str) -> SourceObservation:
+            value = [
+                {
+                    "ProcessId": 17,
+                    "ParentProcessId": 1,
+                    "CreationDate": "20260810000000.000000+000",
+                    "ExecutablePath": r"D:\repo\.venv\Scripts\python.exe",
+                    "CommandLine": "python -m orch integrate owner/repo v6.1",
+                }
+            ]
+            payload = canonical_bytes(value)
+            digest = digest_value(value)
+            return SourceObservation(
+                SourceRecord(
+                    role="legacy.processes",
+                    locator="host://fixture/underived",
+                    repository=repository,
+                    read_mode="COMPLETE_DOUBLE_READ",
+                    identity=(("observation_digest", digest),),
+                    content_sha256=digest,
+                    readback_digest=None,
+                    producer_sha256="8" * 64,
+                ),
+                payload,
+                True,
+            )
+
+    with pytest.raises(BootstrapError) as error:
+        LegacyAttestor(
+            replace(_sources(), processes=UnderivedProcessSource())
+        ).observe(subject=subject, attempt=attempt, writer=writer)
     assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
 
 
