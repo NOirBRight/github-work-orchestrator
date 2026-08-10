@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import base64
 import hashlib
+import json
+import os
 from pathlib import Path
+import shutil
+import sqlite3
 import sys
 from types import SimpleNamespace
 
@@ -25,6 +30,7 @@ from gwo_v8.cutover_guard import (  # noqa: E402
     CompatibilityPathReadback,
     DurableStateReadback,
     PackageReadback,
+    ReadOnlyPackageValidator,
 )
 from gwo_v8.transition import WriterTransitionRecord  # noqa: E402
 import beta3_control_ownership_attestor as attestor_module  # noqa: E402
@@ -46,6 +52,27 @@ class _Blob:
     blob_sha: str
 
 
+@dataclass
+class _ExactBlob:
+    repository: str
+    ref: str
+    commit_oid: str
+    path: str
+    content: bytes
+    blob_sha: str
+    object_type: str = "file"
+    encoding: str = "base64"
+    size: int | None = None
+
+
+@dataclass
+class _Ref:
+    repository: str
+    ref: str
+    commit_oid: str
+    object_type: str = "commit"
+
+
 class _ControlFixture:
     oid = "1" * 40
 
@@ -55,11 +82,11 @@ class _ControlFixture:
         self.active_plan_bytes = b"{}"
         self.legacy_fence_bytes = b"{}"
 
-    def read_ref(self, repository: str, branch: str) -> str:
+    def read_ref(self, repository: str, branch: str) -> _Ref:
         self.calls.append(("read_ref", repository, branch))
-        return self.oid
+        return _Ref(repository, f"refs/heads/{branch}", self.oid)
 
-    def read_at_oid(self, repository: str, oid: str, path: str) -> _Blob | None:
+    def read_at_oid(self, repository: str, oid: str, path: str) -> _ExactBlob | None:
         self.calls.append(("read_at_oid", repository, oid, path))
         content = {
             ".gwo-v8/writer-transition.json": self.writer_bytes,
@@ -71,7 +98,48 @@ class _ControlFixture:
         blob_sha = hashlib.sha1(
             f"blob {len(content)}\0".encode("ascii") + content
         ).hexdigest()
-        return _Blob(content, blob_sha)
+        return _ExactBlob(
+            repository=repository,
+            ref=oid,
+            commit_oid=oid,
+            path=path,
+            content=content,
+            blob_sha=blob_sha,
+            size=len(content),
+        )
+
+
+class _ExactControlFixture(_ControlFixture):
+    def read_ref(self, repository: str, branch: str) -> _Ref:
+        self.calls.append(("read_ref", repository, branch))
+        return _Ref(repository, f"refs/heads/{branch}", self.oid)
+
+    def read_at_oid(
+        self,
+        repository: str,
+        oid: str,
+        path: str,
+    ) -> _ExactBlob | None:
+        self.calls.append(("read_at_oid", repository, oid, path))
+        content = {
+            ".gwo-v8/writer-transition.json": self.writer_bytes,
+            ".gwo/v8/active-plan.json": self.active_plan_bytes,
+            ".gwo-v8/legacy-writer-fence.json": self.legacy_fence_bytes,
+        }[path]
+        if content is None:
+            return None
+        blob_sha = hashlib.sha1(
+            f"blob {len(content)}\0".encode("ascii") + content
+        ).hexdigest()
+        return _ExactBlob(
+            repository=repository,
+            ref=oid,
+            commit_oid=oid,
+            path=path,
+            content=content,
+            blob_sha=blob_sha,
+            size=len(content),
+        )
 
 
 def _subject() -> CutoverSubject:
@@ -83,7 +151,7 @@ def _subject() -> CutoverSubject:
         target_writer_generation="v8",
         store_generation="store:v8:test",
         source_commit="a" * 40,
-        source_tree_digest="b" * 64,
+        source_tree_digest="b" * 40,
         production_entry_refs=("entry:main",),
     )
 
@@ -108,12 +176,30 @@ def control_fixture() -> _ControlFixture:
 
 
 class _Registry:
-    def read(self, _repository: str) -> object:
-        return {"runtimes": []}
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def read(self, repository: str) -> SourceObservation:
+        self.calls.append(repository)
+        payload = canonical_bytes({"runtimes": []})
+        return SourceObservation(
+            record=SourceRecord(
+                role="runtime.registry",
+                locator=f"runtime-registry://{repository}",
+                repository=repository,
+                read_mode="COMPLETE_OBSERVATION",
+                identity=(("observation_digest", digest_bytes(payload)),),
+                content_sha256=digest_bytes(payload),
+                readback_digest=None,
+                producer_sha256="d" * 64,
+            ),
+            canonical_payload=payload,
+            complete=True,
+        )
 
 
 class _RuntimeConfig:
-    def read(self) -> object:
+    def read(self, path: Path | None = None) -> object:
         profile = {
             "provider": "provider",
             "settings": {
@@ -135,7 +221,7 @@ class _RuntimeConfig:
             },
         }
         payload = canonical_bytes(value)
-        config_path = Path.home() / ".orch" / "config.json"
+        config_path = Path(path or r"C:\fixture\.orch\config.json").resolve()
         record = SourceRecord(
             role="runtime.config",
             locator=str(config_path),
@@ -156,8 +242,63 @@ class _RuntimeConfig:
 
 
 class _LocalInputs:
-    def read(self, _config: object, _subject: CutoverSubject) -> None:
-        return None
+    def __init__(
+        self,
+        *,
+        commit: str | None = None,
+        tree: str | None = None,
+        root: Path | None = None,
+    ) -> None:
+        self._commit = commit
+        self._tree = tree
+        self._root = root
+        self.calls: list[tuple[object, CutoverSubject]] = []
+
+    def read(self, config: object, subject: CutoverSubject) -> SourceObservation:
+        self.calls.append((config, subject))
+        root = Path(self._root or config.repository_root).resolve()
+        files = []
+        if all((root / "skills" / name).is_dir() for name in subject.package_names):
+            files = [
+                {
+                    "relative_path": path.relative_to(root).as_posix(),
+                    "byte_sha256": digest_bytes(path.read_bytes()),
+                }
+                for path in attestor_module._checkout_source_files(root, subject)
+            ]
+        value = {
+            "repository_root": str(root),
+            "commit_oid": self._commit or subject.source_commit,
+            "tree_digest": self._tree or subject.source_tree_digest,
+            "git_status_sha256": digest_bytes(b""),
+            "files": files,
+        }
+        payload = canonical_bytes(value)
+        return SourceObservation(
+            record=SourceRecord(
+                role="local.inputs",
+                locator=f"local-checkout://{root}",
+                repository=subject.repository,
+                read_mode="EXACT_GIT_SNAPSHOT",
+                identity=tuple(
+                    sorted(
+                        {
+                            "repository_root": value["repository_root"],
+                            "commit_oid": value["commit_oid"],
+                            "tree_digest": value["tree_digest"],
+                            "git_status_sha256": value["git_status_sha256"],
+                            "file_set_digest": digest_value(files),
+                            "observation_digest": digest_bytes(payload),
+                        }.items()
+                    )
+                ),
+                content_sha256=digest_bytes(payload),
+                readback_digest=None,
+                producer_sha256="d" * 64,
+            ),
+            canonical_payload=payload,
+            complete=True,
+        )
 
 
 def _record(role: str, repository: str, producer: str) -> SourceRecord:
@@ -297,16 +438,228 @@ def _sources(control: _ControlFixture) -> ControlOwnershipSourceSet:
 
 def _config(tmp_path: Path) -> SimpleNamespace:
     return SimpleNamespace(
+        repository="owner/repo",
+        control_branch="gwo-control",
+        target_branch="main",
+        source_writer_generation="v6.1",
+        target_writer_generation="v8",
         expected_head="a" * 40,
-        expected_tree="b" * 64,
+        expected_tree="b" * 40,
         repository_root=tmp_path,
         install_roots=(tmp_path / ".agents", tmp_path / ".codex", tmp_path / ".claude"),
+        package_names=("implement-gwo", "orchestrator"),
+        expected_package_version="8.0.0",
+        expected_package_content_digests=(
+            ("implement-gwo", "1" * 64),
+            ("orchestrator", "2" * 64),
+        ),
         fresh_store=tmp_path / "store.sqlite3",
         fresh_receipt=tmp_path / "receipt.json",
         expected_fresh_store_sha256="e" * 64,
+        expected_fresh_receipt_sha256="f" * 64,
+        expected_fresh_receipt_runbook_sha256="3" * 64,
+        expected_fresh_receipt_schema_digest="4" * 64,
+        expected_fresh_receipt_generation_rows=(("owner/repo", "store:v8:test"),),
+        expected_fresh_receipt_row_counts=(),
+        rollback_store=tmp_path / "rollback.sqlite3",
+        expected_rollback_store_sha256="5" * 64,
+        prior_store=tmp_path / "prior.sqlite3",
+        expected_prior_store_sha256="6" * 64,
+        runtime_config_path=tmp_path / "runtime-config.json",
         store_generation="store:v8:test",
         expected_store_tables=(),
     )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "repository",
+        "control_branch",
+        "target_branch",
+        "source_writer_generation",
+        "target_writer_generation",
+        "expected_head",
+        "expected_tree",
+        "repository_root",
+        "fresh_store",
+        "expected_fresh_store_sha256",
+        "fresh_receipt",
+        "expected_fresh_receipt_sha256",
+        "expected_fresh_receipt_runbook_sha256",
+        "expected_fresh_receipt_schema_digest",
+        "expected_fresh_receipt_generation_rows",
+        "expected_fresh_receipt_row_counts",
+        "rollback_store",
+        "expected_rollback_store_sha256",
+        "prior_store",
+        "expected_prior_store_sha256",
+        "runtime_config_path",
+        "store_generation",
+        "expected_store_tables",
+        "install_roots",
+        "package_names",
+        "expected_package_version",
+        "expected_package_content_digests",
+    ),
+)
+def test_config_requires_every_fixed_identity(tmp_path, field):
+    config = _config(tmp_path)
+    delattr(config, field)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._validate_config_subject(config, _subject())
+
+    assert error.value.code in {
+        "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        "STORE_SOURCE_UNAVAILABLE",
+        "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE",
+        "PACKAGE_SOURCE_UNAVAILABLE",
+    }
+
+
+def _production_subject_and_config(tmp_path):
+    subject = replace(
+        _subject(),
+        repository="NOirBRight/github-work-orchestrator",
+        source_commit="5de34bdaee45f0aba44077a8d1d3e3ed8293f237",
+        source_tree_digest="104ee822dbfb494d33d56b8ccf54092d9d1d9c86",
+        store_generation="store:v8:production:20260809T081500Z",
+    )
+    config = _config(tmp_path)
+    config.repository = subject.repository
+    config.expected_head = subject.source_commit
+    config.expected_tree = subject.source_tree_digest
+    config.repository_root = Path(r"D:\Workstation\github-work-orchestrator")
+    config.fresh_store = Path(
+        r"C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator"
+        r"\store-20260809T081500Z.sqlite3"
+    )
+    config.store_generation = subject.store_generation
+    config.expected_fresh_store_sha256 = (
+        "afff1078e7a65fb8acccde28fee78fab3cf2278db9dd6548f5ef96a882076b98"
+    )
+    config.fresh_receipt = Path(
+        r"D:\gwo-release-evidence\2026-08-09-gwo-v8-beta3-production-cutover"
+        r"\fresh-store-exact-main-receipt.json"
+    )
+    config.expected_fresh_receipt_sha256 = (
+        "46814d166c857e3d7f847b7da6f3da5b39c394b42402b2f1d2cdd61d78ce7781"
+    )
+    config.rollback_store = Path(
+        r"C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator\store.sqlite3"
+    )
+    config.expected_rollback_store_sha256 = (
+        "1cc3f304044032fdab9569f8561b28220ecfd93e4efc35cf6bb2e492c1ca72b8"
+    )
+    config.prior_store = Path(
+        r"C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator"
+        r"\store-20260809T023000Z.sqlite3"
+    )
+    config.expected_prior_store_sha256 = (
+        "df2341d76eb2ab54110ac3e70ff137a93d05ffbb02352c61b654321dba188ed7"
+    )
+    config.expected_fresh_receipt_runbook_sha256 = (
+        "0378be64a95aa4eeb09626c120254ad8105a1a5cc2dfd1f60ddf089dfba821f2"
+    )
+    config.expected_fresh_receipt_schema_digest = (
+        "69ac6babce5db564fcc60fc5dd97feb0635911e07955234098210ddd97a93aed"
+    )
+    config.expected_fresh_receipt_generation_rows = (
+        (subject.repository, subject.store_generation),
+    )
+    config.expected_store_tables = attestor_module._fixed_store_contract()[0]
+    config.expected_fresh_receipt_row_counts = tuple(
+        (
+            table,
+            1 if table == "v8_writer_generations" else 0,
+        )
+        for table in config.expected_store_tables
+    )
+    config.runtime_config_path = Path(r"C:\Users\noirb\.orch\config.json")
+    config.install_roots = tuple(
+        Path(rf"C:\Users\noirb\{surface}\skills")
+        for surface in (".agents", ".codex", ".claude")
+    )
+    config.expected_package_content_digests = (
+        ("implement-gwo", "fcafa60645a2ea18408ec97369fdf5a01402a950b90e701fa2305624a1bfeaa9"),
+        ("orchestrator", "1a10f3f19e6db951150bd97a40561de1093ae20ba07d8c503a244cd1f0123639"),
+    )
+    return subject, config
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("repository_root", Path(r"D:\different")),
+        ("fresh_store", Path(r"C:\different\store.sqlite3")),
+        ("expected_fresh_store_sha256", "0" * 64),
+        ("fresh_receipt", Path(r"D:\different\receipt.json")),
+        ("expected_fresh_receipt_sha256", "0" * 64),
+        ("rollback_store", Path(r"C:\different\rollback.sqlite3")),
+        ("expected_rollback_store_sha256", "0" * 64),
+        ("prior_store", Path(r"C:\different\prior.sqlite3")),
+        ("expected_prior_store_sha256", "0" * 64),
+        ("expected_fresh_receipt_runbook_sha256", "0" * 64),
+        ("expected_fresh_receipt_schema_digest", "0" * 64),
+        ("expected_store_tables", ("unexpected",)),
+        ("expected_fresh_receipt_generation_rows", (("other/repo", "store:v8:other"),)),
+        ("expected_fresh_receipt_row_counts", (("unexpected", 1),)),
+        ("runtime_config_path", Path(r"C:\different\config.json")),
+        ("install_roots", (Path(r"C:\different"),) * 3),
+        ("expected_package_content_digests", (("implement-gwo", "0" * 64), ("orchestrator", "0" * 64))),
+    ),
+)
+def test_production_configuration_requires_every_global_fixed_identity(
+    tmp_path,
+    field,
+    replacement,
+):
+    subject, config = _production_subject_and_config(tmp_path)
+    setattr(config, field, replacement)
+
+    with pytest.raises(BootstrapError):
+        attestor_module._validate_config_subject(config, subject)
+
+
+def test_production_configuration_accepts_exact_global_fixed_identities(tmp_path):
+    subject, config = _production_subject_and_config(tmp_path)
+
+    attestor_module._validate_config_subject(config, subject)
+
+
+def test_production_configuration_rejects_runtime_config_path_alias(tmp_path):
+    subject, config = _production_subject_and_config(tmp_path)
+    config.runtime_config_path = Path(
+        r"C:\Users\noirb\.orch\nested\..\config.json"
+    )
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._validate_config_subject(config, subject)
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("role", ("control", "runtime_registry", "runtime_config", "local_inputs"))
+@pytest.mark.parametrize("extra_method", ("write_file", "synchronize", "unexpected_read"))
+def test_sources_expose_only_the_exact_read_only_surface(
+    control_fixture,
+    role,
+    extra_method,
+):
+    sources = _sources(control_fixture)
+    original = getattr(sources, role)
+    unsafe_type = type(
+        f"Unsafe{role.title()}",
+        (type(original),),
+        {extra_method: lambda self: None},
+    )
+    unsafe = unsafe_type() if role != "control" else unsafe_type()
+
+    with pytest.raises(BootstrapError) as error:
+        ControlOwnershipAttestor(replace(sources, **{role: unsafe}))
+
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
 
 
 def test_control_reads_every_blob_at_one_fixed_oid(control_fixture, tmp_path, monkeypatch):
@@ -351,8 +704,24 @@ def test_control_reads_every_blob_at_one_fixed_oid(control_fixture, tmp_path, mo
     static_record = _record("compatibility.module", subject.repository, _attempt(subject).attestor_sha256)
     package_record = _record("package.file", subject.repository, _attempt(subject).attestor_sha256)
     monkeypatch.setattr(attestor_module, "_read_store", lambda *_args: store)
+    monkeypatch.setattr(attestor_module, "_validate_package_identity_config", lambda *_args: None)
+    monkeypatch.setattr(
+        attestor_module,
+        "_validate_checkout_file_bindings",
+        lambda *_args: None,
+    )
     monkeypatch.setattr(attestor_module, "_static_records", lambda *_args, **_kwargs: [static_record])
     monkeypatch.setattr(attestor_module, "_package_records", lambda *_args, **_kwargs: [package_record])
+    monkeypatch.setattr(
+        attestor_module,
+        "_read_stable_static_inputs",
+        lambda *_args, **_kwargs: (compatibility, [static_record]),
+    )
+    monkeypatch.setattr(
+        attestor_module,
+        "_read_stable_package_inputs",
+        lambda *_args, **_kwargs: (packages, [package_record]),
+    )
     monkeypatch.setattr(attestor_module, "ProductionPathScanner", lambda _root: SimpleNamespace(read=lambda _subject: compatibility))
     monkeypatch.setattr(attestor_module, "ReadOnlyPackageValidator", lambda *_args: SimpleNamespace(read=lambda _subject: packages))
     config = _config(tmp_path)
@@ -415,8 +784,24 @@ def test_control_source_records_retain_each_blob_byte_digest(
     static_record = _record("compatibility.module", subject.repository, attempt.attestor_sha256)
     package_record = _record("package.file", subject.repository, attempt.attestor_sha256)
     monkeypatch.setattr(attestor_module, "_read_store", lambda *_args: store)
+    monkeypatch.setattr(attestor_module, "_validate_package_identity_config", lambda *_args: None)
+    monkeypatch.setattr(
+        attestor_module,
+        "_validate_checkout_file_bindings",
+        lambda *_args: None,
+    )
     monkeypatch.setattr(attestor_module, "_static_records", lambda *_args, **_kwargs: [static_record])
     monkeypatch.setattr(attestor_module, "_package_records", lambda *_args, **_kwargs: [package_record])
+    monkeypatch.setattr(
+        attestor_module,
+        "_read_stable_static_inputs",
+        lambda *_args, **_kwargs: (compatibility, [static_record]),
+    )
+    monkeypatch.setattr(
+        attestor_module,
+        "_read_stable_package_inputs",
+        lambda *_args, **_kwargs: (packages, [package_record]),
+    )
     monkeypatch.setattr(
         attestor_module,
         "ProductionPathScanner",
@@ -448,6 +833,24 @@ def test_control_source_records_retain_each_blob_byte_digest(
     )
 
 
+    checkout_digest = next(
+        record.digest
+        for record in observation.source_records
+        if record.role == "local.inputs"
+    )
+    for readback_name in ("compatibility", "packages"):
+        bindings = [
+            binding
+            for binding in observation.field_bindings
+            if binding.target.startswith(f"{readback_name}.")
+        ]
+        assert bindings
+        assert all(
+            checkout_digest in binding.source_record_digests
+            for binding in bindings
+        )
+
+
 def test_control_rejects_missing_record_instead_of_initial_writer_fallback(
     control_fixture,
     tmp_path,
@@ -467,14 +870,14 @@ def test_control_rejects_blob_identity_mismatch(control_fixture, tmp_path):
     sources = _sources(control_fixture)
 
     class MismatchedBlob(_ControlFixture):
-        def read_ref(self, repository: str, branch: str) -> str:
+        def read_ref(self, repository: str, branch: str) -> _Ref:
             return control_fixture.read_ref(repository, branch)
 
-        def read_at_oid(self, repository: str, oid: str, path: str) -> _Blob | None:
+        def read_at_oid(self, repository: str, oid: str, path: str) -> _ExactBlob | None:
             value = control_fixture.read_at_oid(repository, oid, path)
             if value is None:
                 return None
-            return _Blob(value.content, "0" * 40)
+            return replace(value, blob_sha="0" * 40)
 
     with pytest.raises(Exception) as error:
         ControlOwnershipAttestor(
@@ -499,8 +902,8 @@ def test_runtime_config_rejects_replaced_exact_path(control_fixture, tmp_path, m
     subject = _subject()
     attempt = _attempt(subject)
     sources = _sources(control_fixture)
-    payload = _RuntimeConfig().read().canonical_payload
-    config_path = Path.home() / ".orch" / "config.json"
+    config_path = _config(tmp_path).runtime_config_path.resolve()
+    payload = _RuntimeConfig().read(config_path).canonical_payload
     record = SourceRecord(
         role="runtime.config",
         locator=str(Path("C:/replaced/config.json")),
@@ -518,7 +921,7 @@ def test_runtime_config_rejects_replaced_exact_path(control_fixture, tmp_path, m
         producer_sha256=attempt.attestor_sha256,
     )
     replaced = SourceObservation(record=record, canonical_payload=payload, complete=True)
-    sources = replace(sources, runtime_config=SimpleNamespace(read=lambda: replaced))
+    sources = replace(sources, runtime_config=SimpleNamespace(read=lambda _path: replaced))
     store = SimpleNamespace(
         store_record=_record("store.sqlite", subject.repository, attempt.attestor_sha256),
         receipt_record=_record("store.receipt", subject.repository, attempt.attestor_sha256),
@@ -596,7 +999,7 @@ def test_source_observation_rejects_content_hash_drift():
         role="runtime.registry",
         locator="runtime-registry://owner/repo",
         repository=subject.repository,
-        read_mode="COMPLETE_DOUBLE_READ",
+        read_mode="COMPLETE_OBSERVATION",
         identity=(("observation_digest", digest_bytes(payload)),),
         content_sha256=digest_bytes(payload),
         readback_digest=None,
@@ -615,7 +1018,7 @@ def test_source_observation_rejects_content_hash_drift():
             repository=subject.repository,
             producer_sha256=attempt.attestor_sha256,
             default_locator="runtime-registry://owner/repo",
-            default_read_mode="COMPLETE_DOUBLE_READ",
+            default_read_mode="COMPLETE_OBSERVATION",
         )
     assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
 
@@ -641,8 +1044,30 @@ def test_source_observation_rejects_role_or_read_mode_substitution():
             repository=subject.repository,
             producer_sha256=attempt.attestor_sha256,
             default_locator="runtime-registry://owner/repo",
-            default_read_mode="COMPLETE_DOUBLE_READ",
+            default_read_mode="COMPLETE_OBSERVATION",
         )
+    assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+
+
+def test_runtime_registry_rejects_locator_provenance_substitution():
+    subject = _subject()
+    observed = _Registry().read(subject.repository)
+    replaced_observation = SourceObservation(
+        record=replace(observed.record, locator="runtime-registry://other/repo"),
+        canonical_payload=observed.canonical_payload,
+        complete=True,
+    )
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._source_observation(
+            replaced_observation,
+            role="runtime.registry",
+            repository=subject.repository,
+            producer_sha256="d" * 64,
+            default_locator=f"runtime-registry://{subject.repository}",
+            default_read_mode="COMPLETE_OBSERVATION",
+        )
+
     assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
 
 
@@ -650,6 +1075,30 @@ def test_runtime_registry_rejects_unknown_mapping_shape():
     with pytest.raises(BootstrapError) as error:
         attestor_module._registry_refs({"epoch": "registry:1"})
     assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        {"runtimes": [], "epoch": "extra"},
+        {"runtimes": ["agent:1"]},
+        {"runtimes": [{"identity": "agent:1", "state": "extra"}]},
+        {"runtimes": [{"runtime_id": "agent:1"}]},
+        {"runtimes": [{"identity": ""}]},
+        {"runtimes": [{"identity": "agent:1"}, {"identity": "agent:1"}]},
+    ),
+)
+def test_runtime_registry_requires_one_exact_complete_shape(value):
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._registry_refs(value)
+
+    assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+
+
+def test_runtime_registry_exact_shape_returns_stable_identity_refs():
+    assert attestor_module._registry_refs(
+        {"runtimes": [{"identity": "agent:2"}, {"identity": "agent:1"}]}
+    ) == ("runtime:agent:1", "runtime:agent:2")
 
 
 def test_bindings_do_not_fallback_to_unrelated_source_records():
@@ -677,7 +1126,8 @@ def test_bindings_do_not_fallback_to_unrelated_source_records():
 
 
 def test_runtime_config_requires_complete_file_identity():
-    observation = _RuntimeConfig().read()
+    path = Path(r"C:\fixture\.orch\config.json")
+    observation = _RuntimeConfig().read(path)
     record = replace(
         observation.record,
         identity=tuple(
@@ -690,7 +1140,8 @@ def test_runtime_config_requires_complete_file_identity():
                 record=record,
                 canonical_payload=observation.canonical_payload,
                 complete=True,
-            )
+            ),
+            path,
         )
     assert error.value.code == "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE"
 
@@ -767,6 +1218,84 @@ def test_runtime_config_uses_current_main_empty_features_default():
     assert tuple(item.selector for item in runtime.selectors) == attestor_module.RUNTIME_SELECTORS
 
 
+@pytest.mark.parametrize("location", ("top", "global", "repository"))
+def test_runtime_config_rejects_unknown_mapping_keys(location):
+    value = load_canonical_json(_RuntimeConfig().read().canonical_payload)
+    if location == "top":
+        value["unknown"] = True
+    elif location == "global":
+        value["global"]["unknown"] = True
+    else:
+        value["repositories"] = {"owner/repo": {"unknown": True}}
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._runtime_config_value(canonical_bytes(value), "owner/repo")
+
+    assert error.value.code == "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "reviewer_tier",
+        "unused_global_profile",
+        "unselected_repository_profile",
+        "unselected_repository_identity",
+    ),
+)
+def test_runtime_config_rejects_malformed_unselected_mappings(case):
+    value = load_canonical_json(_RuntimeConfig().read().canonical_payload)
+    invalid_profile = {
+        "provider": "provider",
+        "settings": {
+            "model": "model",
+            "thinkingOptionId": "high",
+            "modeId": "write",
+            "unknown": True,
+        },
+    }
+    if case == "reviewer_tier":
+        value["reviewer_tiers"] = {"standard": "unknown-tier"}
+    elif case == "unused_global_profile":
+        value["tiers"]["light"] = invalid_profile
+    elif case == "unselected_repository_profile":
+        value["repositories"] = {
+            "other/repo": {"tiers": {"light": invalid_profile}}
+        }
+    else:
+        value["repositories"] = {"other-repo": {}}
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._runtime_config_value(canonical_bytes(value), "owner/repo")
+
+    assert error.value.code == "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE"
+
+
+def test_runtime_config_rejects_noncanonical_exact_bytes():
+    payload = _RuntimeConfig().read().canonical_payload + b"\n"
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._runtime_config_value(payload, "owner/repo")
+
+    assert error.value.code == "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE"
+
+
+def test_runtime_config_binds_profile_mapping_and_configuration_digests():
+    configuration, readback = attestor_module._runtime_config_value(
+        _RuntimeConfig().read().canonical_payload,
+        "owner/repo",
+    )
+
+    _, repeated = attestor_module._runtime_config_value(
+        _RuntimeConfig().read().canonical_payload,
+        "owner/repo",
+    )
+    assert readback.configuration_digest == repeated.configuration_digest
+    assert len(readback.configuration_digest) == 64
+    assert tuple(item.selector for item in readback.selectors) == attestor_module.RUNTIME_SELECTORS
+    assert all(item.profile_digest in configuration.profiles for item in readback.selectors)
+
+
 def test_static_records_do_not_fallback_to_empty_provenance(tmp_path):
     with pytest.raises(BootstrapError) as error:
         attestor_module._static_records(
@@ -775,7 +1304,1098 @@ def test_static_records_do_not_fallback_to_empty_provenance(tmp_path):
             producer_sha256="d" * 64,
             role="compatibility.module",
             source_commit="a" * 40,
-            source_tree_digest="b" * 64,
+            source_tree_digest="b" * 40,
             readback_digest="c" * 64,
         )
     assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    ("override", "value"),
+    (
+        ("commit", "c" * 40),
+        ("tree", "c" * 40),
+        ("root", Path(r"C:\different-checkout")),
+    ),
+)
+def test_checkout_observation_rejects_identity_drift(tmp_path, override, value):
+    subject = _subject()
+    config = _config(tmp_path)
+    source = _LocalInputs(**{override: value})
+    observation = source.read(config, subject)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._validate_checkout_observation(observation, config, subject)
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+def test_checkout_observation_accepts_exact_commit_tree_and_root(tmp_path):
+    subject = _subject()
+    config = _config(tmp_path)
+    observation = _LocalInputs().read(config, subject)
+
+    record = attestor_module._validate_checkout_observation(observation, config, subject)
+
+    assert dict(record.identity) == {
+        "commit_oid": subject.source_commit,
+        "file_set_digest": digest_value([]),
+        "git_status_sha256": digest_bytes(b""),
+        "observation_digest": digest_bytes(observation.canonical_payload),
+        "repository_root": str(tmp_path.resolve()),
+        "tree_digest": subject.source_tree_digest,
+    }
+
+
+def test_local_checkout_source_reads_authoritative_head_and_git_tree(tmp_path):
+    subject = _subject()
+    config = _config(tmp_path)
+    _write_static_fixture(tmp_path)
+    responses = (
+        subject.source_commit.encode("ascii"),
+        subject.source_tree_digest.encode("ascii"),
+        b"",
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def command_runner(command):
+        calls.append(command)
+        return responses[len(calls) - 1]
+
+    observed = attestor_module._LocalInputsSource(
+        command_runner,
+        "d" * 64,
+    ).read(config, subject)
+
+    assert calls == [
+        ("git", "-C", str(tmp_path.resolve()), "rev-parse", "--verify", "HEAD"),
+        ("git", "-C", str(tmp_path.resolve()), "rev-parse", "--verify", "HEAD^{tree}"),
+        (
+            "git",
+            "-C",
+            str(tmp_path.resolve()),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ),
+    ]
+    assert dict(observed.record.identity)["commit_oid"] == subject.source_commit
+    assert dict(observed.record.identity)["tree_digest"] == subject.source_tree_digest
+    assert load_canonical_json(observed.canonical_payload)["files"]
+
+
+def test_local_checkout_source_rejects_dirty_worktree(tmp_path):
+    subject = _subject()
+    config = _config(tmp_path)
+    responses = iter(
+        (
+            subject.source_commit.encode("ascii"),
+            subject.source_tree_digest.encode("ascii"),
+            b" M changed.py\0",
+        )
+    )
+    source = attestor_module._LocalInputsSource(lambda _command: next(responses), "d" * 64)
+
+    with pytest.raises(BootstrapError) as error:
+        source.read(config, subject)
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("bare", ({"runtimes": []}, canonical_bytes({"runtimes": []})))
+def test_runtime_registry_rejects_bare_values_without_provenance(bare):
+    subject = _subject()
+    attempt = _attempt(subject)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._source_observation(
+            bare,
+            role="runtime.registry",
+            repository=subject.repository,
+            producer_sha256=attempt.attestor_sha256,
+            default_locator="runtime-registry://owner/repo",
+            default_read_mode="COMPLETE_OBSERVATION",
+        )
+
+    assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+
+
+def test_complete_observation_comparison_rejects_changed_registry_identity():
+    first = _Registry().read("owner/repo")
+    second_record = replace(
+        first.record,
+        identity=(
+            ("observation_digest", digest_bytes(first.canonical_payload)),
+            ("registry_epoch", "epoch:2"),
+        ),
+    )
+    second = SourceObservation(
+        record=second_record,
+        canonical_payload=first.canonical_payload,
+        complete=True,
+    )
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module.compare_complete_observations(first, second)
+
+    assert error.value.code == "LIVE_INPUT_DRIFT"
+
+
+def test_live_registry_source_records_one_complete_observation():
+    calls: list[tuple[str, ...]] = []
+    payload = canonical_bytes({"runtimes": []})
+
+    def command_runner(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        return payload
+
+    observed = attestor_module._RuntimeRegistrySource(
+        command_runner,
+        "d" * 64,
+    ).read("owner/repo")
+
+    assert calls == [
+        ("paseo", "runtime", "registry", "--repository", "owner/repo", "--json")
+    ]
+    assert observed.record.read_mode == "COMPLETE_OBSERVATION"
+
+
+def test_runtime_config_source_reads_only_explicit_fixture_path(tmp_path):
+    path = tmp_path / "explicit-runtime-config.json"
+    path.write_bytes(canonical_bytes({"fixture": True}))
+
+    observed = attestor_module._RuntimeConfigSource("d" * 64, "owner/repo").read(path)
+
+    assert observed.record.locator == str(path.resolve())
+    assert dict(observed.record.identity)["path"] == str(path.resolve())
+
+
+def test_runtime_config_validation_uses_explicit_path_not_home(tmp_path, monkeypatch):
+    expected = tmp_path / "config.json"
+    observed = _RuntimeConfig().read(expected)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path(r"C:\wrong-home")))
+
+    attestor_module._validate_runtime_config_source(observed, expected)
+
+
+def test_control_accepts_only_complete_returned_response_identity():
+    subject = _subject()
+    source = _ExactControlFixture()
+    source.writer_bytes, source.active_plan_bytes, source.legacy_fence_bytes = _control_bytes(subject)
+
+    fence, authority, records = attestor_module._read_control(
+        source,
+        subject=subject,
+        attempt=_attempt(subject),
+    )
+
+    assert fence.repository == subject.repository
+    assert authority.record_id == fence.record_id
+    assert len(records) == 4
+
+
+def test_github_ref_adapter_retains_response_repository_ref_oid_and_type():
+    oid = "1" * 40
+    response = {
+        "ref": "refs/heads/gwo-control",
+        "url": "https://api.github.com/repos/owner/repo/git/refs/heads/gwo-control",
+        "object": {
+            "type": "commit",
+            "sha": oid,
+            "url": f"https://api.github.com/repos/owner/repo/git/commits/{oid}",
+        },
+    }
+    source = attestor_module._GitHubControlSource(
+        lambda _command: json.dumps(response).encode("utf-8")
+    )
+
+    observed = source.read_ref("owner/repo", "gwo-control")
+
+    assert observed.repository == "owner/repo"
+    assert observed.ref == "refs/heads/gwo-control"
+    assert observed.commit_oid == oid
+    assert observed.object_type == "commit"
+
+
+def test_github_blob_adapter_retains_every_returned_identity():
+    oid = "1" * 40
+    path = ".gwo-v8/writer-transition.json"
+    content = b"exact bytes"
+    blob_oid = hashlib.sha1(
+        f"blob {len(content)}\0".encode("ascii") + content
+    ).hexdigest()
+    response = {
+        "name": "writer-transition.json",
+        "path": path,
+        "sha": blob_oid,
+        "size": len(content),
+        "url": f"https://api.github.com/repos/owner/repo/contents/{path}?ref={oid}",
+        "git_url": f"https://api.github.com/repos/owner/repo/git/blobs/{blob_oid}",
+        "type": "file",
+        "encoding": "base64",
+        "content": base64.b64encode(content).decode("ascii"),
+    }
+    source = attestor_module._GitHubControlSource(
+        lambda _command: json.dumps(response).encode("utf-8")
+    )
+
+    observed = source.read_at_oid("owner/repo", oid, path)
+
+    assert observed is not None
+    assert observed.repository == "owner/repo"
+    assert observed.ref == oid
+    assert observed.commit_oid == oid
+    assert observed.path == path
+    assert observed.blob_sha == blob_oid
+    assert observed.object_type == "file"
+    assert observed.encoding == "base64"
+    assert observed.size == len(content)
+    assert observed.content == content
+
+
+@pytest.mark.parametrize(
+    ("kind", "field", "replacement", "code"),
+    (
+        ("ref", "repository", "other/repo", "CONTROL_REF_UNAVAILABLE"),
+        ("ref", "ref", "refs/heads/main", "CONTROL_REF_UNAVAILABLE"),
+        ("ref", "commit_oid", "not-an-oid", "CONTROL_REF_UNAVAILABLE"),
+        ("ref", "object_type", "tag", "CONTROL_REF_UNAVAILABLE"),
+        ("blob", "repository", "other/repo", "WRITER_FENCE_SOURCE_UNAVAILABLE"),
+        ("blob", "ref", "2" * 40, "WRITER_FENCE_SOURCE_UNAVAILABLE"),
+        ("blob", "commit_oid", "2" * 40, "WRITER_FENCE_SOURCE_UNAVAILABLE"),
+        ("blob", "path", ".gwo-v8/other.json", "WRITER_FENCE_SOURCE_UNAVAILABLE"),
+        ("blob", "blob_sha", "2" * 40, "WRITER_FENCE_SOURCE_UNAVAILABLE"),
+        ("blob", "object_type", "dir", "WRITER_FENCE_SOURCE_UNAVAILABLE"),
+        ("blob", "encoding", "utf-8", "WRITER_FENCE_SOURCE_UNAVAILABLE"),
+        ("blob", "size", 0, "WRITER_FENCE_SOURCE_UNAVAILABLE"),
+        ("blob", "content", b"replaced", "WRITER_FENCE_SOURCE_UNAVAILABLE"),
+    ),
+)
+def test_control_rejects_every_returned_identity_substitution(
+    kind,
+    field,
+    replacement,
+    code,
+):
+    subject = _subject()
+    source = _ExactControlFixture()
+    source.writer_bytes, source.active_plan_bytes, source.legacy_fence_bytes = _control_bytes(subject)
+
+    class Substituted:
+        def read_ref(self, repository: str, branch: str):
+            observed = source.read_ref(repository, branch)
+            return replace(observed, **{field: replacement}) if kind == "ref" else observed
+
+        def read_at_oid(self, repository: str, oid: str, path: str):
+            observed = source.read_at_oid(repository, oid, path)
+            if observed is not None and kind == "blob" and path == attestor_module.WRITER_PATH:
+                return replace(observed, **{field: replacement})
+            return observed
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._read_control(
+            Substituted(),
+            subject=subject,
+            attempt=_attempt(subject),
+        )
+
+    assert error.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("ref", "refs/heads/main"),
+        ("url", "https://api.github.com/repos/other/repo/git/refs/heads/gwo-control"),
+        ("object.type", "tag"),
+        ("object.sha", "2" * 40),
+        ("object.url", "https://api.github.com/repos/other/repo/git/commits/" + "1" * 40),
+    ),
+)
+def test_github_ref_adapter_rejects_response_identity_mismatch(field, replacement):
+    oid = "1" * 40
+    response = {
+        "ref": "refs/heads/gwo-control",
+        "url": "https://api.github.com/repos/owner/repo/git/refs/heads/gwo-control",
+        "object": {
+            "type": "commit",
+            "sha": oid,
+            "url": f"https://api.github.com/repos/owner/repo/git/commits/{oid}",
+        },
+    }
+    if field.startswith("object."):
+        response["object"][field.split(".", 1)[1]] = replacement
+    else:
+        response[field] = replacement
+    source = attestor_module._GitHubControlSource(
+        lambda _command: json.dumps(response).encode("utf-8")
+    )
+
+    with pytest.raises(BootstrapError) as error:
+        source.read_ref("owner/repo", "gwo-control")
+
+    assert error.value.code == "CONTROL_REF_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("path", ".gwo-v8/other.json"),
+        ("type", "dir"),
+        ("encoding", "utf-8"),
+        ("size", 0),
+        ("url", "https://api.github.com/repos/other/repo/contents/file?ref=" + "1" * 40),
+        ("git_url", "https://api.github.com/repos/other/repo/git/blobs/" + "2" * 40),
+        ("sha", "2" * 40),
+        ("content", base64.b64encode(b"replaced").decode("ascii")),
+    ),
+)
+def test_github_blob_adapter_rejects_response_identity_mismatch(field, replacement):
+    oid = "1" * 40
+    path = ".gwo-v8/writer-transition.json"
+    content = b"exact bytes"
+    blob_oid = hashlib.sha1(
+        f"blob {len(content)}\0".encode("ascii") + content
+    ).hexdigest()
+    response = {
+        "path": path,
+        "sha": blob_oid,
+        "size": len(content),
+        "url": f"https://api.github.com/repos/owner/repo/contents/{path}?ref={oid}",
+        "git_url": f"https://api.github.com/repos/owner/repo/git/blobs/{blob_oid}",
+        "type": "file",
+        "encoding": "base64",
+        "content": base64.b64encode(content).decode("ascii"),
+    }
+    response[field] = replacement
+    source = attestor_module._GitHubControlSource(
+        lambda _command: json.dumps(response).encode("utf-8")
+    )
+
+    with pytest.raises(BootstrapError) as error:
+        source.read_at_oid("owner/repo", oid, path)
+
+    assert error.value.code == "CONTROL_BLOB_UNAVAILABLE"
+
+
+def _mutated_control_source(subject, mutation):
+    source = _ExactControlFixture()
+    writer_bytes, active_bytes, legacy_bytes = _control_bytes(subject)
+    writer = load_canonical_json(writer_bytes)
+    active = load_canonical_json(active_bytes)
+    legacy = load_canonical_json(legacy_bytes)
+    mutation(writer, active, legacy)
+    source.writer_bytes = canonical_bytes(writer)
+    source.active_plan_bytes = canonical_bytes(active)
+    source.legacy_fence_bytes = canonical_bytes(legacy)
+    return source
+
+
+@pytest.mark.parametrize("target", ("writer", "active", "legacy"))
+def test_control_rejects_noncanonical_bytes_for_every_blob(target):
+    subject = _subject()
+    source = _mutated_control_source(subject, lambda *_values: None)
+    name = {
+        "writer": "writer_bytes",
+        "active": "active_plan_bytes",
+        "legacy": "legacy_fence_bytes",
+    }[target]
+    setattr(source, name, getattr(source, name) + b"\n")
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._read_control(source, subject=subject, attempt=_attempt(subject))
+
+    assert error.value.code == "WRITER_FENCE_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("target", ("writer", "writer_record", "active", "receipt", "legacy", "event"))
+@pytest.mark.parametrize("change", ("missing", "unknown"))
+def test_control_rejects_unknown_or_missing_keys(target, change):
+    subject = _subject()
+
+    def mutate(writer, active, legacy):
+        values = {
+            "writer": (writer, "current"),
+            "writer_record": (writer["records"][0], "reason"),
+            "active": (active, "receipts"),
+            "receipt": (active["receipts"][0], "plan_record_ref"),
+            "legacy": (legacy, "events"),
+            "event": (legacy["events"][0], "operation"),
+        }
+        value, required = values[target]
+        if change == "missing":
+            value.pop(required)
+        else:
+            value["unknown"] = True
+
+    source = _mutated_control_source(subject, mutate)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._read_control(source, subject=subject, attempt=_attempt(subject))
+
+    assert error.value.code == "WRITER_FENCE_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("target", ("writer", "active", "legacy"))
+def test_control_rejects_repository_mismatch_in_every_blob(target):
+    subject = _subject()
+
+    def mutate(writer, active, legacy):
+        if target == "writer":
+            writer["current"]["repository"] = "other/repo"
+        elif target == "active":
+            active["repository"] = "other/repo"
+        else:
+            legacy["repository"] = "other/repo"
+
+    source = _mutated_control_source(subject, mutate)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._read_control(source, subject=subject, attempt=_attempt(subject))
+
+    assert error.value.code == "WRITER_FENCE_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "duplicate_record",
+        "bad_record_id",
+        "current_pointer",
+        "wrong_generation",
+        "non_null_activation",
+        "missing_predecessor",
+        "duplicate_receipt",
+        "activation_generation",
+        "lineage_fork",
+        "lineage_cycle",
+        "lineage_orphan",
+    ),
+)
+def test_control_rejects_record_and_activation_lineage_failures(case):
+    subject = _subject()
+
+    def mutate(writer, active, _legacy):
+        if case == "duplicate_record":
+            writer["records"].append(dict(writer["records"][0]))
+        elif case == "bad_record_id":
+            writer["records"][-1]["record_id"] = "bad-record"
+            writer["current"]["record_id"] = "bad-record"
+        elif case == "current_pointer":
+            writer["current"]["record_id"] = writer["records"][0]["record_id"]
+        elif case == "wrong_generation":
+            writer["current"]["writer_generation"] = "v8"
+        elif case == "non_null_activation":
+            writer["records"][-1]["activation_id"] = "activation:1"
+        elif case == "missing_predecessor":
+            active["receipts"][0]["expected_previous_digest"] = "9" * 64
+        elif case == "duplicate_receipt":
+            active["receipts"].append(dict(active["receipts"][0]))
+        elif case == "activation_generation":
+            active["receipts"][0]["writer_generation"] = "v6.1"
+        else:
+            root = active["receipts"][0]
+            second = {
+                **root,
+                "activation_id": "activation:2",
+                "plan_digest": "3" * 64,
+                "expected_previous_digest": None,
+                "plan_record_ref": "plan:2",
+                "created_at": "2026-08-10T00:00:01Z",
+            }
+            if case == "lineage_fork":
+                second["expected_previous_digest"] = root["plan_digest"]
+                third = {
+                    **second,
+                    "activation_id": "activation:3",
+                    "plan_digest": "4" * 64,
+                    "plan_record_ref": "plan:3",
+                }
+                active["receipts"].extend((second, third))
+                active["active_plan_digest"] = third["plan_digest"]
+            elif case == "lineage_cycle":
+                root["expected_previous_digest"] = second["plan_digest"]
+                second["expected_previous_digest"] = root["plan_digest"]
+                active["receipts"].append(second)
+            else:
+                active["receipts"].append(second)
+
+    source = _mutated_control_source(subject, mutate)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._read_control(source, subject=subject, attempt=_attempt(subject))
+
+    assert error.value.code == "WRITER_FENCE_SOURCE_UNAVAILABLE"
+
+
+def _write_static_fixture(root: Path) -> Path:
+    target = root / "skills" / "orchestrator" / "scripts" / "gwo_v8" / "entry.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("def start():\n    return None\n", encoding="utf-8")
+    implement = root / "skills" / "implement-gwo" / "SKILL.md"
+    implement.parent.mkdir(parents=True)
+    implement.write_text("# implement-gwo\n", encoding="utf-8")
+    orchestrator = root / "skills" / "orchestrator" / "SKILL.md"
+    orchestrator.write_text("# orchestrator\n", encoding="utf-8")
+    return target
+
+
+def _package_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    files = sorted(
+        (
+            child
+            for child in path.rglob("*")
+            if child.is_file()
+            and child.name != ".skill-package.json"
+            and "__pycache__" not in child.parts
+            and child.suffix != ".pyc"
+        ),
+        key=lambda child: child.relative_to(path).as_posix(),
+    )
+    for child in files:
+        relative = child.relative_to(path).as_posix().encode("utf-8")
+        content = child.read_bytes()
+        if child.suffix.lower() in {".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}:
+            content = content.replace(b"\r\n", b"\n")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def _write_package(path: Path, name: str) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+    manifest = {
+        "content_sha256": _package_digest(path),
+        "schema_version": 1,
+        "skill": name,
+        "version": "8.0.0",
+    }
+    (path / ".skill-package.json").write_text(
+        json.dumps(manifest, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_package_fixture(root: Path, install_roots: dict[str, Path]) -> None:
+    for name in ("implement-gwo", "orchestrator"):
+        _write_package(root / "skills" / name, name)
+        for install_root in install_roots.values():
+            _write_package(install_root / name, name)
+
+
+def _compatibility(subject: CutoverSubject) -> CompatibilityPathReadback:
+    return _readback(
+        CompatibilityPathReadback(
+            repository=subject.repository,
+            source_commit=subject.source_commit,
+            source_tree_digest=subject.source_tree_digest,
+            audit_version="fixture",
+            reachable_v2_projection_refs=(),
+            reachable_v3_compatibility_refs=(),
+            reachable_legacy_writer_refs=(),
+            proven_unreachable_refs=tuple(sorted(subject.forbidden_production_refs)),
+            readback_digest="",
+        )
+    )
+
+
+def test_static_scan_rejects_file_replacement_between_validation_and_recording(
+    tmp_path,
+    monkeypatch,
+):
+    target = _write_static_fixture(tmp_path)
+    subject = _subject()
+
+    class ReplacingScanner:
+        def read(self, scan_subject):
+            replacement = target.with_suffix(".replacement")
+            replacement.write_bytes(target.read_bytes())
+            os.replace(replacement, target)
+            return _compatibility(scan_subject)
+
+    monkeypatch.setattr(attestor_module, "ProductionPathScanner", lambda _root: ReplacingScanner())
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._read_stable_static_inputs(
+            tmp_path,
+            subject,
+            producer_sha256="d" * 64,
+        )
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+def test_static_scan_binds_every_scanned_file_snapshot(tmp_path, monkeypatch):
+    _write_static_fixture(tmp_path)
+    subject = _subject()
+    monkeypatch.setattr(
+        attestor_module,
+        "ProductionPathScanner",
+        lambda _root: SimpleNamespace(read=lambda scan_subject: _compatibility(scan_subject)),
+    )
+
+    readback, records = attestor_module._read_stable_static_inputs(
+        tmp_path,
+        subject,
+        producer_sha256="d" * 64,
+    )
+
+    assert readback.source_tree_digest == subject.source_tree_digest
+    assert {dict(record.identity)["relative_path"] for record in records} == {
+        "skills/implement-gwo/SKILL.md",
+        "skills/orchestrator/SKILL.md",
+        "skills/orchestrator/scripts/gwo_v8/entry.py",
+    }
+
+
+def test_package_validation_rejects_installed_file_replacement(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    install_roots = {
+        surface: tmp_path / surface / "skills"
+        for surface in (".agents", ".codex", ".claude")
+    }
+    _write_package_fixture(root, install_roots)
+    subject = _subject()
+    readback = ReadOnlyPackageValidator(root, install_roots).read(subject)
+    target = install_roots[".codex"] / "orchestrator" / "SKILL.md"
+
+    class ReplacingValidator:
+        def read(self, _subject):
+            replacement = target.with_suffix(".replacement")
+            replacement.write_bytes(target.read_bytes())
+            os.replace(replacement, target)
+            return readback
+
+    monkeypatch.setattr(
+        attestor_module,
+        "ReadOnlyPackageValidator",
+        lambda *_args: ReplacingValidator(),
+    )
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._read_stable_package_inputs(
+            root,
+            install_roots,
+            subject,
+            producer_sha256="d" * 64,
+        )
+
+    assert error.value.code == "PACKAGE_SOURCE_UNAVAILABLE"
+
+
+def test_package_validation_binds_every_source_and_installed_file(tmp_path):
+    root = tmp_path / "repo"
+    install_roots = {
+        surface: tmp_path / surface / "skills"
+        for surface in (".agents", ".codex", ".claude")
+    }
+    _write_package_fixture(root, install_roots)
+
+    readback, records = attestor_module._read_stable_package_inputs(
+        root,
+        install_roots,
+        _subject(),
+        producer_sha256="d" * 64,
+    )
+
+    assert readback.drift == ()
+    assert len(records) == 16
+    assert {dict(record.identity)["package"] for record in records} == {
+        f"{surface}:{name}"
+        for surface in ("source", ".agents", ".codex", ".claude")
+        for name in ("implement-gwo", "orchestrator")
+    }
+    assert {dict(record.identity)["relative_path"] for record in records} == {
+        ".skill-package.json",
+        "SKILL.md",
+    }
+
+
+def _checkout_binding_fixture(tmp_path):
+    root = tmp_path / "repo"
+    _write_static_fixture(root)
+    install_roots = {
+        surface: tmp_path / surface / "skills"
+        for surface in (".agents", ".codex", ".claude")
+    }
+    _write_package_fixture(root, install_roots)
+    subject = _subject()
+    config = _config(tmp_path)
+    config.repository_root = root
+    config.install_roots = tuple(install_roots.values())
+    checkout = _LocalInputs().read(config, subject)
+    return root, install_roots, subject, checkout
+
+
+def test_checkout_file_manifest_binds_compatibility_and_source_packages(tmp_path):
+    root, install_roots, subject, checkout = _checkout_binding_fixture(tmp_path)
+    static_records = attestor_module._static_records(
+        root,
+        repository=subject.repository,
+        producer_sha256="d" * 64,
+        role="compatibility.module",
+        source_commit=subject.source_commit,
+        source_tree_digest=subject.source_tree_digest,
+        readback_digest="e" * 64,
+    )
+    package_records = attestor_module._package_records(
+        root,
+        install_roots,
+        subject,
+        producer_sha256="d" * 64,
+        readback_digest="f" * 64,
+    )
+
+    attestor_module._validate_checkout_file_bindings(
+        checkout,
+        root,
+        static_records,
+        package_records,
+    )
+
+
+def test_checkout_file_manifest_rejects_change_after_checkout_observation(tmp_path):
+    root, install_roots, subject, checkout = _checkout_binding_fixture(tmp_path)
+    (root / "skills" / "orchestrator" / "scripts" / "gwo_v8" / "entry.py").write_text(
+        "def changed():\n    return True\n",
+        encoding="utf-8",
+    )
+    static_records = attestor_module._static_records(
+        root,
+        repository=subject.repository,
+        producer_sha256="d" * 64,
+        role="compatibility.module",
+        source_commit=subject.source_commit,
+        source_tree_digest=subject.source_tree_digest,
+        readback_digest="e" * 64,
+    )
+    package_records = attestor_module._package_records(
+        root,
+        install_roots,
+        subject,
+        producer_sha256="d" * 64,
+        readback_digest="f" * 64,
+    )
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._validate_checkout_file_bindings(
+            checkout,
+            root,
+            static_records,
+            package_records,
+        )
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+def test_static_and_package_attestation_never_installs_copies_or_replaces(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    _write_static_fixture(root)
+    install_roots = {
+        surface: tmp_path / surface / "skills"
+        for surface in (".agents", ".codex", ".claude")
+    }
+    _write_package_fixture(root, install_roots)
+    subject = _subject()
+    monkeypatch.setattr(
+        attestor_module,
+        "ProductionPathScanner",
+        lambda _root: SimpleNamespace(read=lambda scan_subject: _compatibility(scan_subject)),
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(shutil, "copytree", lambda *_args, **_kwargs: calls.append("copytree"))
+    monkeypatch.setattr(shutil, "copy2", lambda *_args, **_kwargs: calls.append("copy2"))
+    monkeypatch.setattr(os, "replace", lambda *_args, **_kwargs: calls.append("replace"))
+
+    attestor_module._read_stable_static_inputs(root, subject, producer_sha256="d" * 64)
+    attestor_module._read_stable_package_inputs(
+        root,
+        install_roots,
+        subject,
+        producer_sha256="d" * 64,
+    )
+
+    assert calls == []
+
+
+def _create_store_fixture(tmp_path: Path, *, active: bool = False) -> SimpleNamespace:
+    from gwo_v8.activation import LocalPlanPublication
+    from gwo_v8.kernel import Kernel
+
+    config = _config(tmp_path)
+    config.expected_store_tables = attestor_module._fixed_store_contract()[0]
+    config.rollback_store.write_bytes(b"rollback Store fixture")
+    config.prior_store.write_bytes(b"prior Store fixture")
+    config.expected_rollback_store_sha256 = digest_bytes(config.rollback_store.read_bytes())
+    config.expected_prior_store_sha256 = digest_bytes(config.prior_store.read_bytes())
+
+    LocalPlanPublication(config.fresh_store)
+    connection = sqlite3.connect(config.fresh_store)
+    try:
+        connection.row_factory = sqlite3.Row
+        Kernel.ensure_store_schema(connection)
+        connection.execute(
+            'insert into "v8_writer_generations" values (?, ?)',
+            (config.repository, config.store_generation),
+        )
+        if active:
+            plan = "1" * 64
+            connection.execute(
+                'insert into "v8_admissions" values (?, ?, ?, ?, ?, ?)',
+                ("admission:1", config.repository, plan, "node:1", "goal:1", "admitted"),
+            )
+            connection.execute(
+                'insert into "v8_attempts" values (?, ?, ?, ?, ?, ?)',
+                ("attempt:1", config.repository, plan, "node:1", "admission:1", "running"),
+            )
+            connection.execute(
+                'insert into "v8_integration_leases" values (?, ?)',
+                (config.repository, "lease-owner"),
+            )
+            connection.execute(
+                'insert into "v8_resource_claims" values (?, ?, ?, ?)',
+                (config.repository, "resource:1", "admission:1", "attempt:1"),
+            )
+        connection.commit()
+        schema_digest = attestor_module._sqlite_schema_digest(connection)
+        generation_rows = tuple(
+            tuple(row)
+            for row in connection.execute(
+                'select repository, writer_generation from "v8_writer_generations" order by repository'
+            ).fetchall()
+        )
+        row_counts = tuple(
+            (
+                table,
+                int(connection.execute(f'select count(*) from "{table}"').fetchone()[0]),
+            )
+            for table in config.expected_store_tables
+        )
+    finally:
+        connection.close()
+    config.expected_fresh_store_sha256 = digest_bytes(config.fresh_store.read_bytes())
+    config.expected_fresh_receipt_schema_digest = schema_digest
+    config.expected_fresh_receipt_generation_rows = generation_rows
+    config.expected_fresh_receipt_row_counts = row_counts
+    receipt = {
+        "schema": "gwo-v8-fresh-store-provision.v1",
+        "repository": config.repository,
+        "source_main_sha": config.expected_head,
+        "source_main_tree": config.expected_tree,
+        "runbook_sha256": config.expected_fresh_receipt_runbook_sha256,
+        "store_path": str(config.fresh_store.resolve()),
+        "store_generation": config.store_generation,
+        "store_sha256": config.expected_fresh_store_sha256,
+        "integrity": "ok",
+        "tables": list(config.expected_store_tables),
+        "schema_digest": schema_digest,
+        "generation_rows": [list(row) for row in generation_rows],
+        "row_counts": dict(row_counts),
+        "existing_store_hashes_before": {
+            str(config.rollback_store.resolve()): config.expected_rollback_store_sha256,
+            str(config.prior_store.resolve()): config.expected_prior_store_sha256,
+        },
+        "existing_store_hashes_after": {
+            str(config.rollback_store.resolve()): config.expected_rollback_store_sha256,
+            str(config.prior_store.resolve()): config.expected_prior_store_sha256,
+        },
+        "old_stores_untouched": True,
+    }
+    config.fresh_receipt.write_bytes(canonical_bytes(receipt))
+    config.expected_fresh_receipt_sha256 = digest_bytes(config.fresh_receipt.read_bytes())
+    return config
+
+
+def _refresh_store_fixture(config: SimpleNamespace) -> None:
+    connection = sqlite3.connect(config.fresh_store)
+    try:
+        schema_digest = attestor_module._sqlite_schema_digest(connection)
+        generation_rows = tuple(
+            tuple(row)
+            for row in connection.execute(
+                'select repository, writer_generation from "v8_writer_generations" order by repository'
+            ).fetchall()
+        )
+        row_counts = tuple(
+            (
+                table,
+                int(connection.execute(f'select count(*) from "{table}"').fetchone()[0]),
+            )
+            for table in config.expected_store_tables
+        )
+    finally:
+        connection.close()
+    receipt = load_canonical_json(config.fresh_receipt.read_bytes())
+    config.expected_fresh_store_sha256 = digest_bytes(config.fresh_store.read_bytes())
+    config.expected_fresh_receipt_schema_digest = schema_digest
+    config.expected_fresh_receipt_generation_rows = generation_rows
+    config.expected_fresh_receipt_row_counts = row_counts
+    receipt["store_sha256"] = config.expected_fresh_store_sha256
+    receipt["schema_digest"] = schema_digest
+    receipt["generation_rows"] = [list(row) for row in generation_rows]
+    receipt["row_counts"] = dict(row_counts)
+    config.fresh_receipt.write_bytes(canonical_bytes(receipt))
+    config.expected_fresh_receipt_sha256 = digest_bytes(config.fresh_receipt.read_bytes())
+
+
+def test_ownership_reads_real_immutable_store_and_reports_active_facts(
+    tmp_path,
+    monkeypatch,
+):
+    config = _create_store_fixture(tmp_path, active=True)
+    subject = _subject()
+    attempt = _attempt(subject)
+    real_connect = sqlite3.connect
+    sqlite_calls: list[tuple[object, bool]] = []
+    mutation_calls: list[int] = []
+    mutation_actions = {
+        sqlite3.SQLITE_INSERT,
+        sqlite3.SQLITE_UPDATE,
+        sqlite3.SQLITE_DELETE,
+        sqlite3.SQLITE_CREATE_INDEX,
+        sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_DROP_INDEX,
+        sqlite3.SQLITE_DROP_TABLE,
+        sqlite3.SQLITE_ALTER_TABLE,
+    }
+
+    def tracked_connect(database, *args, **kwargs):
+        sqlite_calls.append((database, kwargs.get("uri") is True))
+        connection = real_connect(database, *args, **kwargs)
+
+        def authorizer(action, _arg1, _arg2, _database, _trigger):
+            if action in mutation_actions:
+                mutation_calls.append(action)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(authorizer)
+        return connection
+
+    monkeypatch.setattr(attestor_module.sqlite3, "connect", tracked_connect)
+
+    observed = attestor_module._read_store(config, subject, attempt)
+
+    assert observed.active_admissions == ("admission:1",)
+    assert observed.active_attempts == ("attempt:1",)
+    assert observed.integration_lease_owner == "lease-owner"
+    assert observed.resource_claims == ("claim:resource:1",)
+    assert observed.durable.generation_id == subject.store_generation
+    assert len(sqlite_calls) == 1
+    assert "mode=ro&immutable=1" in str(sqlite_calls[0][0])
+    assert sqlite_calls[0][1] is True
+    assert mutation_calls == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "store_path",
+        "store_hash",
+        "receipt_path",
+        "receipt_hash",
+        "receipt_identity",
+        "schema",
+        "generation",
+        "sidecar",
+        "duplicate",
+        "cross_link",
+    ),
+)
+def test_store_rejects_path_hash_schema_receipt_generation_and_link_drift(
+    tmp_path,
+    case,
+):
+    config = _create_store_fixture(tmp_path, active=case == "cross_link")
+    if case == "store_path":
+        config.fresh_store = tmp_path / "missing-store.sqlite3"
+    elif case == "store_hash":
+        config.expected_fresh_store_sha256 = "0" * 64
+    elif case == "receipt_path":
+        config.fresh_receipt = tmp_path / "missing-receipt.json"
+    elif case == "receipt_hash":
+        config.expected_fresh_receipt_sha256 = "0" * 64
+    elif case == "receipt_identity":
+        receipt = load_canonical_json(config.fresh_receipt.read_bytes())
+        receipt["repository"] = "other/repo"
+        config.fresh_receipt.write_bytes(canonical_bytes(receipt))
+        config.expected_fresh_receipt_sha256 = digest_bytes(config.fresh_receipt.read_bytes())
+    elif case == "schema":
+        connection = sqlite3.connect(config.fresh_store)
+        try:
+            connection.execute("create table unexpected_table (value text)")
+            connection.commit()
+        finally:
+            connection.close()
+        _refresh_store_fixture(config)
+    elif case == "generation":
+        connection = sqlite3.connect(config.fresh_store)
+        try:
+            connection.execute(
+                'update "v8_writer_generations" set writer_generation = ?',
+                ("store:v8:other",),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        _refresh_store_fixture(config)
+    elif case == "sidecar":
+        Path(f"{config.fresh_store}-wal").write_bytes(b"unexpected sidecar")
+    elif case == "duplicate":
+        connection = sqlite3.connect(config.fresh_store)
+        try:
+            connection.execute(
+                'insert into "v8_integration_leases" values (?, ?)',
+                ("other/repo", "other-owner"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        _refresh_store_fixture(config)
+    else:
+        connection = sqlite3.connect(config.fresh_store)
+        try:
+            connection.execute(
+                'insert into "v8_admissions" values (?, ?, ?, ?, ?, ?)',
+                ("admission:2", config.repository, "1" * 64, "node:2", "goal:2", "admitted"),
+            )
+            connection.execute(
+                'insert into "v8_resource_claims" values (?, ?, ?, ?)',
+                (config.repository, "resource:2", "admission:2", "attempt:1"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        _refresh_store_fixture(config)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._read_store(config, _subject(), _attempt(_subject()))
+
+    assert error.value.code == "STORE_SOURCE_UNAVAILABLE"
+
+
+def test_store_rejects_receipt_replacement_during_immutable_read(tmp_path, monkeypatch):
+    config = _create_store_fixture(tmp_path)
+    real_connect = sqlite3.connect
+
+    def replacing_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        replacement = config.fresh_receipt.with_suffix(".replacement")
+        replacement.write_bytes(config.fresh_receipt.read_bytes())
+        os.replace(replacement, config.fresh_receipt)
+        return connection
+
+    monkeypatch.setattr(attestor_module.sqlite3, "connect", replacing_connect)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._read_store(config, _subject(), _attempt(_subject()))
+
+    assert error.value.code == "STORE_SOURCE_UNAVAILABLE"

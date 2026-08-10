@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,7 @@ from gwo_v8.cutover_guard import (
     CompatibilityPathReadback,
     CutoverSubject,
     DurableStateReadback,
+    PackageIdentity,
     PackageReadback,
     ProductionPathScanner,
     ReadOnlyPackageValidator,
@@ -72,6 +74,41 @@ LEGACY_FENCE_PATH = CONTROL_PATHS[2]
 WRITER_PATH = CONTROL_PATHS[0]
 ACTIVE_PLAN_PATH = CONTROL_PATHS[1]
 STORE_SCHEMA = "gwo.v8.store.v1"
+PRODUCTION_REPOSITORY = "NOirBRight/github-work-orchestrator"
+PRODUCTION_REPOSITORY_ROOT = Path(r"D:\Workstation\github-work-orchestrator")
+PRODUCTION_SOURCE_COMMIT = "5de34bdaee45f0aba44077a8d1d3e3ed8293f237"
+PRODUCTION_SOURCE_TREE = "104ee822dbfb494d33d56b8ccf54092d9d1d9c86"
+PRODUCTION_STORE = Path(
+    r"C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator"
+    r"\store-20260809T081500Z.sqlite3"
+)
+PRODUCTION_STORE_GENERATION = "store:v8:production:20260809T081500Z"
+PRODUCTION_STORE_SHA256 = "afff1078e7a65fb8acccde28fee78fab3cf2278db9dd6548f5ef96a882076b98"
+PRODUCTION_RECEIPT = Path(
+    r"D:\gwo-release-evidence\2026-08-09-gwo-v8-beta3-production-cutover"
+    r"\fresh-store-exact-main-receipt.json"
+)
+PRODUCTION_RECEIPT_SHA256 = "46814d166c857e3d7f847b7da6f3da5b39c394b42402b2f1d2cdd61d78ce7781"
+PRODUCTION_RUNTIME_CONFIG = Path(r"C:\Users\noirb\.orch\config.json")
+PRODUCTION_ROLLBACK_STORE = Path(
+    r"C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator\store.sqlite3"
+)
+PRODUCTION_ROLLBACK_STORE_SHA256 = "1cc3f304044032fdab9569f8561b28220ecfd93e4efc35cf6bb2e492c1ca72b8"
+PRODUCTION_PRIOR_STORE = Path(
+    r"C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator"
+    r"\store-20260809T023000Z.sqlite3"
+)
+PRODUCTION_PRIOR_STORE_SHA256 = "df2341d76eb2ab54110ac3e70ff137a93d05ffbb02352c61b654321dba188ed7"
+PRODUCTION_RECEIPT_RUNBOOK_SHA256 = "0378be64a95aa4eeb09626c120254ad8105a1a5cc2dfd1f60ddf089dfba821f2"
+PRODUCTION_RECEIPT_SCHEMA_DIGEST = "69ac6babce5db564fcc60fc5dd97feb0635911e07955234098210ddd97a93aed"
+PRODUCTION_INSTALL_ROOTS = tuple(
+    Path(rf"C:\Users\noirb\{surface}\skills")
+    for surface in (".agents", ".codex", ".claude")
+)
+PRODUCTION_PACKAGE_CONTENT_DIGESTS = (
+    ("implement-gwo", "fcafa60645a2ea18408ec97369fdf5a01402a950b90e701fa2305624a1bfeaa9"),
+    ("orchestrator", "1a10f3f19e6db951150bd97a40561de1093ae20ba07d8c503a244cd1f0123639"),
+)
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _DYNAMIC_SIDE_FILE = re.compile(
@@ -88,9 +125,24 @@ class ControlOwnershipSourceSet:
 
 
 @dataclass(frozen=True)
+class _ControlRef:
+    repository: str
+    ref: str
+    commit_oid: str
+    object_type: str
+
+
+@dataclass(frozen=True)
 class _Blob:
-    content: bytes
+    repository: str
+    ref: str
+    commit_oid: str
+    path: str
     blob_sha: str
+    object_type: str
+    encoding: str
+    size: int
+    content: bytes
 
 
 @dataclass(frozen=True)
@@ -126,7 +178,7 @@ class _GitHubControlSource:
     def __init__(self, command_runner: Callable[[tuple[str, ...]], bytes]) -> None:
         self._command_runner = command_runner
 
-    def read_ref(self, repository: str, branch: str) -> str:
+    def read_ref(self, repository: str, branch: str) -> _ControlRef:
         payload = self._run(
             (
                 "gh",
@@ -139,13 +191,29 @@ class _GitHubControlSource:
         value = _decode_json_response(payload, "CONTROL_REF_UNAVAILABLE")
         if type(value) is not dict:
             _fail("CONTROL_REF_UNAVAILABLE", "GitHub ref response is not an object")
+        ref_name = value.get("ref")
+        response_url = value.get("url")
         ref = value.get("object")
         if type(ref) is not dict or type(ref.get("sha")) is not str:
             _fail("CONTROL_REF_UNAVAILABLE", "GitHub ref response has no exact OID")
         oid = ref["sha"]
-        if _HEX40.fullmatch(oid) is None:
+        expected_ref = f"refs/heads/{branch}"
+        expected_url = f"https://api.github.com/repos/{repository}/git/refs/heads/{branch}"
+        if (
+            _HEX40.fullmatch(oid) is None
+            or ref_name != expected_ref
+            or response_url != expected_url
+            or ref.get("type") != "commit"
+            or ref.get("url")
+            != f"https://api.github.com/repos/{repository}/git/commits/{oid}"
+        ):
             _fail("CONTROL_REF_UNAVAILABLE", "GitHub ref OID is not a commit identity")
-        return oid
+        return _ControlRef(
+            repository=repository,
+            ref=ref_name,
+            commit_oid=oid,
+            object_type=ref["type"],
+        )
 
     def read_at_oid(self, repository: str, oid: str, path: str) -> _Blob | None:
         payload = self._run(
@@ -174,7 +242,31 @@ class _GitHubControlSource:
             raise BootstrapError(
                 "CONTROL_BLOB_UNAVAILABLE", "GitHub blob content is not exact base64"
             ) from error
-        return _Blob(content=content, blob_sha=blob_sha)
+        if (
+            value.get("path") != path
+            or value.get("type") != "file"
+            or value.get("encoding") != "base64"
+            or type(value.get("size")) is not int
+            or value["size"] != len(content)
+            or value.get("url")
+            != f"https://api.github.com/repos/{repository}/contents/{path}?ref={oid}"
+            or value.get("git_url")
+            != f"https://api.github.com/repos/{repository}/git/blobs/{blob_sha}"
+            or _HEX40.fullmatch(blob_sha) is None
+            or _git_blob_sha(content) != blob_sha
+        ):
+            _fail("CONTROL_BLOB_UNAVAILABLE", "GitHub blob response identity is not exact")
+        return _Blob(
+            repository=repository,
+            ref=oid,
+            commit_oid=oid,
+            path=path,
+            blob_sha=blob_sha,
+            object_type=value["type"],
+            encoding=value["encoding"],
+            size=value["size"],
+            content=content,
+        )
 
     def _run(self, command: tuple[str, ...]) -> bytes:
         try:
@@ -234,7 +326,7 @@ class _RuntimeRegistrySource:
             role="runtime.registry",
             locator=f"runtime-registry://{repository}",
             repository=repository,
-            read_mode="COMPLETE_DOUBLE_READ",
+            read_mode="COMPLETE_OBSERVATION",
             identity={"observation_digest": digest_bytes(canonical)},
             payload=canonical,
             producer_sha256=self._producer_sha256,
@@ -243,26 +335,114 @@ class _RuntimeRegistrySource:
 
 
 class _RuntimeConfigSource:
-    def read(self) -> _RawFileObservation:
-        path = Path.home() / ".orch" / "config.json"
+    def __init__(self, producer_sha256: str, repository: str) -> None:
+        self._producer_sha256 = producer_sha256
+        self._repository = repository
+
+    def read(self, path: Path) -> SourceObservation:
+        path = Path(path).resolve()
         snapshot = _read_file_snapshot(path, "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE")
-        return _RawFileObservation(
-            payload=snapshot.content,
-            identity=snapshot.identity,
+        record = _source_record(
+            role="runtime.config",
             locator=str(path),
+            repository=self._repository,
+            read_mode="EXACT_FILE",
+            identity=dict(snapshot.identity),
+            payload=snapshot.content,
+            producer_sha256=self._producer_sha256,
         )
+        return SourceObservation(record=record, canonical_payload=snapshot.content, complete=True)
 
 
 class _LocalInputsSource:
-    """The production local source has no extra side channel.
+    def __init__(
+        self,
+        command_runner: Callable[[tuple[str, ...]], bytes],
+        producer_sha256: str,
+    ) -> None:
+        self._command_runner = command_runner
+        self._producer_sha256 = producer_sha256
 
-    The attestor owns the Store, compatibility, and package reads directly so
-    that no caller can inject a preformed durable readback.  The source exists
-    as an explicit capability slot for local identity probes and for tests.
-    """
+    def read(self, config: object, subject: CutoverSubject) -> SourceObservation:
+        root = Path(config.repository_root).resolve()
+        def read_oid(revision: str, label: str) -> str:
+            command = ("git", "-C", str(root), "rev-parse", "--verify", revision)
+            try:
+                raw_oid = self._command_runner(command)
+            except Exception as error:
+                raise BootstrapError(
+                    "STATIC_INPUT_SOURCE_UNAVAILABLE",
+                    f"checkout {label} identity read failed",
+                ) from error
+            if type(raw_oid) is not bytes:
+                _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", f"checkout {label} identity is not bytes")
+            try:
+                oid = raw_oid.decode("ascii")
+            except UnicodeDecodeError as error:
+                raise BootstrapError(
+                    "STATIC_INPUT_SOURCE_UNAVAILABLE",
+                    f"checkout {label} identity is not ASCII",
+                ) from error
+            if oid.endswith("\r\n"):
+                oid = oid[:-2]
+            elif oid.endswith("\n"):
+                oid = oid[:-1]
+            if _HEX40.fullmatch(oid) is None:
+                _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", f"checkout {label} identity is malformed")
+            return oid
 
-    def read(self, _config: object, _subject: CutoverSubject) -> None:
-        return None
+        commit = read_oid("HEAD", "commit")
+        tree = read_oid("HEAD^{tree}", "tree")
+        status_command = (
+            "git",
+            "-C",
+            str(root),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        )
+        try:
+            status = self._command_runner(status_command)
+        except Exception as error:
+            raise BootstrapError(
+                "STATIC_INPUT_SOURCE_UNAVAILABLE",
+                "checkout status identity read failed",
+            ) from error
+        if type(status) is not bytes or status != b"":
+            _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "checkout worktree is not exactly clean")
+        files = [
+            {
+                "relative_path": path.relative_to(root).as_posix(),
+                "byte_sha256": digest_bytes(path.read_bytes()),
+            }
+            for path in _checkout_source_files(root, subject)
+        ]
+        value = {
+            "repository_root": str(root),
+            "commit_oid": commit,
+            "tree_digest": tree,
+            "git_status_sha256": digest_bytes(status),
+            "files": files,
+        }
+        payload = canonical_bytes(value)
+        record = _source_record(
+            role="local.inputs",
+            locator=f"local-checkout://{root}",
+            repository=subject.repository,
+            read_mode="EXACT_GIT_SNAPSHOT",
+            identity={
+                "repository_root": str(root),
+                "commit_oid": commit,
+                "tree_digest": tree,
+                "git_status_sha256": digest_bytes(status),
+                "file_set_digest": digest_value(files),
+                "observation_digest": digest_bytes(payload),
+            },
+            payload=payload,
+            producer_sha256=self._producer_sha256,
+        )
+        return SourceObservation(record=record, canonical_payload=payload, complete=True)
 
 
 def _fail(code: str, detail: str) -> None:
@@ -386,6 +566,14 @@ def _read_file_snapshot(path: Path, code: str) -> _FileSnapshot:
         raise BootstrapError(code, f"local file is unavailable: {path}") from error
 
 
+def _source_error_code(role: str) -> str:
+    return {
+        "runtime.registry": "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+        "runtime.config": "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE",
+        "local.inputs": "STATIC_INPUT_SOURCE_UNAVAILABLE",
+    }.get(role, f"{role.upper().replace('.', '_')}_SOURCE_UNAVAILABLE")
+
+
 def _source_observation(
     value: object,
     *,
@@ -395,7 +583,7 @@ def _source_observation(
     default_locator: str,
     default_read_mode: str,
 ) -> SourceObservation:
-    error_code = f"{role.upper().replace('.', '_')}_SOURCE_UNAVAILABLE"
+    error_code = _source_error_code(role)
     if type(value) is SourceObservation:
         if (
             type(value.record) is not SourceRecord
@@ -408,6 +596,8 @@ def _source_observation(
             _fail(error_code, "source identity or completeness is not exact")
         if value.record.role != role or value.record.read_mode != default_read_mode:
             _fail(error_code, "source role or read mode is not the fixed contract")
+        if value.record.locator != default_locator:
+            _fail(error_code, "source locator is not the fixed provenance contract")
         identity = dict(value.record.identity)
         observed_digest = digest_bytes(value.canonical_payload)
         if value.record.content_sha256 != observed_digest:
@@ -420,62 +610,96 @@ def _source_observation(
         }:
             _fail(error_code, "Runtime registry observation provenance is absent")
         return value
-    if type(value) is _RawFileObservation:
-        if type(value.payload) is not bytes:
-            _fail(error_code, "local file payload is not exact bytes")
-        try:
-            identity = dict(value.identity)
-        except (TypeError, ValueError) as error:
-            raise BootstrapError(error_code, "local file identity is malformed") from error
-        observed_digest = digest_bytes(value.payload)
-        if identity.get("byte_sha256") != observed_digest:
-            _fail(error_code, "local file identity is not bound to its bytes")
-        if identity.get("size") != str(len(value.payload)):
-            _fail(error_code, "local file size identity is not exact")
-        if type(value.complete) is not bool or not value.complete:
-            _fail(error_code, "source enumeration is incomplete")
-        record = _source_record(
-            role=role,
-            locator=value.locator,
-            repository=repository,
-            read_mode=default_read_mode,
-            identity=identity,
-            payload=value.payload,
-            producer_sha256=producer_sha256,
+    _fail(error_code, "source did not return an exact complete SourceObservation")
+
+
+def compare_complete_observations(
+    first: SourceObservation,
+    second: SourceObservation,
+) -> SourceObservation:
+    """Purely compare two already-captured complete source observations."""
+
+    for observation in (first, second):
+        if (
+            type(observation) is not SourceObservation
+            or type(observation.record) is not SourceRecord
+            or type(observation.canonical_payload) is not bytes
+            or observation.complete is not True
+            or observation.record.content_sha256
+            != digest_bytes(observation.canonical_payload)
+        ):
+            _fail("LIVE_INPUT_DRIFT", "complete source observation is malformed")
+    if first != second:
+        _fail("LIVE_INPUT_DRIFT", "complete source observation identity changed")
+    return first
+
+
+def _validate_checkout_observation(
+    observation: SourceObservation,
+    config: object,
+    subject: CutoverSubject,
+) -> SourceRecord:
+    code = "STATIC_INPUT_SOURCE_UNAVAILABLE"
+    if (
+        type(observation) is not SourceObservation
+        or type(observation.record) is not SourceRecord
+        or type(observation.canonical_payload) is not bytes
+        or observation.complete is not True
+    ):
+        _fail(code, "checkout source is not one complete observation")
+    root = Path(config.repository_root).resolve()
+    expected = {
+        "repository_root": str(root),
+        "commit_oid": subject.source_commit,
+        "tree_digest": subject.source_tree_digest,
+    }
+    try:
+        value = load_canonical_json(observation.canonical_payload)
+        identity = dict(observation.record.identity)
+    except Exception as error:
+        raise BootstrapError(code, "checkout source identity is malformed") from error
+    files = value.get("files") if type(value) is dict else None
+    if (
+        type(files) is not list
+        or any(
+            type(item) is not dict
+            or set(item) != {"relative_path", "byte_sha256"}
+            or type(item["relative_path"]) is not str
+            or not item["relative_path"]
+            or Path(item["relative_path"]).is_absolute()
+            or ".." in Path(item["relative_path"]).parts
+            or type(item["byte_sha256"]) is not str
+            or _HEX64.fullmatch(item["byte_sha256"]) is None
+            for item in files
         )
-        return SourceObservation(record=record, canonical_payload=value.payload, complete=True)
-    if type(value) is tuple:
-        if len(value) != 2:
-            _fail(error_code, "source tuple observation is malformed")
-        first, second = value
-        if type(first) is SourceRecord and type(second) is bytes:
-            observation = SourceObservation(record=first, canonical_payload=second, complete=True)
-        elif type(first) is bytes and type(second) is SourceRecord:
-            observation = SourceObservation(record=second, canonical_payload=first, complete=True)
-        else:
-            _fail(error_code, "source tuple observation is malformed")
-        return _source_observation(
-            observation,
-            role=role,
-            repository=repository,
-            producer_sha256=producer_sha256,
-            default_locator=default_locator,
-            default_read_mode=default_read_mode,
-        )
-    if type(value) is bytes:
-        payload = value
-    else:
-        payload = _canonical_payload(value, error_code)
-    record = _source_record(
-        role=role,
-        locator=default_locator,
-        repository=repository,
-        read_mode=default_read_mode,
-        identity={"observation_digest": digest_bytes(payload)},
-        payload=payload,
-        producer_sha256=producer_sha256,
-    )
-    return SourceObservation(record=record, canonical_payload=payload, complete=True)
+        or [item["relative_path"] for item in files]
+        != sorted({item["relative_path"] for item in files})
+    ):
+        _fail(code, "checkout source file identity set is malformed")
+    expected_value = {
+        **expected,
+        "git_status_sha256": digest_bytes(b""),
+        "files": files,
+    }
+    expected_identity = {
+        **expected,
+        "git_status_sha256": digest_bytes(b""),
+        "file_set_digest": digest_value(files),
+        "observation_digest": digest_bytes(observation.canonical_payload),
+    }
+    if (
+        type(value) is not dict
+        or value != expected_value
+        or canonical_bytes(value) != observation.canonical_payload
+        or observation.record.role != "local.inputs"
+        or observation.record.repository != subject.repository
+        or observation.record.read_mode != "EXACT_GIT_SNAPSHOT"
+        or observation.record.locator != f"local-checkout://{root}"
+        or observation.record.content_sha256 != digest_bytes(observation.canonical_payload)
+        or identity != expected_identity
+    ):
+        _fail(code, "checkout commit, tree, or root identity changed")
+    return observation.record
 
 
 def _read_source(
@@ -498,7 +722,7 @@ def _read_source(
         raise
     except Exception as error:
         raise BootstrapError(
-            f"{role.upper().replace('.', '_')}_SOURCE_UNAVAILABLE",
+            _source_error_code(role),
             f"{role} source read failed",
         ) from error
     return _source_observation(
@@ -516,13 +740,28 @@ def _git_blob_sha(content: bytes) -> str:
     return hashlib.sha1(header + content).hexdigest()
 
 
-def _blob(value: object, code: str) -> tuple[bytes, str]:
+def _blob(
+    value: object,
+    code: str,
+    *,
+    repository: str,
+    oid: str,
+    path: str,
+) -> tuple[bytes, str]:
     if value is None:
         _fail(code, "control blob is missing")
     content = value if type(value) is bytes else getattr(value, "content", None)
     blob_sha = getattr(value, "blob_sha", getattr(value, "sha", None))
     if (
         type(content) is not bytes
+        or getattr(value, "repository", None) != repository
+        or getattr(value, "ref", None) != oid
+        or getattr(value, "commit_oid", None) != oid
+        or getattr(value, "path", None) != path
+        or getattr(value, "object_type", None) != "file"
+        or getattr(value, "encoding", None) != "base64"
+        or type(getattr(value, "size", None)) is not int
+        or getattr(value, "size", None) != len(content)
         or type(blob_sha) is not str
         or _HEX40.fullmatch(blob_sha) is None
         or _git_blob_sha(content) != blob_sha
@@ -782,12 +1021,20 @@ def _read_control(
     if not callable(read_ref) or not callable(read_at_oid):
         _fail("UNSAFE_SOURCE_CAPABILITY", "control source lacks the fixed-OID read surface")
     try:
-        oid = read_ref(subject.repository, subject.control_branch)
+        ref_value = read_ref(subject.repository, subject.control_branch)
     except BootstrapError:
         raise
     except Exception as error:
         raise BootstrapError("CONTROL_REF_UNAVAILABLE", "control branch ref read failed") from error
-    if type(oid) is not str or _HEX40.fullmatch(oid) is None:
+    expected_ref = f"refs/heads/{subject.control_branch}"
+    oid = getattr(ref_value, "commit_oid", None)
+    if (
+        getattr(ref_value, "repository", None) != subject.repository
+        or getattr(ref_value, "ref", None) != expected_ref
+        or getattr(ref_value, "object_type", None) != "commit"
+        or type(oid) is not str
+        or _HEX40.fullmatch(oid) is None
+    ):
         _fail("CONTROL_REF_UNAVAILABLE", "control branch ref is not one exact commit OID")
     blobs: dict[str, tuple[bytes, str]] = {}
     for path in CONTROL_PATHS:
@@ -802,6 +1049,9 @@ def _read_control(
             "WRITER_FENCE_SOURCE_UNAVAILABLE"
             if path in {WRITER_PATH, ACTIVE_PLAN_PATH, LEGACY_FENCE_PATH}
             else "CONTROL_BLOB_UNAVAILABLE",
+            repository=subject.repository,
+            oid=oid,
+            path=path,
         )
     writer_payload, writer_blob = blobs[WRITER_PATH]
     active_payload, active_blob = blobs[ACTIVE_PLAN_PATH]
@@ -944,7 +1194,7 @@ def _fixed_store_contract() -> tuple[tuple[str, ...], Mapping[str, tuple[tuple[s
 
 
 def _configured_store_tables(config: object, expected_tables: tuple[str, ...]) -> tuple[str, ...]:
-    configured = getattr(config, "expected_store_tables", expected_tables)
+    configured = config.expected_store_tables
     if type(configured) is not tuple or configured != expected_tables:
         _fail("STORE_SOURCE_UNAVAILABLE", "configured Store tables are not the fixed current-main contract")
     return expected_tables
@@ -1056,6 +1306,7 @@ def _receipt(
     config: object,
     subject: CutoverSubject,
     snapshot: _FileSnapshot,
+    store_path: Path,
     *,
     observed_store_sha256: str | None = None,
 ) -> dict[str, object]:
@@ -1090,56 +1341,47 @@ def _receipt(
         "repository": subject.repository,
         "source_main_sha": subject.source_commit,
         "source_main_tree": subject.source_tree_digest,
-        "store_generation": getattr(config, "store_generation", subject.store_generation),
-        "store_sha256": getattr(config, "expected_fresh_store_sha256", None),
+        "store_generation": config.store_generation,
+        "store_sha256": config.expected_fresh_store_sha256,
         "integrity": "ok",
-        "store_path": _path_text(snapshot.path),
+        "store_path": _path_text(store_path),
     }
     for name, expected_value in expected.items():
         if expected_value is not None and value.get(name) != expected_value:
             _fail("STORE_SOURCE_UNAVAILABLE", f"fresh Store receipt {name} is not exact")
-    configured_digest = getattr(config, "expected_fresh_receipt_sha256", None)
+    configured_digest = config.expected_fresh_receipt_sha256
     observed_digest = digest_bytes(snapshot.content)
-    if configured_digest is not None and observed_digest != configured_digest:
+    if observed_digest != configured_digest:
         _fail("STORE_SOURCE_UNAVAILABLE", "fresh Store receipt bytes changed")
-    configured_runbook = getattr(config, "expected_fresh_receipt_runbook_sha256", None)
-    if configured_runbook is not None and value["runbook_sha256"] != configured_runbook:
+    configured_runbook = config.expected_fresh_receipt_runbook_sha256
+    if value["runbook_sha256"] != configured_runbook:
         _fail("STORE_SOURCE_UNAVAILABLE", "fresh Store receipt runbook is not exact")
-    configured_schema = getattr(config, "expected_fresh_receipt_schema_digest", None)
-    if configured_schema is not None and value["schema_digest"] != configured_schema:
+    configured_schema = config.expected_fresh_receipt_schema_digest
+    if value["schema_digest"] != configured_schema:
         _fail("STORE_SOURCE_UNAVAILABLE", "fresh Store receipt schema digest is not exact")
-    configured_generation_rows = getattr(config, "expected_fresh_receipt_generation_rows", None)
-    if configured_generation_rows is not None:
-        expected_rows = [list(row) for row in configured_generation_rows]
-        if value["generation_rows"] != expected_rows:
-            _fail("STORE_SOURCE_UNAVAILABLE", "fresh Store receipt generation rows are not exact")
-    configured_row_counts = getattr(config, "expected_fresh_receipt_row_counts", None)
-    if configured_row_counts is not None:
-        expected_counts = dict(configured_row_counts)
-        if value["row_counts"] != expected_counts:
-            _fail("STORE_SOURCE_UNAVAILABLE", "fresh Store receipt row counts are not exact")
-    rollback_path = getattr(config, "rollback_store", None)
-    prior_path = getattr(config, "prior_store", None)
-    rollback_hash = getattr(config, "expected_rollback_store_sha256", None)
-    prior_hash = getattr(config, "expected_prior_store_sha256", None)
-    if None not in (rollback_path, prior_path, rollback_hash, prior_hash):
-        expected_old = {
-            _path_text(Path(rollback_path)): rollback_hash,
-            _path_text(Path(prior_path)): prior_hash,
-        }
-        for name in ("existing_store_hashes_before", "existing_store_hashes_after"):
-            old = value[name]
-            if (
-                type(old) is not dict
-                or old != expected_old
-                or any(
-                    type(key) is not str
-                    or type(child) is not str
-                    or _HEX64.fullmatch(child) is None
-                    for key, child in old.items()
-                )
-            ):
-                _fail("STORE_SOURCE_UNAVAILABLE", "fresh receipt old Store hashes are not exact")
+    expected_rows = [list(row) for row in config.expected_fresh_receipt_generation_rows]
+    if value["generation_rows"] != expected_rows:
+        _fail("STORE_SOURCE_UNAVAILABLE", "fresh Store receipt generation rows are not exact")
+    expected_counts = dict(config.expected_fresh_receipt_row_counts)
+    if value["row_counts"] != expected_counts:
+        _fail("STORE_SOURCE_UNAVAILABLE", "fresh Store receipt row counts are not exact")
+    expected_old = {
+        _path_text(Path(config.rollback_store)): config.expected_rollback_store_sha256,
+        _path_text(Path(config.prior_store)): config.expected_prior_store_sha256,
+    }
+    for name in ("existing_store_hashes_before", "existing_store_hashes_after"):
+        old = value[name]
+        if (
+            type(old) is not dict
+            or old != expected_old
+            or any(
+                type(key) is not str
+                or type(child) is not str
+                or _HEX64.fullmatch(child) is None
+                for key, child in old.items()
+            )
+        ):
+            _fail("STORE_SOURCE_UNAVAILABLE", "fresh receipt old Store hashes are not exact")
     for name in ("runbook_sha256", "schema_digest", "store_sha256"):
         _require_digest(value.get(name), f"receipt.{name}", "STORE_SOURCE_UNAVAILABLE")
     if observed_store_sha256 is not None:
@@ -1187,27 +1429,25 @@ def _row_dict(row: sqlite3.Row | Sequence[object], names: Sequence[str]) -> dict
 
 
 def _read_store(config: object, subject: CutoverSubject, attempt: AttemptIdentity) -> _StoreFacts:
-    path_value = getattr(config, "fresh_store", None)
-    receipt_path_value = getattr(config, "fresh_receipt", None)
-    if path_value is None or receipt_path_value is None:
-        _fail("STORE_SOURCE_UNAVAILABLE", "fixed Store and receipt paths are absent")
+    path_value = config.fresh_store
+    receipt_path_value = config.fresh_receipt
     try:
         path = Path(path_value)
         receipt_path = Path(receipt_path_value)
     except (OSError, TypeError, ValueError) as error:
         raise BootstrapError("STORE_SOURCE_UNAVAILABLE", "fixed Store paths are malformed") from error
     store_snapshot = _read_file_snapshot(path, "STORE_SOURCE_UNAVAILABLE")
-    expected_hash = getattr(config, "expected_fresh_store_sha256", None)
-    if expected_hash is not None and store_snapshot.identity:
-        observed_hash = dict(store_snapshot.identity).get("byte_sha256")
-        if observed_hash != expected_hash:
-            _fail("STORE_SOURCE_UNAVAILABLE", "fresh Store hash is not the configured identity")
+    expected_hash = config.expected_fresh_store_sha256
+    observed_hash = dict(store_snapshot.identity).get("byte_sha256")
+    if observed_hash != expected_hash:
+        _fail("STORE_SOURCE_UNAVAILABLE", "fresh Store hash is not the configured identity")
     receipt_snapshot = _read_file_snapshot(receipt_path, "STORE_SOURCE_UNAVAILABLE")
     try:
         receipt = _receipt(
             config,
             subject,
             receipt_snapshot,
+            path,
             observed_store_sha256=dict(store_snapshot.identity).get("byte_sha256"),
         )
     except BootstrapError:
@@ -1494,7 +1734,7 @@ def _read_store(config: object, subject: CutoverSubject, attempt: AttemptIdentit
         for row in connection.execute(
             'select repository, writer_generation from "v8_writer_generations" order by repository'
         ).fetchall():
-            if row["writer_generation"] != subject.target_writer_generation and row["repository"] == repository:
+            if row["writer_generation"] != config.store_generation and row["repository"] == repository:
                 _fail("STORE_SOURCE_UNAVAILABLE", "Store writer generation changed")
         if len(pending_activation_ids) != len(set(pending_activation_ids)):
             _fail("STORE_SOURCE_UNAVAILABLE", "pending Activation identities are duplicated")
@@ -1503,9 +1743,15 @@ def _read_store(config: object, subject: CutoverSubject, attempt: AttemptIdentit
         store_after = _read_file_snapshot(path, "STORE_SOURCE_UNAVAILABLE")
         if store_after.identity != store_snapshot.identity:
             _fail("STORE_SOURCE_UNAVAILABLE", "Store bytes changed during immutable read")
+        receipt_after = _read_file_snapshot(receipt_path, "STORE_SOURCE_UNAVAILABLE")
+        if (
+            receipt_after.identity != receipt_snapshot.identity
+            or receipt_after.content != receipt_snapshot.content
+        ):
+            _fail("STORE_SOURCE_UNAVAILABLE", "Store receipt changed during immutable read")
         values = {
             "repository": repository,
-            "generation_id": getattr(config, "store_generation", subject.store_generation),
+            "generation_id": config.store_generation,
             "state_schema": STORE_SCHEMA,
             "compatible": True,
             "active_plan_digests": tuple(sorted(active_plan_digests)),
@@ -1565,40 +1811,17 @@ def _read_store(config: object, subject: CutoverSubject, attempt: AttemptIdentit
 
 
 def _registry_refs(value: object) -> tuple[str, ...]:
-    while type(value) is dict:
-        for key in ("runtimes", "runtime_registry", "agents", "records", "items"):
-            if key in value:
-                value = value[key]
-                break
-        else:
-            if not value or any(
-                type(key) is not str
-                or not key
-                or type(item) is not dict
-                for key, item in value.items()
-            ):
-                _fail(
-                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
-                    "Runtime registry mapping shape is not authoritative",
-                )
-            value = list(value.keys())
-    if type(value) not in (list, tuple):
-        _fail("RUNTIME_REGISTRY_SOURCE_UNAVAILABLE", "Runtime registry enumeration is not a sequence")
+    if type(value) is not dict or set(value) != {"runtimes"}:
+        _fail(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Runtime registry mapping shape is not authoritative",
+        )
+    value = value["runtimes"]
+    if type(value) is not list:
+        _fail("RUNTIME_REGISTRY_SOURCE_UNAVAILABLE", "Runtime registry enumeration is not a list")
     identities: list[str] = []
     for item in value:
-        if type(item) is str:
-            identity = item
-        elif type(item) is dict:
-            identity = next(
-                (
-                    item.get(name)
-                    for name in ("identity", "runtime_id", "agent_id", "id")
-                    if type(item.get(name)) is str
-                ),
-                None,
-            )
-        else:
-            identity = None
+        identity = item.get("identity") if type(item) is dict and set(item) == {"identity"} else None
         if type(identity) is not str or not identity:
             _fail("RUNTIME_REGISTRY_SOURCE_UNAVAILABLE", "Runtime registry identity is absent")
         identity = identity.removeprefix("runtime:")
@@ -1619,6 +1842,15 @@ def _runtime_config_value(
         type(value) is not dict
         or value.get("schema_version") != 1
         or not {"global", "tiers", "role_profiles"} <= set(value)
+        or set(value)
+        - {
+            "schema_version",
+            "global",
+            "tiers",
+            "role_profiles",
+            "reviewer_tiers",
+            "repositories",
+        }
         or type(repository) is not str
         or not repository
     ):
@@ -1628,12 +1860,15 @@ def _runtime_config_value(
         tiers = value["tiers"]
         role_profiles = value["role_profiles"]
         repositories = value.get("repositories", {})
+        reviewer_tiers = value.get("reviewer_tiers", {})
         if (
             type(global_value) is not dict
+            or set(global_value) - {"default_tier", "execution_slots"}
             or type(tiers) is not dict
             or not tiers
             or type(role_profiles) is not dict
             or type(repositories) is not dict
+            or type(reviewer_tiers) is not dict
         ):
             raise ValueError("Runtime configuration mappings are malformed")
         default_tier = global_value.get("default_tier")
@@ -1647,25 +1882,16 @@ def _runtime_config_value(
             raise ValueError("Runtime configuration contains an unknown role profile")
         if not set(RUNTIME_ROLE_PROFILES) <= set(role_profiles):
             raise ValueError("Runtime configuration role profiles are incomplete")
+        if any(
+            type(name) is not str
+            or not name
+            or type(tier) is not str
+            or tier not in RUNTIME_TIERS
+            for name, tier in reviewer_tiers.items()
+        ):
+            raise ValueError("Runtime reviewer tier mapping is malformed")
 
-        repository_value = repositories.get(repository, {})
-        if type(repository_value) is not dict:
-            raise ValueError("repository Runtime configuration is malformed")
-        repository_tiers = repository_value.get("tiers", {})
-        repository_roles = repository_value.get("role_profiles", {})
-        if type(repository_tiers) is not dict or type(repository_roles) is not dict:
-            raise ValueError("repository Runtime mappings are malformed")
-        if any(type(name) is not str or name not in RUNTIME_TIERS for name in repository_tiers):
-            raise ValueError("repository Runtime configuration contains an unknown tier")
-        if any(type(name) is not str or name not in RUNTIME_ROLE_PROFILES for name in repository_roles):
-            raise ValueError("repository Runtime configuration contains an unknown role profile")
-        repository_default_tier = repository_value.get("default_tier", default_tier)
-        if type(repository_default_tier) is not str or repository_default_tier not in RUNTIME_TIERS:
-            raise ValueError("repository Runtime default tier is invalid")
-
-        profiles: dict[str, RuntimeProfile] = {}
-
-        def profile(name: str, raw: object) -> RuntimeProfile:
+        def validate_profile_shape(raw: object) -> tuple[str, dict[str, object]]:
             if (
                 type(raw) is not dict
                 or set(raw) != {"provider", "settings"}
@@ -1691,9 +1917,65 @@ def _runtime_config_value(
                 for field in ("model", "thinkingOptionId", "modeId")
             ) or type(settings.get("features", {})) is not dict:
                 raise ValueError("profile settings are malformed")
+            return raw["provider"], settings
+
+        for raw in (*tiers.values(), *role_profiles.values()):
+            validate_profile_shape(raw)
+        for configured_repository, configured_value in repositories.items():
+            if (
+                type(configured_repository) is not str
+                or "/" not in configured_repository
+                or type(configured_value) is not dict
+                or set(configured_value) - {"default_tier", "tiers", "role_profiles"}
+            ):
+                raise ValueError("repository Runtime configuration is malformed")
+            configured_tiers = configured_value.get("tiers", {})
+            configured_roles = configured_value.get("role_profiles", {})
+            configured_default = configured_value.get("default_tier", default_tier)
+            if (
+                type(configured_tiers) is not dict
+                or type(configured_roles) is not dict
+                or type(configured_default) is not str
+                or configured_default not in RUNTIME_TIERS
+                or any(
+                    type(name) is not str or name not in RUNTIME_TIERS
+                    for name in configured_tiers
+                )
+                or any(
+                    type(name) is not str or name not in RUNTIME_ROLE_PROFILES
+                    for name in configured_roles
+                )
+            ):
+                raise ValueError("repository Runtime mappings are malformed")
+            for raw in (*configured_tiers.values(), *configured_roles.values()):
+                validate_profile_shape(raw)
+
+        repository_value = repositories.get(repository, {})
+        if type(repository_value) is not dict or set(repository_value) - {
+            "default_tier",
+            "tiers",
+            "role_profiles",
+        }:
+            raise ValueError("repository Runtime configuration is malformed")
+        repository_tiers = repository_value.get("tiers", {})
+        repository_roles = repository_value.get("role_profiles", {})
+        if type(repository_tiers) is not dict or type(repository_roles) is not dict:
+            raise ValueError("repository Runtime mappings are malformed")
+        if any(type(name) is not str or name not in RUNTIME_TIERS for name in repository_tiers):
+            raise ValueError("repository Runtime configuration contains an unknown tier")
+        if any(type(name) is not str or name not in RUNTIME_ROLE_PROFILES for name in repository_roles):
+            raise ValueError("repository Runtime configuration contains an unknown role profile")
+        repository_default_tier = repository_value.get("default_tier", default_tier)
+        if type(repository_default_tier) is not str or repository_default_tier not in RUNTIME_TIERS:
+            raise ValueError("repository Runtime default tier is invalid")
+
+        profiles: dict[str, RuntimeProfile] = {}
+
+        def profile(name: str, raw: object) -> RuntimeProfile:
+            provider, settings = validate_profile_shape(raw)
             result = RuntimeProfile(
                 name=name,
-                provider=raw["provider"],
+                provider=provider,
                 model=settings["model"],
                 thinking=settings["thinkingOptionId"],
                 mode=settings["modeId"],
@@ -1766,10 +2048,13 @@ def _runtime_config_value(
         ) from error
 
 
-def _validate_runtime_config_source(observation: SourceObservation) -> None:
+def _validate_runtime_config_source(
+    observation: SourceObservation,
+    expected_path_value: Path,
+) -> None:
     """Keep the Runtime projection bound to the one host config file."""
 
-    expected_path = (Path.home() / ".orch" / "config.json").resolve()
+    expected_path = Path(expected_path_value).resolve()
     record = observation.record
     try:
         locator = Path(record.locator).resolve()
@@ -1812,6 +2097,57 @@ def _audited_files(root: Path) -> tuple[Path, ...]:
     )
 
 
+def _checkout_source_files(root: Path, subject: CutoverSubject) -> tuple[Path, ...]:
+    root = Path(root).resolve()
+    paths = set(_audited_files(root))
+    for package_name in subject.package_names:
+        package = root / "skills" / package_name
+        if not package.is_dir():
+            package = root / package_name
+        if not package.is_dir():
+            _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", f"source package is absent: {package_name}")
+        paths.update(
+            path
+            for path in package.rglob("*")
+            if path.is_file()
+            and "__pycache__" not in path.parts
+            and path.suffix != ".pyc"
+        )
+    return tuple(sorted((path.resolve() for path in paths), key=lambda path: path.relative_to(root).as_posix()))
+
+
+def _snapshot_files(paths: Sequence[Path], code: str) -> tuple[_FileSnapshot, ...]:
+    return tuple(_read_file_snapshot(path, code) for path in paths)
+
+
+def _require_stable_snapshots(
+    before: Sequence[_FileSnapshot],
+    after: Sequence[_FileSnapshot],
+    code: str,
+) -> None:
+    before_values = tuple(
+        (snapshot.path, snapshot.identity, snapshot.content) for snapshot in before
+    )
+    after_values = tuple(
+        (snapshot.path, snapshot.identity, snapshot.content) for snapshot in after
+    )
+    if before_values != after_values:
+        _fail(code, "validated file set changed before SourceRecord creation")
+
+
+def _snapshot_tree_digest(root: Path, snapshots: Sequence[_FileSnapshot]) -> str:
+    digest = hashlib.sha256()
+    resolved_root = root.resolve()
+    for snapshot in snapshots:
+        relative = snapshot.path.relative_to(resolved_root).as_posix().encode("utf-8")
+        content = snapshot.content.replace(b"\r\n", b"\n")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
 def _static_records(
     root: Path,
     *,
@@ -1821,21 +2157,28 @@ def _static_records(
     source_commit: str,
     source_tree_digest: str,
     readback_digest: str,
+    snapshots: Sequence[_FileSnapshot] | None = None,
 ) -> list[SourceRecord]:
     records: list[SourceRecord] = []
-    for path in _audited_files(root):
-        snapshot = _read_file_snapshot(path, "STATIC_INPUT_SOURCE_UNAVAILABLE")
-        relative = path.resolve().relative_to(root.resolve()).as_posix()
+    observed = (
+        tuple(snapshots)
+        if snapshots is not None
+        else _snapshot_files(_audited_files(root), "STATIC_INPUT_SOURCE_UNAVAILABLE")
+    )
+    snapshot_tree_sha256 = _snapshot_tree_digest(root, observed)
+    for snapshot in observed:
+        relative = snapshot.path.relative_to(root.resolve()).as_posix()
         records.append(
             _source_record(
                 role=role,
-                locator=str(path.resolve()),
+                locator=str(snapshot.path),
                 repository=repository,
                 read_mode="FIXED_COMMIT_TREE",
                 identity={
                     **dict(snapshot.identity),
                     "commit_oid": source_commit,
                     "relative_path": relative,
+                    "snapshot_tree_sha256": snapshot_tree_sha256,
                     "tree_digest": source_tree_digest,
                 },
                 payload=snapshot.content,
@@ -1848,8 +2191,65 @@ def _static_records(
     return records
 
 
+def _read_stable_static_inputs(
+    root: Path,
+    subject: CutoverSubject,
+    *,
+    producer_sha256: str,
+) -> tuple[CompatibilityPathReadback, list[SourceRecord]]:
+    root = Path(root).resolve()
+    before_paths = _audited_files(root)
+    if not before_paths:
+        _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "audited static input set is empty")
+    before = _snapshot_files(before_paths, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+    snapshot_tree_sha256 = _snapshot_tree_digest(root, before)
+    scan_subject = replace(subject, source_tree_digest=snapshot_tree_sha256)
+    try:
+        scanned = ProductionPathScanner(root).read(scan_subject)
+    except BootstrapError:
+        raise
+    except Exception as error:
+        raise BootstrapError(
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+            "production path scan failed",
+        ) from error
+    _validate_readback(
+        scanned,
+        CompatibilityPathReadback,
+        code="STATIC_INPUT_SOURCE_UNAVAILABLE",
+        repository=subject.repository,
+    )
+    if (
+        scanned.source_commit != subject.source_commit
+        or scanned.source_tree_digest != snapshot_tree_sha256
+    ):
+        _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "compatibility readback source identity changed")
+    after_paths = _audited_files(root)
+    after = _snapshot_files(after_paths, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+    _require_stable_snapshots(before, after, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+    readback = replace(
+        scanned,
+        source_tree_digest=subject.source_tree_digest,
+        readback_digest="",
+    )
+    readback_values = readback.canonical()
+    readback_values.pop("readback_digest")
+    readback = replace(readback, readback_digest=digest_value(readback_values))
+    records = _static_records(
+        root,
+        repository=subject.repository,
+        producer_sha256=producer_sha256,
+        role="compatibility.module",
+        source_commit=subject.source_commit,
+        source_tree_digest=subject.source_tree_digest,
+        readback_digest=readback.readback_digest,
+        snapshots=before,
+    )
+    return readback, records
+
+
 def _install_roots(config: object, subject: CutoverSubject) -> dict[str, Path]:
-    raw = getattr(config, "install_roots", None)
+    raw = config.install_roots
     if isinstance(raw, Mapping):
         if tuple(raw) != subject.install_surfaces:
             _fail("PACKAGE_SOURCE_UNAVAILABLE", "install surfaces are not in the fixed order")
@@ -1872,8 +2272,44 @@ def _package_records(
     *,
     producer_sha256: str,
     readback_digest: str,
+    snapshots: Sequence[tuple[str, Path, _FileSnapshot]] | None = None,
 ) -> list[SourceRecord]:
     records: list[SourceRecord] = []
+    observed = (
+        tuple(snapshots)
+        if snapshots is not None
+        else _package_file_snapshots(root, install_roots, subject)
+    )
+    for label, package, snapshot in observed:
+        path = snapshot.path
+        records.append(
+            _source_record(
+                role="package.file",
+                locator=str(path),
+                repository=subject.repository,
+                read_mode="FIXED_PACKAGE_FILE",
+                identity={
+                    **dict(snapshot.identity),
+                    "commit_oid": subject.source_commit,
+                    "package": label,
+                    "relative_path": path.relative_to(package).as_posix(),
+                    "tree_digest": subject.source_tree_digest,
+                },
+                payload=snapshot.content,
+                producer_sha256=producer_sha256,
+                readback_digest=readback_digest,
+            )
+        )
+    if not records:
+        _fail("PACKAGE_SOURCE_UNAVAILABLE", "package provenance is empty")
+    return records
+
+
+def _package_paths(
+    root: Path,
+    install_roots: Mapping[str, Path],
+    subject: CutoverSubject,
+) -> tuple[tuple[str, Path], ...]:
     package_paths: list[tuple[str, Path]] = []
     for package_name in subject.package_names:
         source = root / "skills" / package_name
@@ -1890,7 +2326,18 @@ def _package_records(
                     f"installed package is unavailable: {surface}:{package_name}",
                 )
             package_paths.append((f"{surface}:{package_name}", installed))
+    return tuple(package_paths)
+
+
+def _package_file_snapshots(
+    root: Path,
+    install_roots: Mapping[str, Path],
+    subject: CutoverSubject,
+) -> tuple[tuple[str, Path, _FileSnapshot], ...]:
+    snapshots: list[tuple[str, Path, _FileSnapshot]] = []
+    package_paths = _package_paths(root, install_roots, subject)
     for label, package in package_paths:
+        package = package.resolve()
         manifest = package / ".skill-package.json"
         try:
             manifest_stat = manifest.lstat()
@@ -1908,30 +2355,202 @@ def _package_records(
             _fail("PACKAGE_SOURCE_UNAVAILABLE", f"package file set is empty: {package}")
         for path in files:
             snapshot = _read_file_snapshot(path, "PACKAGE_SOURCE_UNAVAILABLE")
-            records.append(
-                _source_record(
-                role="package.file",
-                locator=str(path.resolve()),
-                repository=subject.repository,
-                read_mode="FIXED_PACKAGE_FILE",
-                identity={
-                    **dict(snapshot.identity),
-                    "commit_oid": subject.source_commit,
-                    "package": label,
-                    "relative_path": path.relative_to(package).as_posix(),
-                    "tree_digest": subject.source_tree_digest,
-                },
-                    payload=snapshot.content,
-                    producer_sha256=producer_sha256,
-                    readback_digest=readback_digest,
-                )
-            )
-    if not records:
+            snapshots.append((label, package, snapshot))
+    return tuple(snapshots)
+
+
+def _package_content_digest(
+    package: Path,
+    snapshots: Sequence[_FileSnapshot],
+) -> str:
+    digest = hashlib.sha256()
+    for snapshot in sorted(
+        (item for item in snapshots if item.path.name != ".skill-package.json"),
+        key=lambda item: item.path.relative_to(package).as_posix(),
+    ):
+        relative = snapshot.path.relative_to(package).as_posix().encode("utf-8")
+        content = snapshot.content
+        if snapshot.path.suffix.lower() in {
+            ".json",
+            ".md",
+            ".py",
+            ".toml",
+            ".txt",
+            ".yaml",
+            ".yml",
+        }:
+            content = content.replace(b"\r\n", b"\n")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def _snapshot_package_identities(
+    snapshots: Sequence[tuple[str, Path, _FileSnapshot]],
+) -> tuple[tuple[PackageIdentity, ...], tuple[PackageIdentity, ...]]:
+    grouped: dict[tuple[str, Path], list[_FileSnapshot]] = {}
+    for label, package, snapshot in snapshots:
+        grouped.setdefault((label, package), []).append(snapshot)
+    source: list[PackageIdentity] = []
+    installed: list[PackageIdentity] = []
+    for (label, package), files in grouped.items():
+        manifests = [item for item in files if item.path.name == ".skill-package.json"]
+        if len(manifests) != 1:
+            _fail("PACKAGE_SOURCE_UNAVAILABLE", "package manifest snapshot is not unique")
+        try:
+            manifest = json.loads(manifests[0].content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+            raise BootstrapError("PACKAGE_SOURCE_UNAVAILABLE", "package manifest is malformed") from error
+        package_name = label.split(":", 1)[1]
+        if (
+            type(manifest) is not dict
+            or type(manifest.get("version")) is not str
+            or not manifest["version"]
+        ):
+            _fail("PACKAGE_SOURCE_UNAVAILABLE", "package manifest identity is absent")
+        surface = None if label.startswith("source:") else label.split(":", 1)[0]
+        identity = PackageIdentity(
+            package_name=package_name,
+            version=manifest["version"],
+            content_digest=_package_content_digest(package, files),
+            manifest_content_digest=digest_bytes(manifests[0].content),
+            install_surface=surface,
+        )
+        (source if surface is None else installed).append(identity)
+    def sort_key(item: PackageIdentity) -> tuple[int, str]:
+        surface_index = (
+            -1
+            if item.install_surface is None
+            else (".agents", ".codex", ".claude").index(item.install_surface)
+        )
+        return surface_index, item.package_name
+
+    return tuple(sorted(source, key=sort_key)), tuple(sorted(installed, key=sort_key))
+
+
+def _read_stable_package_inputs(
+    root: Path,
+    install_roots: Mapping[str, Path],
+    subject: CutoverSubject,
+    *,
+    producer_sha256: str,
+) -> tuple[PackageReadback, list[SourceRecord]]:
+    root = Path(root).resolve()
+    before = _package_file_snapshots(root, install_roots, subject)
+    if not before:
         _fail("PACKAGE_SOURCE_UNAVAILABLE", "package provenance is empty")
-    return records
+    expected_source, expected_installed = _snapshot_package_identities(before)
+    try:
+        readback = ReadOnlyPackageValidator(root, install_roots).read(subject)
+    except BootstrapError:
+        raise
+    except Exception as error:
+        raise BootstrapError("PACKAGE_SOURCE_UNAVAILABLE", "package readback failed") from error
+    _validate_readback(readback, PackageReadback, code="PACKAGE_SOURCE_UNAVAILABLE")
+    after = _package_file_snapshots(root, install_roots, subject)
+    _require_stable_snapshots(
+        tuple(item[2] for item in before),
+        tuple(item[2] for item in after),
+        "PACKAGE_SOURCE_UNAVAILABLE",
+    )
+    if (
+        readback.source_packages != expected_source
+        or readback.installed_packages != expected_installed
+    ):
+        _fail("PACKAGE_SOURCE_UNAVAILABLE", "package readback is not bound to file snapshots")
+    records = _package_records(
+        root,
+        install_roots,
+        subject,
+        producer_sha256=producer_sha256,
+        readback_digest=readback.readback_digest,
+        snapshots=before,
+    )
+    return readback, records
+
+
+def _validate_checkout_file_bindings(
+    checkout: SourceObservation,
+    root: Path,
+    static_records: Sequence[SourceRecord],
+    package_records: Sequence[SourceRecord],
+) -> None:
+    code = "STATIC_INPUT_SOURCE_UNAVAILABLE"
+    try:
+        value = load_canonical_json(checkout.canonical_payload)
+        files = value["files"]
+        expected = {item["relative_path"]: item["byte_sha256"] for item in files}
+    except (KeyError, TypeError, ValueError) as error:
+        raise BootstrapError(code, "checkout file manifest is malformed") from error
+    observed: dict[str, str] = {}
+    root = Path(root).resolve()
+
+    def bind(record: SourceRecord, relative: str) -> None:
+        identity = dict(record.identity)
+        digest = identity.get("byte_sha256")
+        if (
+            type(relative) is not str
+            or not relative
+            or type(digest) is not str
+            or _HEX64.fullmatch(digest) is None
+            or (relative in observed and observed[relative] != digest)
+        ):
+            _fail(code, "checkout-bound SourceRecord identity is malformed")
+        observed[relative] = digest
+
+    for record in static_records:
+        if record.role != "compatibility.module":
+            _fail(code, "compatibility SourceRecord role changed")
+        bind(record, dict(record.identity).get("relative_path"))
+    for record in package_records:
+        identity = dict(record.identity)
+        package = identity.get("package")
+        if type(package) is not str or not package.startswith("source:"):
+            continue
+        try:
+            relative = Path(record.locator).resolve().relative_to(root).as_posix()
+        except (OSError, TypeError, ValueError) as error:
+            raise BootstrapError(code, "source package path escapes the checkout") from error
+        bind(record, relative)
+    if observed != expected:
+        _fail(code, "static or source-package files differ from the checkout observation")
 
 
 def _validate_config_subject(config: object, subject: CutoverSubject) -> None:
+    required_fields = {
+        "repository": "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        "control_branch": "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        "target_branch": "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        "source_writer_generation": "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        "target_writer_generation": "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        "expected_head": "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        "expected_tree": "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        "repository_root": "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        "fresh_store": "STORE_SOURCE_UNAVAILABLE",
+        "expected_fresh_store_sha256": "STORE_SOURCE_UNAVAILABLE",
+        "fresh_receipt": "STORE_SOURCE_UNAVAILABLE",
+        "expected_fresh_receipt_sha256": "STORE_SOURCE_UNAVAILABLE",
+        "expected_fresh_receipt_runbook_sha256": "STORE_SOURCE_UNAVAILABLE",
+        "expected_fresh_receipt_schema_digest": "STORE_SOURCE_UNAVAILABLE",
+        "expected_fresh_receipt_generation_rows": "STORE_SOURCE_UNAVAILABLE",
+        "expected_fresh_receipt_row_counts": "STORE_SOURCE_UNAVAILABLE",
+        "rollback_store": "STORE_SOURCE_UNAVAILABLE",
+        "expected_rollback_store_sha256": "STORE_SOURCE_UNAVAILABLE",
+        "prior_store": "STORE_SOURCE_UNAVAILABLE",
+        "expected_prior_store_sha256": "STORE_SOURCE_UNAVAILABLE",
+        "runtime_config_path": "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE",
+        "store_generation": "STORE_SOURCE_UNAVAILABLE",
+        "expected_store_tables": "STORE_SOURCE_UNAVAILABLE",
+        "install_roots": "PACKAGE_SOURCE_UNAVAILABLE",
+        "package_names": "PACKAGE_SOURCE_UNAVAILABLE",
+        "expected_package_version": "PACKAGE_SOURCE_UNAVAILABLE",
+        "expected_package_content_digests": "PACKAGE_SOURCE_UNAVAILABLE",
+    }
+    for name, code in required_fields.items():
+        if not hasattr(config, name):
+            _fail(code, f"fixed configuration {name} is absent")
     if subject.required_runtime_selectors != RUNTIME_SELECTORS:
         _fail(
             "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE",
@@ -1948,7 +2567,7 @@ def _validate_config_subject(config: object, subject: CutoverSubject) -> None:
         "expected_tree": subject.source_tree_digest,
     }
     for name, expected in expected_values.items():
-        if hasattr(config, name) and getattr(config, name) != expected:
+        if getattr(config, name) != expected:
             _fail(
                 "STATIC_INPUT_SOURCE_UNAVAILABLE",
                 f"fixed configuration {name} is not bound to the subject",
@@ -1968,11 +2587,107 @@ def _validate_config_subject(config: object, subject: CutoverSubject) -> None:
                 "STATIC_INPUT_SOURCE_UNAVAILABLE",
                 f"subject {name} is not the fixed current-main contract",
             )
-    if _HEX40.fullmatch(subject.source_commit) is None or _HEX64.fullmatch(subject.source_tree_digest) is None:
+    if _HEX40.fullmatch(subject.source_commit) is None or _HEX40.fullmatch(subject.source_tree_digest) is None:
         _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "subject source identity is malformed")
-    package_names = getattr(config, "package_names", subject.package_names)
+    for name in (
+        "expected_fresh_store_sha256",
+        "expected_fresh_receipt_sha256",
+        "expected_fresh_receipt_runbook_sha256",
+        "expected_fresh_receipt_schema_digest",
+        "expected_rollback_store_sha256",
+        "expected_prior_store_sha256",
+    ):
+        _require_digest(getattr(config, name), name, "STORE_SOURCE_UNAVAILABLE")
+    for name in (
+        "repository_root",
+        "fresh_store",
+        "fresh_receipt",
+        "rollback_store",
+        "prior_store",
+        "runtime_config_path",
+    ):
+        try:
+            Path(getattr(config, name)).resolve()
+        except (OSError, TypeError, ValueError) as error:
+            raise BootstrapError(
+                "STATIC_INPUT_SOURCE_UNAVAILABLE",
+                f"fixed configuration {name} is not a path",
+            ) from error
+    package_names = getattr(config, "package_names")
     if type(package_names) is not tuple or package_names != subject.package_names:
         _fail("PACKAGE_SOURCE_UNAVAILABLE", "configured package names are not exact")
+    if getattr(config, "expected_package_version") != "8.0.0":
+        _fail("PACKAGE_SOURCE_UNAVAILABLE", "configured package version is not exact")
+    if type(getattr(config, "expected_store_tables")) is not tuple:
+        _fail("STORE_SOURCE_UNAVAILABLE", "configured Store tables are malformed")
+    if type(getattr(config, "expected_fresh_receipt_generation_rows")) is not tuple:
+        _fail("STORE_SOURCE_UNAVAILABLE", "configured Store generation rows are malformed")
+    if type(getattr(config, "expected_fresh_receipt_row_counts")) is not tuple:
+        _fail("STORE_SOURCE_UNAVAILABLE", "configured Store row counts are malformed")
+    _install_roots(config, subject)
+    try:
+        package_content = dict(config.expected_package_content_digests)
+    except (TypeError, ValueError) as error:
+        raise BootstrapError(
+            "PACKAGE_SOURCE_UNAVAILABLE",
+            "configured package content identities are malformed",
+        ) from error
+    if set(package_content) != set(subject.package_names) or any(
+        type(value) is not str or _HEX64.fullmatch(value) is None
+        for value in package_content.values()
+    ):
+        _fail("PACKAGE_SOURCE_UNAVAILABLE", "configured package content identities are incomplete")
+    if subject.repository == PRODUCTION_REPOSITORY:
+        production_store_tables, _ = _fixed_store_contract()
+        production_subject = {
+            "source_commit": PRODUCTION_SOURCE_COMMIT,
+            "source_tree_digest": PRODUCTION_SOURCE_TREE,
+            "store_generation": PRODUCTION_STORE_GENERATION,
+        }
+        for name, expected in production_subject.items():
+            if getattr(subject, name) != expected:
+                _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", f"production subject {name} changed")
+        production_config = {
+            "repository_root": PRODUCTION_REPOSITORY_ROOT,
+            "fresh_store": PRODUCTION_STORE,
+            "store_generation": PRODUCTION_STORE_GENERATION,
+            "expected_fresh_store_sha256": PRODUCTION_STORE_SHA256,
+            "fresh_receipt": PRODUCTION_RECEIPT,
+            "expected_fresh_receipt_sha256": PRODUCTION_RECEIPT_SHA256,
+            "runtime_config_path": PRODUCTION_RUNTIME_CONFIG,
+            "rollback_store": PRODUCTION_ROLLBACK_STORE,
+            "expected_rollback_store_sha256": PRODUCTION_ROLLBACK_STORE_SHA256,
+            "prior_store": PRODUCTION_PRIOR_STORE,
+            "expected_prior_store_sha256": PRODUCTION_PRIOR_STORE_SHA256,
+            "expected_fresh_receipt_runbook_sha256": PRODUCTION_RECEIPT_RUNBOOK_SHA256,
+            "expected_fresh_receipt_schema_digest": PRODUCTION_RECEIPT_SCHEMA_DIGEST,
+            "expected_fresh_receipt_generation_rows": (
+                (PRODUCTION_REPOSITORY, PRODUCTION_STORE_GENERATION),
+            ),
+            "expected_store_tables": production_store_tables,
+            "expected_fresh_receipt_row_counts": tuple(
+                (table, 1 if table == "v8_writer_generations" else 0)
+                for table in production_store_tables
+            ),
+            "install_roots": PRODUCTION_INSTALL_ROOTS,
+            "expected_package_content_digests": PRODUCTION_PACKAGE_CONTENT_DIGESTS,
+        }
+        for name, expected in production_config.items():
+            actual = getattr(config, name)
+            if isinstance(expected, Path):
+                try:
+                    matches = Path(actual) == expected
+                except (OSError, TypeError, ValueError):
+                    matches = False
+            elif name == "install_roots":
+                try:
+                    matches = tuple(Path(item) for item in actual) == expected
+                except (OSError, TypeError, ValueError):
+                    matches = False
+            else:
+                matches = actual == expected
+            if not matches:
+                _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", f"production configuration {name} changed")
 
 
 def _validate_readback(
@@ -2002,31 +2717,28 @@ def _validate_package_identity_config(
     packages: PackageReadback,
     subject: CutoverSubject,
 ) -> None:
-    expected_content = getattr(config, "expected_package_content_digests", None)
-    if expected_content is not None:
-        try:
-            expected = dict(expected_content)
-        except (TypeError, ValueError) as error:
-            raise BootstrapError(
-                "PACKAGE_SOURCE_UNAVAILABLE", "configured package content identities are malformed"
-            ) from error
-        source_by_name = {item.package_name: item for item in packages.source_packages}
-        if set(expected) != set(subject.package_names):
-            _fail("PACKAGE_SOURCE_UNAVAILABLE", "configured package content identities are incomplete")
-        for package_name in subject.package_names:
-            expected_digest = expected[package_name]
-            if type(expected_digest) is not str or _HEX64.fullmatch(expected_digest) is None:
-                _fail("PACKAGE_SOURCE_UNAVAILABLE", "configured package content identity is malformed")
-            observed = source_by_name.get(package_name)
-            if observed is None or observed.content_digest != expected_digest:
-                _fail("PACKAGE_SOURCE_UNAVAILABLE", f"source package identity changed: {package_name}")
-    expected_version = getattr(config, "expected_package_version", None)
-    if expected_version is not None:
-        identities = (*packages.source_packages, *packages.installed_packages)
-        if type(expected_version) is not str or not expected_version or any(
-            item.version != expected_version for item in identities
-        ):
-            _fail("PACKAGE_SOURCE_UNAVAILABLE", "package version identity changed")
+    try:
+        expected = dict(config.expected_package_content_digests)
+    except (TypeError, ValueError) as error:
+        raise BootstrapError(
+            "PACKAGE_SOURCE_UNAVAILABLE", "configured package content identities are malformed"
+        ) from error
+    source_by_name = {item.package_name: item for item in packages.source_packages}
+    if set(expected) != set(subject.package_names):
+        _fail("PACKAGE_SOURCE_UNAVAILABLE", "configured package content identities are incomplete")
+    for package_name in subject.package_names:
+        expected_digest = expected[package_name]
+        if type(expected_digest) is not str or _HEX64.fullmatch(expected_digest) is None:
+            _fail("PACKAGE_SOURCE_UNAVAILABLE", "configured package content identity is malformed")
+        observed = source_by_name.get(package_name)
+        if observed is None or observed.content_digest != expected_digest:
+            _fail("PACKAGE_SOURCE_UNAVAILABLE", f"source package identity changed: {package_name}")
+    expected_version = config.expected_package_version
+    identities = (*packages.source_packages, *packages.installed_packages)
+    if type(expected_version) is not str or not expected_version or any(
+        item.version != expected_version for item in identities
+    ):
+        _fail("PACKAGE_SOURCE_UNAVAILABLE", "package version identity changed")
 
 
 def _bindings(
@@ -2071,27 +2783,15 @@ class ControlOwnershipAttestor:
     @staticmethod
     def _check_source(source: object, methods: tuple[str, ...]) -> None:
         try:
-            exposed = set(dir(source))
-            forbidden = {
-                "start",
-                "stop",
-                "restore",
-                "drain",
-                "write",
-                "publish",
-                "compare_and_swap",
-                "compare_and_swap_ref",
-                "activate",
-                "advance",
-                "install",
-                "prepare",
-                "command",
-                "events",
-                "put",
-                "delete",
-                "unlink",
+            exposed = {
+                name
+                for name in dir(source)
+                if not name.startswith("_")
+                and callable(inspect.getattr_static(source, name))
             }
-            if exposed & forbidden or any(not callable(getattr(source, name, None)) for name in methods):
+            if exposed != set(methods) or any(
+                not callable(getattr(source, name, None)) for name in methods
+            ):
                 raise BootstrapError("UNSAFE_SOURCE_CAPABILITY", "source exposes an unsafe or incomplete capability")
         except BootstrapError:
             raise
@@ -2112,6 +2812,18 @@ class ControlOwnershipAttestor:
         if attempt.cutover_subject_digest != digest_value(subject.canonical()):
             _fail("COMPONENT_INVALID", "attempt does not bind the cutover subject")
         _validate_config_subject(config, subject)
+
+        checkout = _read_source(
+            self._sources.local_inputs,
+            "read",
+            (config, subject),
+            role="local.inputs",
+            repository=subject.repository,
+            producer_sha256=attempt.attestor_sha256,
+            default_locator=f"local-checkout://{Path(config.repository_root).resolve()}",
+            default_read_mode="EXACT_GIT_SNAPSHOT",
+        )
+        checkout_record = _validate_checkout_observation(checkout, config, subject)
 
         writer_fence, authority, control_records = _read_control(
             self._sources.control,
@@ -2141,7 +2853,7 @@ class ControlOwnershipAttestor:
             repository=subject.repository,
             producer_sha256=attempt.attestor_sha256,
             default_locator=f"runtime-registry://{subject.repository}",
-            default_read_mode="COMPLETE_DOUBLE_READ",
+            default_read_mode="COMPLETE_OBSERVATION",
         )
         registry_value = _load_canonical_object(registry.canonical_payload, "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE")
         runtime_refs = _registry_refs(registry_value)
@@ -2149,14 +2861,14 @@ class ControlOwnershipAttestor:
         runtime_raw = _read_source(
             self._sources.runtime_config,
             "read",
-            (),
+            (Path(config.runtime_config_path),),
             role="runtime.config",
             repository=subject.repository,
             producer_sha256=attempt.attestor_sha256,
-            default_locator=str(Path.home() / ".orch" / "config.json"),
+            default_locator=str(Path(config.runtime_config_path).resolve()),
             default_read_mode="EXACT_FILE",
         )
-        _validate_runtime_config_source(runtime_raw)
+        _validate_runtime_config_source(runtime_raw, Path(config.runtime_config_path))
         configuration, runtime = _runtime_config_value(runtime_raw.canonical_payload, subject.repository)
         if tuple(item.selector for item in runtime.selectors) != RUNTIME_SELECTORS:
             _fail("RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE", "Runtime selectors are not in fixed order")
@@ -2193,63 +2905,26 @@ class ControlOwnershipAttestor:
             repository=subject.repository,
         )
 
-        root = Path(getattr(config, "repository_root", "."))
-        try:
-            compatibility = ProductionPathScanner(root).read(subject)
-        except BootstrapError:
-            raise
-        except Exception as error:
-            raise BootstrapError("STATIC_INPUT_SOURCE_UNAVAILABLE", "production path scan failed") from error
-        _validate_readback(
-            compatibility,
-            CompatibilityPathReadback,
-            code="STATIC_INPUT_SOURCE_UNAVAILABLE",
-            repository=subject.repository,
-        )
-        if (
-            compatibility.source_commit != subject.source_commit
-            or compatibility.source_tree_digest != subject.source_tree_digest
-        ):
-            _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "compatibility readback source identity changed")
-        try:
-            install_roots = _install_roots(config, subject)
-            packages = ReadOnlyPackageValidator(root, install_roots).read(subject)
-        except BootstrapError:
-            raise
-        except Exception as error:
-            raise BootstrapError("PACKAGE_SOURCE_UNAVAILABLE", "package readback failed") from error
-        _validate_readback(packages, PackageReadback, code="PACKAGE_SOURCE_UNAVAILABLE")
-        _validate_package_identity_config(config, packages, subject)
-
-        static_records = _static_records(
+        root = Path(config.repository_root)
+        compatibility, static_records = _read_stable_static_inputs(
             root,
-            repository=subject.repository,
+            subject,
             producer_sha256=attempt.attestor_sha256,
-            role="compatibility.module",
-            source_commit=subject.source_commit,
-            source_tree_digest=subject.source_tree_digest,
-            readback_digest=compatibility.readback_digest,
         )
-        package_records = _package_records(
+        install_roots = _install_roots(config, subject)
+        packages, package_records = _read_stable_package_inputs(
             root,
             install_roots,
             subject,
             producer_sha256=attempt.attestor_sha256,
-            readback_digest=packages.readback_digest,
         )
-        local_observation = self._sources.local_inputs.read(config, subject)
-        local_records: list[SourceRecord] = []
-        if local_observation is not None:
-            observed = _source_observation(
-                local_observation,
-                role="local.inputs",
-                repository=subject.repository,
-                producer_sha256=attempt.attestor_sha256,
-                default_locator="local-inputs://beta3",
-                default_read_mode="COMPLETE_READ",
-            )
-            local_records.append(observed.record)
-
+        _validate_package_identity_config(config, packages, subject)
+        _validate_checkout_file_bindings(
+            checkout,
+            root,
+            static_records,
+            package_records,
+        )
         readbacks: dict[str, object] = {
             "durable_state": store.durable,
             "writer_fence": writer_fence,
@@ -2260,7 +2935,7 @@ class ControlOwnershipAttestor:
         }
         source_records = tuple(
             sorted(
-                (*control_records, store.store_record, store.receipt_record, registry.record, runtime_raw.record, *static_records, *package_records, *local_records),
+                (*control_records, store.store_record, store.receipt_record, registry.record, runtime_raw.record, checkout_record, *static_records, *package_records),
                 key=lambda record: record.digest,
             )
         )
@@ -2270,9 +2945,9 @@ class ControlOwnershipAttestor:
             "durable_state": (store.store_record, store.receipt_record),
             "writer_fence": tuple(control_records),
             "ownership": (store.store_record, registry.record),
-            "compatibility": tuple(static_records),
+            "compatibility": (checkout_record, *static_records),
             "runtime": (runtime_raw.record,),
-            "packages": tuple(package_records),
+            "packages": (checkout_record, *package_records),
         }
         bindings = _bindings(readbacks, source_records, groups)
         return ComponentObservation(
@@ -2294,6 +2969,6 @@ def production_control_ownership_sources(
     return ControlOwnershipSourceSet(
         control=_GitHubControlSource(command_runner),
         runtime_registry=_RuntimeRegistrySource(command_runner, producer_sha256),
-        runtime_config=_RuntimeConfigSource(),
-        local_inputs=_LocalInputsSource(),
+        runtime_config=_RuntimeConfigSource(producer_sha256, PRODUCTION_REPOSITORY),
+        local_inputs=_LocalInputsSource(command_runner, producer_sha256),
     )
