@@ -245,6 +245,12 @@ CHECK_TO_GUARD_PORT = dict(
         strict=True,
     )
 )
+_ATTESTOR_MODULE_NAMES = (
+    "beta3_bootstrap_model.py",
+    "beta3_control_ownership_attestor.py",
+    "beta3_legacy_attestor.py",
+    "beta3_replay_guard.py",
+)
 PRODUCTION_ENTRY_REFS = (
     "gwo_v8.plan_control_host:ProductionPlanControlStartHost.start",
     "gwo_v8.execution_kernel:advance",
@@ -1083,6 +1089,35 @@ class _InputLease:
             }
             for binding in self._bindings
         }
+
+    def _held_content(self, path: Path) -> bytes:
+        expected = Path(path).resolve()
+        for binding in self._bindings:
+            if binding.path.resolve() == expected:
+                return _read_held_bytes(binding.descriptor, "ATTESTATION_MISMATCH")
+        raise RunnerError("ATTESTATION_MISMATCH", f"held input is not retained: {path}")
+
+    def assert_attempt_identity(self, attempt: object) -> None:
+        runner_sha256 = getattr(attempt, "runner_sha256", None)
+        if type(runner_sha256) is not str:
+            raise RunnerError("ATTESTATION_MISMATCH", "AttemptIdentity runner digest is unavailable")
+        runner_path = Path(__file__).resolve()
+        if hashlib.sha256(self._held_content(runner_path)).hexdigest() != runner_sha256:
+            raise RunnerError("ATTESTATION_MISMATCH", "AttemptIdentity runner digest is not held")
+        attestor_sha256 = getattr(attempt, "attestor_sha256", None)
+        if type(attestor_sha256) is not str:
+            raise RunnerError("ATTESTATION_MISMATCH", "AttemptIdentity attestor digest is unavailable")
+        digest = hashlib.sha256()
+        root = Path(__file__).resolve().parent
+        for name in _ATTESTOR_MODULE_NAMES:
+            content = self._held_content(root / name)
+            encoded_name = name.encode("utf-8")
+            digest.update(len(encoded_name).to_bytes(4, "big"))
+            digest.update(encoded_name)
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+        if digest.hexdigest() != attestor_sha256:
+            raise RunnerError("ATTESTATION_MISMATCH", "AttemptIdentity attestor digest is not held")
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
         self.close()
@@ -2291,50 +2326,10 @@ def _store_snapshots(config: RunnerConfig) -> dict[str, object]:
 
 def _input_lease(config: RunnerConfig, preflight_result: dict[str, object]) -> _InputLease:
     expected: dict[Path, Mapping[str, object]] = {}
-    stores = preflight_result["_stores"]
-    if type(stores) is not dict:
-        raise RunnerError("LIVE_INPUT_DRIFT", "preflight Store identities are unavailable")
-    for snapshot in stores.values():
-        if type(snapshot) is not dict:
-            raise RunnerError("LIVE_INPUT_DRIFT", "preflight Store snapshot is malformed")
-        path = Path(str(snapshot["path"]))
-        identity = snapshot.get("identity")
-        if type(identity) is not dict:
-            raise RunnerError("LIVE_INPUT_DRIFT", f"preflight identity is absent: {path}")
-        expected[path] = {
-            "identity": identity,
-            "sha256": snapshot.get("sha256"),
-        }
-    receipt = preflight_result.get("_receipt")
-    if type(receipt) is not dict or type(receipt.get("_identity")) is not dict:
-        raise RunnerError("LIVE_INPUT_DRIFT", "preflight receipt identity is unavailable")
-    expected[config.fresh_receipt] = {
-        "identity": receipt["_identity"],
-        "sha256": preflight_result.get("_receipt_digest"),
-    }
-    packages = preflight_result.get("_packages")
-    if (
-        type(packages) is not dict
-        or type(packages.get("file_identities")) is not dict
-        or type(packages.get("file_hashes")) is not dict
-    ):
-        raise RunnerError("LIVE_INPUT_DRIFT", "preflight package identities are unavailable")
-    for path, identity in packages["file_identities"].items():
-        if type(identity) is not dict:
-            raise RunnerError("LIVE_INPUT_DRIFT", f"preflight package identity is malformed: {path}")
-        expected[Path(str(path))] = {
-            "identity": identity,
-            "sha256": packages["file_hashes"].get(path),
-        }
     local_paths = (
         Path(config.runtime_config_path),
         Path(__file__).resolve(),
-        *(Path(__file__).resolve().with_name(name) for name in (
-            "beta3_bootstrap_model.py",
-            "beta3_control_ownership_attestor.py",
-            "beta3_legacy_attestor.py",
-            "beta3_replay_guard.py",
-        )),
+        *(Path(__file__).resolve().with_name(name) for name in _ATTESTOR_MODULE_NAMES),
     )
     for path in local_paths:
         if not _lexists(path):
@@ -2357,21 +2352,10 @@ def _pre_guard_refresh(
     try:
         _validate_config_paths(config, allow_existing_outputs=allow_existing_outputs)
         git = _git_snapshot(config, git_runner)
-        receipt, receipt_digest = _validate_receipt(config)
-        stores = _store_snapshots(config)
-        packages = _package_snapshot(config)
     except RunnerError as error:
         raise RunnerError("LIVE_INPUT_DRIFT", f"pre-Guard input changed: {error.detail}") from error
     if git != preflight_result["_git"]:
         raise RunnerError("LIVE_INPUT_DRIFT", "Git identity changed before Guard")
-    if receipt_digest != preflight_result["_receipt_digest"]:
-        raise RunnerError("LIVE_INPUT_DRIFT", "fresh receipt changed before Guard")
-    if stores != preflight_result["_stores"]:
-        raise RunnerError("LIVE_INPUT_DRIFT", "Store identity changed before Guard")
-    previous_packages = preflight_result["_packages"]
-    if packages != previous_packages:
-        raise RunnerError("LIVE_INPUT_DRIFT", "package identity changed before Guard")
-    del receipt
 
 
 def preflight(
@@ -2379,42 +2363,44 @@ def preflight(
     *,
     git_runner: Callable[..., subprocess.CompletedProcess[str]] = _default_git_runner,
     allow_existing_outputs: bool = False,
+    authoritative_sources: bool = True,
 ) -> dict[str, object]:
     _validate_config_paths(config, allow_existing_outputs=allow_existing_outputs)
     git = _git_snapshot(config, git_runner)
-    receipt, receipt_digest = _validate_receipt(config)
-    stores = _store_snapshots(config)
-    packages = _package_snapshot(config)
-    if config.authoritative_legacy_snapshot is not None:
-        raise RunnerError(
-            "DEPENDENCY_INJECTION_FORBIDDEN",
-            "operator legacy snapshots cannot become authoritative",
-        )
-    return {
+    result = {
         "status": "PREFLIGHT_OK",
         "repository": config.repository,
         "head": git["head"],
         "tree": git["tree"],
         "origin_main": git["origin_main"],
         "tracked_status": git["status"],
-        "fresh_receipt_sha256": receipt_digest,
-        "fresh_store_sha256": stores[_path_text(config.fresh_store)]["sha256"],
-        "rollback_store_sha256": stores[_path_text(config.rollback_store)]["sha256"],
-        "prior_store_sha256": stores[_path_text(config.prior_store)]["sha256"],
         "store_generation": config.store_generation,
         "install_roots": [_path_text(path) for path in config.install_roots],
-        "package_snapshot_digest": packages["digest"],
         "outputs_absent": not (_lexists(config.report_path) or _lexists(config.evidence_path)),
         "gateway_artifact_absent": True,
         "_git": git,
-        "_receipt": receipt,
-        "_receipt_digest": receipt_digest,
-        "_stores": stores,
-        "_packages": packages,
         "_evidence_parent_identity": _directory_identity(
             config.evidence_root, "EVIDENCE_ROOT_INVALID"
         ),
     }
+    if authoritative_sources:
+        receipt, receipt_digest = _validate_receipt(config)
+        stores = _store_snapshots(config)
+        packages = _package_snapshot(config)
+        result.update(
+            {
+                "fresh_receipt_sha256": receipt_digest,
+                "fresh_store_sha256": stores[_path_text(config.fresh_store)]["sha256"],
+                "rollback_store_sha256": stores[_path_text(config.rollback_store)]["sha256"],
+                "prior_store_sha256": stores[_path_text(config.prior_store)]["sha256"],
+                "package_snapshot_digest": packages["digest"],
+                "_receipt": receipt,
+                "_receipt_digest": receipt_digest,
+                "_stores": stores,
+                "_packages": packages,
+            }
+        )
+    return result
 
 
 def _plain_observation(value: object) -> object:
@@ -2486,30 +2472,7 @@ def _verify_post_files(
         raise RunnerError("LIVE_INPUT_DRIFT", "Git identity or status changed during Guard")
     _validate_config_paths(config, allow_existing_outputs=allow_existing_outputs)
     _validate_no_side_effect_paths(config)
-    try:
-        receipt, receipt_digest = _validate_receipt(config)
-        if receipt_digest != before["_receipt_digest"]:
-            raise RunnerError("LIVE_INPUT_DRIFT", "fresh Store receipt changed during Guard")
-        stores = _store_snapshots(config)
-    except RunnerError as error:
-        if (
-            error.code.startswith("FRESH_RECEIPT_")
-            or error.code.endswith("_HASH_MISMATCH")
-            or error.code == "STORE_SIDECAR_PRESENT"
-        ):
-            raise RunnerError(
-                "LIVE_INPUT_DRIFT",
-                f"read-only Store input changed: {error.detail}",
-            ) from error
-        raise
-    if stores != before["_stores"]:
-        raise RunnerError("LIVE_INPUT_DRIFT", "Store identity changed during Guard")
-    return {
-        "_git": git,
-        "_receipt": receipt,
-        "_receipt_digest": receipt_digest,
-        "_stores": stores,
-    }
+    return {"_git": git}
 
 
 def _runbook_hash() -> str:
@@ -2759,12 +2722,44 @@ def _validate_attested_replay(bundle: object, replay: object) -> dict[str, objec
             sys.path.insert(0, scripts_root)
         from beta3_bootstrap_model import AttestedCutoverBundle  # type: ignore[import-not-found]
         from beta3_replay_guard import ReplayResult  # type: ignore[import-not-found]
+        from gwo_v8.cutover_guard import (
+            CompatibilityPathReadback,
+            CutoverBlocker,
+            CutoverGuardReceipt,
+            CutoverGuardReport,
+            CutoverReadbackBundle,
+            CutoverSubject,
+            DurableStateReadback,
+            GuardCheck,
+            LegacyReadback,
+            OwnershipReadback,
+            PackageReadback,
+            RuntimePreflightReadback,
+            WriterFenceReadback,
+        )
     except (ImportError, ModuleNotFoundError, OSError) as error:
         raise RunnerError("ATTESTATION_UNAVAILABLE", "replay contracts are unavailable") from error
     if type(bundle) is not AttestedCutoverBundle:
         raise RunnerError("ATTESTATION_MISMATCH", "replay input is not one attested bundle")
     if type(replay) is not ReplayResult:
         raise RunnerError("ATTESTATION_MISMATCH", "replay result is not exact")
+    if type(replay.subject) is not CutoverSubject:
+        raise RunnerError("ATTESTATION_MISMATCH", "replay subject is not exact")
+    if type(replay.readback_bundle) is not CutoverReadbackBundle:
+        raise RunnerError("ATTESTATION_MISMATCH", "replay readback bundle is not exact")
+    if type(replay.report) is not CutoverGuardReport:
+        raise RunnerError("ATTESTATION_MISMATCH", "replay report is not exact")
+    expected_readback_types = {
+        "legacy": LegacyReadback,
+        "durable_state": DurableStateReadback,
+        "writer_fence": WriterFenceReadback,
+        "ownership": OwnershipReadback,
+        "compatibility": CompatibilityPathReadback,
+        "runtime": RuntimePreflightReadback,
+        "packages": PackageReadback,
+    }
+    if any(type(getattr(bundle, name)) is not value_type for name, value_type in expected_readback_types.items()):
+        raise RunnerError("ATTESTATION_MISMATCH", "attested readback component is not exact")
     try:
         bundle.validate()
     except Exception as error:
@@ -2780,6 +2775,32 @@ def _validate_attested_replay(bundle: object, replay: object) -> dict[str, objec
     report_value = _plain_observation(report)
     if type(report_value) is not dict:
         raise RunnerError("ATTESTATION_MISMATCH", "replay report is not a canonical object")
+    if report.schema != "gwo.cutover-guard.v1":
+        raise RunnerError("ATTESTATION_MISMATCH", "replay report schema is not exact")
+    checks = report.checks
+    if type(checks) is not tuple or len(checks) != len(EXPECTED_CHECK_IDS):
+        raise RunnerError("ATTESTATION_MISMATCH", "replay report check count is not exact")
+    if any(type(check) is not GuardCheck for check in checks):
+        raise RunnerError("ATTESTATION_MISMATCH", "replay report check type is not exact")
+    if tuple(check.check_id for check in checks) != EXPECTED_CHECK_IDS:
+        raise RunnerError("ATTESTATION_MISMATCH", "replay report check ids are not exact")
+    blockers = report.blockers
+    if type(blockers) is not tuple or any(type(blocker) is not CutoverBlocker for blocker in blockers):
+        raise RunnerError("ATTESTATION_MISMATCH", "replay report blockers are not exact")
+    failed_checks = {check.check_id for check in checks if not check.passed}
+    blocker_ids = tuple(blocker.check_id for blocker in blockers)
+    if len(set(blocker_ids)) != len(blocker_ids) or not set(blocker_ids) <= failed_checks:
+        raise RunnerError("ATTESTATION_MISMATCH", "replay report blockers are not complete")
+    if report.decision == "GO":
+        if not all(check.passed for check in checks) or blockers:
+            raise RunnerError("ATTESTATION_MISMATCH", "GO replay checks or blockers are not complete")
+        if type(report.receipt) is not CutoverGuardReceipt:
+            raise RunnerError("ATTESTATION_MISMATCH", "GO replay receipt is not exact")
+    elif report.decision == "NO_GO":
+        if all(check.passed for check in checks) or not blockers or report.receipt is not None:
+            raise RunnerError("ATTESTATION_MISMATCH", "NO_GO replay checks or receipt are not complete")
+    else:
+        raise RunnerError("ATTESTATION_MISMATCH", "replay report decision is not exact")
     subject_digest = _exact_digest_value(bundle.subject.canonical())
     readback_digest = _exact_digest_value(
         {
@@ -2787,20 +2808,31 @@ def _validate_attested_replay(bundle: object, replay: object) -> dict[str, objec
             for name in GUARD_PORT_ORDER
         }
     )
-    if report_value.get("subject_digest") != subject_digest:
+    if report.subject_digest != subject_digest or report_value.get("subject_digest") != subject_digest:
         raise RunnerError("ATTESTATION_MISMATCH", "replay report subject is not bound")
-    if report_value.get("readback_digest") != readback_digest:
+    if report.readback_digest != readback_digest or report_value.get("readback_digest") != readback_digest:
         raise RunnerError("ATTESTATION_MISMATCH", "replay report readback is not bound")
-    if report_value.get("decision") not in {"GO", "NO_GO"}:
-        raise RunnerError("ATTESTATION_MISMATCH", "replay report decision is not exact")
-    if report_value.get("repository") != bundle.subject.repository:
+    if report_value.get("repository") != bundle.subject.repository or report.repository != bundle.subject.repository:
         raise RunnerError("ATTESTATION_MISMATCH", "replay report repository is not bound")
-    if report_value.get("schema") != "gwo.cutover-guard.v1":
-        raise RunnerError("ATTESTATION_MISMATCH", "replay report schema is not exact")
-    if report_value["decision"] == "GO" and type(report_value.get("receipt")) is not dict:
-        raise RunnerError("ATTESTATION_MISMATCH", "GO replay has no receipt")
-    if report_value["decision"] == "NO_GO" and report_value.get("receipt") is not None:
-        raise RunnerError("ATTESTATION_MISMATCH", "NO_GO replay has a receipt")
+    if report_value.get("decision") != report.decision:
+        raise RunnerError("ATTESTATION_MISMATCH", "replay report decision is not bound")
+    if report.decision == "GO":
+        receipt = report.receipt
+        if (
+            receipt.schema != "gwo.cutover-guard-receipt.v1"
+            or receipt.repository != bundle.subject.repository
+            or receipt.subject_digest != subject_digest
+            or receipt.readback_digest != readback_digest
+            or receipt.source_writer_generation != bundle.subject.source_writer_generation
+            or receipt.target_writer_generation != bundle.subject.target_writer_generation
+            or receipt.store_generation != bundle.subject.store_generation
+            or receipt.writer_control_ref_digest != bundle.writer_fence.control_ref_digest
+            or receipt.runtime_configuration_digest != bundle.runtime.configuration_digest
+            or receipt.compatibility_audit_digest != bundle.compatibility.readback_digest
+            or receipt.package_readback_digest != bundle.packages.readback_digest
+            or receipt.receipt_digest != _exact_digest_value(receipt.canonical_without_digest())
+        ):
+            raise RunnerError("ATTESTATION_MISMATCH", "GO replay receipt is not attestation-bound")
     return report_value
 
 
@@ -2880,17 +2912,16 @@ def _attested_report(
             strict=True,
         )
     ]
-    return {
+    value = {
         **replay_value,
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "runbook_schema": REPORT_SCHEMA,
         "runbook": _path_text(Path(__file__)),
-        "runbook_sha256": _runbook_hash(),
+        "runbook_sha256": attempt.runner_sha256,
         "source_head": preflight_result["head"],
         "source_tree": preflight_result["tree"],
         "origin_main": preflight_result["origin_main"],
         "store_generation": config.store_generation,
-        "fresh_store_sha256": preflight_result["fresh_store_sha256"],
         "writer_generation": writer_generation,
         "default_writer_changed": False,
         "publication_protocol": "report-first-exclusive-v1",
@@ -2908,6 +2939,16 @@ def _attested_report(
         "mutation_flags": _mutation_flags(),
         "activation_performed": False,
     }
+    for name in (
+        "fresh_receipt_sha256",
+        "fresh_store_sha256",
+        "rollback_store_sha256",
+        "prior_store_sha256",
+        "package_snapshot_digest",
+    ):
+        if name in preflight_result:
+            value[name] = preflight_result[name]
+    return value
 
 
 def _attested_evidence(
@@ -2993,6 +3034,8 @@ def _validate_attested_report_value(
         ("attestation", bundle.canonical()),
         ("attestation_digest", bundle.attestation_digest),
         ("attested_readback_bundle", bundle.cutover_bundle().canonical()),
+        ("runbook", _path_text(Path(__file__))),
+        ("runbook_sha256", attempt.runner_sha256),
         ("decision", replay_value["decision"]),
         ("activation_performed", False),
     ):
@@ -3022,6 +3065,8 @@ def _validate_attested_evidence_value(
         ("attestation", bundle.canonical()),
         ("attestation_digest", bundle.attestation_digest),
         ("attested_readback_bundle", bundle.cutover_bundle().canonical()),
+        ("runbook", _path_text(Path(__file__))),
+        ("runbook_sha256", attempt.runner_sha256),
         ("fixed_subject", bundle.subject.canonical()),
         ("report_digest", report_digest),
         ("report_path", _path_text(config.report_path)),
@@ -3388,12 +3433,7 @@ def _is_fixed_production_subject(config: RunnerConfig) -> bool:
 def _attestor_source_sha256() -> str:
     digest = hashlib.sha256()
     root = Path(__file__).resolve().parent
-    for name in (
-        "beta3_bootstrap_model.py",
-        "beta3_control_ownership_attestor.py",
-        "beta3_legacy_attestor.py",
-        "beta3_replay_guard.py",
-    ):
+    for name in _ATTESTOR_MODULE_NAMES:
         path = root / name
         try:
             content = path.read_bytes()
@@ -3515,26 +3555,20 @@ def run(
         or guard_factory is not None
         or control_reader is not None
         or package_reader is not None
+        or config.authoritative_legacy_snapshot is not None
+        or config.production_readers is not None
     )
-    if execute and _is_fixed_production_subject(config) and injected:
+    if execute and (
+        config.authoritative_legacy_snapshot is not None
+        or config.production_readers is not None
+        or (_is_fixed_production_subject(config) and injected)
+    ):
         return _result(
             "UNAVAILABLE",
             3,
             code="DEPENDENCY_INJECTION_FORBIDDEN",
             detail="fixed production subject does not accept dependency injection",
         )
-    try:
-        preflight_result = preflight(
-            config,
-            git_runner=git_runner,
-            allow_existing_outputs=False,
-        )
-    except RunnerError as error:
-        if error.code == "DEPENDENCY_INJECTION_FORBIDDEN":
-            return _result("UNAVAILABLE", 3, code=error.code, detail=error.detail)
-        return _result("REFUSED", 1, code=error.code, detail=error.detail)
-    except Exception as error:
-        return _result("UNAVAILABLE", 3, code="PREFLIGHT_UNAVAILABLE", detail=str(error))
     if execute and (type(run_id) is not str or not run_id):
         return _result(
             "REFUSED",
@@ -3542,6 +3576,19 @@ def run(
             code="RUN_ID_REQUIRED",
             detail="execute requires one non-empty operator run_id",
         )
+    try:
+        preflight_result = preflight(
+            config,
+            git_runner=git_runner,
+            allow_existing_outputs=False,
+            authoritative_sources=not execute,
+        )
+    except RunnerError as error:
+        if error.code in {"OUTPUT_COLLISION", "LIVE_INPUT_DRIFT"}:
+            return _result("REFUSED", 1, code=error.code, detail=error.detail)
+        return _result("UNAVAILABLE", 3, code=error.code, detail=error.detail)
+    except Exception as error:
+        return _result("UNAVAILABLE", 3, code="PREFLIGHT_UNAVAILABLE", detail=str(error))
     if not execute:
         return preflight_result | {"exit_code": 0}
     lease: object | None = None
@@ -3593,6 +3640,10 @@ def run(
             if type(lease) is not bootstrap_lease_type:
                 raise RunnerError("LEASE_INVALID", "attestation did not return a BootstrapLease")
             with _input_lease(config, preflight_result) as inputs:
+                assert_attempt_identity = getattr(inputs, "assert_attempt_identity", None)
+                if not callable(assert_attempt_identity):
+                    raise RunnerError("LEASE_INVALID", "input lease has no attempt identity assertion")
+                assert_attempt_identity(attempt)
                 _assert_combined_stable(
                     config,
                     preflight_result,
@@ -3659,6 +3710,7 @@ def run(
                         git_runner,
                         allow_existing_outputs=True,
                     )
+                    _revalidate_owned_output(report_outputs[0], "LIVE_INPUT_DRIFT")
                     exit_code = 0 if replay_value["decision"] == "GO" else 2
                     evidence = _attested_evidence(
                         config,
@@ -3700,8 +3752,8 @@ def run(
                         git_runner,
                         allow_existing_outputs=True,
                     )
-                    _revalidate_owned_output(report_outputs[0], "OUTPUT_WRITE_FAILED")
-                    _revalidate_owned_output(evidence_outputs[0], "OUTPUT_WRITE_FAILED")
+                    _revalidate_owned_output(report_outputs[0], "LIVE_INPUT_DRIFT")
+                    _revalidate_owned_output(evidence_outputs[0], "LIVE_INPUT_DRIFT")
                     _validate_attested_report_value(
                         report_body,
                         config=config,
