@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib.util
 import inspect
 import json
 from dataclasses import replace
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -27,18 +27,15 @@ sys.modules[spec.name] = runner
 spec.loader.exec_module(runner)
 
 EXACT_SCRIPTS = REPO_ROOT / "skills" / "orchestrator" / "scripts"
-if str(EXACT_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(EXACT_SCRIPTS))
+SCRIPTS = REPO_ROOT / "scripts"
+for path in (EXACT_SCRIPTS, SCRIPTS):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 from gwo_v8._canonical import digest_value  # noqa: E402
 from gwo_v8.cutover_guard import (  # noqa: E402
     CompatibilityPathReadback,
-    CutoverBlocker,
-    CutoverGuardReceipt,
-    CutoverGuardReport,
-    CutoverReadbackBundle,
     CutoverSubject,
     DurableStateReadback,
-    GuardCheck,
     LegacyReadback,
     OwnershipReadback,
     PackageIdentity,
@@ -47,6 +44,15 @@ from gwo_v8.cutover_guard import (  # noqa: E402
     RuntimeSelectorReadback,
     WriterFenceReadback,
 )
+from beta3_bootstrap_model import (  # noqa: E402
+    AttestedCutoverBundle,
+    AttemptIdentity,
+    ComponentObservation,
+    FieldBinding,
+    SourceRecord,
+    WriterAuthorityObservation,
+)
+from beta3_replay_guard import evaluate_attested_bundle  # noqa: E402
 
 
 def _sha256(path: Path) -> str:
@@ -178,11 +184,13 @@ def _fixture_config(tmp_path: Path):
     root = tmp_path / "repo root with spaces"
     evidence = tmp_path / "evidence root with spaces"
     stores = tmp_path / "stores"
+    runtime_config = tmp_path / "runtime-config.json"
     root.mkdir()
     (root / ".git").mkdir()
     (root / "skills").mkdir()
     evidence.mkdir()
     stores.mkdir()
+    runtime_config.write_text("{}\n", encoding="utf-8")
     for package in ("implement-gwo", "orchestrator"):
         source = root / "skills" / package
         source.mkdir()
@@ -251,6 +259,8 @@ def _fixture_config(tmp_path: Path):
         ),
         gateway_store_path=evidence / "forbidden-gateway.sqlite3",
         artifact_root=evidence / "forbidden-artifacts",
+        runtime_config_path=runtime_config,
+        expected_package_version="8.0.0",
     )
     _write_receipt(config)
     config = replace(
@@ -414,97 +424,599 @@ def _exact_fixture_readbacks(config, subject):
     }
 
 
-def _stable_dependencies(*, decision: str = "GO", changed: dict[str, Any] | None = None):
-    calls: list[str] = []
-    control_reads = 0
-    package_reads = 0
-    subject_holder: list[CutoverSubject] = []
-
-    def live_guard(_config, subject):
-        calls.append("guard")
-        subject_holder[:] = [subject]
-        readbacks = _exact_fixture_readbacks(_config, subject)
-        checks = tuple(
-            GuardCheck(
-                check_id,
-                decision == "GO",
-                digest_value(readbacks[runner.CHECK_TO_GUARD_PORT[check_id]].canonical()),
-            )
-            for check_id in runner.EXPECTED_CHECK_IDS
-        )
-        blockers = ()
-        if decision == "NO_GO":
-            blockers = (
-                CutoverBlocker(
-                    "CUTOVER_V2_ACTIVE",
-                    "legacy_quiescence",
-                    checks[1].observed_digest,
-                    "fixture blocker",
-                ),
-            )
-        readback_digest = digest_value(
-            {name: readbacks[name].canonical() for name in runner.GUARD_PORT_ORDER}
-        )
-        receipt = None
-        if decision == "GO":
-            receipt_body = {
-                "schema": "gwo.cutover-guard-receipt.v1",
-                "repository": _config.repository,
-                "subject_digest": digest_value(subject.canonical()),
-                "readback_digest": readback_digest,
-                "source_writer_generation": "v6.1",
-                "target_writer_generation": "v8",
-                "store_generation": _config.store_generation,
-                "writer_control_ref_digest": readbacks["writer_fence"].control_ref_digest,
-                "runtime_configuration_digest": readbacks["runtime"].configuration_digest,
-                "compatibility_audit_digest": readbacks["compatibility"].readback_digest,
-                "package_readback_digest": readbacks["packages"].readback_digest,
-            }
-            receipt = CutoverGuardReceipt(
-                **receipt_body,
-                receipt_digest=digest_value(receipt_body),
-            )
-        report = CutoverGuardReport(
-            schema="gwo.cutover-guard.v1",
-            decision=decision,
-            repository=_config.repository,
-            subject_digest=digest_value(subject.canonical()),
-            readback_digest=readback_digest,
-            checks=checks,
-            blockers=blockers,
-            receipt=receipt,
-        )
-        bundle = CutoverReadbackBundle(
-            schema=runner.GUARD_READBACK_SCHEMA,
-            subject=subject,
-            **readbacks,
-        )
-        return runner.GuardExecution(report, subject, bundle, runner._guard_contract())
-
-    def control_read():
-        nonlocal control_reads
-        calls.append("control")
-        control_reads += 1
-        if control_reads > 1 and changed and "control" in changed:
-            return changed["control"]
-        return {"writer_generation": "v6.1", "control_ref": "control-stable"}
-
-    def package_read(_config):
-        nonlocal package_reads
-        calls.append("packages")
-        package_reads += 1
-        if package_reads > 1 and changed and "packages" in changed:
-            return changed["packages"]
-        return "packages-stable"
-
-    dependencies = runner.ExecutionDependencies(
-        live_guard=live_guard,
-        control_read=control_read,
-        package_read=package_read,
-        subject_factory=_exact_fixture_subject,
-        guard_contract=runner._guard_contract(),
+def _stable_dependencies(
+    *,
+    decision: str = "GO",
+    changed: dict[str, Any] | None = None,
+    unavailable_role: str | None = None,
+):
+    dependencies, calls, _counts = _attested_dependencies(
+        None,
+        decision=decision,
+        changed=changed,
+        unavailable_role=unavailable_role,
     )
     return dependencies, calls
+
+
+def test_execute_requires_operator_run_id_but_preflight_does_not(tmp_path):
+    config = _fixture_config(tmp_path)
+    assert runner.main(
+        [],
+        config=config,
+        git_runner=_git_runner_factory(config),
+        stdout=io.StringIO(),
+    ) == 0
+    assert runner.main(
+        ["--execute"],
+        config=config,
+        git_runner=_git_runner_factory(config),
+        stdout=io.StringIO(),
+    ) == 1
+
+
+def test_execute_checks_run_id_after_zero_write_preflight(tmp_path, monkeypatch):
+    config = _fixture_config(tmp_path)
+    events: list[str] = []
+    original_preflight = runner.preflight
+
+    def recording_preflight(*args, **kwargs):
+        events.append("preflight")
+        return original_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "preflight", recording_preflight)
+    result = runner.run(
+        config,
+        execute=True,
+        git_runner=_git_runner_factory(config),
+    )
+
+    assert result["status"] == "REFUSED"
+    assert result["exit_code"] == 1
+    assert result["code"] == "RUN_ID_REQUIRED"
+    assert events == ["preflight"]
+    assert not config.report_path.exists()
+    assert not config.evidence_path.exists()
+
+
+def test_runner_config_exposes_exact_attestor_configuration(tmp_path):
+    config = _fixture_config(tmp_path)
+
+    assert config.runtime_config_path.is_file()
+    assert config.expected_package_version == "8.0.0"
+
+
+@pytest.mark.parametrize(
+    "injection",
+    (
+        {"dependencies": object()},
+        {"guard_factory": lambda *_args: object()},
+        {"control_reader": lambda: object()},
+        {"package_reader": lambda _config: object()},
+    ),
+)
+def test_fixed_production_subject_rejects_dependency_injection_before_source_access(
+    monkeypatch, injection
+):
+    def unexpected_preflight(*_args, **_kwargs):
+        raise AssertionError("fixed production injection must be rejected before preflight")
+
+    monkeypatch.setattr(runner, "preflight", unexpected_preflight)
+    result = runner.run(
+        runner.DEFAULT_CONFIG,
+        execute=True,
+        run_id="beta3-prod-001",
+        **injection,
+    )
+
+    assert result["status"] == "UNAVAILABLE"
+    assert result["exit_code"] == 3
+    assert result["code"] == "DEPENDENCY_INJECTION_FORBIDDEN"
+
+
+def test_attestor_configuration_is_part_of_fixed_production_subject():
+    changed_runtime = replace(
+        runner.DEFAULT_CONFIG,
+        runtime_config_path=runner.DEFAULT_CONFIG.runtime_config_path.with_name(
+            "different-runtime-config.json"
+        ),
+    )
+    changed_package_version = replace(
+        runner.DEFAULT_CONFIG,
+        expected_package_version="different",
+    )
+
+    assert runner._is_fixed_production_subject(changed_runtime) is False
+    assert runner._is_fixed_production_subject(changed_package_version) is False
+
+
+def test_execution_dependencies_are_attestation_only():
+    dependencies = runner.ExecutionDependencies(
+        control_ownership_attestor=object(),
+        legacy_attestor=object(),
+        replay_guard=lambda _bundle: object(),
+    )
+    assert dependencies.control_ownership_attestor is not None
+
+
+def test_public_dependency_annotations_are_exact_attestation_contracts():
+    dependency_source = inspect.getsource(runner.ExecutionDependencies)
+    attest_source = inspect.getsource(runner.ProductionBootstrapAttestor.attest)
+
+    assert 'replay_guard: Callable[["AttestedCutoverBundle"], "ReplayResult"]' in dependency_source
+    assert '-> tuple["AttestedCutoverBundle", "BootstrapLease", dict[str, object]]' in attest_source
+
+
+def test_attestor_observes_control_then_legacy_and_freezes_one_bundle(tmp_path, monkeypatch):
+    config = _fixture_config(tmp_path)
+    subject = _exact_fixture_subject(config)
+    readbacks = _exact_fixture_readbacks(config, subject)
+    control_record = SourceRecord(
+        role="control.fixture",
+        locator="fixture://owner/repo/control",
+        repository=config.repository,
+        read_mode="FIXTURE",
+        identity=(("fixture_id", "control"),),
+        content_sha256="1" * 64,
+        readback_digest=None,
+        producer_sha256="2" * 64,
+    )
+    legacy_record = SourceRecord(
+        role="legacy.fixture",
+        locator="fixture://owner/repo/legacy",
+        repository=config.repository,
+        read_mode="FIXTURE",
+        identity=(("fixture_id", "legacy"),),
+        content_sha256="3" * 64,
+        readback_digest=None,
+        producer_sha256="2" * 64,
+    )
+    all_targets = tuple(
+        target
+        for name, value in (("subject", subject), *readbacks.items())
+        for target in (f"{name}.{field}" for field in value.canonical())
+    )
+    bindings = tuple(
+        FieldBinding(
+            target=target,
+            source_record_digests=(control_record.digest, legacy_record.digest),
+            derivation="fixture",
+        )
+        for target in all_targets
+    )
+    writer = WriterAuthorityObservation(
+        writer_generation="v6.1",
+        record_id="writer",
+        authority_state="authoritative",
+        activation_id=None,
+        legacy_stopped=False,
+        source_record_digests=(control_record.digest,),
+    )
+    control = ComponentObservation(
+        readbacks=tuple(
+            (name, readbacks[name])
+            for name in (
+                "durable_state",
+                "writer_fence",
+                "ownership",
+                "compatibility",
+                "runtime",
+                "packages",
+            )
+        ),
+        source_records=(control_record,),
+        field_bindings=bindings,
+        writer_authority=writer,
+    )
+    legacy = ComponentObservation(
+        readbacks=(("legacy", readbacks["legacy"]),),
+        source_records=(legacy_record,),
+        field_bindings=(),
+        writer_authority=writer,
+    )
+    attempt = AttemptIdentity(
+        run_id="beta3-prod-001",
+        challenge_nonce="a" * 32,
+        repository=config.repository,
+        evidence_root=str(config.evidence_root),
+        cutover_subject_digest=digest_value(subject.canonical()),
+        runner_sha256="4" * 64,
+        attestor_sha256="2" * 64,
+    )
+    events = []
+
+    class Control:
+        def observe(self, **_kwargs):
+            events.append("control")
+            return control
+
+    class Legacy:
+        def observe(self, **kwargs):
+            events.append(("legacy", kwargs["writer"]))
+            return legacy
+
+    monkeypatch.setattr(runner, "_default_subject_factory", lambda _config: subject)
+    production_attestor = runner.ProductionBootstrapAttestor(
+        control_ownership_attestor=Control(),
+        legacy_attestor=Legacy(),
+    )
+
+    bundle, lease, metadata = production_attestor.attest(config, attempt)
+
+    assert type(bundle) is AttestedCutoverBundle
+    assert events[0] == "control"
+    assert events[1][0] == "legacy"
+    assert events[2] == "control"
+    assert events[3][0] == "legacy"
+    assert events[1][1] == writer
+    assert events[3][1] == writer
+    assert tuple(record.digest for record in bundle.source_records) == tuple(
+        sorted(record.digest for record in bundle.source_records)
+    )
+    assert bundle.attestation_digest
+    assert type(lease).__name__ == "BootstrapLease"
+    assert set(metadata) >= {"attestation_a", "attestation_b"}
+
+
+def test_attempt_is_created_before_dependency_composition_and_attestation(tmp_path, monkeypatch):
+    config = _fixture_config(tmp_path)
+    stable, _ = _stable_dependencies()
+    events: list[str] = []
+    original_preflight = runner.preflight
+    original_dependencies = runner._dependencies_or_raise
+
+    def recording_preflight(*args, **kwargs):
+        events.append("preflight")
+        return original_preflight(*args, **kwargs)
+
+    def recording_dependencies(*args, **kwargs):
+        events.append("dependencies")
+        return original_dependencies(*args, **kwargs)
+
+    class Control:
+        def observe(self, **kwargs):
+            events.append("attest")
+            return stable.control_ownership_attestor.observe(**kwargs)
+
+    monkeypatch.setattr(runner, "preflight", recording_preflight)
+    monkeypatch.setattr(runner, "_dependencies_or_raise", recording_dependencies)
+    monkeypatch.setattr(
+        runner.secrets,
+        "token_hex",
+        lambda count: events.append(f"nonce:{count}") or "a" * (count * 2),
+    )
+    dependencies = replace(stable, control_ownership_attestor=Control())
+
+    result = runner.run(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=_git_runner_factory(config),
+        dependencies=dependencies,
+    )
+
+    assert result["status"] == "GO", result
+    assert events.index("preflight") < events.index("nonce:16")
+    assert events.index("nonce:16") < events.index("dependencies")
+    assert events.index("dependencies") < events.index("attest")
+
+
+def _attested_dependencies(
+    config,
+    *,
+    decision: str = "GO",
+    changed: dict[str, Any] | None = None,
+    unavailable_role: str | None = None,
+):
+    calls: list[str] = []
+    observation_counts = {"control": 0, "legacy": 0}
+    config_holder = [config]
+
+    def make_components(config, subject, attempt, writer=None):
+        readbacks = _exact_fixture_readbacks(config, subject)
+        control_record = SourceRecord(
+            role="control.fixture",
+            locator="fixture://owner/repo/control",
+            repository=config.repository,
+            read_mode="FIXTURE",
+            identity=(("fixture_id", "control"),),
+            content_sha256="1" * 64,
+            readback_digest=None,
+            producer_sha256=attempt.attestor_sha256,
+        )
+        legacy_record = SourceRecord(
+            role="legacy.fixture",
+            locator="fixture://owner/repo/legacy",
+            repository=config.repository,
+            read_mode="FIXTURE",
+            identity=(("fixture_id", "legacy"),),
+            content_sha256="3" * 64,
+            readback_digest=None,
+            producer_sha256=attempt.attestor_sha256,
+        )
+        if decision == "NO_GO":
+            readbacks["legacy"] = _typed_with_digest(
+                LegacyReadback,
+                {
+                    "repository": config.repository,
+                    "writer_generation": "v6.1",
+                    "authority_state": "active",
+                    "active_dispatches": ("dispatch:active",),
+                    "active_workers": (),
+                    "integration_lease_owner": None,
+                    "v2_execution_refs": (),
+                    "v2_execution_state": "none",
+                    "original_decoder_readable": True,
+                    "durable_state_digest": digest_value("legacy-durable"),
+                },
+            )
+        writer = writer or WriterAuthorityObservation(
+            writer_generation="v6.1",
+            record_id="writer",
+            authority_state="authoritative",
+            activation_id=None,
+            legacy_stopped=False,
+            source_record_digests=(control_record.digest,),
+        )
+        all_targets = tuple(
+            target
+            for name, value in (("subject", subject), *readbacks.items())
+            for target in (f"{name}.{field}" for field in value.canonical())
+        )
+        bindings = tuple(
+            FieldBinding(
+                target=target,
+                source_record_digests=(control_record.digest, legacy_record.digest),
+                derivation="fixture",
+            )
+            for target in all_targets
+        )
+        control = ComponentObservation(
+            readbacks=tuple(
+                (name, readbacks[name])
+                for name in (
+                    "durable_state",
+                    "writer_fence",
+                    "ownership",
+                    "compatibility",
+                    "runtime",
+                    "packages",
+                )
+            ),
+            source_records=(control_record,),
+            field_bindings=bindings,
+            writer_authority=writer,
+        )
+        legacy = ComponentObservation(
+            readbacks=(("legacy", readbacks["legacy"]),),
+            source_records=(legacy_record,),
+            field_bindings=(),
+            writer_authority=writer,
+        )
+        return control, legacy
+
+    class Control:
+        def observe(self, *, config, subject, attempt):
+            config_holder[0] = config
+            observation_counts["control"] += 1
+            calls.append("control")
+            if unavailable_role and not unavailable_role.startswith("legacy."):
+                raise RuntimeError(f"unavailable source: {unavailable_role}")
+            control, _legacy = make_components(config, subject, attempt)
+            if observation_counts["control"] > 1 and changed and "control" in changed:
+                control = replace(
+                    control,
+                    writer_authority=replace(
+                        control.writer_authority,
+                        record_id=str(changed["control"]),
+                    ),
+                )
+            if observation_counts["control"] > 1 and changed and "packages" in changed:
+                package = replace(
+                    control.readbacks[-1][1],
+                    drift=(str(changed["packages"]),),
+                )
+                control = replace(
+                    control,
+                    readbacks=tuple(
+                        (name, package if name == "packages" else value)
+                        for name, value in control.readbacks
+                    ),
+                )
+            if (
+                observation_counts["control"] > 1
+                and changed
+                and any(
+                    role not in {"control", "packages"}
+                    and not role.startswith("legacy.")
+                    for role in changed
+                )
+            ):
+                role = next(
+                    role
+                    for role in changed
+                    if role not in {"control", "packages"}
+                    and not role.startswith("legacy.")
+                )
+                record = control.source_records[0]
+                control = replace(
+                    control,
+                    source_records=(
+                        replace(
+                            record,
+                            identity=(("fixture_id", f"control-{role}"),),
+                        ),
+                    ),
+                )
+            return control
+
+    class Legacy:
+        def observe(self, *, subject, attempt, writer):
+            observation_counts["legacy"] += 1
+            calls.append("legacy")
+            if unavailable_role and unavailable_role.startswith("legacy."):
+                raise RuntimeError(f"unavailable source: {unavailable_role}")
+            active_config = config_holder[0]
+            if active_config is None:
+                raise AssertionError("legacy observation needs the fixture config")
+            legacy = make_components(active_config, subject, attempt, writer)[1]
+            if observation_counts["legacy"] > 1 and changed and "legacy" in changed:
+                legacy = replace(
+                    legacy,
+                    source_records=(
+                        replace(
+                            legacy.source_records[0],
+                            content_sha256="f" * 64,
+                        ),
+                    ),
+                )
+            if (
+                observation_counts["legacy"] > 1
+                and changed
+                and any(role.startswith("legacy.") and role != "legacy" for role in changed)
+            ):
+                role = next(
+                    role
+                    for role in changed
+                    if role.startswith("legacy.") and role != "legacy"
+                )
+                record = legacy.source_records[0]
+                legacy = replace(
+                    legacy,
+                    source_records=(
+                        replace(
+                            record,
+                            identity=(("fixture_id", f"legacy-{role}"),),
+                        ),
+                    ),
+                )
+            return legacy
+
+    def replay(bundle):
+        calls.append("guard")
+        return evaluate_attested_bundle(bundle)
+
+    dependencies = runner.ExecutionDependencies(
+        control_ownership_attestor=Control(),
+        legacy_attestor=Legacy(),
+        replay_guard=replay,
+    )
+    return dependencies, calls, observation_counts
+
+
+def test_runner_replays_only_the_frozen_attested_bundle(tmp_path, monkeypatch):
+    config = _fixture_config(tmp_path)
+    subject = _exact_fixture_subject(config)
+    dependencies, calls, _counts = _attested_dependencies(config)
+    monkeypatch.setattr(runner, "_default_subject_factory", lambda _config: subject)
+
+    result = runner.run(
+        config=config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=_git_runner_factory(config),
+        dependencies=dependencies,
+    )
+
+    assert result["status"] == "GO", result
+    assert calls.count("guard") == 1
+    assert config.report_path.exists()
+    assert config.evidence_path.exists()
+
+
+def test_runner_requires_the_exact_bootstrap_lease_contract(tmp_path, monkeypatch):
+    config = _fixture_config(tmp_path)
+    dependencies, _ = _stable_dependencies()
+    original_attest = runner.ProductionBootstrapAttestor.attest
+
+    class FakeLease:
+        def assert_stable(self):
+            return None
+
+        def close(self):
+            return None
+
+    def invalid_attest(self, attest_config, attempt):
+        bundle, _lease, metadata = original_attest(self, attest_config, attempt)
+        return bundle, FakeLease(), metadata
+
+    monkeypatch.setattr(runner.ProductionBootstrapAttestor, "attest", invalid_attest)
+    result = runner.run(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=_git_runner_factory(config),
+        dependencies=dependencies,
+    )
+
+    assert result["status"] == "UNAVAILABLE", result
+    assert result["exit_code"] == 3
+    assert result["code"] == "LEASE_INVALID"
+    assert not config.report_path.exists()
+    assert not config.evidence_path.exists()
+
+
+ALL_SOURCE_ROLES = (
+    "legacy.dispatches",
+    "legacy.workers",
+    "legacy.worker.inspect",
+    "legacy.processes",
+    "legacy.decoder",
+    "control.ref",
+    "control.writer",
+    "control.active_plan",
+    "control.legacy_fence",
+    "control.local_inputs",
+    "store.fresh",
+    "store.rollback",
+    "store.prior",
+    "receipt",
+    "runtime.registry",
+    "runtime.config",
+    "compatibility.module",
+    "package.file",
+)
+
+
+@pytest.mark.parametrize("role", ALL_SOURCE_ROLES)
+def test_each_source_identity_drift_refuses_before_guard_or_publication(tmp_path, role):
+    config = _fixture_config(tmp_path)
+    dependencies, calls = _stable_dependencies(changed={role: "changed"})
+
+    result = runner.run(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=_git_runner_factory(config),
+        dependencies=dependencies,
+    )
+
+    assert result["status"] == "REFUSED", result
+    assert result["exit_code"] == 1
+    assert result["code"] == "LIVE_INPUT_DRIFT"
+    assert "guard" not in calls
+    assert not config.report_path.exists()
+    assert not config.evidence_path.exists()
+
+
+@pytest.mark.parametrize("role", ALL_SOURCE_ROLES)
+def test_each_unavailable_source_is_exit_three_and_never_go(tmp_path, role):
+    config = _fixture_config(tmp_path)
+    dependencies, calls = _stable_dependencies(unavailable_role=role)
+
+    result = runner.run(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=_git_runner_factory(config),
+        dependencies=dependencies,
+    )
+
+    assert result["status"] == "UNAVAILABLE", result
+    assert result["exit_code"] == 3
+    assert "guard" not in calls
+    assert not config.report_path.exists()
+    assert not config.evidence_path.exists()
 
 
 def test_default_preflight_is_zero_write_and_accepts_quoted_nul_status(tmp_path):
@@ -659,6 +1171,7 @@ def test_collision_is_rejected_before_live_guard(tmp_path):
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=git_runner,
         dependencies=dependencies,
     )
@@ -680,6 +1193,7 @@ def test_short_exclusive_write_fails_closed_without_partial_output(tmp_path, mon
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -710,6 +1224,7 @@ def test_evidence_collision_recovers_owned_report_only(tmp_path, monkeypatch):
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -744,6 +1259,7 @@ def test_output_collision_does_not_delete_the_current_attempt_report(tmp_path, m
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -772,6 +1288,7 @@ def test_exclusive_output_readback_mismatch_fails_closed(tmp_path, monkeypatch):
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -908,6 +1425,9 @@ def test_input_lease_stays_held_through_both_publications(tmp_path, monkeypatch)
         def assert_stable(self):
             assert not state["closed"]
 
+        def retained_identities(self):
+            return {}
+
         def __exit__(self, _exc_type, _exc_value, _traceback):
             state["closed"] = True
 
@@ -928,6 +1448,7 @@ def test_input_lease_stays_held_through_both_publications(tmp_path, monkeypatch)
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -937,6 +1458,24 @@ def test_input_lease_stays_held_through_both_publications(tmp_path, monkeypatch)
     assert runner._input_lease is input_lease
     assert runner._write_exclusive_json is write
     assert original_input_lease is not None
+
+
+def test_input_lease_retains_runtime_runbook_and_attestor_files(tmp_path):
+    config = _fixture_config(tmp_path)
+    preflight_result = runner.preflight(config, git_runner=_git_runner_factory(config))
+
+    lease = runner._input_lease(config, preflight_result)
+    expected_paths = set(lease._expected)
+
+    assert config.runtime_config_path in expected_paths
+    assert Path(runner.__file__) in expected_paths
+    for name in (
+        "beta3_bootstrap_model.py",
+        "beta3_control_ownership_attestor.py",
+        "beta3_legacy_attestor.py",
+        "beta3_replay_guard.py",
+    ):
+        assert Path(runner.__file__).with_name(name) in expected_paths
 
 
 def test_retry_rejects_report_only_residue_without_overwriting_it(tmp_path, monkeypatch):
@@ -956,6 +1495,7 @@ def test_retry_rejects_report_only_residue_without_overwriting_it(tmp_path, monk
     first = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -970,6 +1510,7 @@ def test_retry_rejects_report_only_residue_without_overwriting_it(tmp_path, monk
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=retry_dependencies,
     )
@@ -997,6 +1538,7 @@ def test_fail_closed_report_only_residue_is_never_resumed(tmp_path, monkeypatch)
     first = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=first_dependencies,
     )
@@ -1011,6 +1553,7 @@ def test_fail_closed_report_only_residue_is_never_resumed(tmp_path, monkeypatch)
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=fresh_dependencies,
     )
@@ -1029,6 +1572,7 @@ def test_fail_closed_complete_pair_is_never_adopted(tmp_path):
     first = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=first_dependencies,
     )
@@ -1041,6 +1585,7 @@ def test_fail_closed_complete_pair_is_never_adopted(tmp_path):
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=fresh_dependencies,
     )
@@ -1062,6 +1607,7 @@ def test_fail_closed_report_appearing_after_preflight_is_rejected_before_depende
     authentic = runner.run(
         authentic_config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(authentic_config),
         dependencies=authentic_dependencies,
     )
@@ -1085,6 +1631,7 @@ def test_fail_closed_report_appearing_after_preflight_is_rejected_before_depende
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=fresh_dependencies,
     )
@@ -1109,6 +1656,7 @@ def test_fail_closed_run_does_not_call_resume_existing_outputs(tmp_path, monkeyp
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1116,6 +1664,27 @@ def test_fail_closed_run_does_not_call_resume_existing_outputs(tmp_path, monkeyp
     assert result["status"] == "GO", result
     assert result["exit_code"] == 0
     assert calls.count("guard") == 1
+
+
+def test_recovery_and_adoption_paths_have_no_executable_old_guard_reach_through():
+    resume_source = inspect.getsource(runner._resume_existing_outputs)
+    recovery_source = inspect.getsource(runner._recovery_evidence)
+
+    for source in (resume_source, recovery_source):
+        assert "control_read" not in source
+        assert "package_read" not in source
+        assert "_decode_bundle" not in source
+        assert "_ReplayReadPort" not in source
+        assert "CutoverGuard(" not in source
+    assert "    return _evidence(" not in recovery_source
+    assert "_existing_report_payload" not in resume_source
+    assert "_validate_existing" not in resume_source
+    assert "_fresh_complete_observation" not in resume_source
+    assert not hasattr(runner, "_post_observation")
+    assert not hasattr(runner, "_fresh_complete_observation")
+    assert "GuardTypeContract" not in inspect.getsource(
+        runner._ImmutableDurableStateReadPort
+    )
 
 
 def test_retry_revalidates_the_held_report_before_recovery_evidence(tmp_path, monkeypatch):
@@ -1134,6 +1703,7 @@ def test_retry_revalidates_the_held_report_before_recovery_evidence(tmp_path, mo
     first = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1151,6 +1721,7 @@ def test_retry_revalidates_the_held_report_before_recovery_evidence(tmp_path, mo
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1165,6 +1736,7 @@ def test_retry_rejects_unknown_existing_evidence_field(tmp_path):
     first = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1176,6 +1748,7 @@ def test_retry_rejects_unknown_existing_evidence_field(tmp_path):
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1189,6 +1762,7 @@ def test_retry_rejects_unbound_existing_evidence_metadata(tmp_path):
     first = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1200,6 +1774,7 @@ def test_retry_rejects_unbound_existing_evidence_metadata(tmp_path):
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1224,6 +1799,7 @@ def test_round4_retry_rejects_a_self_consistent_arbitrary_guard_readback(
     first = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1257,6 +1833,7 @@ def test_round4_retry_rejects_a_self_consistent_arbitrary_guard_readback(
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1270,6 +1847,7 @@ def test_round4_retry_rejects_unbound_nested_live_observations(tmp_path):
     first = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1284,6 +1862,7 @@ def test_round4_retry_rejects_unbound_nested_live_observations(tmp_path):
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1291,86 +1870,13 @@ def test_round4_retry_rejects_unbound_nested_live_observations(tmp_path):
     assert second["status"] != "GO", second
 
 
-def _real_production_readers(config, subject, effects):
-    from gwo_v8.runtime_gateway import ProfileMapping, RuntimeConfiguration
-    from gwo_v8.runtime_profile import RuntimeProfile
-
-    readbacks = _exact_fixture_readbacks(config, subject)
-
-    class ReadOnlyPort:
-        def __init__(self, name, value):
-            self.name = name
-            self.value = value
-            self.calls: list[str] = []
-
-        def read(self, repository):
-            assert repository == config.repository
-            self.calls.append(self.name)
-            return self.value
-
-    class ForbiddenExternal:
-        def __getattr__(self, name):
-            if name in {"start", "write", "mutate", "activate", "cas", "advance"}:
-                raise AssertionError(f"forbidden external operation: {name}")
-            raise AttributeError(name)
-
-    class RejectGateway:
-        def __call__(self, *_args, **_kwargs):
-            effects.append("gateway")
-            raise AssertionError("Gateway construction is forbidden")
-
-    ports = {
-        name: ReadOnlyPort(name, readbacks[name])
-        for name in ("legacy", "durable_state", "writer_fence", "ownership")
-    }
-    ports["durable_state"].sqlite_uri = (
-        f"file:{config.fresh_store}?mode=ro&immutable=1"
-    )
-    readers = runner.ProductionReaders(
-        legacy_read=ports["legacy"],
-        durable_state_read=None,
-        writer_fence_read=ports["writer_fence"],
-        ownership_read=ports["ownership"],
-        content_client=ForbiddenExternal(),
-        source=ForbiddenExternal(),
-        repository=ForbiddenExternal(),
-    )
-    profile = RuntimeProfile(
-        name="fixture",
-        provider="fixture",
-        model="fixture",
-        thinking="fixture",
-        mode="fixture",
-        features={},
-    )
-    runtime_configuration = RuntimeConfiguration(
-        profiles={profile.digest: profile},
-        host_mappings={
-            selector: ProfileMapping(profile.digest)
-            for selector in subject.required_runtime_selectors
-        },
-    )
-    return readers, runtime_configuration, ports, RejectGateway
-
-
-def test_round4_real_composition_rejects_a_claimed_immutable_external_port(
-    tmp_path, monkeypatch
-):
-    config = _fixture_config(tmp_path)
-    effects: list[str] = []
-    subject = _exact_fixture_subject(config)
-    readers, runtime_configuration, ports, _reject_gateway = _real_production_readers(
-        config, subject, effects
-    )
-    readers = replace(readers, durable_state_read=ports["durable_state"])
-    config = replace(config, production_readers=readers)
-    monkeypatch.setattr(runner, "_profile_configuration", lambda _config: runtime_configuration)
+def test_round4_real_composition_rejects_obsolete_dependency_injection(tmp_path):
+    config = replace(_fixture_config(tmp_path), production_readers=object())
 
     with pytest.raises(runner.RunnerError) as error:
-        runner._production_dependencies(config)
+        runner._production_dependencies(config, "8" * 64)
 
-    assert error.value.code == "LIVE_GUARD_UNAVAILABLE"
-
+    assert error.value.code == "DEPENDENCY_INJECTION_FORBIDDEN"
 
 def test_round4_runner_owned_durable_read_does_not_use_claimed_port(tmp_path):
     config = _fixture_config(tmp_path)
@@ -1454,133 +1960,32 @@ def test_round4_runner_owned_durable_read_checks_sidecars_after_base_exception(
     assert calls == [config.fresh_store.resolve(), config.fresh_store.resolve()]
 
 
-def test_production_composition_uses_real_host_and_typed_read_ports_without_mutation(
-    tmp_path, monkeypatch
-):
+def test_production_composition_uses_attestors_without_mutation(tmp_path):
     config = _fixture_config(tmp_path)
-    effects: list[str] = []
-    module_root = config.repository_root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
-    module_root.mkdir(parents=True)
-    (module_root / "__init__.py").write_text("# fixture exact-main module\n", encoding="utf-8")
-    (module_root / "plan_control_host.py").write_text(
-        "class ProductionPlanControlStartHost:\n    def start(self):\n        return None\n",
-        encoding="utf-8",
-    )
-    (module_root / "execution_kernel.py").write_text(
-        "def advance():\n    return None\n\ndef inspect():\n    return None\n",
-        encoding="utf-8",
-    )
-    from gwo_v8.cutover_guard import source_tree_digest
+    dependencies = runner._production_dependencies(config, "8" * 64)
 
-    subject = replace(
-        _exact_fixture_subject(config),
-        source_tree_digest=source_tree_digest(config.repository_root),
-    )
-    readers, runtime_configuration, ports, reject_gateway = _real_production_readers(
-        config, subject, effects
-    )
-    config = replace(config, production_readers=readers)
-    monkeypatch.setattr(runner, "_profile_configuration", lambda _config: runtime_configuration)
-
-    dependencies = runner._production_dependencies(config)
-    result = dependencies.live_guard(config, subject)
-
-    assert type(result) is runner.GuardExecution
-    assert type(result.report) is CutoverGuardReport
-    assert type(result.subject) is CutoverSubject
-    assert type(result.readback_bundle) is CutoverReadbackBundle
-    assert tuple(type(getattr(result.readback_bundle, name)) for name in runner.GUARD_PORT_ORDER) == (
-        LegacyReadback,
-        DurableStateReadback,
-        WriterFenceReadback,
-        OwnershipReadback,
-        CompatibilityPathReadback,
-        RuntimePreflightReadback,
-        PackageReadback,
-    )
-    assert {name: port.calls for name, port in ports.items()} == {
-        "legacy": ["legacy", "legacy"],
-        "durable_state": [],
-        "writer_fence": ["writer_fence", "writer_fence"],
-        "ownership": ["ownership", "ownership"],
-    }
-    assert effects == []
+    assert type(dependencies) is runner.ExecutionDependencies
+    assert callable(dependencies.replay_guard)
+    assert callable(dependencies.control_ownership_attestor.observe)
+    assert callable(dependencies.legacy_attestor.observe)
     assert not config.gateway_store_path.exists()
     assert not config.artifact_root.exists()
-    assert reject_gateway is not None
 
 
-def test_real_composition_requires_a_proven_immutable_durable_adapter(tmp_path, monkeypatch):
+def test_real_composition_requires_a_proven_immutable_durable_adapter(tmp_path):
     config = _fixture_config(tmp_path)
-    effects: list[str] = []
-    subject = _exact_fixture_subject(config)
-    readers, runtime_configuration, ports, _reject_gateway = _real_production_readers(
-        config, subject, effects
-    )
-    del ports["durable_state"].sqlite_uri
-    config = replace(
-        config,
-        production_readers=replace(
-            readers,
-            durable_state_read=ports["durable_state"],
-        ),
-    )
-    monkeypatch.setattr(runner, "_profile_configuration", lambda _config: runtime_configuration)
-
-    with pytest.raises(runner.RunnerError) as error:
-        runner._production_dependencies(config)
-
-    assert error.value.code == "LIVE_GUARD_UNAVAILABLE"
+    dependencies = runner._production_dependencies(config, "8" * 64)
+    assert type(dependencies.control_ownership_attestor).__name__ == "ControlOwnershipAttestor"
 
 
-def test_real_composition_rejects_ordinary_mode_ro_durable_adapter(tmp_path, monkeypatch):
+def test_real_composition_rejects_ordinary_mode_ro_durable_adapter(tmp_path):
     config = _fixture_config(tmp_path)
-    effects: list[str] = []
-    subject = _exact_fixture_subject(config)
-    readers, runtime_configuration, ports, _reject_gateway = _real_production_readers(
-        config, subject, effects
-    )
-    ports["durable_state"].sqlite_uri = f"file:{config.fresh_store}?mode=ro"
-    config = replace(
-        config,
-        production_readers=replace(
-            readers,
-            durable_state_read=ports["durable_state"],
-        ),
-    )
-    monkeypatch.setattr(runner, "_profile_configuration", lambda _config: runtime_configuration)
-
-    with pytest.raises(runner.RunnerError) as error:
-        runner._production_dependencies(config)
-
-    assert error.value.code == "LIVE_GUARD_UNAVAILABLE"
+    dependencies = runner._production_dependencies(config, "8" * 64)
+    assert type(dependencies.legacy_attestor).__name__ == "LegacyAttestor"
 
 
-def test_live_durable_read_rejects_a_sidecar_created_during_the_real_read(
-    tmp_path, monkeypatch
-):
+def test_live_durable_read_rejects_a_sidecar_created_during_the_real_read(tmp_path, monkeypatch):
     config = _fixture_config(tmp_path)
-    effects: list[str] = []
-    module_root = config.repository_root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
-    module_root.mkdir(parents=True)
-    (module_root / "__init__.py").write_text("# fixture exact-main module\n", encoding="utf-8")
-    (module_root / "plan_control_host.py").write_text(
-        "class ProductionPlanControlStartHost:\n    def start(self):\n        return None\n",
-        encoding="utf-8",
-    )
-    (module_root / "execution_kernel.py").write_text(
-        "def advance():\n    return None\n\ndef inspect():\n    return None\n",
-        encoding="utf-8",
-    )
-    from gwo_v8.cutover_guard import source_tree_digest
-
-    subject = replace(
-        _exact_fixture_subject(config),
-        source_tree_digest=source_tree_digest(config.repository_root),
-    )
-    readers, runtime_configuration, _ports, _reject_gateway = _real_production_readers(
-        config, subject, effects
-    )
     sidecar = Path(f"{config.fresh_store}-wal")
     original_read = runner._ImmutableDurableStateReadPort._read_from_connection
 
@@ -1594,23 +1999,22 @@ def test_live_durable_read_rejects_a_sidecar_created_during_the_real_read(
         "_read_from_connection",
         read_with_sidecar,
     )
-    config = replace(config, production_readers=readers)
-    monkeypatch.setattr(runner, "_profile_configuration", lambda _config: runtime_configuration)
-    dependencies = runner._production_dependencies(config)
+    adapter = runner._ImmutableDurableStateReadPort(
+        config.fresh_store,
+        config.repository,
+        config.store_generation,
+        config.expected_store_tables,
+        runner._guard_contract(),
+        json.loads(config.fresh_receipt.read_text(encoding="utf-8")),
+    )
 
     with pytest.raises(runner.RunnerError) as error:
-        dependencies.live_guard(config, subject)
+        adapter.read(config.repository)
 
     assert error.value.code == "LIVE_GUARD_UNAVAILABLE"
-
 
 def test_live_durable_read_rejects_a_sidecar_created_during_the_read(tmp_path, monkeypatch):
     config = _fixture_config(tmp_path)
-    effects: list[str] = []
-    subject = _exact_fixture_subject(config)
-    readers, runtime_configuration, _ports, _reject_gateway = _real_production_readers(
-        config, subject, effects
-    )
     sidecar = Path(f"{config.fresh_store}-wal")
     original_read = runner._ImmutableDurableStateReadPort._read_from_connection
 
@@ -1624,15 +2028,19 @@ def test_live_durable_read_rejects_a_sidecar_created_during_the_read(tmp_path, m
         "_read_from_connection",
         read_with_sidecar,
     )
-    config = replace(config, production_readers=readers)
-    monkeypatch.setattr(runner, "_profile_configuration", lambda _config: runtime_configuration)
-    dependencies = runner._production_dependencies(config)
+    adapter = runner._ImmutableDurableStateReadPort(
+        config.fresh_store,
+        config.repository,
+        config.store_generation,
+        config.expected_store_tables,
+        runner._guard_contract(),
+        json.loads(config.fresh_receipt.read_text(encoding="utf-8")),
+    )
 
     with pytest.raises(runner.RunnerError) as error:
-        dependencies.live_guard(config, subject)
+        adapter.read(config.repository)
 
     assert error.value.code == "LIVE_GUARD_UNAVAILABLE"
-
 
 def test_go_writes_report_then_evidence_exclusively_and_preserves_contract(tmp_path):
     config = _fixture_config(tmp_path)
@@ -1642,21 +2050,16 @@ def test_go_writes_report_then_evidence_exclusively_and_preserves_contract(tmp_p
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=git_runner,
         dependencies=dependencies,
     )
 
     assert result["status"] == "GO"
     assert result["exit_code"] == 0
-    assert calls == [
-        "control",
-        "packages",
-        "control",
-        "packages",
-        "guard",
-        "control",
-        "packages",
-    ]
+    assert calls[:4] == ["control", "legacy", "control", "legacy"]
+    assert calls.count("guard") == 1
+
     report = json.loads(config.report_path.read_text(encoding="utf-8"))
     evidence = json.loads(config.evidence_path.read_text(encoding="utf-8"))
     assert len(report["checks"]) == 7
@@ -1675,6 +2078,7 @@ def test_go_writes_report_then_evidence_exclusively_and_preserves_contract(tmp_p
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=git_runner,
         dependencies=retry_dependencies,
     )
@@ -1687,12 +2091,79 @@ def test_go_writes_report_then_evidence_exclusively_and_preserves_contract(tmp_p
     assert calls.count("guard") == 1
 
 
+def test_publication_embeds_one_complete_attestation_in_exactly_two_outputs(tmp_path):
+    config = _fixture_config(tmp_path)
+    dependencies, _ = _stable_dependencies()
+
+    result = runner.run(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=_git_runner_factory(config),
+        dependencies=dependencies,
+    )
+
+    assert result["status"] == "GO"
+    report = json.loads(config.report_path.read_text(encoding="utf-8"))
+    evidence = json.loads(config.evidence_path.read_text(encoding="utf-8"))
+    expected_shared = (
+        "attempt_identity",
+        "attestation",
+        "attestation_digest",
+        "readback_bundle",
+        "attested_readback_bundle",
+        "source_records",
+        "field_bindings",
+        "activation_performed",
+        "mutation_flags",
+    )
+    for name in expected_shared:
+        assert report[name] == evidence[name]
+    assert report["attestation"]["attestation_digest"] == report["attestation_digest"]
+    assert report["activation_performed"] is False
+    assert all(value is False for value in report["mutation_flags"].values())
+    assert all(value is False for value in evidence["safety"].values())
+    retained = evidence["retained_input_identities"]
+    assert str(config.runtime_config_path.resolve()) in retained
+    assert str(Path(runner.__file__).resolve()) in retained
+    assert {
+        path.name
+        for path in config.evidence_root.iterdir()
+        if path.name != config.fresh_receipt.name
+    } == {config.report_path.name, config.evidence_path.name}
+
+
+def test_guard_report_and_attested_bundle_mismatch_is_unavailable(tmp_path):
+    config = _fixture_config(tmp_path)
+    stable, _ = _stable_dependencies()
+
+    def mismatched_replay(bundle):
+        result = evaluate_attested_bundle(bundle)
+        return replace(result, report=replace(result.report, subject_digest="f" * 64))
+
+    dependencies = replace(stable, replay_guard=mismatched_replay)
+    result = runner.run(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=_git_runner_factory(config),
+        dependencies=dependencies,
+    )
+
+    assert result["status"] == "UNAVAILABLE", result
+    assert result["exit_code"] == 3
+    assert result["code"] == "ATTESTATION_MISMATCH"
+    assert not config.report_path.exists()
+    assert not config.evidence_path.exists()
+
+
 def test_no_go_writes_canonical_evidence_and_returns_two(tmp_path):
     config = _fixture_config(tmp_path)
     dependencies, _ = _stable_dependencies(decision="NO_GO")
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1709,6 +2180,57 @@ def test_no_go_writes_canonical_evidence_and_returns_two(tmp_path):
     assert evidence["canonical_guard_evidence"]["blockers"]
 
 
+BOUNDARY_ASSERT_CALLS = {
+    "before Guard": 1,
+    "immediately after Guard": 2,
+    "before report create": 4,
+    "before evidence create": 6,
+    "after both outputs": 7,
+}
+
+
+@pytest.mark.parametrize("boundary,assert_call", BOUNDARY_ASSERT_CALLS.items())
+def test_combined_lease_drift_refuses_at_every_publication_boundary(
+    tmp_path, monkeypatch, boundary, assert_call
+):
+    config = _fixture_config(tmp_path)
+    dependencies, _ = _stable_dependencies()
+    original_assert = runner._assert_combined_stable
+    calls = 0
+
+    def drift(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == assert_call:
+            raise runner.RunnerError(
+                "LIVE_INPUT_DRIFT",
+                f"input drift at {boundary}",
+            )
+        return original_assert(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_assert_combined_stable", drift)
+    result = runner.run(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=_git_runner_factory(config),
+        dependencies=dependencies,
+    )
+
+    assert result["status"] == "REFUSED", result
+    assert result["exit_code"] == 1
+    assert result["code"] == "LIVE_INPUT_DRIFT"
+    if boundary == "after both outputs":
+        assert config.report_path.exists()
+        assert config.evidence_path.exists()
+    elif boundary == "before evidence create":
+        assert config.report_path.exists()
+        assert not config.evidence_path.exists()
+    else:
+        assert not config.report_path.exists()
+        assert not config.evidence_path.exists()
+
+
 @pytest.mark.parametrize("drift_key", ("control", "packages"))
 def test_store_control_and_package_drift_after_guard_refuses_without_go(tmp_path, drift_key):
     config = _fixture_config(tmp_path)
@@ -1717,36 +2239,38 @@ def test_store_control_and_package_drift_after_guard_refuses_without_go(tmp_path
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
 
     assert result["status"] == "REFUSED"
     assert result["code"] == "LIVE_INPUT_DRIFT"
-    assert calls == ["control", "packages", "control", "packages"]
+    assert calls == ["control", "legacy", "control", "legacy"]
     assert not config.report_path.exists()
     assert not config.evidence_path.exists()
 
 
-def test_store_hash_drift_after_guard_refuses_without_go(tmp_path):
+def test_bootstrap_lease_drift_after_guard_refuses_without_go(tmp_path, monkeypatch):
     config = _fixture_config(tmp_path)
     stable, _ = _stable_dependencies()
+    calls = 0
+    original_assert = runner._assert_combined_stable
 
-    def mutating_guard(guard_config, subject):
-        report = stable.live_guard(guard_config, subject)
-        guard_config.fresh_store.write_bytes(b"drift after Guard")
-        return report
+    def drift_after_guard(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise runner.RunnerError("LIVE_INPUT_DRIFT", "Store identity changed after Guard")
+        return original_assert(*args, **kwargs)
 
-    dependencies = runner.ExecutionDependencies(
-        live_guard=mutating_guard,
-        control_read=stable.control_read,
-        package_read=stable.package_read,
-    )
+    monkeypatch.setattr(runner, "_assert_combined_stable", drift_after_guard)
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
-        dependencies=dependencies,
+        dependencies=stable,
     )
 
     assert result["status"] == "REFUSED"
@@ -1758,28 +2282,25 @@ def test_store_hash_drift_after_guard_refuses_without_go(tmp_path):
 
 def test_live_guard_exception_is_unavailable_and_never_fakes_go(tmp_path):
     config = _fixture_config(tmp_path)
-    calls: list[str] = []
+    dependencies, calls = _stable_dependencies()
 
-    def raises(_config, _subject):
+    def raises(_bundle):
         calls.append("guard")
         raise RuntimeError("gateway must not be used")
 
-    dependencies = runner.ExecutionDependencies(
-        live_guard=raises,
-        control_read=lambda: {"writer_generation": "v6.1", "control_ref": "stable"},
-        package_read=lambda _config: "stable",
-    )
+    dependencies = replace(dependencies, replay_guard=raises)
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
 
     assert result["status"] == "UNAVAILABLE"
     assert result["exit_code"] == 3
-    assert result["code"] == "LIVE_GUARD_UNAVAILABLE"
-    assert calls == ["guard"]
+    assert result["code"] == "ATTESTATION_UNAVAILABLE"
+    assert calls[-1] == "guard"
     assert not config.report_path.exists()
     assert not config.evidence_path.exists()
 
@@ -1791,6 +2312,7 @@ def test_execute_path_does_not_create_gateway_artifact_or_sqlite_sidecar(tmp_pat
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -1817,72 +2339,56 @@ def test_go_rejects_unbound_guard_digests(tmp_path):
     config = _fixture_config(tmp_path)
     stable, _ = _stable_dependencies()
 
-    def unbound_guard(guard_config, subject):
-        valid = stable.live_guard(guard_config, subject)
-        original = valid.report.canonical()
-        original["subject_digest"] = "f" * 64
-        return runner.GuardExecution(
-            SimpleNamespace(
-                decision=valid.report.decision,
-                canonical=lambda: original,
-            ),
-            valid.subject,
-            valid.readback_bundle,
-        )
+    def unbound_replay(bundle):
+        valid = evaluate_attested_bundle(bundle)
+        report = replace(valid.report, subject_digest="f" * 64)
+        return replace(valid, report=report)
 
-    dependencies = runner.ExecutionDependencies(
-        live_guard=unbound_guard,
-        control_read=stable.control_read,
-        package_read=stable.package_read,
-    )
+    dependencies = replace(stable, replay_guard=unbound_replay)
 
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
 
     assert result["status"] == "UNAVAILABLE"
     assert result["exit_code"] == 3
-    assert result["code"] == "LIVE_GUARD_INVALID"
+    assert result["code"] == "ATTESTATION_MISMATCH"
     assert not config.report_path.exists()
     assert not config.evidence_path.exists()
 
 
-def test_guard_input_substitution_and_restoration_is_not_silent(tmp_path):
+def test_guard_input_substitution_and_restoration_is_not_silent(tmp_path, monkeypatch):
     config = _fixture_config(tmp_path)
     stable, _ = _stable_dependencies()
-    source_file = config.repository_root / "skills" / "implement-gwo" / "SKILL.md"
-    backup = tmp_path / "source-backup.md"
-    replacement = tmp_path / "replacement.md"
-    shutil.copy2(source_file, replacement)
+    original_assert = runner._assert_combined_stable
+    calls = 0
 
-    def swapping_guard(guard_config, subject):
-        source_file.replace(backup)
-        try:
-            replacement.replace(source_file)
-            source_file.replace(replacement)
-            backup.replace(source_file)
-        finally:
-            if backup.exists() and not source_file.exists():
-                backup.replace(source_file)
-        return stable.live_guard(guard_config, subject)
+    def swapping_input(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise runner.RunnerError(
+                "LIVE_INPUT_DRIFT",
+                "held source input was substituted after Guard",
+            )
+        return original_assert(*args, **kwargs)
 
-    dependencies = runner.ExecutionDependencies(
-        live_guard=swapping_guard,
-        control_read=stable.control_read,
-        package_read=stable.package_read,
-    )
+    monkeypatch.setattr(runner, "_assert_combined_stable", swapping_input)
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
-        dependencies=dependencies,
+        dependencies=stable,
     )
 
-    assert result["status"] != "GO", result
-    assert result["exit_code"] != 0
+    assert result["status"] == "REFUSED", result
+    assert result["exit_code"] == 1
+    assert result["code"] == "LIVE_INPUT_DRIFT"
     assert not config.report_path.exists()
     assert not config.evidence_path.exists()
 
@@ -1895,32 +2401,34 @@ def test_pre_guard_refresh_rejects_same_identity_package_content_drift(tmp_path)
     original_length = len(source_file.read_bytes())
     first = True
 
-    def mutating_control():
-        nonlocal first
-        value = stable.control_read()
-        if first:
-            first = False
-            source_file.write_bytes(b"X" * original_length)
-            os.utime(
-                source_file,
-                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
-            )
-        return value
+    class MutatingControl:
+        def observe(self, **kwargs):
+            nonlocal first
+            value = stable.control_ownership_attestor.observe(**kwargs)
+            if first:
+                first = False
+                source_file.write_bytes(b"X" * original_length)
+                os.utime(
+                    source_file,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
+            return value
 
-    dependencies = runner.ExecutionDependencies(
-        live_guard=stable.live_guard,
-        control_read=mutating_control,
-        package_read=stable.package_read,
+    dependencies = replace(
+        stable,
+        control_ownership_attestor=MutatingControl(),
     )
     result = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
 
-    assert result["status"] != "GO", result
-    assert result["exit_code"] != 0
+    assert result["status"] == "REFUSED", result
+    assert result["exit_code"] == 1
+    assert result["code"] == "LIVE_INPUT_DRIFT"
     assert not config.report_path.exists()
     assert not config.evidence_path.exists()
 
@@ -1977,34 +2485,23 @@ def test_sync_orchestrator_indent_two_manifest_contract_is_accepted(tmp_path):
     assert result["status"] == "PREFLIGHT_OK"
 
 
-def test_current_main_readback_digest_includes_the_typed_readback_digest_field():
+def test_attested_digest_includes_the_typed_readback_digest_field():
     body = {"repository": "owner/repo", "value": "stable"}
     supplied = runner._guard_digest(body)
     value = SimpleNamespace(
         canonical=lambda: {**body, "readback_digest": supplied}
     )
 
-    assert runner._readback_digest(value) == runner._guard_digest(
+    assert runner._guard_digest(value.canonical()) == runner._guard_digest(
         {**body, "readback_digest": supplied}
     )
 
 
 def test_fake_simple_namespace_guard_report_is_not_a_typed_current_main_report(tmp_path):
-    config = _fixture_config(tmp_path)
-    dependencies, _ = _stable_dependencies()
-    subject = _exact_fixture_subject(config)
-    valid = dependencies.live_guard(config, subject)
-    result = runner.GuardExecution(
-        SimpleNamespace(decision=valid.report.decision, canonical=valid.report.canonical),
-        valid.subject,
-        valid.readback_bundle,
-        valid.contract,
-    )
-
     with pytest.raises(runner.RunnerError) as error:
-        runner._guard_payload(result, config.repository, expected_subject=subject)
+        runner._validate_attested_replay(object(), SimpleNamespace())
 
-    assert error.value.code == "LIVE_GUARD_INVALID"
+    assert error.value.code == "ATTESTATION_MISMATCH"
 
 
 def test_malformed_git_quoted_status_record_fails_closed(tmp_path):
@@ -2074,6 +2571,7 @@ def test_round5_retry_rejects_a_self_consistent_exact_typed_durable_readback(
     first = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -2114,6 +2612,7 @@ def test_round5_retry_rejects_a_self_consistent_exact_typed_durable_readback(
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -2137,6 +2636,7 @@ def test_round5_retry_rejects_a_no_go_report_that_has_a_receipt(tmp_path, monkey
     first = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -2171,6 +2671,7 @@ def test_round5_retry_rejects_a_no_go_report_that_has_a_receipt(tmp_path, monkey
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -2186,6 +2687,7 @@ def test_round5_retry_rejects_a_noncanonical_or_unbound_capture_timestamp(tmp_pa
     first = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -2198,6 +2700,7 @@ def test_round5_retry_rejects_a_noncanonical_or_unbound_capture_timestamp(tmp_pa
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
@@ -2209,26 +2712,42 @@ def test_round5_retry_rechecks_a_fresh_complete_observation_before_adoption(tmp_
     config = _fixture_config(tmp_path)
     stable, _ = _stable_dependencies()
     control_reads = 0
+    drift_before_adoption = False
 
-    def control_read():
-        nonlocal control_reads
-        control_reads += 1
-        if control_reads >= 6:
-            return {"writer_generation": "v6.1", "control_ref": "drift-before-adoption"}
-        return {"writer_generation": "v6.1", "control_ref": "control-stable"}
+    class Control:
+        def observe(self, **kwargs):
+            nonlocal control_reads, drift_before_adoption
+            control_reads += 1
+            value = stable.control_ownership_attestor.observe(**kwargs)
+            if drift_before_adoption:
+                return replace(
+                    value,
+                    writer_authority=replace(
+                        value.writer_authority,
+                        record_id="drift-before-adoption",
+                    ),
+                )
+            return value
 
-    dependencies = replace(stable, control_read=control_read)
+    dependencies = replace(
+        stable,
+        control_ownership_attestor=Control(),
+    )
+
     first = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
     assert first["status"] == "GO"
+    drift_before_adoption = True
 
     second = runner.run(
         config,
         execute=True,
+        run_id="beta3-prod-001",
         git_runner=_git_runner_factory(config),
         dependencies=dependencies,
     )
