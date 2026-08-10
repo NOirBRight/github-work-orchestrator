@@ -195,20 +195,24 @@ def _source_observation(
             _unavailable("workers observation has an unknown normalized shape")
         records = _dict_records(value["workers"], source=name)
         inventory_rows = _paseo_inventory_rows(value["inventory"])
-        if len(records) != len(inventory_rows):
-            _unavailable("workers normalized observation omits inventory rows")
         inventory_by_identity: dict[str, dict[str, object]] = {}
         for row in inventory_rows:
             identity = _record_identity(row, name="Worker")
             if identity in inventory_by_identity:
                 _unavailable("workers inventory contains duplicate identity")
             inventory_by_identity[identity] = row
+        normalized_identities: set[str] = set()
         for record in records:
             if set(record) != {"id", "inventory", "inspect"}:
                 _unavailable("workers normalized record has an unknown shape")
             identity = _record_identity(record, name="Worker")
+            if identity in normalized_identities:
+                _unavailable("workers normalized observation contains duplicate identity")
+            normalized_identities.add(identity)
             if record["inventory"] != inventory_by_identity.get(identity):
                 _unavailable("workers normalized record differs from inventory row")
+        if normalized_identities != set(inventory_by_identity):
+            _unavailable("workers normalized observation omits inventory identities")
     elif name == "processes":
         records = _dict_records(result.value, source=name)
         for record in records:
@@ -908,6 +912,7 @@ def _github_connection(
     key: str,
     *,
     context: str,
+    bounded_last: int | None = None,
 ) -> list[dict[str, object]]:
     connection = parent.get(key)
     if type(connection) is not dict:
@@ -919,7 +924,10 @@ def _github_connection(
     if type(page_info) is not dict or page_info.get("hasNextPage") is not False:
         _unavailable(f"GitHub snapshot pagination is incomplete: {context}.{key}")
     total_count = connection.get("totalCount")
-    if type(total_count) is not int or total_count < 0 or total_count != len(nodes):
+    if type(total_count) is not int or total_count < 0:
+        _unavailable(f"GitHub snapshot total count is invalid: {context}.{key}")
+    expected_nodes = total_count if bounded_last is None else min(total_count, bounded_last)
+    if len(nodes) != expected_nodes:
         _unavailable(f"GitHub snapshot total count is invalid: {context}.{key}")
     result: list[dict[str, object]] = []
     for node in nodes:
@@ -995,7 +1003,12 @@ def _validate_pr_node(node: Mapping[str, object]) -> None:
         _unavailable("GitHub PR merge state is invalid")
     reviews = _github_connection(node, "reviews", context=f"PR #{node['number']}")
     files = _github_connection(node, "files", context=f"PR #{node['number']}")
-    commits = _github_connection(node, "commits", context=f"PR #{node['number']}")
+    commits = _github_connection(
+        node,
+        "commits",
+        context=f"PR #{node['number']}",
+        bounded_last=1,
+    )
     if any(type(item.get("path")) is not str or not item["path"] for item in files):
         _unavailable("GitHub PR changed path identity is invalid")
     for review in reviews:

@@ -944,6 +944,26 @@ def test_github_issue_and_pr_schema_feed_dispatch_normalization(
     )
 
 
+def test_github_dispatch_reader_accepts_latest_commit_from_multi_commit_pr() -> None:
+    payload = _github_payload()
+    pull_request = _github_pr_node(number=31, branch="work/issue-17")
+    pull_request["commits"] = {
+        "totalCount": 3,
+        "pageInfo": {"hasNextPage": False},
+        "nodes": [{"commit": {"statusCheckRollup": None}}],
+    }
+    payload["data"]["repository"]["pullRequests"] = _github_connection(
+        [pull_request]
+    )
+
+    observed = GitHubDispatchSnapshotReader(
+        lambda command: canonical_bytes(payload),
+        "8" * 64,
+    ).read("owner/repo")
+
+    assert observed.complete is True
+
+
 @pytest.mark.parametrize(
     "case",
     (
@@ -1363,6 +1383,58 @@ def test_legacy_rejects_live_worker_inventory_omitted_from_normalized_records(
     with pytest.raises(BootstrapError) as error:
         LegacyAttestor(
             replace(_sources(), workers=OmittedWorkerSource())
+        ).observe(subject=subject, attempt=attempt, writer=writer)
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+def test_legacy_rejects_duplicate_normalized_worker_identity_omission(
+    subject: CutoverSubject,
+    attempt: AttemptIdentity,
+    writer: WriterAuthorityObservation,
+) -> None:
+    inventory = [
+        {"Id": "worker-a", "Status": "closed"},
+        {"Id": "worker-b", "Status": "running"},
+    ]
+    closed_worker = {
+        "id": "worker-a",
+        "inventory": inventory[0],
+        "inspect": {
+            "id": "worker-a",
+            "repository": subject.repository,
+            "role": "worker",
+            "status": "closed",
+            "archived": False,
+        },
+    }
+
+    class DuplicateWorkerSource:
+        def read(self, repository: str) -> SourceObservation:
+            value = {
+                "repository": repository,
+                "inventory": inventory,
+                "workers": [closed_worker, dict(closed_worker)],
+            }
+            payload = canonical_bytes(value)
+            digest = digest_value(value)
+            return SourceObservation(
+                SourceRecord(
+                    role="legacy.workers",
+                    locator="paseo://fixture/duplicate-normalized-worker",
+                    repository=repository,
+                    read_mode="COMPLETE_DOUBLE_READ",
+                    identity=(("observation_digest", digest),),
+                    content_sha256=digest,
+                    readback_digest=None,
+                    producer_sha256="8" * 64,
+                ),
+                payload,
+                True,
+            )
+
+    with pytest.raises(BootstrapError) as error:
+        LegacyAttestor(
+            replace(_sources(), workers=DuplicateWorkerSource())
         ).observe(subject=subject, attempt=attempt, writer=writer)
     assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
 
