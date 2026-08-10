@@ -17,6 +17,7 @@ for path in (EXACT_SCRIPTS, SCRIPTS):
 from gwo_v8._canonical import digest_value  # noqa: E402
 from gwo_v8.cutover_guard import (  # noqa: E402
     CompatibilityPathReadback,
+    CutoverReadbackBundle,
     CutoverSubject,
     DurableStateReadback,
     LegacyReadback,
@@ -327,10 +328,92 @@ def test_attested_bundle_binds_digest_and_returns_exact_cutover_bundle(valid_bun
         valid_bundle.canonical_without_attestation_digest()
     )
     cutover = valid_bundle.cutover_bundle()
-    assert type(cutover).__name__ == "CutoverReadbackBundle"
+    assert type(cutover) is CutoverReadbackBundle
     assert cutover.schema == "gwo.cutover-readback-bundle.v1"
     assert cutover.subject is valid_bundle.subject
     assert cutover.runtime is valid_bundle.runtime
+
+
+def _bundle_with_source_records(bundle, source_records):
+    source_digests = tuple(record.digest for record in source_records)
+    component = ComponentObservation(
+        readbacks=tuple((name, getattr(bundle, name)) for name in READBACK_NAMES),
+        source_records=tuple(source_records),
+        field_bindings=tuple(
+            replace(
+                binding,
+                source_record_digests=source_digests,
+            )
+            for binding in bundle.field_bindings
+        ),
+    )
+    return AttestedCutoverBundle.create(
+        attempt=bundle.attempt,
+        subject=bundle.subject,
+        components=(component,),
+    )
+
+
+def test_attested_bundle_rejects_reversed_source_record_digest_order(valid_bundle):
+    second = replace(
+        valid_bundle.source_records[0],
+        role="fixture.second",
+        locator="fixture://owner/repo/second",
+        identity=(("fixture_id", "fixture-2"),),
+        content_sha256="b" * 64,
+    )
+    ordered_records = tuple(
+        sorted(
+            (valid_bundle.source_records[0], second),
+            key=lambda record: record.digest,
+        )
+    )
+    ordered = _bundle_with_source_records(valid_bundle, ordered_records)
+    assert tuple(record.digest for record in ordered.source_records) == tuple(
+        sorted(record.digest for record in ordered_records)
+    )
+    with pytest.raises(BootstrapError) as error:
+        _bundle_with_source_records(valid_bundle, ordered_records[::-1])
+    assert error.value.code == "ATTESTATION_INVALID"
+
+
+def test_attested_bundle_rejects_wrong_exact_main_readback_type(valid_bundle):
+    forged = replace(valid_bundle, legacy=valid_bundle.subject)
+    with pytest.raises(BootstrapError) as error:
+        forged.validate()
+    assert error.value.code == "ATTESTATION_INVALID"
+
+
+def test_attested_bundle_rejects_stale_inner_readback_digest(valid_bundle):
+    forged = replace(
+        valid_bundle,
+        legacy=replace(valid_bundle.legacy, readback_digest="0" * 64),
+    )
+    with pytest.raises(BootstrapError) as error:
+        forged.validate()
+    assert error.value.code == "ATTESTATION_INVALID"
+
+
+def test_attested_bundle_rejects_source_record_producer_mismatch(valid_bundle):
+    forged = replace(
+        valid_bundle,
+        source_records=(
+            replace(
+                valid_bundle.source_records[0],
+                producer_sha256="f" * 64,
+            ),
+        ),
+    )
+    with pytest.raises(BootstrapError) as error:
+        forged.validate()
+    assert error.value.code == "ATTESTATION_INVALID"
+
+
+def test_attested_bundle_rejects_direct_stale_attestation_digest(valid_bundle):
+    forged = replace(valid_bundle, attestation_digest="0" * 64)
+    with pytest.raises(BootstrapError) as error:
+        forged.validate()
+    assert error.value.code == "ATTESTATION_INVALID"
 
 
 @pytest.fixture

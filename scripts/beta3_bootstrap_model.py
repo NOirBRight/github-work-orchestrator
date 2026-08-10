@@ -458,9 +458,12 @@ class AttestedCutoverBundle:
                 field_bindings.extend(component.field_bindings)
             if set(readbacks) != set(_READBACK_TYPE_MAP):
                 _invalid("ATTESTATION_INVALID", "the seven readbacks are not complete")
-            if not source_records or len(
-                {record.digest for record in source_records}
-            ) != len(source_records):
+            source_digests = tuple(record.digest for record in source_records)
+            if (
+                not source_records
+                or len(set(source_digests)) != len(source_records)
+                or source_digests != tuple(sorted(source_digests))
+            ):
                 _invalid(
                     "ATTESTATION_INVALID",
                     "source record digests must be ordered and unique",
@@ -486,7 +489,7 @@ class AttestedCutoverBundle:
                     "ATTESTATION_INVALID",
                     "field bindings do not exactly cover the canonical target set",
                 )
-            source_digests = {record.digest for record in source_records}
+            source_digests = set(source_digests)
             for binding in field_bindings:
                 if not set(binding.source_record_digests) <= source_digests:
                     _invalid(
@@ -615,14 +618,17 @@ class AttestedCutoverBundle:
                         "ATTESTATION_INVALID",
                         f"readback {name!r} has a stale readback_digest",
                     )
-            if not self.source_records or len(
-                {record.digest for record in self.source_records}
-            ) != len(self.source_records):
+            source_digests = tuple(record.digest for record in self.source_records)
+            if (
+                not self.source_records
+                or len(set(source_digests)) != len(self.source_records)
+                or source_digests != tuple(sorted(source_digests))
+            ):
                 _invalid(
                     "ATTESTATION_INVALID",
                     "source record digests must be ordered and unique",
                 )
-            source_digests = {record.digest for record in self.source_records}
+            source_digests = set(source_digests)
             for record in self.source_records:
                 if record.repository != self.attempt.repository:
                     _invalid("ATTESTATION_INVALID", "source record repository differs")
