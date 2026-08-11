@@ -1276,9 +1276,21 @@ def _dynamic_sidecars(path: Path) -> tuple[Path, ...]:
                         f"SQLite sidecar is a link or reparse point: {entry_path}",
                     )
                 if stat.S_ISREG(entry_stat.st_mode):
-                    _validate_held_file(entry_path, held, "STORE_SOURCE_UNAVAILABLE")
+                    _validate_held_file(
+                        entry_path,
+                        held,
+                        "STORE_SOURCE_UNAVAILABLE",
+                        entry=entry,
+                        entry_stat=entry_stat,
+                    )
                 elif stat.S_ISDIR(entry_stat.st_mode):
-                    _held_child_directory_identities(entry_path, held, "STORE_SOURCE_UNAVAILABLE")
+                    _held_child_directory_identities(
+                        entry_path,
+                        held,
+                        "STORE_SOURCE_UNAVAILABLE",
+                        entry=entry,
+                        entry_stat=entry_stat,
+                    )
                 candidates.append(entry_path)
         return tuple(sorted(candidates, key=str))
     except BootstrapError:
@@ -2133,6 +2145,76 @@ def _absolute_local_path(path: Path) -> Path:
     return Path(os.path.abspath(Path(path)))
 
 
+def _stat_identity(stat_result: os.stat_result) -> dict[str, int]:
+    return {
+        "st_dev": int(stat_result.st_dev),
+        "st_ino": int(stat_result.st_ino),
+        "st_mode": int(stat_result.st_mode),
+        "st_size": int(stat_result.st_size),
+        "st_mtime_ns": int(stat_result.st_mtime_ns),
+    }
+
+
+def _entry_inode(entry: object, entry_stat: os.stat_result) -> int | None:
+    inode = getattr(entry, "inode", None)
+    if callable(inode):
+        try:
+            value = inode()
+        except (OSError, TypeError, ValueError):
+            return None
+        if type(value) is int and value >= 0:
+            return value
+    if os.name != "nt" and type(entry_stat.st_ino) is int and entry_stat.st_ino >= 0:
+        return int(entry_stat.st_ino)
+    return None
+
+
+def _entry_identity_matches(
+    entry: object,
+    entry_stat: os.stat_result,
+    opened_identity: Mapping[str, object],
+) -> bool:
+    if (
+        opened_identity.get("st_mode") is None
+        or stat.S_IFMT(int(opened_identity["st_mode"])) != stat.S_IFMT(entry_stat.st_mode)
+        or opened_identity.get("st_size") != int(entry_stat.st_size)
+        or opened_identity.get("st_mtime_ns") != int(entry_stat.st_mtime_ns)
+    ):
+        return False
+    inode = _entry_inode(entry, entry_stat)
+    if inode is None:
+        return False
+    if os.name == "nt":
+        file_id = opened_identity.get("file_id")
+        if type(file_id) is not str:
+            return False
+        try:
+            expected_prefix = inode.to_bytes(8, "little", signed=False).hex()
+        except OverflowError:
+            return False
+        return file_id.startswith(expected_prefix)
+    return (
+        opened_identity.get("st_dev") == int(entry_stat.st_dev)
+        and opened_identity.get("st_ino") == inode
+    )
+
+
+def _held_identity_matches_expected(
+    current: Mapping[str, object],
+    expected: Mapping[str, object],
+    identity_matches: Callable[[Mapping[str, object], Mapping[str, object]], bool],
+) -> bool:
+    if "file_id" in current and "file_id" not in expected:
+        return (
+            current.get("st_mode") is not None
+            and stat.S_IFMT(int(current["st_mode"]))
+            == stat.S_IFMT(int(expected.get("st_mode", -1)))
+            and current.get("st_size") == expected.get("st_size")
+            and current.get("st_mtime_ns") == expected.get("st_mtime_ns")
+        )
+    return identity_matches(current, expected)
+
+
 @dataclass
 class _HeldDirectory:
     path: Path
@@ -2162,6 +2244,7 @@ def _held_local_directory(
     code: str,
     *,
     expected_identities: Sequence[Mapping[str, object]] | None = None,
+    expected_leaf_identity: Mapping[str, object] | None = None,
 ):
     try:
         from run_beta3_live_guard import (
@@ -2178,11 +2261,20 @@ def _held_local_directory(
         if expected_identities is not None and (
             len(identities) != len(expected_identities)
             or any(
-                not _identity_matches(current, expected)
+                not _held_identity_matches_expected(current, expected, _identity_matches)
                 for current, expected in zip(identities, expected_identities, strict=True)
             )
         ):
             raise OSError("directory components are not the enumerated identities")
+        if expected_leaf_identity is not None and (
+            not identities
+            or not _held_identity_matches_expected(
+                identities[-1],
+                expected_leaf_identity,
+                _identity_matches,
+            )
+        ):
+            raise OSError("directory is not the expected initial identity")
         yield _HeldDirectory(
             path=Path(path),
             component_descriptors=descriptors,
@@ -2207,11 +2299,13 @@ def _held_directory_scan(
     code: str,
     *,
     expected_identities: Sequence[Mapping[str, object]] | None = None,
+    expected_leaf_identity: Mapping[str, object] | None = None,
 ):
     with _held_local_directory(
         path,
         code,
         expected_identities=expected_identities,
+        expected_leaf_identity=expected_leaf_identity,
     ) as held:
         try:
             with os.scandir(path) as scanner:
@@ -2254,6 +2348,9 @@ def _held_file_snapshot(
     path: Path,
     parent: _HeldDirectory,
     code: str,
+    *,
+    entry: object | None = None,
+    entry_stat: os.stat_result | None = None,
 ) -> _FileSnapshot:
     try:
         from run_beta3_live_guard import (
@@ -2262,6 +2359,12 @@ def _held_file_snapshot(
             _windows_handle_identity,
         )
         with _held_file_handle(path, parent, code) as (descriptor, identity):
+            if (
+                entry is not None
+                and entry_stat is not None
+                and not _entry_identity_matches(entry, entry_stat, identity)
+            ):
+                raise OSError("opened file identity is not the enumerated entry")
             content = _read_held_bytes(descriptor, code)
             after_identity = _windows_handle_identity(descriptor, code, directory=False)
             if (
@@ -2277,8 +2380,21 @@ def _held_file_snapshot(
         raise BootstrapError(code, f"local file is unavailable: {path}") from error
 
 
-def _validate_held_file(path: Path, parent: _HeldDirectory, code: str) -> None:
-    with _held_file_handle(path, parent, code):
+def _validate_held_file(
+    path: Path,
+    parent: _HeldDirectory,
+    code: str,
+    *,
+    entry: object | None = None,
+    entry_stat: os.stat_result | None = None,
+) -> None:
+    with _held_file_handle(path, parent, code) as (_descriptor, identity):
+        if (
+            entry is not None
+            and entry_stat is not None
+            and not _entry_identity_matches(entry, entry_stat, identity)
+        ):
+            raise OSError("opened file identity is not the enumerated entry")
         parent.assert_stable()
 
 
@@ -2286,6 +2402,9 @@ def _held_child_directory_identities(
     path: Path,
     parent: _HeldDirectory,
     code: str,
+    *,
+    entry: object | None = None,
+    entry_stat: os.stat_result | None = None,
 ) -> tuple[Mapping[str, object], ...]:
     try:
         from run_beta3_live_guard import _open_path_handle, _windows_handle_identity
@@ -2301,6 +2420,12 @@ def _held_child_directory_identities(
             parent=parent.descriptor,
         )
         identity = _windows_handle_identity(descriptor, code, directory=True)
+        if (
+            entry is not None
+            and entry_stat is not None
+            and not _entry_identity_matches(entry, entry_stat, identity)
+        ):
+            raise OSError("opened directory identity is not the enumerated entry")
         parent.assert_stable()
         return tuple((*parent.component_identities, identity))
     except BootstrapError:
@@ -2373,13 +2498,20 @@ def _local_tree_snapshots(
     if not stat.S_ISDIR(identity.st_mode):
         _fail(code, f"local path is not a directory: {root}")
     result: list[_FileSnapshot] = []
-    pending: list[tuple[Path, tuple[Mapping[str, object], ...] | None]] = [(root, None)]
+    pending: list[
+        tuple[
+            Path,
+            tuple[Mapping[str, object], ...] | None,
+            Mapping[str, object] | None,
+        ]
+    ] = [(root, None, _stat_identity(identity))]
     while pending:
-        directory, expected_identities = pending.pop()
+        directory, expected_identities, expected_leaf_identity = pending.pop()
         with _held_directory_scan(
             directory,
             code,
             expected_identities=expected_identities,
+            expected_leaf_identity=expected_leaf_identity,
         ) as (held, scanner):
             for entry in sorted(scanner, key=lambda item: item.name):
                 path = directory / entry.name
@@ -2391,14 +2523,34 @@ def _local_tree_snapshots(
                 if stat.S_ISLNK(entry_stat.st_mode) or _is_reparse(entry_stat):
                     _fail(code, f"local entry is a link or reparse point: {path}")
                 if stat.S_ISDIR(entry_stat.st_mode):
-                    child_identities = _held_child_directory_identities(path, held, code)
+                    child_identities = _held_child_directory_identities(
+                        path,
+                        held,
+                        code,
+                        entry=entry,
+                        entry_stat=entry_stat,
+                    )
                     if entry.name != "__pycache__":
-                        pending.append((path, child_identities))
+                        pending.append((path, child_identities, None))
                 elif stat.S_ISREG(entry_stat.st_mode):
                     if "__pycache__" not in path.parts and path.suffix != ".pyc":
-                        result.append(_held_file_snapshot(path, held, code))
+                        result.append(
+                            _held_file_snapshot(
+                                path,
+                                held,
+                                code,
+                                entry=entry,
+                                entry_stat=entry_stat,
+                            )
+                        )
                     else:
-                        _validate_held_file(path, held, code)
+                        _validate_held_file(
+                            path,
+                            held,
+                            code,
+                            entry=entry,
+                            entry_stat=entry_stat,
+                        )
                 else:
                     _fail(code, f"local entry is not a regular file or directory: {path}")
     return tuple(sorted(result, key=lambda snapshot: _path_text(snapshot.path)))

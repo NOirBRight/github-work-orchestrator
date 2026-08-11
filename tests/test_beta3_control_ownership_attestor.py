@@ -1180,6 +1180,111 @@ def test_local_tree_rejects_ordinary_parent_replacement_after_scan_assertion(
     assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
 
 
+def test_local_tree_rejects_child_file_replacement_after_entry_stat(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    source = root / "source.py"
+    source.write_bytes(b"original")
+    original_scandir = os.scandir
+    replaced = False
+
+    class Entry:
+        def __init__(self, entry):
+            self._entry = entry
+            self.name = entry.name
+            self.path = entry.path
+
+        def stat(self, *, follow_symlinks=True):
+            nonlocal replaced
+            observed = self._entry.stat(follow_symlinks=follow_symlinks)
+            if self.name == source.name and not replaced:
+                original = tmp_path / "original-source.py"
+                source.rename(original)
+                source.write_bytes(b"replacement")
+                replaced = True
+            return observed
+
+        def inode(self):
+            return self._entry.inode()
+
+    class Scanner:
+        def __init__(self, scanner):
+            self._scanner = scanner
+
+        def __enter__(self):
+            self._scanner.__enter__()
+            return (Entry(entry) for entry in self._scanner)
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return self._scanner.__exit__(exc_type, exc_value, traceback)
+
+    def replacing_scandir(path):
+        scanner = original_scandir(path)
+        if Path(path) == root:
+            return Scanner(scanner)
+        return scanner
+
+    monkeypatch.setattr(attestor_module.os, "scandir", replacing_scandir)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._local_tree_files(root, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+def test_local_tree_rejects_child_directory_replacement_after_entry_stat(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    child = root / "child"
+    child.mkdir(parents=True)
+    (child / "source.py").write_bytes(b"original")
+    original_scandir = os.scandir
+    replaced = False
+
+    class Entry:
+        def __init__(self, entry):
+            self._entry = entry
+            self.name = entry.name
+            self.path = entry.path
+
+        def stat(self, *, follow_symlinks=True):
+            nonlocal replaced
+            observed = self._entry.stat(follow_symlinks=follow_symlinks)
+            if self.name == child.name and not replaced:
+                original = tmp_path / "original-child"
+                child.rename(original)
+                child.mkdir()
+                (child / "source.py").write_bytes(b"replacement")
+                replaced = True
+            return observed
+
+        def inode(self):
+            return self._entry.inode()
+
+    class Scanner:
+        def __init__(self, scanner):
+            self._scanner = scanner
+
+        def __enter__(self):
+            self._scanner.__enter__()
+            return (Entry(entry) for entry in self._scanner)
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return self._scanner.__exit__(exc_type, exc_value, traceback)
+
+    def replacing_scandir(path):
+        scanner = original_scandir(path)
+        if Path(path) == root:
+            return Scanner(scanner)
+        return scanner
+
+    monkeypatch.setattr(attestor_module.os, "scandir", replacing_scandir)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._local_tree_files(root, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
 def test_local_tree_rejects_dangling_reparse_ancestor_when_allow_missing(tmp_path):
     redirected = tmp_path / "redirected"
     try:
