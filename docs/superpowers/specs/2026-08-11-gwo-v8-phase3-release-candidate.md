@@ -2,43 +2,83 @@
 
 ## Disposition
 
-**RC HOLD.** Candidate-local verification is green. The integrated four-axis
-review verdicts and Phase 4 workspace-convergence/exact-merged-main rehearsal
-are still pending. No Guard `--execute`, production mutation, GitHub CI, or
-production evidence generation was run.
+**RC HOLD.** Task 7 candidate-local integration is green, but the integrated
+four-axis review verdicts, Phase 4 workspace convergence, exact merged-main
+subject freeze, and read-only cutover rehearsal remain pending. No Guard
+`--execute`, production mutation, GitHub/CI action, activation, transition,
+tag, push, or release was run.
 
 ## Candidate identity
 
 - Worktree: `D:\Workstation\github-work-orchestrator\.codex-tmp\ga-phase1-5-fix`
 - Branch: `codex/ga-phase1-5-fix`
-- Verified source HEAD: `5efdf76f2905aa97d5b183c0a55c5bbca4149001`
-- Verified source HEAD tree: `d06106e6312d6d1186de64afe3a6bc52ff32e451`
+- Verified source HEAD: `12db7168cf3c465a59768e53637b63f149281348`
+- Verified source HEAD tree: `6c0fe9213762afa2be368731c5869013c3a38341`
 - Runtime: Python 3.13, gpt-5.6-luna max configuration already in force
-- Verification date: 2026-08-11 (Asia/Shanghai)
+- Verification date: 2026-08-12 (Asia/Shanghai)
 
-The source and test changes are the committed contents of the verified HEAD;
-the only candidate-local tracked working-tree change during verification was
-the assigned provenance manifest.
+The candidate HEAD contains the Task 7 provenance-fixture and integration-test
+commit. The external production ReleaseSubject has not been generated: its
+exact identity is intentionally deferred until Phase 4 freezes the merged
+canonical `main` tree.
+
+## Identity boundary and output contract
+
+The external manifest is schema `gwo-v8-release-subject.v1` and, in
+production, has the fixed path:
+
+```text
+EVIDENCE_ROOT / gwo-v8-release-subject.json
+```
+
+Its `subject_digest` is the SHA-256 digest of the canonical manifest body with
+only the top-level `subject_digest` excluded: UTF-8 JSON, sorted keys,
+`ensure_ascii=False`, compact separators, and one LF. There is no CLI override
+for the subject, path, SHA, Git tree, evidence root, or run identity.
+
+The runner and the RC evidence keep these identities separate:
+
+| Field | Meaning |
+| --- | --- |
+| `subject_digest` | Existing `CutoverSubject` canonical digest in report/evidence and the `AttemptIdentity` binding |
+| `release_subject_digest` | External `ReleaseSubject.subject_digest` |
+| `merged_main_sha` | 40-character Git commit identity |
+| `merged_main_git_tree` | 40-character Git root-tree identity |
+| `audited_source_tree_digest` / `CutoverSubject.source_tree_digest` | 64-character audited source digest, not the Git tree |
+| `release_subject_path` | Held external subject manifest path |
+
+The runner publishes `release_subject_digest`, `release_subject_path`,
+`merged_main_sha`, and `merged_main_git_tree` in both report and evidence.
+The existing `subject_digest` remains the CutoverSubject digest. The Task 7
+fixture integration test asserts all four external fields and asserts that the
+two digest domains are not substituted for one another.
+
+The reviewed-provenance file remains the closed four-field manifest
+`gwo-beta3-reviewed-provenance.v1`; it does not contain or depend on the
+external subject digest. The held observer order is unchanged: runner, then
+`beta3_bootstrap_model`, `beta3_control_ownership_attestor`,
+`beta3_legacy_attestor`, `beta3_replay_guard`, followed by the reviewed
+provenance bytes.
 
 ## Candidate-local provenance evidence
 
-`scripts/beta3_reviewed_provenance.json` was regenerated as canonical JSON for
-this worktree and the current runner/attestor bytes. The exact canonical paths
-and hashes are:
+`D:\Workstation\github-work-orchestrator\.codex-tmp\ga-phase1-5-fix\scripts\beta3_reviewed_provenance.json`
+was regenerated after the final observer bytes in this candidate were fixed.
+The manifest is canonical JSON and contains no external ReleaseSubject field.
 
-| Item | Canonical path | SHA-256 |
+| Item | Canonical candidate path | SHA-256 |
 | --- | --- | --- |
-| runner | `D:\Workstation\github-work-orchestrator\.codex-tmp\ga-phase1-5-fix\scripts\run_beta3_live_guard.py` | `0be40a0ee9577b3d7b9cb4e1607495137fd9c14ee59c736fd04a240b7893da5e` |
+| runner | `D:\Workstation\github-work-orchestrator\.codex-tmp\ga-phase1-5-fix\scripts\run_beta3_live_guard.py` | `3f734cad9fd2260df9db15569ee3691521d893847fc4648e01983dc6db52e4da` |
 | `beta3_bootstrap_model` | `D:\Workstation\github-work-orchestrator\.codex-tmp\ga-phase1-5-fix\scripts\beta3_bootstrap_model.py` | `37898e0b75168da83a542f7ef8ee53e91f1518a48f66565d23437b997e75050a` |
-| `beta3_control_ownership_attestor` | `D:\Workstation\github-work-orchestrator\.codex-tmp\ga-phase1-5-fix\scripts\beta3_control_ownership_attestor.py` | `9675bd4d94dc09f5da181bfe7d0505e0c5299f41c89b6e44b52247ee464f5065` |
+| `beta3_control_ownership_attestor` | `D:\Workstation\github-work-orchestrator\.codex-tmp\ga-phase1-5-fix\scripts\beta3_control_ownership_attestor.py` | `675f75aff2bf2808e5fbe3528950c1166ca62bb38f95112c95ae6366874e3a8e` |
 | `beta3_legacy_attestor` | `D:\Workstation\github-work-orchestrator\.codex-tmp\ga-phase1-5-fix\scripts\beta3_legacy_attestor.py` | `221097effb9ae559f1f949bd09cab4a9770e8482b0791b20ba5c9a072a7e8ed9` |
 | `beta3_replay_guard` | `D:\Workstation\github-work-orchestrator\.codex-tmp\ga-phase1-5-fix\scripts\beta3_replay_guard.py` | `c4c5711987c83f89d622ab9344acad9db691ed9beea58fbcfb93742bda5617a3` |
 
 Attestor bundle SHA-256:
-`ed54180bd5207a39fea339536c37ba8554139f2b016e103c32de031b0e06ea18`.
+`5e446b86974ec351107758fa52b941970bce1a916661167211fac5068cf5506b`.
 
-The unmodified provenance functions were called directly; no in-memory hash
-override or dependency overlay was used:
+The raw-byte provenance proof was run after regeneration with the existing
+runner functions; no in-memory hash override or dependency overlay was used:
 
 ```powershell
 @'
@@ -70,119 +110,103 @@ Result:
 
 ```text
 PROVENANCE_GREEN
-runner_sha256=0be40a0ee9577b3d7b9cb4e1607495137fd9c14ee59c736fd04a240b7893da5e
-attestor_bundle_sha256=ed54180bd5207a39fea339536c37ba8554139f2b016e103c32de031b0e06ea18
+runner_sha256=3f734cad9fd2260df9db15569ee3691521d893847fc4648e01983dc6db52e4da
+attestor_bundle_sha256=5e446b86974ec351107758fa52b941970bce1a916661167211fac5068cf5506b
 ```
 
-## Verification commands and results
+## Task 7 TDD evidence
 
-### Focused Beta3 and public acceptance suites
+### RED
+
+Before regenerating the reviewed-provenance fixture, the new raw-byte binding
+test was run:
+
+```powershell
+$env:PYTHONDONTWRITEBYTECODE='1'; py -3.13 -B -m pytest -q tests/test_beta3_live_guard_runner.py -k reviewed_provenance_hashes_match_current_observer_bytes
+```
+
+Result: **RED**, `1 failed, 180 deselected in 1.97s`. The expected failure was
+the stale runner hash in the reviewed manifest:
+
+```text
+expected 3f734cad9fd2260df9db15569ee3691521d893847fc4648e01983dc6db52e4da
+observed 0be40a0ee9577b3d7b9cb4e1607495137fd9c14ee59c736fd04a240b7893da5e
+```
+
+### GREEN
+
+The minimal fix was to regenerate the closed reviewed-provenance manifest from
+the current raw observer bytes, retaining its schema and ordered bundle. The
+same test then passed:
+
+```text
+.                                                                        [100%]
+1 passed, 180 deselected in 1.02s
+```
+
+The existing Task 2 root-canary RED/GREEN evidence is carried forward from the
+corrected Task 6 report; it is not appended as a second historical Task 7 fix
+wave. Each cycle recorded `5 failed, 17 deselected` against detached
+`2feeaa6`, followed by `5 passed, 17 deselected`:
+
+1. `root_candidate_readback_uses_real_git_commit_tree_and_diff`
+2. `root_batch_delivery_uses_real_batch_integrator_and_git_readback`
+3. `root_watchdog_callback_lost_wake_duplicate_and_restart_are_public_advance`
+4. `root_worker_slots_release_and_strict_resource_is_exclusive`
+5. `root_acceptance_is_canonical_across_independent_roots`
+
+The source report is:
+`D:\Workstation\github-work-orchestrator\.codex-tmp\ga-phase1-5-fix\.superpowers\sdd\2026-08-11-gwo-v8-release-subject-fix-wave\task-6-report.md`.
+
+## Task 7 focused integration verification
 
 Exact command:
 
 ```powershell
-$env:PYTHONDONTWRITEBYTECODE='1'; py -3.13 -B -m pytest -q tests/test_beta3_bootstrap_model.py tests/test_beta3_control_ownership_attestor.py tests/test_beta3_legacy_attestor.py tests/test_beta3_replay_guard.py tests/test_beta3_live_guard_runner.py tests/test_v8_local_acceptance.py
+$env:PYTHONDONTWRITEBYTECODE='1'; py -3.13 -B -m pytest -q tests/test_beta3_live_guard_runner.py tests/test_beta3_control_ownership_attestor.py tests/test_beta3_release_subject.py tests/test_beta3_release_subject_generator.py tests/test_v8_local_acceptance.py
 ```
 
 Result:
 
 ```text
-505 passed in 493.94s (0:08:13)
+442 passed, 4 skipped in 918.39s (0:15:18)
 ```
 
-### Ruff
+The focused suite covers the runner, control attestor, external subject
+schema/generator, and public single/root local acceptance. The fixture path
+does not fall back to production Git or dependencies.
 
-Exact command:
+Additional checks run after the focused suite:
 
 ```powershell
-$env:PYTHONDONTWRITEBYTECODE='1'; ruff check --no-cache scripts/beta3_bootstrap_model.py scripts/beta3_control_ownership_attestor.py scripts/beta3_legacy_attestor.py scripts/beta3_replay_guard.py scripts/run_beta3_live_guard.py tests/test_beta3_bootstrap_model.py tests/test_beta3_control_ownership_attestor.py tests/test_beta3_legacy_attestor.py tests/test_beta3_replay_guard.py tests/test_beta3_live_guard_runner.py tests/test_v8_local_acceptance.py
+$env:PYTHONDONTWRITEBYTECODE='1'; ruff check --no-cache tests/test_beta3_live_guard_runner.py
 ```
 
 Result: `All checks passed!`
 
-### AST
-
-Exact command:
-
 ```powershell
-@'
-import ast
-from pathlib import Path
-files = [
-    Path('scripts/beta3_bootstrap_model.py'),
-    Path('scripts/beta3_control_ownership_attestor.py'),
-    Path('scripts/beta3_legacy_attestor.py'),
-    Path('scripts/beta3_replay_guard.py'),
-    Path('scripts/run_beta3_live_guard.py'),
-    Path('tests/test_beta3_bootstrap_model.py'),
-    Path('tests/test_beta3_control_ownership_attestor.py'),
-    Path('tests/test_beta3_legacy_attestor.py'),
-    Path('tests/test_beta3_replay_guard.py'),
-    Path('tests/test_beta3_live_guard_runner.py'),
-    Path('tests/test_v8_local_acceptance.py'),
-]
-for path in files:
-    ast.parse(path.read_bytes(), filename=str(path))
-print(f'AST_OK ({len(files)} files)')
-'@ | py -3.13 -B -
+git diff --check
 ```
 
-Result: `AST_OK (11 files)`.
+Result: clean; Git emitted only the expected LF-to-CRLF working-copy warning
+for the JSON manifest.
 
-### Forbidden production call graph
-
-Exact static graph command:
-
-```powershell
-$env:PYTHONDONTWRITEBYTECODE='1'; py -3.13 -B -m pytest -q tests/test_v8_cutover_guard_static.py
-```
-
-Result:
-
-```text
-5 passed in 0.92s
-```
-
-### Diff check
-
-Exact command: `git diff --check`
-
-Result: `DIFF_CHECK_OK` (the expected Git LF-to-CRLF working-copy warning was
-the only warning).
-
-### Full repository pytest
-
-The first foreground attempt reached 96% but the session command ended without
-a pytest summary, so it is not counted as evidence. The full command was then
-rerun in a background PowerShell process with its stdout retained at
-`C:\tmp\gwo-task6-full-rerun-20260811-1.out.log` and its exit marker.
-
-Exact command:
-
-```powershell
-$env:PYTHONDONTWRITEBYTECODE='1'; $env:GWO_CONVERGENCE_ARCHIVE_ROOT='D:\gwo-convergence-archive\20260804T185544Z'; py -3.13 -B -m pytest -q -p no:cacheprovider --basetemp 'C:\tmp\gwo-phase3-full-repository-20260811-rerun'
-```
-
-Result:
-
-```text
-2468 passed, 1 skipped, 3 warnings in 1588.21s (0:26:28)
-EXIT_CODE=0
-```
-
-The three warnings were pytest assert-rewrite warnings for already-imported
-`v8_candidate_assurance_test_support`, `v8_successor_test_support`, and
-`v8_production_test_support`.
+The prior candidate-local full repository run remains recorded for the source
+before this package-only test/manifest commit: `2468 passed, 1 skipped` with
+exit code zero. Task 8 must rerun the full repository suite on the exact final
+combined candidate and must not treat this prior run as the final release gate.
 
 ## Evidence and gates
 
 | Gate/evidence | State |
 | --- | --- |
-| Candidate-local provenance | GREEN |
-| Five Beta3 suites + local acceptance | PASS, 505 passed |
-| Ruff / AST / diff check | PASS |
-| Forbidden production call graph | PASS, 5 passed |
-| Full local repository pytest | PASS, 2468 passed / 1 skipped |
+| Reviewed-provenance raw-byte binding | GREEN |
+| External subject schema/path/digest contract | Implemented; exact production digest pending Phase 4 exact-main freeze |
+| Runner report/evidence external identity fields | GREEN in local fixture integration |
+| Five Task 6 root-canary RED/GREEN cycles | Recorded and carried forward |
+| Task 7 focused integration | PASS, 442 passed / 4 skipped |
+| Ruff / diff check | PASS |
+| Full local repository pytest on exact final candidate | PENDING Task 8 |
 | SPEC GO | PENDING four-axis review |
 | QUALITY GO | PENDING four-axis review |
 | TDD VALID | PENDING integrated audit |
@@ -190,9 +214,20 @@ The three warnings were pytest assert-rewrite warnings for already-imported
 | BETA3_CUTOVER_REHEARSAL_GO | PENDING Phase 4 |
 | Release candidate | **HOLD** |
 
-The targeted fix review already recorded `APPROVE — SPEC PASS / QUALITY PASS`
-for the Windows sharing fix, with the prior manifest caveat now resolved only
-for this candidate-local worktree. That targeted review is not a substitute
-for the requested integrated four-axis review. Phase 4 must regenerate the
-manifest on exact merged `main`, produce the merged-main evidence package, and
-run the read-only Beta3 rehearsal before this RC can move from HOLD.
+## Commit(s)
+
+- `12db7168cf3c465a59768e53637b63f149281348` — `test: bind reviewed provenance to observer bytes`
+- This RC package document is committed as the accompanying documentation update.
+
+## Concerns and safe boundary
+
+1. The external `gwo-v8-release-subject.json` was not generated in Task 7.
+   Phase 4 must freeze exact merged `main`, regenerate candidate-independent
+   reviewed provenance, generate the fixed subject exactly once, and validate
+   its digest and all raw observer hashes.
+2. The candidate-local reviewed-provenance paths intentionally point to this
+   isolated worktree. They are not production provenance and must not be reused
+   after workspace convergence.
+3. V6.1 remains the only production writer. No Activation Receipt, writer
+   transition, rollback, tag, push, release, GitHub/CI, or Guard `--execute`
+   occurred.
