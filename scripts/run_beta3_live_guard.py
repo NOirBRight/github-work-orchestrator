@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib
@@ -17,8 +17,13 @@ import sys
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence, TextIO
 
 if TYPE_CHECKING:
-    from beta3_bootstrap_model import AttestedCutoverBundle, AttemptIdentity, BootstrapLease
+    from beta3_bootstrap_model import (
+        AttestedCutoverBundle,
+        AttemptIdentity,
+        BootstrapLease,
+    )
     from beta3_replay_guard import ReplayResult
+    from beta3_release_subject import ReleaseSubject, ReleaseSubjectBinding
 
 
 REPOSITORY_ROOT = Path(r"D:\Workstation\github-work-orchestrator").resolve()
@@ -26,8 +31,6 @@ EVIDENCE_ROOT = Path(
     r"D:\gwo-release-evidence\2026-08-09-gwo-v8-beta3-production-cutover"
 ).resolve()
 REPOSITORY = "NOirBRight/github-work-orchestrator"
-EXPECTED_HEAD = "5de34bdaee45f0aba44077a8d1d3e3ed8293f237"
-EXPECTED_TREE = "104ee822dbfb494d33d56b8ccf54092d9d1d9c86"
 CONTROL_BRANCH = "gwo-control"
 TARGET_BRANCH = "main"
 SOURCE_WRITER_GENERATION = "v6.1"
@@ -69,9 +72,7 @@ EXPECTED_FRESH_RECEIPT_SHA256 = (
 EXPECTED_FRESH_RECEIPT_SCHEMA_DIGEST = (
     "69ac6babce5db564fcc60fc5dd97feb0635911e07955234098210ddd97a93aed"
 )
-EXPECTED_FRESH_RECEIPT_GENERATION_ROWS = (
-    (REPOSITORY, STORE_GENERATION),
-)
+EXPECTED_FRESH_RECEIPT_GENERATION_ROWS = ((REPOSITORY, STORE_GENERATION),)
 EXPECTED_FRESH_RECEIPT_ROW_COUNTS = {
     "v8_active_plans": 0,
     "v8_admissions": 0,
@@ -291,13 +292,24 @@ class RunnerError(RuntimeError):
         self.detail = detail
 
 
+GitRunner = Callable[
+    [list[str]],
+    subprocess.CompletedProcess[str],
+]
+GuardFactory = Callable[["RunnerConfig", object], object]
+ControlReader = Callable[[], object]
+PackageReader = Callable[["RunnerConfig"], object]
+
+
 @dataclass(frozen=True)
 class RunnerConfig:
     repository_root: Path
     evidence_root: Path
     repository: str
-    expected_head: str
-    expected_tree: str
+    merged_main_sha: str
+    merged_main_git_tree: str
+    audited_source_tree_digest: str
+    release_subject_digest: str
     control_branch: str
     target_branch: str
     source_writer_generation: str
@@ -343,8 +355,10 @@ DEFAULT_CONFIG = RunnerConfig(
     repository_root=REPOSITORY_ROOT,
     evidence_root=EVIDENCE_ROOT,
     repository=REPOSITORY,
-    expected_head=EXPECTED_HEAD,
-    expected_tree=EXPECTED_TREE,
+    merged_main_sha="",
+    merged_main_git_tree="",
+    audited_source_tree_digest="",
+    release_subject_digest="",
     control_branch=CONTROL_BRANCH,
     target_branch=TARGET_BRANCH,
     source_writer_generation=SOURCE_WRITER_GENERATION,
@@ -384,11 +398,15 @@ def canonical_json_bytes(value: object) -> bytes:
             allow_nan=False,
         )
     except (TypeError, ValueError) as error:
-        raise RunnerError("CANONICAL_JSON_INVALID", "value cannot be canonical JSON") from error
+        raise RunnerError(
+            "CANONICAL_JSON_INVALID", "value cannot be canonical JSON"
+        ) from error
     try:
         return (encoded + "\n").encode("utf-8")
     except UnicodeEncodeError as error:
-        raise RunnerError("CANONICAL_JSON_INVALID", "value contains invalid Unicode") from error
+        raise RunnerError(
+            "CANONICAL_JSON_INVALID", "value contains invalid Unicode"
+        ) from error
 
 
 def _exact_digest_value(value: object) -> str:
@@ -405,12 +423,16 @@ def _exact_digest_value(value: object) -> str:
                 allow_nan=False,
             ).encode("utf-8")
         except (TypeError, ValueError, UnicodeEncodeError) as error:
-            raise RunnerError("CANONICAL_JSON_INVALID", "value cannot be exact-main canonical JSON") from error
+            raise RunnerError(
+                "CANONICAL_JSON_INVALID", "value cannot be exact-main canonical JSON"
+            ) from error
         return hashlib.sha256(encoded).hexdigest()
     try:
         return str(digest_value(value))
     except Exception as error:
-        raise RunnerError("CANONICAL_JSON_INVALID", "value cannot be exact-main canonical JSON") from error
+        raise RunnerError(
+            "CANONICAL_JSON_INVALID", "value cannot be exact-main canonical JSON"
+        ) from error
 
 
 def _path_text(path: Path) -> str:
@@ -481,7 +503,9 @@ def _open_directory_components(
         raise
     except OSError as error:
         _close_descriptors(descriptors)
-        raise RunnerError(code, f"directory component could not be held: {path}") from error
+        raise RunnerError(
+            code, f"directory component could not be held: {path}"
+        ) from error
 
 
 def _assert_directory_handles(
@@ -502,7 +526,9 @@ def _assert_directory_handles(
             not _identity_matches(current, expected)
             for current, expected in zip(current_identities, identities, strict=True)
         ):
-            raise RunnerError(code, f"directory path no longer names the held components: {path}")
+            raise RunnerError(
+                code, f"directory path no longer names the held components: {path}"
+            )
     finally:
         _close_descriptors(current_descriptors)
 
@@ -522,7 +548,9 @@ class _HeldDirectory:
     @property
     def identity(self) -> dict[str, int | str]:
         if not self.component_identities:
-            raise RunnerError("LIVE_INPUT_DRIFT", f"directory identity is not held: {self.path}")
+            raise RunnerError(
+                "LIVE_INPUT_DRIFT", f"directory identity is not held: {self.path}"
+            )
         return self.component_identities[-1]
 
     def assert_stable(self) -> None:
@@ -567,7 +595,9 @@ def _file_identity(stat_result: os.stat_result) -> dict[str, int]:
     }
 
 
-def _windows_handle_identity(descriptor: int, code: str, *, directory: bool) -> dict[str, int | str]:
+def _windows_handle_identity(
+    descriptor: int, code: str, *, directory: bool
+) -> dict[str, int | str]:
     if os.name != "nt":
         return _file_identity(os.fstat(descriptor))
     try:
@@ -596,11 +626,17 @@ def _windows_handle_identity(descriptor: int, code: str, *, directory: bool) -> 
         if not kernel32.GetFileInformationByHandleEx(
             handle, 18, ctypes.byref(file_id), ctypes.sizeof(file_id)
         ):
-            raise OSError(ctypes.get_last_error(), "GetFileInformationByHandleEx(FILE_ID_INFO) failed")
+            raise OSError(
+                ctypes.get_last_error(),
+                "GetFileInformationByHandleEx(FILE_ID_INFO) failed",
+            )
         if not kernel32.GetFileInformationByHandleEx(
             handle, 1, ctypes.byref(standard), ctypes.sizeof(standard)
         ):
-            raise OSError(ctypes.get_last_error(), "GetFileInformationByHandleEx(FILE_STANDARD_INFO) failed")
+            raise OSError(
+                ctypes.get_last_error(),
+                "GetFileInformationByHandleEx(FILE_STANDARD_INFO) failed",
+            )
         attributes = int(getattr(os.fstat(descriptor), "st_file_attributes", 0))
         if attributes & 0x0400:
             raise RunnerError(code, "handle is a reparse point")
@@ -623,11 +659,12 @@ def _windows_handle_identity(descriptor: int, code: str, *, directory: bool) -> 
 
 def _identity_matches(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
     if "file_id" in left or "file_id" in right:
-        return (
-            left.get("volume_id") == right.get("volume_id")
-            and left.get("file_id") == right.get("file_id")
-        )
-    return left.get("st_dev") == right.get("st_dev") and left.get("st_ino") == right.get("st_ino")
+        return left.get("volume_id") == right.get("volume_id") and left.get(
+            "file_id"
+        ) == right.get("file_id")
+    return left.get("st_dev") == right.get("st_dev") and left.get(
+        "st_ino"
+    ) == right.get("st_ino")
 
 
 def _validate_closed_file_identity(value: object, label: str) -> None:
@@ -635,11 +672,17 @@ def _validate_closed_file_identity(value: object, label: str) -> None:
         raise _existing_output_collision(f"{label} identity is not an object")
     if "file_id" in value:
         expected = {"volume_id", "file_id", "st_mode", "st_size", "st_mtime_ns"}
-        if set(value) != expected or type(value["volume_id"]) is not int or type(value["file_id"]) is not str:
+        if (
+            set(value) != expected
+            or type(value["volume_id"]) is not int
+            or type(value["file_id"]) is not str
+        ):
             raise _existing_output_collision(f"{label} identity shape is not exact")
     else:
         expected = {"st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns"}
-        if set(value) != expected or any(type(value[name]) is not int for name in expected):
+        if set(value) != expected or any(
+            type(value[name]) is not int for name in expected
+        ):
             raise _existing_output_collision(f"{label} identity shape is not exact")
     for name in ("st_mode", "st_size", "st_mtime_ns"):
         if type(value[name]) is not int or value[name] < 0:
@@ -737,24 +780,30 @@ def _open_windows_relative_handle(
             ctypes.c_void_p,
             ctypes.c_ulong,
         ]
-        status = int(
-            ntdll.NtCreateFile(
-                ctypes.byref(handle),
-                desired_access,
-                ctypes.byref(object_attributes),
-                ctypes.byref(io_status),
-                None,
-                0x00000080,
-                share_access,
-                create_disposition,
-                create_options,
-                None,
-                0,
+        status = (
+            int(
+                ntdll.NtCreateFile(
+                    ctypes.byref(handle),
+                    desired_access,
+                    ctypes.byref(object_attributes),
+                    ctypes.byref(io_status),
+                    None,
+                    0x00000080,
+                    share_access,
+                    create_disposition,
+                    create_options,
+                    None,
+                    0,
+                )
             )
-        ) & 0xFFFFFFFF
+            & 0xFFFFFFFF
+        )
         if status & 0x80000000:
             if create_new and status in {0xC0000035, 0xC0000034}:
-                raise RunnerError("OUTPUT_COLLISION", f"output appeared during exclusive create: {path}")
+                raise RunnerError(
+                    "OUTPUT_COLLISION",
+                    f"output appeared during exclusive create: {path}",
+                )
             raise OSError(status, "NtCreateFile failed")
         try:
             return msvcrt.open_osfhandle(
@@ -767,7 +816,9 @@ def _open_windows_relative_handle(
     except RunnerError:
         raise
     except (ImportError, OSError, AttributeError, TypeError) as error:
-        raise RunnerError(code, f"relative Windows handle could not be opened: {path}") from error
+        raise RunnerError(
+            code, f"relative Windows handle could not be opened: {path}"
+        ) from error
 
 
 def _open_path_handle(
@@ -790,11 +841,17 @@ def _open_path_handle(
         try:
             if parent is None:
                 return os.open(path, flags, 0o600 if create_new else 0o644)
-            return os.open(Path(path).name, flags, 0o600 if create_new else 0o644, dir_fd=parent)
+            return os.open(
+                Path(path).name, flags, 0o600 if create_new else 0o644, dir_fd=parent
+            )
         except FileExistsError as error:
-            raise RunnerError("OUTPUT_COLLISION", f"output appeared during exclusive create: {path}") from error
+            raise RunnerError(
+                "OUTPUT_COLLISION", f"output appeared during exclusive create: {path}"
+            ) from error
         except OSError as error:
-            raise RunnerError(code, f"path could not be opened without reparse following: {path}") from error
+            raise RunnerError(
+                code, f"path could not be opened without reparse following: {path}"
+            ) from error
     if parent is not None:
         return _open_windows_relative_handle(
             path,
@@ -842,7 +899,10 @@ def _open_path_handle(
         if handle in (None, ctypes.c_void_p(-1).value):
             error_code = ctypes.get_last_error()
             if create_new and error_code in (80, 183):
-                raise RunnerError("OUTPUT_COLLISION", f"output appeared during exclusive create: {path}")
+                raise RunnerError(
+                    "OUTPUT_COLLISION",
+                    f"output appeared during exclusive create: {path}",
+                )
             raise OSError(error_code, "CreateFileW failed")
         try:
             return msvcrt.open_osfhandle(
@@ -855,7 +915,9 @@ def _open_path_handle(
     except RunnerError:
         raise
     except (ImportError, OSError, AttributeError, TypeError) as error:
-        raise RunnerError(code, f"path could not be opened by Windows handle: {path}") from error
+        raise RunnerError(
+            code, f"path could not be opened by Windows handle: {path}"
+        ) from error
 
 
 def _open_bound_handle(
@@ -897,7 +959,9 @@ def _open_bound_handle(
             not _identity_matches(observed_identity, expected_identity)
             or observed_identity.get("st_size") != expected_identity.get("st_size")
         ):
-            raise RunnerError(code, f"path identity is not the preflight identity: {path}")
+            raise RunnerError(
+                code, f"path identity is not the preflight identity: {path}"
+            )
         if components_out is not None:
             components_out.extend(components)
             if component_identities_out is not None:
@@ -912,7 +976,9 @@ def _open_bound_handle(
     except OSError as error:
         if descriptor is not None:
             os.close(descriptor)
-        raise RunnerError(code, f"path could not be opened read-only: {path}") from error
+        raise RunnerError(
+            code, f"path could not be opened read-only: {path}"
+        ) from error
     finally:
         _close_descriptors(components)
 
@@ -949,9 +1015,9 @@ def _bound_bytes(path: Path, code: str) -> tuple[bytes, dict[str, int]]:
     try:
         content = _read_held_bytes(descriptor, code)
         after_identity = _windows_handle_identity(descriptor, code, directory=False)
-        if not _identity_matches(after_identity, identity) or after_identity.get("st_size") != identity.get(
+        if not _identity_matches(after_identity, identity) or after_identity.get(
             "st_size"
-        ):
+        ) != identity.get("st_size"):
             raise RunnerError(code, f"path changed during read: {path}")
     except RunnerError:
         raise
@@ -1002,10 +1068,14 @@ class _InputLease:
             for path, expected in self._expected.items():
                 identity = expected.get("identity", expected)
                 if type(identity) is not dict:
-                    raise RunnerError("LIVE_INPUT_DRIFT", f"input identity is malformed: {path}")
+                    raise RunnerError(
+                        "LIVE_INPUT_DRIFT", f"input identity is malformed: {path}"
+                    )
                 expected_hash = expected.get("sha256")
                 if expected_hash is not None and type(expected_hash) is not str:
-                    raise RunnerError("LIVE_INPUT_DRIFT", f"input hash is malformed: {path}")
+                    raise RunnerError(
+                        "LIVE_INPUT_DRIFT", f"input hash is malformed: {path}"
+                    )
                 component_descriptors: list[int] = []
                 component_identities: list[dict[str, int | str]] = []
                 descriptor, observed = _open_bound_handle(
@@ -1016,25 +1086,34 @@ class _InputLease:
                     component_identities_out=component_identities,
                 )
                 parent = (
-                    _HeldDirectory(path.parent, component_descriptors, component_identities)
+                    _HeldDirectory(
+                        path.parent, component_descriptors, component_identities
+                    )
                     if component_descriptors
                     else None
                 )
                 content = _read_held_bytes(descriptor, "LIVE_INPUT_DRIFT")
-                current = _windows_handle_identity(descriptor, "LIVE_INPUT_DRIFT", directory=False)
-                if not _identity_matches(current, observed) or current.get("st_size") != observed.get(
+                current = _windows_handle_identity(
+                    descriptor, "LIVE_INPUT_DRIFT", directory=False
+                )
+                if not _identity_matches(current, observed) or current.get(
                     "st_size"
-                ):
+                ) != observed.get("st_size"):
                     os.close(descriptor)
                     if parent is not None:
                         parent.close()
-                    raise RunnerError("LIVE_INPUT_DRIFT", f"input changed while being held: {path}")
+                    raise RunnerError(
+                        "LIVE_INPUT_DRIFT", f"input changed while being held: {path}"
+                    )
                 observed_hash = hashlib.sha256(content).hexdigest()
                 if expected_hash is not None and observed_hash != expected_hash:
                     os.close(descriptor)
                     if parent is not None:
                         parent.close()
-                    raise RunnerError("LIVE_INPUT_DRIFT", f"input hash changed while being held: {path}")
+                    raise RunnerError(
+                        "LIVE_INPUT_DRIFT",
+                        f"input hash changed while being held: {path}",
+                    )
                 self._bindings.append(
                     _InputBinding(
                         path,
@@ -1045,8 +1124,12 @@ class _InputLease:
                     )
                 )
             for path in self._directories:
-                descriptors, identities = _open_directory_components(path, "LIVE_INPUT_DRIFT")
-                self._directory_bindings.append(_HeldDirectory(path, descriptors, identities))
+                descriptors, identities = _open_directory_components(
+                    path, "LIVE_INPUT_DRIFT"
+                )
+                self._directory_bindings.append(
+                    _HeldDirectory(path, descriptors, identities)
+                )
             return self
         except RunnerError:
             self.close()
@@ -1065,9 +1148,13 @@ class _InputLease:
         for directory in self._directory_bindings:
             directory.assert_stable()
         for binding in self._bindings:
-            current = _windows_handle_identity(binding.descriptor, "LIVE_INPUT_DRIFT", directory=False)
+            current = _windows_handle_identity(
+                binding.descriptor, "LIVE_INPUT_DRIFT", directory=False
+            )
             content = _read_held_bytes(binding.descriptor, "LIVE_INPUT_DRIFT")
-            after = _windows_handle_identity(binding.descriptor, "LIVE_INPUT_DRIFT", directory=False)
+            after = _windows_handle_identity(
+                binding.descriptor, "LIVE_INPUT_DRIFT", directory=False
+            )
             if (
                 not _identity_matches(current, binding.identity)
                 or not _identity_matches(after, binding.identity)
@@ -1075,7 +1162,9 @@ class _InputLease:
                 or after.get("st_size") != binding.identity.get("st_size")
                 or hashlib.sha256(content).hexdigest() != binding.sha256
             ):
-                raise RunnerError("LIVE_INPUT_DRIFT", f"held input changed: {binding.path}")
+                raise RunnerError(
+                    "LIVE_INPUT_DRIFT", f"held input changed: {binding.path}"
+                )
             if binding.parent is not None:
                 binding.parent.assert_stable()
                 path_descriptor, path_identity = _open_bound_handle(
@@ -1122,13 +1211,19 @@ class _InputLease:
     def assert_attempt_identity(self, attempt: object) -> None:
         runner_sha256 = getattr(attempt, "runner_sha256", None)
         if type(runner_sha256) is not str:
-            raise RunnerError("ATTESTATION_MISMATCH", "AttemptIdentity runner digest is unavailable")
+            raise RunnerError(
+                "ATTESTATION_MISMATCH", "AttemptIdentity runner digest is unavailable"
+            )
         runner_path = Path(__file__).resolve()
         if hashlib.sha256(self._held_content(runner_path)).hexdigest() != runner_sha256:
-            raise RunnerError("ATTESTATION_MISMATCH", "AttemptIdentity runner digest is not held")
+            raise RunnerError(
+                "ATTESTATION_MISMATCH", "AttemptIdentity runner digest is not held"
+            )
         attestor_sha256 = getattr(attempt, "attestor_sha256", None)
         if type(attestor_sha256) is not str:
-            raise RunnerError("ATTESTATION_MISMATCH", "AttemptIdentity attestor digest is unavailable")
+            raise RunnerError(
+                "ATTESTATION_MISMATCH", "AttemptIdentity attestor digest is unavailable"
+            )
         digest = hashlib.sha256()
         root = Path(__file__).resolve().parent
         for name in _ATTESTOR_MODULE_NAMES:
@@ -1139,7 +1234,9 @@ class _InputLease:
             digest.update(len(content).to_bytes(8, "big"))
             digest.update(content)
         if digest.hexdigest() != attestor_sha256:
-            raise RunnerError("ATTESTATION_MISMATCH", "AttemptIdentity attestor digest is not held")
+            raise RunnerError(
+                "ATTESTATION_MISMATCH", "AttemptIdentity attestor digest is not held"
+            )
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
         self.close()
@@ -1191,7 +1288,10 @@ def _validate_fixed_store_configuration(config: RunnerConfig) -> None:
             "STORE_SCHEMA_CONFIG_INVALID",
             "RunnerConfig.expected_store_tables is not the fixed current-main contract",
         )
-    if config.expected_fresh_receipt_schema_digest != EXPECTED_FRESH_RECEIPT_SCHEMA_DIGEST:
+    if (
+        config.expected_fresh_receipt_schema_digest
+        != EXPECTED_FRESH_RECEIPT_SCHEMA_DIGEST
+    ):
         raise RunnerError(
             "STORE_SCHEMA_CONFIG_INVALID",
             "RunnerConfig fresh receipt schema digest is not the fixed current-main contract",
@@ -1303,7 +1403,9 @@ def _dynamic_sidecars(path: Path) -> tuple[Path, ...]:
             if match and match.group("prefix") == path.name:
                 result.append(candidate)
     except OSError as error:
-        raise RunnerError("SIDECAR_SCAN_FAILED", f"sidecar family is unavailable: {path}") from error
+        raise RunnerError(
+            "SIDECAR_SCAN_FAILED", f"sidecar family is unavailable: {path}"
+        ) from error
     return tuple(sorted(result, key=str))
 
 
@@ -1311,7 +1413,9 @@ def _check_sidecars(path: Path) -> tuple[str, ...]:
     candidates = (*_sidecars(path), *_dynamic_sidecars(path))
     present = tuple(str(candidate) for candidate in candidates if _lexists(candidate))
     if present:
-        raise RunnerError("STORE_SIDECAR_PRESENT", "SQLite sidecar is present: " + "; ".join(present))
+        raise RunnerError(
+            "STORE_SIDECAR_PRESENT", "SQLite sidecar is present: " + "; ".join(present)
+        )
     return ()
 
 
@@ -1327,8 +1431,15 @@ class _ImmutableDurableStateReadPort:
         contract: object,
         validated_receipt: Mapping[str, object] | None = None,
     ) -> None:
-        if not isinstance(path, Path) or type(repository) is not str or type(generation) is not str:
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", "durable Store adapter configuration is invalid")
+        if (
+            not isinstance(path, Path)
+            or type(repository) is not str
+            or type(generation) is not str
+        ):
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE",
+                "durable Store adapter configuration is invalid",
+            )
         if expected_tables != FIXED_STORE_TABLES:
             raise RunnerError(
                 "LIVE_GUARD_UNAVAILABLE",
@@ -1336,7 +1447,9 @@ class _ImmutableDurableStateReadPort:
             )
         readback_type = dict(contract.readback_types).get("durable_state")
         if readback_type is None:
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", "durable Store readback type is unavailable")
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE", "durable Store readback type is unavailable"
+            )
         self._path = path.resolve()
         self._repository = repository
         self._generation = generation
@@ -1357,14 +1470,18 @@ class _ImmutableDurableStateReadPort:
         if optional and value is None:
             return None
         if type(value) is not str or not value:
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", f"durable Store {label} is malformed")
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE", f"durable Store {label} is malformed"
+            )
         return value
 
     @classmethod
     def _digest(cls, value: object, label: str) -> str:
         text = cls._text(value, label)
         if text is None or not _HEX64.fullmatch(text):
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", f"durable Store {label} is not a digest")
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE", f"durable Store {label} is not a digest"
+            )
         return text
 
     def _require_repository(self, value: object, label: str) -> None:
@@ -1379,9 +1496,13 @@ class _ImmutableDurableStateReadPort:
         try:
             decoded = json.loads(text)
         except (TypeError, ValueError, json.JSONDecodeError) as error:
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", f"durable Store {label} is invalid JSON") from error
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE", f"durable Store {label} is invalid JSON"
+            ) from error
         if type(decoded) is not dict:
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", f"durable Store {label} is not an object")
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE", f"durable Store {label} is not an object"
+            )
         return decoded
 
     def _validate_pending_receipt(
@@ -1409,27 +1530,38 @@ class _ImmutableDurableStateReadPort:
                 "LIVE_GUARD_UNAVAILABLE",
                 "pending Activation receipt schema is not exact",
             )
-        self._require_repository(receipt.get("repository"), "pending Activation receipt.repository")
-        if self._text(
-            receipt.get("writer_generation"),
-            "pending Activation receipt.writer_generation",
-        ) != self._generation:
+        self._require_repository(
+            receipt.get("repository"), "pending Activation receipt.repository"
+        )
+        if (
+            self._text(
+                receipt.get("writer_generation"),
+                "pending Activation receipt.writer_generation",
+            )
+            != self._generation
+        ):
             raise RunnerError(
                 "LIVE_GUARD_UNAVAILABLE",
                 "pending Activation receipt writer generation is not exact",
             )
-        if self._text(
-            receipt.get("activation_id"),
-            "pending Activation receipt.activation_id",
-        ) != activation_id:
+        if (
+            self._text(
+                receipt.get("activation_id"),
+                "pending Activation receipt.activation_id",
+            )
+            != activation_id
+        ):
             raise RunnerError(
                 "LIVE_GUARD_UNAVAILABLE",
                 "pending Activation receipt identity is not exact",
             )
-        if self._digest(
-            receipt.get("plan_digest"),
-            "pending Activation receipt.plan_digest",
-        ) != plan_digest:
+        if (
+            self._digest(
+                receipt.get("plan_digest"),
+                "pending Activation receipt.plan_digest",
+            )
+            != plan_digest
+        ):
             raise RunnerError(
                 "LIVE_GUARD_UNAVAILABLE",
                 "pending Activation receipt plan identity is not exact",
@@ -1445,7 +1577,9 @@ class _ImmutableDurableStateReadPort:
                 "LIVE_GUARD_UNAVAILABLE",
                 "pending Activation receipt predecessor is not exact",
             )
-        self._text(receipt.get("plan_record_ref"), "pending Activation receipt.plan_record_ref")
+        self._text(
+            receipt.get("plan_record_ref"), "pending Activation receipt.plan_record_ref"
+        )
         self._text(receipt.get("created_at"), "pending Activation receipt.created_at")
         if canonical_json_bytes(receipt).decode("utf-8") != raw:
             raise RunnerError(
@@ -1453,7 +1587,9 @@ class _ImmutableDurableStateReadPort:
                 "pending Activation receipt JSON is not canonical",
             )
 
-    def _validate_rows(self, connection: sqlite3.Connection) -> tuple[set[str], tuple[str, ...], tuple[str, ...]]:
+    def _validate_rows(
+        self, connection: sqlite3.Connection
+    ) -> tuple[set[str], tuple[str, ...], tuple[str, ...]]:
         active_plan_digests: set[str] = set()
 
         for table in (
@@ -1508,8 +1644,13 @@ class _ImmutableDurableStateReadPort:
                         f"{table}.evidence_manifest_digest",
                     ) if row["evidence_manifest_digest"] is not None else None
                     if row["evidence_json"] is not None:
-                        self._json_object(row["evidence_json"], f"{table}.evidence_json")
-                    if type(row["superseded"]) is not int or row["superseded"] not in (0, 1):
+                        self._json_object(
+                            row["evidence_json"], f"{table}.evidence_json"
+                        )
+                    if type(row["superseded"]) is not int or row["superseded"] not in (
+                        0,
+                        1,
+                    ):
                         raise RunnerError(
                             "LIVE_GUARD_UNAVAILABLE",
                             f"durable Store {table}.superseded is malformed",
@@ -1517,29 +1658,55 @@ class _ImmutableDurableStateReadPort:
 
         for row in connection.execute(
             "select repository, plan_digest, writer_generation, activation_id "
-            "from \"v8_active_plans\" order by repository"
+            'from "v8_active_plans" order by repository'
         ).fetchall():
             self._require_repository(row["repository"], "v8_active_plans.repository")
             active_plan_digests.add(
                 self._digest(row["plan_digest"], "v8_active_plans.plan_digest")
             )
-            if self._text(row["writer_generation"], "v8_active_plans.writer_generation") != self._generation:
-                raise RunnerError("LIVE_GUARD_UNAVAILABLE", "active Plan writer generation is not exact")
-            self._text(row["activation_id"], "v8_active_plans.activation_id", optional=True)
+            if (
+                self._text(
+                    row["writer_generation"], "v8_active_plans.writer_generation"
+                )
+                != self._generation
+            ):
+                raise RunnerError(
+                    "LIVE_GUARD_UNAVAILABLE",
+                    "active Plan writer generation is not exact",
+                )
+            self._text(
+                row["activation_id"], "v8_active_plans.activation_id", optional=True
+            )
 
         pending_activation_ids: list[str] = []
         for row in connection.execute(
             "select repository, plan_digest, expected_previous_digest, writer_generation, "
-            "activation_id, receipt_json from \"v8_pending_activations\" order by repository"
+            'activation_id, receipt_json from "v8_pending_activations" order by repository'
         ).fetchall():
-            self._require_repository(row["repository"], "v8_pending_activations.repository")
-            plan_digest = self._digest(row["plan_digest"], "v8_pending_activations.plan_digest")
+            self._require_repository(
+                row["repository"], "v8_pending_activations.repository"
+            )
+            plan_digest = self._digest(
+                row["plan_digest"], "v8_pending_activations.plan_digest"
+            )
             expected_previous = row["expected_previous_digest"]
             if expected_previous is not None:
-                self._digest(expected_previous, "v8_pending_activations.expected_previous_digest")
-            if self._text(row["writer_generation"], "v8_pending_activations.writer_generation") != self._generation:
-                raise RunnerError("LIVE_GUARD_UNAVAILABLE", "pending Activation writer generation is not exact")
-            activation_id = self._text(row["activation_id"], "v8_pending_activations.activation_id")
+                self._digest(
+                    expected_previous, "v8_pending_activations.expected_previous_digest"
+                )
+            if (
+                self._text(
+                    row["writer_generation"], "v8_pending_activations.writer_generation"
+                )
+                != self._generation
+            ):
+                raise RunnerError(
+                    "LIVE_GUARD_UNAVAILABLE",
+                    "pending Activation writer generation is not exact",
+                )
+            activation_id = self._text(
+                row["activation_id"], "v8_pending_activations.activation_id"
+            )
             pending_activation_ids.append(str(activation_id))
             self._validate_pending_receipt(
                 row["receipt_json"],
@@ -1551,51 +1718,86 @@ class _ImmutableDurableStateReadPort:
         predecessor_identity_refs: list[str] = []
         for row in connection.execute(
             "select repository, plan_digest, canonical_bytes, compilation_record, writer_generation "
-            "from \"v8_plan_revisions\" order by repository, plan_digest"
+            'from "v8_plan_revisions" order by repository, plan_digest'
         ).fetchall():
             self._require_repository(row["repository"], "v8_plan_revisions.repository")
-            plan_digest = self._digest(row["plan_digest"], "v8_plan_revisions.plan_digest")
+            plan_digest = self._digest(
+                row["plan_digest"], "v8_plan_revisions.plan_digest"
+            )
             canonical_bytes = row["canonical_bytes"]
-            if type(canonical_bytes) is not bytes or hashlib.sha256(canonical_bytes).hexdigest() != plan_digest:
-                raise RunnerError("LIVE_GUARD_UNAVAILABLE", "Plan Revision canonical bytes are not bound")
-            self._json_object(row["compilation_record"], "v8_plan_revisions.compilation_record")
-            if self._text(row["writer_generation"], "v8_plan_revisions.writer_generation") != self._generation:
-                raise RunnerError("LIVE_GUARD_UNAVAILABLE", "Plan Revision writer generation is not exact")
+            if (
+                type(canonical_bytes) is not bytes
+                or hashlib.sha256(canonical_bytes).hexdigest() != plan_digest
+            ):
+                raise RunnerError(
+                    "LIVE_GUARD_UNAVAILABLE",
+                    "Plan Revision canonical bytes are not bound",
+                )
+            self._json_object(
+                row["compilation_record"], "v8_plan_revisions.compilation_record"
+            )
+            if (
+                self._text(
+                    row["writer_generation"], "v8_plan_revisions.writer_generation"
+                )
+                != self._generation
+            ):
+                raise RunnerError(
+                    "LIVE_GUARD_UNAVAILABLE",
+                    "Plan Revision writer generation is not exact",
+                )
             predecessor_identity_refs.append(plan_digest)
 
         for row in connection.execute(
-            "select repository, holder from \"v8_integration_leases\" order by repository"
+            'select repository, holder from "v8_integration_leases" order by repository'
         ).fetchall():
-            self._require_repository(row["repository"], "v8_integration_leases.repository")
+            self._require_repository(
+                row["repository"], "v8_integration_leases.repository"
+            )
             self._text(row["holder"], "v8_integration_leases.holder")
         for row in connection.execute(
-            "select repository, goal_key, reason from \"v8_goal_holds\" order by repository, goal_key"
+            'select repository, goal_key, reason from "v8_goal_holds" order by repository, goal_key'
         ).fetchall():
             self._require_repository(row["repository"], "v8_goal_holds.repository")
             self._text(row["goal_key"], "v8_goal_holds.goal_key")
             self._text(row["reason"], "v8_goal_holds.reason")
         for row in connection.execute(
             "select repository, resource_key, admission_id, attempt_id "
-            "from \"v8_resource_claims\" order by repository, resource_key"
+            'from "v8_resource_claims" order by repository, resource_key'
         ).fetchall():
             self._require_repository(row["repository"], "v8_resource_claims.repository")
             self._text(row["resource_key"], "v8_resource_claims.resource_key")
-            self._text(row["admission_id"], "v8_resource_claims.admission_id", optional=True)
-            self._text(row["attempt_id"], "v8_resource_claims.attempt_id", optional=True)
+            self._text(
+                row["admission_id"], "v8_resource_claims.admission_id", optional=True
+            )
+            self._text(
+                row["attempt_id"], "v8_resource_claims.attempt_id", optional=True
+            )
         for row in connection.execute(
             "select repository, writer_generation, activation_id, state "
-            "from \"v8_writer_fences\" order by repository"
+            'from "v8_writer_fences" order by repository'
         ).fetchall():
             self._require_repository(row["repository"], "v8_writer_fences.repository")
-            if self._text(row["writer_generation"], "v8_writer_fences.writer_generation") != self._generation:
-                raise RunnerError("LIVE_GUARD_UNAVAILABLE", "writer fence generation is not exact")
+            if (
+                self._text(
+                    row["writer_generation"], "v8_writer_fences.writer_generation"
+                )
+                != self._generation
+            ):
+                raise RunnerError(
+                    "LIVE_GUARD_UNAVAILABLE", "writer fence generation is not exact"
+                )
             self._text(row["activation_id"], "v8_writer_fences.activation_id")
             self._text(row["state"], "v8_writer_fences.state")
 
         if len(pending_activation_ids) != len(set(pending_activation_ids)):
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", "pending Activation identities are duplicated")
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE", "pending Activation identities are duplicated"
+            )
         if len(predecessor_identity_refs) != len(set(predecessor_identity_refs)):
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", "Plan Revision identities are duplicated")
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE", "Plan Revision identities are duplicated"
+            )
         return (
             active_plan_digests,
             tuple(sorted(pending_activation_ids)),
@@ -1605,7 +1807,9 @@ class _ImmutableDurableStateReadPort:
     def _read_from_connection(self, connection: sqlite3.Connection) -> object:
         integrity = connection.execute("pragma integrity_check").fetchone()
         if integrity is None or integrity[0] != "ok":
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", "durable Store integrity check failed")
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE", "durable Store integrity check failed"
+            )
         if self._validated_receipt is None:
             raise RunnerError(
                 "LIVE_GUARD_UNAVAILABLE",
@@ -1617,11 +1821,16 @@ class _ImmutableDurableStateReadPort:
             or receipt.get("store_path") != _path_text(self._path)
             or receipt.get("store_generation") != self._generation
         ):
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", "durable Store receipt identity is not exact")
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE", "durable Store receipt identity is not exact"
+            )
         _validate_exact_store_schema(connection, receipt)
         row_counts = receipt.get("row_counts")
         if type(row_counts) is not dict or set(row_counts) != set(FIXED_STORE_TABLES):
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", "fresh receipt row-count contract is not exact")
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE",
+                "fresh receipt row-count contract is not exact",
+            )
         actual_counts = {
             table: int(
                 connection.execute(
@@ -1631,19 +1840,28 @@ class _ImmutableDurableStateReadPort:
             for table in FIXED_STORE_TABLES
         }
         if actual_counts != row_counts:
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", "durable Store rows are not bound to the fresh receipt")
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE",
+                "durable Store rows are not bound to the fresh receipt",
+            )
         rows = connection.execute(
-            "select repository, writer_generation from \"v8_writer_generations\" order by repository"
+            'select repository, writer_generation from "v8_writer_generations" order by repository'
         ).fetchall()
         expected_generation_rows = receipt.get("generation_rows")
         if (
             type(expected_generation_rows) is not list
-            or any(type(row) is not list or len(row) != 2 for row in expected_generation_rows)
+            or any(
+                type(row) is not list or len(row) != 2
+                for row in expected_generation_rows
+            )
             or [list(row) for row in rows] != expected_generation_rows
         ):
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", "durable Store repository/generation is not exact")
-        active_plan_digests, pending_activation_ids, predecessor_identity_refs = self._validate_rows(
-            connection
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE",
+                "durable Store repository/generation is not exact",
+            )
+        active_plan_digests, pending_activation_ids, predecessor_identity_refs = (
+            self._validate_rows(connection)
         )
         values = {
             "repository": self._repository,
@@ -1661,7 +1879,9 @@ class _ImmutableDurableStateReadPort:
 
     def read(self, repository: str) -> object:
         if repository != self._repository:
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", "durable Store repository is not exact")
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE", "durable Store repository is not exact"
+            )
         connection: sqlite3.Connection | None = None
         try:
             _check_sidecars(self._path)
@@ -1671,7 +1891,9 @@ class _ImmutableDurableStateReadPort:
         except RunnerError:
             raise
         except BaseException as error:
-            raise RunnerError("LIVE_GUARD_UNAVAILABLE", "durable Store live read failed") from error
+            raise RunnerError(
+                "LIVE_GUARD_UNAVAILABLE", "durable Store live read failed"
+            ) from error
         finally:
             try:
                 if connection is not None:
@@ -1694,7 +1916,9 @@ def _guard_contract() -> object:
         from gwo_v8._canonical import digest_value
         from gwo_v8.cutover_guard import DurableStateReadback
     except (ImportError, ModuleNotFoundError, OSError) as error:
-        raise RunnerError("LIVE_GUARD_UNAVAILABLE", "durable Store contract is unavailable") from error
+        raise RunnerError(
+            "LIVE_GUARD_UNAVAILABLE", "durable Store contract is unavailable"
+        ) from error
     return SimpleNamespace(
         readback_types=(("durable_state", DurableStateReadback),),
         digest_value=digest_value,
@@ -1753,7 +1977,9 @@ def _unquote_status_path(path: str) -> str:
         raise RunnerError("GIT_STATUS_INVALID", "Git porcelain path is empty")
     if path[0] != '"':
         if '"' in path:
-            raise RunnerError("GIT_STATUS_INVALID", "Git porcelain path has an unmatched quote")
+            raise RunnerError(
+                "GIT_STATUS_INVALID", "Git porcelain path has an unmatched quote"
+            )
         return path
     if len(path) < 2 or path[-1] != '"':
         raise RunnerError("GIT_STATUS_INVALID", "Git quoted path is unterminated")
@@ -1779,14 +2005,18 @@ def _unquote_status_path(path: str) -> str:
             continue
         index += 1
         if index >= end:
-            raise RunnerError("GIT_STATUS_INVALID", "Git quoted path has a dangling escape")
+            raise RunnerError(
+                "GIT_STATUS_INVALID", "Git quoted path has a dangling escape"
+            )
         escaped = path[index]
         if escaped in escapes:
             result.append(escapes[escaped])
             index += 1
             continue
-        if escaped in "01234567" and index + 2 < end and all(
-            value in "01234567" for value in path[index : index + 3]
+        if (
+            escaped in "01234567"
+            and index + 2 < end
+            and all(value in "01234567" for value in path[index : index + 3])
         ):
             result.append(chr(int(path[index : index + 3], 8)))
             index += 3
@@ -1800,7 +2030,9 @@ def parse_porcelain_z_status(output: str | bytes) -> tuple[str, ...]:
         try:
             output = output.decode("utf-8")
         except UnicodeDecodeError as error:
-            raise RunnerError("GIT_STATUS_INVALID", "Git status was not UTF-8") from error
+            raise RunnerError(
+                "GIT_STATUS_INVALID", "Git status was not UTF-8"
+            ) from error
     if type(output) is not str:
         raise RunnerError("GIT_STATUS_INVALID", "Git status was not exact text")
     unexpected: list[str] = []
@@ -1866,26 +2098,31 @@ def _git_snapshot(
     head = _git_output(
         config, ["rev-parse", "--verify", "HEAD"], "GIT_HEAD_UNAVAILABLE", git_runner
     ).strip()
-    if head != config.expected_head:
-        raise RunnerError("GIT_HEAD_MISMATCH", f"HEAD is {head}, not {config.expected_head}")
+    if head != config.merged_main_sha:
+        raise RunnerError(
+            "GIT_HEAD_MISMATCH", f"HEAD is {head}, not {config.merged_main_sha}"
+        )
     tree = _git_output(
         config,
         ["rev-parse", "--verify", "HEAD^{tree}"],
         "GIT_TREE_UNAVAILABLE",
         git_runner,
     ).strip()
-    if tree != config.expected_tree:
-        raise RunnerError("GIT_TREE_MISMATCH", f"HEAD tree is {tree}, not {config.expected_tree}")
+    if tree != config.merged_main_git_tree:
+        raise RunnerError(
+            "GIT_TREE_MISMATCH",
+            f"HEAD tree is {tree}, not {config.merged_main_git_tree}",
+        )
     origin_main = _git_output(
         config,
         ["rev-parse", "--verify", "origin/main"],
         "GIT_ORIGIN_MAIN_UNAVAILABLE",
         git_runner,
     ).strip()
-    if origin_main != config.expected_head:
+    if origin_main != config.merged_main_sha:
         raise RunnerError(
             "GIT_ORIGIN_MAIN_MISMATCH",
-            f"origin/main is {origin_main}, not {config.expected_head}",
+            f"origin/main is {origin_main}, not {config.merged_main_sha}",
         )
     status = _git_output(
         config,
@@ -1948,55 +2185,90 @@ def _validate_receipt(config: RunnerConfig) -> tuple[dict[str, object], str]:
     exact_values = (
         ("schema", "gwo-v8-fresh-store-provision.v1"),
         ("repository", config.repository),
-        ("source_main_sha", config.expected_head),
-        ("source_main_tree", config.expected_tree),
+        ("source_main_sha", config.merged_main_sha),
+        ("source_main_tree", config.merged_main_git_tree),
         ("store_generation", config.store_generation),
         ("store_sha256", config.expected_fresh_store_sha256),
         ("integrity", "ok"),
     )
     for name, expected in exact_values:
         if receipt.get(name) != expected:
-            raise RunnerError("FRESH_RECEIPT_IDENTITY_MISMATCH", f"receipt {name} is not exact")
-    if type(receipt.get("store_path")) is not str or type(receipt.get("tables")) is not list:
-        raise RunnerError("FRESH_RECEIPT_SCHEMA_MISMATCH", "fresh receipt path/table fields are malformed")
+            raise RunnerError(
+                "FRESH_RECEIPT_IDENTITY_MISMATCH", f"receipt {name} is not exact"
+            )
+    if (
+        type(receipt.get("store_path")) is not str
+        or type(receipt.get("tables")) is not list
+    ):
+        raise RunnerError(
+            "FRESH_RECEIPT_SCHEMA_MISMATCH",
+            "fresh receipt path/table fields are malformed",
+        )
     if receipt.get("runbook_sha256") != config.expected_fresh_receipt_runbook_sha256:
-        raise RunnerError("FRESH_RECEIPT_RUNBOOK_MISMATCH", "fresh Store runbook identity changed")
+        raise RunnerError(
+            "FRESH_RECEIPT_RUNBOOK_MISMATCH", "fresh Store runbook identity changed"
+        )
     if receipt.get("store_path") != _path_text(config.fresh_store):
-        raise RunnerError("FRESH_RECEIPT_STORE_MISMATCH", "fresh Store path is not exact")
+        raise RunnerError(
+            "FRESH_RECEIPT_STORE_MISMATCH", "fresh Store path is not exact"
+        )
     if receipt.get("tables") != list(FIXED_STORE_TABLES):
-        raise RunnerError("FRESH_RECEIPT_SCHEMA_MISMATCH", "fresh Store table identity changed")
+        raise RunnerError(
+            "FRESH_RECEIPT_SCHEMA_MISMATCH", "fresh Store table identity changed"
+        )
     if any(type(table) is not str for table in receipt["tables"]):
-        raise RunnerError("FRESH_RECEIPT_SCHEMA_MISMATCH", "fresh Store table names are malformed")
+        raise RunnerError(
+            "FRESH_RECEIPT_SCHEMA_MISMATCH", "fresh Store table names are malformed"
+        )
     if (
         config.expected_fresh_receipt_schema_digest is not None
         and receipt.get("schema_digest") != config.expected_fresh_receipt_schema_digest
     ):
-        raise RunnerError("FRESH_RECEIPT_SCHEMA_MISMATCH", "fresh Store schema digest changed")
+        raise RunnerError(
+            "FRESH_RECEIPT_SCHEMA_MISMATCH", "fresh Store schema digest changed"
+        )
     if config.expected_fresh_receipt_generation_rows is not None:
-        expected_rows = [list(row) for row in config.expected_fresh_receipt_generation_rows]
+        expected_rows = [
+            list(row) for row in config.expected_fresh_receipt_generation_rows
+        ]
         if receipt.get("generation_rows") != expected_rows:
-            raise RunnerError("FRESH_RECEIPT_GENERATION_MISMATCH", "fresh Store generation rows changed")
+            raise RunnerError(
+                "FRESH_RECEIPT_GENERATION_MISMATCH",
+                "fresh Store generation rows changed",
+            )
         if any(
-            type(row) is not list or len(row) != 2 or any(type(item) is not str for item in row)
+            type(row) is not list
+            or len(row) != 2
+            or any(type(item) is not str for item in row)
             for row in receipt["generation_rows"]
         ):
-            raise RunnerError("FRESH_RECEIPT_GENERATION_MISMATCH", "fresh Store generation rows are malformed")
+            raise RunnerError(
+                "FRESH_RECEIPT_GENERATION_MISMATCH",
+                "fresh Store generation rows are malformed",
+            )
     if config.expected_fresh_receipt_row_counts is not None:
         expected_counts = dict(config.expected_fresh_receipt_row_counts)
         if receipt.get("row_counts") != expected_counts:
-            raise RunnerError("FRESH_RECEIPT_ROW_COUNTS_MISMATCH", "fresh Store row counts changed")
+            raise RunnerError(
+                "FRESH_RECEIPT_ROW_COUNTS_MISMATCH", "fresh Store row counts changed"
+            )
         if type(receipt.get("row_counts")) is not dict or any(
             type(key) is not str or type(value) is not int or value < 0
             for key, value in receipt["row_counts"].items()
         ):
-            raise RunnerError("FRESH_RECEIPT_ROW_COUNTS_MISMATCH", "fresh Store row counts are malformed")
+            raise RunnerError(
+                "FRESH_RECEIPT_ROW_COUNTS_MISMATCH",
+                "fresh Store row counts are malformed",
+            )
     expected_old = {
         _path_text(config.rollback_store): config.expected_rollback_store_sha256,
         _path_text(config.prior_store): config.expected_prior_store_sha256,
     }
     for name in ("runbook_sha256", "schema_digest", "store_sha256"):
         if type(receipt.get(name)) is not str or not _HEX64.fullmatch(receipt[name]):
-            raise RunnerError("FRESH_RECEIPT_SCHEMA_MISMATCH", f"receipt {name} is not a digest")
+            raise RunnerError(
+                "FRESH_RECEIPT_SCHEMA_MISMATCH", f"receipt {name} is not a digest"
+            )
     for name in ("existing_store_hashes_before", "existing_store_hashes_after"):
         value = receipt.get(name)
         if (
@@ -2009,18 +2281,29 @@ def _validate_receipt(config: RunnerConfig) -> tuple[dict[str, object], str]:
                 for key, child in value.items()
             )
         ):
-            raise RunnerError("FRESH_RECEIPT_OLD_STORE_MISMATCH", "old Store hash map is malformed")
+            raise RunnerError(
+                "FRESH_RECEIPT_OLD_STORE_MISMATCH", "old Store hash map is malformed"
+            )
     if receipt.get("existing_store_hashes_before") != expected_old:
-        raise RunnerError("FRESH_RECEIPT_OLD_STORE_MISMATCH", "old Store before hashes are not exact")
+        raise RunnerError(
+            "FRESH_RECEIPT_OLD_STORE_MISMATCH", "old Store before hashes are not exact"
+        )
     if receipt.get("existing_store_hashes_after") != expected_old:
-        raise RunnerError("FRESH_RECEIPT_OLD_STORE_MISMATCH", "old Store after hashes are not exact")
+        raise RunnerError(
+            "FRESH_RECEIPT_OLD_STORE_MISMATCH", "old Store after hashes are not exact"
+        )
     if receipt.get("old_stores_untouched") is not True:
-        raise RunnerError("FRESH_RECEIPT_OLD_STORE_MISMATCH", "receipt does not prove old Stores untouched")
-    if (
-        type(config.expected_fresh_receipt_sha256) is not str
-        or not _HEX64.fullmatch(config.expected_fresh_receipt_sha256)
+        raise RunnerError(
+            "FRESH_RECEIPT_OLD_STORE_MISMATCH",
+            "receipt does not prove old Stores untouched",
+        )
+    if type(config.expected_fresh_receipt_sha256) is not str or not _HEX64.fullmatch(
+        config.expected_fresh_receipt_sha256
     ):
-        raise RunnerError("FRESH_RECEIPT_DIGEST_UNAVAILABLE", "expected fresh receipt digest is not pinned")
+        raise RunnerError(
+            "FRESH_RECEIPT_DIGEST_UNAVAILABLE",
+            "expected fresh receipt digest is not pinned",
+        )
     if digest != config.expected_fresh_receipt_sha256:
         raise RunnerError(
             "FRESH_RECEIPT_DIGEST_MISMATCH",
@@ -2068,7 +2351,9 @@ def _tree_snapshot(root: Path, code: str) -> list[dict[str, object]]:
 
 
 _PACKAGE_MANIFEST = ".skill-package.json"
-_PACKAGE_TEXT_SUFFIXES = frozenset({".toml", ".md", ".py", ".yaml", ".yml", ".json", ".txt"})
+_PACKAGE_TEXT_SUFFIXES = frozenset(
+    {".toml", ".md", ".py", ".yaml", ".yml", ".json", ".txt"}
+)
 
 
 def _package_digest(package_root: Path) -> str:
@@ -2097,9 +2382,13 @@ def _package_digest(package_root: Path) -> str:
     return digest.hexdigest()
 
 
-def _expected_package_manifest(package_root: Path, package_name: str) -> dict[str, object]:
+def _expected_package_manifest(
+    package_root: Path, package_name: str
+) -> dict[str, object]:
     if package_root.name != package_name or package_name not in PACKAGE_NAMES:
-        raise RunnerError("PACKAGE_MANIFEST_INVALID", f"unknown Skill package: {package_name}")
+        raise RunnerError(
+            "PACKAGE_MANIFEST_INVALID", f"unknown Skill package: {package_name}"
+        )
     return {
         "content_sha256": _package_digest(package_root),
         "schema_version": 1,
@@ -2115,10 +2404,20 @@ def _package_manifest(package_root: Path, package_name: str) -> dict[str, object
         _require_regular_file(path, "PACKAGE_MANIFEST_INVALID")
         raw, _identity = _bound_bytes(path, "PACKAGE_MANIFEST_INVALID")
         manifest = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
-        raise RunnerError("PACKAGE_MANIFEST_INVALID", f"manifest is unavailable: {path}") from error
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise RunnerError(
+            "PACKAGE_MANIFEST_INVALID", f"manifest is unavailable: {path}"
+        ) from error
     if type(manifest) is not dict:
-        raise RunnerError("PACKAGE_MANIFEST_INVALID", f"manifest is not an object: {path}")
+        raise RunnerError(
+            "PACKAGE_MANIFEST_INVALID", f"manifest is not an object: {path}"
+        )
     if manifest != expected:
         raise RunnerError(
             "PACKAGE_MANIFEST_INVALID",
@@ -2130,7 +2429,9 @@ def _package_manifest(package_root: Path, package_name: str) -> dict[str, object
 def _package_snapshot(config: RunnerConfig) -> dict[str, object]:
     labels = tuple(path.parent.name for path in config.install_roots)
     if labels != INSTALL_SURFACES:
-        raise RunnerError("INSTALL_ROOTS_INVALID", "install roots are not .agents/.codex/.claude")
+        raise RunnerError(
+            "INSTALL_ROOTS_INVALID", "install roots are not .agents/.codex/.claude"
+        )
     sources: dict[str, object] = {}
     installed: dict[str, object] = {}
     file_paths: list[str] = []
@@ -2152,8 +2453,14 @@ def _package_snapshot(config: RunnerConfig) -> dict[str, object]:
         file_hashes[source_manifest_text] = str(source_manifest_snapshot["sha256"])
         source_digest = str(source_manifest["content_sha256"])
         expected_content_digests = dict(config.expected_package_content_digests)
-        if package_name in expected_content_digests and source_digest != expected_content_digests[package_name]:
-            raise RunnerError("PACKAGE_IDENTITY_MISMATCH", f"source package digest changed: {package_name}")
+        if (
+            package_name in expected_content_digests
+            and source_digest != expected_content_digests[package_name]
+        ):
+            raise RunnerError(
+                "PACKAGE_IDENTITY_MISMATCH",
+                f"source package digest changed: {package_name}",
+            )
         sources[package_name] = _tree_snapshot(source, "SOURCE_PACKAGE_INVALID")
         source_entries = sources[package_name]
         if type(source_entries) is list:
@@ -2177,8 +2484,12 @@ def _package_snapshot(config: RunnerConfig) -> dict[str, object]:
             )
             installed_manifest_text = _path_text(installed_manifest_path)
             file_paths.append(installed_manifest_text)
-            file_identities[installed_manifest_text] = installed_manifest_snapshot["identity"]
-            file_hashes[installed_manifest_text] = str(installed_manifest_snapshot["sha256"])
+            file_identities[installed_manifest_text] = installed_manifest_snapshot[
+                "identity"
+            ]
+            file_hashes[installed_manifest_text] = str(
+                installed_manifest_snapshot["sha256"]
+            )
             installed[f"{surface}:{package_name}"] = _tree_snapshot(
                 package_root, "INSTALLED_PACKAGE_INVALID"
             )
@@ -2211,8 +2522,13 @@ def _package_snapshot(config: RunnerConfig) -> dict[str, object]:
                     file_hashes[path_text] = str(snapshot["sha256"])
     value = {"sources": sources, "installed": installed}
     package_digest = _exact_digest_value(value)
-    if config.expected_package_digest is not None and package_digest != config.expected_package_digest:
-        raise RunnerError("PACKAGE_IDENTITY_MISMATCH", "package digest is not the expected identity")
+    if (
+        config.expected_package_digest is not None
+        and package_digest != config.expected_package_digest
+    ):
+        raise RunnerError(
+            "PACKAGE_IDENTITY_MISMATCH", "package digest is not the expected identity"
+        )
     return {
         "digest": package_digest,
         "value": value,
@@ -2245,10 +2561,12 @@ class _PublicationLease:
         self.component_identities: list[dict[str, int | str]] = []
 
     def __enter__(self) -> "_PublicationLease":
-        self.component_descriptors, self.component_identities = _open_directory_components(
-            self.path,
-            "OUTPUT_PARENT_INVALID",
-            allow_file_create=True,
+        self.component_descriptors, self.component_identities = (
+            _open_directory_components(
+                self.path,
+                "OUTPUT_PARENT_INVALID",
+                allow_file_create=True,
+            )
         )
         self.descriptor = self.component_descriptors[-1]
         self.identity = self.component_identities[-1]
@@ -2281,8 +2599,12 @@ def _assert_publication_parent(
     expected_identity: Mapping[str, object] | None = None,
     lease: _PublicationLease | None = None,
 ) -> dict[str, int | str]:
-    _validate_parented_path(config.report_path, config.evidence_root, "OUTPUT_PARENT_INVALID")
-    _validate_parented_path(config.evidence_path, config.evidence_root, "OUTPUT_PARENT_INVALID")
+    _validate_parented_path(
+        config.report_path, config.evidence_root, "OUTPUT_PARENT_INVALID"
+    )
+    _validate_parented_path(
+        config.evidence_path, config.evidence_root, "OUTPUT_PARENT_INVALID"
+    )
     if lease is not None:
         lease.assert_stable()
         if expected_identity is None or lease.identity is None:
@@ -2290,14 +2612,20 @@ def _assert_publication_parent(
         observed = dict(lease.identity)
     else:
         observed = _directory_identity(config.evidence_root, "OUTPUT_PARENT_INVALID")
-    if expected_identity is not None and not _identity_matches(observed, expected_identity):
+    if expected_identity is not None and not _identity_matches(
+        observed, expected_identity
+    ):
         raise RunnerError("LIVE_INPUT_DRIFT", "evidence parent identity changed")
     return observed
 
 
 def _validate_outputs(config: RunnerConfig, *, allow_existing: bool = False) -> None:
-    _validate_parented_path(config.report_path, config.evidence_root, "OUTPUT_PARENT_INVALID")
-    _validate_parented_path(config.evidence_path, config.evidence_root, "OUTPUT_PARENT_INVALID")
+    _validate_parented_path(
+        config.report_path, config.evidence_root, "OUTPUT_PARENT_INVALID"
+    )
+    _validate_parented_path(
+        config.evidence_path, config.evidence_root, "OUTPUT_PARENT_INVALID"
+    )
     if config.report_path.resolve() == config.evidence_path.resolve():
         raise RunnerError("OUTPUT_COLLISION", "report and evidence paths are identical")
     if not allow_existing:
@@ -2308,19 +2636,33 @@ def _validate_outputs(config: RunnerConfig, *, allow_existing: bool = False) -> 
 def _validate_no_side_effect_paths(config: RunnerConfig) -> None:
     _require_absent(config.gateway_store_path, "GATEWAY_PATH_PRESENT")
     _require_absent(config.artifact_root, "ARTIFACT_PATH_PRESENT")
-    for candidate in (*_sidecars(config.gateway_store_path), *_dynamic_sidecars(config.gateway_store_path)):
+    for candidate in (
+        *_sidecars(config.gateway_store_path),
+        *_dynamic_sidecars(config.gateway_store_path),
+    ):
         if _lexists(candidate):
-            raise RunnerError("GATEWAY_SIDECAR_PRESENT", f"gateway sidecar is present: {candidate}")
-    for candidate in (*_sidecars(config.artifact_root), *_dynamic_sidecars(config.artifact_root)):
+            raise RunnerError(
+                "GATEWAY_SIDECAR_PRESENT", f"gateway sidecar is present: {candidate}"
+            )
+    for candidate in (
+        *_sidecars(config.artifact_root),
+        *_dynamic_sidecars(config.artifact_root),
+    ):
         if _lexists(candidate):
-            raise RunnerError("ARTIFACT_SIDECAR_PRESENT", f"artifact sidecar is present: {candidate}")
+            raise RunnerError(
+                "ARTIFACT_SIDECAR_PRESENT", f"artifact sidecar is present: {candidate}"
+            )
 
 
-def _validate_config_paths(config: RunnerConfig, *, allow_existing_outputs: bool = False) -> None:
+def _validate_config_paths(
+    config: RunnerConfig, *, allow_existing_outputs: bool = False
+) -> None:
     _validate_fixed_store_configuration(config)
     _require_directory(config.repository_root, "REPOSITORY_ROOT_INVALID")
     _require_directory(config.evidence_root, "EVIDENCE_ROOT_INVALID")
-    _validate_parented_path(config.fresh_receipt, config.evidence_root, "RECEIPT_PARENT_INVALID")
+    _validate_parented_path(
+        config.fresh_receipt, config.evidence_root, "RECEIPT_PARENT_INVALID"
+    )
     _validate_outputs(config, allow_existing=allow_existing_outputs)
     _validate_no_side_effect_paths(config)
 
@@ -2358,15 +2700,21 @@ def _local_regular_files(root: Path, code: str) -> tuple[Path, ...]:
         try:
             entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
         except OSError as error:
-            raise RunnerError(code, f"local input directory is unavailable: {directory}") from error
+            raise RunnerError(
+                code, f"local input directory is unavailable: {directory}"
+            ) from error
         for entry in entries:
             path = Path(entry.path)
             try:
                 entry_stat = entry.stat(follow_symlinks=False)
             except OSError as error:
-                raise RunnerError(code, f"local input entry is unavailable: {path}") from error
+                raise RunnerError(
+                    code, f"local input entry is unavailable: {path}"
+                ) from error
             if stat.S_ISLNK(entry_stat.st_mode) or _is_reparse(entry_stat):
-                raise RunnerError(code, f"local input is a link or reparse point: {path}")
+                raise RunnerError(
+                    code, f"local input is a link or reparse point: {path}"
+                )
             if stat.S_ISDIR(entry_stat.st_mode):
                 pending.append(path)
             elif stat.S_ISREG(entry_stat.st_mode):
@@ -2422,7 +2770,9 @@ def _local_input_directories(config: RunnerConfig) -> tuple[Path, ...]:
         Path(__file__).resolve().parent,
         *_local_package_roots(config),
     ]
-    guard_root = Path(config.repository_root) / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+    guard_root = (
+        Path(config.repository_root) / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+    )
     if _lexists(guard_root):
         paths.append(guard_root)
     for install_root in config.install_roots:
@@ -2491,9 +2841,13 @@ def _preflight_file_snapshots(
             or type(identities) is not dict
             or type(hashes) is not dict
         ):
-            raise RunnerError("LIVE_INPUT_DRIFT", "preflight input snapshot is malformed")
+            raise RunnerError(
+                "LIVE_INPUT_DRIFT", "preflight input snapshot is malformed"
+            )
         if {_path_text(path) for path in local_paths} != set(file_paths):
-            raise RunnerError("LIVE_INPUT_DRIFT", "input file set changed after preflight")
+            raise RunnerError(
+                "LIVE_INPUT_DRIFT", "input file set changed after preflight"
+            )
         for path in local_paths:
             path_text = _path_text(path)
             add(path, identities.get(path_text), hashes.get(path_text))
@@ -2526,10 +2880,11 @@ def _preflight_file_snapshots(
                 path_text = _path_text(path)
                 add(path, identities.get(path_text), hashes.get(path_text))
         package_paths = packages.get("file_paths")
-        if type(package_paths) is list and all(type(path) is str for path in package_paths):
+        if type(package_paths) is list and all(
+            type(path) is str for path in package_paths
+        ):
             observed_package_paths = {
-                _path_text(path)
-                for path in _local_input_files(config)
+                _path_text(path) for path in _local_input_files(config)
             }
             if observed_package_paths != set(package_paths):
                 raise RunnerError(
@@ -2539,13 +2894,20 @@ def _preflight_file_snapshots(
     return snapshots
 
 
-def _input_lease(config: RunnerConfig, preflight_result: dict[str, object]) -> _InputLease:
+def _input_lease(
+    config: RunnerConfig, preflight_result: dict[str, object]
+) -> _InputLease:
     local_paths = _lease_input_paths(config)
-    preflight_snapshots = _preflight_file_snapshots(config, preflight_result, local_paths)
+    preflight_snapshots = _preflight_file_snapshots(
+        config, preflight_result, local_paths
+    )
     expected: dict[Path, Mapping[str, object]] = {}
     for path in local_paths:
         if not _lexists(path):
-            raise RunnerError("ATTESTATION_UNAVAILABLE", f"retained local input is unavailable: {path}")
+            raise RunnerError(
+                "ATTESTATION_UNAVAILABLE",
+                f"retained local input is unavailable: {path}",
+            )
         snapshot = preflight_snapshots.get(_path_text(path))
         if snapshot is None:
             current = _bound_file_snapshot(path, "LIVE_INPUT_DRIFT")
@@ -2568,7 +2930,9 @@ def _pre_guard_refresh(
         _validate_config_paths(config, allow_existing_outputs=allow_existing_outputs)
         git = _git_snapshot(config, git_runner)
     except RunnerError as error:
-        raise RunnerError("LIVE_INPUT_DRIFT", f"pre-Guard input changed: {error.detail}") from error
+        raise RunnerError(
+            "LIVE_INPUT_DRIFT", f"pre-Guard input changed: {error.detail}"
+        ) from error
     if git != preflight_result["_git"]:
         raise RunnerError("LIVE_INPUT_DRIFT", "Git identity changed before Guard")
 
@@ -2589,9 +2953,12 @@ def preflight(
         "tree": git["tree"],
         "origin_main": git["origin_main"],
         "tracked_status": git["status"],
+        "release_subject_digest": config.release_subject_digest,
         "store_generation": config.store_generation,
         "install_roots": [_path_text(path) for path in config.install_roots],
-        "outputs_absent": not (_lexists(config.report_path) or _lexists(config.evidence_path)),
+        "outputs_absent": not (
+            _lexists(config.report_path) or _lexists(config.evidence_path)
+        ),
         "gateway_artifact_absent": True,
         "_git": git,
         "_evidence_parent_identity": _directory_identity(
@@ -2606,7 +2973,9 @@ def preflight(
             {
                 "fresh_receipt_sha256": receipt_digest,
                 "fresh_store_sha256": stores[_path_text(config.fresh_store)]["sha256"],
-                "rollback_store_sha256": stores[_path_text(config.rollback_store)]["sha256"],
+                "rollback_store_sha256": stores[_path_text(config.rollback_store)][
+                    "sha256"
+                ],
                 "prior_store_sha256": stores[_path_text(config.prior_store)]["sha256"],
                 "package_snapshot_digest": packages["digest"],
                 "_receipt": receipt,
@@ -2638,7 +3007,9 @@ def _plain_observation(value: object) -> object:
             for key, child in vars(value).items()
             if not str(key).startswith("_")
         }
-    raise RunnerError("READBACK_INVALID", "read-only observation has no canonical projection")
+    raise RunnerError(
+        "READBACK_INVALID", "read-only observation has no canonical projection"
+    )
 
 
 def _observation_digest(value: object) -> str:
@@ -2684,9 +3055,13 @@ def _verify_post_files(
     try:
         git = _git_snapshot(config, git_runner)
     except RunnerError as error:
-        raise RunnerError("LIVE_INPUT_DRIFT", f"Git identity changed: {error.detail}") from error
+        raise RunnerError(
+            "LIVE_INPUT_DRIFT", f"Git identity changed: {error.detail}"
+        ) from error
     if git != before["_git"]:
-        raise RunnerError("LIVE_INPUT_DRIFT", "Git identity or status changed during Guard")
+        raise RunnerError(
+            "LIVE_INPUT_DRIFT", "Git identity or status changed during Guard"
+        )
     _validate_config_paths(config, allow_existing_outputs=allow_existing_outputs)
     _validate_no_side_effect_paths(config)
     return {"_git": git}
@@ -2698,7 +3073,9 @@ def _canonical_utc_timestamp(value: object, code: str) -> str:
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as error:
-        raise RunnerError(code, "capture timestamp is not canonical ISO-8601") from error
+        raise RunnerError(
+            code, "capture timestamp is not canonical ISO-8601"
+        ) from error
     if (
         parsed.tzinfo is None
         or parsed.utcoffset() != timedelta(0)
@@ -2752,9 +3129,13 @@ def _revalidate_owned_output(output: _OwnedOutput, code: str) -> None:
     )
     try:
         if not _identity_matches(path_identity, output.identity):
-            raise RunnerError(code, f"retained output path identity changed: {output.path}")
+            raise RunnerError(
+                code, f"retained output path identity changed: {output.path}"
+            )
         if _read_descriptor_bytes(path_descriptor, code) != output.data:
-            raise RunnerError(code, f"retained output path bytes changed: {output.path}")
+            raise RunnerError(
+                code, f"retained output path bytes changed: {output.path}"
+            )
     finally:
         os.close(path_descriptor)
 
@@ -2762,7 +3143,9 @@ def _revalidate_owned_output(output: _OwnedOutput, code: str) -> None:
 def _delete_owned_handle(output: _OwnedOutput) -> None:
     if output.descriptor < 0:
         return
-    current = _windows_handle_identity(output.descriptor, "OUTPUT_WRITE_FAILED", directory=False)
+    current = _windows_handle_identity(
+        output.descriptor, "OUTPUT_WRITE_FAILED", directory=False
+    )
     if not _identity_matches(current, output.identity):
         return
     output.parent.assert_stable()
@@ -2783,16 +3166,22 @@ def _delete_owned_handle(output: _OwnedOutput) -> None:
                 ctypes.byref(disposition),
                 ctypes.sizeof(disposition),
             ):
-                raise OSError(ctypes.get_last_error(), "SetFileInformationByHandle failed")
+                raise OSError(
+                    ctypes.get_last_error(), "SetFileInformationByHandle failed"
+                )
             return
         except (ImportError, OSError, AttributeError, TypeError) as error:
-            raise RunnerError("OUTPUT_WRITE_FAILED", "owned output could not be removed by handle") from error
+            raise RunnerError(
+                "OUTPUT_WRITE_FAILED", "owned output could not be removed by handle"
+            ) from error
     try:
         os.unlink(output.path.name, dir_fd=output.parent.descriptor)
     except FileNotFoundError:
         return
     except OSError as error:
-        raise RunnerError("OUTPUT_WRITE_FAILED", "owned output could not be removed") from error
+        raise RunnerError(
+            "OUTPUT_WRITE_FAILED", "owned output could not be removed"
+        ) from error
 
 
 def _remove_owned_output(output: _OwnedOutput) -> None:
@@ -2871,21 +3260,33 @@ def _write_exclusive_json(
             "OUTPUT_WRITE_FAILED",
             parent=parent,
         )
-        created_identity = _windows_handle_identity(descriptor, "OUTPUT_WRITE_FAILED", directory=False)
+        created_identity = _windows_handle_identity(
+            descriptor, "OUTPUT_WRITE_FAILED", directory=False
+        )
         offset = 0
         while offset < len(data):
             written = os.write(descriptor, data[offset:])
             if written <= 0:
-                raise RunnerError("OUTPUT_WRITE_FAILED", f"short write for output: {path}")
+                raise RunnerError(
+                    "OUTPUT_WRITE_FAILED", f"short write for output: {path}"
+                )
             offset += written
         if offset != len(data):
-            raise RunnerError("OUTPUT_WRITE_FAILED", f"output write was incomplete: {path}")
+            raise RunnerError(
+                "OUTPUT_WRITE_FAILED", f"output write was incomplete: {path}"
+            )
         _flush_output_handle(descriptor, "OUTPUT_WRITE_FAILED")
-        written_identity = _windows_handle_identity(descriptor, "OUTPUT_WRITE_FAILED", directory=False)
+        written_identity = _windows_handle_identity(
+            descriptor, "OUTPUT_WRITE_FAILED", directory=False
+        )
         if not _identity_matches(written_identity, created_identity):
-            raise RunnerError("OUTPUT_WRITE_FAILED", f"output handle identity changed: {path}")
+            raise RunnerError(
+                "OUTPUT_WRITE_FAILED", f"output handle identity changed: {path}"
+            )
         if _read_descriptor_bytes(descriptor, "OUTPUT_WRITE_FAILED") != data:
-            raise RunnerError("OUTPUT_WRITE_FAILED", f"output handle readback differs: {path}")
+            raise RunnerError(
+                "OUTPUT_WRITE_FAILED", f"output handle readback differs: {path}"
+            )
         os.close(descriptor)
         descriptor = None
         reopened, reopened_identity = _open_bound_handle(
@@ -2896,9 +3297,13 @@ def _write_exclusive_json(
         )
         try:
             if _read_descriptor_bytes(reopened, "OUTPUT_WRITE_FAILED") != data:
-                raise RunnerError("OUTPUT_WRITE_FAILED", f"output path readback differs: {path}")
+                raise RunnerError(
+                    "OUTPUT_WRITE_FAILED", f"output path readback differs: {path}"
+                )
             if not _identity_matches(reopened_identity, written_identity):
-                raise RunnerError("OUTPUT_WRITE_FAILED", f"output path identity differs: {path}")
+                raise RunnerError(
+                    "OUTPUT_WRITE_FAILED", f"output path identity differs: {path}"
+                )
             output = _OwnedOutput(path, reopened, reopened_identity, parent, data)
             reopened = -1
         finally:
@@ -2922,7 +3327,9 @@ def _write_exclusive_json(
             os.close(descriptor)
         if output is not None:
             output.close()
-        raise RunnerError("OUTPUT_WRITE_FAILED", f"cannot durably write output: {path}") from error
+        raise RunnerError(
+            "OUTPUT_WRITE_FAILED", f"cannot durably write output: {path}"
+        ) from error
     finally:
         if local_parent is not None:
             local_parent.__exit__(None, None, None)
@@ -2951,9 +3358,13 @@ def _validate_attested_replay(bundle: object, replay: object) -> dict[str, objec
             WriterFenceReadback,
         )
     except (ImportError, ModuleNotFoundError, OSError) as error:
-        raise RunnerError("ATTESTATION_UNAVAILABLE", "replay contracts are unavailable") from error
+        raise RunnerError(
+            "ATTESTATION_UNAVAILABLE", "replay contracts are unavailable"
+        ) from error
     if type(bundle) is not AttestedCutoverBundle:
-        raise RunnerError("ATTESTATION_MISMATCH", "replay input is not one attested bundle")
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "replay input is not one attested bundle"
+        )
     if type(replay) is not ReplayResult:
         raise RunnerError("ATTESTATION_MISMATCH", "replay result is not exact")
     if type(replay.subject) is not CutoverSubject:
@@ -2971,62 +3382,109 @@ def _validate_attested_replay(bundle: object, replay: object) -> dict[str, objec
         "runtime": RuntimePreflightReadback,
         "packages": PackageReadback,
     }
-    if any(type(getattr(bundle, name)) is not value_type for name, value_type in expected_readback_types.items()):
-        raise RunnerError("ATTESTATION_MISMATCH", "attested readback component is not exact")
+    if any(
+        type(getattr(bundle, name)) is not value_type
+        for name, value_type in expected_readback_types.items()
+    ):
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "attested readback component is not exact"
+        )
     try:
         bundle.validate()
     except Exception as error:
-        raise RunnerError("ATTESTATION_MISMATCH", "attested bundle failed validation") from error
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "attested bundle failed validation"
+        ) from error
     if replay.attestation_digest != bundle.attestation_digest:
-        raise RunnerError("ATTESTATION_MISMATCH", "replay result is not bound to attestation")
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "replay result is not bound to attestation"
+        )
     if replay.subject != bundle.subject:
-        raise RunnerError("ATTESTATION_MISMATCH", "replay result subject differs from attestation")
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "replay result subject differs from attestation"
+        )
     expected_bundle = bundle.cutover_bundle()
     if replay.readback_bundle != expected_bundle:
-        raise RunnerError("ATTESTATION_MISMATCH", "replay result readback differs from attestation")
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "replay result readback differs from attestation"
+        )
     report = replay.report
     report_value = _plain_observation(report)
     if type(report_value) is not dict:
-        raise RunnerError("ATTESTATION_MISMATCH", "replay report is not a canonical object")
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "replay report is not a canonical object"
+        )
     if report.schema != "gwo.cutover-guard.v1":
         raise RunnerError("ATTESTATION_MISMATCH", "replay report schema is not exact")
     checks = report.checks
     if type(checks) is not tuple or len(checks) != len(EXPECTED_CHECK_IDS):
-        raise RunnerError("ATTESTATION_MISMATCH", "replay report check count is not exact")
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "replay report check count is not exact"
+        )
     if any(type(check) is not GuardCheck for check in checks):
-        raise RunnerError("ATTESTATION_MISMATCH", "replay report check type is not exact")
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "replay report check type is not exact"
+        )
     if tuple(check.check_id for check in checks) != EXPECTED_CHECK_IDS:
-        raise RunnerError("ATTESTATION_MISMATCH", "replay report check ids are not exact")
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "replay report check ids are not exact"
+        )
     blockers = report.blockers
-    if type(blockers) is not tuple or any(type(blocker) is not CutoverBlocker for blocker in blockers):
-        raise RunnerError("ATTESTATION_MISMATCH", "replay report blockers are not exact")
+    if type(blockers) is not tuple or any(
+        type(blocker) is not CutoverBlocker for blocker in blockers
+    ):
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "replay report blockers are not exact"
+        )
     failed_checks = {check.check_id for check in checks if not check.passed}
     blocker_ids = tuple(blocker.check_id for blocker in blockers)
-    if len(set(blocker_ids)) != len(blocker_ids) or not set(blocker_ids) <= failed_checks:
-        raise RunnerError("ATTESTATION_MISMATCH", "replay report blockers are not complete")
+    if (
+        len(set(blocker_ids)) != len(blocker_ids)
+        or not set(blocker_ids) <= failed_checks
+    ):
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "replay report blockers are not complete"
+        )
     if report.decision == "GO":
         if not all(check.passed for check in checks) or blockers:
-            raise RunnerError("ATTESTATION_MISMATCH", "GO replay checks or blockers are not complete")
+            raise RunnerError(
+                "ATTESTATION_MISMATCH", "GO replay checks or blockers are not complete"
+            )
         if type(report.receipt) is not CutoverGuardReceipt:
             raise RunnerError("ATTESTATION_MISMATCH", "GO replay receipt is not exact")
     elif report.decision == "NO_GO":
-        if all(check.passed for check in checks) or not blockers or report.receipt is not None:
-            raise RunnerError("ATTESTATION_MISMATCH", "NO_GO replay checks or receipt are not complete")
+        if (
+            all(check.passed for check in checks)
+            or not blockers
+            or report.receipt is not None
+        ):
+            raise RunnerError(
+                "ATTESTATION_MISMATCH",
+                "NO_GO replay checks or receipt are not complete",
+            )
     else:
         raise RunnerError("ATTESTATION_MISMATCH", "replay report decision is not exact")
     subject_digest = _exact_digest_value(bundle.subject.canonical())
     readback_digest = _exact_digest_value(
-        {
-            name: getattr(bundle, name).canonical()
-            for name in GUARD_PORT_ORDER
-        }
+        {name: getattr(bundle, name).canonical() for name in GUARD_PORT_ORDER}
     )
-    if report.subject_digest != subject_digest or report_value.get("subject_digest") != subject_digest:
+    if (
+        report.subject_digest != subject_digest
+        or report_value.get("subject_digest") != subject_digest
+    ):
         raise RunnerError("ATTESTATION_MISMATCH", "replay report subject is not bound")
-    if report.readback_digest != readback_digest or report_value.get("readback_digest") != readback_digest:
+    if (
+        report.readback_digest != readback_digest
+        or report_value.get("readback_digest") != readback_digest
+    ):
         raise RunnerError("ATTESTATION_MISMATCH", "replay report readback is not bound")
-    if report_value.get("repository") != bundle.subject.repository or report.repository != bundle.subject.repository:
-        raise RunnerError("ATTESTATION_MISMATCH", "replay report repository is not bound")
+    if (
+        report_value.get("repository") != bundle.subject.repository
+        or report.repository != bundle.subject.repository
+    ):
+        raise RunnerError(
+            "ATTESTATION_MISMATCH", "replay report repository is not bound"
+        )
     if report_value.get("decision") != report.decision:
         raise RunnerError("ATTESTATION_MISMATCH", "replay report decision is not bound")
     if report.decision == "GO":
@@ -3036,16 +3494,24 @@ def _validate_attested_replay(bundle: object, replay: object) -> dict[str, objec
             or receipt.repository != bundle.subject.repository
             or receipt.subject_digest != subject_digest
             or receipt.readback_digest != readback_digest
-            or receipt.source_writer_generation != bundle.subject.source_writer_generation
-            or receipt.target_writer_generation != bundle.subject.target_writer_generation
+            or receipt.source_writer_generation
+            != bundle.subject.source_writer_generation
+            or receipt.target_writer_generation
+            != bundle.subject.target_writer_generation
             or receipt.store_generation != bundle.subject.store_generation
-            or receipt.writer_control_ref_digest != bundle.writer_fence.control_ref_digest
-            or receipt.runtime_configuration_digest != bundle.runtime.configuration_digest
-            or receipt.compatibility_audit_digest != bundle.compatibility.readback_digest
+            or receipt.writer_control_ref_digest
+            != bundle.writer_fence.control_ref_digest
+            or receipt.runtime_configuration_digest
+            != bundle.runtime.configuration_digest
+            or receipt.compatibility_audit_digest
+            != bundle.compatibility.readback_digest
             or receipt.package_readback_digest != bundle.packages.readback_digest
-            or receipt.receipt_digest != _exact_digest_value(receipt.canonical_without_digest())
+            or receipt.receipt_digest
+            != _exact_digest_value(receipt.canonical_without_digest())
         ):
-            raise RunnerError("ATTESTATION_MISMATCH", "GO replay receipt is not attestation-bound")
+            raise RunnerError(
+                "ATTESTATION_MISMATCH", "GO replay receipt is not attestation-bound"
+            )
     return report_value
 
 
@@ -3134,6 +3600,7 @@ def _attested_report(
         "source_head": preflight_result["head"],
         "source_tree": preflight_result["tree"],
         "origin_main": preflight_result["origin_main"],
+        "release_subject_digest": config.release_subject_digest,
         "store_generation": config.store_generation,
         "writer_generation": writer_generation,
         "default_writer_changed": False,
@@ -3190,6 +3657,7 @@ def _attested_evidence(
         "head": preflight_result["head"],
         "tree": preflight_result["tree"],
         "origin_main": preflight_result["origin_main"],
+        "release_subject_digest": config.release_subject_digest,
         "decision": replay_value["decision"],
         "exit_code": evidence_exit_code,
         "evidence_mode": EVIDENCE_MODE,
@@ -3221,7 +3689,9 @@ def _attested_evidence(
             "control_branch": config.control_branch,
             "target_branch": config.target_branch,
         },
-        "retained_input_identities": _retained_input_identities(preflight_result, inputs),
+        "retained_input_identities": _retained_input_identities(
+            preflight_result, inputs
+        ),
         "before": metadata["attestation_a"],
         "after": {
             "attestation": metadata["attestation_b"],
@@ -3250,14 +3720,22 @@ def _validate_attested_report_value(
         ("runbook", _path_text(Path(__file__))),
         ("runbook_sha256", attempt.runner_sha256),
         ("decision", replay_value["decision"]),
+        ("release_subject_digest", config.release_subject_digest),
         ("activation_performed", False),
     ):
         if value.get(name) != expected:
-            raise RunnerError("OUTPUT_WRITE_FAILED", f"report field is not attestation-bound: {name}")
+            raise RunnerError(
+                "OUTPUT_WRITE_FAILED", f"report field is not attestation-bound: {name}"
+            )
     if value.get("repository") != config.repository:
         raise RunnerError("OUTPUT_WRITE_FAILED", "report repository is not exact")
-    if value.get("mutation_flags") != _mutation_flags() or value.get("default_writer_changed") is not False:
-        raise RunnerError("OUTPUT_WRITE_FAILED", "report mutation flags are not all false")
+    if (
+        value.get("mutation_flags") != _mutation_flags()
+        or value.get("default_writer_changed") is not False
+    ):
+        raise RunnerError(
+            "OUTPUT_WRITE_FAILED", "report mutation flags are not all false"
+        )
 
 
 def _validate_attested_evidence_value(
@@ -3281,6 +3759,7 @@ def _validate_attested_evidence_value(
         ("runbook", _path_text(Path(__file__))),
         ("runbook_sha256", attempt.runner_sha256),
         ("fixed_subject", bundle.subject.canonical()),
+        ("release_subject_digest", config.release_subject_digest),
         ("report_digest", report_digest),
         ("report_path", _path_text(config.report_path)),
         ("exit_code", evidence_exit_code),
@@ -3288,13 +3767,43 @@ def _validate_attested_evidence_value(
     )
     for name, expected_value in expected:
         if value.get(name) != expected_value:
-            raise RunnerError("OUTPUT_WRITE_FAILED", f"evidence field is not exact: {name}")
+            raise RunnerError(
+                "OUTPUT_WRITE_FAILED", f"evidence field is not exact: {name}"
+            )
     if value.get("report_file_identity") != dict(report_identity):
-        raise RunnerError("OUTPUT_WRITE_FAILED", "evidence report identity is not exact")
+        raise RunnerError(
+            "OUTPUT_WRITE_FAILED", "evidence report identity is not exact"
+        )
     if value.get("decision") != report_body.get("decision"):
-        raise RunnerError("OUTPUT_WRITE_FAILED", "evidence decision is not report-bound")
-    if value.get("mutation_flags") != _mutation_flags() or value.get("safety") != _mutation_flags():
-        raise RunnerError("OUTPUT_WRITE_FAILED", "evidence mutation flags are not all false")
+        raise RunnerError(
+            "OUTPUT_WRITE_FAILED", "evidence decision is not report-bound"
+        )
+    if (
+        value.get("mutation_flags") != _mutation_flags()
+        or value.get("safety") != _mutation_flags()
+    ):
+        raise RunnerError(
+            "OUTPUT_WRITE_FAILED", "evidence mutation flags are not all false"
+        )
+
+
+def _assert_subject_binding_stable(binding: object | None) -> None:
+    if binding is None:
+        return
+    assert_stable = getattr(binding, "assert_stable", None)
+    if not callable(assert_stable):
+        raise RunnerError(
+            "RELEASE_SUBJECT_DRIFT",
+            "release subject binding has no stability assertion",
+        )
+    try:
+        assert_stable()
+    except RunnerError:
+        raise
+    except Exception as error:
+        code = getattr(error, "code", "RELEASE_SUBJECT_DRIFT")
+        detail = getattr(error, "detail", str(error))
+        raise RunnerError(str(code), str(detail)) from error
 
 
 def _assert_combined_stable(
@@ -3307,14 +3816,18 @@ def _assert_combined_stable(
     *,
     allow_existing_outputs: bool,
     attempt: object | None = None,
+    subject_binding: object | None = None,
 ) -> dict[str, object]:
+    _assert_subject_binding_stable(subject_binding)
     publication.assert_stable()
     inputs.assert_stable()
     if attempt is not None:
         inputs.assert_attempt_identity(attempt)
     assert_stable = getattr(bootstrap_lease, "assert_stable", None)
     if not callable(assert_stable):
-        raise RunnerError("LEASE_INVALID", "BootstrapLease has no public stability assertion")
+        raise RunnerError(
+            "LEASE_INVALID", "BootstrapLease has no public stability assertion"
+        )
     assert_stable()
     return _verify_post_files(
         config,
@@ -3336,7 +3849,8 @@ class ProductionBootstrapAttestor:
         *,
         control_ownership_attestor: object,
         legacy_attestor: object,
-        subject_factory: Callable[[RunnerConfig], object] | None = None,
+        subject_factory: Callable[[RunnerConfig, "ReleaseSubject"], object]
+        | None = None,
     ) -> None:
         if not callable(getattr(control_ownership_attestor, "observe", None)):
             raise RunnerError(
@@ -3396,7 +3910,9 @@ class ProductionBootstrapAttestor:
         component_type: type,
     ) -> tuple[object, object]:
         if type(control) is not component_type or type(legacy) is not component_type:
-            raise ValueError("attestor did not return exact ComponentObservation values")
+            raise ValueError(
+                "attestor did not return exact ComponentObservation values"
+            )
         records = tuple(
             sorted(
                 (*control.source_records, *legacy.source_records),
@@ -3431,6 +3947,7 @@ class ProductionBootstrapAttestor:
         self,
         config: RunnerConfig,
         subject: object,
+        release_subject: "ReleaseSubject",
         attempt: object,
         *,
         component_type: type,
@@ -3442,6 +3959,7 @@ class ProductionBootstrapAttestor:
                 config=config,
                 subject=subject,
                 attempt=attempt,
+                release_subject=release_subject,
             )
             if type(control) is not component_type:
                 raise bootstrap_error(
@@ -3482,6 +4000,7 @@ class ProductionBootstrapAttestor:
         self,
         config: RunnerConfig,
         attempt: "AttemptIdentity",
+        release_subject: "ReleaseSubject",
     ) -> tuple["AttestedCutoverBundle", "BootstrapLease", dict[str, object]]:
         (
             bundle_type,
@@ -3492,12 +4011,15 @@ class ProductionBootstrapAttestor:
         ) = self._bootstrap_contracts()
         try:
             if type(config) is not RunnerConfig:
-                raise bootstrap_error("ATTESTATION_INVALID", "config has the wrong exact type")
+                raise bootstrap_error(
+                    "ATTESTATION_INVALID", "config has the wrong exact type"
+                )
             subject_factory = self._subject_factory or _default_subject_factory
-            subject = subject_factory(config)
+            subject = subject_factory(config, release_subject)
             control_a, legacy_a = self._observe_pair(
                 config,
                 subject,
+                release_subject,
                 attempt,
                 component_type=component_type,
                 writer_type=writer_type,
@@ -3506,6 +4028,7 @@ class ProductionBootstrapAttestor:
             control_b, legacy_b = self._observe_pair(
                 config,
                 subject,
+                release_subject,
                 attempt,
                 component_type=component_type,
                 writer_type=writer_type,
@@ -3540,6 +4063,7 @@ class ProductionBootstrapAttestor:
                     current = self._observe_pair(
                         config,
                         subject,
+                        release_subject,
                         attempt,
                         component_type=component_type,
                         writer_type=writer_type,
@@ -3567,11 +4091,10 @@ class ProductionBootstrapAttestor:
 
             def assert_components() -> None:
                 current_control, current_legacy = refresh()
-                if (
-                    self._component_bytes(current_control)
-                    != self._component_bytes(expected_components[0])
-                    or self._component_bytes(current_legacy)
-                    != self._component_bytes(expected_components[1])
+                if self._component_bytes(current_control) != self._component_bytes(
+                    expected_components[0]
+                ) or self._component_bytes(current_legacy) != self._component_bytes(
+                    expected_components[1]
                 ):
                     raise ValueError("component changed during lease")
                 cycle["components"] = None
@@ -3602,76 +4125,6 @@ class ProductionBootstrapAttestor:
             raise bootstrap_error("ATTESTATION_UNAVAILABLE", str(error)) from error
 
 
-_FIXED_SUBJECT_FIELDS = (
-    "repository_root",
-    "evidence_root",
-    "repository",
-    "expected_head",
-    "expected_tree",
-    "control_branch",
-    "target_branch",
-    "source_writer_generation",
-    "target_writer_generation",
-    "fresh_store",
-    "store_generation",
-    "expected_fresh_store_sha256",
-    "rollback_store",
-    "expected_rollback_store_sha256",
-    "prior_store",
-    "expected_prior_store_sha256",
-    "fresh_receipt",
-    "report_path",
-    "evidence_path",
-    "install_roots",
-    "package_names",
-    "expected_store_tables",
-    "expected_fresh_receipt_runbook_sha256",
-    "expected_fresh_receipt_sha256",
-    "expected_fresh_receipt_schema_digest",
-    "expected_fresh_receipt_generation_rows",
-    "expected_fresh_receipt_row_counts",
-    "expected_package_digest",
-    "expected_package_content_digests",
-    "gateway_store_path",
-    "artifact_root",
-    "runtime_config_path",
-    "expected_package_version",
-)
-
-# These fields identify the production subject independently of optional
-# expectation overrides.  Optional expectations must never turn the fixed
-# production invocation into an injection-friendly fixture invocation.
-_PRODUCTION_SUBJECT_GATE_FIELDS = tuple(
-    name
-    for name in _FIXED_SUBJECT_FIELDS
-    if name
-    not in {
-        "expected_fresh_receipt_runbook_sha256",
-        "expected_fresh_receipt_sha256",
-        "expected_fresh_receipt_schema_digest",
-        "expected_fresh_receipt_generation_rows",
-        "expected_fresh_receipt_row_counts",
-        "expected_package_digest",
-        "expected_package_content_digests",
-        "expected_package_version",
-    }
-)
-
-
-def _is_fixed_production_subject(config: RunnerConfig) -> bool:
-    return type(config) is RunnerConfig and all(
-        getattr(config, name) == getattr(DEFAULT_CONFIG, name)
-        for name in _FIXED_SUBJECT_FIELDS
-    )
-
-
-def _is_production_subject_gate(config: RunnerConfig) -> bool:
-    return type(config) is RunnerConfig and all(
-        getattr(config, name) == getattr(DEFAULT_CONFIG, name)
-        for name in _PRODUCTION_SUBJECT_GATE_FIELDS
-    )
-
-
 def _provenance_mismatch(detail: str) -> None:
     raise RunnerError("ATTESTATION_PROVENANCE_MISMATCH", detail)
 
@@ -3697,11 +4150,19 @@ def _canonical_provenance_path(value: object, label: str) -> Path:
 def _reviewed_provenance() -> dict[str, object]:
     manifest_path = Path(__file__).resolve().with_name(_REVIEWED_PROVENANCE_NAME)
     try:
-        payload, _identity = _bound_bytes(manifest_path, "ATTESTATION_PROVENANCE_MISMATCH")
+        payload, _identity = _bound_bytes(
+            manifest_path, "ATTESTATION_PROVENANCE_MISMATCH"
+        )
         value = json.loads(payload.decode("utf-8"))
     except RunnerError:
         raise
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as error:
         raise RunnerError(
             "ATTESTATION_PROVENANCE_MISMATCH",
             "reviewed provenance manifest is not canonical JSON",
@@ -3716,7 +4177,12 @@ def _reviewed_provenance() -> dict[str, object]:
             "ATTESTATION_PROVENANCE_MISMATCH",
             "reviewed provenance manifest is not canonical JSON",
         ) from error
-    if type(value) is not dict or set(value) != {"schema", "runner", "attestors", "attestor_bundle_sha256"}:
+    if type(value) is not dict or set(value) != {
+        "schema",
+        "runner",
+        "attestors",
+        "attestor_bundle_sha256",
+    }:
         _provenance_mismatch("reviewed provenance manifest shape is not exact")
     if value["schema"] != "gwo-beta3-reviewed-provenance.v1":
         _provenance_mismatch("reviewed provenance schema is not exact")
@@ -3732,22 +4198,33 @@ def _reviewed_provenance() -> dict[str, object]:
     ):
         _provenance_mismatch("reviewed provenance entries are not exact")
     runner_path = _canonical_provenance_path(runner["path"], "reviewed runner path")
-    if runner_path != Path(__file__).resolve() or runner["module"] != Path(__file__).stem:
+    if (
+        runner_path != Path(__file__).resolve()
+        or runner["module"] != Path(__file__).stem
+    ):
         _provenance_mismatch("reviewed runner origin is not canonical")
     runner_module = sys.modules.get(__name__)
     if runner_module is not None:
         module_path = getattr(runner_module, "__file__", None)
-        if module_path is not None and _canonical_provenance_path(
-            module_path,
-            "runner module origin",
-        ) != runner_path:
+        if (
+            module_path is not None
+            and _canonical_provenance_path(
+                module_path,
+                "runner module origin",
+            )
+            != runner_path
+        ):
             _provenance_mismatch("runner module origin is not canonical")
         module_spec = getattr(runner_module, "__spec__", None)
         spec_origin = getattr(module_spec, "origin", None)
-        if spec_origin not in (None, "built-in") and _canonical_provenance_path(
-            spec_origin,
-            "runner module spec origin",
-        ) != runner_path:
+        if (
+            spec_origin not in (None, "built-in")
+            and _canonical_provenance_path(
+                spec_origin,
+                "runner module spec origin",
+            )
+            != runner_path
+        ):
             _provenance_mismatch("runner module spec origin is not canonical")
     if type(runner["sha256"]) is not str or _HEX64.fullmatch(runner["sha256"]) is None:
         _provenance_mismatch("reviewed runner hash is not exact")
@@ -3830,6 +4307,30 @@ def _attestor_source_sha256() -> str:
     return observed_bundle
 
 
+def _fixture_runbook_hash() -> str:
+    content, _identity = _bound_bytes(
+        Path(__file__).resolve(),
+        "ATTESTATION_PROVENANCE_MISMATCH",
+    )
+    return hashlib.sha256(content).hexdigest()
+
+
+def _fixture_attestor_source_sha256() -> str:
+    digest = hashlib.sha256()
+    root = Path(__file__).resolve().parent
+    for name in _ATTESTOR_MODULE_NAMES:
+        content, _identity = _bound_bytes(
+            root / name,
+            "ATTESTATION_PROVENANCE_MISMATCH",
+        )
+        encoded_name = name.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(4, "big"))
+        digest.update(encoded_name)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
 def _production_source_command(command: tuple[str, ...]) -> bytes:
     if type(command) is not tuple or any(type(item) is not str for item in command):
         raise OSError("source command is not an exact tuple")
@@ -3847,7 +4348,10 @@ def _production_dependencies(
 ) -> ExecutionDependencies:
     if type(config) is not RunnerConfig:
         raise RunnerError("DEPENDENCY_INVALID", "config has the wrong exact type")
-    if config.authoritative_legacy_snapshot is not None or config.production_readers is not None:
+    if (
+        config.authoritative_legacy_snapshot is not None
+        or config.production_readers is not None
+    ):
         raise RunnerError(
             "DEPENDENCY_INJECTION_FORBIDDEN",
             "obsolete production read injection is forbidden",
@@ -3863,6 +4367,7 @@ def _production_dependencies(
             production_legacy_sources,
         )
         from beta3_replay_guard import evaluate_attested_bundle  # type: ignore[import-not-found]
+
         control_sources = production_control_ownership_sources(
             command_runner=_production_source_command,
             producer_sha256=producer_sha256,
@@ -3893,13 +4398,22 @@ def _validate_dependency_inputs(
     guard_factory: Callable[[RunnerConfig, object], object] | None,
     control_reader: Callable[[], object] | None,
     package_reader: Callable[[RunnerConfig], object] | None,
+    *,
+    production: bool = False,
 ) -> None:
-    if config.authoritative_legacy_snapshot is not None or config.production_readers is not None:
+    if (
+        config.authoritative_legacy_snapshot is not None
+        or config.production_readers is not None
+    ):
         raise RunnerError(
             "DEPENDENCY_INJECTION_FORBIDDEN",
             "obsolete production read injection is forbidden",
         )
-    if guard_factory is not None or control_reader is not None or package_reader is not None:
+    if production and (
+        guard_factory is not None
+        or control_reader is not None
+        or package_reader is not None
+    ):
         raise RunnerError(
             "DEPENDENCY_INJECTION_FORBIDDEN",
             "legacy live Guard callbacks are forbidden",
@@ -3907,9 +4421,13 @@ def _validate_dependency_inputs(
     if dependencies is None:
         return
     if type(dependencies) is not ExecutionDependencies:
-        raise RunnerError("DEPENDENCY_INVALID", "dependencies have the wrong exact type")
+        raise RunnerError(
+            "DEPENDENCY_INVALID", "dependencies have the wrong exact type"
+        )
     if not callable(getattr(dependencies.control_ownership_attestor, "observe", None)):
-        raise RunnerError("DEPENDENCY_INVALID", "control ownership attestor is not public")
+        raise RunnerError(
+            "DEPENDENCY_INVALID", "control ownership attestor is not public"
+        )
     if not callable(getattr(dependencies.legacy_attestor, "observe", None)):
         raise RunnerError("DEPENDENCY_INVALID", "legacy attestor is not public")
     if not callable(dependencies.replay_guard):
@@ -3942,16 +4460,19 @@ def _dependencies_or_raise(
     return dependencies
 
 
-def run(
-    config: RunnerConfig = DEFAULT_CONFIG,
+def _run_bound(
+    config: RunnerConfig,
     *,
     execute: bool,
     run_id: str | None = None,
-    git_runner: Callable[..., subprocess.CompletedProcess[str]] = _default_git_runner,
+    git_runner: GitRunner = _default_git_runner,
     dependencies: ExecutionDependencies | None = None,
-    guard_factory: Callable[[RunnerConfig, object], object] | None = None,
-    control_reader: Callable[[], object] | None = None,
-    package_reader: Callable[[RunnerConfig], object] | None = None,
+    guard_factory: GuardFactory | None = None,
+    control_reader: ControlReader | None = None,
+    package_reader: PackageReader | None = None,
+    release_subject: object,
+    subject_binding: object | None = None,
+    production: bool = False,
 ) -> dict[str, object]:
     injected = (
         dependencies is not None
@@ -3962,11 +4483,7 @@ def run(
         or config.authoritative_legacy_snapshot is not None
         or config.production_readers is not None
     )
-    if execute and (
-        config.authoritative_legacy_snapshot is not None
-        or config.production_readers is not None
-        or (_is_production_subject_gate(config) and injected)
-    ):
+    if execute and production and injected:
         return _result(
             "UNAVAILABLE",
             3,
@@ -3989,6 +4506,7 @@ def run(
                 guard_factory,
                 control_reader,
                 package_reader,
+                production=production,
             )
         except RunnerError as error:
             return _result("UNAVAILABLE", 3, code=error.code, detail=error.detail)
@@ -4004,7 +4522,10 @@ def run(
             return _result("REFUSED", 1, code=error.code, detail=error.detail)
         return _result("UNAVAILABLE", 3, code=error.code, detail=error.detail)
     except Exception as error:
-        return _result("UNAVAILABLE", 3, code="PREFLIGHT_UNAVAILABLE", detail=str(error))
+        return _result(
+            "UNAVAILABLE", 3, code="PREFLIGHT_UNAVAILABLE", detail=str(error)
+        )
+    _assert_subject_binding_stable(subject_binding)
     if not execute:
         return preflight_result | {"exit_code": 0}
     lease: object | None = None
@@ -4013,26 +4534,40 @@ def run(
     try:
         expected_parent = preflight_result.get("_evidence_parent_identity")
         if type(expected_parent) is not dict:
-            raise RunnerError("LIVE_INPUT_DRIFT", "evidence parent identity is unavailable")
+            raise RunnerError(
+                "LIVE_INPUT_DRIFT", "evidence parent identity is unavailable"
+            )
         with _PublicationLease(config.evidence_root) as publication:
             _assert_publication_parent(config, expected_parent, lease=publication)
             _precheck_existing_output_bytes(config)
             with _input_lease(config, preflight_result) as inputs:
                 _pre_guard_refresh(config, preflight_result, git_runner)
-                subject = _default_subject_factory(config)
+                subject = _default_subject_factory(config, release_subject)
                 try:
                     from beta3_bootstrap_model import AttemptIdentity  # type: ignore[import-not-found]
                 except (ImportError, ModuleNotFoundError, OSError) as error:
-                    raise RunnerError("ATTESTATION_UNAVAILABLE", "AttemptIdentity is unavailable") from error
+                    raise RunnerError(
+                        "ATTESTATION_UNAVAILABLE", "AttemptIdentity is unavailable"
+                    ) from error
+                _assert_subject_binding_stable(subject_binding)
+                runbook_hash = (
+                    _runbook_hash() if production else _fixture_runbook_hash()
+                )
+                attestor_source_sha256 = (
+                    _attestor_source_sha256()
+                    if production
+                    else _fixture_attestor_source_sha256()
+                )
                 attempt = AttemptIdentity.create(
                     run_id=run_id,
                     repository=config.repository,
                     evidence_root=_path_text(config.evidence_root),
                     cutover_subject_digest=_exact_digest_value(subject.canonical()),
-                    runner_sha256=_runbook_hash(),
-                    attestor_sha256=_attestor_source_sha256(),
+                    runner_sha256=runbook_hash,
+                    attestor_sha256=attestor_source_sha256,
                     nonce_factory=secrets.token_hex,
                 )
+                _assert_subject_binding_stable(subject_binding)
                 live_dependencies = _dependencies_or_raise(
                     config,
                     dependencies,
@@ -4044,21 +4579,38 @@ def run(
                 bootstrap_attestor = ProductionBootstrapAttestor(
                     control_ownership_attestor=live_dependencies.control_ownership_attestor,
                     legacy_attestor=live_dependencies.legacy_attestor,
-                    subject_factory=lambda _config: subject,
+                    subject_factory=(
+                        None
+                        if production
+                        else lambda _config, _release_subject: subject
+                    ),
                 )
+                _assert_subject_binding_stable(subject_binding)
                 bundle, lease, attestation_metadata = bootstrap_attestor.attest(
                     config,
                     attempt,
+                    release_subject,
                 )
-                _bundle_type, _bootstrap_error, bootstrap_lease_type, _component_type, _writer_type = (
-                    ProductionBootstrapAttestor._bootstrap_contracts()
-                )
+                _assert_subject_binding_stable(subject_binding)
+                (
+                    _bundle_type,
+                    _bootstrap_error,
+                    bootstrap_lease_type,
+                    _component_type,
+                    _writer_type,
+                ) = ProductionBootstrapAttestor._bootstrap_contracts()
                 del _bundle_type, _bootstrap_error, _component_type, _writer_type
                 if type(lease) is not bootstrap_lease_type:
-                    raise RunnerError("LEASE_INVALID", "attestation did not return a BootstrapLease")
-                assert_attempt_identity = getattr(inputs, "assert_attempt_identity", None)
+                    raise RunnerError(
+                        "LEASE_INVALID", "attestation did not return a BootstrapLease"
+                    )
+                assert_attempt_identity = getattr(
+                    inputs, "assert_attempt_identity", None
+                )
                 if not callable(assert_attempt_identity):
-                    raise RunnerError("LEASE_INVALID", "input lease has no attempt identity assertion")
+                    raise RunnerError(
+                        "LEASE_INVALID", "input lease has no attempt identity assertion"
+                    )
                 assert_attempt_identity(attempt)
                 _assert_combined_stable(
                     config,
@@ -4069,8 +4621,11 @@ def run(
                     git_runner,
                     allow_existing_outputs=False,
                     attempt=attempt,
+                    subject_binding=subject_binding,
                 )
+                _assert_subject_binding_stable(subject_binding)
                 replay_result = live_dependencies.replay_guard(bundle)
+                _assert_subject_binding_stable(subject_binding)
                 _assert_combined_stable(
                     config,
                     preflight_result,
@@ -4080,8 +4635,10 @@ def run(
                     git_runner,
                     allow_existing_outputs=False,
                     attempt=attempt,
+                    subject_binding=subject_binding,
                 )
                 replay_value = _validate_attested_replay(bundle, replay_result)
+                _assert_subject_binding_stable(subject_binding)
                 _assert_combined_stable(
                     config,
                     preflight_result,
@@ -4091,8 +4648,11 @@ def run(
                     git_runner,
                     allow_existing_outputs=False,
                     attempt=attempt,
+                    subject_binding=subject_binding,
                 )
+                _assert_subject_binding_stable(subject_binding)
                 writer_generation = bundle.writer_fence.writer_generation
+                _assert_subject_binding_stable(subject_binding)
                 report_body = _attested_report(
                     config,
                     preflight_result,
@@ -4112,7 +4672,9 @@ def run(
                         git_runner,
                         allow_existing_outputs=False,
                         attempt=attempt,
+                        subject_binding=subject_binding,
                     )
+                    _assert_subject_binding_stable(subject_binding)
                     report_digest = _write_exclusive_json(
                         config.report_path,
                         report_body,
@@ -4120,7 +4682,9 @@ def run(
                         ownership_out=report_outputs,
                     )
                     if len(report_outputs) != 1:
-                        raise RunnerError("OUTPUT_WRITE_FAILED", "report ownership was not retained")
+                        raise RunnerError(
+                            "OUTPUT_WRITE_FAILED", "report ownership was not retained"
+                        )
                     after_report_files = _assert_combined_stable(
                         config,
                         preflight_result,
@@ -4130,9 +4694,11 @@ def run(
                         git_runner,
                         allow_existing_outputs=True,
                         attempt=attempt,
+                        subject_binding=subject_binding,
                     )
                     _revalidate_owned_output(report_outputs[0], "LIVE_INPUT_DRIFT")
                     exit_code = 0 if replay_value["decision"] == "GO" else 2
+                    _assert_subject_binding_stable(subject_binding)
                     evidence = _attested_evidence(
                         config,
                         preflight_result,
@@ -4156,6 +4722,7 @@ def run(
                         git_runner,
                         allow_existing_outputs=True,
                         attempt=attempt,
+                        subject_binding=subject_binding,
                     )
                     _write_exclusive_json(
                         config.evidence_path,
@@ -4164,7 +4731,9 @@ def run(
                         ownership_out=evidence_outputs,
                     )
                     if len(evidence_outputs) != 1:
-                        raise RunnerError("OUTPUT_WRITE_FAILED", "evidence ownership was not retained")
+                        raise RunnerError(
+                            "OUTPUT_WRITE_FAILED", "evidence ownership was not retained"
+                        )
                     _assert_combined_stable(
                         config,
                         preflight_result,
@@ -4174,6 +4743,7 @@ def run(
                         git_runner,
                         allow_existing_outputs=True,
                         attempt=attempt,
+                        subject_binding=subject_binding,
                     )
                     _revalidate_owned_output(report_outputs[0], "LIVE_INPUT_DRIFT")
                     _revalidate_owned_output(evidence_outputs[0], "LIVE_INPUT_DRIFT")
@@ -4205,6 +4775,7 @@ def run(
                     status,
                     exit_code,
                     decision=replay_value["decision"],
+                    release_subject_digest=config.release_subject_digest,
                     report_path=_path_text(config.report_path),
                     evidence_path=_path_text(config.evidence_path),
                     report_digest=report_digest,
@@ -4220,7 +4791,9 @@ def run(
             if code in {"OUTPUT_COLLISION", "LIVE_INPUT_DRIFT"}:
                 return _result("REFUSED", 1, code=code, detail=detail)
             return _result("UNAVAILABLE", 3, code=code, detail=detail)
-        return _result("UNAVAILABLE", 3, code="ATTESTATION_UNAVAILABLE", detail=str(error))
+        return _result(
+            "UNAVAILABLE", 3, code="ATTESTATION_UNAVAILABLE", detail=str(error)
+        )
     finally:
         if lease is not None:
             close = getattr(lease, "close", None)
@@ -4231,9 +4804,177 @@ def run(
                     pass
 
 
-def _default_subject_factory(config: RunnerConfig) -> object:
+def _subject_error_result(error: BaseException) -> dict[str, object]:
+    code = getattr(error, "code", "RELEASE_SUBJECT_UNAVAILABLE")
+    detail = getattr(error, "detail", str(error))
+    return _result("UNAVAILABLE", 3, code=str(code), detail=str(detail))
+
+
+def load_production_release_subject() -> "ReleaseSubjectBinding":
+    _add_repo_import_paths(REPOSITORY_ROOT)
+    try:
+        from beta3_release_subject import (  # type: ignore[import-not-found]
+            load_production_release_subject as load_subject,
+        )
+    except (ImportError, ModuleNotFoundError, OSError) as error:
+        raise RunnerError(
+            "RELEASE_SUBJECT_UNAVAILABLE",
+            "release subject loader is unavailable",
+        ) from error
+    return load_subject()
+
+
+def _bind_runner_config_from_subject(subject: object) -> RunnerConfig:
+    _add_repo_import_paths(REPOSITORY_ROOT)
+    try:
+        from beta3_release_subject import ReleaseSubject  # type: ignore[import-not-found]
+    except (ImportError, ModuleNotFoundError, OSError) as error:
+        raise RunnerError(
+            "RELEASE_SUBJECT_UNAVAILABLE",
+            "release subject contract is unavailable",
+        ) from error
+    if type(subject) is not ReleaseSubject:
+        raise RunnerError(
+            "RELEASE_SUBJECT_SCHEMA_INVALID", "release subject is not exact"
+        )
+    if (
+        subject.repository != REPOSITORY
+        or Path(subject.repository_root).resolve() != REPOSITORY_ROOT
+        or Path(subject.evidence_root).resolve() != EVIDENCE_ROOT
+    ):
+        raise RunnerError(
+            "RELEASE_SUBJECT_SCHEMA_INVALID",
+            "release subject roots are not the fixed production roots",
+        )
+    evidence_root = Path(subject.evidence_root)
+    return replace(
+        DEFAULT_CONFIG,
+        repository_root=Path(subject.repository_root),
+        evidence_root=evidence_root,
+        repository=subject.repository,
+        merged_main_sha=subject.merged_main_sha,
+        merged_main_git_tree=subject.merged_main_git_tree,
+        audited_source_tree_digest=subject.audited_source_tree_digest,
+        release_subject_digest=subject.subject_digest,
+        fresh_receipt=evidence_root / DEFAULT_CONFIG.fresh_receipt.name,
+        report_path=evidence_root / DEFAULT_CONFIG.report_path.name,
+        evidence_path=evidence_root / DEFAULT_CONFIG.evidence_path.name,
+        gateway_store_path=evidence_root / DEFAULT_CONFIG.gateway_store_path.name,
+        artifact_root=evidence_root / DEFAULT_CONFIG.artifact_root.name,
+    )
+
+
+def _fixture_release_subject(config: RunnerConfig) -> object:
+    from types import SimpleNamespace
+
+    digest = config.release_subject_digest or _exact_digest_value(
+        {
+            "merged_main_sha": config.merged_main_sha,
+            "merged_main_git_tree": config.merged_main_git_tree,
+            "audited_source_tree_digest": config.audited_source_tree_digest,
+        }
+    )
+    return SimpleNamespace(
+        merged_main_sha=config.merged_main_sha,
+        merged_main_git_tree=config.merged_main_git_tree,
+        audited_source_tree_digest=config.audited_source_tree_digest,
+        subject_digest=digest,
+    )
+
+
+def run(
+    config: RunnerConfig | None = None,
+    *,
+    execute: bool,
+    run_id: str | None = None,
+    git_runner: GitRunner = _default_git_runner,
+    dependencies: ExecutionDependencies | None = None,
+    guard_factory: GuardFactory | None = None,
+    control_reader: ControlReader | None = None,
+    package_reader: PackageReader | None = None,
+) -> dict[str, object]:
+    if config is None:
+        binding: object | None = None
+        try:
+            binding = load_production_release_subject()
+            _assert_subject_binding_stable(binding)
+            subject = getattr(binding, "subject", None)
+            effective_config = _bind_runner_config_from_subject(subject)
+            injected = (
+                dependencies is not None
+                or git_runner is not _default_git_runner
+                or guard_factory is not None
+                or control_reader is not None
+                or package_reader is not None
+            )
+            if execute and injected:
+                return _result(
+                    "UNAVAILABLE",
+                    3,
+                    code="DEPENDENCY_INJECTION_FORBIDDEN",
+                    detail="production bound subject does not accept dependency injection",
+                )
+            return _run_bound(
+                effective_config,
+                execute=execute,
+                run_id=run_id,
+                git_runner=git_runner,
+                dependencies=dependencies,
+                guard_factory=guard_factory,
+                control_reader=control_reader,
+                package_reader=package_reader,
+                release_subject=subject,
+                subject_binding=binding,
+                production=True,
+            )
+        except (RunnerError, ValueError, OSError) as error:
+            return _subject_error_result(error)
+        except Exception as error:
+            return _subject_error_result(error)
+        finally:
+            if binding is not None:
+                close = getattr(binding, "close", None)
+                if callable(close):
+                    close()
+    if type(config) is not RunnerConfig:
+        return _result(
+            "UNAVAILABLE",
+            3,
+            code="CONFIG_INVALID",
+            detail="fixture config has the wrong exact type",
+        )
+    return _run_bound(
+        config,
+        execute=execute,
+        run_id=run_id,
+        git_runner=git_runner,
+        dependencies=dependencies,
+        guard_factory=guard_factory,
+        control_reader=control_reader,
+        package_reader=package_reader,
+        release_subject=_fixture_release_subject(config),
+        subject_binding=None,
+        production=False,
+    )
+
+
+def _default_subject_factory(
+    config: RunnerConfig,
+    release_subject: "ReleaseSubject",
+) -> object:
     _add_repo_import_paths(config.repository_root)
-    from gwo_v8.cutover_guard import CutoverSubject, source_tree_digest
+    from gwo_v8.cutover_guard import CutoverSubject
+
+    if release_subject.merged_main_sha != config.merged_main_sha:
+        raise RunnerError(
+            "RELEASE_SUBJECT_DRIFT",
+            "release subject commit is not bound to the runner config",
+        )
+    if release_subject.merged_main_git_tree != config.merged_main_git_tree:
+        raise RunnerError(
+            "RELEASE_SUBJECT_DRIFT",
+            "release subject Git tree is not bound to the runner config",
+        )
 
     return CutoverSubject(
         repository=config.repository,
@@ -4242,8 +4983,8 @@ def _default_subject_factory(config: RunnerConfig) -> object:
         source_writer_generation=config.source_writer_generation,
         target_writer_generation=config.target_writer_generation,
         store_generation=config.store_generation,
-        source_commit=config.expected_head,
-        source_tree_digest=source_tree_digest(config.repository_root),
+        source_commit=release_subject.merged_main_sha,
+        source_tree_digest=release_subject.audited_source_tree_digest,
         production_entry_refs=PRODUCTION_ENTRY_REFS,
     )
 
@@ -4278,12 +5019,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(
     argv: Sequence[str] | None = None,
     *,
-    config: RunnerConfig = DEFAULT_CONFIG,
-    git_runner: Callable[..., subprocess.CompletedProcess[str]] = _default_git_runner,
+    config: RunnerConfig | None = None,
+    git_runner: GitRunner = _default_git_runner,
     dependencies: ExecutionDependencies | None = None,
-    guard_factory: Callable[[RunnerConfig, object], object] | None = None,
-    control_reader: Callable[[], object] | None = None,
-    package_reader: Callable[[RunnerConfig], object] | None = None,
+    guard_factory: GuardFactory | None = None,
+    control_reader: ControlReader | None = None,
+    package_reader: PackageReader | None = None,
     stdout: TextIO | None = None,
 ) -> int:
     try:
