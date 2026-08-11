@@ -417,8 +417,14 @@ class _LocalInputsSource:
         if type(status) is not bytes or status != b"":
             _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "checkout worktree is not exactly clean")
         files = []
-        for path in _checkout_source_files(root, subject):
-            snapshot = _read_file_snapshot(path, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+        checkout_paths = _checkout_source_files(root, subject)
+        checkout_snapshots = _checkout_source_snapshots(root, subject)
+        if tuple(snapshot.path for snapshot in checkout_snapshots) != checkout_paths:
+            _fail(
+                "STATIC_INPUT_SOURCE_UNAVAILABLE",
+                "checkout file enumeration changed before held readback",
+            )
+        for snapshot in checkout_snapshots:
             files.append(
                 {
                     "relative_path": snapshot.path.relative_to(root).as_posix(),
@@ -549,28 +555,39 @@ def _held_file_bytes(path: Path, code: str) -> tuple[bytes, Mapping[str, object]
         raise BootstrapError(code, f"local file is unavailable: {path}") from error
 
 
+def _file_snapshot_from_held(
+    path: Path,
+    content: bytes,
+    held_identity: Mapping[str, object],
+) -> _FileSnapshot:
+    inode = held_identity.get("st_ino", held_identity.get("file_id"))
+    if inode is None:
+        raise OSError("held file identity has no inode")
+    mtime_ns = held_identity.get("st_mtime_ns")
+    size = held_identity.get("st_size")
+    if mtime_ns is None or size is None:
+        raise OSError("held file identity is incomplete")
+    identity = _identity_pairs(
+        {
+            "byte_sha256": digest_bytes(content),
+            "inode": str(inode),
+            "mtime_ns": str(mtime_ns),
+            "path": str(_absolute_local_path(path)),
+            "size": str(size),
+        }
+    )
+    return _FileSnapshot(
+        path=_absolute_local_path(path),
+        content=content,
+        identity=identity,
+    )
+
+
 def _read_file_snapshot(path: Path, code: str) -> _FileSnapshot:
     path = Path(path)
     try:
         content, held_identity = _held_file_bytes(path, code)
-        canonical_path = _absolute_local_path(path)
-        inode = held_identity.get("st_ino", held_identity.get("file_id"))
-        if inode is None:
-            raise OSError("held file identity has no inode")
-        mtime_ns = held_identity.get("st_mtime_ns")
-        size = held_identity.get("st_size")
-        if mtime_ns is None or size is None:
-            raise OSError("held file identity is incomplete")
-        identity = _identity_pairs(
-            {
-                "byte_sha256": digest_bytes(content),
-                "inode": str(inode),
-                "mtime_ns": str(mtime_ns),
-                "path": str(canonical_path),
-                "size": str(size),
-            }
-        )
-        return _FileSnapshot(path=canonical_path, content=content, identity=identity)
+        return _file_snapshot_from_held(path, content, held_identity)
     except BootstrapError:
         raise
     except (OSError, ValueError, TypeError) as error:
@@ -1239,30 +1256,41 @@ def _dynamic_sidecars(path: Path) -> tuple[Path, ...]:
     try:
         parent = _canonical_local_directory(parent, "STORE_SOURCE_UNAVAILABLE")
     except BootstrapError as error:
-        if not parent.exists():
+        if not os.path.lexists(parent):
+            _validate_missing_local_path(parent, "STORE_SOURCE_UNAVAILABLE")
             return ()
         raise error
     try:
         candidates: list[Path] = []
-        for entry in _held_directory_entries(parent, "STORE_SOURCE_UNAVAILABLE"):
-            match = _DYNAMIC_SIDE_FILE.fullmatch(entry.name)
-            if match is None or match.group("prefix") != Path(path).name:
-                continue
-            entry_stat = entry.stat(follow_symlinks=False)
-            if stat.S_ISLNK(entry_stat.st_mode) or _is_reparse(entry_stat):
-                _fail("STORE_SOURCE_UNAVAILABLE", f"SQLite sidecar is a link or reparse point: {entry.path}")
-            candidates.append(Path(entry.path))
+        with _held_directory_scan(parent, "STORE_SOURCE_UNAVAILABLE") as (held, scanner):
+            for entry in sorted(scanner, key=lambda item: item.name):
+                match = _DYNAMIC_SIDE_FILE.fullmatch(entry.name)
+                if match is None or match.group("prefix") != Path(path).name:
+                    continue
+                entry_path = parent / entry.name
+                entry_stat = entry.stat(follow_symlinks=False)
+                held.assert_stable()
+                if stat.S_ISLNK(entry_stat.st_mode) or _is_reparse(entry_stat):
+                    _fail(
+                        "STORE_SOURCE_UNAVAILABLE",
+                        f"SQLite sidecar is a link or reparse point: {entry_path}",
+                    )
+                if stat.S_ISREG(entry_stat.st_mode):
+                    _validate_held_file(entry_path, held, "STORE_SOURCE_UNAVAILABLE")
+                elif stat.S_ISDIR(entry_stat.st_mode):
+                    _held_child_directory_identities(entry_path, held, "STORE_SOURCE_UNAVAILABLE")
+                candidates.append(entry_path)
         return tuple(sorted(candidates, key=str))
+    except BootstrapError:
+        raise
     except OSError as error:
         raise BootstrapError("STORE_SOURCE_UNAVAILABLE", "SQLite sidecar scan failed") from error
 
 
 def _check_sidecars(path: Path) -> None:
-    present = tuple(
-        str(candidate)
-        for candidate in (*_sidecars(path), *_dynamic_sidecars(path))
-        if os.path.lexists(candidate)
-    )
+    dynamic = _dynamic_sidecars(path)
+    fixed = tuple(candidate for candidate in _sidecars(path) if os.path.lexists(candidate))
+    present = tuple(str(candidate) for candidate in (*fixed, *dynamic))
     if present:
         _fail("STORE_SOURCE_UNAVAILABLE", "SQLite sidecar is present")
 
@@ -2105,12 +2133,41 @@ def _absolute_local_path(path: Path) -> Path:
     return Path(os.path.abspath(Path(path)))
 
 
+@dataclass
+class _HeldDirectory:
+    path: Path
+    component_descriptors: list[int]
+    component_identities: list[dict[str, int | str]]
+    code: str
+    assert_directory_handles: Callable[..., None]
+
+    @property
+    def descriptor(self) -> int:
+        if not self.component_descriptors:
+            raise OSError(f"directory is not held: {self.path}")
+        return self.component_descriptors[-1]
+
+    def assert_stable(self) -> None:
+        self.assert_directory_handles(
+            self.path,
+            self.component_descriptors,
+            self.component_identities,
+            self.code,
+        )
+
+
 @contextmanager
-def _held_local_directory(path: Path, code: str):
+def _held_local_directory(
+    path: Path,
+    code: str,
+    *,
+    expected_identities: Sequence[Mapping[str, object]] | None = None,
+):
     try:
         from run_beta3_live_guard import (
             _assert_directory_handles,
             _close_descriptors,
+            _identity_matches,
             _open_directory_components,
         )
     except Exception as error:
@@ -2118,7 +2175,21 @@ def _held_local_directory(path: Path, code: str):
     descriptors: list[int] = []
     try:
         descriptors, identities = _open_directory_components(Path(path), code)
-        yield lambda: _assert_directory_handles(Path(path), descriptors, identities, code)
+        if expected_identities is not None and (
+            len(identities) != len(expected_identities)
+            or any(
+                not _identity_matches(current, expected)
+                for current, expected in zip(identities, expected_identities, strict=True)
+            )
+        ):
+            raise OSError("directory components are not the enumerated identities")
+        yield _HeldDirectory(
+            path=Path(path),
+            component_descriptors=descriptors,
+            component_identities=identities,
+            code=code,
+            assert_directory_handles=_assert_directory_handles,
+        )
     except BootstrapError:
         raise
     except Exception as error:
@@ -2130,17 +2201,139 @@ def _held_local_directory(path: Path, code: str):
             raise BootstrapError(code, f"local directory handles could not be closed: {path}") from error
 
 
-def _held_directory_entries(path: Path, code: str):
-    with _held_local_directory(path, code) as assert_stable:
+@contextmanager
+def _held_directory_scan(
+    path: Path,
+    code: str,
+    *,
+    expected_identities: Sequence[Mapping[str, object]] | None = None,
+):
+    with _held_local_directory(
+        path,
+        code,
+        expected_identities=expected_identities,
+    ) as held:
         try:
             with os.scandir(path) as scanner:
-                entries = sorted(scanner, key=lambda entry: entry.name)
-            assert_stable()
-            return entries
+                held.assert_stable()
+                yield held, scanner
+                held.assert_stable()
         except BootstrapError:
             raise
+        except Exception as error:
+            raise BootstrapError(code, f"local directory scan failed: {path}") from error
+
+
+@contextmanager
+def _held_file_handle(path: Path, parent: _HeldDirectory, code: str):
+    try:
+        from run_beta3_live_guard import _open_bound_handle
+    except Exception as error:
+        raise BootstrapError(code, f"local file is unavailable: {path}") from error
+    descriptor: int | None = None
+    try:
+        descriptor, identity = _open_bound_handle(
+            Path(path),
+            code,
+            parent=parent,
+        )
+        yield descriptor, identity
+    except BootstrapError:
+        raise
+    except Exception as error:
+        raise BootstrapError(code, f"local file is unavailable: {path}") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise BootstrapError(code, f"local file handle could not be closed: {path}") from error
+
+
+def _held_file_snapshot(
+    path: Path,
+    parent: _HeldDirectory,
+    code: str,
+) -> _FileSnapshot:
+    try:
+        from run_beta3_live_guard import (
+            _identity_matches,
+            _read_held_bytes,
+            _windows_handle_identity,
+        )
+        with _held_file_handle(path, parent, code) as (descriptor, identity):
+            content = _read_held_bytes(descriptor, code)
+            after_identity = _windows_handle_identity(descriptor, code, directory=False)
+            if (
+                not _identity_matches(after_identity, identity)
+                or after_identity.get("st_size") != identity.get("st_size")
+            ):
+                raise OSError("file changed during held read")
+            parent.assert_stable()
+            return _file_snapshot_from_held(path, content, identity)
+    except BootstrapError:
+        raise
+    except Exception as error:
+        raise BootstrapError(code, f"local file is unavailable: {path}") from error
+
+
+def _validate_held_file(path: Path, parent: _HeldDirectory, code: str) -> None:
+    with _held_file_handle(path, parent, code):
+        parent.assert_stable()
+
+
+def _held_child_directory_identities(
+    path: Path,
+    parent: _HeldDirectory,
+    code: str,
+) -> tuple[Mapping[str, object], ...]:
+    try:
+        from run_beta3_live_guard import _open_path_handle, _windows_handle_identity
+    except Exception as error:
+        raise BootstrapError(code, f"local directory is unavailable: {path}") from error
+    descriptor: int | None = None
+    try:
+        parent.assert_stable()
+        descriptor = _open_path_handle(
+            Path(path.name),
+            code,
+            directory=True,
+            parent=parent.descriptor,
+        )
+        identity = _windows_handle_identity(descriptor, code, directory=True)
+        parent.assert_stable()
+        return tuple((*parent.component_identities, identity))
+    except BootstrapError:
+        raise
+    except Exception as error:
+        raise BootstrapError(code, f"local directory is unavailable: {path}") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise BootstrapError(code, f"local directory handle could not be closed: {path}") from error
+
+
+def _validate_missing_local_path(path: Path, code: str) -> None:
+    candidate = _absolute_local_path(Path(path)).parent
+    while True:
+        try:
+            identity = candidate.lstat()
+        except FileNotFoundError:
+            parent = candidate.parent
+            if parent == candidate:
+                _fail(code, f"local path has no existing ancestor: {path}")
+            candidate = parent
+            continue
         except OSError as error:
-            raise BootstrapError(code, f"local directory is unavailable: {path}") from error
+            raise BootstrapError(code, f"local path is unavailable: {path}") from error
+        if stat.S_ISLNK(identity.st_mode) or _is_reparse(identity):
+            _fail(code, f"local path has a reparse ancestor: {path}")
+        if not stat.S_ISDIR(identity.st_mode):
+            _fail(code, f"local path ancestor is not a directory: {candidate}")
+        with _held_local_directory(candidate, code):
+            return
 
 
 def _canonical_local_directory(path: Path, code: str) -> Path:
@@ -2159,17 +2352,18 @@ def _canonical_local_directory(path: Path, code: str) -> Path:
         raise BootstrapError(code, f"local directory is unavailable: {path}") from error
 
 
-def _local_tree_files(
+def _local_tree_snapshots(
     root: Path,
     code: str,
     *,
     allow_missing: bool = False,
-) -> tuple[Path, ...]:
+) -> tuple[_FileSnapshot, ...]:
     root = _absolute_local_path(Path(root))
     try:
         identity = root.lstat()
     except FileNotFoundError:
         if allow_missing:
+            _validate_missing_local_path(root, code)
             return ()
         raise BootstrapError(code, f"local directory is unavailable: {root}")
     except OSError as error:
@@ -2178,33 +2372,52 @@ def _local_tree_files(
         _fail(code, f"local directory is a link or reparse point: {root}")
     if not stat.S_ISDIR(identity.st_mode):
         _fail(code, f"local path is not a directory: {root}")
-    result: list[Path] = []
-    pending = [root]
+    result: list[_FileSnapshot] = []
+    pending: list[tuple[Path, tuple[Mapping[str, object], ...] | None]] = [(root, None)]
     while pending:
-        directory = pending.pop()
-        try:
-            entries = _held_directory_entries(directory, code)
-        except BootstrapError:
-            raise
-        except OSError as error:
-            raise BootstrapError(code, f"local directory is unavailable: {directory}") from error
-        for entry in entries:
-            path = Path(entry.path)
-            try:
-                entry_stat = entry.stat(follow_symlinks=False)
-            except OSError as error:
-                raise BootstrapError(code, f"local entry is unavailable: {path}") from error
-            if stat.S_ISLNK(entry_stat.st_mode) or _is_reparse(entry_stat):
-                _fail(code, f"local entry is a link or reparse point: {path}")
-            if stat.S_ISDIR(entry_stat.st_mode):
-                if entry.name != "__pycache__":
-                    pending.append(path)
-            elif stat.S_ISREG(entry_stat.st_mode):
-                if "__pycache__" not in path.parts and path.suffix != ".pyc":
-                    result.append(path)
-            else:
-                _fail(code, f"local entry is not a regular file or directory: {path}")
-    return tuple(sorted((_absolute_local_path(path) for path in result), key=_path_text))
+        directory, expected_identities = pending.pop()
+        with _held_directory_scan(
+            directory,
+            code,
+            expected_identities=expected_identities,
+        ) as (held, scanner):
+            for entry in sorted(scanner, key=lambda item: item.name):
+                path = directory / entry.name
+                try:
+                    entry_stat = entry.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise BootstrapError(code, f"local entry is unavailable: {path}") from error
+                held.assert_stable()
+                if stat.S_ISLNK(entry_stat.st_mode) or _is_reparse(entry_stat):
+                    _fail(code, f"local entry is a link or reparse point: {path}")
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    child_identities = _held_child_directory_identities(path, held, code)
+                    if entry.name != "__pycache__":
+                        pending.append((path, child_identities))
+                elif stat.S_ISREG(entry_stat.st_mode):
+                    if "__pycache__" not in path.parts and path.suffix != ".pyc":
+                        result.append(_held_file_snapshot(path, held, code))
+                    else:
+                        _validate_held_file(path, held, code)
+                else:
+                    _fail(code, f"local entry is not a regular file or directory: {path}")
+    return tuple(sorted(result, key=lambda snapshot: _path_text(snapshot.path)))
+
+
+def _local_tree_files(
+    root: Path,
+    code: str,
+    *,
+    allow_missing: bool = False,
+) -> tuple[Path, ...]:
+    return tuple(
+        snapshot.path
+        for snapshot in _local_tree_snapshots(
+            root,
+            code,
+            allow_missing=allow_missing,
+        )
+    )
 
 
 def _local_file_if_present(path: Path, code: str) -> Path | None:
@@ -2212,6 +2425,7 @@ def _local_file_if_present(path: Path, code: str) -> Path | None:
     try:
         identity = path.lstat()
     except FileNotFoundError:
+        _validate_missing_local_path(path, code)
         return None
     except OSError as error:
         raise BootstrapError(code, f"local file is unavailable: {path}") from error
@@ -2224,50 +2438,73 @@ def _local_file_if_present(path: Path, code: str) -> Path | None:
 
 
 def _audited_files(root: Path) -> tuple[Path, ...]:
+    return tuple(snapshot.path for snapshot in _audited_file_snapshots(root))
+
+
+def _audited_file_snapshots(root: Path) -> tuple[_FileSnapshot, ...]:
     root = _canonical_local_directory(root, "STATIC_INPUT_SOURCE_UNAVAILABLE")
-    candidates = [
-        _local_file_if_present(
-            root / "skills" / "implement-gwo" / "SKILL.md",
+    snapshots: list[_FileSnapshot] = []
+    for candidate in (
+        root / "skills" / "implement-gwo" / "SKILL.md",
+        root / "skills" / "orchestrator" / "SKILL.md",
+    ):
+        path = _local_file_if_present(
+            candidate,
             "STATIC_INPUT_SOURCE_UNAVAILABLE",
-        ),
-        _local_file_if_present(
-            root / "skills" / "orchestrator" / "SKILL.md",
-            "STATIC_INPUT_SOURCE_UNAVAILABLE",
-        ),
-        *(
-            path
-            for path in _local_tree_files(
-                root / "skills" / "orchestrator" / "scripts" / "gwo_v8",
-                "STATIC_INPUT_SOURCE_UNAVAILABLE",
-                allow_missing=True,
+        )
+        if path is not None:
+            snapshots.append(
+                _read_file_snapshot(path, "STATIC_INPUT_SOURCE_UNAVAILABLE")
             )
-            if path.suffix == ".py"
-        ),
-    ]
+    snapshots.extend(
+        snapshot
+        for snapshot in _local_tree_snapshots(
+            root / "skills" / "orchestrator" / "scripts" / "gwo_v8",
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+            allow_missing=True,
+        )
+        if snapshot.path.suffix == ".py"
+    )
     return tuple(
         sorted(
-            (path for path in candidates if path is not None),
-            key=lambda path: path.relative_to(root).as_posix(),
+            snapshots,
+            key=lambda snapshot: snapshot.path.relative_to(root).as_posix(),
+        )
+    )
+
+
+def _checkout_source_snapshots(
+    root: Path,
+    subject: CutoverSubject,
+) -> tuple[_FileSnapshot, ...]:
+    root = _canonical_local_directory(Path(root), "STATIC_INPUT_SOURCE_UNAVAILABLE")
+    snapshots = list(_audited_file_snapshots(root))
+    for package_name in subject.package_names:
+        package = root / "skills" / package_name
+        if not package.is_dir():
+            package = root / package_name
+        snapshots.extend(
+            _local_tree_snapshots(package, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+        )
+    unique: dict[Path, _FileSnapshot] = {}
+    for snapshot in snapshots:
+        previous = unique.get(snapshot.path)
+        if previous is not None and previous != snapshot:
+            _fail(
+                "STATIC_INPUT_SOURCE_UNAVAILABLE",
+                f"checkout file was changed during held traversal: {snapshot.path}",
+            )
+        unique[snapshot.path] = snapshot
+    return tuple(
+        sorted(
+            unique.values(),
+            key=lambda snapshot: snapshot.path.relative_to(root).as_posix(),
         )
     )
 
 
 def _checkout_source_files(root: Path, subject: CutoverSubject) -> tuple[Path, ...]:
-    root = _canonical_local_directory(Path(root), "STATIC_INPUT_SOURCE_UNAVAILABLE")
-    paths = set(_audited_files(root))
-    for package_name in subject.package_names:
-        package = root / "skills" / package_name
-        if not package.is_dir():
-            package = root / package_name
-        paths.update(
-            _local_tree_files(package, "STATIC_INPUT_SOURCE_UNAVAILABLE")
-        )
-    return tuple(
-        sorted(
-            (_absolute_local_path(path) for path in paths),
-            key=lambda path: path.relative_to(root).as_posix(),
-        )
-    )
+    return tuple(snapshot.path for snapshot in _checkout_source_snapshots(root, subject))
 
 
 def _snapshot_files(paths: Sequence[Path], code: str) -> tuple[_FileSnapshot, ...]:
@@ -2317,7 +2554,7 @@ def _static_records(
     observed = (
         tuple(snapshots)
         if snapshots is not None
-        else _snapshot_files(_audited_files(root), "STATIC_INPUT_SOURCE_UNAVAILABLE")
+        else _audited_file_snapshots(root)
     )
     snapshot_tree_sha256 = _snapshot_tree_digest(root, observed)
     for snapshot in observed:
@@ -2352,10 +2589,9 @@ def _read_stable_static_inputs(
     producer_sha256: str,
 ) -> tuple[CompatibilityPathReadback, list[SourceRecord]]:
     root = _canonical_local_directory(Path(root), "STATIC_INPUT_SOURCE_UNAVAILABLE")
-    before_paths = _audited_files(root)
-    if not before_paths:
+    before = _audited_file_snapshots(root)
+    if not before:
         _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "audited static input set is empty")
-    before = _snapshot_files(before_paths, "STATIC_INPUT_SOURCE_UNAVAILABLE")
     snapshot_tree_sha256 = _snapshot_tree_digest(root, before)
     scan_subject = replace(subject, source_tree_digest=snapshot_tree_sha256)
     try:
@@ -2378,8 +2614,7 @@ def _read_stable_static_inputs(
         or scanned.source_tree_digest != snapshot_tree_sha256
     ):
         _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "compatibility readback source identity changed")
-    after_paths = _audited_files(root)
-    after = _snapshot_files(after_paths, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+    after = _audited_file_snapshots(root)
     _require_stable_snapshots(before, after, "STATIC_INPUT_SOURCE_UNAVAILABLE")
     readback = replace(
         scanned,
@@ -2499,15 +2734,10 @@ def _package_file_snapshots(
             raise BootstrapError(
                 "PACKAGE_SOURCE_UNAVAILABLE", f"package manifest is unavailable: {manifest}"
             )
-        files = sorted(
-            _local_tree_files(package, "PACKAGE_SOURCE_UNAVAILABLE"),
-            key=lambda path: path.relative_to(package).as_posix(),
-        )
+        files = _local_tree_snapshots(package, "PACKAGE_SOURCE_UNAVAILABLE")
         if not files:
             _fail("PACKAGE_SOURCE_UNAVAILABLE", f"package file set is empty: {package}")
-        for path in files:
-            snapshot = _read_file_snapshot(path, "PACKAGE_SOURCE_UNAVAILABLE")
-            snapshots.append((label, package, snapshot))
+        snapshots.extend((label, package, snapshot) for snapshot in files)
     return tuple(snapshots)
 
 

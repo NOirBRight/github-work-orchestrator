@@ -1127,6 +1127,89 @@ def test_local_tree_reads_normal_path_without_reparse(tmp_path):
     ) == (source.resolve(),)
 
 
+def test_local_tree_rejects_ordinary_parent_replacement_after_scan_assertion(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    source = root / "source.py"
+    source.write_bytes(b"original")
+    original_scandir = os.scandir
+    replaced = False
+
+    class Entry:
+        def __init__(self, entry):
+            self._entry = entry
+            self.name = entry.name
+            self.path = entry.path
+
+        def stat(self, *, follow_symlinks=True):
+            nonlocal replaced
+            observed = self._entry.stat(follow_symlinks=follow_symlinks)
+            if not replaced:
+                original = tmp_path / "original-root"
+                root.rename(original)
+                root.mkdir()
+                (root / source.name).write_bytes(b"replacement")
+                replaced = True
+            return observed
+
+    class Scanner:
+        def __init__(self, scanner):
+            self._scanner = scanner
+
+        def __enter__(self):
+            self._scanner.__enter__()
+            return (Entry(entry) for entry in self._scanner)
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return self._scanner.__exit__(exc_type, exc_value, traceback)
+
+    def replacing_scandir(path):
+        scanner = original_scandir(path)
+        if Path(path) == root:
+            return Scanner(scanner)
+        return scanner
+
+    monkeypatch.setattr(attestor_module.os, "scandir", replacing_scandir)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._local_tree_files(root, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+def test_local_tree_rejects_dangling_reparse_ancestor_when_allow_missing(tmp_path):
+    redirected = tmp_path / "redirected"
+    try:
+        redirected.symlink_to(tmp_path / "missing-target", target_is_directory=True)
+    except OSError:
+        pytest.skip("directory reparse/symlink creation is unavailable")
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._local_tree_files(
+            redirected / "tree",
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+            allow_missing=True,
+        )
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+def test_dynamic_sidecars_reject_dangling_reparse_parent(tmp_path):
+    redirected = tmp_path / "redirected"
+    try:
+        redirected.symlink_to(tmp_path / "missing-target", target_is_directory=True)
+    except OSError:
+        pytest.skip("directory reparse/symlink creation is unavailable")
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._dynamic_sidecars(redirected / "store.sqlite3")
+
+    assert error.value.code == "STORE_SOURCE_UNAVAILABLE"
+
+
 def test_source_observation_rejects_role_or_read_mode_substitution():
     subject = _subject()
     attempt = _attempt(subject)
