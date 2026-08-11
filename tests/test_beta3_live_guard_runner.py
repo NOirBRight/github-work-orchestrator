@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib.util
 import inspect
 import json
@@ -718,6 +719,61 @@ def test_explicit_fixture_configuration_is_not_the_production_default(tmp_path):
     config = _fixture_config(tmp_path)
     assert config is not runner.DEFAULT_CONFIG
     assert config.release_subject_digest == "d" * 64
+
+
+@pytest.mark.parametrize("missing_port", ("git_runner", "dependencies"))
+def test_run_fixture_requires_explicit_ports_before_live_access(
+    tmp_path, monkeypatch, missing_port
+):
+    config = _fixture_config(tmp_path)
+    binding = _FixtureBinding(config)
+    dependencies, _ = _stable_dependencies()
+    fixture_git_runner = _git_runner_factory(config)
+    events: list[str] = []
+
+    def recording_git(*args, **kwargs):
+        events.append("git")
+        return fixture_git_runner(*args, **kwargs)
+
+    def forbidden(name):
+        def call(*_args, **_kwargs):
+            events.append(name)
+            raise AssertionError(f"fixture port validation reached {name}")
+
+        return call
+
+    if missing_port != "git_runner":
+        binding.git_runner = recording_git
+    if missing_port != "dependencies":
+        binding.dependencies = dependencies
+
+    monkeypatch.setattr(runner, "_default_git_runner", forbidden("default_git"))
+    monkeypatch.setattr(
+        runner, "_production_dependencies", forbidden("production_dependencies")
+    )
+    monkeypatch.setattr(
+        runner, "_production_source_command", forbidden("provider_or_cim")
+    )
+    monkeypatch.setattr(
+        runner.secrets,
+        "token_hex",
+        lambda count: events.append("nonce") or "a" * (count * 2),
+    )
+    monkeypatch.setattr(runner, "_write_exclusive_json", forbidden("output"))
+
+    result = runner.run_fixture(
+        config,
+        binding=binding,
+        execute=True,
+        run_id="fixture-ports-required",
+    )
+
+    assert result["status"] == "UNAVAILABLE"
+    assert result["exit_code"] == 3
+    assert result["code"] == "DEPENDENCY_INVALID"
+    assert events == []
+    assert not config.report_path.exists()
+    assert not config.evidence_path.exists()
 
 
 def test_attestor_provenance_rejects_shadowed_import_origin(tmp_path, monkeypatch):
@@ -2101,6 +2157,56 @@ def test_input_lease_stays_held_through_both_publications(tmp_path, monkeypatch)
     assert original_input_lease is not None
 
 
+@pytest.mark.parametrize("drift_before_evidence", (False, True))
+def test_real_input_lease_holds_fixture_manifest_through_publication(
+    tmp_path, monkeypatch, drift_before_evidence
+):
+    binding = _fixture_binding(tmp_path)
+    config = _fixture_config_for_binding(binding)
+    original_input_lease = runner._input_lease
+    original_write = runner._write_exclusive_json
+    observed: dict[str, object] = {}
+    writes: list[Path] = []
+
+    def capture_input_lease(*args, **kwargs):
+        lease = original_input_lease(*args, **kwargs)
+        observed["lease"] = lease
+        return lease
+
+    def write(path, value, **kwargs):
+        lease = observed["lease"]
+        manifest_bindings = [
+            item for item in lease._bindings if item.path == binding.manifest_path
+        ]
+        assert len(manifest_bindings) == 1
+        assert manifest_bindings[0].descriptor >= 0
+        assert str(binding.manifest_path.resolve()) in lease.retained_identities()
+        writes.append(path)
+        digest = original_write(path, value, **kwargs)
+        if drift_before_evidence and path == config.report_path:
+            binding.manifest_path.write_bytes(b'{"fixture":"drift"}\n')
+        return digest
+
+    monkeypatch.setattr(runner, "_input_lease", capture_input_lease)
+    monkeypatch.setattr(runner, "_write_exclusive_json", write)
+
+    result = runner.run_fixture(
+        config,
+        binding=binding,
+        execute=True,
+        run_id="real-manifest-lease",
+    )
+
+    if drift_before_evidence:
+        assert result["status"] == "REFUSED"
+        assert result["code"] == "LIVE_INPUT_DRIFT"
+        assert writes == [config.report_path]
+        assert not config.evidence_path.exists()
+    else:
+        assert result["status"] == "GO", result
+        assert writes == [config.report_path, config.evidence_path]
+
+
 def test_input_lease_retains_runtime_runbook_and_attestor_files(tmp_path):
     config = _fixture_config(tmp_path)
     preflight_result = runner.preflight(config, git_runner=_git_runner_factory(config))
@@ -2996,6 +3102,33 @@ def test_publication_rejects_runbook_digest_divergence(
     assert result["code"] == "OUTPUT_WRITE_FAILED"
 
 
+@pytest.mark.parametrize("output_kind", ("report", "evidence"))
+def test_publication_rejects_forged_top_level_subject_digest(
+    tmp_path, monkeypatch, output_kind
+):
+    config = _fixture_config(tmp_path)
+    dependencies, _ = _stable_dependencies()
+    builder_name = f"_attested_{output_kind}"
+    original_builder = getattr(runner, builder_name)
+
+    def forged_builder(*args, **kwargs):
+        value = original_builder(*args, **kwargs)
+        return {**value, "subject_digest": "f" * 64}
+
+    monkeypatch.setattr(runner, builder_name, forged_builder)
+    result = _run_fixture(
+        config,
+        execute=True,
+        run_id="forged-subject-digest",
+        git_runner=_git_runner_factory(config),
+        dependencies=dependencies,
+    )
+
+    assert result["status"] == "UNAVAILABLE", result
+    assert result["exit_code"] == 3
+    assert result["code"] == "OUTPUT_WRITE_FAILED"
+
+
 def test_guard_report_and_attested_bundle_mismatch_is_unavailable(tmp_path):
     config = _fixture_config(tmp_path)
     stable, _ = _stable_dependencies()
@@ -3295,7 +3428,7 @@ def test_execute_path_does_not_create_gateway_artifact_or_sqlite_sidecar(tmp_pat
         assert not Path(f"{path}-shm").exists()
 
 
-def test_main_default_prints_canonical_preflight_json(tmp_path):
+def test_fixture_preflight_returns_ok_without_execution(tmp_path):
     config = _fixture_config(tmp_path)
     result = _run_fixture(
         config,
@@ -3305,6 +3438,27 @@ def test_main_default_prints_canonical_preflight_json(tmp_path):
 
     assert result["exit_code"] == 0
     assert result["status"] == "PREFLIGHT_OK"
+
+
+def test_main_dispatches_parser_to_run_and_prints_canonical_json(monkeypatch):
+    calls: list[tuple[object, object, object]] = []
+    expected = {"status": "NO_GO", "exit_code": 2, "decision": "NO_GO"}
+
+    def fake_run(config, *, execute, run_id, **_ports):
+        calls.append((config, execute, run_id))
+        return expected
+
+    stdout = io.StringIO()
+    monkeypatch.setattr(runner, "run", fake_run)
+
+    exit_code = runner.main(
+        ["--execute", "--run-id", "cli-dispatch"],
+        stdout=stdout,
+    )
+
+    assert calls == [(None, True, "cli-dispatch")]
+    assert stdout.getvalue() == runner.canonical_json_bytes(expected).decode("utf-8")
+    assert exit_code == 2
 
 
 def test_go_rejects_unbound_guard_digests(tmp_path):

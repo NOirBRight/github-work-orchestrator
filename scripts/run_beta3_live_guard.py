@@ -3815,6 +3815,7 @@ def _validate_attested_report_value(
         ("runbook", _path_text(Path(__file__))),
         ("runbook_sha256", attempt.runner_sha256),
         ("decision", replay_value["decision"]),
+        ("subject_digest", _exact_digest_value(bundle.subject.canonical())),
         *subject_metadata.items(),
         ("activation_performed", False),
     ):
@@ -3861,6 +3862,7 @@ def _validate_attested_evidence_value(
         ("runbook", _path_text(Path(__file__))),
         ("runbook_sha256", attempt.runner_sha256),
         ("fixed_subject", bundle.subject.canonical()),
+        ("subject_digest", _exact_digest_value(bundle.subject.canonical())),
         *subject_metadata.items(),
         ("report_digest", report_digest),
         ("report_path", _path_text(config.report_path)),
@@ -5053,15 +5055,41 @@ def run_fixture(
     try:
         _assert_subject_binding_stable(binding)
         _assert_release_subject_binding(subject, binding)
+        if execute and (type(run_id) is not str or not run_id):
+            return _result(
+                "REFUSED",
+                1,
+                code="RUN_ID_REQUIRED",
+                detail="execute requires one non-empty operator run_id",
+            )
+        fixture_git_runner = getattr(binding, "git_runner", None)
+        fixture_dependencies = getattr(binding, "dependencies", None)
+        fixture_guard_factory = getattr(binding, "guard_factory", None)
+        fixture_control_reader = getattr(binding, "control_reader", None)
+        fixture_package_reader = getattr(binding, "package_reader", None)
+        _validate_git_runner(fixture_git_runner)
+        if execute:
+            _validate_dependency_inputs(
+                config,
+                fixture_dependencies,
+                fixture_guard_factory,
+                fixture_control_reader,
+                fixture_package_reader,
+            )
+            if fixture_dependencies is None:
+                raise RunnerError(
+                    "DEPENDENCY_INVALID",
+                    "fixture execution requires explicit ExecutionDependencies",
+                )
         return _run_bound(
             config,
             execute=execute,
             run_id=run_id,
-            git_runner=getattr(binding, "git_runner", _default_git_runner),
-            dependencies=getattr(binding, "dependencies", None),
-            guard_factory=getattr(binding, "guard_factory", None),
-            control_reader=getattr(binding, "control_reader", None),
-            package_reader=getattr(binding, "package_reader", None),
+            git_runner=fixture_git_runner,
+            dependencies=fixture_dependencies,
+            guard_factory=fixture_guard_factory,
+            control_reader=fixture_control_reader,
+            package_reader=fixture_package_reader,
             release_subject=subject,
             subject_binding=binding,
             production=False,
