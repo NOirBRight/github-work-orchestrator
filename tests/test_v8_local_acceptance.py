@@ -222,26 +222,39 @@ def test_complete_readback_is_canonical_linked_and_idempotent_after_replay(
     assert delivery["target_contains_batch_sha"] is True
     assert proof["accepted_candidate_receipt_digest"] == accepted["receipt_digest"]
     assert proof["candidate_diff_record_digest"] == diff["record_digest"]
-    assert proof["batch_delivery_receipt_digest"] == facts["batch"]["delivery_receipt_digest"]
+    assert (
+        proof["batch_delivery_receipt_digest"]
+        == facts["batch"]["delivery_receipt_digest"]
+    )
     assert proof["result_digest"] == facts["result"]["result_digest"]
     assert proof["evidence_digests"] == facts["evidence"]["digests"]
 
-    assert runner.digest_value(
-        {key: value for key, value in candidate.items() if key != "receipt_digest"}
-    ) == candidate["receipt_digest"]
-    assert runner.digest_value(
-        {key: value for key, value in accepted.items() if key != "receipt_digest"}
-    ) == accepted["receipt_digest"]
+    assert (
+        runner.digest_value(
+            {key: value for key, value in candidate.items() if key != "receipt_digest"}
+        )
+        == candidate["receipt_digest"]
+    )
+    assert (
+        runner.digest_value(
+            {key: value for key, value in accepted.items() if key != "receipt_digest"}
+        )
+        == accepted["receipt_digest"]
+    )
     diff_body = {key: value for key, value in diff.items() if key != "record_digest"}
-    assert hashlib.sha256(
-        b"gwo.candidate-diff-record.v1\x00" + runner.canonical_bytes(diff_body)
-    ).hexdigest() == diff["record_digest"]
+    assert (
+        hashlib.sha256(
+            b"gwo.candidate-diff-record.v1\x00" + runner.canonical_bytes(diff_body)
+        ).hexdigest()
+        == diff["record_digest"]
+    )
     delivery_body = {
         key: value for key, value in delivery.items() if key != "proof_digest"
     }
-    assert runner.digest_value(
-        {"kind": "batch-delivery-proof.v1", **delivery_body}
-    ) == delivery["proof_digest"]
+    assert (
+        runner.digest_value({"kind": "batch-delivery-proof.v1", **delivery_body})
+        == delivery["proof_digest"]
+    )
     proof_value = runner.ResultIntegrityProof(
         **{
             field.name: (
@@ -252,12 +265,17 @@ def test_complete_readback_is_canonical_linked_and_idempotent_after_replay(
             for field in fields(runner.ResultIntegrityProof)
         }
     )
-    assert proof_value.expected_batch_delivery_proof_digest() == delivery["proof_digest"]
+    assert (
+        proof_value.expected_batch_delivery_proof_digest() == delivery["proof_digest"]
+    )
     assert proof_value.expected_result_digest() == proof["result_digest"]
 
     for observation_group in readback["observations"].values():
         for observation in observation_group:
-            assert runner.WorkRunObservation.from_canonical(observation).canonical() == observation
+            assert (
+                runner.WorkRunObservation.from_canonical(observation).canonical()
+                == observation
+            )
 
     assert record["record_digest"] == runner.digest_value(
         {key: value for key, value in record.items() if key != "record_digest"}
@@ -367,6 +385,8 @@ def test_root_canary_covers_four_work_runs_review_repair_rejection_and_batches(
     assert facts["concurrency"] == {
         "worker_slot_limit": 4,
         "max_held": 4,
+        "final_held": 0,
+        "final_available": 4,
         "work_run_count": 4,
     }
     assert facts["exclusive_resources"] == {
@@ -428,21 +448,17 @@ def test_root_canary_covers_four_work_runs_review_repair_rejection_and_batches(
     candidates = {item["ticket_key"]: item for item in readback["candidate_receipts"]}
     diffs = {
         ticket_key: item
-        for ticket_key, item in zip(
-            (*standard, strict), readback["candidate_diffs"]
-        )
+        for ticket_key, item in zip((*standard, strict), readback["candidate_diffs"])
     }
     accepted = {
-        item["ticket_key"]: item
-        for item in readback["accepted_candidate_receipts"]
+        item["ticket_key"]: item for item in readback["accepted_candidate_receipts"]
     }
     result_proofs = {
         item["accepted_candidate_receipt_digest"]: item
         for item in readback["result_integrities"]
     }
     deliveries = {
-        item["delivery_stable_action_id"]: item
-        for item in readback["delivery_proofs"]
+        item["delivery_stable_action_id"]: item for item in readback["delivery_proofs"]
     }
     for ticket_key in (*standard, strict):
         candidate = candidates[ticket_key]
@@ -454,10 +470,16 @@ def test_root_canary_covers_four_work_runs_review_repair_rejection_and_batches(
 
         assert run["candidate_receipt_digest"] == candidate["receipt_digest"]
         assert candidate["diff_record_digest"] == diff["record_digest"]
-        assert accepted_candidate["candidate_receipt_digest"] == candidate["receipt_digest"]
+        assert (
+            accepted_candidate["candidate_receipt_digest"]
+            == candidate["receipt_digest"]
+        )
         assert accepted_candidate["diff_record_digest"] == diff["record_digest"]
         assert accepted_candidate["candidate_sha"] == candidate["candidate_commit_oid"]
-        assert result["accepted_candidate_receipt_digest"] == accepted_candidate["receipt_digest"]
+        assert (
+            result["accepted_candidate_receipt_digest"]
+            == accepted_candidate["receipt_digest"]
+        )
         assert result["candidate_commit_oid"] == candidate["candidate_commit_oid"]
         assert result["candidate_diff_record_digest"] == diff["record_digest"]
         assert result["batch_delivery_receipt_digest"] == run["delivery_receipt_digest"]
@@ -466,6 +488,39 @@ def test_root_canary_covers_four_work_runs_review_repair_rejection_and_batches(
         assert delivery["proof_digest"] == result["batch_delivery_proof_digest"]
         assert delivery["batch_id"] == run["batch_id"]
         assert delivery["batch_sha"] == run["batch_sha"]
+
+
+def test_root_canary_persists_authoritative_candidate_gate_transitions(
+    tmp_path: Path,
+):
+    runner = _load_runner()
+
+    record = runner.run_local_acceptance(
+        root=tmp_path,
+        run_id="root-candidate-transitions",
+        scenario="root",
+    )
+
+    transitions = record["facts"]["candidate_gate"]["transitions"]
+    by_ticket = {}
+    for transition in transitions:
+        by_ticket.setdefault(transition["ticket_key"], []).append(transition)
+
+    assert [item["status"] for item in by_ticket["issue:101"]] == ["review_accepted"]
+    assert [item["status"] for item in by_ticket["issue:102"]] == [
+        "repair_required",
+        "repair_accepted",
+    ]
+    assert [item["status"] for item in by_ticket["issue:103"]] == [
+        "ordinary_rejected",
+        "review_accepted",
+    ]
+    assert [item["status"] for item in by_ticket["issue:104"]] == ["review_accepted"]
+    assert (
+        by_ticket["issue:103"][0]["candidate_receipt"]["candidate_commit_oid"]
+        != (by_ticket["issue:103"][1]["candidate_receipt"]["candidate_commit_oid"])
+    )
+    assert all(transition["persisted"] is True for transition in transitions)
 
 
 def test_root_canary_uses_public_advance_for_watchdog_lost_wake_duplicate_and_restart(
@@ -501,8 +556,8 @@ def test_root_canary_uses_public_advance_for_watchdog_lost_wake_duplicate_and_re
     assert replay["delivery_execute_calls_before_restart"] == 4
     assert replay["delivery_execute_calls_after_replay"] == 4
     assert any(
-        wake_ref is not None and wake_ref.startswith("watchdog:due:")
-        for _name, wake_ref in calls
+        name == "advance" and wake_ref == replay["callback_emitted"]
+        for name, wake_ref in calls
     )
     assert replay["duplicate_callback_ref"].startswith("watchdog:runtime:")
     assert any(
@@ -517,7 +572,7 @@ def test_root_cli_output_is_canonical_and_deterministic(tmp_path: Path):
         sys.executable,
         str(RUNNER),
         "--root",
-        str(tmp_path / "caller-root"),
+        "PLACEHOLDER_ROOT",
         "--run-id",
         "root-cli-run",
         "--scenario",
@@ -526,7 +581,10 @@ def test_root_cli_output_is_canonical_and_deterministic(tmp_path: Path):
     environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
     first = subprocess.run(
-        command,
+        [
+            str(value).replace("PLACEHOLDER_ROOT", str(tmp_path / "first-root"))
+            for value in command
+        ],
         cwd=ROOT,
         env=environment,
         capture_output=True,
@@ -534,7 +592,10 @@ def test_root_cli_output_is_canonical_and_deterministic(tmp_path: Path):
         check=False,
     )
     second = subprocess.run(
-        command,
+        [
+            str(value).replace("PLACEHOLDER_ROOT", str(tmp_path / "second-root"))
+            for value in command
+        ],
         cwd=ROOT,
         env=environment,
         capture_output=True,
