@@ -552,6 +552,25 @@ def test_binding_rejects_os_replace_manifest_identity_change(tmp_path: Path):
 
 
 @pytest.mark.skipif(
+    os.name == "nt", reason="POSIX permits replacement while a handle is held"
+)
+def test_binding_rejects_identical_os_replace_manifest_identity_change(
+    tmp_path: Path,
+):
+    manifest, binding = _load_binding_fixture(tmp_path)
+    try:
+        replacement = tmp_path / "replacement.json"
+        replacement.write_bytes(manifest.read_bytes())
+        os.replace(replacement, manifest)
+        assert manifest.read_bytes() == binding.raw_bytes
+        with pytest.raises(ReleaseSubjectError) as error:
+            binding.assert_stable()
+        assert error.value.code == "RELEASE_SUBJECT_DRIFT"
+    finally:
+        binding.close()
+
+
+@pytest.mark.skipif(
     os.name == "nt", reason="POSIX permits delete/recreate while a handle is held"
 )
 def test_binding_rejects_delete_recreate_manifest_identity_change(tmp_path: Path):
@@ -576,6 +595,41 @@ def test_windows_held_binding_blocks_manifest_replace(tmp_path: Path):
         with pytest.raises(OSError):
             os.replace(replacement, manifest)
         binding.assert_stable()
+    finally:
+        binding.close()
+
+
+def test_binding_rejects_identity_only_fresh_observation_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    manifest, binding = _load_binding_fixture(tmp_path)
+    fresh_identity = dict(binding.identity)
+    if "file_id" in fresh_identity:
+        file_id = str(fresh_identity["file_id"])
+        replacement = "0" * len(file_id)
+        if replacement == file_id:
+            replacement = "1" * len(file_id)
+        fresh_identity["file_id"] = replacement
+    else:
+        fresh_identity["st_ino"] = int(fresh_identity["st_ino"]) + 1
+
+    def same_bytes_with_different_identity(
+        path: Path, code: str
+    ) -> tuple[bytes, dict[str, object]]:
+        assert path == manifest
+        assert code == "RELEASE_SUBJECT_DRIFT"
+        return binding.raw_bytes, fresh_identity
+
+    monkeypatch.setattr(
+        release_subject,
+        "_read_regular_file_once",
+        same_bytes_with_different_identity,
+    )
+    try:
+        with pytest.raises(ReleaseSubjectError) as error:
+            binding.assert_stable()
+        assert error.value.code == "RELEASE_SUBJECT_DRIFT"
     finally:
         binding.close()
 
