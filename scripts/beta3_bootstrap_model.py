@@ -717,6 +717,11 @@ def require_read_only_surface(source: object, *, required_method: str) -> None:
         import inspect
 
         source_type = type(source)
+        if type(source_type) is not type:
+            raise BootstrapError(
+                "UNSAFE_SOURCE_CAPABILITY",
+                "source type uses an unsupported custom metaclass",
+            )
         source_mro = source_type.__mro__
         if any(
             name in vars(cls)

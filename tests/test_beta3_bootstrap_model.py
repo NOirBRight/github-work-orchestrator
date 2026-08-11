@@ -597,3 +597,48 @@ def test_capability_check_does_not_execute_side_effecting_property():
         require_read_only_surface(SideEffecting(), required_method="read")
     assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
     assert accesses == []
+
+
+def test_capability_check_rejects_metaclass_hidden_inherited_callable():
+    class Inherited:
+        def read(self):
+            return object()
+
+        def __getattribute__(self, name):
+            if name == "publish":
+                return lambda: object()
+            return object.__getattribute__(self, name)
+
+    class HidingMeta(type):
+        def __getattribute__(cls, name):
+            if name == "__mro__":
+                return (cls, object)
+            return super().__getattribute__(name)
+
+    class Source(Inherited, metaclass=HidingMeta):
+        pass
+
+    with pytest.raises(BootstrapError) as error:
+        require_read_only_surface(Source(), required_method="read")
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+
+
+def test_capability_check_does_not_execute_metaclass_attribute_resolution():
+    accesses = []
+
+    class SideEffectMeta(type):
+        def __getattribute__(cls, name):
+            accesses.append(name)
+            return super().__getattribute__(name)
+
+    class SideEffecting(metaclass=SideEffectMeta):
+        def read(self):
+            return object()
+
+        def publish(self):
+            return object()
+
+    with pytest.raises(BootstrapError) as error:
+        require_read_only_surface(SideEffecting(), required_method="read")
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+    assert accesses == []
