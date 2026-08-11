@@ -738,5 +738,4 @@ def test_root_acceptance_is_canonical_across_independent_roots(tmp_path: Path):
     )
     assert first["record_digest"] == second["record_digest"]
     assert runner.canonical_json(first) == runner.canonical_json(second)
-    assert first["facts"]["git_readback"]["candidate_objects"] == second["facts"]["git_readback"]["candidate_objects"]
     assert len(first["facts"]["git_readback"]["candidate_objects"]) == 4
