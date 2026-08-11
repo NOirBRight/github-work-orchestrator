@@ -2415,6 +2415,11 @@ def _local_input_directories(config: RunnerConfig) -> tuple[Path, ...]:
         Path(config.rollback_store).parent,
         Path(config.prior_store).parent,
         Path(config.fresh_receipt).parent,
+        Path(config.report_path).parent,
+        Path(config.evidence_path).parent,
+        Path(config.gateway_store_path).parent,
+        Path(config.artifact_root).parent,
+        Path(__file__).resolve().parent,
         *_local_package_roots(config),
     ]
     guard_root = Path(config.repository_root) / "skills" / "orchestrator" / "scripts" / "gwo_v8"
@@ -2432,8 +2437,62 @@ def _local_input_directories(config: RunnerConfig) -> tuple[Path, ...]:
     return tuple(unique)
 
 
+def _preflight_file_snapshots(
+    config: RunnerConfig,
+    preflight_result: Mapping[str, object],
+    local_paths: Sequence[Path],
+) -> dict[str, dict[str, object]]:
+    snapshots: dict[str, dict[str, object]] = {}
+
+    def add(path: Path, identity: object, sha256: object) -> None:
+        if type(identity) is dict and type(sha256) is str:
+            snapshots[_path_text(path)] = {
+                "identity": dict(identity),
+                "sha256": sha256,
+            }
+
+    stores = preflight_result.get("_stores")
+    if type(stores) is dict:
+        for path in (
+            Path(config.fresh_store),
+            Path(config.rollback_store),
+            Path(config.prior_store),
+        ):
+            snapshot = stores.get(_path_text(path))
+            if type(snapshot) is dict:
+                add(path, snapshot.get("identity"), snapshot.get("sha256"))
+
+    receipt = preflight_result.get("_receipt")
+    if type(receipt) is dict:
+        add(
+            Path(config.fresh_receipt),
+            receipt.get("_identity"),
+            preflight_result.get("_receipt_digest"),
+        )
+
+    packages = preflight_result.get("_packages")
+    if type(packages) is dict:
+        identities = packages.get("file_identities")
+        hashes = packages.get("file_hashes")
+        if type(identities) is dict and type(hashes) is dict:
+            for path in local_paths:
+                path_text = _path_text(path)
+                add(path, identities.get(path_text), hashes.get(path_text))
+        package_paths = packages.get("file_paths")
+        if type(package_paths) is list and all(type(path) is str for path in package_paths):
+            observed_package_paths = {
+                _path_text(path)
+                for path in _local_input_files(config)
+            }
+            if observed_package_paths != set(package_paths):
+                raise RunnerError(
+                    "LIVE_INPUT_DRIFT",
+                    "package file set changed after preflight",
+                )
+    return snapshots
+
+
 def _input_lease(config: RunnerConfig, preflight_result: dict[str, object]) -> _InputLease:
-    expected: dict[Path, Mapping[str, object]] = {}
     local_paths = (
         Path(config.fresh_store),
         Path(config.rollback_store),
@@ -2445,14 +2504,19 @@ def _input_lease(config: RunnerConfig, preflight_result: dict[str, object]) -> _
         *(Path(__file__).resolve().with_name(name) for name in _ATTESTOR_MODULE_NAMES),
         *_local_input_files(config),
     )
+    preflight_snapshots = _preflight_file_snapshots(config, preflight_result, local_paths)
+    expected: dict[Path, Mapping[str, object]] = {}
     for path in local_paths:
         if not _lexists(path):
             raise RunnerError("ATTESTATION_UNAVAILABLE", f"retained local input is unavailable: {path}")
-        snapshot = _bound_file_snapshot(path, "LIVE_INPUT_DRIFT")
-        expected[path] = {
-            "identity": snapshot["identity"],
-            "sha256": snapshot["sha256"],
-        }
+        snapshot = preflight_snapshots.get(_path_text(path))
+        if snapshot is None:
+            current = _bound_file_snapshot(path, "LIVE_INPUT_DRIFT")
+            snapshot = {
+                "identity": current["identity"],
+                "sha256": current["sha256"],
+            }
+        expected[path] = snapshot
     return _InputLease(expected, directories=_local_input_directories(config))
 
 
@@ -3580,12 +3644,15 @@ def _canonical_provenance_path(value: object, label: str) -> Path:
     if not candidate.is_absolute():
         _provenance_mismatch(f"{label} is not an absolute path")
     try:
-        return candidate.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as error:
         raise RunnerError(
             "ATTESTATION_PROVENANCE_MISMATCH",
             f"{label} is not a canonical existing path",
         ) from error
+    if candidate != resolved:
+        _provenance_mismatch(f"{label} is not a canonical existing path")
+    return resolved
 
 
 def _reviewed_provenance() -> dict[str, object]:
@@ -3628,6 +3695,21 @@ def _reviewed_provenance() -> dict[str, object]:
     runner_path = _canonical_provenance_path(runner["path"], "reviewed runner path")
     if runner_path != Path(__file__).resolve() or runner["module"] != Path(__file__).stem:
         _provenance_mismatch("reviewed runner origin is not canonical")
+    runner_module = sys.modules.get(__name__)
+    if runner_module is not None:
+        module_path = getattr(runner_module, "__file__", None)
+        if module_path is not None and _canonical_provenance_path(
+            module_path,
+            "runner module origin",
+        ) != runner_path:
+            _provenance_mismatch("runner module origin is not canonical")
+        module_spec = getattr(runner_module, "__spec__", None)
+        spec_origin = getattr(module_spec, "origin", None)
+        if spec_origin not in (None, "built-in") and _canonical_provenance_path(
+            spec_origin,
+            "runner module spec origin",
+        ) != runner_path:
+            _provenance_mismatch("runner module spec origin is not canonical")
     if type(runner["sha256"]) is not str or _HEX64.fullmatch(runner["sha256"]) is None:
         _provenance_mismatch("reviewed runner hash is not exact")
     expected_root = Path(__file__).resolve().parent
@@ -3766,15 +3848,13 @@ def _production_dependencies(
     )
 
 
-def _dependencies_or_raise(
+def _validate_dependency_inputs(
     config: RunnerConfig,
     dependencies: ExecutionDependencies | None,
     guard_factory: Callable[[RunnerConfig, object], object] | None,
     control_reader: Callable[[], object] | None,
     package_reader: Callable[[RunnerConfig], object] | None,
-    *,
-    producer_sha256: str,
-) -> ExecutionDependencies:
+) -> None:
     if config.authoritative_legacy_snapshot is not None or config.production_readers is not None:
         raise RunnerError(
             "DEPENDENCY_INJECTION_FORBIDDEN",
@@ -3786,7 +3866,7 @@ def _dependencies_or_raise(
             "legacy live Guard callbacks are forbidden",
         )
     if dependencies is None:
-        return _production_dependencies(config, producer_sha256)
+        return
     if type(dependencies) is not ExecutionDependencies:
         raise RunnerError("DEPENDENCY_INVALID", "dependencies have the wrong exact type")
     if not callable(getattr(dependencies.control_ownership_attestor, "observe", None)):
@@ -3795,6 +3875,31 @@ def _dependencies_or_raise(
         raise RunnerError("DEPENDENCY_INVALID", "legacy attestor is not public")
     if not callable(dependencies.replay_guard):
         raise RunnerError("DEPENDENCY_INVALID", "replay guard is not callable")
+
+
+def _validate_git_runner(git_runner: object) -> None:
+    if not callable(git_runner):
+        raise RunnerError("DEPENDENCY_INVALID", "git runner is not callable")
+
+
+def _dependencies_or_raise(
+    config: RunnerConfig,
+    dependencies: ExecutionDependencies | None,
+    guard_factory: Callable[[RunnerConfig, object], object] | None,
+    control_reader: Callable[[], object] | None,
+    package_reader: Callable[[RunnerConfig], object] | None,
+    *,
+    producer_sha256: str,
+) -> ExecutionDependencies:
+    _validate_dependency_inputs(
+        config,
+        dependencies,
+        guard_factory,
+        control_reader,
+        package_reader,
+    )
+    if dependencies is None:
+        return _production_dependencies(config, producer_sha256)
     return dependencies
 
 
@@ -3836,6 +3941,18 @@ def run(
             code="RUN_ID_REQUIRED",
             detail="execute requires one non-empty operator run_id",
         )
+    if execute:
+        try:
+            _validate_git_runner(git_runner)
+            _validate_dependency_inputs(
+                config,
+                dependencies,
+                guard_factory,
+                control_reader,
+                package_reader,
+            )
+        except RunnerError as error:
+            return _result("UNAVAILABLE", 3, code=error.code, detail=error.detail)
     try:
         preflight_result = preflight(
             config,

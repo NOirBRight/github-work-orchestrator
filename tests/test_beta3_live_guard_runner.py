@@ -609,6 +609,72 @@ def test_attestor_provenance_rejects_shadowed_import_origin(tmp_path, monkeypatc
     assert error.value.code == "ATTESTATION_PROVENANCE_MISMATCH"
 
 
+def test_invalid_dependency_shape_is_rejected_before_source_or_nonce(tmp_path, monkeypatch):
+    config = _fixture_config(tmp_path)
+    events: list[str] = []
+
+    def forbidden(*_args, **_kwargs):
+        events.append("source-or-nonce")
+        raise AssertionError("invalid dependency reached a source or nonce")
+
+    monkeypatch.setattr(runner, "_git_snapshot", forbidden)
+    monkeypatch.setattr(runner.secrets, "token_hex", forbidden)
+    result = runner.run(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=_git_runner_factory(config),
+        dependencies=object(),
+    )
+
+    assert result["status"] == "UNAVAILABLE", result
+    assert result["exit_code"] == 3
+    assert result["code"] == "DEPENDENCY_INVALID"
+    assert events == []
+
+
+def test_invalid_git_runner_is_rejected_before_source_or_nonce(tmp_path, monkeypatch):
+    config = _fixture_config(tmp_path)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("invalid git runner reached a source or nonce")
+
+    monkeypatch.setattr(runner, "_git_snapshot", forbidden)
+    monkeypatch.setattr(runner.secrets, "token_hex", forbidden)
+    result = runner.run(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=object(),
+    )
+
+    assert result["status"] == "UNAVAILABLE", result
+    assert result["exit_code"] == 3
+    assert result["code"] == "DEPENDENCY_INVALID"
+
+
+def test_reviewed_provenance_rejects_a_noncanonical_runner_path(tmp_path):
+    path = Path(runner.__file__).resolve()
+    alias = path.parent / ".." / path.parent.name / path.name
+
+    assert alias != path
+    with pytest.raises(runner.RunnerError) as error:
+        runner._canonical_provenance_path(str(alias), "runner path")
+
+    assert error.value.code == "ATTESTATION_PROVENANCE_MISMATCH"
+
+
+def test_reviewed_provenance_rejects_a_shadowed_runner_spec_origin(tmp_path, monkeypatch):
+    spec = runner.__spec__
+    assert spec is not None
+    monkeypatch.setattr(spec, "origin", str(tmp_path / "shadow.py"))
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner._reviewed_provenance()
+
+    assert error.value.code == "ATTESTATION_PROVENANCE_MISMATCH"
+
+
 def test_reviewed_provenance_pins_canonical_runner_and_attestor_origins():
     provenance = runner._reviewed_provenance()
     runner_path = Path(runner.__file__).resolve()
@@ -1770,6 +1836,60 @@ def test_input_lease_retains_store_receipt_checkout_and_package_files(tmp_path):
             assert config.repository_root / "skills" / package_name / "SKILL.md" in expected_paths
             for install_root in config.install_roots:
                 assert install_root / package_name / "SKILL.md" in expected_paths
+    finally:
+        lease.close()
+
+
+def test_input_lease_binds_authoritative_files_to_the_preflight_snapshot(tmp_path):
+    config = _fixture_config(tmp_path)
+    preflight_result = runner.preflight(config, git_runner=_git_runner_factory(config))
+    original = config.fresh_store.read_bytes()
+    config.fresh_store.write_bytes(original + b"drift")
+
+    with pytest.raises(runner.RunnerError) as error:
+        with runner._input_lease(config, preflight_result):
+            pass
+
+    assert error.value.code == "LIVE_INPUT_DRIFT"
+
+
+@pytest.mark.parametrize("surface", ("source", "installed"))
+def test_input_lease_rejects_a_new_package_file_after_preflight(tmp_path, surface):
+    config = _fixture_config(tmp_path)
+    preflight_result = runner.preflight(config, git_runner=_git_runner_factory(config))
+    if surface == "source":
+        package_root = config.repository_root / "skills" / "implement-gwo"
+    else:
+        package_root = config.install_roots[0] / "implement-gwo"
+    (package_root / "new-file.txt").write_text("drift\n", encoding="utf-8")
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner._input_lease(config, preflight_result)
+
+    assert error.value.code == "LIVE_INPUT_DRIFT"
+
+
+def test_input_lease_retains_all_configured_output_parent_components(tmp_path):
+    config = _fixture_config(tmp_path)
+    gateway_parent = tmp_path / "gateway parent"
+    artifact_parent = tmp_path / "artifact parent"
+    gateway_parent.mkdir()
+    artifact_parent.mkdir()
+    config = replace(
+        config,
+        gateway_store_path=gateway_parent / "gateway.sqlite3",
+        artifact_root=artifact_parent / "artifacts",
+    )
+    preflight_result = runner.preflight(config, git_runner=_git_runner_factory(config))
+    lease = runner._input_lease(config, preflight_result)
+
+    try:
+        assert {
+            config.report_path.parent,
+            config.evidence_path.parent,
+            config.gateway_store_path.parent,
+            config.artifact_root.parent,
+        } <= set(lease._directories)
     finally:
         lease.close()
 
