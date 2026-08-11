@@ -702,19 +702,32 @@ FORBIDDEN_SOURCE_SURFACES = {
 
 
 def require_read_only_surface(source: object, *, required_method: str) -> None:
+    """Reject any source whose public callable surface is not exactly {required_method}.
+
+    Uses ``inspect.getattr_static`` so that ``__dir__`` / ``__getattr__``
+    overrides cannot hide mutators.
+    """
     if type(required_method) is not str or not required_method:
         raise BootstrapError(
             "UNSAFE_SOURCE_CAPABILITY",
             "required_method must be non-empty exact text",
         )
     try:
-        exposed = set(dir(source))
-        if exposed & FORBIDDEN_SOURCE_SURFACES:
-            raise BootstrapError(
-                "UNSAFE_SOURCE_CAPABILITY",
-                "source exposes a forbidden mutator surface",
-            )
-        if not callable(getattr(source, required_method)):
+        import inspect
+
+        exposed = {
+            name
+            for name in dir(type(source))
+            if not name.startswith("_")
+        }
+        for name in sorted(exposed):
+            attr = inspect.getattr_static(source, name)
+            if callable(attr) and name != required_method:
+                raise BootstrapError(
+                    "UNSAFE_SOURCE_CAPABILITY",
+                    f"source exposes an unlisted public callable: {name}",
+                )
+        if not callable(getattr(source, required_method, None)):
             raise BootstrapError(
                 "UNSAFE_SOURCE_CAPABILITY",
                 "source does not expose the required read method",

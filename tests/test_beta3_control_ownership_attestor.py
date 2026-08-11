@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import base64
+import gc
 import hashlib
 import json
 import os
@@ -1021,6 +1022,50 @@ def test_source_observation_rejects_content_hash_drift():
             default_read_mode="COMPLETE_OBSERVATION",
         )
     assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+
+
+def test_local_file_snapshot_rejects_reparse_parent(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    source = target / "source.json"
+    source.write_bytes(b"{}")
+    redirected = tmp_path / "redirected"
+    try:
+        redirected.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory reparse/symlink creation is unavailable")
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._read_file_snapshot(
+            redirected / source.name,
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        )
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+def test_local_checkout_source_rejects_reparse_path_before_read(tmp_path, monkeypatch):
+    target = _write_static_fixture(tmp_path)
+    redirected = tmp_path / "redirected"
+    try:
+        redirected.symlink_to(target.parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory reparse/symlink creation is unavailable")
+
+    monkeypatch.setattr(
+        attestor_module,
+        "_checkout_source_files",
+        lambda *_args: (redirected / target.name,),
+    )
+    responses = iter((_subject().source_commit.encode("ascii"), _subject().source_tree_digest.encode("ascii"), b""))
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._LocalInputsSource(lambda _command: next(responses), "d" * 64).read(
+            _config(tmp_path),
+            _subject(),
+        )
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
 
 
 def test_source_observation_rejects_role_or_read_mode_substitution():
@@ -2138,6 +2183,7 @@ def _create_store_fixture(tmp_path: Path, *, active: bool = False) -> SimpleName
     config.expected_prior_store_sha256 = digest_bytes(config.prior_store.read_bytes())
 
     LocalPlanPublication(config.fresh_store)
+    gc.collect()
     connection = sqlite3.connect(config.fresh_store)
     try:
         connection.row_factory = sqlite3.Row

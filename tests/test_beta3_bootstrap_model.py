@@ -477,3 +477,48 @@ def test_bootstrap_lease_closes_in_reverse_order_only_once():
     lease.close()
     lease.close()
     assert calls == ["second", "first"]
+
+
+# --- RED: P2-4 exact read-only capability allowlist ---
+
+def test_capability_check_rejects_unlisted_public_method():
+    """A source with an extra public method beyond 'read' must be rejected."""
+
+    class Sneaky:
+        def read(self):
+            return object()
+
+        def write_file(self):
+            raise AssertionError("must not be callable")
+
+    with pytest.raises(BootstrapError) as error:
+        require_read_only_surface(Sneaky(), required_method="read")
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+
+
+def test_capability_check_rejects_custom_dir_hiding_mutator():
+    """A source that overrides __dir__ to hide a mutator must still be rejected."""
+
+    class Hiding:
+        def read(self):
+            return object()
+
+        def synchronize(self):
+            raise AssertionError("must not be callable")
+
+        def __dir__(self):
+            return ["read"]
+
+    with pytest.raises(BootstrapError) as error:
+        require_read_only_surface(Hiding(), required_method="read")
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+
+
+def test_capability_check_accepts_exact_read_only_surface():
+    """A source exposing only 'read' must pass."""
+
+    class Exact:
+        def read(self):
+            return object()
+
+    require_read_only_surface(Exact(), required_method="read")

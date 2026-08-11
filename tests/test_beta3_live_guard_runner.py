@@ -542,6 +542,7 @@ def test_runner_config_exposes_exact_attestor_configuration(tmp_path):
         {"guard_factory": lambda *_args: object()},
         {"control_reader": lambda: object()},
         {"package_reader": lambda _config: object()},
+        {"git_runner": lambda *_args, **_kwargs: object()},
     ),
 )
 def test_fixed_production_subject_rejects_dependency_injection_before_source_access(
@@ -561,6 +562,61 @@ def test_fixed_production_subject_rejects_dependency_injection_before_source_acc
     assert result["status"] == "UNAVAILABLE"
     assert result["exit_code"] == 3
     assert result["code"] == "DEPENDENCY_INJECTION_FORBIDDEN"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("expected_package_digest", "expected_package_content_digests", "expected_package_version"),
+)
+def test_optional_production_configuration_cannot_bypass_dependency_gate(tmp_path, monkeypatch, field):
+    replacement = {
+        "expected_package_digest": "f" * 64,
+        "expected_package_content_digests": (("implement-gwo", "f" * 64), ("orchestrator", "e" * 64)),
+        "expected_package_version": "different",
+    }[field]
+    config = replace(runner.DEFAULT_CONFIG, **{field: replacement})
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("optional production configuration reached source or nonce")
+
+    monkeypatch.setattr(runner, "preflight", forbidden)
+    monkeypatch.setattr(runner.secrets, "token_hex", forbidden)
+    result = runner.run(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=runner._default_git_runner,
+        dependencies=object(),
+    )
+
+    assert result["status"] == "UNAVAILABLE", result
+    assert result["exit_code"] == 3
+    assert result["code"] == "DEPENDENCY_INJECTION_FORBIDDEN"
+
+
+def test_attestor_provenance_rejects_shadowed_import_origin(tmp_path, monkeypatch):
+    shadow = tmp_path / "beta3_control_ownership_attestor.py"
+    shadow.write_text("# shadow\n", encoding="utf-8")
+    monkeypatch.setitem(
+        sys.modules,
+        "beta3_control_ownership_attestor",
+        SimpleNamespace(__file__=str(shadow)),
+    )
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner._attestor_source_sha256()
+
+    assert error.value.code == "ATTESTATION_PROVENANCE_MISMATCH"
+
+
+def test_reviewed_provenance_pins_canonical_runner_and_attestor_origins():
+    provenance = runner._reviewed_provenance()
+    runner_path = Path(runner.__file__).resolve()
+
+    assert provenance["runner"]["path"] == str(runner_path)
+    assert provenance["runner"]["sha256"] == _sha256(runner_path)
+    assert runner._runbook_hash() == provenance["runner"]["sha256"]
+    assert runner._attestor_source_sha256() == provenance["attestor_bundle_sha256"]
 
 
 def test_attestor_configuration_is_part_of_fixed_production_subject():
@@ -1697,6 +1753,56 @@ def test_input_lease_retains_runtime_runbook_and_attestor_files(tmp_path):
         assert Path(runner.__file__).with_name(name) in expected_paths
 
 
+def test_input_lease_retains_store_receipt_checkout_and_package_files(tmp_path):
+    config = _fixture_config(tmp_path)
+    preflight_result = runner.preflight(config, git_runner=_git_runner_factory(config))
+
+    lease = runner._input_lease(config, preflight_result)
+    expected_paths = set(lease._expected)
+    try:
+        assert {
+            config.fresh_store,
+            config.rollback_store,
+            config.prior_store,
+            config.fresh_receipt,
+        } <= expected_paths
+        for package_name in config.package_names:
+            assert config.repository_root / "skills" / package_name / "SKILL.md" in expected_paths
+            for install_root in config.install_roots:
+                assert install_root / package_name / "SKILL.md" in expected_paths
+    finally:
+        lease.close()
+
+
+def test_input_lease_is_held_before_attestor_observation(tmp_path, monkeypatch):
+    config = _fixture_config(tmp_path)
+    stable, _ = _stable_dependencies()
+    state = {"entered": False}
+    original_enter = runner._InputLease.__enter__
+
+    def capture_enter(lease):
+        entered = original_enter(lease)
+        state["entered"] = True
+        return entered
+
+    class Control:
+        def observe(self, **kwargs):
+            assert state["entered"]
+            return stable.control_ownership_attestor.observe(**kwargs)
+
+    monkeypatch.setattr(runner._InputLease, "__enter__", capture_enter)
+    dependencies = replace(stable, control_ownership_attestor=Control())
+    result = runner.run(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=_git_runner_factory(config),
+        dependencies=dependencies,
+    )
+
+    assert result["status"] == "GO", result
+
+
 def test_retry_rejects_report_only_residue_without_overwriting_it(tmp_path, monkeypatch):
     config = _fixture_config(tmp_path)
     dependencies, _ = _stable_dependencies()
@@ -2777,11 +2883,11 @@ def test_attestor_observation_rejects_same_identity_package_content_drift(tmp_pa
             value = stable.control_ownership_attestor.observe(**kwargs)
             if first:
                 first = False
-                source_file.write_bytes(b"X" * original_length)
-                os.utime(
-                    source_file,
-                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
-                )
+                mutation_handle.seek(0)
+                mutation_handle.write(b"X" * original_length)
+                mutation_handle.flush()
+                os.fsync(mutation_handle.fileno())
+                os.utime(source_file, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
             else:
                 package = next(
                     readback
@@ -2805,13 +2911,14 @@ def test_attestor_observation_rejects_same_identity_package_content_drift(tmp_pa
         stable,
         control_ownership_attestor=MutatingControl(),
     )
-    result = runner.run(
-        config,
-        execute=True,
-        run_id="beta3-prod-001",
-        git_runner=_git_runner_factory(config),
-        dependencies=dependencies,
-    )
+    with source_file.open("r+b") as mutation_handle:
+        result = runner.run(
+            config,
+            execute=True,
+            run_id="beta3-prod-001",
+            git_runner=_git_runner_factory(config),
+            dependencies=dependencies,
+        )
 
     assert result["status"] == "REFUSED", result
     assert result["exit_code"] == 1

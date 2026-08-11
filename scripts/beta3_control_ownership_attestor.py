@@ -411,13 +411,15 @@ class _LocalInputsSource:
             ) from error
         if type(status) is not bytes or status != b"":
             _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "checkout worktree is not exactly clean")
-        files = [
-            {
-                "relative_path": path.relative_to(root).as_posix(),
-                "byte_sha256": digest_bytes(path.read_bytes()),
-            }
-            for path in _checkout_source_files(root, subject)
-        ]
+        files = []
+        for path in _checkout_source_files(root, subject):
+            snapshot = _read_file_snapshot(path, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+            files.append(
+                {
+                    "relative_path": snapshot.path.relative_to(root).as_posix(),
+                    "byte_sha256": digest_bytes(snapshot.content),
+                }
+            )
         value = {
             "repository_root": str(root),
             "commit_oid": commit,
@@ -526,43 +528,47 @@ def _file_identity(path: Path, stat_result: os.stat_result) -> tuple[tuple[str, 
     )
 
 
+def _held_file_bytes(path: Path, code: str) -> tuple[bytes, Mapping[str, object]]:
+    """Read one local file through the runner's no-follow held-handle boundary."""
+
+    try:
+        from run_beta3_live_guard import _bound_bytes
+
+        content, identity = _bound_bytes(Path(path), code)
+        if type(content) is not bytes or type(identity) is not dict:
+            raise TypeError("held local file boundary returned the wrong exact types")
+        return content, identity
+    except BootstrapError:
+        raise
+    except Exception as error:
+        raise BootstrapError(code, f"local file is unavailable: {path}") from error
+
+
 def _read_file_snapshot(path: Path, code: str) -> _FileSnapshot:
     path = Path(path)
     try:
-        first = path.lstat()
-        if not stat.S_ISREG(first.st_mode):
-            raise OSError("path is not a regular file")
-        content = path.read_bytes()
-        second = path.lstat()
-        if (
-            first.st_dev,
-            first.st_ino,
-            first.st_mode,
-            first.st_size,
-            first.st_mtime_ns,
-            first.st_ctime_ns,
-        ) != (
-            second.st_dev,
-            second.st_ino,
-            second.st_mode,
-            second.st_size,
-            second.st_mtime_ns,
-            second.st_ctime_ns,
-        ):
-            raise OSError("file identity changed during read")
+        content, held_identity = _held_file_bytes(path, code)
+        canonical_path = path.resolve(strict=True)
+        inode = held_identity.get("st_ino", held_identity.get("file_id"))
+        if inode is None:
+            raise OSError("held file identity has no inode")
+        mtime_ns = held_identity.get("st_mtime_ns")
+        size = held_identity.get("st_size")
+        if mtime_ns is None or size is None:
+            raise OSError("held file identity is incomplete")
         identity = _identity_pairs(
             {
                 "byte_sha256": digest_bytes(content),
-                "inode": str(second.st_ino),
-                "mtime_ns": str(second.st_mtime_ns),
-                "path": str(path.resolve()),
-                "size": str(second.st_size),
+                "inode": str(inode),
+                "mtime_ns": str(mtime_ns),
+                "path": str(canonical_path),
+                "size": str(size),
             }
         )
-        return _FileSnapshot(path=path.resolve(), content=content, identity=identity)
+        return _FileSnapshot(path=canonical_path, content=content, identity=identity)
     except BootstrapError:
         raise
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, TypeError) as error:
         raise BootstrapError(code, f"local file is unavailable: {path}") from error
 
 
@@ -1221,24 +1227,24 @@ def _sidecars(path: Path) -> tuple[Path, ...]:
 
 
 def _dynamic_sidecars(path: Path) -> tuple[Path, ...]:
-    parent = path.parent
-    if not parent.is_dir():
-        return ()
+    parent = Path(path).parent
     try:
-        return tuple(
-            sorted(
-                (
-                    candidate
-                    for candidate in parent.iterdir()
-                    if (
-                        (match := _DYNAMIC_SIDE_FILE.fullmatch(candidate.name))
-                        is not None
-                        and match.group("prefix") == path.name
-                    )
-                ),
-                key=str,
-            )
-        )
+        parent = _canonical_local_directory(parent, "STORE_SOURCE_UNAVAILABLE")
+    except BootstrapError as error:
+        if not parent.exists():
+            return ()
+        raise error
+    try:
+        candidates: list[Path] = []
+        for entry in os.scandir(parent):
+            match = _DYNAMIC_SIDE_FILE.fullmatch(entry.name)
+            if match is None or match.group("prefix") != Path(path).name:
+                continue
+            entry_stat = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(entry_stat.st_mode) or _is_reparse(entry_stat):
+                _fail("STORE_SOURCE_UNAVAILABLE", f"SQLite sidecar is a link or reparse point: {entry.path}")
+            candidates.append(Path(entry.path))
+        return tuple(sorted(candidates, key=str))
     except OSError as error:
         raise BootstrapError("STORE_SOURCE_UNAVAILABLE", "SQLite sidecar scan failed") from error
 
@@ -2083,35 +2089,124 @@ def _validate_runtime_config_source(
         )
 
 
+def _is_reparse(stat_result: os.stat_result) -> bool:
+    return bool(getattr(stat_result, "st_file_attributes", 0) & 0x0400)
+
+
+def _canonical_local_directory(path: Path, code: str) -> Path:
+    path = Path(path)
+    try:
+        identity = path.lstat()
+        if stat.S_ISLNK(identity.st_mode) or _is_reparse(identity):
+            raise OSError("directory is a link or reparse point")
+        if not stat.S_ISDIR(identity.st_mode):
+            raise OSError("path is not a directory")
+        return path.resolve(strict=True)
+    except BootstrapError:
+        raise
+    except (OSError, ValueError) as error:
+        raise BootstrapError(code, f"local directory is unavailable: {path}") from error
+
+
+def _local_tree_files(
+    root: Path,
+    code: str,
+    *,
+    allow_missing: bool = False,
+) -> tuple[Path, ...]:
+    root = Path(root)
+    try:
+        identity = root.lstat()
+    except FileNotFoundError:
+        if allow_missing:
+            return ()
+        raise BootstrapError(code, f"local directory is unavailable: {root}")
+    except OSError as error:
+        raise BootstrapError(code, f"local directory is unavailable: {root}") from error
+    if stat.S_ISLNK(identity.st_mode) or _is_reparse(identity):
+        _fail(code, f"local directory is a link or reparse point: {root}")
+    if not stat.S_ISDIR(identity.st_mode):
+        _fail(code, f"local path is not a directory: {root}")
+    result: list[Path] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            raise BootstrapError(code, f"local directory is unavailable: {directory}") from error
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise BootstrapError(code, f"local entry is unavailable: {path}") from error
+            if stat.S_ISLNK(entry_stat.st_mode) or _is_reparse(entry_stat):
+                _fail(code, f"local entry is a link or reparse point: {path}")
+            if stat.S_ISDIR(entry_stat.st_mode):
+                if entry.name != "__pycache__":
+                    pending.append(path)
+            elif stat.S_ISREG(entry_stat.st_mode):
+                if "__pycache__" not in path.parts and path.suffix != ".pyc":
+                    result.append(path)
+            else:
+                _fail(code, f"local entry is not a regular file or directory: {path}")
+    return tuple(sorted((path.resolve() for path in result), key=_path_text))
+
+
+def _local_file_if_present(path: Path, code: str) -> Path | None:
+    path = Path(path)
+    try:
+        identity = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise BootstrapError(code, f"local file is unavailable: {path}") from error
+    if stat.S_ISLNK(identity.st_mode) or _is_reparse(identity):
+        _fail(code, f"local file is a link or reparse point: {path}")
+    if not stat.S_ISREG(identity.st_mode):
+        _fail(code, f"local path is not a regular file: {path}")
+    return path.resolve()
+
+
 def _audited_files(root: Path) -> tuple[Path, ...]:
+    root = _canonical_local_directory(root, "STATIC_INPUT_SOURCE_UNAVAILABLE")
     candidates = [
-        root / "skills" / "implement-gwo" / "SKILL.md",
-        root / "skills" / "orchestrator" / "SKILL.md",
-        *(root / "skills" / "orchestrator" / "scripts" / "gwo_v8").rglob("*.py"),
+        _local_file_if_present(
+            root / "skills" / "implement-gwo" / "SKILL.md",
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        ),
+        _local_file_if_present(
+            root / "skills" / "orchestrator" / "SKILL.md",
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        ),
+        *(
+            path
+            for path in _local_tree_files(
+                root / "skills" / "orchestrator" / "scripts" / "gwo_v8",
+                "STATIC_INPUT_SOURCE_UNAVAILABLE",
+                allow_missing=True,
+            )
+            if path.suffix == ".py"
+        ),
     ]
     return tuple(
         sorted(
-            (path for path in candidates if path.is_file()),
+            (path for path in candidates if path is not None),
             key=lambda path: path.relative_to(root).as_posix(),
         )
     )
 
 
 def _checkout_source_files(root: Path, subject: CutoverSubject) -> tuple[Path, ...]:
-    root = Path(root).resolve()
+    root = _canonical_local_directory(Path(root), "STATIC_INPUT_SOURCE_UNAVAILABLE")
     paths = set(_audited_files(root))
     for package_name in subject.package_names:
         package = root / "skills" / package_name
         if not package.is_dir():
             package = root / package_name
-        if not package.is_dir():
-            _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", f"source package is absent: {package_name}")
         paths.update(
-            path
-            for path in package.rglob("*")
-            if path.is_file()
-            and "__pycache__" not in path.parts
-            and path.suffix != ".pyc"
+            _local_tree_files(package, "STATIC_INPUT_SOURCE_UNAVAILABLE")
         )
     return tuple(sorted((path.resolve() for path in paths), key=lambda path: path.relative_to(root).as_posix()))
 
@@ -2197,7 +2292,7 @@ def _read_stable_static_inputs(
     *,
     producer_sha256: str,
 ) -> tuple[CompatibilityPathReadback, list[SourceRecord]]:
-    root = Path(root).resolve()
+    root = _canonical_local_directory(Path(root), "STATIC_INPUT_SOURCE_UNAVAILABLE")
     before_paths = _audited_files(root)
     if not before_paths:
         _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "audited static input set is empty")
@@ -2315,17 +2410,20 @@ def _package_paths(
         source = root / "skills" / package_name
         if not source.is_dir():
             source = root / package_name
-        if not source.is_dir():
-            _fail("PACKAGE_SOURCE_UNAVAILABLE", f"source package is unavailable: {package_name}")
-        package_paths.append((f"source:{package_name}", source))
+        package_paths.append(
+            (
+                f"source:{package_name}",
+                _canonical_local_directory(source, "PACKAGE_SOURCE_UNAVAILABLE"),
+            )
+        )
         for surface, install_root in install_roots.items():
             installed = install_root / package_name
-            if not installed.is_dir():
-                _fail(
-                    "PACKAGE_SOURCE_UNAVAILABLE",
-                    f"installed package is unavailable: {surface}:{package_name}",
+            package_paths.append(
+                (
+                    f"{surface}:{package_name}",
+                    _canonical_local_directory(installed, "PACKAGE_SOURCE_UNAVAILABLE"),
                 )
-            package_paths.append((f"{surface}:{package_name}", installed))
+            )
     return tuple(package_paths)
 
 
@@ -2337,18 +2435,13 @@ def _package_file_snapshots(
     snapshots: list[tuple[str, Path, _FileSnapshot]] = []
     package_paths = _package_paths(root, install_roots, subject)
     for label, package in package_paths:
-        package = package.resolve()
         manifest = package / ".skill-package.json"
-        try:
-            manifest_stat = manifest.lstat()
-        except OSError as error:
+        if _local_file_if_present(manifest, "PACKAGE_SOURCE_UNAVAILABLE") is None:
             raise BootstrapError(
                 "PACKAGE_SOURCE_UNAVAILABLE", f"package manifest is unavailable: {manifest}"
-            ) from error
-        if not stat.S_ISREG(manifest_stat.st_mode):
-            _fail("PACKAGE_SOURCE_UNAVAILABLE", f"package manifest is not a regular file: {manifest}")
+            )
         files = sorted(
-            (path for path in package.rglob("*") if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"),
+            _local_tree_files(package, "PACKAGE_SOURCE_UNAVAILABLE"),
             key=lambda path: path.relative_to(package).as_posix(),
         )
         if not files:
@@ -2437,7 +2530,7 @@ def _read_stable_package_inputs(
     *,
     producer_sha256: str,
 ) -> tuple[PackageReadback, list[SourceRecord]]:
-    root = Path(root).resolve()
+    root = _canonical_local_directory(Path(root), "PACKAGE_SOURCE_UNAVAILABLE")
     before = _package_file_snapshots(root, install_roots, subject)
     if not before:
         _fail("PACKAGE_SOURCE_UNAVAILABLE", "package provenance is empty")

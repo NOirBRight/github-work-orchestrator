@@ -4,6 +4,7 @@ import argparse
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -251,6 +252,7 @@ _ATTESTOR_MODULE_NAMES = (
     "beta3_legacy_attestor.py",
     "beta3_replay_guard.py",
 )
+_REVIEWED_PROVENANCE_NAME = "beta3_reviewed_provenance.json"
 PRODUCTION_ENTRY_REFS = (
     "gwo_v8.plan_control_host:ProductionPlanControlStartHost.start",
     "gwo_v8.execution_kernel:advance",
@@ -984,9 +986,16 @@ class _InputBinding:
 
 
 class _InputLease:
-    def __init__(self, expected: Mapping[Path, Mapping[str, object]]) -> None:
+    def __init__(
+        self,
+        expected: Mapping[Path, Mapping[str, object]],
+        *,
+        directories: Sequence[Path] = (),
+    ) -> None:
         self._expected = expected
+        self._directories = tuple(Path(path) for path in directories)
         self._bindings: list[_InputBinding] = []
+        self._directory_bindings: list[_HeldDirectory] = []
 
     def __enter__(self) -> "_InputLease":
         try:
@@ -1035,6 +1044,9 @@ class _InputLease:
                         parent,
                     )
                 )
+            for path in self._directories:
+                descriptors, identities = _open_directory_components(path, "LIVE_INPUT_DRIFT")
+                self._directory_bindings.append(_HeldDirectory(path, descriptors, identities))
             return self
         except RunnerError:
             self.close()
@@ -1046,8 +1058,12 @@ class _InputLease:
             os.close(binding.descriptor)
             if binding.parent is not None:
                 binding.parent.close()
+        while self._directory_bindings:
+            self._directory_bindings.pop().close()
 
     def assert_stable(self) -> None:
+        for directory in self._directory_bindings:
+            directory.assert_stable()
         for binding in self._bindings:
             current = _windows_handle_identity(binding.descriptor, "LIVE_INPUT_DRIFT", directory=False)
             content = _read_held_bytes(binding.descriptor, "LIVE_INPUT_DRIFT")
@@ -1088,6 +1104,12 @@ class _InputLease:
                 "sha256": binding.sha256,
             }
             for binding in self._bindings
+        } | {
+            _path_text(directory.path): {
+                "identity": dict(directory.identity),
+                "kind": "directory",
+            }
+            for directory in self._directory_bindings
         }
 
     def _held_content(self, path: Path) -> bytes:
@@ -2324,22 +2346,114 @@ def _store_snapshots(config: RunnerConfig) -> dict[str, object]:
     }
 
 
+def _local_regular_files(root: Path, code: str) -> tuple[Path, ...]:
+    root = Path(root)
+    _lstat(root, code)
+    if not stat.S_ISDIR(os.lstat(root).st_mode):
+        raise RunnerError(code, f"local input root is not a directory: {root}")
+    result: list[Path] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            raise RunnerError(code, f"local input directory is unavailable: {directory}") from error
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise RunnerError(code, f"local input entry is unavailable: {path}") from error
+            if stat.S_ISLNK(entry_stat.st_mode) or _is_reparse(entry_stat):
+                raise RunnerError(code, f"local input is a link or reparse point: {path}")
+            if stat.S_ISDIR(entry_stat.st_mode):
+                pending.append(path)
+            elif stat.S_ISREG(entry_stat.st_mode):
+                if "__pycache__" not in path.parts and path.suffix != ".pyc":
+                    result.append(path)
+    return tuple(result)
+
+
+def _local_input_files(config: RunnerConfig) -> tuple[Path, ...]:
+    root = Path(config.repository_root)
+    paths: set[Path] = set()
+    package_roots = _local_package_roots(config)
+    for package in package_roots:
+        paths.update(_local_regular_files(package, "LIVE_INPUT_DRIFT"))
+    guard_root = root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+    if _lexists(guard_root):
+        paths.update(_local_regular_files(guard_root, "LIVE_INPUT_DRIFT"))
+    for install_root in config.install_roots:
+        for package_name in config.package_names:
+            paths.update(
+                _local_regular_files(
+                    Path(install_root) / package_name,
+                    "LIVE_INPUT_DRIFT",
+                )
+            )
+    return tuple(sorted(paths, key=_path_text))
+
+
+def _local_package_roots(config: RunnerConfig) -> tuple[Path, ...]:
+    root = Path(config.repository_root)
+    result: list[Path] = []
+    for package_name in config.package_names:
+        package = root / "skills" / package_name
+        if not package.is_dir():
+            package = root / package_name
+        result.append(package)
+    return tuple(result)
+
+
+def _local_input_directories(config: RunnerConfig) -> tuple[Path, ...]:
+    paths: list[Path] = [
+        Path(config.evidence_root),
+        Path(config.repository_root),
+        Path(config.runtime_config_path).parent,
+        Path(config.fresh_store).parent,
+        Path(config.rollback_store).parent,
+        Path(config.prior_store).parent,
+        Path(config.fresh_receipt).parent,
+        *_local_package_roots(config),
+    ]
+    guard_root = Path(config.repository_root) / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+    if _lexists(guard_root):
+        paths.append(guard_root)
+    for install_root in config.install_roots:
+        install_root = Path(install_root)
+        paths.append(install_root)
+        for package_name in config.package_names:
+            paths.append(install_root / package_name)
+    unique: dict[Path, None] = {}
+    for path in paths:
+        if _lexists(path):
+            unique.setdefault(path, None)
+    return tuple(unique)
+
+
 def _input_lease(config: RunnerConfig, preflight_result: dict[str, object]) -> _InputLease:
     expected: dict[Path, Mapping[str, object]] = {}
     local_paths = (
+        Path(config.fresh_store),
+        Path(config.rollback_store),
+        Path(config.prior_store),
+        Path(config.fresh_receipt),
         Path(config.runtime_config_path),
         Path(__file__).resolve(),
+        Path(__file__).resolve().with_name(_REVIEWED_PROVENANCE_NAME),
         *(Path(__file__).resolve().with_name(name) for name in _ATTESTOR_MODULE_NAMES),
+        *_local_input_files(config),
     )
     for path in local_paths:
         if not _lexists(path):
-            raise RunnerError("LIVE_INPUT_DRIFT", f"retained local input is unavailable: {path}")
+            raise RunnerError("ATTESTATION_UNAVAILABLE", f"retained local input is unavailable: {path}")
         snapshot = _bound_file_snapshot(path, "LIVE_INPUT_DRIFT")
         expected[path] = {
             "identity": snapshot["identity"],
             "sha256": snapshot["sha256"],
         }
-    return _InputLease(expected)
+    return _InputLease(expected, directories=_local_input_directories(config))
 
 
 def _pre_guard_refresh(
@@ -2473,10 +2587,6 @@ def _verify_post_files(
     _validate_config_paths(config, allow_existing_outputs=allow_existing_outputs)
     _validate_no_side_effect_paths(config)
     return {"_git": git}
-
-
-def _runbook_hash() -> str:
-    return _sha256(Path(__file__), "RUNBOOK_READ_FAILED")
 
 
 def _canonical_utc_timestamp(value: object, code: str) -> str:
@@ -3093,9 +3203,12 @@ def _assert_combined_stable(
     git_runner: Callable[..., subprocess.CompletedProcess[str]],
     *,
     allow_existing_outputs: bool,
+    attempt: object | None = None,
 ) -> dict[str, object]:
     publication.assert_stable()
     inputs.assert_stable()
+    if attempt is not None:
+        inputs.assert_attempt_identity(attempt)
     assert_stable = getattr(bootstrap_lease, "assert_stable", None)
     if not callable(assert_stable):
         raise RunnerError("LEASE_INVALID", "BootstrapLease has no public stability assertion")
@@ -3422,6 +3535,25 @@ _FIXED_SUBJECT_FIELDS = (
     "expected_package_version",
 )
 
+# These fields identify the production subject independently of optional
+# expectation overrides.  Optional expectations must never turn the fixed
+# production invocation into an injection-friendly fixture invocation.
+_PRODUCTION_SUBJECT_GATE_FIELDS = tuple(
+    name
+    for name in _FIXED_SUBJECT_FIELDS
+    if name
+    not in {
+        "expected_fresh_receipt_runbook_sha256",
+        "expected_fresh_receipt_sha256",
+        "expected_fresh_receipt_schema_digest",
+        "expected_fresh_receipt_generation_rows",
+        "expected_fresh_receipt_row_counts",
+        "expected_package_digest",
+        "expected_package_content_digests",
+        "expected_package_version",
+    }
+)
+
 
 def _is_fixed_production_subject(config: RunnerConfig) -> bool:
     return type(config) is RunnerConfig and all(
@@ -3430,24 +3562,151 @@ def _is_fixed_production_subject(config: RunnerConfig) -> bool:
     )
 
 
+def _is_production_subject_gate(config: RunnerConfig) -> bool:
+    return type(config) is RunnerConfig and all(
+        getattr(config, name) == getattr(DEFAULT_CONFIG, name)
+        for name in _PRODUCTION_SUBJECT_GATE_FIELDS
+    )
+
+
+def _provenance_mismatch(detail: str) -> None:
+    raise RunnerError("ATTESTATION_PROVENANCE_MISMATCH", detail)
+
+
+def _canonical_provenance_path(value: object, label: str) -> Path:
+    if type(value) is not str or not value:
+        _provenance_mismatch(f"{label} is not an absolute path")
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        _provenance_mismatch(f"{label} is not an absolute path")
+    try:
+        return candidate.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise RunnerError(
+            "ATTESTATION_PROVENANCE_MISMATCH",
+            f"{label} is not a canonical existing path",
+        ) from error
+
+
+def _reviewed_provenance() -> dict[str, object]:
+    manifest_path = Path(__file__).resolve().with_name(_REVIEWED_PROVENANCE_NAME)
+    try:
+        payload, _identity = _bound_bytes(manifest_path, "ATTESTATION_PROVENANCE_MISMATCH")
+        value = json.loads(payload.decode("utf-8"))
+    except RunnerError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise RunnerError(
+            "ATTESTATION_PROVENANCE_MISMATCH",
+            "reviewed provenance manifest is not canonical JSON",
+        ) from error
+    try:
+        if canonical_json_bytes(value) != payload:
+            _provenance_mismatch("reviewed provenance manifest is not canonical")
+    except RunnerError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise RunnerError(
+            "ATTESTATION_PROVENANCE_MISMATCH",
+            "reviewed provenance manifest is not canonical JSON",
+        ) from error
+    if type(value) is not dict or set(value) != {"schema", "runner", "attestors", "attestor_bundle_sha256"}:
+        _provenance_mismatch("reviewed provenance manifest shape is not exact")
+    if value["schema"] != "gwo-beta3-reviewed-provenance.v1":
+        _provenance_mismatch("reviewed provenance schema is not exact")
+    runner = value["runner"]
+    attestors = value["attestors"]
+    if (
+        type(runner) is not dict
+        or set(runner) != {"module", "path", "sha256"}
+        or type(attestors) is not list
+        or len(attestors) != len(_ATTESTOR_MODULE_NAMES)
+        or type(value["attestor_bundle_sha256"]) is not str
+        or _HEX64.fullmatch(value["attestor_bundle_sha256"]) is None
+    ):
+        _provenance_mismatch("reviewed provenance entries are not exact")
+    runner_path = _canonical_provenance_path(runner["path"], "reviewed runner path")
+    if runner_path != Path(__file__).resolve() or runner["module"] != Path(__file__).stem:
+        _provenance_mismatch("reviewed runner origin is not canonical")
+    if type(runner["sha256"]) is not str or _HEX64.fullmatch(runner["sha256"]) is None:
+        _provenance_mismatch("reviewed runner hash is not exact")
+    expected_root = Path(__file__).resolve().parent
+    for entry, name in zip(attestors, _ATTESTOR_MODULE_NAMES, strict=True):
+        if (
+            type(entry) is not dict
+            or set(entry) != {"module", "path", "sha256"}
+            or entry["module"] != Path(name).stem
+            or type(entry["sha256"]) is not str
+            or _HEX64.fullmatch(entry["sha256"]) is None
+            or _canonical_provenance_path(entry["path"], f"reviewed {name} path")
+            != expected_root / name
+        ):
+            _provenance_mismatch(f"reviewed {name} entry is not canonical")
+    return value
+
+
+def _imported_module_with_canonical_origin(name: str, expected_path: Path) -> object:
+    module_name = Path(name).stem
+    try:
+        module = sys.modules.get(module_name)
+        if module is None:
+            module = importlib.import_module(module_name)
+        module_path = _canonical_provenance_path(
+            getattr(module, "__file__", None),
+            f"{module_name} import origin",
+        )
+        spec = getattr(module, "__spec__", None)
+        spec_path = _canonical_provenance_path(
+            getattr(spec, "origin", None),
+            f"{module_name} import spec origin",
+        )
+    except RunnerError:
+        raise
+    except (ImportError, ModuleNotFoundError, OSError, TypeError, ValueError) as error:
+        raise RunnerError(
+            "ATTESTATION_PROVENANCE_MISMATCH",
+            f"{module_name} import origin is unavailable",
+        ) from error
+    if module_path != expected_path or spec_path != expected_path:
+        _provenance_mismatch(f"{module_name} import origin is not canonical")
+    return module
+
+
+def _runbook_hash() -> str:
+    provenance = _reviewed_provenance()
+    runner = provenance["runner"]
+    assert type(runner) is dict
+    path = Path(__file__).resolve()
+    content, _identity = _bound_bytes(path, "ATTESTATION_PROVENANCE_MISMATCH")
+    observed = hashlib.sha256(content).hexdigest()
+    if observed != runner["sha256"]:
+        _provenance_mismatch("runner bytes do not match the reviewed hash")
+    return str(runner["sha256"])
+
+
 def _attestor_source_sha256() -> str:
+    provenance = _reviewed_provenance()
+    attestors = provenance["attestors"]
+    assert type(attestors) is list
     digest = hashlib.sha256()
     root = Path(__file__).resolve().parent
-    for name in _ATTESTOR_MODULE_NAMES:
+    for entry, name in zip(attestors, _ATTESTOR_MODULE_NAMES, strict=True):
+        assert type(entry) is dict
         path = root / name
-        try:
-            content = path.read_bytes()
-        except OSError as error:
-            raise RunnerError(
-                "ATTESTATION_UNAVAILABLE",
-                f"attestor module is unavailable: {path}",
-            ) from error
+        _imported_module_with_canonical_origin(name, path)
+        content, _identity = _bound_bytes(path, "ATTESTATION_PROVENANCE_MISMATCH")
+        observed = hashlib.sha256(content).hexdigest()
+        if observed != entry["sha256"]:
+            _provenance_mismatch(f"{name} bytes do not match the reviewed hash")
         encoded_name = name.encode("utf-8")
         digest.update(len(encoded_name).to_bytes(4, "big"))
         digest.update(encoded_name)
         digest.update(len(content).to_bytes(8, "big"))
         digest.update(content)
-    return digest.hexdigest()
+    observed_bundle = digest.hexdigest()
+    if observed_bundle != provenance["attestor_bundle_sha256"]:
+        _provenance_mismatch("attestor bytes do not match the reviewed bundle hash")
+    return observed_bundle
 
 
 def _production_source_command(command: tuple[str, ...]) -> bytes:
@@ -3552,6 +3811,7 @@ def run(
 ) -> dict[str, object]:
     injected = (
         dependencies is not None
+        or git_runner is not _default_git_runner
         or guard_factory is not None
         or control_reader is not None
         or package_reader is not None
@@ -3561,7 +3821,7 @@ def run(
     if execute and (
         config.authoritative_legacy_snapshot is not None
         or config.production_readers is not None
-        or (_is_fixed_production_subject(config) and injected)
+        or (_is_production_subject_gate(config) and injected)
     ):
         return _result(
             "UNAVAILABLE",
@@ -3601,45 +3861,45 @@ def run(
         with _PublicationLease(config.evidence_root) as publication:
             _assert_publication_parent(config, expected_parent, lease=publication)
             _precheck_existing_output_bytes(config)
-            _pre_guard_refresh(config, preflight_result, git_runner)
-            subject = _default_subject_factory(config)
-            try:
-                from beta3_bootstrap_model import AttemptIdentity  # type: ignore[import-not-found]
-            except (ImportError, ModuleNotFoundError, OSError) as error:
-                raise RunnerError("ATTESTATION_UNAVAILABLE", "AttemptIdentity is unavailable") from error
-            attempt = AttemptIdentity.create(
-                run_id=run_id,
-                repository=config.repository,
-                evidence_root=_path_text(config.evidence_root),
-                cutover_subject_digest=_exact_digest_value(subject.canonical()),
-                runner_sha256=_runbook_hash(),
-                attestor_sha256=_attestor_source_sha256(),
-                nonce_factory=secrets.token_hex,
-            )
-            live_dependencies = _dependencies_or_raise(
-                config,
-                dependencies,
-                guard_factory,
-                control_reader,
-                package_reader,
-                producer_sha256=attempt.attestor_sha256,
-            )
-            bootstrap_attestor = ProductionBootstrapAttestor(
-                control_ownership_attestor=live_dependencies.control_ownership_attestor,
-                legacy_attestor=live_dependencies.legacy_attestor,
-                subject_factory=lambda _config: subject,
-            )
-            bundle, lease, attestation_metadata = bootstrap_attestor.attest(
-                config,
-                attempt,
-            )
-            _bundle_type, _bootstrap_error, bootstrap_lease_type, _component_type, _writer_type = (
-                ProductionBootstrapAttestor._bootstrap_contracts()
-            )
-            del _bundle_type, _bootstrap_error, _component_type, _writer_type
-            if type(lease) is not bootstrap_lease_type:
-                raise RunnerError("LEASE_INVALID", "attestation did not return a BootstrapLease")
             with _input_lease(config, preflight_result) as inputs:
+                _pre_guard_refresh(config, preflight_result, git_runner)
+                subject = _default_subject_factory(config)
+                try:
+                    from beta3_bootstrap_model import AttemptIdentity  # type: ignore[import-not-found]
+                except (ImportError, ModuleNotFoundError, OSError) as error:
+                    raise RunnerError("ATTESTATION_UNAVAILABLE", "AttemptIdentity is unavailable") from error
+                attempt = AttemptIdentity.create(
+                    run_id=run_id,
+                    repository=config.repository,
+                    evidence_root=_path_text(config.evidence_root),
+                    cutover_subject_digest=_exact_digest_value(subject.canonical()),
+                    runner_sha256=_runbook_hash(),
+                    attestor_sha256=_attestor_source_sha256(),
+                    nonce_factory=secrets.token_hex,
+                )
+                live_dependencies = _dependencies_or_raise(
+                    config,
+                    dependencies,
+                    guard_factory,
+                    control_reader,
+                    package_reader,
+                    producer_sha256=attempt.attestor_sha256,
+                )
+                bootstrap_attestor = ProductionBootstrapAttestor(
+                    control_ownership_attestor=live_dependencies.control_ownership_attestor,
+                    legacy_attestor=live_dependencies.legacy_attestor,
+                    subject_factory=lambda _config: subject,
+                )
+                bundle, lease, attestation_metadata = bootstrap_attestor.attest(
+                    config,
+                    attempt,
+                )
+                _bundle_type, _bootstrap_error, bootstrap_lease_type, _component_type, _writer_type = (
+                    ProductionBootstrapAttestor._bootstrap_contracts()
+                )
+                del _bundle_type, _bootstrap_error, _component_type, _writer_type
+                if type(lease) is not bootstrap_lease_type:
+                    raise RunnerError("LEASE_INVALID", "attestation did not return a BootstrapLease")
                 assert_attempt_identity = getattr(inputs, "assert_attempt_identity", None)
                 if not callable(assert_attempt_identity):
                     raise RunnerError("LEASE_INVALID", "input lease has no attempt identity assertion")
@@ -3652,6 +3912,7 @@ def run(
                     lease,
                     git_runner,
                     allow_existing_outputs=False,
+                    attempt=attempt,
                 )
                 replay_result = live_dependencies.replay_guard(bundle)
                 _assert_combined_stable(
@@ -3662,6 +3923,7 @@ def run(
                     lease,
                     git_runner,
                     allow_existing_outputs=False,
+                    attempt=attempt,
                 )
                 replay_value = _validate_attested_replay(bundle, replay_result)
                 _assert_combined_stable(
@@ -3672,6 +3934,7 @@ def run(
                     lease,
                     git_runner,
                     allow_existing_outputs=False,
+                    attempt=attempt,
                 )
                 writer_generation = bundle.writer_fence.writer_generation
                 report_body = _attested_report(
@@ -3692,6 +3955,7 @@ def run(
                         lease,
                         git_runner,
                         allow_existing_outputs=False,
+                        attempt=attempt,
                     )
                     report_digest = _write_exclusive_json(
                         config.report_path,
@@ -3709,6 +3973,7 @@ def run(
                         lease,
                         git_runner,
                         allow_existing_outputs=True,
+                        attempt=attempt,
                     )
                     _revalidate_owned_output(report_outputs[0], "LIVE_INPUT_DRIFT")
                     exit_code = 0 if replay_value["decision"] == "GO" else 2
@@ -3734,6 +3999,7 @@ def run(
                         lease,
                         git_runner,
                         allow_existing_outputs=True,
+                        attempt=attempt,
                     )
                     _write_exclusive_json(
                         config.evidence_path,
@@ -3751,6 +4017,7 @@ def run(
                         lease,
                         git_runner,
                         allow_existing_outputs=True,
+                        attempt=attempt,
                     )
                     _revalidate_owned_output(report_outputs[0], "LIVE_INPUT_DRIFT")
                     _revalidate_owned_output(evidence_outputs[0], "LIVE_INPUT_DRIFT")
