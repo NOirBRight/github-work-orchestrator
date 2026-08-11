@@ -1869,6 +1869,52 @@ def test_input_lease_rejects_a_new_package_file_after_preflight(tmp_path, surfac
     assert error.value.code == "LIVE_INPUT_DRIFT"
 
 
+def test_execute_refuses_package_file_added_before_lease(tmp_path, monkeypatch):
+    config = _fixture_config(tmp_path)
+    dependencies, _ = _stable_dependencies()
+    original_input_lease = runner._input_lease
+    monkeypatch.setattr(runner, "_runbook_hash", lambda: _sha256(Path(runner.__file__)))
+    attestor_digest = hashlib.sha256()
+    for name in runner._ATTESTOR_MODULE_NAMES:
+        path = Path(runner.__file__).with_name(name)
+        content = path.read_bytes()
+        encoded_name = name.encode("utf-8")
+        attestor_digest.update(len(encoded_name).to_bytes(4, "big"))
+        attestor_digest.update(encoded_name)
+        attestor_digest.update(len(content).to_bytes(8, "big"))
+        attestor_digest.update(content)
+    monkeypatch.setattr(
+        runner,
+        "_attestor_source_sha256",
+        lambda: attestor_digest.hexdigest(),
+    )
+
+    def add_package_file_before_lease(active_config, preflight_result):
+        package_file = (
+            active_config.repository_root
+            / "skills"
+            / "implement-gwo"
+            / "added-after-preflight.txt"
+        )
+        package_file.write_text("drift\n", encoding="utf-8")
+        return original_input_lease(active_config, preflight_result)
+
+    monkeypatch.setattr(runner, "_input_lease", add_package_file_before_lease)
+    result = runner.run(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        git_runner=_git_runner_factory(config),
+        dependencies=dependencies,
+    )
+
+    assert result["status"] == "REFUSED", result
+    assert result["exit_code"] == 1
+    assert result["code"] == "LIVE_INPUT_DRIFT"
+    assert not config.report_path.exists()
+    assert not config.evidence_path.exists()
+
+
 def test_input_lease_retains_all_configured_output_parent_components(tmp_path):
     config = _fixture_config(tmp_path)
     gateway_parent = tmp_path / "gateway parent"

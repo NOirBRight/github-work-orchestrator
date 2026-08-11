@@ -2437,6 +2437,35 @@ def _local_input_directories(config: RunnerConfig) -> tuple[Path, ...]:
     return tuple(unique)
 
 
+def _lease_input_paths(config: RunnerConfig) -> tuple[Path, ...]:
+    return (
+        Path(config.fresh_store),
+        Path(config.rollback_store),
+        Path(config.prior_store),
+        Path(config.fresh_receipt),
+        Path(config.runtime_config_path),
+        Path(__file__).resolve(),
+        Path(__file__).resolve().with_name(_REVIEWED_PROVENANCE_NAME),
+        *(Path(__file__).resolve().with_name(name) for name in _ATTESTOR_MODULE_NAMES),
+        *_local_input_files(config),
+    )
+
+
+def _mechanical_input_snapshot(config: RunnerConfig) -> dict[str, object]:
+    file_identities: dict[str, dict[str, int | str]] = {}
+    file_hashes: dict[str, str] = {}
+    for path in _lease_input_paths(config):
+        snapshot = _bound_file_snapshot(path, "ATTESTATION_UNAVAILABLE")
+        path_text = _path_text(path)
+        file_identities[path_text] = snapshot["identity"]
+        file_hashes[path_text] = str(snapshot["sha256"])
+    return {
+        "file_paths": sorted(file_identities),
+        "file_identities": file_identities,
+        "file_hashes": file_hashes,
+    }
+
+
 def _preflight_file_snapshots(
     config: RunnerConfig,
     preflight_result: Mapping[str, object],
@@ -2450,6 +2479,24 @@ def _preflight_file_snapshots(
                 "identity": dict(identity),
                 "sha256": sha256,
             }
+
+    input_snapshot = preflight_result.get("_input_snapshot")
+    if type(input_snapshot) is dict:
+        file_paths = input_snapshot.get("file_paths")
+        identities = input_snapshot.get("file_identities")
+        hashes = input_snapshot.get("file_hashes")
+        if (
+            type(file_paths) is not list
+            or any(type(path) is not str for path in file_paths)
+            or type(identities) is not dict
+            or type(hashes) is not dict
+        ):
+            raise RunnerError("LIVE_INPUT_DRIFT", "preflight input snapshot is malformed")
+        if {_path_text(path) for path in local_paths} != set(file_paths):
+            raise RunnerError("LIVE_INPUT_DRIFT", "input file set changed after preflight")
+        for path in local_paths:
+            path_text = _path_text(path)
+            add(path, identities.get(path_text), hashes.get(path_text))
 
     stores = preflight_result.get("_stores")
     if type(stores) is dict:
@@ -2493,17 +2540,7 @@ def _preflight_file_snapshots(
 
 
 def _input_lease(config: RunnerConfig, preflight_result: dict[str, object]) -> _InputLease:
-    local_paths = (
-        Path(config.fresh_store),
-        Path(config.rollback_store),
-        Path(config.prior_store),
-        Path(config.fresh_receipt),
-        Path(config.runtime_config_path),
-        Path(__file__).resolve(),
-        Path(__file__).resolve().with_name(_REVIEWED_PROVENANCE_NAME),
-        *(Path(__file__).resolve().with_name(name) for name in _ATTESTOR_MODULE_NAMES),
-        *_local_input_files(config),
-    )
+    local_paths = _lease_input_paths(config)
     preflight_snapshots = _preflight_file_snapshots(config, preflight_result, local_paths)
     expected: dict[Path, Mapping[str, object]] = {}
     for path in local_paths:
@@ -2578,6 +2615,8 @@ def preflight(
                 "_packages": packages,
             }
         )
+    else:
+        result["_input_snapshot"] = _mechanical_input_snapshot(config)
     return result
 
 
