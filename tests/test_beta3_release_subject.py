@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import hashlib
 import json
 from pathlib import Path
@@ -201,6 +201,60 @@ def test_parsed_subject_has_frozen_typed_nested_identities(tmp_path: Path):
         parsed.schema = RELEASE_SUBJECT_SCHEMA  # type: ignore[misc]
 
 
+def test_release_subject_constructor_rejects_wrong_attestor_count(tmp_path: Path):
+    subject = ReleaseSubject.from_canonical(_canonical_fixture_payload(tmp_path))
+    attestors = subject.attestors[:-1]
+    body = subject.canonical_body()
+    body["attestors"] = [attestor.canonical() for attestor in attestors]
+
+    with pytest.raises(ReleaseSubjectError) as error:
+        replace(
+            subject,
+            attestors=attestors,
+            subject_digest=hashlib.sha256(
+                _fixture_canonical_json_bytes(body)
+            ).hexdigest(),
+        )
+    assert error.value.code == "RELEASE_SUBJECT_SCHEMA_INVALID"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing_attestor",
+        "swapped_attestors",
+        "runner_path",
+        "attestor_path",
+        "reviewed_provenance_path",
+    ),
+)
+def test_release_subject_from_canonical_rejects_noncanonical_fixed_identities(
+    tmp_path: Path, mutation: str
+):
+    payload = _canonical_fixture_payload(tmp_path)
+    if mutation == "missing_attestor":
+        payload["attestors"] = payload["attestors"][:-1]  # type: ignore[index]
+    elif mutation == "swapped_attestors":
+        payload["attestors"] = list(reversed(payload["attestors"]))  # type: ignore[arg-type]
+    elif mutation == "runner_path":
+        payload["runner"]["path"] = str(tmp_path / "other-runner.py")  # type: ignore[index]
+    elif mutation == "attestor_path":
+        payload["attestors"][0]["path"] = str(tmp_path / "other-attestor.py")  # type: ignore[index]
+    else:
+        payload["reviewed_provenance"]["path"] = str(  # type: ignore[index]
+            tmp_path / "other-provenance.json"
+        )
+    body = dict(payload)
+    body.pop("subject_digest")
+    payload["subject_digest"] = hashlib.sha256(
+        _fixture_canonical_json_bytes(body)
+    ).hexdigest()
+
+    with pytest.raises(ReleaseSubjectError) as error:
+        ReleaseSubject.from_canonical(payload)
+    assert error.value.code == "RELEASE_SUBJECT_SCHEMA_INVALID"
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (
@@ -308,6 +362,16 @@ def test_subject_parser_rejects_duplicate_json_keys(tmp_path: Path):
     raw = canonical_json_bytes(payload).replace(
         b'"schema":"gwo-v8-release-subject.v1",',
         b'"schema":"gwo-v8-release-subject.v1","schema":"gwo-v8-release-subject.v1",',
+    )
+    with pytest.raises(ReleaseSubjectError) as error:
+        parse_release_subject(raw, tmp_path / "repository", tmp_path / "evidence")
+    assert error.value.code == "RELEASE_SUBJECT_SCHEMA_INVALID"
+
+
+def test_subject_parser_rejects_escaped_unpaired_unicode_surrogate(tmp_path: Path):
+    raw = canonical_json_bytes(_canonical_fixture_payload(tmp_path)).replace(
+        b'"repository":"NOirBRight/github-work-orchestrator"',
+        b'"repository":"\\ud800"',
     )
     with pytest.raises(ReleaseSubjectError) as error:
         parse_release_subject(raw, tmp_path / "repository", tmp_path / "evidence")

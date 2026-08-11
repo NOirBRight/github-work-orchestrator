@@ -104,6 +104,10 @@ def _require_closed_keys(
     return value
 
 
+def _canonical_path(path: Path) -> str:
+    return str(path.expanduser().resolve(strict=False))
+
+
 @dataclass(frozen=True)
 class ReleaseFileIdentity:
     module: str
@@ -136,6 +140,36 @@ class ReviewedProvenanceIdentity:
         return {"path": self.path, "sha256": self.sha256}
 
 
+def _validate_fixed_identities(
+    repository_root: str,
+    runner: ReleaseFileIdentity,
+    attestors: tuple[ReleaseFileIdentity, ...],
+    reviewed_provenance: ReviewedProvenanceIdentity,
+) -> None:
+    canonical_root = _canonical_path(Path(repository_root))
+    if repository_root != canonical_root:
+        _schema_invalid("repository_root must be canonical")
+    expected_runner_path = _canonical_path(
+        Path(canonical_root) / "scripts" / "run_beta3_live_guard.py"
+    )
+    if runner.module != "run_beta3_live_guard" or runner.path != expected_runner_path:
+        _schema_invalid("runner identity is not the canonical live guard")
+    if len(attestors) != len(ATTESTOR_FILENAMES):
+        _schema_invalid("attestors must contain the four ordered attestors")
+    for observed, filename in zip(attestors, ATTESTOR_FILENAMES, strict=True):
+        expected_module = filename.removesuffix(".py")
+        expected_path = _canonical_path(Path(canonical_root) / "scripts" / filename)
+        if observed.module != expected_module or observed.path != expected_path:
+            _schema_invalid(
+                "attestor identity is not the required ordered canonical identity"
+            )
+    expected_reviewed_path = _canonical_path(
+        Path(canonical_root) / "scripts" / "beta3_reviewed_provenance.json"
+    )
+    if reviewed_provenance.path != expected_reviewed_path:
+        _schema_invalid("reviewed_provenance path is not canonical")
+
+
 @dataclass(frozen=True)
 class ReleaseSubject:
     schema: str
@@ -147,7 +181,12 @@ class ReleaseSubject:
     audited_source_tree_digest: str
     remote_ref: str
     runner: ReleaseFileIdentity
-    attestors: tuple[ReleaseFileIdentity, ...]
+    attestors: tuple[
+        ReleaseFileIdentity,
+        ReleaseFileIdentity,
+        ReleaseFileIdentity,
+        ReleaseFileIdentity,
+    ]
     attestor_bundle_sha256: str
     reviewed_provenance: ReviewedProvenanceIdentity
     subject_digest: str
@@ -183,6 +222,12 @@ class ReleaseSubject:
             _schema_invalid("attestors must be a tuple of ReleaseFileIdentity values")
         if type(self.reviewed_provenance) is not ReviewedProvenanceIdentity:
             _schema_invalid("reviewed_provenance must be a ReviewedProvenanceIdentity")
+        _validate_fixed_identities(
+            self.repository_root,
+            self.runner,
+            self.attestors,
+            self.reviewed_provenance,
+        )
         if self.subject_digest != release_subject_digest(self.canonical_body()):
             raise ReleaseSubjectError(
                 "RELEASE_SUBJECT_DIGEST_MISMATCH",
@@ -299,13 +344,13 @@ def _decode_exact_canonical_object(raw: bytes) -> dict[str, object]:
         _schema_invalid(f"raw release subject is not valid canonical JSON: {error}")
     if type(value) is not dict:
         _schema_invalid("raw release subject must contain a JSON object")
-    if canonical_json_bytes(value) != raw:
+    try:
+        canonical = canonical_json_bytes(value)
+    except UnicodeEncodeError as error:
+        _schema_invalid(f"raw release subject is not valid canonical JSON: {error}")
+    if canonical != raw:
         _schema_invalid("raw release subject is not canonically encoded")
     return value
-
-
-def _canonical_path(path: Path) -> str:
-    return str(path.expanduser().resolve(strict=False))
 
 
 def _validate_closed_shape(
@@ -343,29 +388,15 @@ def _validate_closed_shape(
     _require_digest(value["subject_digest"], "subject_digest")
 
     runner = _require_closed_keys(value["runner"], _FILE_IDENTITY_KEYS, "runner")
-    expected_runner_path = _canonical_path(
-        repository_root / "scripts" / "run_beta3_live_guard.py"
-    )
-    if (
-        runner["module"] != "run_beta3_live_guard"
-        or runner["path"] != expected_runner_path
-    ):
-        _schema_invalid("runner identity is not the canonical live guard")
     _require_exact_text(runner["module"], "runner.module")
     _require_exact_text(runner["path"], "runner.path")
     _require_digest(runner["sha256"], "runner.sha256")
 
     attestors = value["attestors"]
-    if type(attestors) is not list or len(attestors) != len(ATTESTOR_FILENAMES):
-        _schema_invalid("attestors must contain the four ordered attestors")
-    for observed, filename in zip(attestors, ATTESTOR_FILENAMES, strict=True):
+    if type(attestors) is not list:
+        _schema_invalid("attestors must be a JSON array")
+    for observed in attestors:
         identity = _require_closed_keys(observed, _FILE_IDENTITY_KEYS, "attestors[]")
-        expected_module = filename.removesuffix(".py")
-        expected_path = _canonical_path(repository_root / "scripts" / filename)
-        if identity["module"] != expected_module or identity["path"] != expected_path:
-            _schema_invalid(
-                "attestor identity is not the required ordered canonical identity"
-            )
         _require_exact_text(identity["module"], "attestors[].module")
         _require_exact_text(identity["path"], "attestors[].path")
         _require_digest(identity["sha256"], "attestors[].sha256")
@@ -375,11 +406,6 @@ def _validate_closed_shape(
         _REVIEWED_PROVENANCE_KEYS,
         "reviewed_provenance",
     )
-    expected_reviewed_path = _canonical_path(
-        repository_root / "scripts" / "beta3_reviewed_provenance.json"
-    )
-    if reviewed["path"] != expected_reviewed_path:
-        _schema_invalid("reviewed_provenance path is not canonical")
     _require_exact_text(reviewed["path"], "reviewed_provenance.path")
     _require_digest(reviewed["sha256"], "reviewed_provenance.sha256")
 
@@ -393,11 +419,4 @@ def parse_release_subject(
 
     value = _decode_exact_canonical_object(raw)
     _validate_closed_shape(value, expected_repository_root, expected_evidence_root)
-    body = dict(value)
-    observed_digest = body.pop("subject_digest")
-    if observed_digest != release_subject_digest(body):
-        raise ReleaseSubjectError(
-            "RELEASE_SUBJECT_DIGEST_MISMATCH",
-            "subject_digest is not the digest of the canonical body",
-        )
     return ReleaseSubject.from_canonical(value)
