@@ -32,6 +32,7 @@ from beta3_bootstrap_model import (
     SourceRecord,
     WriterAuthorityObservation,
 )
+from beta3_release_subject import ReleaseSubject
 from gwo_v8._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
 from gwo_v8.cutover_guard import (
     CompatibilityPathReadback,
@@ -77,8 +78,6 @@ ACTIVE_PLAN_PATH = CONTROL_PATHS[1]
 STORE_SCHEMA = "gwo.v8.store.v1"
 PRODUCTION_REPOSITORY = "NOirBRight/github-work-orchestrator"
 PRODUCTION_REPOSITORY_ROOT = Path(r"D:\Workstation\github-work-orchestrator")
-PRODUCTION_SOURCE_COMMIT = "5de34bdaee45f0aba44077a8d1d3e3ed8293f237"
-PRODUCTION_SOURCE_TREE = "104ee822dbfb494d33d56b8ccf54092d9d1d9c86"
 PRODUCTION_STORE = Path(
     r"C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator"
     r"\store-20260809T081500Z.sqlite3"
@@ -434,7 +433,7 @@ class _LocalInputsSource:
         value = {
             "repository_root": str(root),
             "commit_oid": commit,
-            "tree_digest": tree,
+            "git_tree_oid": tree,
             "git_status_sha256": digest_bytes(status),
             "files": files,
         }
@@ -447,7 +446,7 @@ class _LocalInputsSource:
             identity={
                 "repository_root": str(root),
                 "commit_oid": commit,
-                "tree_digest": tree,
+                "git_tree_oid": tree,
                 "git_status_sha256": digest_bytes(status),
                 "file_set_digest": digest_value(files),
                 "observation_digest": digest_bytes(payload),
@@ -681,8 +680,8 @@ def _validate_checkout_observation(
     )
     expected = {
         "repository_root": str(root),
-        "commit_oid": subject.source_commit,
-        "tree_digest": subject.source_tree_digest,
+        "commit_oid": config.merged_main_sha,
+        "git_tree_oid": config.merged_main_git_tree,
     }
     try:
         value = load_canonical_json(observation.canonical_payload)
@@ -1393,8 +1392,8 @@ def _receipt(
     expected = {
         "schema": "gwo-v8-fresh-store-provision.v1",
         "repository": subject.repository,
-        "source_main_sha": subject.source_commit,
-        "source_main_tree": subject.source_tree_digest,
+        "source_main_sha": config.merged_main_sha,
+        "source_main_tree": config.merged_main_git_tree,
         "store_generation": config.store_generation,
         "store_sha256": config.expected_fresh_store_sha256,
         "integrity": "ok",
@@ -3234,15 +3233,20 @@ def _validate_checkout_file_bindings(
         _fail(code, "static or source-package files differ from the checkout observation")
 
 
-def _validate_config_subject(config: object, subject: CutoverSubject) -> None:
+def _validate_config_subject(
+    config: object,
+    subject: CutoverSubject,
+    release_subject: ReleaseSubject,
+) -> None:
     required_fields = {
         "repository": "STATIC_INPUT_SOURCE_UNAVAILABLE",
         "control_branch": "STATIC_INPUT_SOURCE_UNAVAILABLE",
         "target_branch": "STATIC_INPUT_SOURCE_UNAVAILABLE",
         "source_writer_generation": "STATIC_INPUT_SOURCE_UNAVAILABLE",
         "target_writer_generation": "STATIC_INPUT_SOURCE_UNAVAILABLE",
-        "expected_head": "STATIC_INPUT_SOURCE_UNAVAILABLE",
-        "expected_tree": "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        "merged_main_sha": "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        "merged_main_git_tree": "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        "audited_source_tree_digest": "STATIC_INPUT_SOURCE_UNAVAILABLE",
         "repository_root": "STATIC_INPUT_SOURCE_UNAVAILABLE",
         "fresh_store": "STORE_SOURCE_UNAVAILABLE",
         "expected_fresh_store_sha256": "STORE_SOURCE_UNAVAILABLE",
@@ -3267,6 +3271,8 @@ def _validate_config_subject(config: object, subject: CutoverSubject) -> None:
     for name, code in required_fields.items():
         if not hasattr(config, name):
             _fail(code, f"fixed configuration {name} is absent")
+    if type(release_subject) is not ReleaseSubject:
+        _fail("COMPONENT_INVALID", "release subject must be one exact typed value")
     if subject.required_runtime_selectors != RUNTIME_SELECTORS:
         _fail(
             "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE",
@@ -3279,8 +3285,6 @@ def _validate_config_subject(config: object, subject: CutoverSubject) -> None:
         "source_writer_generation": subject.source_writer_generation,
         "target_writer_generation": subject.target_writer_generation,
         "store_generation": subject.store_generation,
-        "expected_head": subject.source_commit,
-        "expected_tree": subject.source_tree_digest,
     }
     for name, expected in expected_values.items():
         if getattr(config, name) != expected:
@@ -3288,6 +3292,41 @@ def _validate_config_subject(config: object, subject: CutoverSubject) -> None:
                 "STATIC_INPUT_SOURCE_UNAVAILABLE",
                 f"fixed configuration {name} is not bound to the subject",
             )
+    if config.merged_main_sha != release_subject.merged_main_sha:
+        _fail(
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+            "config merged_main_sha is not manifest-bound",
+        )
+    if config.merged_main_git_tree != release_subject.merged_main_git_tree:
+        _fail(
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+            "config merged_main_git_tree is not manifest-bound",
+        )
+    if config.audited_source_tree_digest != release_subject.audited_source_tree_digest:
+        _fail(
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+            "config audited source digest is not manifest-bound",
+        )
+    if subject.source_commit != release_subject.merged_main_sha:
+        _fail(
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+            "CutoverSubject source commit is not manifest-bound",
+        )
+    if subject.source_tree_digest != release_subject.audited_source_tree_digest:
+        _fail(
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+            "CutoverSubject audited source digest is not manifest-bound",
+        )
+    if subject.repository != release_subject.repository:
+        _fail(
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+            "CutoverSubject repository is not manifest-bound",
+        )
+    if config.repository != release_subject.repository:
+        _fail(
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+            "config repository is not manifest-bound",
+        )
     fixed_subject_values = {
         "control_branch": "gwo-control",
         "target_branch": "main",
@@ -3303,8 +3342,31 @@ def _validate_config_subject(config: object, subject: CutoverSubject) -> None:
                 "STATIC_INPUT_SOURCE_UNAVAILABLE",
                 f"subject {name} is not the fixed current-main contract",
             )
-    if _HEX40.fullmatch(subject.source_commit) is None or _HEX40.fullmatch(subject.source_tree_digest) is None:
-        _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "subject source identity is malformed")
+    if (
+        type(config.merged_main_sha) is not str
+        or _HEX40.fullmatch(config.merged_main_sha) is None
+    ):
+        _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "config merged main SHA is malformed")
+    if (
+        type(config.merged_main_git_tree) is not str
+        or _HEX40.fullmatch(config.merged_main_git_tree) is None
+    ):
+        _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "config merged main Git tree is malformed")
+    if (
+        type(config.audited_source_tree_digest) is not str
+        or _HEX64.fullmatch(config.audited_source_tree_digest) is None
+    ):
+        _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "config audited source digest is malformed")
+    if (
+        type(subject.source_commit) is not str
+        or _HEX40.fullmatch(subject.source_commit) is None
+    ):
+        _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "subject source commit is malformed")
+    if (
+        type(subject.source_tree_digest) is not str
+        or _HEX64.fullmatch(subject.source_tree_digest) is None
+    ):
+        _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "subject audited source digest is malformed")
     for name in (
         "expected_fresh_store_sha256",
         "expected_fresh_receipt_sha256",
@@ -3355,14 +3417,6 @@ def _validate_config_subject(config: object, subject: CutoverSubject) -> None:
         _fail("PACKAGE_SOURCE_UNAVAILABLE", "configured package content identities are incomplete")
     if subject.repository == PRODUCTION_REPOSITORY:
         production_store_tables, _ = _fixed_store_contract()
-        production_subject = {
-            "source_commit": PRODUCTION_SOURCE_COMMIT,
-            "source_tree_digest": PRODUCTION_SOURCE_TREE,
-            "store_generation": PRODUCTION_STORE_GENERATION,
-        }
-        for name, expected in production_subject.items():
-            if getattr(subject, name) != expected:
-                _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", f"production subject {name} changed")
         production_config = {
             "repository_root": PRODUCTION_REPOSITORY_ROOT,
             "fresh_store": PRODUCTION_STORE,
@@ -3520,14 +3574,22 @@ class ControlOwnershipAttestor:
         config: object,
         subject: CutoverSubject,
         attempt: AttemptIdentity,
+        release_subject: ReleaseSubject,
     ) -> ComponentObservation:
-        if type(subject) is not CutoverSubject or type(attempt) is not AttemptIdentity:
-            _fail("COMPONENT_INVALID", "subject and attempt must be exact current contracts")
+        if (
+            type(subject) is not CutoverSubject
+            or type(attempt) is not AttemptIdentity
+            or type(release_subject) is not ReleaseSubject
+        ):
+            _fail(
+                "COMPONENT_INVALID",
+                "subject, attempt, and release subject must be exact current contracts",
+            )
         if attempt.repository != subject.repository:
             _fail("COMPONENT_INVALID", "attempt and subject repositories differ")
         if attempt.cutover_subject_digest != digest_value(subject.canonical()):
             _fail("COMPONENT_INVALID", "attempt does not bind the cutover subject")
-        _validate_config_subject(config, subject)
+        _validate_config_subject(config, subject, release_subject)
 
         checkout = _read_source(
             self._sources.local_inputs,

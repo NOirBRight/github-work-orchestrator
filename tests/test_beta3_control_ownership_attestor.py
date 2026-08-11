@@ -35,6 +35,7 @@ from gwo_v8.cutover_guard import (  # noqa: E402
 )
 from gwo_v8.transition import WriterTransitionRecord  # noqa: E402
 import beta3_control_ownership_attestor as attestor_module  # noqa: E402
+from beta3_release_subject import ReleaseSubject, release_subject_digest  # noqa: E402
 from beta3_bootstrap_model import (  # noqa: E402
     AttemptIdentity,
     BootstrapError,
@@ -152,9 +153,82 @@ def _subject() -> CutoverSubject:
         target_writer_generation="v8",
         store_generation="store:v8:test",
         source_commit="a" * 40,
-        source_tree_digest="b" * 40,
+        source_tree_digest="b" * 64,
         production_entry_refs=("entry:main",),
     )
+
+
+def _subject_with_source_tree_digest(source_tree_digest: str) -> CutoverSubject:
+    return replace(
+        _subject(),
+        repository="NOirBRight/github-work-orchestrator",
+        source_tree_digest=source_tree_digest,
+        store_generation="store:v8:production:20260809T081500Z",
+    )
+
+
+def _release_subject(
+    *,
+    merged_main_sha: str,
+    merged_main_git_tree: str,
+    audited_source_tree_digest: str,
+) -> ReleaseSubject:
+    repository_root = ROOT.resolve()
+    body = {
+        "schema": "gwo-v8-release-subject.v1",
+        "repository": "NOirBRight/github-work-orchestrator",
+        "repository_root": str(repository_root),
+        "evidence_root": str((repository_root / ".codex-tmp" / "evidence").resolve()),
+        "merged_main_sha": merged_main_sha,
+        "merged_main_git_tree": merged_main_git_tree,
+        "audited_source_tree_digest": audited_source_tree_digest,
+        "remote_ref": "origin/main",
+        "runner": {
+            "module": "run_beta3_live_guard",
+            "path": str(repository_root / "scripts" / "run_beta3_live_guard.py"),
+            "sha256": "1" * 64,
+        },
+        "attestors": [
+            {
+                "module": name.removesuffix(".py"),
+                "path": str(repository_root / "scripts" / name),
+                "sha256": digest,
+            }
+            for name, digest in zip(
+                (
+                    "beta3_bootstrap_model.py",
+                    "beta3_control_ownership_attestor.py",
+                    "beta3_legacy_attestor.py",
+                    "beta3_replay_guard.py",
+                ),
+                ("2" * 64, "3" * 64, "4" * 64, "5" * 64),
+                strict=True,
+            )
+        ],
+        "attestor_bundle_sha256": "6" * 64,
+        "reviewed_provenance": {
+            "path": str(repository_root / "scripts" / "beta3_reviewed_provenance.json"),
+            "sha256": "7" * 64,
+        },
+    }
+    return ReleaseSubject.from_canonical(
+        {**body, "subject_digest": release_subject_digest(body)}
+    )
+
+
+def _release_subject_for(subject: CutoverSubject) -> ReleaseSubject:
+    if subject.repository == "NOirBRight/github-work-orchestrator":
+        return _release_subject(
+            merged_main_sha=subject.source_commit,
+            merged_main_git_tree="104ee822dbfb494d33d56b8ccf54092d9d1d9c86",
+            audited_source_tree_digest=subject.source_tree_digest,
+        )
+    value = object.__new__(ReleaseSubject)
+    object.__setattr__(value, "repository", subject.repository)
+    object.__setattr__(value, "merged_main_sha", subject.source_commit)
+    object.__setattr__(value, "merged_main_git_tree", "b" * 40)
+    object.__setattr__(value, "audited_source_tree_digest", subject.source_tree_digest)
+    return value
 
 
 def _attempt(subject: CutoverSubject) -> AttemptIdentity:
@@ -270,7 +344,7 @@ class _LocalInputs:
         value = {
             "repository_root": str(root),
             "commit_oid": self._commit or subject.source_commit,
-            "tree_digest": self._tree or subject.source_tree_digest,
+            "git_tree_oid": self._tree or config.merged_main_git_tree,
             "git_status_sha256": digest_bytes(b""),
             "files": files,
         }
@@ -286,7 +360,7 @@ class _LocalInputs:
                         {
                             "repository_root": value["repository_root"],
                             "commit_oid": value["commit_oid"],
-                            "tree_digest": value["tree_digest"],
+                            "git_tree_oid": value["git_tree_oid"],
                             "git_status_sha256": value["git_status_sha256"],
                             "file_set_digest": digest_value(files),
                             "observation_digest": digest_bytes(payload),
@@ -444,8 +518,9 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         target_branch="main",
         source_writer_generation="v6.1",
         target_writer_generation="v8",
-        expected_head="a" * 40,
-        expected_tree="b" * 40,
+        merged_main_sha="a" * 40,
+        merged_main_git_tree="b" * 40,
+        audited_source_tree_digest="b" * 64,
         repository_root=tmp_path,
         install_roots=(tmp_path / ".agents", tmp_path / ".codex", tmp_path / ".claude"),
         package_names=("implement-gwo", "orchestrator"),
@@ -472,6 +547,55 @@ def _config(tmp_path: Path) -> SimpleNamespace:
     )
 
 
+def _config_with_identity(
+    *,
+    merged_main_sha: str,
+    merged_main_git_tree: str,
+    audited_source_tree_digest: str,
+) -> SimpleNamespace:
+    _, config = _production_subject_and_config(
+        ROOT / ".codex-tmp" / "control-attestor-fixture"
+    )
+    config.merged_main_sha = merged_main_sha
+    config.merged_main_git_tree = merged_main_git_tree
+    config.audited_source_tree_digest = audited_source_tree_digest
+    return config
+
+
+def test_default_subject_accepts_separate_git_tree_and_audited_digest():
+    subject = _subject_with_source_tree_digest("c" * 64)
+    config = _config_with_identity(
+        merged_main_sha=subject.source_commit,
+        merged_main_git_tree="b" * 40,
+        audited_source_tree_digest="c" * 64,
+    )
+    release_subject = _release_subject(
+        merged_main_sha=subject.source_commit,
+        merged_main_git_tree="b" * 40,
+        audited_source_tree_digest="c" * 64,
+    )
+
+    attestor_module._validate_config_subject(config, subject, release_subject)
+
+
+def test_swapping_git_tree_and_audited_source_digest_fails_before_readers():
+    subject = _subject_with_source_tree_digest("b" * 40)
+    config = _config_with_identity(
+        merged_main_sha=subject.source_commit,
+        merged_main_git_tree="c" * 64,
+        audited_source_tree_digest="b" * 40,
+    )
+    release_subject = _release_subject(
+        merged_main_sha=subject.source_commit,
+        merged_main_git_tree="c" * 40,
+        audited_source_tree_digest="b" * 64,
+    )
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._validate_config_subject(config, subject, release_subject)
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
 @pytest.mark.parametrize(
     "field",
     (
@@ -480,8 +604,9 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         "target_branch",
         "source_writer_generation",
         "target_writer_generation",
-        "expected_head",
-        "expected_tree",
+        "merged_main_sha",
+        "merged_main_git_tree",
+        "audited_source_tree_digest",
         "repository_root",
         "fresh_store",
         "expected_fresh_store_sha256",
@@ -509,7 +634,11 @@ def test_config_requires_every_fixed_identity(tmp_path, field):
     delattr(config, field)
 
     with pytest.raises(BootstrapError) as error:
-        attestor_module._validate_config_subject(config, _subject())
+        attestor_module._validate_config_subject(
+            config,
+            _subject(),
+            _release_subject_for(_subject()),
+        )
 
     assert error.value.code in {
         "STATIC_INPUT_SOURCE_UNAVAILABLE",
@@ -524,13 +653,14 @@ def _production_subject_and_config(tmp_path):
         _subject(),
         repository="NOirBRight/github-work-orchestrator",
         source_commit="5de34bdaee45f0aba44077a8d1d3e3ed8293f237",
-        source_tree_digest="104ee822dbfb494d33d56b8ccf54092d9d1d9c86",
+        source_tree_digest="c" * 64,
         store_generation="store:v8:production:20260809T081500Z",
     )
     config = _config(tmp_path)
     config.repository = subject.repository
-    config.expected_head = subject.source_commit
-    config.expected_tree = subject.source_tree_digest
+    config.merged_main_sha = subject.source_commit
+    config.merged_main_git_tree = "104ee822dbfb494d33d56b8ccf54092d9d1d9c86"
+    config.audited_source_tree_digest = subject.source_tree_digest
     config.repository_root = Path(r"D:\Workstation\github-work-orchestrator")
     config.fresh_store = Path(
         r"C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator"
@@ -620,13 +750,13 @@ def test_production_configuration_requires_every_global_fixed_identity(
     setattr(config, field, replacement)
 
     with pytest.raises(BootstrapError):
-        attestor_module._validate_config_subject(config, subject)
+        attestor_module._validate_config_subject(config, subject, _release_subject_for(subject))
 
 
 def test_production_configuration_accepts_exact_global_fixed_identities(tmp_path):
     subject, config = _production_subject_and_config(tmp_path)
 
-    attestor_module._validate_config_subject(config, subject)
+    attestor_module._validate_config_subject(config, subject, _release_subject_for(subject))
 
 
 def test_production_configuration_rejects_runtime_config_path_alias(tmp_path):
@@ -636,7 +766,7 @@ def test_production_configuration_rejects_runtime_config_path_alias(tmp_path):
     )
 
     with pytest.raises(BootstrapError) as error:
-        attestor_module._validate_config_subject(config, subject)
+        attestor_module._validate_config_subject(config, subject, _release_subject_for(subject))
 
     assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
 
@@ -727,7 +857,10 @@ def test_control_reads_every_blob_at_one_fixed_oid(control_fixture, tmp_path, mo
     monkeypatch.setattr(attestor_module, "ReadOnlyPackageValidator", lambda *_args: SimpleNamespace(read=lambda _subject: packages))
     config = _config(tmp_path)
     observation = ControlOwnershipAttestor(_sources(control_fixture)).observe(
-        config=config, subject=subject, attempt=_attempt(subject)
+        config=config,
+        subject=subject,
+        attempt=_attempt(subject),
+        release_subject=_release_subject_for(subject),
     )
     assert observation.writer_authority is not None
     assert control_fixture.calls == [
@@ -815,7 +948,10 @@ def test_control_source_records_retain_each_blob_byte_digest(
     )
 
     observation = ControlOwnershipAttestor(_sources(control_fixture)).observe(
-        config=_config(tmp_path), subject=subject, attempt=attempt
+        config=_config(tmp_path),
+        subject=subject,
+        attempt=attempt,
+        release_subject=_release_subject_for(subject),
     )
 
     control_records = {
@@ -861,7 +997,10 @@ def test_control_rejects_missing_record_instead_of_initial_writer_fallback(
     control_fixture.writer_bytes = None
     with pytest.raises(Exception) as error:
         ControlOwnershipAttestor(sources).observe(
-            config=_config(tmp_path), subject=subject, attempt=_attempt(subject)
+            config=_config(tmp_path),
+            subject=subject,
+            attempt=_attempt(subject),
+            release_subject=_release_subject_for(subject),
         )
     assert getattr(error.value, "code", None) == "WRITER_FENCE_SOURCE_UNAVAILABLE"
 
@@ -883,7 +1022,12 @@ def test_control_rejects_blob_identity_mismatch(control_fixture, tmp_path):
     with pytest.raises(Exception) as error:
         ControlOwnershipAttestor(
             replace(sources, control=MismatchedBlob())
-        ).observe(config=_config(tmp_path), subject=subject, attempt=_attempt(subject))
+        ).observe(
+            config=_config(tmp_path),
+            subject=subject,
+            attempt=_attempt(subject),
+            release_subject=_release_subject_for(subject),
+        )
     assert getattr(error.value, "code", None) == "WRITER_FENCE_SOURCE_UNAVAILABLE"
 
 
@@ -972,7 +1116,10 @@ def test_runtime_config_rejects_replaced_exact_path(control_fixture, tmp_path, m
     )
     with pytest.raises(Exception) as error:
         ControlOwnershipAttestor(sources).observe(
-            config=_config(tmp_path), subject=subject, attempt=attempt
+            config=_config(tmp_path),
+            subject=subject,
+            attempt=attempt,
+            release_subject=_release_subject_for(subject),
         )
     assert getattr(error.value, "code", None) == "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE"
 
@@ -1057,13 +1204,20 @@ def test_local_checkout_source_rejects_reparse_path_before_read(tmp_path, monkey
         "_checkout_source_files",
         lambda *_args: (redirected / target.name,),
     )
-    responses = iter((_subject().source_commit.encode("ascii"), _subject().source_tree_digest.encode("ascii"), b""))
+    config = _config(tmp_path)
+    subject = _subject()
+    responses = iter(
+        (
+            subject.source_commit.encode("ascii"),
+            config.merged_main_git_tree.encode("ascii"),
+            b"",
+        )
+    )
 
     with pytest.raises(BootstrapError) as error:
-        attestor_module._LocalInputsSource(lambda _command: next(responses), "d" * 64).read(
-            _config(tmp_path),
-            _subject(),
-        )
+        attestor_module._LocalInputsSource(
+            lambda _command: next(responses), "d" * 64
+        ).read(config, subject)
 
     assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
 
@@ -1749,7 +1903,7 @@ def test_static_records_do_not_fallback_to_empty_provenance(tmp_path):
             producer_sha256="d" * 64,
             role="compatibility.module",
             source_commit="a" * 40,
-            source_tree_digest="b" * 40,
+            source_tree_digest="b" * 64,
             readback_digest="c" * 64,
         )
     assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
@@ -1788,7 +1942,7 @@ def test_checkout_observation_accepts_exact_commit_tree_and_root(tmp_path):
         "git_status_sha256": digest_bytes(b""),
         "observation_digest": digest_bytes(observation.canonical_payload),
         "repository_root": str(tmp_path.resolve()),
-        "tree_digest": subject.source_tree_digest,
+        "git_tree_oid": config.merged_main_git_tree,
     }
 
 
@@ -1798,7 +1952,7 @@ def test_local_checkout_source_reads_authoritative_head_and_git_tree(tmp_path):
     _write_static_fixture(tmp_path)
     responses = (
         subject.source_commit.encode("ascii"),
-        subject.source_tree_digest.encode("ascii"),
+        config.merged_main_git_tree.encode("ascii"),
         b"",
     )
     calls: list[tuple[str, ...]] = []
@@ -1826,7 +1980,7 @@ def test_local_checkout_source_reads_authoritative_head_and_git_tree(tmp_path):
         ),
     ]
     assert dict(observed.record.identity)["commit_oid"] == subject.source_commit
-    assert dict(observed.record.identity)["tree_digest"] == subject.source_tree_digest
+    assert dict(observed.record.identity)["git_tree_oid"] == config.merged_main_git_tree
     assert load_canonical_json(observed.canonical_payload)["files"]
 
 
@@ -1836,7 +1990,7 @@ def test_local_checkout_source_rejects_dirty_worktree(tmp_path):
     responses = iter(
         (
             subject.source_commit.encode("ascii"),
-            subject.source_tree_digest.encode("ascii"),
+            config.merged_main_git_tree.encode("ascii"),
             b" M changed.py\0",
         )
     )
@@ -2634,8 +2788,8 @@ def _create_store_fixture(tmp_path: Path, *, active: bool = False) -> SimpleName
     receipt = {
         "schema": "gwo-v8-fresh-store-provision.v1",
         "repository": config.repository,
-        "source_main_sha": config.expected_head,
-        "source_main_tree": config.expected_tree,
+        "source_main_sha": config.merged_main_sha,
+        "source_main_tree": config.merged_main_git_tree,
         "runbook_sha256": config.expected_fresh_receipt_runbook_sha256,
         "store_path": str(config.fresh_store.resolve()),
         "store_generation": config.store_generation,
