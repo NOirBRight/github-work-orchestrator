@@ -2145,14 +2145,50 @@ def _absolute_local_path(path: Path) -> Path:
     return Path(os.path.abspath(Path(path)))
 
 
-def _stat_identity(stat_result: os.stat_result) -> dict[str, int]:
-    return {
-        "st_dev": int(stat_result.st_dev),
-        "st_ino": int(stat_result.st_ino),
-        "st_mode": int(stat_result.st_mode),
-        "st_size": int(stat_result.st_size),
-        "st_mtime_ns": int(stat_result.st_mtime_ns),
-    }
+@dataclass(frozen=True)
+class _EnumeratedStat:
+    st_mode: int
+    st_ino: int
+    st_dev: int
+    st_size: int
+    st_mtime_ns: int
+    st_file_attributes: int
+
+
+@dataclass(frozen=True)
+class _HeldDirectoryEntry:
+    name: str
+    path: Path
+    _stat_result: _EnumeratedStat
+
+    def stat(self, *, follow_symlinks: bool = True) -> _EnumeratedStat:
+        del follow_symlinks
+        return self._stat_result
+
+    def inode(self) -> int:
+        return self._stat_result.st_ino
+
+
+def _held_directory_identity(path: Path, code: str) -> Mapping[str, int | str]:
+    try:
+        from run_beta3_live_guard import _close_descriptors, _open_directory_components
+    except Exception as error:
+        raise BootstrapError(code, f"local directory is unavailable: {path}") from error
+    descriptors: list[int] = []
+    try:
+        descriptors, identities = _open_directory_components(Path(path), code)
+        if not identities:
+            raise OSError("directory identity is unavailable")
+        return dict(identities[-1])
+    except BootstrapError:
+        raise
+    except Exception as error:
+        raise BootstrapError(code, f"local directory identity is unavailable: {path}") from error
+    finally:
+        try:
+            _close_descriptors(descriptors)
+        except OSError as error:
+            raise BootstrapError(code, f"local directory handles could not be closed: {path}") from error
 
 
 def _entry_inode(entry: object, entry_stat: os.stat_result) -> int | None:
@@ -2204,14 +2240,8 @@ def _held_identity_matches_expected(
     expected: Mapping[str, object],
     identity_matches: Callable[[Mapping[str, object], Mapping[str, object]], bool],
 ) -> bool:
-    if "file_id" in current and "file_id" not in expected:
-        return (
-            current.get("st_mode") is not None
-            and stat.S_IFMT(int(current["st_mode"]))
-            == stat.S_IFMT(int(expected.get("st_mode", -1)))
-            and current.get("st_size") == expected.get("st_size")
-            and current.get("st_mtime_ns") == expected.get("st_mtime_ns")
-        )
+    if ("file_id" in current) != ("file_id" in expected):
+        return False
     return identity_matches(current, expected)
 
 
@@ -2293,6 +2323,153 @@ def _held_local_directory(
             raise BootstrapError(code, f"local directory handles could not be closed: {path}") from error
 
 
+def _windows_directory_entries(
+    held: _HeldDirectory,
+    code: str,
+) -> tuple[_HeldDirectoryEntry, ...]:
+    try:
+        import ctypes
+        import msvcrt
+        import struct
+
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = [
+                ("status", ctypes.c_void_p),
+                ("information", ctypes.c_size_t),
+            ]
+
+        ntdll = ctypes.WinDLL("ntdll")
+        ntdll.NtQueryDirectoryFile.restype = ctypes.c_long
+        ntdll.NtQueryDirectoryFile.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(IoStatusBlock),
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_ubyte,
+            ctypes.c_void_p,
+            ctypes.c_ubyte,
+        ]
+        handle = ctypes.c_void_p(msvcrt.get_osfhandle(held.descriptor))
+        status_no_more_files = 0x80000006
+        status_buffer_overflow = 0x80000005
+        unix_epoch_filetime = 116444736000000000
+        entries: list[_HeldDirectoryEntry] = []
+        restart_scan = 1
+        while True:
+            buffer = ctypes.create_string_buffer(64 * 1024)
+            io_status = IoStatusBlock()
+            status = int(
+                ntdll.NtQueryDirectoryFile(
+                    handle,
+                    None,
+                    None,
+                    None,
+                    ctypes.byref(io_status),
+                    ctypes.byref(buffer),
+                    ctypes.sizeof(buffer),
+                    37,
+                    0,
+                    None,
+                    restart_scan,
+                )
+            ) & 0xFFFFFFFF
+            restart_scan = 0
+            if status == status_no_more_files:
+                break
+            if status not in {0, status_buffer_overflow}:
+                raise OSError(status, "NtQueryDirectoryFile failed")
+            information = int(io_status.information)
+            if information <= 0:
+                raise OSError("directory enumeration returned no data")
+            data = buffer.raw[:information]
+            offset = 0
+            while offset < information:
+                if offset + 104 > information:
+                    raise OSError("directory enumeration record is truncated")
+                next_offset = struct.unpack_from("<I", data, offset)[0]
+                file_attributes = struct.unpack_from("<I", data, offset + 56)[0]
+                file_name_length = struct.unpack_from("<I", data, offset + 60)[0]
+                file_size = struct.unpack_from("<q", data, offset + 40)[0]
+                filetime = struct.unpack_from("<q", data, offset + 24)[0]
+                file_id = struct.unpack_from("<Q", data, offset + 96)[0]
+                name_start = offset + 104
+                name_end = name_start + file_name_length
+                if (
+                    file_name_length % 2
+                    or name_end > information
+                    or file_id == 0
+                    or (next_offset and (next_offset < 104 or offset + next_offset > information))
+                ):
+                    raise OSError("directory enumeration record is malformed")
+                name = data[name_start:name_end].decode("utf-16-le")
+                if name not in {".", ".."}:
+                    mode = (
+                        stat.S_IFDIR | 0o755
+                        if file_attributes & 0x10
+                        else stat.S_IFREG | 0o644
+                    )
+                    entries.append(
+                        _HeldDirectoryEntry(
+                            name=name,
+                            path=held.path / name,
+                            _stat_result=_EnumeratedStat(
+                                st_mode=mode,
+                                st_ino=file_id,
+                                st_dev=0,
+                                st_size=max(file_size, 0),
+                                st_mtime_ns=(filetime - unix_epoch_filetime) * 100,
+                                st_file_attributes=file_attributes,
+                            ),
+                        )
+                    )
+                if not next_offset:
+                    break
+                offset += next_offset
+            if not offset and information:
+                raise OSError("directory enumeration did not advance")
+        return tuple(entries)
+    except BootstrapError:
+        raise
+    except Exception as error:
+        raise BootstrapError(code, "Windows directory enumeration failed") from error
+
+
+@contextmanager
+def _enumerate_held_directory(
+    path: Path,
+    held: _HeldDirectory,
+    code: str,
+):
+    del path
+    if os.name == "nt":
+        yield _windows_directory_entries(held, code)
+        return
+    scan_descriptor: int | None = None
+    try:
+        scan_descriptor = os.dup(held.descriptor)
+        scanner = os.scandir(scan_descriptor)
+        scan_descriptor = None
+        with scanner:
+            yield scanner
+    except BootstrapError:
+        raise
+    except OSError as error:
+        raise BootstrapError(code, "descriptor-relative directory enumeration failed") from error
+    finally:
+        if scan_descriptor is not None:
+            try:
+                os.close(scan_descriptor)
+            except OSError as error:
+                raise BootstrapError(
+                    code,
+                    "descriptor-relative directory handle could not be closed",
+                ) from error
+
+
 @contextmanager
 def _held_directory_scan(
     path: Path,
@@ -2308,10 +2485,10 @@ def _held_directory_scan(
         expected_leaf_identity=expected_leaf_identity,
     ) as held:
         try:
-            with os.scandir(path) as scanner:
-                held.assert_stable()
+            held.assert_stable()
+            with _enumerate_held_directory(path, held, code) as scanner:
                 yield held, scanner
-                held.assert_stable()
+            held.assert_stable()
         except BootstrapError:
             raise
         except Exception as error:
@@ -2484,7 +2661,10 @@ def _local_tree_snapshots(
     allow_missing: bool = False,
 ) -> tuple[_FileSnapshot, ...]:
     root = _absolute_local_path(Path(root))
+    root_identity: Mapping[str, object] | None = None
     try:
+        if os.path.lexists(root):
+            root_identity = _held_directory_identity(root, code)
         identity = root.lstat()
     except FileNotFoundError:
         if allow_missing:
@@ -2497,6 +2677,8 @@ def _local_tree_snapshots(
         _fail(code, f"local directory is a link or reparse point: {root}")
     if not stat.S_ISDIR(identity.st_mode):
         _fail(code, f"local path is not a directory: {root}")
+    if root_identity is None:
+        root_identity = _held_directory_identity(root, code)
     result: list[_FileSnapshot] = []
     pending: list[
         tuple[
@@ -2504,7 +2686,7 @@ def _local_tree_snapshots(
             tuple[Mapping[str, object], ...] | None,
             Mapping[str, object] | None,
         ]
-    ] = [(root, None, _stat_identity(identity))]
+    ] = [(root, None, root_identity)]
     while pending:
         directory, expected_identities, expected_leaf_identity = pending.pop()
         with _held_directory_scan(

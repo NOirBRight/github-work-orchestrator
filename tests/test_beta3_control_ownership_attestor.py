@@ -1087,7 +1087,10 @@ def test_local_tree_rejects_parent_replacement_during_scan(tmp_path, monkeypatch
             replaced = True
         return original_scandir(path)
 
-    monkeypatch.setattr(attestor_module.os, "scandir", replacing_scandir)
+    def replacing_enumeration(path, _held, _code):
+        return replacing_scandir(path)
+
+    monkeypatch.setattr(attestor_module, "_enumerate_held_directory", replacing_enumeration)
 
     with pytest.raises(BootstrapError) as error:
         attestor_module._local_tree_files(root, "STATIC_INPUT_SOURCE_UNAVAILABLE")
@@ -1125,6 +1128,143 @@ def test_local_tree_reads_normal_path_without_reparse(tmp_path):
         root,
         "STATIC_INPUT_SOURCE_UNAVAILABLE",
     ) == (source.resolve(),)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file-ID root identity contract")
+def test_local_tree_rejects_same_metadata_root_replacement_before_first_scan(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    source = root / "source.py"
+    source.write_bytes(b"original")
+    replaced = False
+
+    original_identity = attestor_module._held_directory_identity
+
+    def replacing_identity(path, code):
+        nonlocal replaced
+        observed = original_identity(path, code)
+        if Path(path) == root and not replaced:
+            original = tmp_path / "original-root"
+            root.rename(original)
+            replacement = tmp_path / "replacement-root"
+            replacement.mkdir()
+            (replacement / source.name).write_bytes(b"changed!")
+            os.utime(
+                replacement,
+                ns=(observed["st_mtime_ns"], observed["st_mtime_ns"]),
+            )
+            replacement.rename(root)
+            os.utime(root, ns=(observed["st_mtime_ns"], observed["st_mtime_ns"]))
+            replacement_stat = root.stat()
+            if replacement_stat.st_size != observed["st_size"]:
+                pytest.skip("directory metadata cannot be preserved on this filesystem")
+            replaced = True
+        return observed
+
+    monkeypatch.setattr(attestor_module, "_held_directory_identity", replacing_identity)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._local_tree_files(root, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+def test_local_tree_rejects_scan_replacement_to_empty_subset_after_held_assertion(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "source.py").write_bytes(b"original")
+    original_scandir = os.scandir
+    replaced = False
+
+    class Scanner:
+        def __enter__(self):
+            return self
+
+        def __iter__(self):
+            nonlocal replaced
+            original = tmp_path / "original-root"
+            replacement = tmp_path / "replacement-root"
+            root.rename(original)
+            replacement.mkdir()
+            replacement_scanner = original_scandir(replacement)
+            replaced = True
+            try:
+                yield from replacement_scanner
+            finally:
+                replacement_scanner.close()
+                replacement.rename(tmp_path / "empty-replacement-root")
+                original.rename(root)
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    def replacing_scandir(path):
+        if Path(path) == root and not replaced:
+            return Scanner()
+        return original_scandir(path)
+
+    def replacing_enumeration(path, _held, _code):
+        return replacing_scandir(path)
+
+    monkeypatch.setattr(attestor_module, "_enumerate_held_directory", replacing_enumeration)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._local_tree_files(root, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file-ID identity contract")
+def test_windows_entry_identity_uses_file_id_not_metadata(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    source = root / "source.py"
+    source.write_bytes(b"source")
+
+    from run_beta3_live_guard import (
+        _close_descriptors,
+        _open_directory_components,
+        _open_path_handle,
+        _windows_handle_identity,
+    )
+
+    with os.scandir(root) as scanner:
+        entry = next(scanner)
+        entry_stat = entry.stat(follow_symlinks=False)
+        entry_inode = entry.inode()
+    descriptors, _identities = _open_directory_components(root, "TEST")
+    descriptor = None
+    try:
+        descriptor = _open_path_handle(
+            Path(source.name),
+            "TEST",
+            directory=False,
+            parent=descriptors[-1],
+        )
+        opened_identity = _windows_handle_identity(descriptor, "TEST", directory=False)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        _close_descriptors(descriptors)
+
+    assert type(entry_inode) is int
+    assert opened_identity["file_id"].startswith(
+        entry_inode.to_bytes(8, "little", signed=False).hex()
+    )
+    assert attestor_module._entry_identity_matches(entry, entry_stat, opened_identity)
+    replaced_identity = dict(opened_identity)
+    replaced_identity["file_id"] = "0" * len(opened_identity["file_id"])
+    assert not attestor_module._entry_identity_matches(
+        entry,
+        entry_stat,
+        replaced_identity,
+    )
 
 
 def test_local_tree_rejects_ordinary_parent_replacement_after_scan_assertion(
@@ -1172,7 +1312,10 @@ def test_local_tree_rejects_ordinary_parent_replacement_after_scan_assertion(
             return Scanner(scanner)
         return scanner
 
-    monkeypatch.setattr(attestor_module.os, "scandir", replacing_scandir)
+    def replacing_enumeration(path, _held, _code):
+        return replacing_scandir(path)
+
+    monkeypatch.setattr(attestor_module, "_enumerate_held_directory", replacing_enumeration)
 
     with pytest.raises(BootstrapError) as error:
         attestor_module._local_tree_files(root, "STATIC_INPUT_SOURCE_UNAVAILABLE")
@@ -1193,6 +1336,7 @@ def test_local_tree_rejects_child_file_replacement_after_entry_stat(tmp_path, mo
             self._entry = entry
             self.name = entry.name
             self.path = entry.path
+            self._inode = entry.inode()
 
         def stat(self, *, follow_symlinks=True):
             nonlocal replaced
@@ -1200,12 +1344,13 @@ def test_local_tree_rejects_child_file_replacement_after_entry_stat(tmp_path, mo
             if self.name == source.name and not replaced:
                 original = tmp_path / "original-source.py"
                 source.rename(original)
-                source.write_bytes(b"replacement")
+                source.write_bytes(b"changed!")
+                os.utime(source, ns=(observed.st_atime_ns, observed.st_mtime_ns))
                 replaced = True
             return observed
 
         def inode(self):
-            return self._entry.inode()
+            return self._inode
 
     class Scanner:
         def __init__(self, scanner):
@@ -1224,7 +1369,10 @@ def test_local_tree_rejects_child_file_replacement_after_entry_stat(tmp_path, mo
             return Scanner(scanner)
         return scanner
 
-    monkeypatch.setattr(attestor_module.os, "scandir", replacing_scandir)
+    def replacing_enumeration(path, _held, _code):
+        return replacing_scandir(path)
+
+    monkeypatch.setattr(attestor_module, "_enumerate_held_directory", replacing_enumeration)
 
     with pytest.raises(BootstrapError) as error:
         attestor_module._local_tree_files(root, "STATIC_INPUT_SOURCE_UNAVAILABLE")
@@ -1245,6 +1393,7 @@ def test_local_tree_rejects_child_directory_replacement_after_entry_stat(tmp_pat
             self._entry = entry
             self.name = entry.name
             self.path = entry.path
+            self._inode = entry.inode()
 
         def stat(self, *, follow_symlinks=True):
             nonlocal replaced
@@ -1253,12 +1402,13 @@ def test_local_tree_rejects_child_directory_replacement_after_entry_stat(tmp_pat
                 original = tmp_path / "original-child"
                 child.rename(original)
                 child.mkdir()
-                (child / "source.py").write_bytes(b"replacement")
+                (child / "source.py").write_bytes(b"changed!")
+                os.utime(child, ns=(observed.st_atime_ns, observed.st_mtime_ns))
                 replaced = True
             return observed
 
         def inode(self):
-            return self._entry.inode()
+            return self._inode
 
     class Scanner:
         def __init__(self, scanner):
@@ -1277,7 +1427,10 @@ def test_local_tree_rejects_child_directory_replacement_after_entry_stat(tmp_pat
             return Scanner(scanner)
         return scanner
 
-    monkeypatch.setattr(attestor_module.os, "scandir", replacing_scandir)
+    def replacing_enumeration(path, _held, _code):
+        return replacing_scandir(path)
+
+    monkeypatch.setattr(attestor_module, "_enumerate_held_directory", replacing_enumeration)
 
     with pytest.raises(BootstrapError) as error:
         attestor_module._local_tree_files(root, "STATIC_INPUT_SOURCE_UNAVAILABLE")
