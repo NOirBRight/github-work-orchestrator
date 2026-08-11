@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, replace
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -497,21 +499,83 @@ def test_production_loader_uses_one_fixed_path_and_rejects_absence(
     assert error.value.code == "RELEASE_SUBJECT_UNAVAILABLE"
 
 
-def test_binding_rejects_manifest_byte_replacement_after_first_read(tmp_path: Path):
+def _load_binding_fixture(
+    tmp_path: Path,
+) -> tuple[Path, release_subject.ReleaseSubjectBinding]:
     manifest = _write_valid_subject_fixture(tmp_path)
-    binding = load_release_subject_for_test(
+    return manifest, load_release_subject_for_test(
         manifest,
         expected_repository_root=tmp_path / "repository",
         expected_evidence_root=tmp_path / "evidence",
     )
+
+
+def _mutated_manifest_bytes(manifest: Path) -> bytes:
     original = manifest.read_bytes()
-    manifest.write_bytes(
-        original.replace(b'"' + b"a" * 40 + b'"', b'"' + b"b" * 40 + b'"', 1)
-    )
+    return original.replace(b'"' + b"a" * 40 + b'"', b'"' + b"b" * 40 + b'"', 1)
+
+
+def test_binding_rejects_same_inode_manifest_mutation_after_first_read(
+    tmp_path: Path,
+):
+    manifest, binding = _load_binding_fixture(tmp_path)
     try:
+        writer = os.open(manifest, os.O_RDWR)
+        try:
+            mutated = _mutated_manifest_bytes(manifest)
+            os.ftruncate(writer, 0)
+            os.write(writer, mutated)
+            os.fsync(writer)
+            with pytest.raises(ReleaseSubjectError) as error:
+                binding.assert_stable()
+            assert error.value.code == "RELEASE_SUBJECT_DRIFT"
+        finally:
+            os.close(writer)
+    finally:
+        binding.close()
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX permits replacement while a handle is held"
+)
+def test_binding_rejects_os_replace_manifest_identity_change(tmp_path: Path):
+    manifest, binding = _load_binding_fixture(tmp_path)
+    try:
+        replacement = tmp_path / "replacement.json"
+        replacement.write_bytes(_mutated_manifest_bytes(manifest))
+        os.replace(replacement, manifest)
         with pytest.raises(ReleaseSubjectError) as error:
             binding.assert_stable()
         assert error.value.code == "RELEASE_SUBJECT_DRIFT"
+    finally:
+        binding.close()
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX permits delete/recreate while a handle is held"
+)
+def test_binding_rejects_delete_recreate_manifest_identity_change(tmp_path: Path):
+    manifest, binding = _load_binding_fixture(tmp_path)
+    try:
+        mutated = _mutated_manifest_bytes(manifest)
+        manifest.unlink()
+        manifest.write_bytes(mutated)
+        with pytest.raises(ReleaseSubjectError) as error:
+            binding.assert_stable()
+        assert error.value.code == "RELEASE_SUBJECT_DRIFT"
+    finally:
+        binding.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows held-handle sharing contract")
+def test_windows_held_binding_blocks_manifest_replace(tmp_path: Path):
+    manifest, binding = _load_binding_fixture(tmp_path)
+    try:
+        replacement = tmp_path / "replacement.json"
+        replacement.write_bytes(_mutated_manifest_bytes(manifest))
+        with pytest.raises(OSError):
+            os.replace(replacement, manifest)
+        binding.assert_stable()
     finally:
         binding.close()
 
@@ -541,19 +605,95 @@ def test_exclusive_generator_writes_canonical_subject_and_returns_binding(
         binding.close()
 
 
-def test_loader_rejects_reparse_ancestor_before_json_decoding(tmp_path: Path):
+def _assert_path_rejected_before_json_decode(
+    manifest: Path,
+    repository_root: Path,
+    evidence_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def parser_must_not_run(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("manifest JSON parsing ran before path rejection")
+
+    monkeypatch.setattr(release_subject, "parse_release_subject", parser_must_not_run)
+    with pytest.raises(ReleaseSubjectError) as error:
+        load_release_subject_for_test(
+            manifest,
+            expected_repository_root=repository_root,
+            expected_evidence_root=evidence_root,
+        )
+    assert error.value.code == "RELEASE_SUBJECT_PATH_INVALID"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction/reparse contract")
+def test_loader_rejects_windows_junction_ancestor_before_json_decoding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    real_root = tmp_path / "real"
+    manifest = _write_valid_subject_fixture(real_root)
+    junction = tmp_path / "junction"
+    result = subprocess.run(
+        ["cmd", "/d", "/c", "mklink", "/J", str(junction), str(real_root)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not junction.is_dir():
+        pytest.fail(
+            "Windows junction fixture could not be created: "
+            f"exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}"
+        )
+    _assert_path_rejected_before_json_decode(
+        junction / manifest.relative_to(real_root),
+        real_root / "repository",
+        real_root / "evidence",
+        monkeypatch,
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX O_NOFOLLOW contract")
+def test_loader_rejects_posix_symlink_ancestor_before_json_decoding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     real_root = tmp_path / "real"
     manifest = _write_valid_subject_fixture(real_root)
     redirected = tmp_path / "redirected"
     try:
         redirected.symlink_to(real_root, target_is_directory=True)
     except (OSError, NotImplementedError) as error:
-        pytest.skip(f"directory reparse/symlink creation is unavailable: {error}")
-    redirected_manifest = redirected / manifest.relative_to(real_root)
+        pytest.fail(f"POSIX symlink fixture could not be created: {error}")
+    _assert_path_rejected_before_json_decode(
+        redirected / manifest.relative_to(real_root),
+        real_root / "repository",
+        real_root / "evidence",
+        monkeypatch,
+    )
+
+
+def test_loader_maps_observer_identity_mismatch_to_provenance_mismatch(tmp_path: Path):
+    manifest = _write_valid_subject_fixture(tmp_path)
+    runner = tmp_path / "repository" / "scripts" / "run_beta3_live_guard.py"
+    runner.write_bytes(b"changed runner bytes\n")
     with pytest.raises(ReleaseSubjectError) as error:
         load_release_subject_for_test(
-            redirected_manifest,
-            expected_repository_root=real_root / "repository",
-            expected_evidence_root=real_root / "evidence",
+            manifest,
+            expected_repository_root=tmp_path / "repository",
+            expected_evidence_root=tmp_path / "evidence",
         )
-    assert error.value.code == "RELEASE_SUBJECT_PATH_INVALID"
+    assert error.value.code == "RELEASE_SUBJECT_PROVENANCE_MISMATCH"
+
+
+def test_loader_maps_malformed_reviewed_provenance_to_provenance_mismatch(
+    tmp_path: Path,
+):
+    manifest = _write_valid_subject_fixture(tmp_path)
+    reviewed = tmp_path / "repository" / "scripts" / "beta3_reviewed_provenance.json"
+    reviewed.write_bytes(b"{}\n")
+    with pytest.raises(ReleaseSubjectError) as error:
+        load_release_subject_for_test(
+            manifest,
+            expected_repository_root=tmp_path / "repository",
+            expected_evidence_root=tmp_path / "evidence",
+        )
+    assert error.value.code == "RELEASE_SUBJECT_PROVENANCE_MISMATCH"

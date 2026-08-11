@@ -1012,6 +1012,35 @@ def _validate_manifest_path(path: Path, expected_evidence_root: Path) -> None:
         _path_invalid(f"manifest is not the fixed evidence-root subject path: {path}")
 
 
+def _require_subject_absent(path: Path) -> None:
+    manifest_path = Path(path)
+    parent_descriptors: list[int] = []
+    try:
+        parent_descriptors, _ = _open_directory_components(
+            manifest_path.parent,
+            "RELEASE_SUBJECT_PATH_INVALID",
+        )
+        try:
+            observed = os.lstat(manifest_path)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ReleaseSubjectError(
+                "RELEASE_SUBJECT_PATH_INVALID",
+                f"subject path could not be observed without following links: {manifest_path}",
+            ) from error
+        if stat.S_ISLNK(observed.st_mode) or _is_reparse(observed):
+            _path_invalid(f"subject path is a link or reparse point: {manifest_path}")
+        if not stat.S_ISREG(observed.st_mode):
+            _path_invalid(f"subject path is not a regular file: {manifest_path}")
+        raise ReleaseSubjectError(
+            "RELEASE_SUBJECT_EXISTS",
+            f"subject already exists: {manifest_path}",
+        )
+    finally:
+        _close_descriptors(parent_descriptors)
+
+
 def _observer_paths(repository_root: Path) -> tuple[Path, tuple[Path, ...], Path]:
     scripts_root = Path(repository_root).expanduser().resolve(strict=False) / "scripts"
     runner = scripts_root / "run_beta3_live_guard.py"
@@ -1021,7 +1050,7 @@ def _observer_paths(repository_root: Path) -> tuple[Path, tuple[Path, ...], Path
 
 
 def _observer_invalid(detail: str) -> None:
-    raise ReleaseSubjectError("RELEASE_SUBJECT_OBSERVER_INVALID", detail)
+    raise ReleaseSubjectError("RELEASE_SUBJECT_PROVENANCE_MISMATCH", detail)
 
 
 def _validate_reviewed_provenance_bytes(
@@ -1034,7 +1063,7 @@ def _validate_reviewed_provenance_bytes(
         value = _decode_exact_canonical_object(raw)
     except ReleaseSubjectError as error:
         raise ReleaseSubjectError(
-            "RELEASE_SUBJECT_OBSERVER_INVALID", error.detail
+            "RELEASE_SUBJECT_PROVENANCE_MISMATCH", error.detail
         ) from error
     expected = {
         "schema": "gwo-beta3-reviewed-provenance.v1",
@@ -1433,6 +1462,7 @@ def generate_production_subject() -> ReleaseSubject:
             evidence_root,
             "RELEASE_SUBJECT_EVIDENCE_INVALID",
         )
+        _require_subject_absent(evidence_root / RELEASE_SUBJECT_FILENAME)
     finally:
         _close_descriptors(repository_descriptors)
         _close_descriptors(evidence_descriptors)
