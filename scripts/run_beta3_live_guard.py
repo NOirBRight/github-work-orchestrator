@@ -14,7 +14,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Callable, Mapping, Sequence, TextIO
+from typing import TYPE_CHECKING, Callable, Mapping, Protocol, Sequence, TextIO
 
 if TYPE_CHECKING:
     from beta3_bootstrap_model import (
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     )
     from beta3_replay_guard import ReplayResult
     from beta3_release_subject import ReleaseSubject, ReleaseSubjectBinding
+    from gwo_v8.cutover_guard import CutoverSubject
 
 
 REPOSITORY_ROOT = Path(r"D:\Workstation\github-work-orchestrator").resolve()
@@ -292,10 +293,16 @@ class RunnerError(RuntimeError):
         self.detail = detail
 
 
-GitRunner = Callable[
-    [list[str]],
-    subprocess.CompletedProcess[str],
-]
+class GitRunner(Protocol):
+    def __call__(
+        self,
+        args: list[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]: ...
+
+
 GuardFactory = Callable[["RunnerConfig", object], object]
 ControlReader = Callable[[], object]
 PackageReader = Callable[["RunnerConfig"], object]
@@ -3849,7 +3856,7 @@ class ProductionBootstrapAttestor:
         *,
         control_ownership_attestor: object,
         legacy_attestor: object,
-        subject_factory: Callable[[RunnerConfig, "ReleaseSubject"], object]
+        subject_factory: Callable[[RunnerConfig, "ReleaseSubject"], "CutoverSubject"]
         | None = None,
     ) -> None:
         if not callable(getattr(control_ownership_attestor, "observe", None)):
@@ -4483,7 +4490,7 @@ def _run_bound(
         or config.authoritative_legacy_snapshot is not None
         or config.production_readers is not None
     )
-    if execute and production and injected:
+    if production and injected:
         return _result(
             "UNAVAILABLE",
             3,
@@ -4558,6 +4565,7 @@ def _run_bound(
                     if production
                     else _fixture_attestor_source_sha256()
                 )
+                _assert_subject_binding_stable(subject_binding)
                 attempt = AttemptIdentity.create(
                     run_id=run_id,
                     repository=config.repository,
@@ -4907,7 +4915,7 @@ def run(
                 or control_reader is not None
                 or package_reader is not None
             )
-            if execute and injected:
+            if injected:
                 return _result(
                     "UNAVAILABLE",
                     3,
@@ -4961,7 +4969,7 @@ def run(
 def _default_subject_factory(
     config: RunnerConfig,
     release_subject: "ReleaseSubject",
-) -> object:
+) -> "CutoverSubject":
     _add_repo_import_paths(config.repository_root)
     from gwo_v8.cutover_guard import CutoverSubject
 

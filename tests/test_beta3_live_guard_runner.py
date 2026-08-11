@@ -603,6 +603,44 @@ def test_fixed_production_subject_rejects_dependency_injection_before_source_acc
     assert result["code"] == "DEPENDENCY_INJECTION_FORBIDDEN"
 
 
+def test_production_preflight_rejects_injected_git_runner_before_preflight(
+    monkeypatch,
+):
+    events: list[str] = []
+
+    class Binding:
+        subject = object()
+
+        def assert_stable(self):
+            return None
+
+        def close(self):
+            return None
+
+    def fake_git_runner(*_args, **_kwargs):
+        events.append("git")
+        raise AssertionError("injected Git runner was called")
+
+    def unexpected_preflight(*_args, git_runner, **_kwargs):
+        events.append("preflight")
+        git_runner([], cwd=Path.cwd(), env={})
+
+    monkeypatch.setattr(runner, "load_production_release_subject", lambda: Binding())
+    monkeypatch.setattr(
+        runner,
+        "_bind_runner_config_from_subject",
+        lambda _subject: runner.DEFAULT_CONFIG,
+    )
+    monkeypatch.setattr(runner, "preflight", unexpected_preflight)
+
+    result = runner.run(execute=False, git_runner=fake_git_runner)
+
+    assert events == []
+    assert result["status"] == "UNAVAILABLE"
+    assert result["exit_code"] == 3
+    assert result["code"] == "DEPENDENCY_INJECTION_FORBIDDEN"
+
+
 def test_explicit_fixture_configuration_is_not_the_production_default(tmp_path):
     config = _fixture_config(tmp_path)
     assert config is not runner.DEFAULT_CONFIG
@@ -931,6 +969,69 @@ def test_attempt_is_created_before_dependency_composition_and_attestation(
     assert events.index("preflight") < events.index("nonce:16")
     assert events.index("nonce:16") < events.index("dependencies")
     assert events.index("dependencies") < events.index("attest")
+
+
+def test_subject_drift_during_attestor_hash_read_is_rejected_before_nonce(
+    tmp_path, monkeypatch
+):
+    config = _fixture_config(tmp_path)
+    release_subject = runner._fixture_release_subject(config)
+    nonce_calls: list[int] = []
+
+    class Binding:
+        drifted = False
+
+        def assert_stable(self):
+            if self.drifted:
+                raise runner.RunnerError(
+                    "RELEASE_SUBJECT_DRIFT",
+                    "release subject drifted during the attestor hash read",
+                )
+
+    class NoopContext:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    binding = Binding()
+
+    def drift_during_attestor_hash():
+        binding.drifted = True
+        return "2" * 64
+
+    monkeypatch.setattr(
+        runner,
+        "preflight",
+        lambda *_args, **_kwargs: {"_evidence_parent_identity": {}},
+    )
+    monkeypatch.setattr(runner, "_PublicationLease", lambda _path: NoopContext())
+    monkeypatch.setattr(runner, "_assert_publication_parent", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        runner, "_precheck_existing_output_bytes", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(runner, "_input_lease", lambda *_a, **_k: NoopContext())
+    monkeypatch.setattr(runner, "_pre_guard_refresh", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner, "_runbook_hash", lambda: "1" * 64)
+    monkeypatch.setattr(runner, "_attestor_source_sha256", drift_during_attestor_hash)
+    monkeypatch.setattr(
+        runner.secrets,
+        "token_hex",
+        lambda count: nonce_calls.append(count) or "a" * (count * 2),
+    )
+
+    result = runner._run_bound(
+        config,
+        execute=True,
+        run_id="beta3-prod-001",
+        release_subject=release_subject,
+        subject_binding=binding,
+        production=True,
+    )
+
+    assert result["code"] == "RELEASE_SUBJECT_DRIFT"
+    assert nonce_calls == []
 
 
 def _attested_dependencies(
