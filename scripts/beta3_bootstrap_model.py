@@ -705,8 +705,8 @@ def require_read_only_surface(source: object, *, required_method: str) -> None:
     """Reject any source whose public callable surface is not exactly {required_method}.
 
     Inspect class and instance namespaces directly so that ``__dir__`` cannot
-    hide mutators. Dynamic attribute resolution is rejected because its
-    callable surface cannot be enumerated exactly.
+    hide mutators. Dynamic attribute resolution and unsupported descriptors are
+    rejected because their callable surfaces cannot be enumerated safely.
     """
     if type(required_method) is not str or not required_method:
         raise BootstrapError(
@@ -718,7 +718,12 @@ def require_read_only_surface(source: object, *, required_method: str) -> None:
 
         source_type = type(source)
         source_mro = source_type.__mro__
-        if any("__getattr__" in vars(cls) for cls in source_mro):
+        if any(
+            name in vars(cls)
+            for cls in source_mro
+            if cls is not object
+            for name in ("__getattr__", "__getattribute__")
+        ):
             raise BootstrapError(
                 "UNSAFE_SOURCE_CAPABILITY",
                 "source exposes dynamic attribute resolution",
@@ -730,26 +735,60 @@ def require_read_only_surface(source: object, *, required_method: str) -> None:
             for name in vars(cls)
             if not name.startswith("_")
         }
+        instance_dict_descriptor_type = type(vars(type)["__dict__"])
         try:
-            instance_namespace = object.__getattribute__(source, "__dict__")
+            instance_dict_descriptor = inspect.getattr_static(source, "__dict__")
         except AttributeError:
             instance_namespace = {}
-        if isinstance(instance_namespace, dict):
+        else:
+            if type(instance_dict_descriptor) is not instance_dict_descriptor_type:
+                raise BootstrapError(
+                    "UNSAFE_SOURCE_CAPABILITY",
+                    "source instance namespace uses an unsupported descriptor",
+                )
+            instance_namespace = object.__getattribute__(source, "__dict__")
+            if type(instance_namespace) is not dict:
+                raise BootstrapError(
+                    "UNSAFE_SOURCE_CAPABILITY",
+                    "source instance namespace is not an exact dictionary",
+                )
+        if type(instance_namespace) is dict:
             exposed.update(
                 name
                 for name in instance_namespace
                 if type(name) is str and not name.startswith("_")
             )
+
+        def unsupported_descriptor(value: object) -> bool:
+            is_descriptor = any(
+                "__get__" in vars(value_type)
+                for value_type in type(value).__mro__
+            )
+            return is_descriptor and not inspect.isroutine(value)
+
         for name in sorted(exposed):
             attr = inspect.getattr_static(source, name)
+            if unsupported_descriptor(attr):
+                raise BootstrapError(
+                    "UNSAFE_SOURCE_CAPABILITY",
+                    f"source exposes an unsupported descriptor: {name}",
+                )
             if name != required_method and (
-                callable(attr) or callable(getattr(source, name))
+                callable(attr) or inspect.isroutine(attr)
             ):
                 raise BootstrapError(
                     "UNSAFE_SOURCE_CAPABILITY",
                     f"source exposes an unlisted public callable: {name}",
                 )
-        if not callable(getattr(source, required_method, None)):
+        try:
+            required_attr = inspect.getattr_static(source, required_method)
+        except AttributeError:
+            required_attr = None
+        if (
+            required_attr is None
+            or unsupported_descriptor(required_attr)
+            or not (callable(required_attr) or inspect.isroutine(required_attr))
+        ):
             raise BootstrapError(
                 "UNSAFE_SOURCE_CAPABILITY",
                 "source does not expose the required read method",

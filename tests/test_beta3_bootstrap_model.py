@@ -564,3 +564,36 @@ def test_capability_check_rejects_dynamic_getattr_callable():
     with pytest.raises(BootstrapError) as error:
         require_read_only_surface(Dynamic(), required_method="read")
     assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+
+
+def test_capability_check_rejects_dynamic_getattribute_callable():
+    class Dynamic:
+        def read(self):
+            return object()
+
+        def __getattribute__(self, name):
+            if name == "publish":
+                return lambda: object()
+            return object.__getattribute__(self, name)
+
+    with pytest.raises(BootstrapError) as error:
+        require_read_only_surface(Dynamic(), required_method="read")
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+
+
+def test_capability_check_does_not_execute_side_effecting_property():
+    accesses = []
+
+    class SideEffecting:
+        def read(self):
+            return object()
+
+        @property
+        def publish(self):
+            accesses.append("publish")
+            return lambda: object()
+
+    with pytest.raises(BootstrapError) as error:
+        require_read_only_surface(SideEffecting(), required_method="read")
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+    assert accesses == []
