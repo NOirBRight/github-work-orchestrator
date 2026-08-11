@@ -522,3 +522,45 @@ def test_capability_check_accepts_exact_read_only_surface():
             return object()
 
     require_read_only_surface(Exact(), required_method="read")
+
+
+def test_capability_check_rejects_instance_assigned_public_callable():
+    class InstanceAssigned:
+        def __init__(self):
+            self.publish = lambda: object()
+
+        def read(self):
+            return object()
+
+    with pytest.raises(BootstrapError) as error:
+        require_read_only_surface(InstanceAssigned(), required_method="read")
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+
+
+def test_capability_check_rejects_callable_property():
+    class CallableProperty:
+        def read(self):
+            return object()
+
+        @property
+        def publish(self):
+            return lambda: object()
+
+    with pytest.raises(BootstrapError) as error:
+        require_read_only_surface(CallableProperty(), required_method="read")
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+
+
+def test_capability_check_rejects_dynamic_getattr_callable():
+    class Dynamic:
+        def read(self):
+            return object()
+
+        def __getattr__(self, name):
+            if name == "publish":
+                return lambda: object()
+            raise AttributeError(name)
+
+    with pytest.raises(BootstrapError) as error:
+        require_read_only_surface(Dynamic(), required_method="read")
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"

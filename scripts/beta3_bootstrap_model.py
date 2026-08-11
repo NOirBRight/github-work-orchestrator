@@ -704,8 +704,9 @@ FORBIDDEN_SOURCE_SURFACES = {
 def require_read_only_surface(source: object, *, required_method: str) -> None:
     """Reject any source whose public callable surface is not exactly {required_method}.
 
-    Uses ``inspect.getattr_static`` so that ``__dir__`` / ``__getattr__``
-    overrides cannot hide mutators.
+    Inspect class and instance namespaces directly so that ``__dir__`` cannot
+    hide mutators. Dynamic attribute resolution is rejected because its
+    callable surface cannot be enumerated exactly.
     """
     if type(required_method) is not str or not required_method:
         raise BootstrapError(
@@ -715,14 +716,35 @@ def require_read_only_surface(source: object, *, required_method: str) -> None:
     try:
         import inspect
 
+        source_type = type(source)
+        source_mro = source_type.__mro__
+        if any("__getattr__" in vars(cls) for cls in source_mro):
+            raise BootstrapError(
+                "UNSAFE_SOURCE_CAPABILITY",
+                "source exposes dynamic attribute resolution",
+            )
+
         exposed = {
             name
-            for name in dir(type(source))
+            for cls in source_mro
+            for name in vars(cls)
             if not name.startswith("_")
         }
+        try:
+            instance_namespace = object.__getattribute__(source, "__dict__")
+        except AttributeError:
+            instance_namespace = {}
+        if isinstance(instance_namespace, dict):
+            exposed.update(
+                name
+                for name in instance_namespace
+                if type(name) is str and not name.startswith("_")
+            )
         for name in sorted(exposed):
             attr = inspect.getattr_static(source, name)
-            if callable(attr) and name != required_method:
+            if name != required_method and (
+                callable(attr) or callable(getattr(source, name))
+            ):
                 raise BootstrapError(
                     "UNSAFE_SOURCE_CAPABILITY",
                     f"source exposes an unlisted public callable: {name}",
