@@ -711,7 +711,7 @@ def _open_windows_relative_handle(
             desired_access = 0x00000001 | 0x00000020 | 0x00000080 | 0x00100000
             if writable:
                 desired_access |= 0x00000002
-        share_access = 0x00000003 if directory else 0x00000001
+        share_access = 0x00000003
         create_disposition = 2 if create_new else 1
         # FILE_OPEN_REPARSE_POINT applies to opens of an existing leaf.  The
         # native create disposition rejects that option for FILE_CREATE;

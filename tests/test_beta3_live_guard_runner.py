@@ -1650,6 +1650,34 @@ def test_exclusive_json_reopens_the_windows_owned_file_handle(tmp_path):
     assert path.read_bytes() == expected_bytes
 
 
+def test_windows_parent_relative_read_only_open_allows_existing_writer(tmp_path):
+    if os.name != "nt":
+        pytest.skip("Windows handle contract")
+    path = tmp_path / "input.json"
+    expected = b'{"stable":true}\n'
+    path.write_bytes(expected)
+
+    with path.open("r+b"):
+        descriptors, _identities = runner._open_directory_components(
+            path.parent, "FILE_READ_FAILED"
+        )
+        try:
+            descriptor = runner._open_path_handle(
+                path.name,
+                "FILE_READ_FAILED",
+                directory=False,
+                parent=descriptors[-1],
+            )
+            try:
+                assert (
+                    runner._read_held_bytes(descriptor, "FILE_READ_FAILED") == expected
+                )
+            finally:
+                os.close(descriptor)
+        finally:
+            runner._close_descriptors(descriptors)
+
+
 def test_publication_lease_retains_no_reparse_component_handles(tmp_path):
     path = tmp_path / "ancestor" / "evidence root with spaces"
     path.mkdir(parents=True)
