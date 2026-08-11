@@ -255,6 +255,7 @@ _ATTESTOR_MODULE_NAMES = (
     "beta3_replay_guard.py",
 )
 _REVIEWED_PROVENANCE_NAME = "beta3_reviewed_provenance.json"
+_RELEASE_SUBJECT_NAME = "gwo-v8-release-subject.json"
 PRODUCTION_ENTRY_REFS = (
     "gwo_v8.plan_control_host:ProductionPlanControlStartHost.start",
     "gwo_v8.execution_kernel:advance",
@@ -2730,9 +2731,18 @@ def _local_regular_files(root: Path, code: str) -> tuple[Path, ...]:
     return tuple(result)
 
 
-def _local_input_files(config: RunnerConfig) -> tuple[Path, ...]:
+def _local_input_files(
+    config: RunnerConfig,
+    *,
+    subject_binding: object | None = None,
+) -> tuple[Path, ...]:
     root = Path(config.repository_root)
     paths: set[Path] = set()
+    manifest_path = getattr(subject_binding, "manifest_path", None)
+    if manifest_path is None:
+        manifest_path = Path(config.evidence_root) / _RELEASE_SUBJECT_NAME
+    if _lexists(Path(manifest_path)):
+        paths.add(Path(manifest_path))
     package_roots = _local_package_roots(config)
     for package in package_roots:
         paths.update(_local_regular_files(package, "LIVE_INPUT_DRIFT"))
@@ -2794,7 +2804,11 @@ def _local_input_directories(config: RunnerConfig) -> tuple[Path, ...]:
     return tuple(unique)
 
 
-def _lease_input_paths(config: RunnerConfig) -> tuple[Path, ...]:
+def _lease_input_paths(
+    config: RunnerConfig,
+    *,
+    subject_binding: object | None = None,
+) -> tuple[Path, ...]:
     return (
         Path(config.fresh_store),
         Path(config.rollback_store),
@@ -2804,14 +2818,18 @@ def _lease_input_paths(config: RunnerConfig) -> tuple[Path, ...]:
         Path(__file__).resolve(),
         Path(__file__).resolve().with_name(_REVIEWED_PROVENANCE_NAME),
         *(Path(__file__).resolve().with_name(name) for name in _ATTESTOR_MODULE_NAMES),
-        *_local_input_files(config),
+        *_local_input_files(config, subject_binding=subject_binding),
     )
 
 
-def _mechanical_input_snapshot(config: RunnerConfig) -> dict[str, object]:
+def _mechanical_input_snapshot(
+    config: RunnerConfig,
+    *,
+    subject_binding: object | None = None,
+) -> dict[str, object]:
     file_identities: dict[str, dict[str, int | str]] = {}
     file_hashes: dict[str, str] = {}
-    for path in _lease_input_paths(config):
+    for path in _lease_input_paths(config, subject_binding=subject_binding):
         snapshot = _bound_file_snapshot(path, "ATTESTATION_UNAVAILABLE")
         path_text = _path_text(path)
         file_identities[path_text] = snapshot["identity"]
@@ -2827,6 +2845,8 @@ def _preflight_file_snapshots(
     config: RunnerConfig,
     preflight_result: Mapping[str, object],
     local_paths: Sequence[Path],
+    *,
+    subject_binding: object | None = None,
 ) -> dict[str, dict[str, object]]:
     snapshots: dict[str, dict[str, object]] = {}
 
@@ -2891,7 +2911,11 @@ def _preflight_file_snapshots(
             type(path) is str for path in package_paths
         ):
             observed_package_paths = {
-                _path_text(path) for path in _local_input_files(config)
+                _path_text(path)
+                for path in _local_input_files(
+                    config,
+                    subject_binding=subject_binding,
+                )
             }
             if observed_package_paths != set(package_paths):
                 raise RunnerError(
@@ -2902,11 +2926,17 @@ def _preflight_file_snapshots(
 
 
 def _input_lease(
-    config: RunnerConfig, preflight_result: dict[str, object]
+    config: RunnerConfig,
+    preflight_result: dict[str, object],
+    *,
+    subject_binding: object | None = None,
 ) -> _InputLease:
-    local_paths = _lease_input_paths(config)
+    local_paths = _lease_input_paths(config, subject_binding=subject_binding)
     preflight_snapshots = _preflight_file_snapshots(
-        config, preflight_result, local_paths
+        config,
+        preflight_result,
+        local_paths,
+        subject_binding=subject_binding,
     )
     expected: dict[Path, Mapping[str, object]] = {}
     for path in local_paths:
@@ -3567,6 +3597,41 @@ def _mutation_flags() -> dict[str, bool]:
     }
 
 
+def _release_subject_metadata(
+    config: RunnerConfig,
+    release_subject: object,
+    subject_binding: object | None,
+) -> dict[str, str]:
+    bound_subject = getattr(subject_binding, "subject", None)
+    if subject_binding is not None and bound_subject is not release_subject:
+        raise RunnerError(
+            "RELEASE_SUBJECT_DRIFT",
+            "release subject is not the object held by its binding",
+        )
+    subject = bound_subject if bound_subject is not None else release_subject
+    manifest_path = getattr(subject_binding, "manifest_path", None)
+    if manifest_path is None:
+        manifest_path = Path(config.evidence_root) / _RELEASE_SUBJECT_NAME
+    values = {
+        "release_subject_digest": getattr(
+            subject, "subject_digest", config.release_subject_digest
+        ),
+        "release_subject_path": _path_text(Path(manifest_path)),
+        "merged_main_sha": getattr(
+            subject, "merged_main_sha", config.merged_main_sha
+        ),
+        "merged_main_git_tree": getattr(
+            subject, "merged_main_git_tree", config.merged_main_git_tree
+        ),
+    }
+    if any(type(value) is not str or not value for value in values.values()):
+        raise RunnerError(
+            "RELEASE_SUBJECT_DRIFT",
+            "release subject metadata is incomplete",
+        )
+    return values
+
+
 def _attested_report(
     config: RunnerConfig,
     preflight_result: Mapping[str, object],
@@ -3575,6 +3640,9 @@ def _attested_report(
     replay_value: dict[str, object],
     metadata: Mapping[str, object],
     writer_generation: str,
+    *,
+    release_subject: object,
+    subject_binding: object | None = None,
 ) -> dict[str, object]:
     attempt_canonical = attempt.canonical()
     attestation = bundle.canonical()
@@ -3598,6 +3666,11 @@ def _attested_report(
             strict=True,
         )
     ]
+    subject_metadata = _release_subject_metadata(
+        config,
+        release_subject,
+        subject_binding,
+    )
     value = {
         **replay_value,
         "captured_at": datetime.now(timezone.utc).isoformat(),
@@ -3607,7 +3680,7 @@ def _attested_report(
         "source_head": preflight_result["head"],
         "source_tree": preflight_result["tree"],
         "origin_main": preflight_result["origin_main"],
-        "release_subject_digest": config.release_subject_digest,
+        **subject_metadata,
         "store_generation": config.store_generation,
         "writer_generation": writer_generation,
         "default_writer_changed": False,
@@ -3651,9 +3724,17 @@ def _attested_evidence(
     metadata: Mapping[str, object],
     after_files: Mapping[str, object],
     inputs: _InputLease | None = None,
+    *,
+    release_subject: object,
+    subject_binding: object | None = None,
 ) -> dict[str, object]:
     flags = _mutation_flags()
     guard_readbacks = report_body["readback_bundle"]
+    subject_metadata = _release_subject_metadata(
+        config,
+        release_subject,
+        subject_binding,
+    )
     return {
         "schema": EVIDENCE_SCHEMA,
         "captured_at": _canonical_utc_timestamp(
@@ -3664,7 +3745,7 @@ def _attested_evidence(
         "head": preflight_result["head"],
         "tree": preflight_result["tree"],
         "origin_main": preflight_result["origin_main"],
-        "release_subject_digest": config.release_subject_digest,
+        **subject_metadata,
         "decision": replay_value["decision"],
         "exit_code": evidence_exit_code,
         "evidence_mode": EVIDENCE_MODE,
@@ -3716,9 +3797,16 @@ def _validate_attested_report_value(
     attempt: object,
     bundle: object,
     replay_value: Mapping[str, object],
+    release_subject: object,
+    subject_binding: object | None = None,
 ) -> None:
     if type(value) is not dict:
         raise RunnerError("OUTPUT_WRITE_FAILED", "report root is not an object")
+    subject_metadata = _release_subject_metadata(
+        config,
+        release_subject,
+        subject_binding,
+    )
     for name, expected in (
         ("attempt_identity", attempt.canonical()),
         ("attestation", bundle.canonical()),
@@ -3727,7 +3815,7 @@ def _validate_attested_report_value(
         ("runbook", _path_text(Path(__file__))),
         ("runbook_sha256", attempt.runner_sha256),
         ("decision", replay_value["decision"]),
-        ("release_subject_digest", config.release_subject_digest),
+        *subject_metadata.items(),
         ("activation_performed", False),
     ):
         if value.get(name) != expected:
@@ -3755,9 +3843,16 @@ def _validate_attested_evidence_value(
     report_digest: str,
     report_identity: Mapping[str, object],
     evidence_exit_code: int,
+    release_subject: object,
+    subject_binding: object | None = None,
 ) -> None:
     if type(value) is not dict:
         raise RunnerError("OUTPUT_WRITE_FAILED", "evidence root is not an object")
+    subject_metadata = _release_subject_metadata(
+        config,
+        release_subject,
+        subject_binding,
+    )
     expected = (
         ("attempt_identity", attempt.canonical()),
         ("attestation", bundle.canonical()),
@@ -3766,11 +3861,12 @@ def _validate_attested_evidence_value(
         ("runbook", _path_text(Path(__file__))),
         ("runbook_sha256", attempt.runner_sha256),
         ("fixed_subject", bundle.subject.canonical()),
-        ("release_subject_digest", config.release_subject_digest),
+        *subject_metadata.items(),
         ("report_digest", report_digest),
         ("report_path", _path_text(config.report_path)),
         ("exit_code", evidence_exit_code),
         ("activation_performed", False),
+        ("default_writer_changed", False),
     )
     for name, expected_value in expected:
         if value.get(name) != expected_value:
@@ -3811,6 +3907,26 @@ def _assert_subject_binding_stable(binding: object | None) -> None:
         code = getattr(error, "code", "RELEASE_SUBJECT_DRIFT")
         detail = getattr(error, "detail", str(error))
         raise RunnerError(str(code), str(detail)) from error
+
+
+def _assert_release_subject_binding(
+    release_subject: object,
+    subject_binding: object | None,
+) -> None:
+    if subject_binding is None:
+        return
+    bound_subject = getattr(subject_binding, "subject", None)
+    if bound_subject is not None and bound_subject is not release_subject:
+        raise RunnerError(
+            "RELEASE_SUBJECT_DRIFT",
+            "release subject is not the object held by its binding",
+        )
+    manifest_path = getattr(subject_binding, "manifest_path", None)
+    if manifest_path is not None and not isinstance(manifest_path, Path):
+        raise RunnerError(
+            "RELEASE_SUBJECT_PATH_INVALID",
+            "release subject binding path is not a Path",
+        )
 
 
 def _assert_combined_stable(
@@ -4533,6 +4649,7 @@ def _run_bound(
             "UNAVAILABLE", 3, code="PREFLIGHT_UNAVAILABLE", detail=str(error)
         )
     _assert_subject_binding_stable(subject_binding)
+    _assert_release_subject_binding(release_subject, subject_binding)
     if not execute:
         return preflight_result | {"exit_code": 0}
     lease: object | None = None
@@ -4544,10 +4661,20 @@ def _run_bound(
             raise RunnerError(
                 "LIVE_INPUT_DRIFT", "evidence parent identity is unavailable"
             )
+        _assert_subject_binding_stable(subject_binding)
         with _PublicationLease(config.evidence_root) as publication:
             _assert_publication_parent(config, expected_parent, lease=publication)
             _precheck_existing_output_bytes(config)
-            with _input_lease(config, preflight_result) as inputs:
+            input_lease = (
+                _input_lease(config, preflight_result)
+                if subject_binding is None
+                else _input_lease(
+                    config,
+                    preflight_result,
+                    subject_binding=subject_binding,
+                )
+            )
+            with input_lease as inputs:
                 _pre_guard_refresh(config, preflight_result, git_runner)
                 subject = _default_subject_factory(config, release_subject)
                 try:
@@ -4669,6 +4796,8 @@ def _run_bound(
                     replay_value,
                     attestation_metadata,
                     writer_generation,
+                    release_subject=release_subject,
+                    subject_binding=subject_binding,
                 )
                 try:
                     _assert_combined_stable(
@@ -4683,6 +4812,7 @@ def _run_bound(
                         subject_binding=subject_binding,
                     )
                     _assert_subject_binding_stable(subject_binding)
+                    _assert_release_subject_binding(release_subject, subject_binding)
                     report_digest = _write_exclusive_json(
                         config.report_path,
                         report_body,
@@ -4720,6 +4850,8 @@ def _run_bound(
                         attestation_metadata,
                         after_report_files,
                         inputs,
+                        release_subject=release_subject,
+                        subject_binding=subject_binding,
                     )
                     _assert_combined_stable(
                         config,
@@ -4732,6 +4864,8 @@ def _run_bound(
                         attempt=attempt,
                         subject_binding=subject_binding,
                     )
+                    _assert_subject_binding_stable(subject_binding)
+                    _assert_release_subject_binding(release_subject, subject_binding)
                     _write_exclusive_json(
                         config.evidence_path,
                         evidence,
@@ -4761,6 +4895,8 @@ def _run_bound(
                         attempt=attempt,
                         bundle=bundle,
                         replay_value=replay_value,
+                        release_subject=release_subject,
+                        subject_binding=subject_binding,
                     )
                     _validate_attested_evidence_value(
                         evidence,
@@ -4771,6 +4907,8 @@ def _run_bound(
                         report_digest=report_digest,
                         report_identity=report_outputs[0].identity,
                         evidence_exit_code=exit_code,
+                        release_subject=release_subject,
+                        subject_binding=subject_binding,
                     )
                 except RunnerError:
                     raise
@@ -4890,6 +5028,58 @@ def _fixture_release_subject(config: RunnerConfig) -> object:
     )
 
 
+def run_fixture(
+    config: RunnerConfig,
+    binding: "ReleaseSubjectBinding",
+    *,
+    execute: bool,
+    run_id: str,
+) -> dict[str, object]:
+    if type(config) is not RunnerConfig:
+        return _result(
+            "UNAVAILABLE",
+            3,
+            code="CONFIG_INVALID",
+            detail="fixture config has the wrong exact type",
+        )
+    subject = getattr(binding, "subject", None)
+    if subject is None:
+        return _result(
+            "UNAVAILABLE",
+            3,
+            code="RELEASE_SUBJECT_SCHEMA_INVALID",
+            detail="fixture binding has no release subject",
+        )
+    try:
+        _assert_subject_binding_stable(binding)
+        _assert_release_subject_binding(subject, binding)
+        return _run_bound(
+            config,
+            execute=execute,
+            run_id=run_id,
+            git_runner=getattr(binding, "git_runner", _default_git_runner),
+            dependencies=getattr(binding, "dependencies", None),
+            guard_factory=getattr(binding, "guard_factory", None),
+            control_reader=getattr(binding, "control_reader", None),
+            package_reader=getattr(binding, "package_reader", None),
+            release_subject=subject,
+            subject_binding=binding,
+            production=False,
+        )
+    except RunnerError as error:
+        exit_code = 1 if error.code in {"OUTPUT_COLLISION", "LIVE_INPUT_DRIFT"} else 3
+        status = "REFUSED" if exit_code == 1 else "UNAVAILABLE"
+        return _result(status, exit_code, code=error.code, detail=error.detail)
+    except Exception as error:
+        return _result(
+            "UNAVAILABLE", 3, code="ATTESTATION_UNAVAILABLE", detail=str(error)
+        )
+    finally:
+        close = getattr(binding, "close", None)
+        if callable(close):
+            close()
+
+
 def run(
     config: RunnerConfig | None = None,
     *,
@@ -4906,8 +5096,6 @@ def run(
         try:
             binding = load_production_release_subject()
             _assert_subject_binding_stable(binding)
-            subject = getattr(binding, "subject", None)
-            effective_config = _bind_runner_config_from_subject(subject)
             injected = (
                 dependencies is not None
                 or git_runner is not _default_git_runner
@@ -4922,6 +5110,8 @@ def run(
                     code="DEPENDENCY_INJECTION_FORBIDDEN",
                     detail="production bound subject does not accept dependency injection",
                 )
+            subject = getattr(binding, "subject", None)
+            effective_config = _bind_runner_config_from_subject(subject)
             return _run_bound(
                 effective_config,
                 execute=execute,
@@ -4944,25 +5134,11 @@ def run(
                 close = getattr(binding, "close", None)
                 if callable(close):
                     close()
-    if type(config) is not RunnerConfig:
-        return _result(
-            "UNAVAILABLE",
-            3,
-            code="CONFIG_INVALID",
-            detail="fixture config has the wrong exact type",
-        )
-    return _run_bound(
-        config,
-        execute=execute,
-        run_id=run_id,
-        git_runner=git_runner,
-        dependencies=dependencies,
-        guard_factory=guard_factory,
-        control_reader=control_reader,
-        package_reader=package_reader,
-        release_subject=_fixture_release_subject(config),
-        subject_binding=None,
-        production=False,
+    return _result(
+        "UNAVAILABLE",
+        3,
+        code="DEPENDENCY_INJECTION_FORBIDDEN",
+        detail="fixture execution requires the explicit run_fixture helper",
     )
 
 

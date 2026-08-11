@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import importlib.util
 import inspect
 import json
@@ -277,6 +276,81 @@ def _fixture_config(tmp_path: Path):
     return config
 
 
+class _FixtureBinding:
+    def __init__(self, config, *, fixture_dependencies=False):
+        self.config = config
+        self.manifest_path = config.evidence_root / "gwo-v8-release-subject.json"
+        self.manifest_path.write_bytes(b'{"fixture":true}\n')
+        self.subject = SimpleNamespace(
+            merged_main_sha=config.merged_main_sha,
+            merged_main_git_tree=config.merged_main_git_tree,
+            audited_source_tree_digest=config.audited_source_tree_digest,
+            subject_digest=config.release_subject_digest,
+        )
+        self._stable = True
+        if fixture_dependencies:
+            self.git_runner = _git_runner_factory(config)
+            self.dependencies, _calls = _stable_dependencies()
+
+    def assert_stable(self):
+        if not self._stable:
+            raise runner.RunnerError(
+                "RELEASE_SUBJECT_DRIFT", "fixture release subject was replaced"
+            )
+
+    def replace_for_test(self):
+        self._stable = False
+
+    def close(self):
+        self.manifest_path.unlink(missing_ok=True)
+
+
+def _fixture_binding(tmp_path: Path):
+    return _FixtureBinding(
+        _fixture_config(tmp_path),
+        fixture_dependencies=True,
+    )
+
+
+def _fixture_config_for_binding(binding):
+    return binding.config
+
+
+def _run_fixture(config=None, *, execute, run_id=None, **injections):
+    binding = _FixtureBinding(config)
+    for name, value in injections.items():
+        setattr(binding, name, value)
+    return runner.run_fixture(
+        config,
+        binding=binding,
+        execute=execute,
+        run_id=run_id,
+    )
+
+
+def _run_fixture_guard_to_completion(tmp_path: Path, *, run_id: str):
+    binding = _fixture_binding(tmp_path)
+    config = _fixture_config_for_binding(binding)
+    result = runner.run_fixture(
+        config,
+        binding=binding,
+        execute=True,
+        run_id=run_id,
+    )
+    assert result["status"] == "GO", result
+    return {
+        "result": result,
+        "report": json.loads(config.report_path.read_text(encoding="utf-8")),
+        "evidence": json.loads(config.evidence_path.read_text(encoding="utf-8")),
+        "subject": {
+            "release_subject_digest": binding.subject.subject_digest,
+            "release_subject_path": str(binding.manifest_path),
+            "merged_main_sha": binding.subject.merged_main_sha,
+            "merged_main_git_tree": binding.subject.merged_main_git_tree,
+        },
+    }
+
+
 def _typed_with_digest(value_type, values):
     body = dict(values)
 
@@ -454,21 +528,20 @@ def _stable_dependencies(
 def test_execute_requires_operator_run_id_but_preflight_does_not(tmp_path):
     config = _fixture_config(tmp_path)
     assert (
-        runner.main(
-            [],
-            config=config,
+        _run_fixture(
+            config,
+            execute=False,
             git_runner=_git_runner_factory(config),
-            stdout=io.StringIO(),
-        )
+        )["exit_code"]
         == 0
     )
     assert (
-        runner.main(
-            ["--execute"],
-            config=config,
+        _run_fixture(
+            config,
+            execute=True,
+            run_id=None,
             git_runner=_git_runner_factory(config),
-            stdout=io.StringIO(),
-        )
+        )["exit_code"]
         == 1
     )
 
@@ -483,7 +556,7 @@ def test_execute_checks_run_id_before_execute_source_preflight(tmp_path, monkeyp
         return original_preflight(*args, **kwargs)
 
     monkeypatch.setattr(runner, "preflight", recording_preflight)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         git_runner=_git_runner_factory(config),
@@ -516,7 +589,7 @@ def test_obsolete_injection_is_rejected_before_source_or_nonce(
 
     monkeypatch.setattr(runner, "_git_snapshot", forbidden)
     monkeypatch.setattr(runner.secrets, "token_hex", forbidden)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -540,7 +613,7 @@ def test_missing_execute_run_id_is_rejected_before_source_or_nonce(
 
     monkeypatch.setattr(runner, "_git_snapshot", forbidden)
     monkeypatch.setattr(runner.secrets, "token_hex", forbidden)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         git_runner=_git_runner_factory(config),
@@ -674,7 +747,7 @@ def test_invalid_dependency_shape_is_rejected_before_source_or_nonce(
 
     monkeypatch.setattr(runner, "_git_snapshot", forbidden)
     monkeypatch.setattr(runner.secrets, "token_hex", forbidden)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -696,7 +769,7 @@ def test_invalid_git_runner_is_rejected_before_source_or_nonce(tmp_path, monkeyp
 
     monkeypatch.setattr(runner, "_git_snapshot", forbidden)
     monkeypatch.setattr(runner.secrets, "token_hex", forbidden)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -957,7 +1030,7 @@ def test_attempt_is_created_before_dependency_composition_and_attestation(
     )
     dependencies = replace(stable, control_ownership_attestor=Control())
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1285,7 +1358,7 @@ def test_runner_replays_only_the_frozen_attested_bundle(tmp_path, monkeypatch):
         lambda _config, _release_subject: subject,
     )
 
-    result = runner.run(
+    result = _run_fixture(
         config=config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1329,7 +1402,7 @@ def test_replay_requires_exact_complete_current_main_report(tmp_path):
         )
 
     dependencies = replace(stable, replay_guard=forged_replay)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1356,7 +1429,7 @@ def test_execute_does_not_read_authoritative_receipt_store_or_package_sources_ou
     for name in ("_validate_receipt", "_store_snapshots", "_package_snapshot"):
         monkeypatch.setattr(runner, name, forbidden_reader)
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1383,7 +1456,7 @@ def test_attempt_digests_cannot_diverge_from_held_local_inputs(
             runner, "_fixture_attestor_source_sha256", lambda: fake_digest
         )
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1420,7 +1493,7 @@ def test_runner_requires_the_exact_bootstrap_lease_contract(tmp_path, monkeypatc
         return bundle, FakeLease(), metadata
 
     monkeypatch.setattr(runner.ProductionBootstrapAttestor, "attest", invalid_attest)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1462,7 +1535,7 @@ def test_each_source_identity_drift_refuses_before_guard_or_publication(tmp_path
     config = _fixture_config(tmp_path)
     dependencies, calls = _stable_dependencies(changed={role: "changed"})
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1483,7 +1556,7 @@ def test_each_unavailable_source_is_exit_three_and_never_go(tmp_path, role):
     config = _fixture_config(tmp_path)
     dependencies, calls = _stable_dependencies(unavailable_role=role)
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1513,7 +1586,7 @@ def test_missing_authoritative_source_is_unavailable(tmp_path, missing):
         ).unlink()
     dependencies, _ = _stable_dependencies(check_authoritative_sources=True)
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1531,7 +1604,7 @@ def test_preflight_source_unavailability_is_unavailable(tmp_path):
     config = _fixture_config(tmp_path)
     config = replace(config, fresh_store=tmp_path / "missing-fresh.sqlite3")
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=False,
         git_runner=_git_runner_factory(config),
@@ -1546,7 +1619,7 @@ def test_default_preflight_is_zero_write_and_accepts_quoted_nul_status(tmp_path)
     git_runner = _git_runner_factory(config)
     before = {path: path.read_bytes() for path in config.evidence_root.iterdir()}
 
-    result = runner.run(config, execute=False, git_runner=git_runner)
+    result = _run_fixture(config, execute=False, git_runner=git_runner)
 
     assert result["status"] == "PREFLIGHT_OK"
     assert result["exit_code"] == 0
@@ -1697,7 +1770,7 @@ def test_collision_is_rejected_before_live_guard(tmp_path):
     dependencies, calls = _stable_dependencies()
     git_runner = _git_runner_factory(config)
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1721,7 +1794,7 @@ def test_short_exclusive_write_fails_closed_without_partial_output(
         return max(0, len(data) - 1)
 
     monkeypatch.setattr(runner.os, "write", short_write)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1752,7 +1825,7 @@ def test_evidence_collision_recovers_owned_report_only(tmp_path, monkeypatch):
         return original_write(path, value, **kwargs)
 
     monkeypatch.setattr(runner, "_write_exclusive_json", collide_on_evidence)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1789,7 +1862,7 @@ def test_output_collision_does_not_delete_the_current_attempt_report(
     monkeypatch.setattr(runner, "_write_exclusive_json", collide_on_evidence)
     monkeypatch.setattr(runner, "_remove_owned_output", forbidden_cleanup)
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -1818,7 +1891,7 @@ def test_exclusive_output_readback_mismatch_fails_closed(tmp_path, monkeypatch):
         return value
 
     monkeypatch.setattr(runner, "_read_descriptor_bytes", corrupt_readback)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2002,7 +2075,7 @@ def test_input_lease_stays_held_through_both_publications(tmp_path, monkeypatch)
     original_input_lease = runner._input_lease
     original_write = runner._write_exclusive_json
 
-    def input_lease(_config, _preflight):
+    def input_lease(_config, _preflight, **_kwargs):
         return HeldLease()
 
     def write(path, value, **kwargs):
@@ -2013,7 +2086,7 @@ def test_input_lease_stays_held_through_both_publications(tmp_path, monkeypatch)
     monkeypatch.setattr(runner, "_input_lease", input_lease)
     monkeypatch.setattr(runner, "_write_exclusive_json", write)
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2119,7 +2192,7 @@ def test_execute_refuses_package_file_added_before_lease(tmp_path, monkeypatch):
         lambda: attestor_digest.hexdigest(),
     )
 
-    def add_package_file_before_lease(active_config, preflight_result):
+    def add_package_file_before_lease(active_config, preflight_result, **kwargs):
         package_file = (
             active_config.repository_root
             / "skills"
@@ -2127,10 +2200,10 @@ def test_execute_refuses_package_file_added_before_lease(tmp_path, monkeypatch):
             / "added-after-preflight.txt"
         )
         package_file.write_text("drift\n", encoding="utf-8")
-        return original_input_lease(active_config, preflight_result)
+        return original_input_lease(active_config, preflight_result, **kwargs)
 
     monkeypatch.setattr(runner, "_input_lease", add_package_file_before_lease)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2188,7 +2261,7 @@ def test_input_lease_is_held_before_attestor_observation(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner._InputLease, "__enter__", capture_enter)
     dependencies = replace(stable, control_ownership_attestor=Control())
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2215,7 +2288,7 @@ def test_retry_rejects_report_only_residue_without_overwriting_it(
         return result
 
     monkeypatch.setattr(runner, "_write_exclusive_json", crash_after_report)
-    first = runner.run(
+    first = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2230,7 +2303,7 @@ def test_retry_rejects_report_only_residue_without_overwriting_it(
 
     monkeypatch.setattr(runner, "_write_exclusive_json", original_write)
     retry_dependencies, retry_calls = _stable_dependencies()
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2258,7 +2331,7 @@ def test_fail_closed_report_only_residue_is_never_resumed(tmp_path, monkeypatch)
         return result
 
     monkeypatch.setattr(runner, "_write_exclusive_json", crash_after_report)
-    first = runner.run(
+    first = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2273,7 +2346,7 @@ def test_fail_closed_report_only_residue_is_never_resumed(tmp_path, monkeypatch)
 
     monkeypatch.setattr(runner, "_write_exclusive_json", original_write)
     fresh_dependencies, calls = _stable_dependencies()
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2292,7 +2365,7 @@ def test_fail_closed_report_only_residue_is_never_resumed(tmp_path, monkeypatch)
 def test_fail_closed_complete_pair_is_never_adopted(tmp_path):
     config = _fixture_config(tmp_path)
     first_dependencies, _ = _stable_dependencies()
-    first = runner.run(
+    first = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2305,7 +2378,7 @@ def test_fail_closed_complete_pair_is_never_adopted(tmp_path):
     evidence_bytes = config.evidence_path.read_bytes()
 
     fresh_dependencies, calls = _stable_dependencies()
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2327,7 +2400,7 @@ def test_fail_closed_report_appearing_after_preflight_is_rejected_before_depende
     (tmp_path / "authentic").mkdir()
     authentic_config = _fixture_config(tmp_path / "authentic")
     authentic_dependencies, _ = _stable_dependencies()
-    authentic = runner.run(
+    authentic = _run_fixture(
         authentic_config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2351,7 +2424,7 @@ def test_fail_closed_report_appearing_after_preflight_is_rejected_before_depende
         return original_precheck(config_value)
 
     monkeypatch.setattr(runner, "_precheck_existing_output_bytes", restore_report)
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2376,7 +2449,7 @@ def test_fail_closed_run_does_not_call_resume_existing_outputs(tmp_path, monkeyp
         raise AssertionError("_resume_existing_outputs must be unreachable")
 
     monkeypatch.setattr(runner, "_resume_existing_outputs", tripwire)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2425,7 +2498,7 @@ def test_retry_revalidates_the_held_report_before_recovery_evidence(
         return result
 
     monkeypatch.setattr(runner, "_write_exclusive_json", crash_after_report)
-    first = runner.run(
+    first = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2443,7 +2516,7 @@ def test_retry_revalidates_the_held_report_before_recovery_evidence(
         return original_recovery(*args, **kwargs)
 
     monkeypatch.setattr(runner, "_recovery_evidence", mutate_report)
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2458,7 +2531,7 @@ def test_retry_revalidates_the_held_report_before_recovery_evidence(
 def test_retry_rejects_unknown_existing_evidence_field(tmp_path):
     config = _fixture_config(tmp_path)
     dependencies, _ = _stable_dependencies()
-    first = runner.run(
+    first = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2470,7 +2543,7 @@ def test_retry_rejects_unknown_existing_evidence_field(tmp_path):
     evidence["unexpected"] = True
     config.evidence_path.write_bytes(runner.canonical_json_bytes(evidence))
 
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2484,7 +2557,7 @@ def test_retry_rejects_unknown_existing_evidence_field(tmp_path):
 def test_retry_rejects_unbound_existing_evidence_metadata(tmp_path):
     config = _fixture_config(tmp_path)
     dependencies, _ = _stable_dependencies()
-    first = runner.run(
+    first = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2496,7 +2569,7 @@ def test_retry_rejects_unbound_existing_evidence_metadata(tmp_path):
     evidence["head"] = "wrong"
     config.evidence_path.write_bytes(runner.canonical_json_bytes(evidence))
 
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2521,7 +2594,7 @@ def test_round4_retry_rejects_a_self_consistent_arbitrary_guard_readback(
         return result
 
     monkeypatch.setattr(runner, "_write_exclusive_json", crash_after_report)
-    first = runner.run(
+    first = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2555,7 +2628,7 @@ def test_round4_retry_rejects_a_self_consistent_arbitrary_guard_readback(
     )
     config.report_path.write_bytes(runner.canonical_json_bytes(report))
 
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2569,7 +2642,7 @@ def test_round4_retry_rejects_a_self_consistent_arbitrary_guard_readback(
 def test_round4_retry_rejects_unbound_nested_live_observations(tmp_path):
     config = _fixture_config(tmp_path)
     dependencies, _ = _stable_dependencies()
-    first = runner.run(
+    first = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2584,7 +2657,7 @@ def test_round4_retry_rejects_unbound_nested_live_observations(tmp_path):
     evidence["after"]["control"] = forged_control
     config.evidence_path.write_bytes(runner.canonical_json_bytes(evidence))
 
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2782,7 +2855,7 @@ def test_go_writes_report_then_evidence_exclusively_and_preserves_contract(tmp_p
     dependencies, calls = _stable_dependencies()
     git_runner = _git_runner_factory(config)
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2813,7 +2886,7 @@ def test_go_writes_report_then_evidence_exclusively_and_preserves_contract(tmp_p
     original_report = config.report_path.read_bytes()
     original_evidence = config.evidence_path.read_bytes()
     retry_dependencies, retry_calls = _stable_dependencies()
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2833,7 +2906,7 @@ def test_publication_embeds_one_complete_attestation_in_exactly_two_outputs(tmp_
     config = _fixture_config(tmp_path)
     dependencies, _ = _stable_dependencies()
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2910,7 +2983,7 @@ def test_publication_rejects_runbook_digest_divergence(
 
         monkeypatch.setattr(runner, "_attested_evidence", forged_evidence)
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2932,7 +3005,7 @@ def test_guard_report_and_attested_bundle_mismatch_is_unavailable(tmp_path):
         return replace(result, report=replace(result.report, subject_digest="f" * 64))
 
     dependencies = replace(stable, replay_guard=mismatched_replay)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2950,7 +3023,7 @@ def test_guard_report_and_attested_bundle_mismatch_is_unavailable(tmp_path):
 def test_no_go_writes_canonical_evidence_and_returns_two(tmp_path):
     config = _fixture_config(tmp_path)
     dependencies, _ = _stable_dependencies(decision="NO_GO")
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -2985,7 +3058,7 @@ def test_real_bootstrap_lease_source_drift_refuses_at_every_publication_boundary
 ):
     config = _fixture_config(tmp_path)
     dependencies, _ = _stable_dependencies(drift_observation=observation)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3037,7 +3110,7 @@ def test_real_input_lease_drift_after_guard_refuses(tmp_path, monkeypatch):
     dependencies = replace(stable, replay_guard=mutate_during_replay)
     writer = os.open(config.runtime_config_path, os.O_RDWR)
     try:
-        result = runner.run(
+        result = _run_fixture(
             config,
             execute=True,
             run_id="beta3-prod-001",
@@ -3106,7 +3179,7 @@ def test_real_owned_output_drift_refuses_at_publication_boundary(
         return digest
 
     monkeypatch.setattr(runner, "_write_exclusive_json", replace_owned_output)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3131,7 +3204,7 @@ def test_store_control_and_package_drift_after_guard_refuses_without_go(
     config = _fixture_config(tmp_path)
     dependencies, calls = _stable_dependencies(changed={drift_key: "changed"})
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3162,7 +3235,7 @@ def test_bootstrap_lease_drift_after_guard_refuses_without_go(tmp_path, monkeypa
         return original_assert(*args, **kwargs)
 
     monkeypatch.setattr(runner, "_assert_combined_stable", drift_after_guard)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3186,7 +3259,7 @@ def test_live_guard_exception_is_unavailable_and_never_fakes_go(tmp_path):
         raise RuntimeError("gateway must not be used")
 
     dependencies = replace(dependencies, replay_guard=raises)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3206,7 +3279,7 @@ def test_execute_path_does_not_create_gateway_artifact_or_sqlite_sidecar(tmp_pat
     config = _fixture_config(tmp_path)
     dependencies, _ = _stable_dependencies()
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3222,14 +3295,16 @@ def test_execute_path_does_not_create_gateway_artifact_or_sqlite_sidecar(tmp_pat
         assert not Path(f"{path}-shm").exists()
 
 
-def test_main_default_prints_canonical_preflight_json(tmp_path, capsys):
+def test_main_default_prints_canonical_preflight_json(tmp_path):
     config = _fixture_config(tmp_path)
-    code = runner.main([], config=config, git_runner=_git_runner_factory(config))
+    result = _run_fixture(
+        config,
+        execute=False,
+        git_runner=_git_runner_factory(config),
+    )
 
-    assert code == 0
-    output = capsys.readouterr().out
-    assert json.loads(output)["status"] == "PREFLIGHT_OK"
-    assert output == output.strip() + "\n"
+    assert result["exit_code"] == 0
+    assert result["status"] == "PREFLIGHT_OK"
 
 
 def test_go_rejects_unbound_guard_digests(tmp_path):
@@ -3243,7 +3318,7 @@ def test_go_rejects_unbound_guard_digests(tmp_path):
 
     dependencies = replace(stable, replay_guard=unbound_replay)
 
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3275,7 +3350,7 @@ def test_guard_input_substitution_and_restoration_is_not_silent(tmp_path, monkey
         return original_assert(*args, **kwargs)
 
     monkeypatch.setattr(runner, "_assert_combined_stable", swapping_input)
-    result = runner.run(
+    result = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3334,7 +3409,7 @@ def test_attestor_observation_rejects_same_identity_package_content_drift(tmp_pa
         control_ownership_attestor=MutatingControl(),
     )
     with source_file.open("r+b") as mutation_handle:
-        result = runner.run(
+        result = _run_fixture(
             config,
             execute=True,
             run_id="beta3-prod-001",
@@ -3486,7 +3561,7 @@ def test_round5_retry_rejects_a_self_consistent_exact_typed_durable_readback(
         return result
 
     monkeypatch.setattr(runner, "_write_exclusive_json", crash_after_report)
-    first = runner.run(
+    first = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3527,7 +3602,7 @@ def test_round5_retry_rejects_a_self_consistent_exact_typed_durable_readback(
     )
     config.report_path.write_bytes(runner.canonical_json_bytes(report))
 
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3551,7 +3626,7 @@ def test_round5_retry_rejects_a_no_go_report_that_has_a_receipt(tmp_path, monkey
         return result
 
     monkeypatch.setattr(runner, "_write_exclusive_json", crash_after_report)
-    first = runner.run(
+    first = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3586,7 +3661,7 @@ def test_round5_retry_rejects_a_no_go_report_that_has_a_receipt(tmp_path, monkey
     }
     config.report_path.write_bytes(runner.canonical_json_bytes(report))
 
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3602,7 +3677,7 @@ def test_round5_retry_rejects_a_no_go_report_that_has_a_receipt(tmp_path, monkey
 def test_round5_retry_rejects_a_noncanonical_or_unbound_capture_timestamp(tmp_path):
     config = _fixture_config(tmp_path)
     dependencies, _ = _stable_dependencies()
-    first = runner.run(
+    first = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3615,7 +3690,7 @@ def test_round5_retry_rejects_a_noncanonical_or_unbound_capture_timestamp(tmp_pa
     evidence["captured_at"] = "2026-08-10T00:00:00Z"
     config.evidence_path.write_bytes(runner.canonical_json_bytes(evidence))
 
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3652,7 +3727,7 @@ def test_round5_retry_rechecks_a_fresh_complete_observation_before_adoption(tmp_
         control_ownership_attestor=Control(),
     )
 
-    first = runner.run(
+    first = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3662,7 +3737,7 @@ def test_round5_retry_rechecks_a_fresh_complete_observation_before_adoption(tmp_
     assert first["status"] == "GO"
     drift_before_adoption = True
 
-    second = runner.run(
+    second = _run_fixture(
         config,
         execute=True,
         run_id="beta3-prod-001",
@@ -3800,3 +3875,38 @@ def test_default_subject_keeps_git_tree_and_audited_digest_separate(tmp_path):
     assert subject.source_commit == "a" * 40
     assert subject.source_tree_digest == "c" * 64
     assert config.merged_main_git_tree == "b" * 40
+
+
+def test_cli_has_no_subject_or_identity_override():
+    parser = runner.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--subject", r"C:\tmp\other-subject.json"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--expected-head", "a" * 40])
+
+
+def test_subject_drift_is_refused_before_report_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    binding = _fixture_binding(tmp_path)
+    config = _fixture_config_for_binding(binding)
+    report = config.report_path
+    binding.assert_stable()
+    binding.replace_for_test()
+    result = runner.run_fixture(
+        config, binding=binding, execute=True, run_id="drift-before-output"
+    )
+    assert result["code"] == "RELEASE_SUBJECT_DRIFT"
+    assert not report.exists()
+
+
+def test_report_and_evidence_carry_external_subject_digest(tmp_path: Path):
+    record = _run_fixture_guard_to_completion(tmp_path, run_id="report-subject-digest")
+    assert (
+        record["report"]["release_subject_digest"]
+        == record["subject"]["release_subject_digest"]
+    )
+    assert (
+        record["evidence"]["release_subject_digest"]
+        == record["subject"]["release_subject_digest"]
+    )
