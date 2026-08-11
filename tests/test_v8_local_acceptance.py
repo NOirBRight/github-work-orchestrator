@@ -26,6 +26,31 @@ def _load_runner():
     return module
 
 
+class _NoCleanupTemporaryDirectory:
+    def __init__(self, root: Path):
+        self.root = str(root)
+
+    def __enter__(self) -> str:
+        return self.root
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+def _patch_runner_root_lifecycle(
+    runner, root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    original = runner.tempfile.TemporaryDirectory
+
+    def temporary_directory(*args, **kwargs):
+        directory = kwargs.get("dir")
+        if directory is not None and Path(directory).resolve() == root.resolve():
+            return _NoCleanupTemporaryDirectory(root)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runner.tempfile, "TemporaryDirectory", temporary_directory)
+
+
 def test_single_acceptance_uses_public_api_and_reaches_complete(tmp_path: Path):
     runner = _load_runner()
 
@@ -611,3 +636,107 @@ def test_root_cli_output_is_canonical_and_deterministic(tmp_path: Path):
     assert first.stdout == runner.canonical_json(record) + "\n"
     assert record["gate"] == "LOCAL_ROOT_CANARY_GO"
     assert record["status"] == "Complete"
+
+
+def test_root_candidate_readback_uses_real_git_commit_tree_and_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runner = _load_runner()
+    _patch_runner_root_lifecycle(runner, tmp_path, monkeypatch)
+    record = runner.run_local_acceptance(root=tmp_path, run_id="task2-git-readback", scenario="root")
+    repository = tmp_path / "repository"
+    candidates = record["facts"]["git_readback"]["candidate_objects"]
+    assert len(candidates) == 4
+    for candidate in candidates:
+        commit = subprocess.run(
+            ["git", "rev-parse", f"{candidate['reference']}^{{commit}}"],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        tree = subprocess.run(
+            ["git", "rev-parse", f"{candidate['reference']}^{{tree}}"],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert (commit, tree) == (candidate["commit_sha"], candidate["tree_sha"])
+        assert candidate["diff_record_digest"] in {
+            diff["record_digest"] for diff in record["facts"]["readback"]["candidate_diffs"]
+        }
+
+
+def test_root_batch_delivery_uses_real_batch_integrator_and_git_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runner = _load_runner()
+    _patch_runner_root_lifecycle(runner, tmp_path, monkeypatch)
+    record = runner.run_local_acceptance(root=tmp_path, run_id="task2-batch-readback", scenario="root")
+    repository = tmp_path / "repository"
+    batches = record["facts"]["git_readback"]["batches"]
+    assert [batch["member_ticket_keys"] for batch in batches] == [
+        ["issue:101", "issue:102", "issue:103"],
+        ["issue:104"],
+    ]
+    assert all(batch["batch_ref_sha"] == batch["batch_sha"] for batch in batches)
+    assert all(batch["target_contains_batch_sha"] for batch in batches)
+    for batch in batches:
+        ancestry = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", batch["batch_sha"], batch["target_head_sha"]],
+            cwd=repository,
+            check=False,
+        )
+        assert ancestry.returncode == 0
+
+
+def test_root_watchdog_callback_lost_wake_duplicate_and_restart_are_public_advance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runner = _load_runner()
+    calls: list[str | None] = []
+    original = runner.gwo_v8.advance
+
+    def traced(handle, wake_ref=None, **kwargs):
+        calls.append(wake_ref)
+        return original(handle, wake_ref, **kwargs)
+
+    monkeypatch.setattr(runner.gwo_v8, "advance", traced)
+    record = runner.run_local_acceptance(root=tmp_path, run_id="task2-watchdog", scenario="root")
+    replay = record["replay"]
+    assert replay["watchdog_progressed"] is True
+    assert replay["lost_wake"]["status"] == "Complete"
+    assert replay["duplicate_callback"]["status"] == "Complete"
+    assert replay["restart_advance"]["status"] == "Complete"
+    assert any(wake == replay["callback_emitted"] for wake in calls)
+    assert replay["idempotent_effects"] is True
+
+
+def test_root_worker_slots_release_and_strict_resource_is_exclusive(tmp_path: Path):
+    runner = _load_runner()
+    record = runner.run_local_acceptance(root=tmp_path, run_id="task2-resources", scenario="root")
+    concurrency = record["facts"]["concurrency"]
+    resources = record["facts"]["exclusive_resources"]
+    assert concurrency["worker_slot_limit"] == 4
+    assert concurrency["max_held"] == 4
+    assert concurrency["final_held"] == 0
+    assert concurrency["final_available"] == 4
+    assert resources["issue:101"] == []
+    assert resources["issue:102"] == []
+    assert resources["issue:103"] == []
+    assert resources["issue:104"] == ["repository.target.v1"]
+
+
+def test_root_acceptance_is_canonical_across_independent_roots(tmp_path: Path):
+    runner = _load_runner()
+    first = runner.run_local_acceptance(
+        root=tmp_path / "first-root", run_id="task2-deterministic", scenario="root"
+    )
+    second = runner.run_local_acceptance(
+        root=tmp_path / "second-root", run_id="task2-deterministic", scenario="root"
+    )
+    assert first["record_digest"] == second["record_digest"]
+    assert runner.canonical_json(first) == runner.canonical_json(second)
+    assert first["facts"]["git_readback"]["candidate_objects"] == second["facts"]["git_readback"]["candidate_objects"]
+    assert len(first["facts"]["git_readback"]["candidate_objects"]) == 4
