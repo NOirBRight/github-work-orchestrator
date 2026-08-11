@@ -15,6 +15,7 @@ import gc
 from pathlib import Path
 import sqlite3
 import sys
+import tempfile
 from typing import Any
 
 
@@ -24,7 +25,11 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import gwo_v8  # noqa: E402
-from gwo_v8._canonical import canonical_bytes, digest_value, load_canonical_json  # noqa: E402
+from gwo_v8._canonical import (  # noqa: E402
+    canonical_bytes,
+    digest_value,
+    load_canonical_json,
+)
 from gwo_v8.batch_integrator import BatchDeliveryProof  # noqa: E402
 from gwo_v8.candidate_gate import (  # noqa: E402
     AcceptedCandidateReceipt,
@@ -44,7 +49,7 @@ from gwo_v8.execution_kernel import (  # noqa: E402
 from gwo_v8.plan_control import (  # noqa: E402
     InMemoryPlanRepository,
     PlanControl,
-    _install_start_control,
+    _install_start_host,
 )
 from gwo_v8.runtime_gateway import (  # noqa: E402
     ArtifactStore,
@@ -57,6 +62,16 @@ PUBLIC_API_SINGLE_NODE_GO = "PUBLIC_API_SINGLE_NODE_GO"
 _REPOSITORY = "local/v8-acceptance"
 _TICKET_KEY = "issue:1"
 _TARGET_BRANCH = "main"
+
+
+def _campaign_key(run_id: str, scenario: str) -> str:
+    return "campaign:" + digest_value(
+        {
+            "kind": "gwo.v8.local-acceptance-campaign.v1",
+            "run_id": run_id,
+            "scenario": scenario,
+        }
+    )[:24]
 
 
 @contextmanager
@@ -251,15 +266,7 @@ class _LocalPlanningGateway:
 
 
 def _candidate_for(action: WorkRunAction) -> CandidateReceipt:
-    diff = CandidateDiffRecordV1(
-        schema_version="CandidateDiffRecordV1",
-        repository_object_format="sha1",
-        base_commit_oid="2" * 40,
-        base_tree_oid="3" * 40,
-        candidate_commit_oid="4" * 40,
-        candidate_tree_oid="5" * 40,
-        entries=(),
-    )
+    diff = _candidate_diff_for()
     return CandidateReceipt(
         parent_digest=digest_value(
             {"kind": "local-candidate-parent.v1", "work": action.work_run_key}
@@ -281,6 +288,18 @@ def _candidate_for(action: WorkRunAction) -> CandidateReceipt:
             {"kind": "local-worker-authority.v1", "ticket": action.ticket_key}
         ),
         runtime_subject_digest=action.work_subject_digest,
+    )
+
+
+def _candidate_diff_for() -> CandidateDiffRecordV1:
+    return CandidateDiffRecordV1(
+        schema_version="CandidateDiffRecordV1",
+        repository_object_format="sha1",
+        base_commit_oid="2" * 40,
+        base_tree_oid="3" * 40,
+        candidate_commit_oid="4" * 40,
+        candidate_tree_oid="5" * 40,
+        entries=(),
     )
 
 
@@ -478,6 +497,16 @@ class _LocalDeliveryStub:
             return None
         return WorkRunObservation.from_canonical(load_canonical_json(row[0]))
 
+    def readbacks(self) -> tuple[WorkRunObservation, ...]:
+        with _connection(self.store_path) as connection:
+            rows = connection.execute(
+                "SELECT observation_json FROM deliveries ORDER BY stable_action_id"
+            ).fetchall()
+        return tuple(
+            WorkRunObservation.from_canonical(load_canonical_json(row[0]))
+            for row in rows
+        )
+
     def execute(self, action: WorkRunAction) -> WorkRunObservation:
         existing = self.readback(action)
         if existing is not None:
@@ -510,6 +539,21 @@ class _LocalEffects:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS counters(
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    execute_calls INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO counters(singleton, execute_calls)
+                VALUES (1, 0)
+                ON CONFLICT(singleton) DO NOTHING
+                """
+            )
 
     def bind_batch_delivery_request_digest(self, action: WorkRunAction) -> str:
         return digest_value(
@@ -520,6 +564,15 @@ class _LocalEffects:
                 "candidate": action.accepted_candidate_receipt_digest,
             }
         )
+
+    @property
+    def execute_calls(self) -> int:
+        with _connection(self.store_path) as connection:
+            row = connection.execute(
+                "SELECT execute_calls FROM counters WHERE singleton = 1"
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
 
     def _read_semantic(self, action: WorkRunAction) -> WorkRunObservation | None:
         with _connection(self.store_path) as connection:
@@ -536,6 +589,22 @@ class _LocalEffects:
             return self.delivery.readback(action)
         return self._read_semantic(action)
 
+    def canonical_readbacks(self) -> dict[str, list[dict[str, Any]]]:
+        with _connection(self.store_path) as connection:
+            rows = connection.execute(
+                "SELECT observation_json FROM observations ORDER BY stable_action_id"
+            ).fetchall()
+        semantic = [
+            WorkRunObservation.from_canonical(load_canonical_json(row[0]))
+            for row in rows
+        ]
+        return {
+            "semantic": [observation.canonical() for observation in semantic],
+            "delivery": [
+                observation.canonical() for observation in self.delivery.readbacks()
+            ],
+        }
+
     def _save_semantic(self, action: WorkRunAction, observation: WorkRunObservation):
         rendered = canonical_bytes(observation.canonical())
         with _connection(self.store_path) as connection:
@@ -550,6 +619,12 @@ class _LocalEffects:
             return existing
         if self.scenario == "failure":
             raise LocalAcceptanceFailure("deterministic local Runtime failure")
+        if action.kind == "batch_delivery":
+            return self.delivery.execute(action)
+        with _connection(self.store_path) as connection:
+            connection.execute(
+                "UPDATE counters SET execute_calls = execute_calls + 1 WHERE singleton = 1"
+            )
         if self.scenario == "wait":
             observation = WorkRunObservation(
                 phase="wait",
@@ -584,8 +659,6 @@ class _LocalEffects:
                 accepted_candidate_receipt_digest=accepted.digest,
                 candidate_diff_record_digest=candidate.diff_record_digest,
             )
-        elif action.kind == "batch_delivery":
-            return self.delivery.execute(action)
         else:  # pragma: no cover - the Kernel owns the closed action union.
             raise LocalAcceptanceFailure(f"unsupported local action: {action.kind}")
         self._save_semantic(action, observation)
@@ -602,6 +675,113 @@ class _Harness:
     delivery: _LocalDeliveryStub
     control: PlanControl
     configuration: ExecutionKernelConfiguration
+
+
+@dataclass(frozen=True)
+class _LocalStartHost:
+    control: PlanControl
+    campaign_key: str
+
+    def start(
+        self,
+        repository: str,
+        ready_refs: tuple[str, ...],
+        options: object = None,
+    ) -> CampaignHandle:
+        return self.control.start(
+            repository,
+            ready_refs,
+            options,
+            campaign_key=self.campaign_key,
+        )
+
+
+def _canonical_readback(effects: _LocalEffects) -> dict[str, Any]:
+    observations = effects.canonical_readbacks()
+    all_observations = [
+        WorkRunObservation.from_canonical(value)
+        for group in observations.values()
+        for value in group
+    ]
+    candidate_observation = next(
+        (
+            observation
+            for observation in all_observations
+            if observation.candidate_receipt is not None
+        ),
+        None,
+    )
+    candidate = (
+        candidate_observation.candidate_receipt
+        if candidate_observation is not None
+        else None
+    )
+    if candidate is None or candidate_observation is None:
+        return {
+            "observations": observations,
+            "candidate_receipt": None,
+            "candidate_diff": None,
+            "accepted_candidate_receipt": None,
+            "delivery_proof": None,
+            "result_integrity": None,
+        }
+
+    action = WorkRunAction(
+        stable_action_id=candidate_observation.stable_action_id,
+        repository=candidate.repository,
+        campaign_key=candidate.campaign_key,
+        plan_revision_digest=candidate.plan_revision_digest,
+        ticket_key=candidate.ticket_key,
+        kind="semantic_execution",
+        semantic_action_id=candidate_observation.stable_action_id,
+        work_run_key=candidate.work_run_key,
+        work_subject_digest=candidate.runtime_subject_digest,
+        runtime_binding_id=candidate_observation.runtime_binding_id,
+    )
+    diff = _candidate_diff_for()
+    accepted = _accepted_for(action, candidate)
+    result_observation = next(
+        (
+            observation
+            for observation in all_observations
+            if observation.result_integrity is not None
+        ),
+        None,
+    )
+    proof = (
+        result_observation.result_integrity
+        if result_observation is not None
+        else None
+    )
+    delivery = None
+    if proof is not None:
+        delivery = BatchDeliveryProof.create(
+            delivery_stable_action_id=proof.delivery_stable_action_id,
+            delivery_request_digest=proof.delivery_request_digest,
+            batch_id=proof.batch_id,
+            batch_sha=proof.batch_sha,
+            member_ticket_keys=proof.delivery_member_ticket_keys,
+            local_check_receipt_digest=proof.local_check_receipt_digest,
+            publication_receipt_digest=proof.publication_receipt_digest,
+            pull_request_number=proof.pull_request_number,
+            pull_request_head_sha=proof.pull_request_head_sha,
+            hosted_result_receipt_digest=proof.hosted_result_receipt_digest,
+            integration_lease_digest=proof.integration_lease_digest,
+            target_branch=proof.target_branch,
+            target_head_sha=proof.target_head_sha,
+            target_readback_digest=proof.target_readback_digest,
+            target_contains_batch_sha=proof.target_contains_batch_sha,
+            pull_request_merge_target_sha=proof.pull_request_merge_target_sha,
+            merge_method=proof.merge_method,
+        )
+    return {
+        "observations": observations,
+        "candidate_receipt": candidate.canonical(),
+        "candidate_diff": diff.canonical(),
+        "accepted_candidate_receipt": accepted.canonical(),
+        "delivery_proof": None if delivery is None else delivery.canonical(),
+        "result_integrity": None if proof is None else proof.canonical(),
+    }
 
 
 def _install_harness(root: Path, run_id: str, scenario: str) -> tuple[_Harness, CampaignHandle]:
@@ -622,7 +802,9 @@ def _install_harness(root: Path, run_id: str, scenario: str) -> tuple[_Harness, 
         gateway=planning_gateway,
         repository=InMemoryPlanRepository(writer_generation="writer:local"),
     )
-    _install_start_control(control)
+    _install_start_host(
+        _LocalStartHost(control, _campaign_key(run_id, scenario))
+    )
     delivery = _LocalDeliveryStub(sqlite_root / "delivery.sqlite3")
     effects = _LocalEffects(
         sqlite_root / "effects.sqlite3",
@@ -712,7 +894,7 @@ def _record_digest(record: dict[str, Any]) -> dict[str, Any]:
     return {**record, "record_digest": digest_value(record)}
 
 
-def run_local_acceptance(
+def _run_local_acceptance_in_root(
     *,
     root: Path,
     run_id: str = "phase1-single",
@@ -722,58 +904,93 @@ def run_local_acceptance(
 
     if type(run_id) is not str or not run_id:
         raise ValueError("run_id must be non-empty text")
-    if scenario == "single":
-        mode = "complete"
-    elif scenario in {"wait", "blocked", "failure"}:
-        mode = scenario
-    else:
+    if scenario not in {"single", "wait", "blocked", "failure"}:
         raise ValueError("scenario must be single, wait, blocked, or failure")
 
-    harness, handle = _install_harness(Path(root), run_id, mode)
+    harness, handle = _install_harness(Path(root), run_id, scenario)
     initial = gwo_v8.inspect(handle)
     transcript: list[dict[str, Any]] = [
         {"operation": "start", "campaign_key": handle.campaign_key},
         {"operation": "inspect", "readback": _diagnostics_record(initial)},
     ]
-    failure: dict[str, str] | None = None
-    try:
-        first_outcome = gwo_v8.advance(handle, "local:initial")
-        transcript.append(
-            {"operation": "advance", "wake_ref": "local:initial", "outcome": _outcome_record(first_outcome)}
-        )
-    except LocalAcceptanceFailure as error:
-        failure = {"type": type(error).__name__, "message": str(error)}
-        transcript.append(
-            {"operation": "advance", "wake_ref": "local:initial", "outcome": {"status": "Failure", **failure}}
-        )
+    def advance_with_readback(wake_ref: str) -> tuple[dict[str, str], dict[str, str] | None]:
+        try:
+            outcome = gwo_v8.advance(handle, wake_ref)
+        except LocalAcceptanceFailure as error:
+            failure_record = {"type": type(error).__name__, "message": str(error)}
+            return {"status": "Failure", **failure_record}, failure_record
+        return _outcome_record(outcome), None
 
-    after_first = gwo_v8.inspect(handle)
-    transcript.append(
-        {"operation": "inspect", "readback": _diagnostics_record(after_first)}
-    )
-    replay: dict[str, Any] = {}
-    if failure is None and mode == "complete":
-        replay_outcome = gwo_v8.advance(handle, "local:initial")
-        replay["same_wake"] = _outcome_record(replay_outcome)
-        replay["delivery_execute_calls_before_restart"] = harness.delivery.execute_calls
-        _install_restart(harness)
-        restarted = gwo_v8.inspect(handle)
-        replay["restart_inspect"] = _diagnostics_record(restarted)
-        restart_outcome = gwo_v8.advance(handle, "local:restart")
-        replay["restart_advance"] = _outcome_record(restart_outcome)
-        replay["delivery_execute_calls_after_restart"] = harness.delivery.execute_calls
-        replay["idempotent_delivery"] = (
-            replay["delivery_execute_calls_before_restart"]
-            == replay["delivery_execute_calls_after_restart"]
+    def inspect_with_readback() -> object:
+        diagnostics = gwo_v8.inspect(handle)
+        transcript.append(
+            {"operation": "inspect", "readback": _diagnostics_record(diagnostics)}
         )
-        final = gwo_v8.inspect(handle)
-    elif failure is None:
-        _install_restart(harness)
-        restarted = gwo_v8.inspect(handle)
-        replay["restart_inspect"] = _diagnostics_record(restarted)
-        final = restarted
-    else:
-        final = after_first
+        return diagnostics
+
+    first_outcome, failure = advance_with_readback("local:initial")
+    transcript.append(
+        {
+            "operation": "advance",
+            "wake_ref": "local:initial",
+            "outcome": first_outcome,
+        }
+    )
+    inspect_with_readback()
+
+    same_wake_ref = "local:initial" if failure is None else "local:replay-before-restart"
+    same_wake, _same_wake_failure = advance_with_readback(same_wake_ref)
+    transcript.append(
+        {
+            "operation": "advance",
+            "wake_ref": same_wake_ref,
+            "outcome": same_wake,
+        }
+    )
+    same_wake_inspect = inspect_with_readback()
+    before_restart_readback = _canonical_readback(harness.effects)
+    replay: dict[str, Any] = {
+        "same_wake": same_wake,
+        "same_wake_ref": same_wake_ref,
+        "same_wake_inspect": _diagnostics_record(same_wake_inspect),
+        "semantic_execute_calls_before_restart": harness.effects.execute_calls,
+        "delivery_execute_calls_before_restart": harness.delivery.execute_calls,
+        "readback_digest_before_restart": digest_value(before_restart_readback),
+    }
+
+    _install_restart(harness)
+    restarted = inspect_with_readback()
+    replay["restart_inspect"] = _diagnostics_record(restarted)
+
+    restart_outcome, _restart_failure = advance_with_readback("local:restart")
+    replay["restart_advance"] = restart_outcome
+    restarted_after_advance = inspect_with_readback()
+    replay["restart_advance_inspect"] = _diagnostics_record(restarted_after_advance)
+
+    repeated_restart_ref = (
+        "local:restart" if failure is None else "local:replay-after-restart"
+    )
+    repeated_restart, _repeated_restart_failure = advance_with_readback(
+        repeated_restart_ref
+    )
+    replay["repeated_restart_advance_ref"] = repeated_restart_ref
+    replay["repeated_restart_advance"] = repeated_restart
+    final = inspect_with_readback()
+    replay["final_inspect"] = _diagnostics_record(final)
+    after_replay_readback = _canonical_readback(harness.effects)
+    replay["semantic_execute_calls_after_replay"] = harness.effects.execute_calls
+    replay["delivery_execute_calls_after_replay"] = harness.delivery.execute_calls
+    replay["readback_digest_after_replay"] = digest_value(after_replay_readback)
+    replay["readback_unchanged"] = before_restart_readback == after_replay_readback
+    replay["idempotent_delivery"] = (
+        replay["delivery_execute_calls_before_restart"]
+        == replay["delivery_execute_calls_after_replay"]
+    )
+    replay["idempotent_effects"] = (
+        replay["semantic_execute_calls_before_restart"]
+        == replay["semantic_execute_calls_after_replay"]
+        and replay["idempotent_delivery"]
+    )
 
     run = final.work_runs[0] if final.work_runs else None
     status = "Failure" if failure is not None else final.status.value
@@ -783,7 +1000,9 @@ def run_local_acceptance(
         "scenario": scenario,
         "run_id": run_id,
         "status": status,
+        "public_status": final.status.value,
         "reason": failure["message"] if failure is not None else final.reason,
+        "public_reason": final.reason,
         "campaign": {
             "repository": handle.repository,
             "campaign_key": handle.campaign_key,
@@ -832,12 +1051,37 @@ def run_local_acceptance(
                 if run is not None and run.evidence_digests
                 else None
             ),
+            "readback": after_replay_readback,
         },
         "transcript": transcript,
         "replay": replay,
         "failure": failure,
     }
     return _record_digest(record)
+
+
+def run_local_acceptance(
+    *,
+    root: Path,
+    run_id: str = "phase1-single",
+    scenario: str = "single",
+) -> dict[str, Any]:
+    """Run one isolated local acceptance scenario and return its JSON record."""
+
+    caller_root = Path(root).resolve()
+    caller_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="gwo-v8-local-run-",
+        dir=str(caller_root),
+    ) as isolated_root:
+        try:
+            return _run_local_acceptance_in_root(
+                root=Path(isolated_root),
+                run_id=run_id,
+                scenario=scenario,
+            )
+        finally:
+            gc.collect()
 
 
 def canonical_json(record: dict[str, Any]) -> str:
