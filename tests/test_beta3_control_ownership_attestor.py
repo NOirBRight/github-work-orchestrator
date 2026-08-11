@@ -1068,6 +1068,65 @@ def test_local_checkout_source_rejects_reparse_path_before_read(tmp_path, monkey
     assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
 
 
+def test_local_tree_rejects_parent_replacement_during_scan(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "source.py").write_bytes(b"original")
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "source.py").write_bytes(b"replacement")
+    original_scandir = os.scandir
+    replaced = False
+
+    def replacing_scandir(path):
+        nonlocal replaced
+        if Path(path) == root and not replaced:
+            original = tmp_path / "original-root"
+            root.rename(original)
+            root.symlink_to(replacement, target_is_directory=True)
+            replaced = True
+        return original_scandir(path)
+
+    monkeypatch.setattr(attestor_module.os, "scandir", replacing_scandir)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._local_tree_files(root, "STATIC_INPUT_SOURCE_UNAVAILABLE")
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+def test_local_tree_rejects_reparse_ancestor(tmp_path):
+    real_root = tmp_path / "real-root"
+    scanned = real_root / "tree"
+    scanned.mkdir(parents=True)
+    (scanned / "source.py").write_bytes(b"source")
+    redirected = tmp_path / "redirected"
+    try:
+        redirected.symlink_to(real_root, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory reparse/symlink creation is unavailable")
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._local_tree_files(
+            redirected / "tree",
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        )
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
+def test_local_tree_reads_normal_path_without_reparse(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    source = root / "source.py"
+    source.write_bytes(b"source")
+
+    assert attestor_module._local_tree_files(
+        root,
+        "STATIC_INPUT_SOURCE_UNAVAILABLE",
+    ) == (source.resolve(),)
+
+
 def test_source_observation_rejects_role_or_read_mode_substitution():
     subject = _subject()
     attempt = _attempt(subject)

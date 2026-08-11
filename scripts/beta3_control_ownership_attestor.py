@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import hashlib
 import inspect
@@ -340,7 +341,7 @@ class _RuntimeConfigSource:
         self._repository = repository
 
     def read(self, path: Path) -> SourceObservation:
-        path = Path(path).resolve()
+        path = _absolute_local_path(Path(path))
         snapshot = _read_file_snapshot(path, "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE")
         record = _source_record(
             role="runtime.config",
@@ -364,7 +365,11 @@ class _LocalInputsSource:
         self._producer_sha256 = producer_sha256
 
     def read(self, config: object, subject: CutoverSubject) -> SourceObservation:
-        root = Path(config.repository_root).resolve()
+        root = _canonical_local_directory(
+            Path(config.repository_root),
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+        )
+
         def read_oid(revision: str, label: str) -> str:
             command = ("git", "-C", str(root), "rev-parse", "--verify", revision)
             try:
@@ -522,7 +527,7 @@ def _file_identity(path: Path, stat_result: os.stat_result) -> tuple[tuple[str, 
             "byte_sha256": digest_bytes(path.read_bytes()),
             "inode": str(stat_result.st_ino),
             "mtime_ns": str(stat_result.st_mtime_ns),
-            "path": str(path.resolve()),
+            "path": str(_absolute_local_path(path)),
             "size": str(stat_result.st_size),
         }
     )
@@ -548,7 +553,7 @@ def _read_file_snapshot(path: Path, code: str) -> _FileSnapshot:
     path = Path(path)
     try:
         content, held_identity = _held_file_bytes(path, code)
-        canonical_path = path.resolve(strict=True)
+        canonical_path = _absolute_local_path(path)
         inode = held_identity.get("st_ino", held_identity.get("file_id"))
         if inode is None:
             raise OSError("held file identity has no inode")
@@ -653,7 +658,10 @@ def _validate_checkout_observation(
         or observation.complete is not True
     ):
         _fail(code, "checkout source is not one complete observation")
-    root = Path(config.repository_root).resolve()
+    root = _canonical_local_directory(
+        Path(config.repository_root),
+        "STATIC_INPUT_SOURCE_UNAVAILABLE",
+    )
     expected = {
         "repository_root": str(root),
         "commit_oid": subject.source_commit,
@@ -1207,7 +1215,7 @@ def _configured_store_tables(config: object, expected_tables: tuple[str, ...]) -
 
 
 def _path_text(path: Path) -> str:
-    return str(Path(path).resolve())
+    return str(_absolute_local_path(Path(path)))
 
 
 def _sidecars(path: Path) -> tuple[Path, ...]:
@@ -1236,7 +1244,7 @@ def _dynamic_sidecars(path: Path) -> tuple[Path, ...]:
         raise error
     try:
         candidates: list[Path] = []
-        for entry in os.scandir(parent):
+        for entry in _held_directory_entries(parent, "STORE_SOURCE_UNAVAILABLE"):
             match = _DYNAMIC_SIDE_FILE.fullmatch(entry.name)
             if match is None or match.group("prefix") != Path(path).name:
                 continue
@@ -2060,10 +2068,10 @@ def _validate_runtime_config_source(
 ) -> None:
     """Keep the Runtime projection bound to the one host config file."""
 
-    expected_path = Path(expected_path_value).resolve()
+    expected_path = _absolute_local_path(Path(expected_path_value))
     record = observation.record
     try:
-        locator = Path(record.locator).resolve()
+        locator = _absolute_local_path(Path(record.locator))
     except (OSError, TypeError, ValueError) as error:
         raise BootstrapError(
             "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE",
@@ -2093,6 +2101,48 @@ def _is_reparse(stat_result: os.stat_result) -> bool:
     return bool(getattr(stat_result, "st_file_attributes", 0) & 0x0400)
 
 
+def _absolute_local_path(path: Path) -> Path:
+    return Path(os.path.abspath(Path(path)))
+
+
+@contextmanager
+def _held_local_directory(path: Path, code: str):
+    try:
+        from run_beta3_live_guard import (
+            _assert_directory_handles,
+            _close_descriptors,
+            _open_directory_components,
+        )
+    except Exception as error:
+        raise BootstrapError(code, f"local directory is unavailable: {path}") from error
+    descriptors: list[int] = []
+    try:
+        descriptors, identities = _open_directory_components(Path(path), code)
+        yield lambda: _assert_directory_handles(Path(path), descriptors, identities, code)
+    except BootstrapError:
+        raise
+    except Exception as error:
+        raise BootstrapError(code, f"local directory is unavailable: {path}") from error
+    finally:
+        try:
+            _close_descriptors(descriptors)
+        except OSError as error:
+            raise BootstrapError(code, f"local directory handles could not be closed: {path}") from error
+
+
+def _held_directory_entries(path: Path, code: str):
+    with _held_local_directory(path, code) as assert_stable:
+        try:
+            with os.scandir(path) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name)
+            assert_stable()
+            return entries
+        except BootstrapError:
+            raise
+        except OSError as error:
+            raise BootstrapError(code, f"local directory is unavailable: {path}") from error
+
+
 def _canonical_local_directory(path: Path, code: str) -> Path:
     path = Path(path)
     try:
@@ -2101,7 +2151,8 @@ def _canonical_local_directory(path: Path, code: str) -> Path:
             raise OSError("directory is a link or reparse point")
         if not stat.S_ISDIR(identity.st_mode):
             raise OSError("path is not a directory")
-        return path.resolve(strict=True)
+        with _held_local_directory(path, code):
+            return _absolute_local_path(path)
     except BootstrapError:
         raise
     except (OSError, ValueError) as error:
@@ -2114,7 +2165,7 @@ def _local_tree_files(
     *,
     allow_missing: bool = False,
 ) -> tuple[Path, ...]:
-    root = Path(root)
+    root = _absolute_local_path(Path(root))
     try:
         identity = root.lstat()
     except FileNotFoundError:
@@ -2132,7 +2183,9 @@ def _local_tree_files(
     while pending:
         directory = pending.pop()
         try:
-            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+            entries = _held_directory_entries(directory, code)
+        except BootstrapError:
+            raise
         except OSError as error:
             raise BootstrapError(code, f"local directory is unavailable: {directory}") from error
         for entry in entries:
@@ -2151,11 +2204,11 @@ def _local_tree_files(
                     result.append(path)
             else:
                 _fail(code, f"local entry is not a regular file or directory: {path}")
-    return tuple(sorted((path.resolve() for path in result), key=_path_text))
+    return tuple(sorted((_absolute_local_path(path) for path in result), key=_path_text))
 
 
 def _local_file_if_present(path: Path, code: str) -> Path | None:
-    path = Path(path)
+    path = _absolute_local_path(Path(path))
     try:
         identity = path.lstat()
     except FileNotFoundError:
@@ -2166,7 +2219,8 @@ def _local_file_if_present(path: Path, code: str) -> Path | None:
         _fail(code, f"local file is a link or reparse point: {path}")
     if not stat.S_ISREG(identity.st_mode):
         _fail(code, f"local path is not a regular file: {path}")
-    return path.resolve()
+    _held_file_bytes(path, code)
+    return path
 
 
 def _audited_files(root: Path) -> tuple[Path, ...]:
@@ -2208,7 +2262,12 @@ def _checkout_source_files(root: Path, subject: CutoverSubject) -> tuple[Path, .
         paths.update(
             _local_tree_files(package, "STATIC_INPUT_SOURCE_UNAVAILABLE")
         )
-    return tuple(sorted((path.resolve() for path in paths), key=lambda path: path.relative_to(root).as_posix()))
+    return tuple(
+        sorted(
+            (_absolute_local_path(path) for path in paths),
+            key=lambda path: path.relative_to(root).as_posix(),
+        )
+    )
 
 
 def _snapshot_files(paths: Sequence[Path], code: str) -> tuple[_FileSnapshot, ...]:
@@ -2232,7 +2291,7 @@ def _require_stable_snapshots(
 
 def _snapshot_tree_digest(root: Path, snapshots: Sequence[_FileSnapshot]) -> str:
     digest = hashlib.sha256()
-    resolved_root = root.resolve()
+    resolved_root = _absolute_local_path(root)
     for snapshot in snapshots:
         relative = snapshot.path.relative_to(resolved_root).as_posix().encode("utf-8")
         content = snapshot.content.replace(b"\r\n", b"\n")
@@ -2262,7 +2321,7 @@ def _static_records(
     )
     snapshot_tree_sha256 = _snapshot_tree_digest(root, observed)
     for snapshot in observed:
-        relative = snapshot.path.relative_to(root.resolve()).as_posix()
+        relative = snapshot.path.relative_to(_absolute_local_path(root)).as_posix()
         records.append(
             _source_record(
                 role=role,
@@ -2578,7 +2637,7 @@ def _validate_checkout_file_bindings(
     except (KeyError, TypeError, ValueError) as error:
         raise BootstrapError(code, "checkout file manifest is malformed") from error
     observed: dict[str, str] = {}
-    root = Path(root).resolve()
+    root = _absolute_local_path(Path(root))
 
     def bind(record: SourceRecord, relative: str) -> None:
         identity = dict(record.identity)
@@ -2603,7 +2662,7 @@ def _validate_checkout_file_bindings(
         if type(package) is not str or not package.startswith("source:"):
             continue
         try:
-            relative = Path(record.locator).resolve().relative_to(root).as_posix()
+            relative = _absolute_local_path(Path(record.locator)).relative_to(root).as_posix()
         except (OSError, TypeError, ValueError) as error:
             raise BootstrapError(code, "source package path escapes the checkout") from error
         bind(record, relative)
@@ -2700,7 +2759,7 @@ def _validate_config_subject(config: object, subject: CutoverSubject) -> None:
         "runtime_config_path",
     ):
         try:
-            Path(getattr(config, name)).resolve()
+            _absolute_local_path(Path(getattr(config, name)))
         except (OSError, TypeError, ValueError) as error:
             raise BootstrapError(
                 "STATIC_INPUT_SOURCE_UNAVAILABLE",
@@ -2913,7 +2972,7 @@ class ControlOwnershipAttestor:
             role="local.inputs",
             repository=subject.repository,
             producer_sha256=attempt.attestor_sha256,
-            default_locator=f"local-checkout://{Path(config.repository_root).resolve()}",
+            default_locator=f"local-checkout://{_absolute_local_path(Path(config.repository_root))}",
             default_read_mode="EXACT_GIT_SNAPSHOT",
         )
         checkout_record = _validate_checkout_observation(checkout, config, subject)
@@ -2958,7 +3017,7 @@ class ControlOwnershipAttestor:
             role="runtime.config",
             repository=subject.repository,
             producer_sha256=attempt.attestor_sha256,
-            default_locator=str(Path(config.runtime_config_path).resolve()),
+            default_locator=str(_absolute_local_path(Path(config.runtime_config_path))),
             default_read_mode="EXACT_FILE",
         )
         _validate_runtime_config_source(runtime_raw, Path(config.runtime_config_path))
