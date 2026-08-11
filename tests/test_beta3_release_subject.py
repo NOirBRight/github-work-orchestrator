@@ -14,6 +14,7 @@ SCRIPTS = REPO_ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import beta3_release_subject as release_subject  # noqa: E402
 from beta3_release_subject import (  # noqa: E402
     RELEASE_SUBJECT_SCHEMA,
     ReleaseFileIdentity,
@@ -21,8 +22,10 @@ from beta3_release_subject import (  # noqa: E402
     ReleaseSubjectError,
     ReviewedProvenanceIdentity,
     canonical_json_bytes,
+    load_release_subject_for_test,
     parse_release_subject,
     release_subject_digest,
+    write_subject_for_test_exclusive,
 )
 
 
@@ -89,6 +92,109 @@ def _canonical_fixture_payload(tmp_path: Path) -> dict[str, object]:
             _fixture_canonical_json_bytes(body)
         ).hexdigest(),
     }
+
+
+def _valid_subject_files(tmp_path: Path) -> tuple[Path, Path, dict[str, bytes]]:
+    repository_root = (tmp_path / "repository").resolve()
+    evidence_root = (tmp_path / "evidence").resolve()
+    scripts_root = repository_root / "scripts"
+    scripts_root.mkdir(parents=True)
+    evidence_root.mkdir()
+    names = (
+        "run_beta3_live_guard.py",
+        "beta3_bootstrap_model.py",
+        "beta3_control_ownership_attestor.py",
+        "beta3_legacy_attestor.py",
+        "beta3_replay_guard.py",
+    )
+    contents = {name: f"{name}\n".encode("ascii") for name in names}
+    for name, content in contents.items():
+        (scripts_root / name).write_bytes(content)
+    attestors = []
+    bundle = hashlib.sha256()
+    for name in names[1:]:
+        content = contents[name]
+        digest = hashlib.sha256(content).hexdigest()
+        attestors.append(
+            {
+                "module": name.removesuffix(".py"),
+                "path": str(scripts_root / name),
+                "sha256": digest,
+            }
+        )
+        encoded_name = name.encode("utf-8")
+        bundle.update(len(encoded_name).to_bytes(4, "big"))
+        bundle.update(encoded_name)
+        bundle.update(len(content).to_bytes(8, "big"))
+        bundle.update(content)
+    reviewed = {
+        "schema": "gwo-beta3-reviewed-provenance.v1",
+        "runner": {
+            "module": "run_beta3_live_guard",
+            "path": str(scripts_root / names[0]),
+            "sha256": hashlib.sha256(contents[names[0]]).hexdigest(),
+        },
+        "attestors": attestors,
+        "attestor_bundle_sha256": bundle.hexdigest(),
+    }
+    reviewed_raw = canonical_json_bytes(reviewed)
+    (scripts_root / "beta3_reviewed_provenance.json").write_bytes(reviewed_raw)
+    contents["beta3_reviewed_provenance.json"] = reviewed_raw
+    return repository_root, evidence_root, contents
+
+
+def _valid_subject_value(tmp_path: Path) -> ReleaseSubject:
+    repository_root, evidence_root, contents = _valid_subject_files(tmp_path)
+    scripts_root = repository_root / "scripts"
+    body = {
+        "schema": RELEASE_SUBJECT_SCHEMA,
+        "repository": "NOirBRight/github-work-orchestrator",
+        "repository_root": str(repository_root),
+        "evidence_root": str(evidence_root),
+        "merged_main_sha": "a" * 40,
+        "merged_main_git_tree": "b" * 40,
+        "audited_source_tree_digest": "c" * 64,
+        "remote_ref": "origin/main",
+        "runner": {
+            "module": "run_beta3_live_guard",
+            "path": str(scripts_root / "run_beta3_live_guard.py"),
+            "sha256": hashlib.sha256(contents["run_beta3_live_guard.py"]).hexdigest(),
+        },
+        "attestors": [
+            {
+                "module": name.removesuffix(".py"),
+                "path": str(scripts_root / name),
+                "sha256": hashlib.sha256(contents[name]).hexdigest(),
+            }
+            for name in (
+                "beta3_bootstrap_model.py",
+                "beta3_control_ownership_attestor.py",
+                "beta3_legacy_attestor.py",
+                "beta3_replay_guard.py",
+            )
+        ],
+        "attestor_bundle_sha256": json.loads(
+            (scripts_root / "beta3_reviewed_provenance.json").read_text()
+        )["attestor_bundle_sha256"],
+        "reviewed_provenance": {
+            "path": str(scripts_root / "beta3_reviewed_provenance.json"),
+            "sha256": hashlib.sha256(
+                contents["beta3_reviewed_provenance.json"]
+            ).hexdigest(),
+        },
+    }
+    payload = {
+        **body,
+        "subject_digest": release_subject_digest(body),
+    }
+    return ReleaseSubject.from_canonical(payload)
+
+
+def _write_valid_subject_fixture(tmp_path: Path) -> Path:
+    subject = _valid_subject_value(tmp_path)
+    path = tmp_path / "evidence" / "gwo-v8-release-subject.json"
+    path.write_bytes(canonical_json_bytes(subject.canonical()))
+    return path
 
 
 def test_subject_digest_excludes_only_subject_digest(tmp_path: Path):
@@ -376,3 +482,78 @@ def test_subject_parser_rejects_escaped_unpaired_unicode_surrogate(tmp_path: Pat
     with pytest.raises(ReleaseSubjectError) as error:
         parse_release_subject(raw, tmp_path / "repository", tmp_path / "evidence")
     assert error.value.code == "RELEASE_SUBJECT_SCHEMA_INVALID"
+
+
+def test_production_loader_uses_one_fixed_path_and_rejects_absence(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        release_subject,
+        "EVIDENCE_ROOT",
+        Path(r"C:\tmp\gwo-subject-test-evidence"),
+    )
+    with pytest.raises(ReleaseSubjectError) as error:
+        release_subject.load_production_release_subject()
+    assert error.value.code == "RELEASE_SUBJECT_UNAVAILABLE"
+
+
+def test_binding_rejects_manifest_byte_replacement_after_first_read(tmp_path: Path):
+    manifest = _write_valid_subject_fixture(tmp_path)
+    binding = load_release_subject_for_test(
+        manifest,
+        expected_repository_root=tmp_path / "repository",
+        expected_evidence_root=tmp_path / "evidence",
+    )
+    original = manifest.read_bytes()
+    manifest.write_bytes(
+        original.replace(b'"' + b"a" * 40 + b'"', b'"' + b"b" * 40 + b'"', 1)
+    )
+    try:
+        with pytest.raises(ReleaseSubjectError) as error:
+            binding.assert_stable()
+        assert error.value.code == "RELEASE_SUBJECT_DRIFT"
+    finally:
+        binding.close()
+
+
+def test_exclusive_generator_does_not_replace_existing_subject(tmp_path: Path):
+    subject = _valid_subject_value(tmp_path)
+    path = tmp_path / "evidence" / "gwo-v8-release-subject.json"
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(b"existing subject bytes\n")
+    with pytest.raises(ReleaseSubjectError) as error:
+        write_subject_for_test_exclusive(subject, path)
+    assert error.value.code == "RELEASE_SUBJECT_EXISTS"
+    assert path.read_bytes() == b"existing subject bytes\n"
+
+
+def test_exclusive_generator_writes_canonical_subject_and_returns_binding(
+    tmp_path: Path,
+):
+    subject = _valid_subject_value(tmp_path)
+    path = tmp_path / "evidence" / "gwo-v8-release-subject.json"
+    binding = write_subject_for_test_exclusive(subject, path)
+    try:
+        assert binding.subject == subject
+        assert path.read_bytes() == canonical_json_bytes(subject.canonical())
+        binding.assert_stable()
+    finally:
+        binding.close()
+
+
+def test_loader_rejects_reparse_ancestor_before_json_decoding(tmp_path: Path):
+    real_root = tmp_path / "real"
+    manifest = _write_valid_subject_fixture(real_root)
+    redirected = tmp_path / "redirected"
+    try:
+        redirected.symlink_to(real_root, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"directory reparse/symlink creation is unavailable: {error}")
+    redirected_manifest = redirected / manifest.relative_to(real_root)
+    with pytest.raises(ReleaseSubjectError) as error:
+        load_release_subject_for_test(
+            redirected_manifest,
+            expected_repository_root=real_root / "repository",
+            expected_evidence_root=real_root / "evidence",
+        )
+    assert error.value.code == "RELEASE_SUBJECT_PATH_INVALID"
