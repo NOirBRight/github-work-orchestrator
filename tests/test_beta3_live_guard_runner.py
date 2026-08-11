@@ -868,6 +868,15 @@ def test_reviewed_provenance_pins_canonical_runner_and_attestor_origins():
     assert len(runner._fixture_attestor_source_sha256()) == 64
 
 
+def test_reviewed_provenance_hashes_match_current_observer_bytes():
+    runner_path = Path(runner.__file__).resolve()
+    manifest = runner._reviewed_provenance()
+
+    assert manifest["runner"]["sha256"] == _sha256(runner_path)
+    assert runner._runbook_hash() == manifest["runner"]["sha256"]
+    assert runner._attestor_source_sha256() == manifest["attestor_bundle_sha256"]
+
+
 def test_attestor_configuration_is_part_of_fixed_production_subject():
     assert runner.DEFAULT_CONFIG.merged_main_sha == ""
     assert runner.DEFAULT_CONFIG.merged_main_git_tree == ""
@@ -4056,11 +4065,9 @@ def test_subject_drift_is_refused_before_report_creation(
 
 def test_report_and_evidence_carry_external_subject_digest(tmp_path: Path):
     record = _run_fixture_guard_to_completion(tmp_path, run_id="report-subject-digest")
-    assert (
-        record["report"]["release_subject_digest"]
-        == record["subject"]["release_subject_digest"]
-    )
-    assert (
-        record["evidence"]["release_subject_digest"]
-        == record["subject"]["release_subject_digest"]
-    )
+    for output in (record["report"], record["evidence"]):
+        assert output["release_subject_digest"] == record["subject"]["release_subject_digest"]
+        assert output["release_subject_path"] == record["subject"]["release_subject_path"]
+        assert output["merged_main_sha"] == record["subject"]["merged_main_sha"]
+        assert output["merged_main_git_tree"] == record["subject"]["merged_main_git_tree"]
+        assert output["subject_digest"] != output["release_subject_digest"]
