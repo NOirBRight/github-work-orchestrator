@@ -340,3 +340,213 @@ def test_cli_emits_canonical_deterministic_output_for_every_status(
     assert record["status"] == expected_status
     assert record["public_status"] == expected_public_status
     assert runner.load_canonical_json(first.stdout.rstrip("\n")) == record
+
+
+def test_root_canary_covers_four_work_runs_review_repair_rejection_and_batches(
+    tmp_path: Path,
+):
+    runner = _load_runner()
+
+    record = runner.run_local_acceptance(
+        root=tmp_path,
+        run_id="root-run",
+        scenario="root",
+    )
+
+    assert record["gate"] == "LOCAL_ROOT_CANARY_GO"
+    assert record["status"] == "Complete"
+    assert record["public_status"] == "Complete"
+
+    standard = ("issue:101", "issue:102", "issue:103")
+    strict = "issue:104"
+    facts = record["facts"]
+    assert [item["ticket_key"] for item in facts["work_runs"]] == [
+        *standard,
+        strict,
+    ]
+    assert facts["concurrency"] == {
+        "worker_slot_limit": 4,
+        "max_held": 4,
+        "work_run_count": 4,
+    }
+    assert facts["exclusive_resources"] == {
+        "issue:101": [],
+        "issue:102": [],
+        "issue:103": [],
+        "issue:104": ["repository.target.v1"],
+    }
+
+    gate = facts["candidate_gate"]
+    assert gate["reviewed"] == [*standard, strict]
+    assert gate["repair_required"] == ["issue:102"]
+    assert gate["rejected"] == ["issue:103"]
+    assert gate["strict_specialist_review"] == [strict]
+    assert gate["accepted"] == [*standard, strict]
+    gate_events = {item["ticket_key"]: item for item in gate["events"]}
+    assert gate_events["issue:102"]["repair"] == "repair_verify"
+    assert gate_events["issue:103"]["repair"] == "replacement_candidate"
+    assert (
+        gate_events["issue:103"]["rejected_candidate_receipt_digest"]
+        != gate_events["issue:103"]["candidate_receipt_digest"]
+    )
+    assert gate_events[strict]["specialist_review"] == "accepted"
+
+    batches = facts["batches"]
+    assert len(batches) == 2
+    assert batches[0]["member_ticket_keys"] == list(standard)
+    assert batches[0]["singleton"] is False
+    assert batches[1]["member_ticket_keys"] == [strict]
+    assert batches[1]["singleton"] is True
+    assert batches[0]["batch_id"] != batches[1]["batch_id"]
+    assert batches[0]["batch_sha"] != batches[1]["batch_sha"]
+
+    work_runs = {item["ticket_key"]: item for item in facts["work_runs"]}
+    for ticket_key in (*standard, strict):
+        run = work_runs[ticket_key]
+        assert run["phase"] == "completed"
+        assert run["candidate_identity"]
+        assert run["accepted_candidate_receipt_digest"]
+        assert run["candidate_diff_record_digest"]
+        assert run["batch_id"]
+        assert run["batch_sha"]
+        assert run["result_digest"]
+        assert run["evidence_digests"]
+        assert run["git_readback"]["target_contains_batch_sha"] is True
+
+    readback = facts["readback"]
+    assert len(readback["candidate_receipts"]) == 4
+    assert len(readback["candidate_diffs"]) == 4
+    assert len(readback["accepted_candidate_receipts"]) == 4
+    assert len(readback["delivery_proofs"]) == 4
+    assert len(readback["result_integrities"]) == 4
+    assert readback["git_readback"]["target_branch"] == "main"
+    assert all(
+        item["target_contains_batch_sha"]
+        for item in readback["git_readback"]["batches"]
+    )
+
+    candidates = {item["ticket_key"]: item for item in readback["candidate_receipts"]}
+    diffs = {
+        ticket_key: item
+        for ticket_key, item in zip(
+            (*standard, strict), readback["candidate_diffs"]
+        )
+    }
+    accepted = {
+        item["ticket_key"]: item
+        for item in readback["accepted_candidate_receipts"]
+    }
+    result_proofs = {
+        item["accepted_candidate_receipt_digest"]: item
+        for item in readback["result_integrities"]
+    }
+    deliveries = {
+        item["delivery_stable_action_id"]: item
+        for item in readback["delivery_proofs"]
+    }
+    for ticket_key in (*standard, strict):
+        candidate = candidates[ticket_key]
+        diff = diffs[ticket_key]
+        accepted_candidate = accepted[ticket_key]
+        run = work_runs[ticket_key]
+        result = result_proofs[accepted_candidate["receipt_digest"]]
+        delivery = deliveries[result["delivery_stable_action_id"]]
+
+        assert run["candidate_receipt_digest"] == candidate["receipt_digest"]
+        assert candidate["diff_record_digest"] == diff["record_digest"]
+        assert accepted_candidate["candidate_receipt_digest"] == candidate["receipt_digest"]
+        assert accepted_candidate["diff_record_digest"] == diff["record_digest"]
+        assert accepted_candidate["candidate_sha"] == candidate["candidate_commit_oid"]
+        assert result["accepted_candidate_receipt_digest"] == accepted_candidate["receipt_digest"]
+        assert result["candidate_commit_oid"] == candidate["candidate_commit_oid"]
+        assert result["candidate_diff_record_digest"] == diff["record_digest"]
+        assert result["batch_delivery_receipt_digest"] == run["delivery_receipt_digest"]
+        assert result["result_digest"] == run["result_digest"]
+        assert result["evidence_digests"] == run["evidence_digests"]
+        assert delivery["proof_digest"] == result["batch_delivery_proof_digest"]
+        assert delivery["batch_id"] == run["batch_id"]
+        assert delivery["batch_sha"] == run["batch_sha"]
+
+
+def test_root_canary_uses_public_advance_for_watchdog_lost_wake_duplicate_and_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = _load_runner()
+    calls: list[tuple[str, str | None]] = []
+
+    original_advance = runner.gwo_v8.advance
+
+    def traced_advance(handle, wake_ref=None, **kwargs):
+        calls.append(("advance", wake_ref))
+        return original_advance(handle, wake_ref, **kwargs)
+
+    monkeypatch.setattr(runner.gwo_v8, "advance", traced_advance)
+
+    record = runner.run_local_acceptance(
+        root=tmp_path,
+        run_id="root-replay",
+        scenario="root",
+    )
+
+    replay = record["replay"]
+    assert replay["watchdog_progressed"] is True
+    assert replay["lost_wake"]["status"] == "Complete"
+    assert replay["duplicate_callback"]["status"] == "Complete"
+    assert replay["restart_advance"]["status"] == "Complete"
+    assert replay["readback_unchanged"] is True
+    assert replay["idempotent_effects"] is True
+    assert replay["semantic_execute_calls_before_restart"] == 4
+    assert replay["semantic_execute_calls_after_replay"] == 4
+    assert replay["delivery_execute_calls_before_restart"] == 4
+    assert replay["delivery_execute_calls_after_replay"] == 4
+    assert any(
+        wake_ref is not None and wake_ref.startswith("watchdog:due:")
+        for _name, wake_ref in calls
+    )
+    assert replay["duplicate_callback_ref"].startswith("watchdog:runtime:")
+    assert any(
+        name == "advance" and wake_ref == replay["duplicate_callback_ref"]
+        for name, wake_ref in calls
+    )
+
+
+def test_root_cli_output_is_canonical_and_deterministic(tmp_path: Path):
+    runner = _load_runner()
+    command = [
+        sys.executable,
+        str(RUNNER),
+        "--root",
+        str(tmp_path / "caller-root"),
+        "--run-id",
+        "root-cli-run",
+        "--scenario",
+        "root",
+    ]
+    environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+
+    first = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    second = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert first.stderr == ""
+    assert first.stdout == second.stdout
+    record = json.loads(first.stdout)
+    assert first.stdout == runner.canonical_json(record) + "\n"
+    assert record["gate"] == "LOCAL_ROOT_CANARY_GO"
+    assert record["status"] == "Complete"
