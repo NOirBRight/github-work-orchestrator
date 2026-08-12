@@ -12,15 +12,21 @@ tag, push, or release was run.
 
 - Worktree: `D:\Workstation\github-work-orchestrator\.codex-tmp\ga-phase1-5-fix`
 - Branch: `codex/ga-phase1-5-fix`
-- Verified source HEAD: `12db7168cf3c465a59768e53637b63f149281348`
-- Verified source HEAD tree: `6c0fe9213762afa2be368731c5869013c3a38341`
+- Verified Task 7 package HEAD: `a83800f9371aee91bc36458e8e0c6a1891550cdf`
+- Verified Task 7 package HEAD tree: `0119a4667bd4eaa56fcc6e504f61934d1da311ef`
 - Runtime: Python 3.13, gpt-5.6-luna max configuration already in force
 - Verification date: 2026-08-12 (Asia/Shanghai)
 
-The candidate HEAD contains the Task 7 provenance-fixture and integration-test
-commit. The external production ReleaseSubject has not been generated: its
-exact identity is intentionally deferred until Phase 4 freezes the merged
-canonical `main` tree.
+The Task 7 package is exactly the two commits
+`12db7168cf3c465a59768e53637b63f149281348` (provenance fixture and integration
+test) followed by `a83800f9371aee91bc36458e8e0c6a1891550cdf` (RC
+documentation). The fix-round 1 verification commit is recorded separately in
+the authoritative report below. The external production ReleaseSubject has
+not been generated: its exact identity is intentionally deferred until Phase
+4 freezes the merged canonical `main` tree.
+
+Authoritative Task 7 report:
+`D:\Workstation\github-work-orchestrator\.codex-tmp\ga-phase1-5-fix\.superpowers\sdd\2026-08-11-gwo-v8-phase1-5-production\task-7-report.md`.
 
 ## Identity boundary and output contract
 
@@ -33,7 +39,7 @@ EVIDENCE_ROOT / gwo-v8-release-subject.json
 
 Its `subject_digest` is the SHA-256 digest of the canonical manifest body with
 only the top-level `subject_digest` excluded: UTF-8 JSON, sorted keys,
-`ensure_ascii=False`, compact separators, and one LF. There is no CLI override
+`ensure_ascii=False`, compact separators, `allow_nan=False`, and one LF. There is no CLI override
 for the subject, path, SHA, Git tree, evidence root, or run identity.
 
 The runner and the RC evidence keep these identities separate:
@@ -50,8 +56,9 @@ The runner and the RC evidence keep these identities separate:
 The runner publishes `release_subject_digest`, `release_subject_path`,
 `merged_main_sha`, and `merged_main_git_tree` in both report and evidence.
 The existing `subject_digest` remains the CutoverSubject digest. The Task 7
-fixture integration test asserts all four external fields and asserts that the
-two digest domains are not substituted for one another.
+fixture integration test independently computes the exact CutoverSubject
+canonical digest and asserts that both report and evidence bind to it, while
+`release_subject_digest` binds to the external subject digest.
 
 The reviewed-provenance file remains the closed four-field manifest
 `gwo-beta3-reviewed-provenance.v1`; it does not contain or depend on the
@@ -196,6 +203,35 @@ before this package-only test/manifest commit: `2468 passed, 1 skipped` with
 exit code zero. Task 8 must rerun the full repository suite on the exact final
 combined candidate and must not treat this prior run as the final release gate.
 
+## Task 7 fix round 1 evidence
+
+The requested pre-integration RED cannot be reconstructed honestly after the
+fact: the original full five-suite command was not captured before the Task 7
+integration changes, and the current checkout already contains those changes.
+No historical failure list is fabricated. The actual five-suite command that
+was run after the integration changes was:
+
+```powershell
+$env:PYTHONDONTWRITEBYTECODE='1'; py -3.13 -B -m pytest -q tests/test_beta3_live_guard_runner.py tests/test_beta3_control_ownership_attestor.py tests/test_beta3_release_subject.py tests/test_beta3_release_subject_generator.py tests/test_v8_local_acceptance.py
+```
+
+Result: `442 passed, 4 skipped in 918.39s (0:15:18)`.
+
+Fix round 1 added the missing independent CutoverSubject digest contract to
+the existing fixture integration test. It uses a separately constructed
+`CutoverSubject` and `digest_value`, not a value copied from report/evidence.
+The focused contract test passed:
+
+```text
+1 passed in 5.14s
+```
+
+This was a coverage-only correction: the existing production implementation
+already emitted the exact CutoverSubject digest, so there is no honest
+production RED to report. The fix-round report records this sequencing
+limitation and the actual RED/GREEN evidence without relabeling an existing
+GREEN run as historical RED.
+
 ## Evidence and gates
 
 | Gate/evidence | State |
@@ -217,7 +253,8 @@ combined candidate and must not treat this prior run as the final release gate.
 ## Commit(s)
 
 - `12db7168cf3c465a59768e53637b63f149281348` — `test: bind reviewed provenance to observer bytes`
-- This RC package document is committed as the accompanying documentation update.
+- `a83800f9371aee91bc36458e8e0c6a1891550cdf` — `docs: record release subject fix wave evidence`
+- Fix round 1 implementation/documentation commit: recorded in the authoritative report.
 
 ## Concerns and safe boundary
 

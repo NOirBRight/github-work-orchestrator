@@ -348,6 +348,7 @@ def _run_fixture_guard_to_completion(tmp_path: Path, *, run_id: str):
             "release_subject_path": str(binding.manifest_path),
             "merged_main_sha": binding.subject.merged_main_sha,
             "merged_main_git_tree": binding.subject.merged_main_git_tree,
+            "audited_source_tree_digest": binding.subject.audited_source_tree_digest,
         },
     }
 
@@ -4065,9 +4066,22 @@ def test_subject_drift_is_refused_before_report_creation(
 
 def test_report_and_evidence_carry_external_subject_digest(tmp_path: Path):
     record = _run_fixture_guard_to_completion(tmp_path, run_id="report-subject-digest")
+    expected_cutover_subject = CutoverSubject(
+        repository="owner/repo",
+        control_branch="gwo-control",
+        target_branch="main",
+        source_writer_generation="v6.1",
+        target_writer_generation="v8",
+        store_generation="store:v8:fixture:081500Z",
+        source_commit=record["subject"]["merged_main_sha"],
+        source_tree_digest=record["subject"]["audited_source_tree_digest"],
+        production_entry_refs=runner.PRODUCTION_ENTRY_REFS,
+    )
+    expected_cutover_digest = digest_value(expected_cutover_subject.canonical())
     for output in (record["report"], record["evidence"]):
         assert output["release_subject_digest"] == record["subject"]["release_subject_digest"]
         assert output["release_subject_path"] == record["subject"]["release_subject_path"]
         assert output["merged_main_sha"] == record["subject"]["merged_main_sha"]
         assert output["merged_main_git_tree"] == record["subject"]["merged_main_git_tree"]
+        assert output["subject_digest"] == expected_cutover_digest
         assert output["subject_digest"] != output["release_subject_digest"]
