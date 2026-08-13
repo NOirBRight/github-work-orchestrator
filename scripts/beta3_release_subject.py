@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field as dataclass_field
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import stat
 import subprocess
 import sys
 from types import TracebackType
+from types import ModuleType
 from typing import Callable, Mapping, Sequence
 
 
@@ -595,6 +597,8 @@ def _open_windows_relative_handle(
     parent: int,
     create_new: bool = False,
     writable: bool = False,
+    delete: bool = False,
+    share_delete: bool = False,
     missing_ok: bool = False,
 ) -> int:
     try:
@@ -646,11 +650,15 @@ def _open_windows_relative_handle(
         desired_access = 0x80000000 | 0x00100000
         if writable:
             desired_access |= 0x40000000
+        if delete:
+            desired_access |= 0x00010000
         if directory:
             desired_access = 0x00000001 | 0x00000020 | 0x00000080 | 0x00100000
             if writable:
                 desired_access |= 0x00000002
         share_access = 0x00000003
+        if delete or share_delete:
+            share_access |= 0x00000004
         create_disposition = 2 if create_new else 1
         create_options = 0x00000020
         if not create_new:
@@ -724,6 +732,8 @@ def _open_path_handle(
     parent: int | None = None,
     create_new: bool = False,
     writable: bool = False,
+    delete: bool = False,
+    share_delete: bool = False,
     missing_ok: bool = False,
 ) -> int:
     if os.name != "nt":
@@ -733,7 +743,7 @@ def _open_path_handle(
         if directory:
             flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         else:
-            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
             if parent is None:
                 return os.open(path, flags, 0o600 if create_new else 0o644)
@@ -772,6 +782,8 @@ def _open_path_handle(
             parent=parent,
             create_new=create_new,
             writable=writable,
+            delete=delete,
+            share_delete=share_delete,
             missing_ok=missing_ok,
         )
     try:
@@ -798,7 +810,9 @@ def _open_path_handle(
             | 0x00100000
             | (0x00000002 if writable else 0)
         )
-        share = 0x00000003
+        if delete:
+            access |= 0x00010000
+        share = 0x00000003 | (0x00000004 if delete or share_delete else 0)
         flags = 0x00200000 | (0x02000000 if directory else 0)
         handle = kernel32.CreateFileW(
             str(Path(path).absolute()),
@@ -1025,6 +1039,7 @@ def _open_bound_handle(
     *,
     create_new: bool = False,
     writable: bool = False,
+    share_delete: bool = False,
 ) -> tuple[int, dict[str, int | str], _DirectoryLease]:
     components: list[int] = []
     descriptor: int | None = None
@@ -1048,6 +1063,7 @@ def _open_bound_handle(
             parent=lease.handles[-1],
             create_new=create_new,
             writable=writable,
+            share_delete=share_delete,
         )
         identity = _windows_handle_identity(descriptor, code, directory=False)
         observed_mode = os.fstat(descriptor).st_mode
@@ -1096,8 +1112,11 @@ def _read_held_regular_file(
     code: str,
     *,
     file_reader: Callable[[Path], tuple[bytes, Mapping[str, object]]] | None = None,
+    share_delete: bool = False,
 ) -> tuple[bytes, dict[str, int | str], int, _DirectoryLease]:
-    descriptor, identity, lease = _open_bound_handle(path, code)
+    descriptor, identity, lease = _open_bound_handle(
+        path, code, share_delete=share_delete
+    )
     try:
         raw = _read_held_bytes(descriptor, code)
         after_identity = _windows_handle_identity(descriptor, code, directory=False)
@@ -1556,6 +1575,7 @@ def load_release_subject_for_test(
         manifest_path,
         "RELEASE_SUBJECT_UNAVAILABLE",
         file_reader=file_reader,
+        share_delete=True,
     )
     try:
         repository_lease = _directory_lease(
@@ -1606,6 +1626,7 @@ def load_production_release_subject() -> ReleaseSubjectBinding:
     raw, identity, handle, parent_lease = _read_held_regular_file(
         path,
         "RELEASE_SUBJECT_UNAVAILABLE",
+        share_delete=True,
     )
     try:
         repository_lease = _directory_lease(
@@ -1671,6 +1692,107 @@ def _write_all(descriptor: int, raw: bytes) -> None:
         ) from error
 
 
+def _remove_created_subject(
+    path: Path,
+    parent: int,
+    created_identity: Mapping[str, object] | None,
+    created_raw: bytes,
+    *,
+    created_descriptor: int | None = None,
+) -> None:
+    """Remove only a failed-create leaf whose path still matches its identity."""
+
+    current: int | None = None
+    try:
+        if created_identity is None:
+            if created_descriptor is None:
+                return
+            if os.name == "nt":
+                import ctypes
+                import msvcrt
+
+                class FileDispositionInfo(ctypes.Structure):
+                    _fields_ = [("delete_file", ctypes.c_int)]
+
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                disposition = FileDispositionInfo(1)
+                if not kernel32.SetFileInformationByHandle(
+                    msvcrt.get_osfhandle(created_descriptor),
+                    4,
+                    ctypes.byref(disposition),
+                    ctypes.sizeof(disposition),
+                ):
+                    raise OSError(
+                        ctypes.get_last_error(),
+                        "SetFileInformationByHandle failed",
+                    )
+                return
+
+            created_stat = os.fstat(created_descriptor)
+            current = _open_path_handle(
+                Path(path.name),
+                "RELEASE_SUBJECT_WRITE_FAILED",
+                directory=False,
+                parent=parent,
+            )
+            current_stat = os.fstat(current)
+            if (
+                not stat.S_ISREG(current_stat.st_mode)
+                or current_stat.st_dev != created_stat.st_dev
+                or current_stat.st_ino != created_stat.st_ino
+                or _read_held_bytes(current, "RELEASE_SUBJECT_WRITE_FAILED")
+                != created_raw
+            ):
+                return
+            os.unlink(Path(path.name).name, dir_fd=parent)
+            return
+
+        current = _open_path_handle(
+            Path(path.name),
+            "RELEASE_SUBJECT_WRITE_FAILED",
+            directory=False,
+            parent=parent,
+            delete=os.name == "nt",
+        )
+        current_identity = _windows_handle_identity(
+            current, "RELEASE_SUBJECT_WRITE_FAILED", directory=False
+        )
+        if os.name != "nt" and not stat.S_ISREG(os.fstat(current).st_mode):
+            return
+        if (
+            not _identity_matches(current_identity, created_identity)
+            or _read_held_bytes(current, "RELEASE_SUBJECT_WRITE_FAILED") != created_raw
+        ):
+            return
+        if os.name == "nt":
+            import ctypes
+            import msvcrt
+
+            class FileDispositionInfo(ctypes.Structure):
+                _fields_ = [("delete_file", ctypes.c_int)]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            disposition = FileDispositionInfo(1)
+            if not kernel32.SetFileInformationByHandle(
+                msvcrt.get_osfhandle(current),
+                4,
+                ctypes.byref(disposition),
+                ctypes.sizeof(disposition),
+            ):
+                raise OSError(ctypes.get_last_error(), "SetFileInformationByHandle failed")
+            return
+
+        os.unlink(Path(path.name).name, dir_fd=parent)
+    except (FileNotFoundError, OSError, ReleaseSubjectError):
+        return
+    finally:
+        if current is not None:
+            try:
+                os.close(current)
+            except OSError:
+                pass
+
+
 def _write_subject_exclusive(
     subject: ReleaseSubject,
     path: Path,
@@ -1692,6 +1814,9 @@ def _write_subject_exclusive(
     generation_lease = subject._take_generation_lease()
     parent_descriptors: list[int] = []
     descriptor: int | None = None
+    created_identity: dict[str, int | str] | None = None
+    parent: int | None = None
+    completed = False
     try:
         if generation_lease is not None:
             generation_lease.assert_stable()
@@ -1715,7 +1840,15 @@ def _write_subject_exclusive(
             parent=parent,
             create_new=True,
             writable=True,
+            delete=os.name == "nt",
+            share_delete=True,
         )
+        try:
+            created_identity = _windows_handle_identity(
+                descriptor, "RELEASE_SUBJECT_WRITE_FAILED", directory=False
+            )
+        except Exception:
+            raise
         _write_all(descriptor, raw)
         observed_raw = _read_held_bytes(descriptor, "RELEASE_SUBJECT_WRITE_FAILED")
         if observed_raw != raw:
@@ -1735,10 +1868,39 @@ def _write_subject_exclusive(
             )
         else:
             binding = runtime_loader()
+        completed = True
         return binding
     finally:
         if descriptor is not None:
-            os.close(descriptor)
+            if not completed and parent is not None:
+                try:
+                    created_raw = _read_held_bytes(
+                        descriptor, "RELEASE_SUBJECT_WRITE_FAILED"
+                    )
+                except (OSError, ReleaseSubjectError):
+                    created_raw = b""
+                if created_identity is None:
+                    _remove_created_subject(
+                        manifest_path,
+                        parent,
+                        None,
+                        created_raw,
+                        created_descriptor=descriptor,
+                    )
+                else:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                    descriptor = None
+                    _remove_created_subject(
+                        manifest_path, parent, created_identity, created_raw
+                    )
+            try:
+                if descriptor is not None:
+                    os.close(descriptor)
+            except OSError:
+                pass
         _close_descriptors(parent_descriptors)
         if generation_lease is not None:
             generation_lease.close()
@@ -1784,22 +1946,69 @@ def source_tree_digest(
 
     root = Path(repository_root).expanduser().resolve(strict=False)
     scripts_root = root / "skills" / "orchestrator" / "scripts"
-    inserted = str(scripts_root) not in sys.path
-    if inserted:
-        sys.path.insert(0, str(scripts_root))
+    package_root = scripts_root / "gwo_v8"
+    if not package_root.is_dir():
+        raise ReleaseSubjectError(
+            "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
+            "V8 source-tree digest implementation is unavailable",
+        )
+    alias = "_gwo_v8_release_subject_" + hashlib.sha256(
+        str(scripts_root).encode("utf-8")
+    ).hexdigest()[:16]
+    package_name = alias
+    module_name = f"{alias}.cutover_guard"
+    package = ModuleType(package_name)
+    package.__file__ = str(package_root / "__init__.py")
+    package.__package__ = package_name
+    package.__path__ = [str(package_root)]  # type: ignore[attr-defined]
+    package.__spec__ = importlib.util.spec_from_loader(
+        package_name, loader=None, is_package=True
+    )
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        package_root / "cutover_guard.py",
+        submodule_search_locations=None,
+    )
+    if spec is None or spec.loader is None:
+        raise ReleaseSubjectError(
+            "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
+            "V8 source-tree digest implementation is unavailable",
+        )
+    module = importlib.util.module_from_spec(spec)
+    previous_bytecode_setting = sys.dont_write_bytecode
+    sys.modules[package_name] = package
+    sys.modules[module_name] = module
+    sys.dont_write_bytecode = True
     try:
-        from gwo_v8.cutover_guard import source_tree_digest as digest
-    except (ImportError, ModuleNotFoundError, OSError) as error:
+        spec.loader.exec_module(module)
+        digest = getattr(module, "source_tree_digest", None)
+        module_path = _canonical_path(Path(getattr(module, "__file__", "")))
+        spec_origin = _canonical_path(
+            Path(getattr(getattr(module, "__spec__", None), "origin", ""))
+        )
+        expected_path = _canonical_path(package_root / "cutover_guard.py")
+        if module_path != expected_path or spec_origin != expected_path:
+            raise ReleaseSubjectError(
+                "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
+                "V8 source-tree digest implementation has a non-canonical origin",
+            )
+        if not callable(digest):
+            raise ReleaseSubjectError(
+                "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
+                "V8 source-tree digest implementation is unavailable",
+            )
+    except ReleaseSubjectError:
+        raise
+    except (ImportError, ModuleNotFoundError, OSError, TypeError, ValueError) as error:
         raise ReleaseSubjectError(
             "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
             "V8 source-tree digest implementation is unavailable",
         ) from error
     finally:
-        if inserted:
-            try:
-                sys.path.remove(str(scripts_root))
-            except ValueError:
-                pass
+        sys.dont_write_bytecode = previous_bytecode_setting
+        for name in tuple(sys.modules):
+            if name == alias or name.startswith(f"{alias}."):
+                sys.modules.pop(name, None)
     try:
         value = digest(root, root_handle=root_handle)
     except Exception as error:

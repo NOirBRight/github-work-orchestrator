@@ -5,6 +5,7 @@ import io
 import importlib.util
 import inspect
 import json
+import multiprocessing
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -315,6 +316,17 @@ def _fixture_binding(tmp_path: Path):
 
 def _fixture_config_for_binding(binding):
     return binding.config
+
+
+def _preflight_in_child(config, result_queue):
+    try:
+        runner.preflight(config, git_runner=_git_runner_factory(config))
+    except runner.RunnerError as error:
+        result_queue.put(("runner-error", error.code))
+    except BaseException as error:
+        result_queue.put(("unexpected-error", type(error).__name__, str(error)))
+    else:
+        result_queue.put(("ok",))
 
 
 def _run_fixture(config=None, *, execute, run_id=None, **injections):
@@ -1678,6 +1690,34 @@ def test_preflight_source_unavailability_is_unavailable(tmp_path):
 
     assert result["status"] == "UNAVAILABLE", result
     assert result["exit_code"] == 3
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO contract")
+def test_preflight_rejects_a_posix_fifo_without_blocking(tmp_path):
+    config = _fixture_config(tmp_path)
+    config.fresh_receipt.unlink()
+    os.mkfifo(config.fresh_receipt, 0o600)
+    context = multiprocessing.get_context("fork")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_preflight_in_child,
+        args=(config, result_queue),
+    )
+    process.start()
+    try:
+        process.join(timeout=2)
+        assert not process.is_alive(), "FIFO read path blocked preflight"
+        assert process.exitcode == 0
+        assert result_queue.get(timeout=1) == (
+            "runner-error",
+            "FRESH_RECEIPT_INVALID",
+        )
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=1)
+        result_queue.close()
+        result_queue.join_thread()
 
 
 def test_default_preflight_is_zero_write_and_accepts_quoted_nul_status(tmp_path):
@@ -4039,6 +4079,54 @@ def test_default_subject_keeps_git_tree_and_audited_digest_separate(tmp_path):
     assert subject.source_commit == "a" * 40
     assert subject.source_tree_digest == "c" * 64
     assert config.merged_main_git_tree == "b" * 40
+
+
+def test_default_subject_rejects_shadowed_gwo_v8_dependency(tmp_path, monkeypatch):
+    config = _fixture_config(tmp_path)
+    manifest = _fixture_subject(
+        merged_main_sha=config.merged_main_sha,
+        merged_main_git_tree=config.merged_main_git_tree,
+        audited_source_tree_digest=config.audited_source_tree_digest,
+    )
+
+    shadow_root = tmp_path / "shadow-gwo-v8"
+    shadow_root.mkdir()
+
+    class ShadowCutoverSubject:
+        def __init__(self, **_kwargs):
+            pass
+
+    shadow_package = SimpleNamespace(
+        __file__=str(shadow_root / "__init__.py"),
+        __path__=[str(shadow_root)],
+        __spec__=SimpleNamespace(origin=str(shadow_root / "__init__.py")),
+    )
+    shadow_module = SimpleNamespace(
+        __file__=str(shadow_root / "cutover_guard.py"),
+        __spec__=SimpleNamespace(origin=str(shadow_root / "cutover_guard.py")),
+        CutoverSubject=ShadowCutoverSubject,
+    )
+    monkeypatch.setitem(sys.modules, "gwo_v8", shadow_package)
+    monkeypatch.setitem(sys.modules, "gwo_v8.cutover_guard", shadow_module)
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner._default_subject_factory(config, manifest, strict=True)
+
+    assert error.value.code == "ATTESTATION_PROVENANCE_MISMATCH"
+
+
+def test_default_subject_rejects_noncanonical_repository_without_v8_fallback(tmp_path):
+    config = replace(_fixture_config(tmp_path), repository="owner/noncanonical")
+    manifest = _fixture_subject(
+        merged_main_sha=config.merged_main_sha,
+        merged_main_git_tree=config.merged_main_git_tree,
+        audited_source_tree_digest=config.audited_source_tree_digest,
+    )
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner._default_subject_factory(config, manifest, strict=True)
+
+    assert error.value.code == "ATTESTATION_PROVENANCE_MISMATCH"
 
 
 def test_cli_has_no_subject_or_identity_override():

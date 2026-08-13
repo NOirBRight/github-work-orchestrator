@@ -793,6 +793,22 @@ def test_sources_expose_only_the_exact_read_only_surface(
     assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
 
 
+def test_control_rejects_shadowed_gwo_v8_dependency(control_fixture, monkeypatch, tmp_path):
+    shadow_root = tmp_path / "shadow-gwo-v8"
+    shadow_root.mkdir()
+    shadow_package = SimpleNamespace(
+        __file__=str(shadow_root / "__init__.py"),
+        __path__=[str(shadow_root)],
+        __spec__=SimpleNamespace(origin=str(shadow_root / "__init__.py")),
+    )
+    monkeypatch.setitem(sys.modules, "gwo_v8", shadow_package)
+
+    with pytest.raises(BootstrapError) as error:
+        ControlOwnershipAttestor(_sources(control_fixture))
+
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+
+
 def test_control_reads_every_blob_at_one_fixed_oid(control_fixture, tmp_path, monkeypatch):
     subject = _subject()
     store_record = _record("store.sqlite", subject.repository, _attempt(subject).attestor_sha256)
@@ -1418,6 +1434,57 @@ def test_windows_entry_identity_uses_file_id_not_metadata(tmp_path):
         entry,
         entry_stat,
         replaced_identity,
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file-ID identity contract")
+def test_windows_entry_identity_tolerates_directory_metadata_refresh(tmp_path):
+    entry = SimpleNamespace(inode=lambda: 0x1234)
+    entry_stat = SimpleNamespace(
+        st_mode=0o40755,
+        st_size=0,
+        st_mtime_ns=100,
+    )
+    opened_identity = {
+        "volume_id": 7,
+        "file_id": (0x1234).to_bytes(8, "little").hex() + "00" * 8,
+        "st_mode": 0o40755,
+        "st_size": 4096,
+        "st_mtime_ns": 200,
+    }
+
+    assert attestor_module._entry_identity_matches(
+        entry,
+        entry_stat,
+        opened_identity,
+    )
+
+
+@pytest.mark.parametrize("changed_field", ("st_size", "st_mtime_ns"))
+def test_windows_entry_identity_rejects_ordinary_file_metadata_change(
+    monkeypatch,
+    changed_field,
+):
+    monkeypatch.setattr(attestor_module.os, "name", "nt")
+    entry = SimpleNamespace(inode=lambda: 0x1234)
+    entry_stat = SimpleNamespace(
+        st_mode=0o100644,
+        st_size=6,
+        st_mtime_ns=100,
+    )
+    opened_identity = {
+        "volume_id": 7,
+        "file_id": (0x1234).to_bytes(8, "little").hex() + "00" * 8,
+        "st_mode": 0o100644,
+        "st_size": 6,
+        "st_mtime_ns": 100,
+    }
+    opened_identity[changed_field] = 7 if changed_field == "st_size" else 200
+
+    assert not attestor_module._entry_identity_matches(
+        entry,
+        entry_stat,
+        opened_identity,
     )
 
 

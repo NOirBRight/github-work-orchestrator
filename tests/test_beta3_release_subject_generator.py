@@ -45,7 +45,11 @@ def _write_authoritative_repository(tmp_path: Path) -> tuple[Path, Path]:
         repository_root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
     )
     target_source_root.parent.mkdir(parents=True)
-    shutil.copytree(source_root, target_source_root)
+    shutil.copytree(
+        source_root,
+        target_source_root,
+        ignore=shutil.ignore_patterns("__pycache__", "*.py[cod]"),
+    )
     (repository_root / "skills" / "implement-gwo").mkdir(parents=True)
     (repository_root / "skills" / "orchestrator").mkdir(exist_ok=True)
     (repository_root / "skills" / "implement-gwo" / "SKILL.md").write_text(
@@ -190,7 +194,45 @@ def test_generator_reads_real_git_source_and_observer_inputs(
         assert len(subject.subject.audited_source_tree_digest) == 64
         assert capsys.readouterr().out == f"{subject.subject.subject_digest}\n"
     finally:
+        pass
         subject.close()
+
+
+def test_source_digest_does_not_write_bytecode_to_authoritative_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+
+    assert release_subject.source_tree_digest(repository_root)
+    assert not tuple(repository_root.rglob("__pycache__"))
+
+
+def test_source_digest_does_not_use_preloaded_shadowed_gwo_v8_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    shadow_path = tmp_path / "shadow" / "cutover_guard.py"
+    shadow_path.parent.mkdir()
+    shadow_path.write_text("# shadow\n", encoding="utf-8")
+    shadow_package = SimpleNamespace(
+        __path__=[str(shadow_path.parent)],
+        __file__=str(shadow_path.parent / "__init__.py"),
+    )
+    shadow_module = SimpleNamespace(
+        __file__=str(shadow_path),
+        __spec__=SimpleNamespace(origin=str(shadow_path)),
+        source_tree_digest=lambda *_args, **_kwargs: "f" * 64,
+    )
+    monkeypatch.setitem(sys.modules, "gwo_v8", shadow_package)
+    monkeypatch.setitem(sys.modules, "gwo_v8.cutover_guard", shadow_module)
+
+    observed = release_subject.source_tree_digest(repository_root)
+
+    assert observed != "f" * 64
 
 
 def test_generator_rejects_origin_mismatch_from_real_git_repository(
@@ -328,6 +370,35 @@ def test_generator_closes_transferred_lease_after_successful_write(
         binding.close()
 
 
+def test_generator_loader_shares_delete_with_writer_manifest_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    subject = release_subject.generate_production_subject()
+    loader_share_delete: list[bool] = []
+    original_open = release_subject._open_path_handle
+
+    def tracking_open(path: Path, code: str, **kwargs: object) -> int:
+        if (
+            Path(path).name == release_subject.RELEASE_SUBJECT_FILENAME
+            and code == "RELEASE_SUBJECT_UNAVAILABLE"
+        ):
+            loader_share_delete.append(bool(kwargs.get("share_delete", False)))
+        return original_open(path, code, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(release_subject, "_open_path_handle", tracking_open)
+    binding = release_subject.write_subject_for_test_exclusive(
+        subject,
+        evidence_root / release_subject.RELEASE_SUBJECT_FILENAME,
+    )
+    try:
+        assert loader_share_delete == [True]
+    finally:
+        binding.close()
+
+
 def test_generator_closes_transferred_lease_when_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -352,8 +423,190 @@ def test_generator_closes_transferred_lease_when_write_fails(
             evidence_root / release_subject.RELEASE_SUBJECT_FILENAME,
         )
     assert error.value.code == "RELEASE_SUBJECT_WRITE_FAILED"
+    assert not (evidence_root / release_subject.RELEASE_SUBJECT_FILENAME).exists()
     assert getattr(subject, "_generation_lease", None) is None
     assert getattr(lease, "_closed", False) is True
+
+
+def test_generator_publicly_holds_evidence_boundary_until_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+
+    subject = release_subject.generate_production_subject()
+    moved_root = tmp_path / "moved-evidence"
+    renamed = True
+    try:
+        evidence_root.rename(moved_root)
+    except OSError:
+        renamed = False
+    if not renamed:
+        binding = release_subject.write_subject_for_test_exclusive(
+            subject,
+            evidence_root / release_subject.RELEASE_SUBJECT_FILENAME,
+        )
+        binding.close()
+        assert (evidence_root / release_subject.RELEASE_SUBJECT_FILENAME).is_file()
+        return
+    evidence_root.mkdir()
+    replacement_subject = evidence_root / release_subject.RELEASE_SUBJECT_FILENAME
+    try:
+        binding = None
+        try:
+            binding = release_subject.write_subject_for_test_exclusive(
+                subject,
+                replacement_subject,
+            )
+        except release_subject.ReleaseSubjectError as error:
+            assert error.code in {
+                "RELEASE_SUBJECT_DRIFT",
+                "RELEASE_SUBJECT_PATH_INVALID",
+            }
+        else:
+            binding.close()
+            pytest.fail("writer accepted a replaced evidence root")
+        assert not replacement_subject.exists()
+    finally:
+        if replacement_subject.exists():
+            try:
+                replacement_subject.unlink()
+            except OSError:
+                pass
+        try:
+            evidence_root.rmdir()
+        except OSError:
+            pass
+        if not evidence_root.exists():
+            try:
+                moved_root.rename(evidence_root)
+            except OSError:
+                pass
+
+
+def test_generator_public_cleanup_after_loader_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    subject = release_subject.generate_production_subject()
+    subject_path = evidence_root / release_subject.RELEASE_SUBJECT_FILENAME
+
+    def fail_loader(*_args: object, **_kwargs: object) -> object:
+        raise release_subject.ReleaseSubjectError(
+            "RELEASE_SUBJECT_SCHEMA_INVALID",
+            "test loader failure",
+        )
+
+    monkeypatch.setattr(release_subject, "load_release_subject_for_test", fail_loader)
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.write_subject_for_test_exclusive(subject, subject_path)
+    assert error.value.code == "RELEASE_SUBJECT_SCHEMA_INVALID"
+    assert not subject_path.exists()
+
+
+def test_generator_public_cleanup_after_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    subject = release_subject.generate_production_subject()
+    subject_path = evidence_root / release_subject.RELEASE_SUBJECT_FILENAME
+
+    def fail_write(_descriptor: int, _raw: bytes) -> None:
+        raise release_subject.ReleaseSubjectError(
+            "RELEASE_SUBJECT_WRITE_FAILED",
+            "test write failure",
+        )
+
+    monkeypatch.setattr(release_subject, "_write_all", fail_write)
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.write_subject_for_test_exclusive(subject, subject_path)
+    assert error.value.code == "RELEASE_SUBJECT_WRITE_FAILED"
+    assert not subject_path.exists()
+
+
+def test_generator_public_cleanup_after_create_identity_capture_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    subject = release_subject.generate_production_subject()
+    subject_path = evidence_root / release_subject.RELEASE_SUBJECT_FILENAME
+    original_identity = release_subject._windows_handle_identity
+    identity_calls = 0
+
+    def fail_once(
+        descriptor: int,
+        code: str,
+        *,
+        directory: bool,
+    ) -> dict[str, int | str]:
+        nonlocal identity_calls
+        if not directory and code == "RELEASE_SUBJECT_WRITE_FAILED":
+            identity_calls += 1
+            if identity_calls == 1:
+                raise release_subject.ReleaseSubjectError(
+                    "RELEASE_SUBJECT_WRITE_FAILED",
+                    "test identity capture failure",
+                )
+        return original_identity(descriptor, code, directory=directory)
+
+    monkeypatch.setattr(release_subject, "_windows_handle_identity", fail_once)
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.write_subject_for_test_exclusive(subject, subject_path)
+
+    assert error.value.code == "RELEASE_SUBJECT_WRITE_FAILED"
+    assert identity_calls == 1
+    assert not subject_path.exists()
+
+
+def test_generator_public_close_is_idempotent_after_successful_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    subject = release_subject.generate_production_subject()
+    binding = release_subject.write_subject_for_test_exclusive(
+        subject,
+        evidence_root / release_subject.RELEASE_SUBJECT_FILENAME,
+    )
+    binding.close()
+    binding.close()
+
+    moved_root = tmp_path / "closed-evidence"
+    evidence_root.rename(moved_root)
+    moved_root.rename(evidence_root)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX replacement safety contract")
+def test_generator_does_not_remove_replaced_subject_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    subject = release_subject.generate_production_subject()
+    subject_path = evidence_root / release_subject.RELEASE_SUBJECT_FILENAME
+    replacement = evidence_root / "replacement-subject.json"
+    replacement_bytes = b"replacement subject bytes\n"
+
+    def replace_and_fail(*_args: object, **_kwargs: object) -> object:
+        replacement.write_bytes(replacement_bytes)
+        os.replace(replacement, subject_path)
+        raise release_subject.ReleaseSubjectError(
+            "RELEASE_SUBJECT_WRITE_FAILED", "test loader failure"
+        )
+
+    monkeypatch.setattr(release_subject, "load_release_subject_for_test", replace_and_fail)
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.write_subject_for_test_exclusive(subject, subject_path)
+    assert error.value.code == "RELEASE_SUBJECT_WRITE_FAILED"
+    assert subject_path.read_bytes() == replacement_bytes
 
 
 def test_generator_rejects_fifo_subject_without_blocking(
@@ -368,3 +621,38 @@ def test_generator_rejects_fifo_subject_without_blocking(
     with pytest.raises(release_subject.ReleaseSubjectError) as error:
         release_subject.generate_production_subject()
     assert error.value.code == "RELEASE_SUBJECT_PATH_INVALID"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO contract")
+def test_open_path_handle_opens_fifo_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+        pytest.skip("POSIX FIFO contract")
+    fifo_path = tmp_path / "subject"
+    os.mkfifo(fifo_path)
+    original_open = release_subject.os.open
+    observed_flags: list[int] = []
+
+    def tracking_open(
+        path: object,
+        flags: int,
+        mode: int = 0o644,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if Path(path).name == fifo_path.name:
+            observed_flags.append(flags)
+            assert flags & os.O_NONBLOCK
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(release_subject.os, "open", tracking_open)
+    descriptor = release_subject._open_path_handle(
+        fifo_path,
+        "RELEASE_SUBJECT_PATH_INVALID",
+        directory=False,
+    )
+    try:
+        assert observed_flags
+    finally:
+        os.close(descriptor)

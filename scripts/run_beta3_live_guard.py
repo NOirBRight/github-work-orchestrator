@@ -419,22 +419,14 @@ def canonical_json_bytes(value: object) -> bytes:
 
 def _exact_digest_value(value: object) -> str:
     """Use current-main digest semantics without importing it during preflight."""
+    _validate_v8_module_origins()
     try:
         from gwo_v8._canonical import digest_value
-    except (ImportError, ModuleNotFoundError):
-        try:
-            encoded = json.dumps(
-                value,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
-        except (TypeError, ValueError, UnicodeEncodeError) as error:
-            raise RunnerError(
-                "CANONICAL_JSON_INVALID", "value cannot be exact-main canonical JSON"
-            ) from error
-        return hashlib.sha256(encoded).hexdigest()
+    except (ImportError, ModuleNotFoundError, OSError) as error:
+        raise RunnerError(
+            "ATTESTATION_PROVENANCE_MISMATCH",
+            "gwo_v8 canonical digest module is unavailable",
+        ) from error
     try:
         return str(digest_value(value))
     except Exception as error:
@@ -845,7 +837,7 @@ def _open_path_handle(
         if directory:
             flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         else:
-            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
             if parent is None:
                 return os.open(path, flags, 0o600 if create_new else 0o644)
@@ -1920,12 +1912,14 @@ def _guard_contract() -> object:
     """Compatibility metadata for the runner-owned durable Store reader."""
     from types import SimpleNamespace
 
+    _validate_v8_module_origins()
     try:
         from gwo_v8._canonical import digest_value
         from gwo_v8.cutover_guard import DurableStateReadback
     except (ImportError, ModuleNotFoundError, OSError) as error:
         raise RunnerError(
-            "LIVE_GUARD_UNAVAILABLE", "durable Store contract is unavailable"
+            "ATTESTATION_PROVENANCE_MISMATCH",
+            "durable Store contract is unavailable from the canonical V8 package",
         ) from error
     return SimpleNamespace(
         readback_types=(("durable_state", DurableStateReadback),),
@@ -3374,6 +3368,7 @@ def _write_exclusive_json(
 
 def _validate_attested_replay(bundle: object, replay: object) -> dict[str, object]:
     try:
+        _validate_v8_module_origins()
         scripts_root = str(Path(__file__).resolve().parent)
         if scripts_root not in sys.path:
             sys.path.insert(0, scripts_root)
@@ -3395,8 +3390,11 @@ def _validate_attested_replay(bundle: object, replay: object) -> dict[str, objec
             WriterFenceReadback,
         )
     except (ImportError, ModuleNotFoundError, OSError) as error:
+        if isinstance(error, RunnerError):
+            raise
         raise RunnerError(
-            "ATTESTATION_UNAVAILABLE", "replay contracts are unavailable"
+            "ATTESTATION_PROVENANCE_MISMATCH",
+            "replay contracts are unavailable from the canonical V8 package",
         ) from error
     if type(bundle) is not AttestedCutoverBundle:
         raise RunnerError(
@@ -4254,6 +4252,86 @@ def _provenance_mismatch(detail: str) -> None:
     raise RunnerError("ATTESTATION_PROVENANCE_MISMATCH", detail)
 
 
+def _v8_source_root(
+    repository_root: Path | None = None,
+    *,
+    repository: str | None = None,
+) -> Path:
+    candidate_root = (
+        Path(repository_root).resolve(strict=False)
+        if repository_root is not None
+        else Path(__file__).resolve().parent.parent
+    )
+    configured = candidate_root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+    if configured.is_dir():
+        return configured
+    return (
+        configured
+        if repository_root is not None
+        else Path(__file__).resolve().parent.parent
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+    )
+
+
+def _validate_v8_module_origins(
+    repository_root: Path | None = None,
+    *,
+    repository: str | None = None,
+) -> None:
+    """Require loaded V8 modules to come from the selected checkout."""
+
+    if repository_root is not None:
+        _add_repo_import_paths(Path(repository_root).resolve(strict=False))
+    expected_root = _v8_source_root(repository_root, repository=repository)
+    package = sys.modules.get("gwo_v8")
+    if package is None:
+        try:
+            package = importlib.import_module("gwo_v8")
+        except (ImportError, ModuleNotFoundError, OSError) as error:
+            raise RunnerError(
+                "ATTESTATION_PROVENANCE_MISMATCH",
+                "gwo_v8 package cannot be loaded from the selected checkout",
+            ) from error
+    package_file = _canonical_provenance_path(
+        getattr(package, "__file__", None), "gwo_v8 package origin"
+    )
+    package_spec = getattr(getattr(package, "__spec__", None), "origin", None)
+    package_origin = _canonical_provenance_path(
+        package_spec, "gwo_v8 package spec origin"
+    )
+    if package_file != expected_root / "__init__.py" or package_origin != package_file:
+        _provenance_mismatch("gwo_v8 package origin is not canonical")
+    package_paths = getattr(package, "__path__", None)
+    if type(package_paths) not in (list, tuple) or len(package_paths) != 1:
+        _provenance_mismatch("gwo_v8 package path is not exact")
+    package_path = _canonical_provenance_path(
+        package_paths[0], "gwo_v8 package path"
+    )
+    if package_path != expected_root:
+        _provenance_mismatch("gwo_v8 package path is not canonical")
+    for name, module in tuple(sys.modules.items()):
+        if name == "gwo_v8" or not name.startswith("gwo_v8."):
+            continue
+        if module is None:
+            _provenance_mismatch(f"{name} is not an exact loaded module")
+        origin = _canonical_provenance_path(
+            getattr(module, "__file__", None), f"{name} module origin"
+        )
+        spec_origin = _canonical_provenance_path(
+            getattr(getattr(module, "__spec__", None), "origin", None),
+            f"{name} module spec origin",
+        )
+        if origin != spec_origin:
+            _provenance_mismatch(f"{name} module origins differ")
+        try:
+            origin.relative_to(expected_root)
+        except ValueError:
+            _provenance_mismatch(f"{name} module origin is not canonical")
+
+
 def _canonical_provenance_path(value: object, label: str) -> Path:
     if type(value) is not str or not value:
         _provenance_mismatch(f"{label} is not an absolute path")
@@ -4470,6 +4548,8 @@ def _production_source_command(command: tuple[str, ...]) -> bytes:
 def _production_dependencies(
     config: RunnerConfig,
     producer_sha256: str,
+    *,
+    strict: bool = False,
 ) -> ExecutionDependencies:
     if type(config) is not RunnerConfig:
         raise RunnerError("DEPENDENCY_INVALID", "config has the wrong exact type")
@@ -4480,6 +4560,11 @@ def _production_dependencies(
         raise RunnerError(
             "DEPENDENCY_INJECTION_FORBIDDEN",
             "obsolete production read injection is forbidden",
+        )
+    if strict:
+        _validate_v8_module_origins(
+            config.repository_root,
+            repository=config.repository,
         )
     _add_repo_import_paths(config.repository_root)
     try:
@@ -4572,6 +4657,7 @@ def _dependencies_or_raise(
     package_reader: Callable[[RunnerConfig], object] | None,
     *,
     producer_sha256: str,
+    production: bool = False,
 ) -> ExecutionDependencies:
     _validate_dependency_inputs(
         config,
@@ -4581,7 +4667,11 @@ def _dependencies_or_raise(
         package_reader,
     )
     if dependencies is None:
-        return _production_dependencies(config, producer_sha256)
+        return _production_dependencies(
+            config,
+            producer_sha256,
+            strict=production,
+        )
     return dependencies
 
 
@@ -4678,7 +4768,14 @@ def _run_bound(
             )
             with input_lease as inputs:
                 _pre_guard_refresh(config, preflight_result, git_runner)
-                subject = _default_subject_factory(config, release_subject)
+                if production:
+                    subject = _default_subject_factory(
+                        config,
+                        release_subject,
+                        strict=(config.repository_root.resolve() == REPOSITORY_ROOT),
+                    )
+                else:
+                    subject = _default_subject_factory(config, release_subject)
                 try:
                     from beta3_bootstrap_model import AttemptIdentity  # type: ignore[import-not-found]
                 except (ImportError, ModuleNotFoundError, OSError) as error:
@@ -4712,6 +4809,10 @@ def _run_bound(
                     control_reader,
                     package_reader,
                     producer_sha256=attempt.attestor_sha256,
+                    production=(
+                        production
+                        and config.repository_root.resolve() == REPOSITORY_ROOT
+                    ),
                 )
                 bootstrap_attestor = ProductionBootstrapAttestor(
                     control_ownership_attestor=live_dependencies.control_ownership_attestor,
@@ -5173,8 +5274,15 @@ def run(
 def _default_subject_factory(
     config: RunnerConfig,
     release_subject: "ReleaseSubject",
+    *,
+    strict: bool = False,
 ) -> "CutoverSubject":
     _add_repo_import_paths(config.repository_root)
+    if strict:
+        _validate_v8_module_origins(
+            config.repository_root,
+            repository=config.repository,
+        )
     from gwo_v8.cutover_guard import CutoverSubject
 
     if release_subject.merged_main_sha != config.merged_main_sha:

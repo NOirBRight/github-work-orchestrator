@@ -21,6 +21,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import sys
 from urllib.parse import quote
 
 from beta3_bootstrap_model import (
@@ -122,6 +123,104 @@ class ControlOwnershipSourceSet:
     runtime_registry: object
     runtime_config: object
     local_inputs: object
+
+
+_GWO_V8_MODULE_PREFIX = "gwo_v8"
+
+
+def _gwo_v8_source_root() -> Path:
+    return (
+        Path(__file__).resolve().parent.parent
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+    )
+
+
+def _gwo_v8_origin_path(module: object, label: str) -> Path:
+    module_path = getattr(module, "__file__", None)
+    module_spec = getattr(module, "__spec__", None)
+    spec_path = getattr(module_spec, "origin", None)
+    if type(module_path) is not str or type(spec_path) is not str:
+        raise BootstrapError(
+            "UNSAFE_SOURCE_CAPABILITY",
+            f"{label} has no exact source origin",
+        )
+    try:
+        path = Path(module_path).resolve(strict=True)
+        origin = Path(spec_path).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise BootstrapError(
+            "UNSAFE_SOURCE_CAPABILITY",
+            f"{label} source origin is unavailable",
+        ) from error
+    if path != origin:
+        raise BootstrapError(
+            "UNSAFE_SOURCE_CAPABILITY",
+            f"{label} file and spec origins differ",
+        )
+    return path
+
+
+def _validate_gwo_v8_provenance() -> None:
+    """Reject a preloaded V8 package from outside this attestor checkout."""
+
+    expected_root = _gwo_v8_source_root()
+    package = sys.modules.get(_GWO_V8_MODULE_PREFIX)
+    if package is None:
+        raise BootstrapError(
+            "UNSAFE_SOURCE_CAPABILITY",
+            "gwo_v8 package is not loaded from the attestor checkout",
+        )
+    package_path = _gwo_v8_origin_path(package, "gwo_v8 package")
+    if package_path != expected_root / "__init__.py":
+        raise BootstrapError(
+            "UNSAFE_SOURCE_CAPABILITY",
+            "gwo_v8 package origin is not canonical",
+        )
+    package_paths = getattr(package, "__path__", None)
+    if type(package_paths) not in (list, tuple) or len(package_paths) != 1:
+        raise BootstrapError(
+            "UNSAFE_SOURCE_CAPABILITY",
+            "gwo_v8 package path is not exact",
+        )
+    try:
+        observed_package_root = Path(package_paths[0]).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise BootstrapError(
+            "UNSAFE_SOURCE_CAPABILITY",
+            "gwo_v8 package path is unavailable",
+        ) from error
+    if observed_package_root != expected_root:
+        raise BootstrapError(
+            "UNSAFE_SOURCE_CAPABILITY",
+            "gwo_v8 package path is not canonical",
+        )
+
+    for name, module in tuple(sys.modules.items()):
+        if name != _GWO_V8_MODULE_PREFIX and not name.startswith(
+            f"{_GWO_V8_MODULE_PREFIX}."
+        ):
+            continue
+        if module is None:
+            raise BootstrapError(
+                "UNSAFE_SOURCE_CAPABILITY",
+                f"{name} is not an exact loaded module",
+            )
+        origin = _gwo_v8_origin_path(module, name)
+        try:
+            relative = origin.relative_to(expected_root)
+        except ValueError as error:
+            raise BootstrapError(
+                "UNSAFE_SOURCE_CAPABILITY",
+                f"{name} module origin is not canonical",
+            ) from error
+        if not relative.parts:
+            raise BootstrapError(
+                "UNSAFE_SOURCE_CAPABILITY",
+                f"{name} module origin is not a source file",
+            )
 
 
 @dataclass(frozen=True)
@@ -2209,15 +2308,17 @@ def _entry_identity_matches(
     entry_stat: os.stat_result,
     opened_identity: Mapping[str, object],
 ) -> bool:
-    if (
-        opened_identity.get("st_mode") is None
-        or stat.S_IFMT(int(opened_identity["st_mode"])) != stat.S_IFMT(entry_stat.st_mode)
-        or opened_identity.get("st_size") != int(entry_stat.st_size)
-        or opened_identity.get("st_mtime_ns") != int(entry_stat.st_mtime_ns)
-    ):
+    if opened_identity.get("st_mode") is None or stat.S_IFMT(
+        int(opened_identity["st_mode"])
+    ) != stat.S_IFMT(entry_stat.st_mode):
         return False
     inode = _entry_inode(entry, entry_stat)
     if inode is None:
+        return False
+    if not stat.S_ISDIR(entry_stat.st_mode) and (
+        opened_identity.get("st_size") != int(entry_stat.st_size)
+        or opened_identity.get("st_mtime_ns") != int(entry_stat.st_mtime_ns)
+    ):
         return False
     if os.name == "nt":
         file_id = opened_identity.get("file_id")
@@ -3544,6 +3645,7 @@ class ControlOwnershipAttestor:
     def __init__(self, sources: ControlOwnershipSourceSet) -> None:
         if type(sources) is not ControlOwnershipSourceSet:
             raise BootstrapError("COMPONENT_INVALID", "sources must be one exact source set")
+        _validate_gwo_v8_provenance()
         self._sources = sources
         self._check_source(sources.control, ("read_ref", "read_at_oid"))
         self._check_source(sources.runtime_registry, ("read",))

@@ -487,6 +487,39 @@ def test_subject_parser_rejects_escaped_unpaired_unicode_surrogate(tmp_path: Pat
     assert error.value.code == "RELEASE_SUBJECT_SCHEMA_INVALID"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO contract")
+def test_loader_rejects_held_open_fifo_without_blocking(tmp_path: Path):
+    if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+        pytest.skip("POSIX FIFO contract")
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    manifest = evidence_root / release_subject.RELEASE_SUBJECT_FILENAME
+    os.mkfifo(manifest)
+    child_code = """
+import sys
+from pathlib import Path
+import beta3_release_subject as release_subject
+
+try:
+    release_subject._read_held_regular_file(
+        Path(sys.argv[1]), "RELEASE_SUBJECT_UNAVAILABLE"
+    )
+except release_subject.ReleaseSubjectError as error:
+    raise SystemExit(0 if error.code == "RELEASE_SUBJECT_UNAVAILABLE" else 2)
+raise SystemExit(3)
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(SCRIPTS)
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(manifest)],
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=1,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+
 def test_production_loader_uses_one_fixed_path_and_rejects_absence(
     monkeypatch: pytest.MonkeyPatch,
 ):
