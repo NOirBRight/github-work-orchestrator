@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -269,3 +270,101 @@ def test_generator_rejects_missing_fixed_evidence_parent(
         release_subject.generate_production_subject()
     assert error.value.code == "RELEASE_SUBJECT_EVIDENCE_INVALID"
     assert not missing_evidence_root.exists()
+
+
+def test_generator_holds_repository_and_evidence_boundaries_until_subject_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    events: list[str] = []
+
+    original_git = release_subject._git_snapshot
+    original_source = release_subject.source_tree_digest
+    original_observer = release_subject._observer_snapshot
+
+    def git(*, repository_lease=None):
+        events.append(f"git:{repository_lease is not None}")
+        return original_git(repository_lease=repository_lease)
+
+    def source(root, *, root_handle=None):
+        events.append(f"source:{root_handle is not None}")
+        return original_source(root, root_handle=root_handle)
+
+    def observer(root, *, repository_lease=None):
+        events.append(f"observer:{repository_lease is not None}")
+        return original_observer(root, repository_lease=repository_lease)
+
+    monkeypatch.setattr(release_subject, "_git_snapshot", git)
+    monkeypatch.setattr(release_subject, "source_tree_digest", source)
+    monkeypatch.setattr(release_subject, "_observer_snapshot", observer)
+
+    subject = release_subject.generate_production_subject()
+    assert events
+    assert all(event.endswith(":True") for event in events)
+    assert getattr(subject, "_generation_lease", None) is not None
+    binding = release_subject.write_subject_for_test_exclusive(subject, evidence_root / release_subject.RELEASE_SUBJECT_FILENAME)
+    binding.close()
+
+
+def test_generator_closes_transferred_lease_after_successful_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+
+    subject = release_subject.generate_production_subject()
+    lease = getattr(subject, "_generation_lease", None)
+    assert lease is not None
+    binding = release_subject.write_subject_for_test_exclusive(
+        subject,
+        evidence_root / release_subject.RELEASE_SUBJECT_FILENAME,
+    )
+    try:
+        assert getattr(subject, "_generation_lease", None) is None
+        assert getattr(lease, "_closed", False) is True
+    finally:
+        binding.close()
+
+
+def test_generator_closes_transferred_lease_when_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+
+    subject = release_subject.generate_production_subject()
+    lease = getattr(subject, "_generation_lease", None)
+    assert lease is not None
+
+    def fail_write(_descriptor: int, _raw: bytes) -> None:
+        raise release_subject.ReleaseSubjectError(
+            "RELEASE_SUBJECT_WRITE_FAILED",
+            "test write failure",
+        )
+
+    monkeypatch.setattr(release_subject, "_write_all", fail_write)
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.write_subject_for_test_exclusive(
+            subject,
+            evidence_root / release_subject.RELEASE_SUBJECT_FILENAME,
+        )
+    assert error.value.code == "RELEASE_SUBJECT_WRITE_FAILED"
+    assert getattr(subject, "_generation_lease", None) is None
+    assert getattr(lease, "_closed", False) is True
+
+
+def test_generator_rejects_fifo_subject_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    if not hasattr(os, "mkfifo") or os.name == "nt":
+        pytest.skip("POSIX FIFO contract")
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    subject_path = evidence_root / release_subject.RELEASE_SUBJECT_FILENAME
+    os.mkfifo(subject_path)
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.generate_production_subject()
+    assert error.value.code == "RELEASE_SUBJECT_PATH_INVALID"
