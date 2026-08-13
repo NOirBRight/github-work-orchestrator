@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 import hashlib
 import json
 import os
@@ -199,6 +199,12 @@ class ReleaseSubject:
     attestor_bundle_sha256: str
     reviewed_provenance: ReviewedProvenanceIdentity
     subject_digest: str
+    _generation_lease: "_GenerationLease | None" = dataclass_field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if self.schema != RELEASE_SUBJECT_SCHEMA:
@@ -261,6 +267,26 @@ class ReleaseSubject:
 
     def canonical(self) -> dict[str, object]:
         return {**self.canonical_body(), "subject_digest": self.subject_digest}
+
+    def _take_generation_lease(self) -> "_GenerationLease | None":
+        lease = self._generation_lease
+        object.__setattr__(self, "_generation_lease", None)
+        return lease
+
+    def close(self) -> None:
+        """Close an in-flight generation boundary, if this subject owns one."""
+
+        lease = self._take_generation_lease()
+        if lease is not None:
+            lease.close()
+
+    def __del__(self) -> None:
+        # A caller normally transfers the generation lease to the writer.  The
+        # finalizer is only a safety net for test/error paths that discard a
+        # generated value without writing it.
+        lease = getattr(self, "_generation_lease", None)
+        if lease is not None:
+            lease.close()
 
     @classmethod
     def from_canonical(cls, value: Mapping[str, object]) -> "ReleaseSubject":
@@ -451,7 +477,10 @@ def _directory_components(path: Path) -> tuple[Path, ...]:
 
 def _close_descriptors(descriptors: list[int]) -> None:
     while descriptors:
-        os.close(descriptors.pop())
+        try:
+            os.close(descriptors.pop())
+        except OSError:
+            pass
 
 
 def _reject_reparse_component(path: Path) -> None:
@@ -540,6 +569,8 @@ def _windows_handle_identity(
         }
     except ReleaseSubjectError:
         raise
+    except FileNotFoundError:
+        raise
     except (ImportError, OSError, AttributeError, TypeError) as error:
         raise ReleaseSubjectError(
             code, "Windows handle identity is unavailable"
@@ -564,6 +595,7 @@ def _open_windows_relative_handle(
     parent: int,
     create_new: bool = False,
     writable: bool = False,
+    missing_ok: bool = False,
 ) -> int:
     try:
         import ctypes
@@ -663,6 +695,8 @@ def _open_windows_relative_handle(
                     "RELEASE_SUBJECT_EXISTS",
                     f"subject appeared during exclusive create: {path}",
                 )
+            if missing_ok and status in {0xC0000034, 0xC000003A}:
+                raise FileNotFoundError(str(path))
             raise OSError(status, "NtCreateFile failed")
         try:
             return msvcrt.open_osfhandle(
@@ -673,6 +707,8 @@ def _open_windows_relative_handle(
             ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
             raise
     except ReleaseSubjectError:
+        raise
+    except FileNotFoundError:
         raise
     except (ImportError, OSError, AttributeError, TypeError) as error:
         raise ReleaseSubjectError(
@@ -688,6 +724,7 @@ def _open_path_handle(
     parent: int | None = None,
     create_new: bool = False,
     writable: bool = False,
+    missing_ok: bool = False,
 ) -> int:
     if os.name != "nt":
         flags = (os.O_RDWR if writable else os.O_RDONLY) | getattr(os, "O_BINARY", 0)
@@ -715,6 +752,12 @@ def _open_path_handle(
             raise ReleaseSubjectError(
                 code, f"path already exists unexpectedly: {path}"
             ) from error
+        except FileNotFoundError:
+            if missing_ok:
+                raise
+            raise ReleaseSubjectError(
+                code, f"path could not be opened without reparse following: {path}"
+            )
         except OSError as error:
             if parent is None:
                 _reject_reparse_component(path)
@@ -729,6 +772,7 @@ def _open_path_handle(
             parent=parent,
             create_new=create_new,
             writable=writable,
+            missing_ok=missing_ok,
         )
     try:
         import ctypes
@@ -830,26 +874,178 @@ def _open_directory_components(
         ) from error
 
 
+@dataclass
+class _DirectoryLease:
+    """Own one identity-checked, descriptor-relative directory chain."""
+
+    path: Path
+    handles: tuple[int, ...]
+    identities: tuple[Mapping[str, object], ...]
+    _closed: bool = dataclass_field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.handles) is not tuple or not self.handles:
+            raise TypeError("directory lease handles must be a non-empty tuple")
+        if any(type(handle) is not int for handle in self.handles):
+            raise TypeError("directory lease handles must be integer descriptors")
+        if type(self.identities) is not tuple or len(self.identities) != len(
+            self.handles
+        ):
+            raise TypeError("directory lease identities must match handles")
+        if any(not isinstance(identity, Mapping) for identity in self.identities):
+            raise TypeError("directory lease identities must be mappings")
+
+    def assert_stable(self, code: str = "RELEASE_SUBJECT_DRIFT") -> None:
+        if self._closed:
+            raise ReleaseSubjectError(code, "directory lease is already closed")
+        for handle, identity in zip(self.handles, self.identities, strict=True):
+            current = _windows_handle_identity(handle, code, directory=True)
+            if not _identity_matches(current, identity):
+                _drift("held directory component identity changed")
+        fresh_handles: list[int] = []
+        try:
+            fresh_handles, fresh_identities = _open_directory_components(
+                self.path,
+                code,
+            )
+            if len(fresh_identities) != len(self.identities) or any(
+                not _identity_matches(current, expected)
+                for current, expected in zip(
+                    fresh_identities,
+                    self.identities,
+                    strict=True,
+                )
+            ):
+                _drift("directory lease path identity changed")
+        finally:
+            _close_descriptors(fresh_handles)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for handle in reversed(self.handles):
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+
+
+@dataclass
+class _GenerationLease:
+    """Keep both release roots held until the subject file is durable."""
+
+    repository: _DirectoryLease
+    evidence: _DirectoryLease
+    _closed: bool = dataclass_field(default=False, init=False, repr=False)
+
+    def assert_stable(self) -> None:
+        if self._closed:
+            raise ReleaseSubjectError(
+                "RELEASE_SUBJECT_DRIFT", "generation lease is already closed"
+            )
+        self.repository.assert_stable()
+        self.evidence.assert_stable()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.evidence.close()
+        self.repository.close()
+
+
+def _directory_lease(path: Path, code: str, *, allow_file_create: bool = False) -> _DirectoryLease:
+    descriptors, identities = _open_directory_components(
+        path,
+        code,
+        allow_file_create=allow_file_create,
+    )
+    try:
+        return _DirectoryLease(
+            Path(os.path.abspath(path)),
+            tuple(descriptors),
+            tuple(dict(identity) for identity in identities),
+        )
+    except Exception:
+        _close_descriptors(descriptors)
+        raise
+
+
+def _open_relative_regular_file(
+    parent: int,
+    relative: str,
+    code: str,
+) -> tuple[bytes, dict[str, int | str]]:
+    """Read one canonical repository file beneath an already-held root."""
+
+    components = [Path(part) for part in relative.split("/") if part]
+    if not components:
+        raise ReleaseSubjectError(code, "relative observer path is empty")
+    directories: list[int] = []
+    descriptor: int | None = None
+    current_parent = parent
+    try:
+        for component in components[:-1]:
+            descriptor = _open_path_handle(
+                component,
+                code,
+                directory=True,
+                parent=current_parent,
+            )
+            directories.append(descriptor)
+            current_parent = descriptor
+            descriptor = None
+        descriptor = _open_path_handle(
+            components[-1],
+            code,
+            directory=False,
+            parent=current_parent,
+        )
+        identity = _windows_handle_identity(descriptor, code, directory=False)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ReleaseSubjectError(code, f"path is not a regular file: {relative}")
+        raw = _read_held_bytes(descriptor, code)
+        after = _windows_handle_identity(descriptor, code, directory=False)
+        if not _identity_matches(after, identity) or after.get("st_size") != len(raw):
+            _drift(f"held observer file changed during read: {relative}")
+        return raw, identity
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        _close_descriptors(directories)
+
+
 def _open_bound_handle(
     path: Path,
     code: str,
     *,
     create_new: bool = False,
     writable: bool = False,
-) -> tuple[int, dict[str, int | str]]:
+) -> tuple[int, dict[str, int | str], _DirectoryLease]:
     components: list[int] = []
     descriptor: int | None = None
+    lease: _DirectoryLease | None = None
     try:
-        components, _identities = _open_directory_components(
+        components, identities = _open_directory_components(
             Path(path).parent,
             code,
             allow_file_create=create_new,
         )
+        lease = _DirectoryLease(
+            Path(os.path.abspath(path)).parent,
+            tuple(components),
+            tuple(dict(identity) for identity in identities),
+        )
+        components = []
         descriptor = _open_path_handle(
             Path(path).name,
             code,
             directory=False,
-            parent=components[-1],
+            parent=lease.handles[-1],
             create_new=create_new,
             writable=writable,
         )
@@ -857,14 +1053,24 @@ def _open_bound_handle(
         observed_mode = os.fstat(descriptor).st_mode
         if not stat.S_ISREG(observed_mode):
             raise ReleaseSubjectError(code, f"path is not a regular file: {path}")
-        return descriptor, identity
+        return descriptor, identity, lease
     except ReleaseSubjectError:
         if descriptor is not None:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if lease is not None:
+            lease.close()
         raise
     except OSError as error:
         if descriptor is not None:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if lease is not None:
+            lease.close()
         raise ReleaseSubjectError(
             code, f"path could not be opened read-only: {path}"
         ) from error
@@ -890,8 +1096,8 @@ def _read_held_regular_file(
     code: str,
     *,
     file_reader: Callable[[Path], tuple[bytes, Mapping[str, object]]] | None = None,
-) -> tuple[bytes, dict[str, int | str], int]:
-    descriptor, identity = _open_bound_handle(path, code)
+) -> tuple[bytes, dict[str, int | str], int, _DirectoryLease]:
+    descriptor, identity, lease = _open_bound_handle(path, code)
     try:
         raw = _read_held_bytes(descriptor, code)
         after_identity = _windows_handle_identity(descriptor, code, directory=False)
@@ -909,21 +1115,54 @@ def _read_held_regular_file(
                 observed_identity, identity
             ):
                 _drift(f"test file reader disagreed with the held observation: {path}")
-        return raw, dict(identity), descriptor
+        return raw, dict(identity), descriptor, lease
     except Exception:
-        os.close(descriptor)
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        lease.close()
         raise
 
 
 def _read_regular_file_once(
     path: Path,
     code: str,
+    *,
+    parent_lease: _DirectoryLease | None = None,
 ) -> tuple[bytes, dict[str, int | str]]:
-    raw, identity, descriptor = _read_held_regular_file(path, code)
+    if parent_lease is not None:
+        parent_lease.assert_stable(code)
+        if Path(os.path.abspath(path)).parent != parent_lease.path:
+            _path_invalid(f"fresh observation escaped its held parent: {path}")
+        descriptor = _open_path_handle(
+            Path(path).name,
+            code,
+            directory=False,
+            parent=parent_lease.handles[-1],
+        )
+        try:
+            identity = _windows_handle_identity(descriptor, code, directory=False)
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                _path_invalid(f"path is not a regular file: {path}")
+            raw = _read_held_bytes(descriptor, code)
+            after_identity = _windows_handle_identity(
+                descriptor, code, directory=False
+            )
+            if not _identity_matches(after_identity, identity) or after_identity.get(
+                "st_size"
+            ) != len(raw):
+                _drift(f"path changed during held fresh read: {path}")
+            parent_lease.assert_stable(code)
+            return raw, identity
+        finally:
+            os.close(descriptor)
+    raw, identity, descriptor, lease = _read_held_regular_file(path, code)
     try:
         return raw, identity
     finally:
         os.close(descriptor)
+        lease.close()
 
 
 @dataclass(frozen=True)
@@ -933,6 +1172,8 @@ class ReleaseSubjectBinding:
     raw_bytes: bytes
     identity: Mapping[str, object]
     handle: int
+    parent_lease: _DirectoryLease | None = None
+    _closed: bool = dataclass_field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if type(self.subject) is not ReleaseSubject:
@@ -955,9 +1196,16 @@ class ReleaseSubjectBinding:
             raise ReleaseSubjectError(
                 "RELEASE_SUBJECT_DRIFT", "binding handle is not an integer"
             )
+        if self.parent_lease is not None and type(self.parent_lease) is not _DirectoryLease:
+            raise ReleaseSubjectError(
+                "RELEASE_SUBJECT_DRIFT", "binding parent lease is not typed"
+            )
 
     def assert_stable(self) -> None:
         try:
+            if self.parent_lease is None:
+                _drift("binding has no retained parent directory lease")
+            self.parent_lease.assert_stable()
             current_identity = _windows_handle_identity(
                 self.handle,
                 "RELEASE_SUBJECT_DRIFT",
@@ -971,7 +1219,13 @@ class ReleaseSubjectBinding:
             fresh_raw, fresh_identity = _read_regular_file_once(
                 self.manifest_path,
                 "RELEASE_SUBJECT_DRIFT",
+                parent_lease=self.parent_lease,
             )
+        except FileNotFoundError as error:
+            raise ReleaseSubjectError(
+                "RELEASE_SUBJECT_DRIFT",
+                f"held manifest is unavailable: {self.manifest_path}",
+            ) from error
         except ReleaseSubjectError:
             raise
         except OSError as error:
@@ -986,10 +1240,15 @@ class ReleaseSubjectBinding:
             _drift(f"manifest changed after binding: {self.manifest_path}")
 
     def close(self) -> None:
+        if self._closed:
+            return
+        object.__setattr__(self, "_closed", True)
         try:
             os.close(self.handle)
         except OSError:
             pass
+        if self.parent_lease is not None:
+            self.parent_lease.close()
 
     def __enter__(self) -> "ReleaseSubjectBinding":
         return self
@@ -1041,6 +1300,67 @@ def _require_subject_absent(path: Path) -> None:
         _close_descriptors(parent_descriptors)
 
 
+def _require_subject_absent_held(
+    path: Path,
+    parent_lease: _DirectoryLease,
+) -> None:
+    """Check the fixed subject name beneath an already-held evidence root."""
+
+    parent_lease.assert_stable()
+    name = Path(path).name
+    parent = parent_lease.handles[-1]
+    if os.name != "nt":
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent)
+        except FileNotFoundError:
+            parent_lease.assert_stable()
+            return
+        except OSError as error:
+            raise ReleaseSubjectError(
+                "RELEASE_SUBJECT_PATH_INVALID",
+                f"subject path could not be observed beneath held evidence root: {path}",
+            ) from error
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                _path_invalid(f"subject path is not a regular file: {path}")
+            raise ReleaseSubjectError(
+                "RELEASE_SUBJECT_EXISTS",
+                f"subject already exists: {path}",
+            )
+        finally:
+            os.close(descriptor)
+    try:
+        descriptor = _open_path_handle(
+            Path(name),
+            "RELEASE_SUBJECT_PATH_INVALID",
+            directory=False,
+            parent=parent,
+            missing_ok=True,
+        )
+    except FileNotFoundError:
+        parent_lease.assert_stable()
+        return
+    try:
+        _windows_handle_identity(
+            descriptor,
+            "RELEASE_SUBJECT_PATH_INVALID",
+            directory=False,
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            _path_invalid(f"subject path is not a regular file: {path}")
+        raise ReleaseSubjectError(
+            "RELEASE_SUBJECT_EXISTS",
+            f"subject already exists: {path}",
+        )
+    finally:
+        os.close(descriptor)
+
+
 def _observer_paths(repository_root: Path) -> tuple[Path, tuple[Path, ...], Path]:
     scripts_root = Path(repository_root).expanduser().resolve(strict=False) / "scripts"
     runner = scripts_root / "run_beta3_live_guard.py"
@@ -1090,6 +1410,8 @@ def _attestor_bundle_sha256(
 
 def _observer_snapshot(
     repository_root: Path,
+    *,
+    repository_lease: _DirectoryLease | None = None,
 ) -> tuple[
     ReleaseFileIdentity,
     tuple[ReleaseFileIdentity, ...],
@@ -1097,21 +1419,64 @@ def _observer_snapshot(
     ReviewedProvenanceIdentity,
 ]:
     runner_path, attestor_paths, reviewed_path = _observer_paths(repository_root)
-    runner_raw, _runner_identity = _read_regular_file_once(
-        runner_path,
-        "RELEASE_SUBJECT_OBSERVER_UNAVAILABLE",
-    )
-    attestor_raw: list[tuple[str, bytes]] = []
-    for name, path in zip(ATTESTOR_FILENAMES, attestor_paths, strict=True):
-        raw, _identity = _read_regular_file_once(
-            path,
+    if repository_lease is None:
+        runner_raw, _runner_identity = _read_regular_file_once(
+            runner_path,
             "RELEASE_SUBJECT_OBSERVER_UNAVAILABLE",
         )
-        attestor_raw.append((name, raw))
-    reviewed_raw, _reviewed_identity = _read_regular_file_once(
-        reviewed_path,
-        "RELEASE_SUBJECT_OBSERVER_UNAVAILABLE",
-    )
+        attestor_raw: list[tuple[str, bytes]] = []
+        for name, path in zip(ATTESTOR_FILENAMES, attestor_paths, strict=True):
+            raw, _identity = _read_regular_file_once(
+                path,
+                "RELEASE_SUBJECT_OBSERVER_UNAVAILABLE",
+            )
+            attestor_raw.append((name, raw))
+        reviewed_raw, _reviewed_identity = _read_regular_file_once(
+            reviewed_path,
+            "RELEASE_SUBJECT_OBSERVER_UNAVAILABLE",
+        )
+    else:
+        repository_lease.assert_stable()
+        scripts_descriptor = _open_path_handle(
+            Path("scripts"),
+            "RELEASE_SUBJECT_OBSERVER_UNAVAILABLE",
+            directory=True,
+            parent=repository_lease.handles[-1],
+        )
+        try:
+            scripts_identity = _windows_handle_identity(
+                scripts_descriptor,
+                "RELEASE_SUBJECT_OBSERVER_UNAVAILABLE",
+                directory=True,
+            )
+            runner_raw, _runner_identity = _open_relative_regular_file(
+                scripts_descriptor,
+                "run_beta3_live_guard.py",
+                "RELEASE_SUBJECT_OBSERVER_UNAVAILABLE",
+            )
+            attestor_raw = []
+            for name in ATTESTOR_FILENAMES:
+                raw, _identity = _open_relative_regular_file(
+                    scripts_descriptor,
+                    name,
+                    "RELEASE_SUBJECT_OBSERVER_UNAVAILABLE",
+                )
+                attestor_raw.append((name, raw))
+            reviewed_raw, _reviewed_identity = _open_relative_regular_file(
+                scripts_descriptor,
+                "beta3_reviewed_provenance.json",
+                "RELEASE_SUBJECT_OBSERVER_UNAVAILABLE",
+            )
+            after_scripts_identity = _windows_handle_identity(
+                scripts_descriptor,
+                "RELEASE_SUBJECT_OBSERVER_UNAVAILABLE",
+                directory=True,
+            )
+            if not _identity_matches(after_scripts_identity, scripts_identity):
+                _drift("observer scripts directory changed during read")
+        finally:
+            os.close(scripts_descriptor)
+        repository_lease.assert_stable()
     runner = ReleaseFileIdentity(
         module="run_beta3_live_guard",
         path=_canonical_path(runner_path),
@@ -1145,6 +1510,8 @@ def _validate_manifest_and_observer_bytes(
     manifest_path: Path,
     expected_repository_root: Path,
     expected_evidence_root: Path,
+    *,
+    repository_lease: _DirectoryLease,
 ) -> ReleaseSubject:
     if type(raw) is not bytes or not isinstance(identity, Mapping):
         raise ReleaseSubjectError(
@@ -1160,6 +1527,7 @@ def _validate_manifest_and_observer_bytes(
     )
     runner, attestors, bundle_sha256, reviewed = _observer_snapshot(
         expected_repository_root,
+        repository_lease=repository_lease,
     )
     if subject.runner != runner:
         _observer_invalid("runner identity does not match held bytes")
@@ -1184,11 +1552,23 @@ def load_release_subject_for_test(
 ) -> ReleaseSubjectBinding:
     manifest_path = Path(path)
     _validate_manifest_path(manifest_path, expected_evidence_root)
-    raw, identity, handle = _read_held_regular_file(
+    raw, identity, handle, parent_lease = _read_held_regular_file(
         manifest_path,
         "RELEASE_SUBJECT_UNAVAILABLE",
         file_reader=file_reader,
     )
+    try:
+        repository_lease = _directory_lease(
+            Path(expected_repository_root),
+            "RELEASE_SUBJECT_REPOSITORY_INVALID",
+        )
+    except Exception:
+        try:
+            os.close(handle)
+        except OSError:
+            pass
+        parent_lease.close()
+        raise
     try:
         subject = _validate_manifest_and_observer_bytes(
             raw,
@@ -1196,20 +1576,49 @@ def load_release_subject_for_test(
             manifest_path,
             expected_repository_root,
             expected_evidence_root,
+            repository_lease=repository_lease,
         )
     except Exception:
-        os.close(handle)
+        try:
+            os.close(handle)
+        except OSError:
+            pass
+        parent_lease.close()
+        repository_lease.close()
         raise
-    return ReleaseSubjectBinding(subject, manifest_path, raw, identity, handle)
+    repository_lease.close()
+    try:
+        return ReleaseSubjectBinding(
+            subject, manifest_path, raw, identity, handle, parent_lease
+        )
+    except Exception:
+        try:
+            os.close(handle)
+        except OSError:
+            pass
+        parent_lease.close()
+        raise
 
 
 def load_production_release_subject() -> ReleaseSubjectBinding:
     path = production_subject_path()
     _validate_manifest_path(path, EVIDENCE_ROOT)
-    raw, identity, handle = _read_held_regular_file(
+    raw, identity, handle, parent_lease = _read_held_regular_file(
         path,
         "RELEASE_SUBJECT_UNAVAILABLE",
     )
+    try:
+        repository_lease = _directory_lease(
+            REPOSITORY_ROOT,
+            "RELEASE_SUBJECT_REPOSITORY_INVALID",
+        )
+    except Exception:
+        try:
+            os.close(handle)
+        except OSError:
+            pass
+        parent_lease.close()
+        raise
     try:
         subject = _validate_manifest_and_observer_bytes(
             raw,
@@ -1217,11 +1626,26 @@ def load_production_release_subject() -> ReleaseSubjectBinding:
             path,
             REPOSITORY_ROOT,
             EVIDENCE_ROOT,
+            repository_lease=repository_lease,
         )
     except Exception:
-        os.close(handle)
+        try:
+            os.close(handle)
+        except OSError:
+            pass
+        parent_lease.close()
+        repository_lease.close()
         raise
-    return ReleaseSubjectBinding(subject, path, raw, identity, handle)
+    repository_lease.close()
+    try:
+        return ReleaseSubjectBinding(subject, path, raw, identity, handle, parent_lease)
+    except Exception:
+        try:
+            os.close(handle)
+        except OSError:
+            pass
+        parent_lease.close()
+        raise
 
 
 def _write_all(descriptor: int, raw: bytes) -> None:
@@ -1265,19 +1689,30 @@ def _write_subject_exclusive(
         )
     _validate_manifest_path(manifest_path, Path(subject.evidence_root))
     raw = canonical_json_bytes(subject.canonical())
+    generation_lease = subject._take_generation_lease()
     parent_descriptors: list[int] = []
     descriptor: int | None = None
     try:
-        parent_descriptors, _parent_identities = _open_directory_components(
-            manifest_path.parent,
-            "RELEASE_SUBJECT_PATH_INVALID",
-            allow_file_create=True,
+        if generation_lease is not None:
+            generation_lease.assert_stable()
+            evidence_parent = generation_lease.evidence
+        else:
+            evidence_parent = None
+            parent_descriptors, _parent_identities = _open_directory_components(
+                manifest_path.parent,
+                "RELEASE_SUBJECT_PATH_INVALID",
+                allow_file_create=True,
+            )
+        parent = (
+            evidence_parent.handles[-1]
+            if evidence_parent is not None
+            else parent_descriptors[-1]
         )
         descriptor = _open_path_handle(
             Path(manifest_path.name),
             "RELEASE_SUBJECT_PATH_INVALID",
             directory=False,
-            parent=parent_descriptors[-1],
+            parent=parent,
             create_new=True,
             writable=True,
         )
@@ -1288,6 +1723,8 @@ def _write_subject_exclusive(
                 "RELEASE_SUBJECT_WRITE_FAILED",
                 "subject write readback did not match canonical bytes",
             )
+        if generation_lease is not None:
+            generation_lease.assert_stable()
         # Keep the newly-created handle open while the runtime loader acquires
         # its own held read boundary.  Windows sharing excludes delete/rename.
         if runtime_loader is None:
@@ -1303,6 +1740,8 @@ def _write_subject_exclusive(
         if descriptor is not None:
             os.close(descriptor)
         _close_descriptors(parent_descriptors)
+        if generation_lease is not None:
+            generation_lease.close()
 
 
 def write_subject_for_test_exclusive(
@@ -1336,7 +1775,11 @@ def write_production_subject_exclusive(
     )
 
 
-def source_tree_digest(repository_root: Path) -> str:
+def source_tree_digest(
+    repository_root: Path,
+    *,
+    root_handle: int | None = None,
+) -> str:
     """Return the existing V8 audited source-tree digest for a fixed root."""
 
     root = Path(repository_root).expanduser().resolve(strict=False)
@@ -1358,7 +1801,7 @@ def source_tree_digest(repository_root: Path) -> str:
             except ValueError:
                 pass
     try:
-        value = digest(root)
+        value = digest(root, root_handle=root_handle)
     except Exception as error:
         raise ReleaseSubjectError(
             "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
@@ -1372,11 +1815,18 @@ def source_tree_digest(repository_root: Path) -> str:
     return value
 
 
-def _default_git_output(args: Sequence[str], code: str) -> str:
+def _default_git_output(
+    args: Sequence[str],
+    code: str,
+    *,
+    repository_lease: _DirectoryLease | None = None,
+) -> str:
+    if repository_lease is not None:
+        repository_lease.assert_stable(code)
     try:
         result = subprocess.run(
             ["git", *args],
-            cwd=REPOSITORY_ROOT,
+            cwd=repository_lease.path if repository_lease is not None else REPOSITORY_ROOT,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
             capture_output=True,
             text=True,
@@ -1391,6 +1841,8 @@ def _default_git_output(args: Sequence[str], code: str) -> str:
         raise ReleaseSubjectError(code, detail)
     if type(result.stdout) is not str:
         raise ReleaseSubjectError(code, "git output was not exact text")
+    if repository_lease is not None:
+        repository_lease.assert_stable(code)
     return result.stdout
 
 
@@ -1411,17 +1863,24 @@ def _unexpected_status_records(output: str) -> tuple[str, ...]:
     return tuple(unexpected)
 
 
-def _git_snapshot() -> tuple[str, str]:
+def _git_snapshot(
+    *,
+    repository_lease: _DirectoryLease | None = None,
+) -> tuple[str, str]:
     head = _default_git_output(
-        ("rev-parse", "--verify", "HEAD"), "RELEASE_SUBJECT_HEAD_UNAVAILABLE"
+        ("rev-parse", "--verify", "HEAD"),
+        "RELEASE_SUBJECT_HEAD_UNAVAILABLE",
+        repository_lease=repository_lease,
     ).strip()
     tree = _default_git_output(
         ("rev-parse", "--verify", "HEAD^{tree}"),
         "RELEASE_SUBJECT_TREE_UNAVAILABLE",
+        repository_lease=repository_lease,
     ).strip()
     origin_main = _default_git_output(
         ("rev-parse", "--verify", REMOTE_REF),
         "RELEASE_SUBJECT_ORIGIN_UNAVAILABLE",
+        repository_lease=repository_lease,
     ).strip()
     if origin_main != head:
         raise ReleaseSubjectError(
@@ -1431,6 +1890,7 @@ def _git_snapshot() -> tuple[str, str]:
     status = _default_git_output(
         ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
         "RELEASE_SUBJECT_STATUS_UNAVAILABLE",
+        repository_lease=repository_lease,
     )
     unexpected = _unexpected_status_records(status)
     if unexpected:
@@ -1451,50 +1911,101 @@ def generate_production_subject() -> ReleaseSubject:
 
     repository_root = Path(REPOSITORY_ROOT).expanduser().resolve(strict=False)
     evidence_root = Path(EVIDENCE_ROOT).expanduser().resolve(strict=False)
-    repository_descriptors: list[int] = []
-    evidence_descriptors: list[int] = []
+    repository_lease: _DirectoryLease | None = None
+    evidence_lease: _DirectoryLease | None = None
     try:
-        repository_descriptors, _ = _open_directory_components(
+        repository_lease = _directory_lease(
             repository_root,
             "RELEASE_SUBJECT_REPOSITORY_INVALID",
         )
-        evidence_descriptors, _ = _open_directory_components(
+        evidence_lease = _directory_lease(
             evidence_root,
             "RELEASE_SUBJECT_EVIDENCE_INVALID",
         )
-        _require_subject_absent(evidence_root / RELEASE_SUBJECT_FILENAME)
+        generation_lease = _GenerationLease(repository_lease, evidence_lease)
+        generation_lease.assert_stable()
+        _require_subject_absent_held(
+            evidence_root / RELEASE_SUBJECT_FILENAME,
+            evidence_lease,
+        )
+        generation_lease.assert_stable()
+        head, tree = _git_snapshot(repository_lease=repository_lease)
+        generation_lease.assert_stable()
+        audited_source_tree_digest = source_tree_digest(
+            repository_root,
+            root_handle=repository_lease.handles[-1],
+        )
+        generation_lease.assert_stable()
+        runner, attestors, bundle_sha256, reviewed = _observer_snapshot(
+            repository_root,
+            repository_lease=repository_lease,
+        )
+        generation_lease.assert_stable()
+        final_head, final_tree = _git_snapshot(repository_lease=repository_lease)
+        if (final_head, final_tree) != (head, tree):
+            raise ReleaseSubjectError(
+                "RELEASE_SUBJECT_REPOSITORY_DRIFT",
+                "Git revision changed during subject generation",
+            )
+        final_source_digest = source_tree_digest(
+            repository_root,
+            root_handle=repository_lease.handles[-1],
+        )
+        if final_source_digest != audited_source_tree_digest:
+            raise ReleaseSubjectError(
+                "RELEASE_SUBJECT_REPOSITORY_DRIFT",
+                "source tree changed during subject generation",
+            )
+        final_runner, final_attestors, final_bundle, final_reviewed = _observer_snapshot(
+            repository_root,
+            repository_lease=repository_lease,
+        )
+        if (
+            final_runner != runner
+            or final_attestors != attestors
+            or final_bundle != bundle_sha256
+            or final_reviewed != reviewed
+        ):
+            raise ReleaseSubjectError(
+                "RELEASE_SUBJECT_REPOSITORY_DRIFT",
+                "observer inputs changed during subject generation",
+            )
+        generation_lease.assert_stable()
+        body: dict[str, object] = {
+            "schema": RELEASE_SUBJECT_SCHEMA,
+            "repository": REPOSITORY,
+            "repository_root": _canonical_path(repository_root),
+            "evidence_root": _canonical_path(evidence_root),
+            "merged_main_sha": head,
+            "merged_main_git_tree": tree,
+            "audited_source_tree_digest": audited_source_tree_digest,
+            "remote_ref": REMOTE_REF,
+            "runner": runner.canonical(),
+            "attestors": [attestor.canonical() for attestor in attestors],
+            "attestor_bundle_sha256": bundle_sha256,
+            "reviewed_provenance": reviewed.canonical(),
+        }
+        subject = ReleaseSubject(
+            schema=RELEASE_SUBJECT_SCHEMA,
+            repository=REPOSITORY,
+            repository_root=_canonical_path(repository_root),
+            evidence_root=_canonical_path(evidence_root),
+            merged_main_sha=head,
+            merged_main_git_tree=tree,
+            audited_source_tree_digest=audited_source_tree_digest,
+            remote_ref=REMOTE_REF,
+            runner=runner,
+            attestors=attestors,  # type: ignore[arg-type]
+            attestor_bundle_sha256=bundle_sha256,
+            reviewed_provenance=reviewed,
+            subject_digest=release_subject_digest(body),
+        )
+        object.__setattr__(subject, "_generation_lease", generation_lease)
+        repository_lease = None
+        evidence_lease = None
+        return subject
     finally:
-        _close_descriptors(repository_descriptors)
-        _close_descriptors(evidence_descriptors)
-    head, tree = _git_snapshot()
-    audited_source_tree_digest = source_tree_digest(repository_root)
-    runner, attestors, bundle_sha256, reviewed = _observer_snapshot(repository_root)
-    body: dict[str, object] = {
-        "schema": RELEASE_SUBJECT_SCHEMA,
-        "repository": REPOSITORY,
-        "repository_root": _canonical_path(repository_root),
-        "evidence_root": _canonical_path(evidence_root),
-        "merged_main_sha": head,
-        "merged_main_git_tree": tree,
-        "audited_source_tree_digest": audited_source_tree_digest,
-        "remote_ref": REMOTE_REF,
-        "runner": runner.canonical(),
-        "attestors": [attestor.canonical() for attestor in attestors],
-        "attestor_bundle_sha256": bundle_sha256,
-        "reviewed_provenance": reviewed.canonical(),
-    }
-    return ReleaseSubject(
-        schema=RELEASE_SUBJECT_SCHEMA,
-        repository=REPOSITORY,
-        repository_root=_canonical_path(repository_root),
-        evidence_root=_canonical_path(evidence_root),
-        merged_main_sha=head,
-        merged_main_git_tree=tree,
-        audited_source_tree_digest=audited_source_tree_digest,
-        remote_ref=REMOTE_REF,
-        runner=runner,
-        attestors=attestors,  # type: ignore[arg-type]
-        attestor_bundle_sha256=bundle_sha256,
-        reviewed_provenance=reviewed,
-        subject_digest=release_subject_digest(body),
-    )
+        if evidence_lease is not None:
+            evidence_lease.close()
+        if repository_lease is not None:
+            repository_lease.close()

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import stat
 
 import pytest
 
@@ -586,6 +587,275 @@ def test_binding_rejects_delete_recreate_manifest_identity_change(tmp_path: Path
         binding.close()
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX-only parent replacement; Windows handle-sharing behavior stays skipped",
+)
+def test_binding_rejects_parent_delete_recreate_after_binding(tmp_path: Path):
+    manifest, binding = _load_binding_fixture(tmp_path)
+    parent = manifest.parent
+    displaced = tmp_path / "evidence-displaced"
+    parent.rename(displaced)
+    parent.mkdir()
+    try:
+        with pytest.raises(ReleaseSubjectError) as error:
+            binding.assert_stable()
+        assert error.value.code == "RELEASE_SUBJECT_DRIFT"
+    finally:
+        binding.close()
+        parent.rmdir()
+        displaced.rename(parent)
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX-only descriptor-relative observation; Windows handle-sharing behavior stays skipped",
+)
+def test_binding_fresh_read_uses_the_held_parent_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    manifest, binding = _load_binding_fixture(tmp_path)
+    parent_fd = os.open(
+        manifest.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    expected_parent_identity = os.fstat(parent_fd)
+    observed_parent_identities: list[tuple[int, int]] = []
+    original_open = release_subject.os.open
+
+    def observing_open(*args: object, **kwargs: object) -> int:
+        dir_fd = kwargs.get("dir_fd")
+        path = args[0] if args else None
+        if dir_fd is not None and path is not None:
+            try:
+                observed = os.fstat(int(dir_fd))
+            except OSError:
+                pass
+            else:
+                if Path(path).name == manifest.name:
+                    observed_parent_identities.append((observed.st_dev, observed.st_ino))
+        return original_open(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(release_subject.os, "open", observing_open)
+    try:
+        binding.assert_stable()
+    finally:
+        os.close(parent_fd)
+        binding.close()
+
+    assert observed_parent_identities == [
+        (expected_parent_identity.st_dev, expected_parent_identity.st_ino)
+    ]
+
+
+def test_binding_close_closes_leaf_and_parent_descriptors_at_most_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _manifest, binding = _load_binding_fixture(tmp_path)
+    close_events: list[tuple[int, bool]] = []
+    original_close = release_subject.os.close
+
+    def observing_close(descriptor: int) -> None:
+        try:
+            is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+        except OSError:
+            is_directory = False
+        close_events.append((descriptor, is_directory))
+        original_close(descriptor)
+
+    monkeypatch.setattr(release_subject.os, "close", observing_close)
+    binding.close()
+    binding.close()
+
+    close_counts: dict[int, int] = {}
+    for descriptor, _is_directory in close_events:
+        close_counts[descriptor] = close_counts.get(descriptor, 0) + 1
+    assert close_events
+    assert sum(not is_directory for _descriptor, is_directory in close_events) == 1
+    assert sum(is_directory for _descriptor, is_directory in close_events) >= 1
+    assert all(count <= 1 for count in close_counts.values())
+
+
+def test_loader_exception_cleanup_does_not_close_any_descriptor_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    manifest = _write_valid_subject_fixture(tmp_path)
+    original_open_bound = release_subject._open_path_handle
+    original_close = release_subject.os.close
+
+    class OpenHandle:
+        def __init__(self, generation: int) -> None:
+            self.generation = generation
+            self.close_count = 0
+
+    opened_handles: list[OpenHandle] = []
+    active_by_descriptor: dict[int, list[OpenHandle]] = {}
+    close_events: list[OpenHandle] = []
+    unmatched_close_events: list[int] = []
+
+    def tracking_open(*args: object, **kwargs: object) -> int:
+        descriptor = original_open_bound(*args, **kwargs)  # type: ignore[arg-type]
+        handle = OpenHandle(len(opened_handles) + 1)
+        opened_handles.append(handle)
+        active_by_descriptor.setdefault(descriptor, []).append(handle)
+        return descriptor
+
+    def tracking_close(descriptor: int) -> None:
+        handles = active_by_descriptor.get(descriptor)
+        if not handles:
+            unmatched_close_events.append(descriptor)
+            try:
+                original_close(descriptor)
+            except OSError:
+                pass
+            return
+        handle = handles.pop()
+        if not handles:
+            del active_by_descriptor[descriptor]
+        handle.close_count += 1
+        close_events.append(handle)
+        try:
+            original_close(descriptor)
+        except OSError:
+            pass
+
+    def fail_binding_construction(*_args: object, **_kwargs: object) -> object:
+        raise ReleaseSubjectError(
+            "RELEASE_SUBJECT_SCHEMA_INVALID", "forced loader failure"
+        )
+
+    monkeypatch.setattr(release_subject, "_open_path_handle", tracking_open)
+    monkeypatch.setattr(release_subject.os, "close", tracking_close)
+    monkeypatch.setattr(
+        release_subject,
+        "ReleaseSubjectBinding",
+        fail_binding_construction,
+    )
+
+    try:
+        with pytest.raises(ReleaseSubjectError) as error:
+            load_release_subject_for_test(
+                manifest,
+                expected_repository_root=tmp_path / "repository",
+                expected_evidence_root=tmp_path / "evidence",
+            )
+
+        assert error.value.code == "RELEASE_SUBJECT_SCHEMA_INVALID"
+        assert opened_handles
+        assert not unmatched_close_events
+        assert not active_by_descriptor
+        assert len(close_events) == len(opened_handles)
+        assert all(handle.close_count == 1 for handle in opened_handles)
+        assert sorted(handle.generation for handle in close_events) == list(
+            range(1, len(opened_handles) + 1)
+        )
+    finally:
+        for descriptor in tuple(active_by_descriptor):
+            try:
+                original_close(descriptor)
+            except OSError:
+                pass
+
+
+def test_loader_cleanup_continues_after_leaf_close_oserror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    manifest = _write_valid_subject_fixture(tmp_path)
+    (tmp_path / "repository" / "scripts" / "run_beta3_live_guard.py").write_bytes(
+        b"changed runner bytes\n"
+    )
+
+    original_open_path_handle = release_subject._open_path_handle
+    original_read_held_regular_file = release_subject._read_held_regular_file
+    original_directory_lease = release_subject._directory_lease
+    original_close = release_subject.os.close
+
+    class Descriptor:
+        def __init__(self, descriptor: int) -> None:
+            self.descriptor = descriptor
+            self.active = True
+
+    active_by_descriptor: dict[int, list[Descriptor]] = {}
+    descriptors: list[Descriptor] = []
+    close_events: list[Descriptor] = []
+    leaf_descriptor: Descriptor | None = None
+    parent_descriptors: tuple[Descriptor, ...] = ()
+    repository_leases: list[tuple[object, tuple[Descriptor, ...]]] = []
+
+    def current_descriptor(descriptor: int) -> Descriptor:
+        return active_by_descriptor[descriptor][-1]
+
+    def tracking_open(*args: object, **kwargs: object) -> int:
+        descriptor = original_open_path_handle(*args, **kwargs)  # type: ignore[arg-type]
+        record = Descriptor(descriptor)
+        descriptors.append(record)
+        active_by_descriptor.setdefault(descriptor, []).append(record)
+        return descriptor
+
+    def tracking_read(*args: object, **kwargs: object):
+        nonlocal leaf_descriptor, parent_descriptors
+        result = original_read_held_regular_file(*args, **kwargs)  # type: ignore[arg-type]
+        leaf_descriptor = current_descriptor(result[2])
+        parent_descriptors = tuple(
+            current_descriptor(descriptor) for descriptor in result[3].handles
+        )
+        return result
+
+    def tracking_directory_lease(*args: object, **kwargs: object):
+        lease = original_directory_lease(*args, **kwargs)  # type: ignore[arg-type]
+        repository_leases.append(
+            (lease, tuple(current_descriptor(descriptor) for descriptor in lease.handles))
+        )
+        return lease
+
+    def failing_close(descriptor: int) -> None:
+        record = current_descriptor(descriptor)
+        close_events.append(record)
+        if record is leaf_descriptor:
+            raise OSError("forced leaf close failure")
+        active_by_descriptor[descriptor].pop()
+        if not active_by_descriptor[descriptor]:
+            del active_by_descriptor[descriptor]
+        original_close(descriptor)
+        record.active = False
+
+    monkeypatch.setattr(release_subject, "_open_path_handle", tracking_open)
+    monkeypatch.setattr(
+        release_subject,
+        "_read_held_regular_file",
+        tracking_read,
+    )
+    monkeypatch.setattr(release_subject, "_directory_lease", tracking_directory_lease)
+    monkeypatch.setattr(release_subject.os, "close", failing_close)
+
+    try:
+        with pytest.raises(ReleaseSubjectError) as error:
+            load_release_subject_for_test(
+                manifest,
+                expected_repository_root=tmp_path / "repository",
+                expected_evidence_root=tmp_path / "evidence",
+            )
+
+        assert error.value.code == "RELEASE_SUBJECT_PROVENANCE_MISMATCH"
+        assert leaf_descriptor is not None
+        assert close_events.count(leaf_descriptor) == 1
+        assert parent_descriptors
+        assert repository_leases
+        repository_lease, repository_descriptors = repository_leases[0]
+        assert getattr(repository_lease, "_closed") is True
+        assert all(not descriptor.active for descriptor in parent_descriptors)
+        assert all(not descriptor.active for descriptor in repository_descriptors)
+    finally:
+        for record in descriptors:
+            if record.active:
+                original_close(record.descriptor)
+                record.active = False
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows held-handle sharing contract")
 def test_windows_held_binding_blocks_manifest_replace(tmp_path: Path):
     manifest, binding = _load_binding_fixture(tmp_path)
@@ -615,16 +885,50 @@ def test_binding_rejects_identity_only_fresh_observation_mismatch(
         fresh_identity["st_ino"] = int(fresh_identity["st_ino"]) + 1
 
     def same_bytes_with_different_identity(
-        path: Path, code: str
+        path: Path,
+        code: str,
+        *,
+        parent_lease: object = None,
     ) -> tuple[bytes, dict[str, object]]:
         assert path == manifest
         assert code == "RELEASE_SUBJECT_DRIFT"
+        assert parent_lease is not None
         return binding.raw_bytes, fresh_identity
 
     monkeypatch.setattr(
         release_subject,
         "_read_regular_file_once",
         same_bytes_with_different_identity,
+    )
+    try:
+        with pytest.raises(ReleaseSubjectError) as error:
+            binding.assert_stable()
+        assert error.value.code == "RELEASE_SUBJECT_DRIFT"
+    finally:
+        binding.close()
+
+
+def test_binding_maps_missing_fresh_observation_to_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    manifest, binding = _load_binding_fixture(tmp_path)
+
+    def missing_fresh_observation(
+        path: Path,
+        code: str,
+        *,
+        parent_lease: object = None,
+    ) -> tuple[bytes, dict[str, object]]:
+        assert path == manifest
+        assert code == "RELEASE_SUBJECT_DRIFT"
+        assert parent_lease is not None
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(
+        release_subject,
+        "_read_regular_file_once",
+        missing_fresh_observation,
     )
     try:
         with pytest.raises(ReleaseSubjectError) as error:
