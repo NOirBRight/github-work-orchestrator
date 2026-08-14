@@ -2953,7 +2953,12 @@ def _unexpected_status_records(output: str) -> tuple[str, ...]:
             unexpected.append(record)
             continue
         status = record[:2]
-        path = record[3:].replace("\\", "/")
+        path = record[3:]
+        if os.name == "nt":
+            path = path.replace("\\", "/")
+        elif os.name != "posix":
+            unexpected.append(record)
+            continue
         if status != "??" or not (
             path == ".codex-tmp" or path.startswith(".codex-tmp/")
         ):
