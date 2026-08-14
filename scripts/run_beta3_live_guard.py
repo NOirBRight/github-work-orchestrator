@@ -2400,7 +2400,12 @@ def parse_porcelain_z_status(output: str | bytes) -> tuple[str, ...]:
         if not record:
             continue
         status, raw_path = _decode_status_record(record)
-        path = _unquote_status_path(raw_path).replace("\\", "/")
+        path = _unquote_status_path(raw_path)
+        if os.name == "nt":
+            path = path.replace("\\", "/")
+        elif os.name != "posix":
+            unexpected.append(record)
+            continue
         if status != "??" or not (
             path == ".codex-tmp" or path.startswith(".codex-tmp/")
         ):
