@@ -112,6 +112,7 @@ _TARGET_BRANCH = "main"
 _ROOT_STANDARD_TICKETS = ("issue:101", "issue:102", "issue:103")
 _ROOT_STRICT_TICKET = "issue:104"
 _ROOT_TICKET_KEYS = (*_ROOT_STANDARD_TICKETS, _ROOT_STRICT_TICKET)
+_LAST_ROOT_PUBLIC_ADVANCER_WAKE_REFS: tuple[str | None, ...] = ()
 
 
 def _campaign_key(run_id: str, scenario: str) -> str:
@@ -2009,11 +2010,15 @@ class _RootWatchdogEventSource:
 
 @dataclass(frozen=True)
 class _PublicAdvance:
+    wake_refs: list[str | None] | None = None
+
     def advance(
         self,
         handle: CampaignHandle,
         wake_ref: str | None = None,
     ):
+        if self.wake_refs is not None:
+            self.wake_refs.append(wake_ref)
         return gwo_v8.advance(handle, wake_ref)
 
 
@@ -2638,6 +2643,9 @@ def _run_root_acceptance_in_root(
     root: Path,
     run_id: str,
 ) -> dict[str, Any]:
+    global _LAST_ROOT_PUBLIC_ADVANCER_WAKE_REFS
+    _LAST_ROOT_PUBLIC_ADVANCER_WAKE_REFS = ()
+
     harness, handle = _install_harness(Path(root), run_id, "root")
     initial = gwo_v8.inspect(handle)
     transcript: list[dict[str, Any]] = [
@@ -2673,6 +2681,8 @@ def _run_root_acceptance_in_root(
     initial_outcome = advance_with_readback("root:initial")
     initial_after_advance = inspect_with_readback()
 
+    public_advancer_wake_refs: list[str | None] = []
+    public_advancer = _PublicAdvance(public_advancer_wake_refs)
     watchdog_source = _RootWatchdogEventSource(handle)
     watchdog = CampaignWatchdog(
         store_path=Path(root) / "sqlite" / "watchdog.sqlite3",
@@ -2680,9 +2690,10 @@ def _run_root_acceptance_in_root(
             "runtime": watchdog_source,
         },
         campaign_source=harness.kernel,
-        advancer=_PublicAdvance(),
+        advancer=public_advancer,
     )
     lost_wake_outcomes = watchdog.run_once("2026-08-11T00:00:01+00:00")
+    _LAST_ROOT_PUBLIC_ADVANCER_WAKE_REFS = tuple(public_advancer_wake_refs)
     lost_wake = _outcome_record(lost_wake_outcomes[-1])
     transcript.append(
         {
