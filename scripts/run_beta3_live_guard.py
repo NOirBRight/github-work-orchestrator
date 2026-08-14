@@ -71,9 +71,6 @@ RUNTIME_CONFIG_PATH = Path(r"C:\Users\noirb\.orch\config.json")
 EXPECTED_FRESH_RECEIPT_RUNBOOK_SHA256 = (
     "0378be64a95aa4eeb09626c120254ad8105a1a5cc2dfd1f60ddf089dfba821f2"
 )
-EXPECTED_FRESH_RECEIPT_SHA256 = (
-    "46814d166c857e3d7f847b7da6f3da5b39c394b42402b2f1d2cdd61d78ce7781"
-)
 EXPECTED_FRESH_RECEIPT_SCHEMA_DIGEST = (
     "69ac6babce5db564fcc60fc5dd97feb0635911e07955234098210ddd97a93aed"
 )
@@ -340,7 +337,7 @@ class RunnerConfig:
     package_names: tuple[str, ...] = PACKAGE_NAMES
     expected_store_tables: tuple[str, ...] = EXPECTED_STORE_TABLES
     expected_fresh_receipt_runbook_sha256: str = EXPECTED_FRESH_RECEIPT_RUNBOOK_SHA256
-    expected_fresh_receipt_sha256: str | None = EXPECTED_FRESH_RECEIPT_SHA256
+    expected_fresh_receipt_sha256: str | None = None
     expected_fresh_receipt_schema_digest: str | None = None
     expected_fresh_receipt_generation_rows: tuple[tuple[str, str], ...] | None = None
     expected_fresh_receipt_row_counts: tuple[tuple[str, int], ...] | None = None
@@ -389,7 +386,6 @@ DEFAULT_CONFIG = RunnerConfig(
     expected_fresh_receipt_schema_digest=EXPECTED_FRESH_RECEIPT_SCHEMA_DIGEST,
     expected_fresh_receipt_generation_rows=EXPECTED_FRESH_RECEIPT_GENERATION_ROWS,
     expected_fresh_receipt_row_counts=tuple(EXPECTED_FRESH_RECEIPT_ROW_COUNTS.items()),
-    expected_fresh_receipt_sha256=EXPECTED_FRESH_RECEIPT_SHA256,
 )
 
 
@@ -6173,6 +6169,7 @@ def _bind_runner_config_from_subject(subject: object) -> RunnerConfig:
         audited_source_tree_digest=subject.audited_source_tree_digest,
         release_subject_digest=subject.subject_digest,
         fresh_receipt=evidence_root / DEFAULT_CONFIG.fresh_receipt.name,
+        expected_fresh_receipt_sha256=getattr(subject, "fresh_receipt_sha256", None),
         report_path=evidence_root / DEFAULT_CONFIG.report_path.name,
         evidence_path=evidence_root / DEFAULT_CONFIG.evidence_path.name,
         gateway_store_path=evidence_root / DEFAULT_CONFIG.gateway_store_path.name,

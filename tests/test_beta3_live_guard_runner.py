@@ -3640,10 +3640,49 @@ def test_attestor_observation_rejects_same_identity_package_content_drift(tmp_pa
     assert not config.evidence_path.exists()
 
 
-def test_default_config_pins_the_authoritative_fresh_receipt_digest():
-    assert runner.DEFAULT_CONFIG.expected_fresh_receipt_sha256 == (
-        "46814d166c857e3d7f847b7da6f3da5b39c394b42402b2f1d2cdd61d78ce7781"
+def test_default_config_does_not_pin_a_fresh_receipt_digest():
+    assert runner.DEFAULT_CONFIG.expected_fresh_receipt_sha256 is None
+
+
+def test_production_subject_binds_nonlegacy_fresh_receipt_digest(tmp_path, monkeypatch):
+    config = _fixture_config(tmp_path)
+    receipt_digest = _sha256(config.fresh_receipt)
+    legacy_digest = "46814d166c857e3d7f847b7da6f3da5b39c394b42402b2f1d2cdd61d78ce7781"
+    assert receipt_digest != legacy_digest
+
+    class ReleaseSubject:
+        pass
+
+    subject = ReleaseSubject()
+    subject.repository = config.repository
+    subject.repository_root = str(config.repository_root)
+    subject.evidence_root = str(config.evidence_root)
+    subject.merged_main_sha = config.merged_main_sha
+    subject.merged_main_git_tree = config.merged_main_git_tree
+    subject.audited_source_tree_digest = config.audited_source_tree_digest
+    subject.subject_digest = config.release_subject_digest
+    subject.fresh_receipt_sha256 = receipt_digest
+
+    monkeypatch.setattr(
+        runner,
+        "_production_release_subject_module",
+        lambda: SimpleNamespace(ReleaseSubject=ReleaseSubject),
     )
+    monkeypatch.setattr(
+        runner,
+        "DEFAULT_CONFIG",
+        replace(config, expected_fresh_receipt_sha256=legacy_digest),
+    )
+    monkeypatch.setattr(runner, "REPOSITORY", config.repository)
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", config.repository_root)
+    monkeypatch.setattr(runner, "EVIDENCE_ROOT", config.evidence_root)
+
+    bound_config = runner._bind_runner_config_from_subject(subject)
+    receipt, bound_digest = runner._validate_receipt(bound_config)
+
+    assert bound_config.expected_fresh_receipt_sha256 == receipt_digest
+    assert bound_digest == receipt_digest
+    assert receipt["source_main_sha"] == config.merged_main_sha
 
 
 def test_actual_skill_manifest_contract_is_accepted_by_preflight(tmp_path):
