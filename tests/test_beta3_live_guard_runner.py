@@ -1761,6 +1761,26 @@ def test_parse_porcelain_z_status_rejects_posix_backslash_name_outside_codex_tmp
     assert runner.parse_porcelain_z_status(record + "\0") == (record,)
 
 
+@pytest.mark.parametrize(
+    "path",
+    (
+        ".codex-tmp/../outside.txt",
+        ".codex-tmp/nested/../outside.txt",
+        "/outside.txt",
+    ),
+)
+def test_parse_porcelain_z_status_rejects_codex_tmp_allowlist_escape(path):
+    record = f"?? {path}"
+
+    assert runner.parse_porcelain_z_status(record + "\0") == (record,)
+
+
+def test_parse_porcelain_z_status_accepts_nested_codex_tmp_path():
+    record = "?? .codex-tmp/evidence/receipt.json"
+
+    assert runner.parse_porcelain_z_status(record + "\0") == ()
+
+
 def test_preflight_rejects_identity_and_hash_drift(tmp_path):
     config = _fixture_config(tmp_path)
     config.fresh_store.write_bytes(b"drift")
@@ -3754,6 +3774,129 @@ def test_production_subject_binds_fresh_store_identity_from_bound_receipt(
     )
 
 
+def test_dynamic_store_receipt_binding_precedes_store_access_and_reaches_attestor(
+    tmp_path, monkeypatch
+):
+    config = _fixture_config(tmp_path)
+    dynamic_store = config.fresh_store.with_name("store-20260815T081500Z.sqlite3")
+    dynamic_store.write_bytes(config.fresh_store.read_bytes())
+    dynamic_generation = "store:v8:fixture:20260815T081500Z"
+    dynamic_store_sha256 = _sha256(dynamic_store)
+    receipt = json.loads(config.fresh_receipt.read_text(encoding="utf-8"))
+    receipt.update(
+        {
+            "store_path": str(dynamic_store),
+            "store_generation": dynamic_generation,
+            "store_sha256": dynamic_store_sha256,
+            "generation_rows": [[config.repository, dynamic_generation]],
+        }
+    )
+    config.fresh_receipt.write_bytes(runner.canonical_json_bytes(receipt))
+    receipt_digest = _sha256(config.fresh_receipt)
+    config = replace(
+        config,
+        expected_fresh_receipt_sha256=receipt_digest,
+    )
+
+    class ReleaseSubject:
+        pass
+
+    subject = ReleaseSubject()
+    subject.repository = config.repository
+    subject.repository_root = str(config.repository_root)
+    subject.evidence_root = str(config.evidence_root)
+    subject.merged_main_sha = config.merged_main_sha
+    subject.merged_main_git_tree = config.merged_main_git_tree
+    subject.audited_source_tree_digest = config.audited_source_tree_digest
+    subject.subject_digest = config.release_subject_digest
+    subject.fresh_receipt_sha256 = receipt_digest
+
+    monkeypatch.setattr(
+        runner,
+        "_production_release_subject_module",
+        lambda: SimpleNamespace(ReleaseSubject=ReleaseSubject),
+    )
+    monkeypatch.setattr(runner, "DEFAULT_CONFIG", config)
+    monkeypatch.setattr(runner, "REPOSITORY", config.repository)
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", config.repository_root)
+    monkeypatch.setattr(runner, "EVIDENCE_ROOT", config.evidence_root)
+
+    store_access: list[Path] = []
+    original_require_regular_file = runner._require_regular_file
+
+    def record_store_access(path, code):
+        if Path(path) == dynamic_store:
+            store_access.append(Path(path))
+        return original_require_regular_file(path, code)
+
+    monkeypatch.setattr(runner, "_require_regular_file", record_store_access)
+    invalid_subject = ReleaseSubject()
+    invalid_subject.__dict__.update(vars(subject))
+    invalid_subject.fresh_receipt_sha256 = "0" * 64
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner._bind_runner_config_from_subject(invalid_subject)
+
+    assert error.value.code == "FRESH_RECEIPT_DIGEST_MISMATCH"
+    assert store_access == []
+
+    bound_config = runner._bind_runner_config_from_subject(subject)
+    assert bound_config.fresh_store == dynamic_store
+    assert bound_config.store_generation == dynamic_generation
+    assert bound_config.expected_fresh_store_sha256 == dynamic_store_sha256
+
+    dependencies, calls, _counts = _attested_dependencies(
+        bound_config,
+        check_authoritative_sources=True,
+    )
+    observed_configs: list[runner.RunnerConfig] = []
+    control = dependencies.control_ownership_attestor
+
+    class RecordingControl:
+        def observe(self, **kwargs):
+            observed_configs.append(kwargs["config"])
+            return control.observe(**kwargs)
+
+    dependencies = replace(
+        dependencies,
+        control_ownership_attestor=RecordingControl(),
+    )
+
+    class Binding:
+        def __init__(self):
+            self.subject = subject
+            self.git_runner = _git_runner_factory(bound_config)
+            self.dependencies = dependencies
+
+        def assert_stable(self):
+            return None
+
+        def close(self):
+            return None
+
+    result = runner.run_fixture(
+        bound_config,
+        binding=Binding(),
+        execute=True,
+        run_id="dynamic-store-boundary",
+    )
+
+    assert result["status"] == "GO", result
+    assert calls.count("guard") == 1
+    assert store_access
+    assert observed_configs
+    assert all(observed is bound_config for observed in observed_configs)
+    assert all(observed.fresh_store == dynamic_store for observed in observed_configs)
+    assert all(
+        observed.store_generation == dynamic_generation
+        for observed in observed_configs
+    )
+    assert all(
+        observed.expected_fresh_store_sha256 == dynamic_store_sha256
+        for observed in observed_configs
+    )
+
+
 def test_actual_skill_manifest_contract_is_accepted_by_preflight(tmp_path):
     config = _fixture_config(tmp_path)
     for package_name in config.package_names:
@@ -4707,6 +4850,43 @@ def test_runner_posix_open_fails_closed_when_required_flag_is_unavailable(
         )
 
     assert error.value.code == "TEST_REQUIRED_POSIX_FLAG"
+
+
+def test_runner_posix_relative_open_accepts_plain_string_leaf_with_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    target = tmp_path / "input.json"
+    expected = b'{"stable":true}\n'
+    target.write_bytes(expected)
+    parent = 731
+    real_open = runner.os.open
+    calls: list[tuple[object, int, int, object]] = []
+
+    monkeypatch.setattr(runner.os, "name", "posix")
+    monkeypatch.setattr(runner.os, "O_NOFOLLOW", 1, raising=False)
+    monkeypatch.setattr(runner.os, "O_NONBLOCK", 2, raising=False)
+
+    def controlled_open(path, flags, mode=0o644, *, dir_fd=None):
+        calls.append((path, flags, mode, dir_fd))
+        assert type(path) is str
+        assert path == target.name
+        assert dir_fd == parent
+        return real_open(target, os.O_RDONLY)
+
+    monkeypatch.setattr(runner.os, "open", controlled_open)
+    descriptor = runner._open_path_handle(
+        target.name,
+        "FILE_READ_FAILED",
+        directory=False,
+        parent=parent,
+    )
+    try:
+        assert runner._read_descriptor_bytes(descriptor, "FILE_READ_FAILED") == expected
+    finally:
+        os.close(descriptor)
+
+    assert len(calls) == 1
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX open-flag contract")

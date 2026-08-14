@@ -55,6 +55,26 @@ def test_unexpected_status_records_rejects_posix_literal_backslash_path(
     assert release_subject._unexpected_status_records(record + "\0") == (record,)
 
 
+@pytest.mark.parametrize(
+    "path",
+    (
+        ".codex-tmp/../outside.txt",
+        ".codex-tmp/nested/../outside.txt",
+        "/outside.txt",
+    ),
+)
+def test_unexpected_status_records_rejects_codex_tmp_allowlist_escape(path):
+    record = f"?? {path}"
+
+    assert release_subject._unexpected_status_records(record + "\0") == (record,)
+
+
+def test_unexpected_status_records_accepts_nested_codex_tmp_path():
+    record = "?? .codex-tmp/evidence/receipt.json"
+
+    assert release_subject._unexpected_status_records(record + "\0") == ()
+
+
 def _canonical_fixture_body(tmp_path: Path) -> dict[str, object]:
     repository_root = (tmp_path / "repository").resolve()
     evidence_root = (tmp_path / "evidence").resolve()

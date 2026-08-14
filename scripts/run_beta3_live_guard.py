@@ -1037,7 +1037,7 @@ def _validate_closed_file_identity(value: object, label: str) -> None:
 
 
 def _open_windows_relative_handle(
-    path: Path,
+    path: Path | str,
     code: str,
     *,
     directory: bool,
@@ -1169,7 +1169,7 @@ def _open_windows_relative_handle(
 
 
 def _open_path_handle(
-    path: Path,
+    path: Path | str,
     code: str,
     *,
     directory: bool,
@@ -1197,7 +1197,10 @@ def _open_path_handle(
             if parent is None:
                 return os.open(path, flags, 0o600 if create_new else 0o644)
             return os.open(
-                Path(path).name, flags, 0o600 if create_new else 0o644, dir_fd=parent
+                os.path.basename(os.fspath(path)),
+                flags,
+                0o600 if create_new else 0o644,
+                dir_fd=parent,
             )
         except FileExistsError as error:
             raise RunnerError(
@@ -2382,6 +2385,20 @@ def _unquote_status_path(path: str) -> str:
     return "".join(result)
 
 
+def _is_allowed_codex_tmp_path(path: str) -> bool:
+    if not path or path.startswith("/"):
+        return False
+    components = path.split("/")
+    if components[0] != ".codex-tmp":
+        return False
+    for component in components[1:]:
+        if component == "..":
+            return False
+        if component in ("", "."):
+            continue
+    return True
+
+
 def parse_porcelain_z_status(output: str | bytes) -> tuple[str, ...]:
     if type(output) is bytes:
         try:
@@ -2404,9 +2421,7 @@ def parse_porcelain_z_status(output: str | bytes) -> tuple[str, ...]:
         elif os.name != "posix":
             unexpected.append(record)
             continue
-        if status != "??" or not (
-            path == ".codex-tmp" or path.startswith(".codex-tmp/")
-        ):
+        if status != "??" or not _is_allowed_codex_tmp_path(path):
             unexpected.append(record)
     return tuple(unexpected)
 
@@ -3580,7 +3595,7 @@ def _delete_owned_handle(output: _OwnedOutput) -> None:
                 except FileExistsError:
                     continue
                 cleanup_parent = _open_path_handle(
-                    Path(cleanup_name),
+                    cleanup_name,
                     "OUTPUT_WRITE_FAILED",
                     directory=True,
                     parent=output.parent.descriptor,
@@ -3590,14 +3605,14 @@ def _delete_owned_handle(output: _OwnedOutput) -> None:
                 raise OSError("could not create a private output cleanup directory")
 
             os.rename(
-                Path(output.path.name),
-                Path(output.path.name),
+                output.path.name,
+                output.path.name,
                 src_dir_fd=output.parent.descriptor,
                 dst_dir_fd=cleanup_parent,
             )
             detached_from_public = True
             detached = _open_path_handle(
-                Path(output.path.name),
+                output.path.name,
                 "OUTPUT_WRITE_FAILED",
                 directory=False,
                 parent=cleanup_parent,
