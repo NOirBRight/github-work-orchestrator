@@ -69,7 +69,7 @@ GATEWAY_STORE_PATH = EVIDENCE_ROOT / "beta3-live-guard-gateway.sqlite3"
 ARTIFACT_ROOT = EVIDENCE_ROOT / "beta3-live-guard-artifacts"
 RUNTIME_CONFIG_PATH = Path(r"C:\Users\noirb\.orch\config.json")
 EXPECTED_FRESH_RECEIPT_RUNBOOK_SHA256 = (
-    "0378be64a95aa4eeb09626c120254ad8105a1a5cc2dfd1f60ddf089dfba821f2"
+    "329bade311df03d0b52a344ce7062c7c7984e2fa35b3d0fa9cbb5386a88e0c6c"
 )
 EXPECTED_FRESH_RECEIPT_SCHEMA_DIGEST = (
     "69ac6babce5db564fcc60fc5dd97feb0635911e07955234098210ddd97a93aed"

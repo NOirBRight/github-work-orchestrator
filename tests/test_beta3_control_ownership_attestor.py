@@ -690,7 +690,7 @@ def _production_subject_and_config(tmp_path):
         "df2341d76eb2ab54110ac3e70ff137a93d05ffbb02352c61b654321dba188ed7"
     )
     config.expected_fresh_receipt_runbook_sha256 = (
-        "0378be64a95aa4eeb09626c120254ad8105a1a5cc2dfd1f60ddf089dfba821f2"
+        "329bade311df03d0b52a344ce7062c7c7984e2fa35b3d0fa9cbb5386a88e0c6c"
     )
     config.expected_fresh_receipt_schema_digest = (
         "69ac6babce5db564fcc60fc5dd97feb0635911e07955234098210ddd97a93aed"
