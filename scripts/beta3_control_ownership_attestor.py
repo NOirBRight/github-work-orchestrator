@@ -1627,11 +1627,6 @@ def _read_store(config: object, subject: CutoverSubject, attempt: AttemptIdentit
         receipt_path = Path(receipt_path_value)
     except (OSError, TypeError, ValueError) as error:
         raise BootstrapError("STORE_SOURCE_UNAVAILABLE", "fixed Store paths are malformed") from error
-    store_snapshot = _read_file_snapshot(path, "STORE_SOURCE_UNAVAILABLE")
-    expected_hash = config.expected_fresh_store_sha256
-    observed_hash = dict(store_snapshot.identity).get("byte_sha256")
-    if observed_hash != expected_hash:
-        _fail("STORE_SOURCE_UNAVAILABLE", "fresh Store hash is not the configured identity")
     receipt_snapshot = _read_file_snapshot(receipt_path, "STORE_SOURCE_UNAVAILABLE")
     try:
         receipt = _receipt(
@@ -1639,7 +1634,23 @@ def _read_store(config: object, subject: CutoverSubject, attempt: AttemptIdentit
             subject,
             receipt_snapshot,
             path,
-            observed_store_sha256=dict(store_snapshot.identity).get("byte_sha256"),
+        )
+    except BootstrapError:
+        raise
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        raise BootstrapError("STORE_SOURCE_UNAVAILABLE", "fresh Store receipt is malformed") from error
+    store_snapshot = _read_file_snapshot(path, "STORE_SOURCE_UNAVAILABLE")
+    expected_hash = config.expected_fresh_store_sha256
+    observed_hash = dict(store_snapshot.identity).get("byte_sha256")
+    if observed_hash != expected_hash:
+        _fail("STORE_SOURCE_UNAVAILABLE", "fresh Store hash is not the configured identity")
+    try:
+        receipt = _receipt(
+            config,
+            subject,
+            receipt_snapshot,
+            path,
+            observed_store_sha256=observed_hash,
         )
     except BootstrapError:
         raise
@@ -3605,6 +3616,11 @@ def _validate_config_subject(
             _fail(
                 "STORE_SOURCE_UNAVAILABLE",
                 "production fresh Store path is not a controlled canonical file",
+            )
+        if fresh_store in {PRODUCTION_ROLLBACK_STORE, PRODUCTION_PRIOR_STORE}:
+            _fail(
+                "STORE_SOURCE_UNAVAILABLE",
+                "production fresh Store aliases an existing Store",
             )
         production_store_tables, _ = _fixed_store_contract()
         production_config = {

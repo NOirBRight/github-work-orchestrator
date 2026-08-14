@@ -770,6 +770,20 @@ def test_production_configuration_accepts_subject_bound_fresh_store_identity(tmp
     attestor_module._validate_config_subject(config, subject, _release_subject_for(subject))
 
 
+@pytest.mark.parametrize("existing_store", ("prior_store", "rollback_store"))
+def test_production_configuration_rejects_fresh_store_aliasing_existing_store(
+    tmp_path,
+    existing_store,
+):
+    subject, config = _production_subject_and_config(tmp_path)
+    config.fresh_store = getattr(config, existing_store)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._validate_config_subject(config, subject, _release_subject_for(subject))
+
+    assert error.value.code == "STORE_SOURCE_UNAVAILABLE"
+
+
 def test_production_configuration_accepts_nonlegacy_receipt_digest_bound_by_v2_subject(
     tmp_path,
 ):
@@ -3251,3 +3265,34 @@ def test_store_rejects_receipt_replacement_during_immutable_read(tmp_path, monke
         attestor_module._read_store(config, _subject(), _attempt(_subject()))
 
     assert error.value.code == "STORE_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    ("receipt_case", "expected_detail"),
+    (
+        ("digest", "fresh Store receipt bytes changed"),
+        ("content", "fresh Store receipt schema is not exact"),
+    ),
+)
+def test_store_validates_receipt_before_opening_fresh_store(
+    tmp_path,
+    receipt_case,
+    expected_detail,
+):
+    config = _create_store_fixture(tmp_path)
+    config.fresh_store = tmp_path / "missing-store.sqlite3"
+    receipt = load_canonical_json(config.fresh_receipt.read_bytes())
+    receipt["store_path"] = str(config.fresh_store.resolve())
+    config.fresh_receipt.write_bytes(canonical_bytes(receipt))
+    if receipt_case == "digest":
+        config.expected_fresh_receipt_sha256 = "0" * 64
+    else:
+        config.fresh_receipt.write_bytes(b"{}")
+        config.expected_fresh_receipt_sha256 = digest_bytes(config.fresh_receipt.read_bytes())
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._read_store(config, _subject(), _attempt(_subject()))
+
+    assert error.value.code == "STORE_SOURCE_UNAVAILABLE"
+    assert error.value.detail == expected_detail
+    assert not config.fresh_store.exists()
