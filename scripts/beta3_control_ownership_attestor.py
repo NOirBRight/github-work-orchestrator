@@ -3655,16 +3655,104 @@ class ControlOwnershipAttestor:
     @staticmethod
     def _check_source(source: object, methods: tuple[str, ...]) -> None:
         try:
+            source_type = type(source)
+            if type(source_type) is not type:
+                raise BootstrapError(
+                    "UNSAFE_SOURCE_CAPABILITY",
+                    "source type uses an unsupported custom metaclass",
+                )
+
+            source_mro = source_type.__mro__
+            dynamic_resolution = False
+            for cls in source_mro:
+                if cls is object:
+                    continue
+                namespace = vars(cls)
+                if any(name in namespace for name in ("__dir__", "__getattr__")):
+                    dynamic_resolution = True
+                    break
+                getattribute = namespace.get("__getattribute__")
+                if getattribute is not None and not inspect.ismethoddescriptor(getattribute):
+                    dynamic_resolution = True
+                    break
+            if dynamic_resolution:
+                raise BootstrapError(
+                    "UNSAFE_SOURCE_CAPABILITY",
+                    "source exposes dynamic attribute resolution",
+                )
+
             exposed = {
                 name
-                for name in dir(source)
+                for cls in source_mro
+                for name in vars(cls)
                 if not name.startswith("_")
-                and callable(inspect.getattr_static(source, name))
             }
-            if exposed != set(methods) or any(
-                not callable(getattr(source, name, None)) for name in methods
-            ):
-                raise BootstrapError("UNSAFE_SOURCE_CAPABILITY", "source exposes an unsafe or incomplete capability")
+            instance_dict_descriptor_type = type(vars(type)["__dict__"])
+            try:
+                instance_dict_descriptor = inspect.getattr_static(source, "__dict__")
+            except AttributeError:
+                instance_namespace = {}
+            else:
+                if not (
+                    type(instance_dict_descriptor) is instance_dict_descriptor_type
+                    or inspect.ismemberdescriptor(instance_dict_descriptor)
+                    or inspect.isgetsetdescriptor(instance_dict_descriptor)
+                ):
+                    raise BootstrapError(
+                        "UNSAFE_SOURCE_CAPABILITY",
+                        "source instance namespace uses an unsupported descriptor",
+                    )
+                instance_namespace = object.__getattribute__(source, "__dict__")
+                if type(instance_namespace) is not dict:
+                    raise BootstrapError(
+                        "UNSAFE_SOURCE_CAPABILITY",
+                        "source instance namespace is not an exact dictionary",
+                    )
+            if type(instance_namespace) is dict:
+                exposed.update(
+                    name
+                    for name in instance_namespace
+                    if type(name) is str and not name.startswith("_")
+                )
+
+            def unsupported_descriptor(value: object) -> bool:
+                is_descriptor = any(
+                    "__get__" in vars(value_type)
+                    for value_type in type(value).__mro__
+                )
+                return is_descriptor and not inspect.isroutine(value)
+
+            for name in sorted(exposed):
+                attr = inspect.getattr_static(source, name)
+                if unsupported_descriptor(attr):
+                    raise BootstrapError(
+                        "UNSAFE_SOURCE_CAPABILITY",
+                        f"source exposes an unsupported descriptor: {name}",
+                    )
+                if name not in methods and (
+                    callable(attr) or inspect.isroutine(attr)
+                ):
+                    raise BootstrapError(
+                        "UNSAFE_SOURCE_CAPABILITY",
+                        f"source exposes an unlisted public callable: {name}",
+                    )
+
+            for name in methods:
+                try:
+                    required_attr = inspect.getattr_static(source, name)
+                except AttributeError:
+                    required_attr = None
+                if (
+                    required_attr is None
+                    or unsupported_descriptor(required_attr)
+                    or not (
+                        callable(required_attr) or inspect.isroutine(required_attr)
+                    )
+                ):
+                    raise BootstrapError(
+                        "UNSAFE_SOURCE_CAPABILITY",
+                        "source does not expose the required read method",
+                    )
         except BootstrapError:
             raise
         except Exception as error:

@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass, field as dataclass_field
 import hashlib
+import importlib.abc
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import struct
 import subprocess
 import sys
+from threading import RLock
 from types import TracebackType
 from types import ModuleType
 from typing import Callable, Mapping, Sequence
+import uuid
 
 
 RELEASE_SUBJECT_SCHEMA = "gwo-v8-release-subject.v1"
@@ -53,6 +58,7 @@ _FILE_IDENTITY_KEYS = frozenset({"module", "path", "sha256"})
 _REVIEWED_PROVENANCE_KEYS = frozenset({"path", "sha256"})
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE_TREE_DIGEST_LOCK = RLock()
 
 
 class ReleaseSubjectError(ValueError):
@@ -463,6 +469,16 @@ def _path_invalid(detail: str) -> None:
     raise ReleaseSubjectError("RELEASE_SUBJECT_PATH_INVALID", detail)
 
 
+def _required_posix_open_flags(code: str, *names: str) -> tuple[int, ...]:
+    values: list[int] = []
+    for name in names:
+        value = getattr(os, name, None)
+        if type(value) is not int or value == 0:
+            raise ReleaseSubjectError(code, f"POSIX open requires {name}")
+        values.append(value)
+    return tuple(values)
+
+
 def _drift(detail: str) -> None:
     raise ReleaseSubjectError("RELEASE_SUBJECT_DRIFT", detail)
 
@@ -509,6 +525,12 @@ def _windows_handle_identity(
             raise ReleaseSubjectError(
                 code, "held handle identity is unavailable"
             ) from error
+        if (
+            stat.S_ISDIR(observed.st_mode) != directory
+            or (not directory and not stat.S_ISREG(observed.st_mode))
+            or _is_reparse(observed)
+        ):
+            raise ReleaseSubjectError(code, "held handle type is not expected")
         return {
             "st_dev": int(observed.st_dev),
             "st_ino": int(observed.st_ino),
@@ -737,13 +759,21 @@ def _open_path_handle(
     missing_ok: bool = False,
 ) -> int:
     if os.name != "nt":
-        flags = (os.O_RDWR if writable else os.O_RDONLY) | getattr(os, "O_BINARY", 0)
+        flags = (
+            os.O_RDWR if writable and not directory else os.O_RDONLY
+        ) | getattr(os, "O_BINARY", 0)
         if create_new:
             flags |= os.O_CREAT | os.O_EXCL
         if directory:
-            flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            directory_flag, nofollow = _required_posix_open_flags(
+                code, "O_DIRECTORY", "O_NOFOLLOW"
+            )
+            flags |= directory_flag | nofollow
         else:
-            flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            nofollow, nonblock = _required_posix_open_flags(
+                code, "O_NOFOLLOW", "O_NONBLOCK"
+            )
+            flags |= nofollow | nonblock
         try:
             if parent is None:
                 return os.open(path, flags, 0o600 if create_new else 0o644)
@@ -1329,10 +1359,13 @@ def _require_subject_absent_held(
     name = Path(path).name
     parent = parent_lease.handles[-1]
     if os.name != "nt":
+        nofollow, nonblock = _required_posix_open_flags(
+            "RELEASE_SUBJECT_PATH_INVALID", "O_NOFOLLOW", "O_NONBLOCK"
+        )
         flags = (
             os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
+            | nofollow
+            | nonblock
         )
         try:
             descriptor = os.open(name, flags, dir_fd=parent)
@@ -1692,6 +1725,188 @@ def _write_all(descriptor: int, raw: bytes) -> None:
         ) from error
 
 
+def _open_posix_cleanup_directory(parent: int) -> tuple[int, str]:
+    """Open a private directory used to detach a cleanup candidate."""
+
+    directory_flag, nofollow = _required_posix_open_flags(
+        "RELEASE_SUBJECT_WRITE_FAILED", "O_DIRECTORY", "O_NOFOLLOW"
+    )
+    flags = os.O_RDONLY | directory_flag | nofollow
+    for _ in range(16):
+        name = f".{RELEASE_SUBJECT_FILENAME}.cleanup-{uuid.uuid4().hex}"
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+        except FileExistsError:
+            continue
+        try:
+            return os.open(name, flags, dir_fd=parent), name
+        except OSError:
+            try:
+                os.rmdir(name, dir_fd=parent)
+            except OSError:
+                pass
+            raise
+    raise OSError("could not create a private POSIX cleanup directory")
+
+
+def _restore_posix_detached_subject(
+    name: str,
+    cleanup_parent: int,
+    parent: int,
+) -> None:
+    """Restore a detached non-candidate without replacing a new subject."""
+
+    try:
+        observed = os.stat(name, dir_fd=cleanup_parent, follow_symlinks=False)
+        if stat.S_ISDIR(observed.st_mode):
+            os.rename(
+                name,
+                name,
+                src_dir_fd=cleanup_parent,
+                dst_dir_fd=parent,
+            )
+        else:
+            os.link(
+                name,
+                name,
+                src_dir_fd=cleanup_parent,
+                dst_dir_fd=parent,
+                follow_symlinks=False,
+            )
+            os.unlink(name, dir_fd=cleanup_parent)
+    except OSError:
+        # The fixed subject may already have been recreated.  Leaving the
+        # detached entry in the private directory is safer than replacing or
+        # deleting anything at the public path.
+        pass
+
+
+def _remove_created_subject_posix(
+    path: Path,
+    parent: int,
+    created_identity: Mapping[str, object] | None,
+    created_raw: bytes,
+    *,
+    created_descriptor: int | None = None,
+) -> None:
+    """Detach before cleanup so a fixed-path replacement cannot be unlinked."""
+
+    current: int | None = None
+    cleanup_parent: int | None = None
+    cleanup_name: str | None = None
+    detached: int | None = None
+    detached_from_public = False
+    try:
+        current = _open_path_handle(
+            Path(path.name),
+            "RELEASE_SUBJECT_WRITE_FAILED",
+            directory=False,
+            parent=parent,
+        )
+        current_stat = os.fstat(current)
+        if not stat.S_ISREG(current_stat.st_mode):
+            return
+        if created_identity is None:
+            if created_descriptor is None:
+                return
+            created_stat = os.fstat(created_descriptor)
+            if (
+                current_stat.st_dev != created_stat.st_dev
+                or current_stat.st_ino != created_stat.st_ino
+                or _read_held_bytes(current, "RELEASE_SUBJECT_WRITE_FAILED")
+                != created_raw
+            ):
+                return
+        else:
+            current_identity = _windows_handle_identity(
+                current, "RELEASE_SUBJECT_WRITE_FAILED", directory=False
+            )
+            if (
+                not _identity_matches(current_identity, created_identity)
+                or _read_held_bytes(current, "RELEASE_SUBJECT_WRITE_FAILED")
+                != created_raw
+            ):
+                return
+
+        cleanup_parent, cleanup_name = _open_posix_cleanup_directory(parent)
+        os.rename(
+            Path(path.name),
+            Path(path.name),
+            src_dir_fd=parent,
+            dst_dir_fd=cleanup_parent,
+        )
+        detached_from_public = True
+        detached = _open_path_handle(
+            Path(path.name),
+            "RELEASE_SUBJECT_WRITE_FAILED",
+            directory=False,
+            parent=cleanup_parent,
+        )
+        detached_stat = os.fstat(detached)
+        detached_matches = stat.S_ISREG(detached_stat.st_mode)
+        if created_identity is None:
+            detached_matches = detached_matches and (
+                detached_stat.st_dev == created_stat.st_dev
+                and detached_stat.st_ino == created_stat.st_ino
+                and _read_held_bytes(detached, "RELEASE_SUBJECT_WRITE_FAILED")
+                == created_raw
+            )
+        else:
+            detached_identity = _windows_handle_identity(
+                detached, "RELEASE_SUBJECT_WRITE_FAILED", directory=False
+            )
+            detached_matches = detached_matches and (
+                _identity_matches(detached_identity, created_identity)
+                and _read_held_bytes(detached, "RELEASE_SUBJECT_WRITE_FAILED")
+                == created_raw
+            )
+        if not detached_matches:
+            _restore_posix_detached_subject(
+                Path(path.name).name,
+                cleanup_parent,
+                parent,
+            )
+            try:
+                os.rmdir(cleanup_name, dir_fd=parent)
+            except OSError:
+                pass
+            return
+        os.unlink(Path(path.name).name, dir_fd=cleanup_parent)
+        try:
+            os.rmdir(cleanup_name, dir_fd=parent)
+        except OSError:
+            pass
+    except (FileNotFoundError, OSError, ReleaseSubjectError):
+        if cleanup_parent is not None and cleanup_name is not None:
+            if detached_from_public:
+                _restore_posix_detached_subject(
+                    Path(path.name).name,
+                    cleanup_parent,
+                    parent,
+                )
+            try:
+                os.rmdir(cleanup_name, dir_fd=parent)
+            except OSError:
+                pass
+        return
+    finally:
+        if detached is not None:
+            try:
+                os.close(detached)
+            except OSError:
+                pass
+        if cleanup_parent is not None:
+            try:
+                os.close(cleanup_parent)
+            except OSError:
+                pass
+        if current is not None:
+            try:
+                os.close(current)
+            except OSError:
+                pass
+
+
 def _remove_created_subject(
     path: Path,
     parent: int,
@@ -1701,6 +1916,16 @@ def _remove_created_subject(
     created_descriptor: int | None = None,
 ) -> None:
     """Remove only a failed-create leaf whose path still matches its identity."""
+
+    if os.name != "nt":
+        _remove_created_subject_posix(
+            path,
+            parent,
+            created_identity,
+            created_raw,
+            created_descriptor=created_descriptor,
+        )
+        return
 
     current: int | None = None
     try:
@@ -1937,91 +2162,757 @@ def write_production_subject_exclusive(
     )
 
 
+_WINDOWS_DIRECTORY_INFO_CLASS = 60
+_WINDOWS_DIRECTORY_RECORD_MIN_SIZE = 88
+_WINDOWS_DIRECTORY_FILE_ID_OFFSET = 72
+_WINDOWS_DIRECTORY_FILE_ID_SIZE = 16
+_WINDOWS_DIRECTORY_FILE_ID_END = 88
+_WINDOWS_DIRECTORY_FILE_NAME_OFFSET = 88
+_SourceDirectoryEntry = tuple[str, bool, bool, Mapping[str, object]]
+
+
+@dataclass
+class _HeldSourceDirectory:
+    relative: str
+    handle: int
+    identity: Mapping[str, object]
+    entries: tuple[_SourceDirectoryEntry, ...]
+
+
+@dataclass(frozen=True)
+class _CapturedSourceFile:
+    relative: str
+    parent_relative: str
+    name: str
+    identity: Mapping[str, object]
+    raw: bytes
+
+
+def _source_entry_identity(
+    observed: os.stat_result,
+    code: str,
+) -> dict[str, int | str]:
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or _is_reparse(observed)
+        or not (stat.S_ISDIR(observed.st_mode) or stat.S_ISREG(observed.st_mode))
+    ):
+        raise ReleaseSubjectError(
+            code,
+            "source directory contains a link, reparse point, or special file",
+        )
+    return {
+        "st_dev": int(observed.st_dev),
+        "st_ino": int(observed.st_ino),
+        "st_mode": int(observed.st_mode),
+        "st_size": int(observed.st_size),
+        "st_mtime_ns": int(observed.st_mtime_ns),
+    }
+
+
+def _enumerate_windows_source_directory_entries(
+    handle: int,
+    code: str,
+) -> tuple[_SourceDirectoryEntry, ...]:
+    try:
+        import ctypes
+        import msvcrt
+
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = [
+                ("status", ctypes.c_void_p),
+                ("information", ctypes.c_size_t),
+            ]
+
+        ntdll = ctypes.WinDLL("ntdll")
+        ntdll.NtQueryDirectoryFile.restype = ctypes.c_long
+        ntdll.NtQueryDirectoryFile.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(IoStatusBlock),
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_ubyte,
+            ctypes.c_void_p,
+            ctypes.c_ubyte,
+        ]
+        native = ctypes.c_void_p(msvcrt.get_osfhandle(handle))
+        parent_identity = _windows_handle_identity(handle, code, directory=True)
+        volume_id = parent_identity.get("volume_id")
+        result: list[_SourceDirectoryEntry] = []
+        restart = 1
+        while True:
+            buffer = ctypes.create_string_buffer(64 * 1024)
+            status_block = IoStatusBlock()
+            status = int(
+                ntdll.NtQueryDirectoryFile(
+                    native,
+                    None,
+                    None,
+                    None,
+                    ctypes.byref(status_block),
+                    ctypes.byref(buffer),
+                    ctypes.sizeof(buffer),
+                    _WINDOWS_DIRECTORY_INFO_CLASS,
+                    0,
+                    None,
+                    restart,
+                )
+            ) & 0xFFFFFFFF
+            restart = 0
+            if status == 0x80000006:
+                break
+            if status not in {0, 0x80000005}:
+                raise OSError(status, "NtQueryDirectoryFile failed")
+            data = buffer.raw[: int(status_block.information)]
+            offset = 0
+            saw_record = False
+            while offset < len(data):
+                if offset + _WINDOWS_DIRECTORY_RECORD_MIN_SIZE > len(data):
+                    raise OSError("directory record is truncated")
+                next_offset = struct.unpack_from("<I", data, offset)[0]
+                attributes = struct.unpack_from("<I", data, offset + 56)[0]
+                name_length = struct.unpack_from("<I", data, offset + 60)[0]
+                file_id_start = offset + _WINDOWS_DIRECTORY_FILE_ID_OFFSET
+                file_id_end = offset + _WINDOWS_DIRECTORY_FILE_ID_END
+                file_id = data[file_id_start:file_id_end]
+                start = offset + _WINDOWS_DIRECTORY_FILE_NAME_OFFSET
+                end = start + name_length
+                if (
+                    len(file_id) != _WINDOWS_DIRECTORY_FILE_ID_SIZE
+                    or not any(file_id)
+                    or name_length % 2
+                    or end > len(data)
+                    or (
+                        next_offset
+                        and next_offset
+                        < _WINDOWS_DIRECTORY_FILE_NAME_OFFSET + name_length
+                    )
+                    or (next_offset and offset + next_offset > len(data))
+                ):
+                    raise OSError("directory record is malformed")
+                name = data[start:end].decode("utf-16-le")
+                saw_record = True
+                if attributes & 0x400:
+                    raise ReleaseSubjectError(
+                        code,
+                        "source directory contains a reparse point",
+                    )
+                entry_identity = {
+                    "volume_id": volume_id,
+                    "file_id": file_id.hex(),
+                }
+                if name not in {".", ".."}:
+                    result.append(
+                        (
+                            name,
+                            bool(attributes & 0x10),
+                            False,
+                            entry_identity,
+                        )
+                    )
+                if not next_offset:
+                    offset = len(data)
+                    break
+                offset += next_offset
+            if data and not saw_record:
+                raise OSError("directory enumeration did not advance")
+        return tuple(sorted(result))
+    except ReleaseSubjectError:
+        raise
+    except (ImportError, OSError, UnicodeError, AttributeError, TypeError) as error:
+        raise ReleaseSubjectError(
+            code,
+            "Windows source directory enumeration failed",
+        ) from error
+
+
+def _enumerate_source_directory_entries(
+    handle: int,
+    code: str,
+) -> tuple[_SourceDirectoryEntry, ...]:
+    if os.name == "nt":
+        return _enumerate_windows_source_directory_entries(handle, code)
+    nofollow, directory_flag = _required_posix_open_flags(
+        code, "O_NOFOLLOW", "O_DIRECTORY"
+    )
+    duplicate: int | None = None
+    try:
+        duplicate = os.open(".", os.O_RDONLY | nofollow | directory_flag, dir_fd=handle)
+        with os.scandir(duplicate) as scanner:
+            entries: list[_SourceDirectoryEntry] = []
+            for entry in scanner:
+                observed = entry.stat(follow_symlinks=False)
+                is_directory = stat.S_ISDIR(observed.st_mode)
+                if entry.is_symlink() or stat.S_ISLNK(observed.st_mode):
+                    raise ReleaseSubjectError(
+                        code,
+                        "source directory contains a link",
+                    )
+                identity = _source_entry_identity(observed, code)
+                entries.append((entry.name, is_directory, False, identity))
+            return tuple(sorted(entries))
+    except ReleaseSubjectError:
+        raise
+    except OSError as error:
+        raise ReleaseSubjectError(
+            code,
+            "source directory cannot be enumerated",
+        ) from error
+    finally:
+        if duplicate is not None:
+            try:
+                os.close(duplicate)
+            except OSError:
+                pass
+
+
+def _source_entry(
+    entries: tuple[_SourceDirectoryEntry, ...],
+    name: str,
+    code: str,
+) -> _SourceDirectoryEntry:
+    matches = tuple(entry for entry in entries if entry[0] == name)
+    if len(matches) != 1:
+        raise ReleaseSubjectError(
+            code,
+            f"source directory entry is unavailable: {name}",
+        )
+    return matches[0]
+
+
 def source_tree_digest(
     repository_root: Path,
     *,
     root_handle: int | None = None,
 ) -> str:
-    """Return the existing V8 audited source-tree digest for a fixed root."""
+    """Return the audited source digest through one process-global boundary."""
 
-    root = Path(repository_root).expanduser().resolve(strict=False)
+    # The implementation temporarily replaces process-global import machinery
+    # and installs a deterministic alias family in sys.modules.  Serialize the
+    # complete boundary, not just the hook assignment, so concurrent callers
+    # cannot observe or restore one another's state.
+    with _SOURCE_TREE_DIGEST_LOCK:
+        return _source_tree_digest_unlocked(repository_root, root_handle=root_handle)
+
+
+def _source_tree_digest_unlocked(
+    repository_root: Path,
+    *,
+    root_handle: int | None = None,
+) -> str:
+    """Return the V8 audited source-tree digest using captured source bytes."""
+
+    root = Path(os.path.abspath(Path(repository_root).expanduser()))
     scripts_root = root / "skills" / "orchestrator" / "scripts"
     package_root = scripts_root / "gwo_v8"
-    if not package_root.is_dir():
-        raise ReleaseSubjectError(
-            "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
-            "V8 source-tree digest implementation is unavailable",
-        )
-    alias = "_gwo_v8_release_subject_" + hashlib.sha256(
-        str(scripts_root).encode("utf-8")
-    ).hexdigest()[:16]
-    package_name = alias
-    module_name = f"{alias}.cutover_guard"
-    package = ModuleType(package_name)
-    package.__file__ = str(package_root / "__init__.py")
-    package.__package__ = package_name
-    package.__path__ = [str(package_root)]  # type: ignore[attr-defined]
-    package.__spec__ = importlib.util.spec_from_loader(
-        package_name, loader=None, is_package=True
-    )
-    spec = importlib.util.spec_from_file_location(
-        module_name,
-        package_root / "cutover_guard.py",
-        submodule_search_locations=None,
-    )
-    if spec is None or spec.loader is None:
-        raise ReleaseSubjectError(
-            "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
-            "V8 source-tree digest implementation is unavailable",
-        )
-    module = importlib.util.module_from_spec(spec)
-    previous_bytecode_setting = sys.dont_write_bytecode
-    sys.modules[package_name] = package
-    sys.modules[module_name] = module
-    sys.dont_write_bytecode = True
-    try:
-        spec.loader.exec_module(module)
-        digest = getattr(module, "source_tree_digest", None)
-        module_path = _canonical_path(Path(getattr(module, "__file__", "")))
-        spec_origin = _canonical_path(
-            Path(getattr(getattr(module, "__spec__", None), "origin", ""))
-        )
-        expected_path = _canonical_path(package_root / "cutover_guard.py")
-        if module_path != expected_path or spec_origin != expected_path:
+    code = "RELEASE_SUBJECT_SOURCE_UNAVAILABLE"
+
+    repository_lease: _DirectoryLease | None = None
+    held_directories: list[int] = []
+    if root_handle is not None:
+        if type(root_handle) is not int:
             raise ReleaseSubjectError(
-                "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
-                "V8 source-tree digest implementation has a non-canonical origin",
+                code, "root_handle must be an integer directory descriptor"
             )
-        if not callable(digest):
+        canonical_lease: _DirectoryLease | None = None
+        try:
+            observed_identity = _windows_handle_identity(
+                root_handle, code, directory=True
+            )
+            canonical_lease = _directory_lease(root, code)
+            expected_identity = canonical_lease.identities[-1]
+            if not _identity_matches(observed_identity, expected_identity):
+                raise ReleaseSubjectError(
+                    code,
+                    "root_handle does not identify the canonical repository root",
+                )
+        finally:
+            if canonical_lease is not None:
+                canonical_lease.close()
+
+    try:
+        if root_handle is None:
+            repository_lease = _directory_lease(root, code)
+            repository_handle = repository_lease.handles[-1]
+        else:
+            repository_handle = root_handle
+
+        repository_identity = _windows_handle_identity(
+            repository_handle,
+            code,
+            directory=True,
+        )
+        repository_entries = _enumerate_source_directory_entries(
+            repository_handle,
+            code,
+        )
+        repository_directory = _HeldSourceDirectory(
+            "@repository",
+            repository_handle,
+            repository_identity,
+            repository_entries,
+        )
+        source_directories: dict[str, _HeldSourceDirectory] = {}
+
+        def hold_directory(
+            parent: _HeldSourceDirectory,
+            name: str,
+            relative: str,
+        ) -> _HeldSourceDirectory:
+            entry = _source_entry(parent.entries, name, code)
+            if entry[2] or not entry[1]:
+                raise ReleaseSubjectError(
+                    code,
+                    f"source path is not a real directory: {relative}",
+                )
+            descriptor: int | None = None
+            try:
+                descriptor = _open_path_handle(
+                    Path(name),
+                    code,
+                    directory=True,
+                    parent=parent.handle,
+                )
+                identity = _windows_handle_identity(
+                    descriptor,
+                    code,
+                    directory=True,
+                )
+                if not _identity_matches(identity, entry[3]):
+                    raise ReleaseSubjectError(
+                        code,
+                        f"source directory changed before open: {relative}",
+                    )
+                entries = _enumerate_source_directory_entries(descriptor, code)
+                return _HeldSourceDirectory(relative, descriptor, identity, entries)
+            except Exception:
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                raise
+
+        parent = repository_directory
+        for component in ("skills", "orchestrator", "scripts", "gwo_v8"):
+            relative = (
+                component
+                if parent is repository_directory
+                else f"{parent.relative}/{component}"
+            )
+            child = hold_directory(parent, component, relative)
+            held_directories.append(child.handle)
+            source_directories[relative] = child
+            parent = child
+        package_directory = parent
+
+        captured: dict[str, bytes] = {}
+        source_files: dict[str, _CapturedSourceFile] = {}
+
+        def capture_file(
+            directory: _HeldSourceDirectory,
+            name: str,
+            expected_identity: Mapping[str, object],
+            relative: str,
+        ) -> None:
+            descriptor: int | None = None
+            try:
+                descriptor = _open_path_handle(
+                    Path(name),
+                    code,
+                    directory=False,
+                    parent=directory.handle,
+                )
+                identity = _windows_handle_identity(
+                    descriptor,
+                    code,
+                    directory=False,
+                )
+                if not _identity_matches(identity, expected_identity):
+                    raise ReleaseSubjectError(
+                        code,
+                        f"source file changed before open: {relative}",
+                    )
+                raw = _read_held_bytes(descriptor, code)
+                after_identity = _windows_handle_identity(
+                    descriptor,
+                    code,
+                    directory=False,
+                )
+                if (
+                    not _identity_matches(after_identity, identity)
+                    or after_identity.get("st_size") != len(raw)
+                ):
+                    raise ReleaseSubjectError(
+                        code,
+                        f"source file changed during capture: {relative}",
+                    )
+                captured[relative] = raw
+                source_files[relative] = _CapturedSourceFile(
+                    relative,
+                    directory.relative,
+                    name,
+                    identity,
+                    raw,
+                )
+            finally:
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+
+        def walk(directory: _HeldSourceDirectory, relative: str) -> None:
+            for name, is_directory, is_link, entry_identity in directory.entries:
+                if is_link:
+                    raise ReleaseSubjectError(
+                        code,
+                        "source tree contains a link or reparse point",
+                    )
+                child_relative = f"{relative}/{name}" if relative else name
+                if is_directory:
+                    child_path = f"{directory.relative}/{name}"
+                    child = hold_directory(directory, name, child_path)
+                    held_directories.append(child.handle)
+                    source_directories[child_path] = child
+                    walk(child, child_relative)
+                elif name.endswith(".py"):
+                    capture_file(directory, name, entry_identity, child_relative)
+
+        walk(package_directory, "")
+        if "__init__.py" not in captured or "cutover_guard.py" not in captured:
             raise ReleaseSubjectError(
-                "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
+                code,
                 "V8 source-tree digest implementation is unavailable",
             )
-    except ReleaseSubjectError:
-        raise
-    except (ImportError, ModuleNotFoundError, OSError, TypeError, ValueError) as error:
-        raise ReleaseSubjectError(
-            "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
-            "V8 source-tree digest implementation is unavailable",
-        ) from error
-    finally:
-        sys.dont_write_bytecode = previous_bytecode_setting
-        for name in tuple(sys.modules):
+
+        def assert_source_tree_stable() -> None:
+            for directory in (repository_directory, *source_directories.values()):
+                current_identity = _windows_handle_identity(
+                    directory.handle,
+                    code,
+                    directory=True,
+                )
+                if not _identity_matches(current_identity, directory.identity):
+                    raise ReleaseSubjectError(
+                        code,
+                        f"source directory changed: {directory.relative}",
+                    )
+                current_entries = _enumerate_source_directory_entries(
+                    directory.handle,
+                    code,
+                )
+                if current_entries != directory.entries:
+                    raise ReleaseSubjectError(
+                        code,
+                        f"source directory entries changed: {directory.relative}",
+                    )
+            for file in source_files.values():
+                directory = source_directories.get(file.parent_relative)
+                if directory is None:
+                    raise ReleaseSubjectError(
+                        code,
+                        f"source parent is not held: {file.relative}",
+                    )
+                entry = _source_entry(directory.entries, file.name, code)
+                if (
+                    entry[2]
+                    or entry[1]
+                    or not _identity_matches(entry[3], file.identity)
+                ):
+                    raise ReleaseSubjectError(
+                        code,
+                        f"source file path changed: {file.relative}",
+                    )
+                descriptor: int | None = None
+                try:
+                    descriptor = _open_path_handle(
+                        Path(file.name),
+                        code,
+                        directory=False,
+                        parent=directory.handle,
+                    )
+                    identity = _windows_handle_identity(
+                        descriptor,
+                        code,
+                        directory=False,
+                    )
+                    raw = _read_held_bytes(descriptor, code)
+                    after_identity = _windows_handle_identity(
+                        descriptor,
+                        code,
+                        directory=False,
+                    )
+                    if (
+                        not _identity_matches(identity, file.identity)
+                        or not _identity_matches(after_identity, file.identity)
+                        or after_identity.get("st_size") != len(raw)
+                        or raw != file.raw
+                    ):
+                        raise ReleaseSubjectError(
+                            code,
+                            f"source file changed: {file.relative}",
+                        )
+                finally:
+                    if descriptor is not None:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+
+        assert_source_tree_stable()
+
+        alias = "_gwo_v8_release_subject_" + hashlib.sha256(
+            str(scripts_root).encode("utf-8")
+        ).hexdigest()[:16]
+        package_name = alias
+        module_name = f"{alias}.cutover_guard"
+        if any(name == alias or name.startswith(f"{alias}.") for name in sys.modules):
+            raise ReleaseSubjectError(code, "V8 source-tree digest alias has preloaded modules")
+
+        def relative_for_name(name: str) -> tuple[str, bool] | None:
+            if name == package_name:
+                return "__init__.py", True
+            prefix = f"{package_name}."
+            if not name.startswith(prefix):
+                return None
+            parts = name[len(prefix) :].split(".")
+            if not parts or any(not part.isidentifier() for part in parts):
+                raise ReleaseSubjectError(code, "V8 source-tree digest loaded an invalid alias module")
+            module_relative = "/".join(parts) + ".py"
+            if module_relative in captured:
+                return module_relative, False
+            package_relative = "/".join(parts) + "/__init__.py"
+            if package_relative in captured:
+                return package_relative, True
+            raise ReleaseSubjectError(code, "V8 source-tree digest loaded a module without canonical source")
+
+        execution_alias_names = {package_name, module_name}
+        execution_alias_modules: dict[str, list[ModuleType]] = {}
+
+        def remember_alias_module(name: str, module: ModuleType) -> None:
             if name == alias or name.startswith(f"{alias}."):
-                sys.modules.pop(name, None)
-    try:
-        value = digest(root, root_handle=root_handle)
-    except Exception as error:
-        raise ReleaseSubjectError(
-            "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
-            "V8 source-tree digest could not be computed",
-        ) from error
-    if type(value) is not str or _HEX64.fullmatch(value) is None:
-        raise ReleaseSubjectError(
-            "RELEASE_SUBJECT_SOURCE_INVALID",
-            "V8 source-tree digest is not a lowercase SHA-256",
-        )
-    return value
+                execution_alias_names.add(name)
+                execution_alias_modules.setdefault(name, []).append(module)
+
+        class BoundSourceLoader(importlib.abc.Loader):
+            def __init__(self, name: str, relative: str, is_package: bool) -> None:
+                self.name = name
+                self.relative = relative
+                self.is_package_value = is_package
+                self.raw = captured[relative]
+                self.filename = str(package_root / Path(relative))
+
+            def create_module(self, _spec: object) -> None:
+                return None
+
+            def is_package(self, _fullname: str) -> bool:
+                return self.is_package_value
+
+            def get_filename(self, fullname: str) -> str:
+                if fullname != self.name:
+                    raise ImportError("loader name mismatch")
+                return self.filename
+
+            def get_data(self, path: str) -> bytes:
+                if _canonical_path(Path(path)) != _canonical_path(Path(self.filename)):
+                    raise OSError("loader path mismatch")
+                return self.raw
+
+            def exec_module(self, module: ModuleType) -> None:
+                # The compiler receives the captured bytes, never the pathname.
+                remember_alias_module(self.name, module)
+                code_object = compile(self.raw, self.filename, "exec")
+                exec(code_object, module.__dict__)
+
+        class BoundSourceFinder(importlib.abc.MetaPathFinder):
+            def find_spec(
+                self,
+                fullname: str,
+                _path: object = None,
+                _target: object = None,
+            ) -> object:
+                resolved = relative_for_name(fullname)
+                if resolved is None:
+                    return None
+                relative, is_package = resolved
+                loader = BoundSourceLoader(fullname, relative, is_package)
+                spec = importlib.util.spec_from_loader(
+                    fullname,
+                    loader,
+                    origin=loader.filename,
+                    is_package=is_package,
+                )
+                if spec is None:
+                    raise ImportError("bound source spec unavailable")
+                execution_alias_names.add(fullname)
+                if is_package:
+                    spec.submodule_search_locations = [
+                        str(package_root / Path(relative).parent)
+                    ]
+                return spec
+
+        def validate_name(name: str, package: str | None = None) -> None:
+            resolved = importlib.util.resolve_name(name, package) if name.startswith(".") else name
+            if resolved == alias or resolved.startswith(f"{alias}."):
+                relative_for_name(resolved)
+                return
+            root_name = resolved.split(".", 1)[0]
+            if root_name not in getattr(sys, "stdlib_module_names", set()) and root_name not in sys.builtin_module_names:
+                raise ImportError(f"external import is not permitted: {resolved}")
+
+        finder = BoundSourceFinder()
+        original_import = builtins.__import__
+        original_import_module = importlib.import_module
+        original_meta_path_object = sys.meta_path
+        original_meta_path = list(sys.meta_path)
+
+        def guarded_import(
+            name: str,
+            globals: Mapping[str, object] | None = None,
+            locals: Mapping[str, object] | None = None,
+            fromlist: object = (),
+            level: int = 0,
+        ) -> object:
+            package = None if globals is None else globals.get("__package__")
+            validate_name("." * level + name, package if isinstance(package, str) else None)
+            return original_import(name, globals, locals, fromlist, level)
+
+        def guarded_import_module(name: str, package: str | None = None) -> object:
+            validate_name(name, package)
+            return original_import_module(name, package)
+
+        def validate_loaded_module(name: str, loaded: object) -> None:
+            resolved = relative_for_name(name)
+            if resolved is None:
+                raise ReleaseSubjectError(code, "V8 source-tree digest loaded a module outside its alias")
+            relative, is_package = resolved
+            expected = _canonical_path(package_root / Path(relative))
+            observed_file = getattr(loaded, "__file__", None)
+            observed_spec = getattr(loaded, "__spec__", None)
+            observed_origin = getattr(observed_spec, "origin", None)
+            loader = getattr(observed_spec, "loader", None)
+            if (
+                type(observed_file) is not str
+                or type(observed_origin) is not str
+                or _canonical_path(Path(observed_file)) != expected
+                or _canonical_path(Path(observed_origin)) != expected
+                or type(loader) is not BoundSourceLoader
+                or loader.get_filename(name) != observed_file
+                or loader.get_data(observed_file) != captured[relative]
+            ):
+                raise ReleaseSubjectError(
+                    code,
+                    f"V8 source-tree digest module provenance is not canonical: "
+                    f"file={observed_file!r} origin={observed_origin!r} "
+                    f"loader={type(loader)!r} expected={expected!r} "
+                    f"loader_file={getattr(loader, 'filename', None)!r}",
+                )
+            if is_package and getattr(loaded, "__path__", None) != [str(package_root / Path(relative).parent)]:
+                raise ReleaseSubjectError(code, "V8 source-tree digest package path is not canonical")
+
+        def validate_loaded_alias() -> None:
+            current_names = {
+                name
+                for name in sys.modules
+                if name == alias or name.startswith(f"{alias}.")
+            }
+            names = tuple(sorted(execution_alias_names | current_names))
+            for name in names:
+                loaded = sys.modules.get(name)
+                if loaded is None:
+                    raise ReleaseSubjectError(
+                        code,
+                        "V8 source-tree digest alias contains an incomplete module",
+                    )
+                validate_loaded_module(name, loaded)
+            for name, modules in execution_alias_modules.items():
+                for loaded in modules:
+                    if loaded is not sys.modules.get(name):
+                        raise ReleaseSubjectError(
+                            code,
+                            "V8 source-tree digest alias module was replaced during execution",
+                        )
+                    validate_loaded_module(name, loaded)
+
+        previous_bytecode_setting = sys.dont_write_bytecode
+        value: object = None
+        try:
+            sys.dont_write_bytecode = True
+            sys.meta_path.insert(0, finder)
+            builtins.__import__ = guarded_import
+            importlib.import_module = guarded_import_module
+            spec = importlib.util.spec_from_loader(
+                module_name,
+                BoundSourceLoader(module_name, "cutover_guard.py", False),
+                origin=str(package_root / "cutover_guard.py"),
+                is_package=False,
+            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[package_name] = importlib.util.module_from_spec(
+                importlib.util.spec_from_loader(
+                    package_name,
+                    BoundSourceLoader(package_name, "__init__.py", True),
+                    origin=str(package_root / "__init__.py"),
+                    is_package=True,
+                )
+            )
+            sys.modules[module_name] = module
+            package = sys.modules[package_name]
+            remember_alias_module(package_name, package)
+            remember_alias_module(module_name, module)
+            package.__file__ = str(package_root / "__init__.py")
+            package.__package__ = package_name
+            package.__path__ = [str(package_root)]  # type: ignore[attr-defined]
+            exec(compile(captured["__init__.py"], str(package_root / "__init__.py"), "exec"), package.__dict__)
+            module.__file__ = str(package_root / "cutover_guard.py")
+            module.__package__ = package_name
+            exec(compile(captured["cutover_guard.py"], str(package_root / "cutover_guard.py"), "exec"), module.__dict__)
+            for loaded_name in tuple(
+                name for name in sys.modules if name == alias or name.startswith(f"{alias}.")
+            ):
+                loaded_module = sys.modules.get(loaded_name)
+                if loaded_module is not None and getattr(loaded_module, "__file__", None) is None:
+                    loaded_module.__file__ = getattr(
+                        getattr(loaded_module, "__spec__", None), "origin", None
+                    )
+            validate_loaded_alias()
+            digest = getattr(module, "source_tree_digest", None)
+            if not callable(digest):
+                raise ReleaseSubjectError(code, "V8 source-tree digest implementation is unavailable")
+            try:
+                value = digest(root, root_handle=repository_handle)
+            except Exception as error:
+                raise ReleaseSubjectError(
+                    code, "V8 source-tree digest could not be computed"
+                ) from error
+            validate_loaded_alias()
+        except ReleaseSubjectError:
+            raise
+        except Exception as error:
+            raise ReleaseSubjectError(code, "V8 source-tree digest implementation is unavailable") from error
+        finally:
+            builtins.__import__ = original_import
+            importlib.import_module = original_import_module
+            sys.meta_path = original_meta_path_object
+            sys.meta_path[:] = original_meta_path
+            sys.dont_write_bytecode = previous_bytecode_setting
+            for name in tuple(sys.modules):
+                if name == alias or name.startswith(f"{alias}."):
+                    sys.modules.pop(name, None)
+
+        assert_source_tree_stable()
+        if type(value) is not str or _HEX64.fullmatch(value) is None:
+            raise ReleaseSubjectError("RELEASE_SUBJECT_SOURCE_INVALID", "V8 source-tree digest is not a lowercase SHA-256")
+        return value
+    finally:
+        if repository_lease is not None:
+            repository_lease.close()
+        _close_descriptors(held_directories)
 
 
 def _default_git_output(

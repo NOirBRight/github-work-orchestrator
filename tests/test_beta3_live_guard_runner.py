@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import builtins
 import hashlib
+import importlib.machinery
 import io
 import importlib.util
 import inspect
@@ -12,7 +14,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -4059,6 +4061,786 @@ def test_production_run_loads_subject_before_git_and_nonce(
     result = runner.run(execute=True, run_id="subject-order-red")
     assert result["code"] == "RELEASE_SUBJECT_UNAVAILABLE"
     assert events == ["subject"]
+
+
+def test_production_release_subject_loader_rejects_preloaded_shadow_before_source_or_nonce(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", REPO_ROOT)
+    shadow_path = tmp_path / "beta3_release_subject.py"
+    shadow_path.write_text("# shadow\n", encoding="utf-8")
+    calls: list[str] = []
+    source_reads: list[Path] = []
+
+    def shadow_loader():
+        calls.append("loader")
+        return SimpleNamespace()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "beta3_release_subject",
+        SimpleNamespace(
+            __file__=str(shadow_path),
+            __spec__=SimpleNamespace(origin=str(shadow_path)),
+            load_production_release_subject=shadow_loader,
+        ),
+    )
+
+    def forbidden(*_args, **_kwargs):
+        calls.append("source-or-nonce")
+        raise AssertionError("shadow release-subject module reached source or nonce")
+
+    def forbidden_bound_bytes(path, *_args, **_kwargs):
+        source_reads.append(Path(path))
+        raise AssertionError("preloaded module was checked after canonical source read")
+
+    monkeypatch.setattr(runner, "_bound_bytes", forbidden_bound_bytes)
+    monkeypatch.setattr(runner, "_git_snapshot", forbidden)
+    monkeypatch.setattr(runner.secrets, "token_hex", forbidden)
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner.load_production_release_subject()
+
+    assert error.value.code == "ATTESTATION_PROVENANCE_MISMATCH"
+    assert calls == []
+    assert source_reads == []
+
+
+def test_production_release_subject_loader_cleans_candidate_after_import_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", REPO_ROOT)
+    monkeypatch.delitem(sys.modules, "beta3_release_subject", raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "beta3_release_subject", REPO_ROOT / "scripts" / "beta3_release_subject.py"
+    )
+    assert spec is not None
+
+    class ExplodingLoader:
+        def create_module(self, _spec):
+            return None
+
+        def exec_module(self, _module):
+            raise RuntimeError("synthetic import failure")
+
+    spec.loader = ExplodingLoader()
+    monkeypatch.setattr(
+        runner.importlib.util,
+        "spec_from_file_location",
+        lambda *_args, **_kwargs: spec,
+    )
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner.load_production_release_subject()
+
+    assert error.value.code == "ATTESTATION_PROVENANCE_MISMATCH"
+    assert "beta3_release_subject" not in sys.modules
+
+
+def test_production_release_subject_loader_revalidates_successful_module_for_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repository_root = tmp_path / "repository"
+    scripts_root = repository_root / "scripts"
+    evidence_root = tmp_path / "evidence"
+    scripts_root.mkdir(parents=True)
+    evidence_root.mkdir()
+    source = f'''from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ReleaseSubject:
+    repository: str
+    repository_root: str
+    evidence_root: str
+    merged_main_sha: str
+    merged_main_git_tree: str
+    audited_source_tree_digest: str
+    subject_digest: str
+
+
+class ReleaseSubjectBinding:
+    def __init__(self, subject):
+        self.subject = subject
+
+    def close(self):
+        pass
+
+
+def load_production_release_subject():
+    return ReleaseSubjectBinding(ReleaseSubject(
+        repository="NOirBRight/github-work-orchestrator",
+        repository_root={str(repository_root.resolve())!r},
+        evidence_root={str(evidence_root.resolve())!r},
+        merged_main_sha="a" * 40,
+        merged_main_git_tree="b" * 40,
+        audited_source_tree_digest="c" * 64,
+        subject_digest="d" * 64,
+    ))
+'''
+    (scripts_root / "beta3_release_subject.py").write_text(source, encoding="utf-8")
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", repository_root.resolve())
+    monkeypatch.setattr(runner, "EVIDENCE_ROOT", evidence_root.resolve())
+    monkeypatch.delitem(sys.modules, "beta3_release_subject", raising=False)
+
+    binding = runner.load_production_release_subject()
+    config = runner._bind_runner_config_from_subject(binding.subject)
+
+    assert binding.subject.repository_root == str(repository_root.resolve())
+    assert config.repository_root == repository_root.resolve()
+    assert config.evidence_root == evidence_root.resolve()
+
+
+def _write_minimal_release_subject_module(
+    repository_root: Path,
+    *,
+    value: str,
+) -> Path:
+    scripts_root = repository_root / "scripts"
+    source_path = scripts_root / "beta3_release_subject.py"
+    source_path.write_text(
+        f'''class Binding:
+    def __init__(self, value):
+        self.subject = type("Subject", (), {{"value": value}})()
+
+    def close(self):
+        pass
+
+
+def load_production_release_subject():
+    return Binding({value!r})
+''',
+        encoding="utf-8",
+    )
+    return source_path
+
+
+def test_production_release_subject_loader_compiles_captured_bytes_without_source_loader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root = tmp_path / "repository"
+    (repository_root / "scripts").mkdir(parents=True)
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    source_path = _write_minimal_release_subject_module(
+        repository_root,
+        value="captured",
+    )
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", repository_root)
+    monkeypatch.setattr(runner, "EVIDENCE_ROOT", evidence_root)
+    monkeypatch.delitem(sys.modules, "beta3_release_subject", raising=False)
+
+    compiled_sources: list[object] = []
+    original_compile = builtins.compile
+
+    def record_compile(
+        source: object,
+        filename: object,
+        mode: str,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        if Path(str(filename)) == source_path:
+            compiled_sources.append(source)
+        return original_compile(source, filename, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "compile", record_compile)
+
+    def source_loader_must_not_read(self: object, _path: str) -> bytes:
+        raise AssertionError("production loader read source through SourceFileLoader")
+
+    monkeypatch.setattr(
+        importlib.machinery.SourceFileLoader,
+        "get_data",
+        source_loader_must_not_read,
+    )
+
+    binding = runner.load_production_release_subject()
+
+    assert binding.subject.value == "captured"
+    assert compiled_sources
+    assert type(compiled_sources[-1]) is bytes
+
+
+def test_production_release_subject_loader_clears_a_stale_canonical_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root = tmp_path / "repository"
+    (repository_root / "scripts").mkdir(parents=True)
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    source_path = _write_minimal_release_subject_module(
+        repository_root,
+        value="fresh",
+    )
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", repository_root)
+    monkeypatch.setattr(runner, "EVIDENCE_ROOT", evidence_root)
+
+    stale_spec = importlib.util.spec_from_file_location(
+        "beta3_release_subject", source_path
+    )
+    assert stale_spec is not None and stale_spec.loader is not None
+    stale_module = importlib.util.module_from_spec(stale_spec)
+    monkeypatch.setitem(sys.modules, "beta3_release_subject", stale_module)
+    stale_spec.loader.exec_module(stale_module)
+    stale_module.load_production_release_subject = lambda: (_ for _ in ()).throw(
+        AssertionError("stale release-subject module was executed")
+    )
+
+    binding = runner.load_production_release_subject()
+
+    assert binding.subject.value == "fresh"
+
+
+def test_attestor_loader_executes_held_raw_bytes_not_canonical_path_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module_name = "beta3_attestor_fixture"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_bytes(b"value = 'path'\n")
+    held_raw = b"value = 'held'\n"
+    reads: list[Path] = []
+
+    def held_bytes(path: Path, _code: str):
+        reads.append(Path(path))
+        return held_raw, {}
+
+    def source_loader_must_not_read(self: object, _path: str) -> bytes:
+        raise AssertionError("attestor loader read source through SourceFileLoader")
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    monkeypatch.setattr(runner, "_bound_bytes", held_bytes)
+    monkeypatch.setattr(
+        importlib.machinery.SourceFileLoader,
+        "get_data",
+        source_loader_must_not_read,
+    )
+
+    module = runner._imported_module_with_canonical_origin(
+        f"{module_name}.py", source_path
+    )
+
+    assert module.value == "held"
+    assert reads == [source_path]
+
+
+def test_attestor_loader_replaces_a_canonical_path_module_with_unbound_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module_name = "beta3_attestor_fixture"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_bytes(b"value = 'canonical'\n")
+    shadow = ModuleType(module_name)
+    shadow.__file__ = str(source_path)
+    shadow_loader = object()
+    shadow.__spec__ = SimpleNamespace(
+        origin=str(source_path),
+        loader=shadow_loader,
+    )
+    shadow.__loader__ = shadow_loader
+    shadow.value = "shadow"
+    monkeypatch.setitem(sys.modules, module_name, shadow)
+
+    module = runner._imported_module_with_canonical_origin(
+        f"{module_name}.py", source_path
+    )
+
+    assert module is not shadow
+    assert module.value == "canonical"
+    assert type(module.__spec__.loader) is runner._CapturedReleaseSubjectLoader
+
+
+def test_strict_v8_package_loader_executes_held_bytes_not_path_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    package_root = tmp_path / "gwo_v8"
+    package_root.mkdir()
+    (package_root / "__init__.py").write_text(
+        "from .value import VALUE\n",
+        encoding="utf-8",
+    )
+    (package_root / "value.py").write_text(
+        "VALUE = 'path'\n",
+        encoding="utf-8",
+    )
+    previous_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "gwo_v8" or name.startswith("gwo_v8.")
+    }
+    previous_state = runner._CAPTURED_V8_PACKAGE_STATE
+    previous_meta_path = list(sys.meta_path)
+    try:
+        for name in previous_modules:
+            sys.modules.pop(name, None)
+        original_bound_tree_files = runner._bound_tree_files
+
+        def held_bytes(path: Path, code: str):
+            return tuple(
+                replace(item, content=b"VALUE = 'held'\n")
+                if item.relative == "value.py"
+                else item
+                for item in original_bound_tree_files(path, code)
+            )
+
+        monkeypatch.setattr(runner, "_bound_tree_files", held_bytes)
+        package = runner._load_captured_v8_package(package_root)
+        assert package.VALUE == "held"
+        assert type(package.__spec__.loader) is runner._CapturedV8PackageLoader
+    finally:
+        for name in tuple(sys.modules):
+            if name == "gwo_v8" or name.startswith("gwo_v8."):
+                sys.modules.pop(name, None)
+        sys.modules.update(previous_modules)
+        sys.meta_path[:] = previous_meta_path
+        runner._CAPTURED_V8_PACKAGE_STATE = previous_state
+
+
+def test_strict_v8_package_loader_rejects_forged_canonical_module():
+    root = runner._v8_source_root(runner.REPOSITORY_ROOT)
+    init_path = root / "__init__.py"
+    previous_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "gwo_v8" or name.startswith("gwo_v8.")
+    }
+    previous_state = runner._CAPTURED_V8_PACKAGE_STATE
+    previous_meta_path = list(sys.meta_path)
+    try:
+        for name in previous_modules:
+            sys.modules.pop(name, None)
+        forged = ModuleType("gwo_v8")
+        forged.__file__ = str(init_path)
+        forged.__path__ = [str(root)]
+        forged.__spec__ = SimpleNamespace(origin=str(init_path), loader=object())
+        # Restore the manually captured module set ourselves.  Using
+        # monkeypatch.setitem here records the temporary absence after the
+        # pre-test purge; its teardown would therefore delete the original
+        # canonical package that this finally block restores.
+        sys.modules["gwo_v8"] = forged
+        with pytest.raises(runner.RunnerError) as error:
+            runner._validate_v8_module_origins(
+                runner.REPOSITORY_ROOT,
+                repository=runner.REPOSITORY,
+            )
+        assert error.value.code == "ATTESTATION_PROVENANCE_MISMATCH"
+    finally:
+        for name in tuple(sys.modules):
+            if name == "gwo_v8" or name.startswith("gwo_v8."):
+                sys.modules.pop(name, None)
+        sys.modules.update(previous_modules)
+        sys.meta_path[:] = previous_meta_path
+        runner._CAPTURED_V8_PACKAGE_STATE = previous_state
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX open-flag contract")
+@pytest.mark.parametrize(
+    ("missing_flag", "directory"),
+    (
+        ("O_DIRECTORY", True),
+        ("O_NOFOLLOW", True),
+        ("O_NOFOLLOW", False),
+        ("O_NONBLOCK", False),
+    ),
+)
+def test_runner_posix_open_fails_closed_when_required_flag_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_flag: str,
+    directory: bool,
+):
+    path = tmp_path if directory else tmp_path / "source.py"
+    if not directory:
+        path.write_bytes(b"value = 1\n")
+
+    monkeypatch.delattr(runner.os, missing_flag)
+
+    def unexpected_open(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("os.open must not be reached without required flags")
+
+    monkeypatch.setattr(runner.os, "open", unexpected_open)
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner._open_path_handle(
+            path,
+            "TEST_REQUIRED_POSIX_FLAG",
+            directory=directory,
+        )
+
+    assert error.value.code == "TEST_REQUIRED_POSIX_FLAG"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX open-flag contract")
+@pytest.mark.parametrize("missing_flag", ("O_DIRECTORY", "O_NOFOLLOW"))
+def test_runner_held_directory_enumeration_fails_closed_without_required_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_flag: str,
+):
+    parent = os.open(tmp_path, os.O_RDONLY)
+    try:
+        monkeypatch.delattr(runner.os, missing_flag)
+
+        def unexpected_open(*_args: object, **_kwargs: object) -> int:
+            raise AssertionError(
+                "os.open must not be reached without required directory flags"
+            )
+
+        monkeypatch.setattr(runner.os, "open", unexpected_open)
+
+        with pytest.raises(runner.RunnerError) as error:
+            runner._held_directory_entries(parent, "TEST_REQUIRED_POSIX_FLAG")
+
+        assert error.value.code == "TEST_REQUIRED_POSIX_FLAG"
+    finally:
+        os.close(parent)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX same-inode capture contract")
+def test_held_tree_capture_rejects_same_inode_same_length_content_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    package_root = tmp_path / "gwo_v8"
+    package_root.mkdir()
+    target = package_root / "value.py"
+    original = b"VALUE = 'old'\n"
+    replacement = b"VALUE = 'new'\n"
+    assert len(original) == len(replacement)
+    target.write_bytes(original)
+    original_read = runner._read_held_bytes
+    mutated = False
+
+    def read_then_replace(descriptor: int, code: str) -> bytes:
+        nonlocal mutated
+        content = original_read(descriptor, code)
+        if not mutated:
+            mutated = True
+            with target.open("r+b") as writer:
+                writer.write(replacement)
+                writer.flush()
+                os.fsync(writer.fileno())
+        return content
+
+    monkeypatch.setattr(runner, "_read_held_bytes", read_then_replace)
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner._bound_tree_files(package_root, "LIVE_INPUT_DRIFT")
+
+    assert error.value.code == "LIVE_INPUT_DRIFT"
+
+
+def test_captured_package_loader_restores_failed_load_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    package_root = tmp_path / "gwo_v8"
+    package_root.mkdir()
+    init_path = package_root / "__init__.py"
+    init_path.write_text("VALUE = 'preloaded'\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    previous_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "gwo_v8" or name.startswith("gwo_v8.")
+    }
+    previous_state = runner._CAPTURED_V8_PACKAGE_STATE
+    original_meta_path = sys.meta_path
+    original_meta_path_contents = list(sys.meta_path)
+    try:
+        for name in previous_modules:
+            sys.modules.pop(name, None)
+        preloaded = importlib.import_module("gwo_v8")
+        init_path.write_text(
+            "import sys as _sys\n"
+            "_sys.meta_path = []\n"
+            "raise RuntimeError('captured import failed')\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(RuntimeError, match="captured import failed"):
+            runner._load_captured_v8_package(package_root)
+
+        assert sys.modules.get("gwo_v8") is preloaded
+        assert {
+            name: module
+            for name, module in sys.modules.items()
+            if name == "gwo_v8" or name.startswith("gwo_v8.")
+        } == {"gwo_v8": preloaded}
+        assert sys.meta_path is original_meta_path
+        assert sys.meta_path == original_meta_path_contents
+        assert runner._CAPTURED_V8_PACKAGE_STATE is previous_state
+    finally:
+        for name in tuple(sys.modules):
+            if name == "gwo_v8" or name.startswith("gwo_v8."):
+                sys.modules.pop(name, None)
+        sys.modules.update(previous_modules)
+        sys.meta_path = original_meta_path
+        sys.meta_path[:] = original_meta_path_contents
+        runner._CAPTURED_V8_PACKAGE_STATE = previous_state
+
+
+def test_captured_package_loader_restores_all_module_entries_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    package_root = tmp_path / "gwo_v8"
+    package_root.mkdir()
+    init_path = package_root / "__init__.py"
+    init_path.write_text("VALUE = 'preloaded'\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    previous_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "gwo_v8" or name.startswith("gwo_v8.")
+    }
+    previous_state = runner._CAPTURED_V8_PACKAGE_STATE
+    original_modules = sys.modules
+    original_meta_path = sys.meta_path
+    original_meta_path_contents = list(sys.meta_path)
+    try:
+        for name in previous_modules:
+            sys.modules.pop(name, None)
+        preloaded = importlib.import_module("gwo_v8")
+        expected_module_items = list(sys.modules.items())
+        init_path.write_text(
+            "import sys as _sys\n"
+            "_sys.modules['captured_loader_side_effect'] = object()\n"
+            "_sys.meta_path = []\n"
+            "raise RuntimeError('captured import failed')\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(RuntimeError, match="captured import failed"):
+            runner._load_captured_v8_package(package_root)
+
+        assert sys.modules is original_modules
+        assert list(sys.modules.items()) == expected_module_items
+        assert sys.modules.get("gwo_v8") is preloaded
+        assert sys.meta_path is original_meta_path
+        assert sys.meta_path == original_meta_path_contents
+        assert runner._CAPTURED_V8_PACKAGE_STATE is previous_state
+    finally:
+        sys.modules = original_modules
+        for name in tuple(sys.modules):
+            if (
+                name == "gwo_v8"
+                or name.startswith("gwo_v8.")
+                or name == "captured_loader_side_effect"
+            ):
+                sys.modules.pop(name, None)
+        sys.modules.update(previous_modules)
+        sys.meta_path = original_meta_path
+        sys.meta_path[:] = original_meta_path_contents
+        runner._CAPTURED_V8_PACKAGE_STATE = previous_state
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point contract")
+def test_production_release_subject_loader_rejects_a_reparse_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    real_root = tmp_path / "real-repository"
+    (real_root / "scripts").mkdir(parents=True)
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    source_path = _write_minimal_release_subject_module(
+        real_root,
+        value="must-not-execute",
+    )
+    junction = tmp_path / "repository-junction"
+    result = subprocess.run(
+        ["cmd", "/d", "/c", "mklink", "/J", str(junction), str(real_root)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not junction.is_dir():
+        pytest.skip(f"junction fixture unavailable: {result.stderr}")
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", junction)
+    monkeypatch.setattr(runner, "EVIDENCE_ROOT", evidence_root)
+    monkeypatch.delitem(sys.modules, "beta3_release_subject", raising=False)
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner.load_production_release_subject()
+
+    assert error.value.code == "ATTESTATION_PROVENANCE_MISMATCH"
+    assert not source_path.with_name("executed.marker").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point contract")
+def test_production_release_subject_loader_rejects_a_reparse_leaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root = tmp_path / "repository"
+    (repository_root / "scripts").mkdir(parents=True)
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    target_path = _write_minimal_release_subject_module(
+        repository_root,
+        value="must-not-execute",
+    )
+    link_path = target_path.with_name("beta3_release_subject.py.link-target")
+    target_path.rename(link_path)
+    result = subprocess.run(
+        ["cmd", "/d", "/c", "mklink", str(target_path), str(link_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not target_path.is_symlink():
+        pytest.skip(f"file reparse fixture unavailable: {result.stderr}")
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", repository_root)
+    monkeypatch.setattr(runner, "EVIDENCE_ROOT", evidence_root)
+    monkeypatch.delitem(sys.modules, "beta3_release_subject", raising=False)
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner.load_production_release_subject()
+
+    assert error.value.code == "ATTESTATION_PROVENANCE_MISMATCH"
+
+
+def test_package_and_local_file_discovery_reads_only_descriptor_relative_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    package_root = tmp_path / "package"
+    (package_root / "nested").mkdir(parents=True)
+    (package_root / "root.md").write_text("root\n", encoding="utf-8")
+    (package_root / "nested" / "child.txt").write_text(
+        "child\n", encoding="utf-8"
+    )
+    (package_root / ".skill-package.json").write_text("{}\n", encoding="utf-8")
+    (package_root / "nested" / "ignored.pyc").write_bytes(b"pyc")
+    (package_root / "__pycache__").mkdir()
+    (package_root / "__pycache__" / "ignored.py").write_text(
+        "ignored\n", encoding="utf-8"
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unbound source discovery or read was used")
+
+    monkeypatch.setattr(runner.os, "walk", forbidden)
+    monkeypatch.setattr(runner.os, "scandir", forbidden)
+    monkeypatch.setattr(Path, "rglob", forbidden)
+    monkeypatch.setattr(runner, "_bound_bytes", forbidden)
+
+    tree = runner._tree_snapshot(package_root, "PACKAGE_INVALID")
+    digest = runner._package_digest(package_root)
+    local_files = runner._local_regular_files(package_root, "LIVE_INPUT_DRIFT")
+
+    assert [entry["path"] for entry in tree] == [
+        ".skill-package.json",
+        "nested/child.txt",
+        "root.md",
+    ]
+    assert len(digest) == 64
+    assert set(local_files) == {
+        package_root / ".skill-package.json",
+        package_root / "nested" / "child.txt",
+        package_root / "root.md",
+    }
+
+
+def test_package_snapshot_binds_source_and_installed_files_during_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = _fixture_config(tmp_path)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("package snapshot performed an unbound read")
+
+    monkeypatch.setattr(runner.os, "walk", forbidden)
+    monkeypatch.setattr(runner.os, "scandir", forbidden)
+    monkeypatch.setattr(Path, "rglob", forbidden)
+    monkeypatch.setattr(runner, "_bound_bytes", forbidden)
+
+    snapshot = runner._package_snapshot(config)
+
+    assert set(snapshot["value"]["sources"]) == set(config.package_names)
+    assert set(snapshot["value"]["installed"]) == {
+        f"{surface}:{package_name}"
+        for surface in runner.INSTALL_SURFACES
+        for package_name in config.package_names
+    }
+
+
+def test_mechanical_input_snapshot_uses_held_package_file_captures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = _fixture_config(tmp_path)
+    package_roots = [
+        config.repository_root / "skills" / package_name
+        for package_name in config.package_names
+    ]
+    package_roots.extend(
+        install_root / package_name
+        for install_root in config.install_roots
+        for package_name in config.package_names
+    )
+    original_bound_snapshot = runner._bound_file_snapshot
+
+    def forbid_post_discovery_package_read(path: Path, code: str):
+        absolute = Path(path).absolute()
+        if any(
+            absolute == root.absolute()
+            or root.absolute() in absolute.parents
+            for root in package_roots
+        ):
+            raise AssertionError("package file was read again by pathname")
+        return original_bound_snapshot(path, code)
+
+    monkeypatch.setattr(
+        runner,
+        "_bound_file_snapshot",
+        forbid_post_discovery_package_read,
+    )
+
+    snapshot = runner._mechanical_input_snapshot(config)
+
+    assert any(
+        str(config.repository_root / "skills" / "implement-gwo" / "SKILL.md")
+        == path
+        for path in snapshot["file_paths"]
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point contract")
+def test_local_regular_files_rejects_a_reparse_ancestor(
+    tmp_path: Path,
+):
+    real_root = tmp_path / "real-root"
+    package_root = real_root / "package"
+    package_root.mkdir(parents=True)
+    (package_root / "source.txt").write_text("source\n", encoding="utf-8")
+    junction = tmp_path / "redirected-root"
+    result = subprocess.run(
+        ["cmd", "/d", "/c", "mklink", "/J", str(junction), str(real_root)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not junction.is_dir():
+        pytest.skip(f"junction fixture unavailable: {result.stderr}")
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner._local_regular_files(
+            junction / "package",
+            "LIVE_INPUT_DRIFT",
+        )
+
+    assert error.value.code == "LIVE_INPUT_DRIFT"
 
 
 def test_default_subject_keeps_git_tree_and_audited_digest_separate(tmp_path):

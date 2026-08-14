@@ -275,10 +275,17 @@ def _open_windows_component(path: Path, parent: int | None, *, directory: bool) 
 
 
 def _open_component(path: Path | str, parent: int | None, *, directory: bool) -> int:
-    path = Path(path)
+    # Keep the POSIX branch path-like agnostic.  Besides avoiding needless
+    # pathlib construction, this lets the contract test exercise the POSIX
+    # branch on Windows by replacing ``os.name`` without asking pathlib to
+    # instantiate a native-incompatible PosixPath.
+    raw_path: object = path
     try:
+        raw_path = os.fspath(path)
         if os.name == "nt":
-            return _open_windows_component(path, parent, directory=directory)
+            return _open_windows_component(
+                Path(raw_path), parent, directory=directory
+            )
         nofollow = getattr(os, "O_NOFOLLOW", None)
         if nofollow is None:
             raise SourceSnapshotError(
@@ -299,11 +306,14 @@ def _open_component(path: Path | str, parent: int | None, *, directory: bool) ->
                     "POSIX source capture requires O_NONBLOCK for files"
                 )
             flags |= nonblock
-        return os.open(path if parent is None else path.name, flags, dir_fd=parent)
+        target = raw_path if parent is None else os.path.basename(raw_path)
+        return os.open(target, flags, dir_fd=parent)
     except SourceSnapshotError:
         raise
     except (OSError, TypeError) as error:
-        raise SourceSnapshotError(f"source component cannot be held: {path}") from error
+        raise SourceSnapshotError(
+            f"source component cannot be held: {raw_path}"
+        ) from error
 
 
 def _read(descriptor: int) -> bytes:

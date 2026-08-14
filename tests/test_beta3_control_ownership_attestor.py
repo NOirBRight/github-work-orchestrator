@@ -793,6 +793,69 @@ def test_sources_expose_only_the_exact_read_only_surface(
     assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
 
 
+def test_check_source_rejects_instance_dir_hiding_public_callable():
+    class Hiding:
+        def read(self):
+            return object()
+
+        def publish(self):
+            return object()
+
+        def __dir__(self):
+            return ["read"]
+
+    with pytest.raises(BootstrapError) as error:
+        ControlOwnershipAttestor._check_source(Hiding(), ("read",))
+
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+
+
+def test_check_source_rejects_instance_dynamic_getattr_callable():
+    class Dynamic:
+        def read(self):
+            return object()
+
+        def __getattr__(self, name):
+            if name == "publish":
+                return lambda: object()
+            raise AttributeError(name)
+
+    with pytest.raises(BootstrapError) as error:
+        ControlOwnershipAttestor._check_source(Dynamic(), ("read",))
+
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+
+
+def test_check_source_rejects_instance_dynamic_getattribute_callable():
+    class Dynamic:
+        def read(self):
+            return object()
+
+        def __getattribute__(self, name):
+            if name == "publish":
+                return lambda: object()
+            return object.__getattribute__(self, name)
+
+    with pytest.raises(BootstrapError) as error:
+        ControlOwnershipAttestor._check_source(Dynamic(), ("read",))
+
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+
+
+def test_check_source_rejects_custom_metaclass_even_with_exact_declared_surface():
+    class CustomMeta(type):
+        pass
+
+    class Source(metaclass=CustomMeta):
+        def read(self):
+            return object()
+
+    with pytest.raises(BootstrapError) as error:
+        ControlOwnershipAttestor._check_source(Source(), ("read",))
+
+    assert error.value.code == "UNSAFE_SOURCE_CAPABILITY"
+
+
 def test_control_rejects_shadowed_gwo_v8_dependency(control_fixture, monkeypatch, tmp_path):
     shadow_root = tmp_path / "shadow-gwo-v8"
     shadow_root.mkdir()

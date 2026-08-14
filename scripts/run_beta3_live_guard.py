@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib
+import importlib.abc
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+from types import ModuleType
 from typing import TYPE_CHECKING, Callable, Mapping, Protocol, Sequence, TextIO
 
 if TYPE_CHECKING:
@@ -27,10 +29,12 @@ if TYPE_CHECKING:
     from gwo_v8.cutover_guard import CutoverSubject
 
 
-REPOSITORY_ROOT = Path(r"D:\Workstation\github-work-orchestrator").resolve()
+REPOSITORY_ROOT = Path(os.path.abspath(r"D:\Workstation\github-work-orchestrator"))
 EVIDENCE_ROOT = Path(
-    r"D:\gwo-release-evidence\2026-08-09-gwo-v8-beta3-production-cutover"
-).resolve()
+    os.path.abspath(
+        r"D:\gwo-release-evidence\2026-08-09-gwo-v8-beta3-production-cutover"
+    )
+)
 REPOSITORY = "NOirBRight/github-work-orchestrator"
 CONTROL_BRANCH = "gwo-control"
 TARGET_BRANCH = "main"
@@ -436,18 +440,34 @@ def _exact_digest_value(value: object) -> str:
 
 
 def _path_text(path: Path) -> str:
-    return str(Path(path).resolve())
+    return str(_absolute_path(Path(path)))
+
+
+def _absolute_path(path: Path) -> Path:
+    """Normalize only lexical path syntax; do not follow a reparse point."""
+
+    return Path(os.path.abspath(Path(path).expanduser()))
 
 
 def _same_path(left: object, right: Path) -> bool:
     try:
-        return Path(str(left)).resolve() == Path(right).resolve()
+        return _absolute_path(Path(str(left))) == _absolute_path(Path(right))
     except (OSError, RuntimeError, TypeError):
         return False
 
 
 def _is_reparse(stat_result: os.stat_result) -> bool:
     return bool(getattr(stat_result, "st_file_attributes", 0) & 0x0400)
+
+
+def _required_posix_open_flags(code: str, *names: str) -> tuple[int, ...]:
+    values: list[int] = []
+    for name in names:
+        value = getattr(os, name, None)
+        if type(value) is not int or value == 0:
+            raise RunnerError(code, f"POSIX open requires {name}")
+        values.append(value)
+    return tuple(values)
 
 
 def _lstat(path: Path, code: str) -> os.stat_result:
@@ -564,6 +584,335 @@ class _HeldDirectory:
     def close(self) -> None:
         _close_descriptors(self.component_descriptors)
         self.component_identities.clear()
+
+
+@dataclass(frozen=True)
+class _HeldTreeEntry:
+    name: str
+    is_directory: bool
+    is_reparse: bool
+    identity: Mapping[str, object] | None = None
+    windows_file_id: int | None = None
+
+
+@dataclass(frozen=True)
+class _HeldTreeFile:
+    path: Path
+    relative: str
+    content: bytes
+    identity: dict[str, int | str]
+
+
+def _windows_directory_entries(
+    descriptor: int, code: str
+) -> tuple[_HeldTreeEntry, ...]:
+    """Enumerate one already-held Windows directory handle."""
+
+    try:
+        import ctypes
+        import msvcrt
+        import struct
+
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = [
+                ("status", ctypes.c_void_p),
+                ("information", ctypes.c_size_t),
+            ]
+
+        ntdll = ctypes.WinDLL("ntdll")
+        ntdll.NtQueryDirectoryFile.restype = ctypes.c_long
+        ntdll.NtQueryDirectoryFile.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(IoStatusBlock),
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_ubyte,
+            ctypes.c_void_p,
+            ctypes.c_ubyte,
+        ]
+        handle = ctypes.c_void_p(msvcrt.get_osfhandle(descriptor))
+        status_no_more_files = 0x80000006
+        status_buffer_overflow = 0x80000005
+        entries: list[_HeldTreeEntry] = []
+        restart_scan = 1
+        while True:
+            buffer = ctypes.create_string_buffer(64 * 1024)
+            io_status = IoStatusBlock()
+            status = int(
+                ntdll.NtQueryDirectoryFile(
+                    handle,
+                    None,
+                    None,
+                    None,
+                    ctypes.byref(io_status),
+                    ctypes.byref(buffer),
+                    ctypes.sizeof(buffer),
+                    37,
+                    0,
+                    None,
+                    restart_scan,
+                )
+            ) & 0xFFFFFFFF
+            restart_scan = 0
+            if status == status_no_more_files:
+                break
+            if status not in {0, status_buffer_overflow}:
+                raise OSError(status, "NtQueryDirectoryFile failed")
+            information = int(io_status.information)
+            if information <= 0:
+                raise OSError("directory enumeration returned no data")
+            data = buffer.raw[:information]
+            offset = 0
+            while offset < information:
+                if offset + 104 > information:
+                    raise OSError("directory enumeration record is truncated")
+                next_offset = struct.unpack_from("<I", data, offset)[0]
+                attributes = struct.unpack_from("<I", data, offset + 56)[0]
+                name_length = struct.unpack_from("<I", data, offset + 60)[0]
+                file_id = struct.unpack_from("<Q", data, offset + 96)[0]
+                name_start = offset + 104
+                name_end = name_start + name_length
+                if (
+                    name_length % 2
+                    or name_end > information
+                    or file_id == 0
+                    or (
+                        next_offset
+                        and (next_offset < 104 or offset + next_offset > information)
+                    )
+                ):
+                    raise OSError("directory enumeration record is malformed")
+                name = data[name_start:name_end].decode("utf-16-le")
+                if name not in {".", ".."}:
+                    entries.append(
+                        _HeldTreeEntry(
+                            name=name,
+                            is_directory=bool(attributes & 0x10),
+                            is_reparse=bool(attributes & 0x0400),
+                            windows_file_id=file_id,
+                        )
+                    )
+                if not next_offset:
+                    break
+                offset += next_offset
+            if not offset and information:
+                raise OSError("directory enumeration did not advance")
+        return tuple(sorted(entries, key=lambda entry: entry.name))
+    except RunnerError:
+        raise
+    except Exception as error:
+        raise RunnerError(code, "held directory enumeration failed") from error
+
+
+def _held_directory_entries(
+    descriptor: int, code: str
+) -> tuple[_HeldTreeEntry, ...]:
+    """Enumerate names from a held descriptor, never from an unbound path."""
+
+    if os.name == "nt":
+        return _windows_directory_entries(descriptor, code)
+    duplicate: int | None = None
+    try:
+        directory_flag, nofollow = _required_posix_open_flags(
+            code, "O_DIRECTORY", "O_NOFOLLOW"
+        )
+        flags = os.O_RDONLY | directory_flag | nofollow
+        duplicate = os.open(".", flags, dir_fd=descriptor)
+        names = os.listdir(duplicate)
+        entries: list[_HeldTreeEntry] = []
+        for name in names:
+            try:
+                observed = os.stat(name, dir_fd=duplicate, follow_symlinks=False)
+            except OSError as error:
+                raise RunnerError(
+                    code, f"held directory entry is unavailable: {name}"
+                ) from error
+            entries.append(
+                _HeldTreeEntry(
+                    name=str(name),
+                    is_directory=stat.S_ISDIR(observed.st_mode),
+                    is_reparse=stat.S_ISLNK(observed.st_mode)
+                    or _is_reparse(observed),
+                    identity=_file_identity(observed),
+                )
+            )
+        return tuple(sorted(entries, key=lambda entry: entry.name))
+    except RunnerError:
+        raise
+    except OSError as error:
+        raise RunnerError(code, "held directory enumeration failed") from error
+    finally:
+        if duplicate is not None:
+            try:
+                os.close(duplicate)
+            except OSError:
+                pass
+
+
+def _held_entry_identity_matches(
+    entry: _HeldTreeEntry, observed: Mapping[str, object]
+) -> bool:
+    if entry.windows_file_id is not None:
+        observed_id = observed.get("file_id")
+        if type(observed_id) is not str:
+            return False
+        try:
+            prefix = entry.windows_file_id.to_bytes(8, "little").hex()
+        except OverflowError:
+            return False
+        return observed_id.startswith(prefix)
+    return entry.identity is not None and _identity_matches(observed, entry.identity)
+
+
+def _held_entry_signature(
+    entry: _HeldTreeEntry,
+) -> tuple[str, bool, bool, int | None, object]:
+    identity = entry.identity or {}
+    return (
+        entry.name,
+        entry.is_directory,
+        entry.is_reparse,
+        entry.windows_file_id,
+        (identity.get("st_dev"), identity.get("st_ino")),
+    )
+
+
+def _open_held_child_directory(
+    parent: _HeldDirectory,
+    entry: _HeldTreeEntry,
+    path: Path,
+    code: str,
+) -> tuple[_HeldDirectory, int]:
+    if not entry.is_directory or entry.is_reparse:
+        raise RunnerError(code, f"local input is not a real directory: {path}")
+    descriptor: int | None = None
+    try:
+        descriptor = _open_path_handle(
+            Path(entry.name),
+            code,
+            directory=True,
+            parent=parent.descriptor,
+        )
+        identity = _windows_handle_identity(descriptor, code, directory=True)
+        if not _held_entry_identity_matches(entry, identity):
+            raise RunnerError(code, f"directory changed before it was held: {path}")
+        child = _HeldDirectory(
+            path,
+            [*parent.component_descriptors, descriptor],
+            [*parent.component_identities, dict(identity)],
+        )
+        return child, descriptor
+    except RunnerError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise RunnerError(code, f"directory could not be held: {path}") from error
+
+
+def _read_held_child_file(
+    parent: _HeldDirectory,
+    entry: _HeldTreeEntry,
+    path: Path,
+    code: str,
+) -> tuple[bytes, dict[str, int | str]]:
+    if entry.is_directory or entry.is_reparse:
+        raise RunnerError(code, f"local input is not a regular file: {path}")
+    descriptor: int | None = None
+    try:
+        descriptor = _open_path_handle(
+            Path(entry.name),
+            code,
+            directory=False,
+            parent=parent.descriptor,
+        )
+        identity = _windows_handle_identity(descriptor, code, directory=False)
+        if not _held_entry_identity_matches(entry, identity):
+            raise RunnerError(code, f"file changed before it was held: {path}")
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise RunnerError(code, f"local input is not a regular file: {path}")
+        content = _read_held_bytes(descriptor, code)
+        after_identity = _windows_handle_identity(descriptor, code, directory=False)
+        if (
+            not _identity_matches(after_identity, identity)
+            or after_identity.get("st_size") != identity.get("st_size")
+            or identity.get("st_size") != len(content)
+        ):
+            raise RunnerError(code, f"file changed during held read: {path}")
+        stability_content = _read_held_bytes(descriptor, code)
+        stability_identity = _windows_handle_identity(
+            descriptor, code, directory=False
+        )
+        if (
+            stability_content != content
+            or not _identity_matches(stability_identity, identity)
+            or stability_identity.get("st_size") != len(stability_content)
+        ):
+            raise RunnerError(code, f"file content changed during held read: {path}")
+        return content, dict(identity)
+    except RunnerError:
+        raise
+    except OSError as error:
+        raise RunnerError(code, f"file could not be read: {path}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _bound_tree_files(root: Path, code: str) -> tuple[_HeldTreeFile, ...]:
+    """Capture a tree using held directories and relative child opens."""
+
+    root = _absolute_path(Path(root))
+    descriptors, identities = _open_directory_components(root, code)
+    held_root = _HeldDirectory(root, descriptors, identities)
+    files: list[_HeldTreeFile] = []
+
+    def walk(directory: _HeldDirectory, relative_prefix: str) -> None:
+        directory.assert_stable()
+        observed_entries = _held_directory_entries(directory.descriptor, code)
+        for entry in observed_entries:
+            path = directory.path / entry.name
+            relative = (
+                f"{relative_prefix}/{entry.name}"
+                if relative_prefix
+                else entry.name
+            )
+            if entry.is_reparse:
+                raise RunnerError(code, f"local input is a link or reparse point: {path}")
+            if entry.is_directory:
+                child, child_descriptor = _open_held_child_directory(
+                    directory, entry, path, code
+                )
+                try:
+                    if entry.name != "__pycache__":
+                        walk(child, relative)
+                finally:
+                    os.close(child_descriptor)
+            else:
+                content, identity = _read_held_child_file(
+                    directory, entry, path, code
+                )
+                if entry.name.endswith(".pyc") or "__pycache__" in path.parts:
+                    continue
+                files.append(_HeldTreeFile(path, relative.replace("\\", "/"), content, identity))
+        current_entries = _held_directory_entries(directory.descriptor, code)
+        if tuple(map(_held_entry_signature, current_entries)) != tuple(
+            map(_held_entry_signature, observed_entries)
+        ):
+            raise RunnerError(code, f"local input directory changed during traversal: {directory.path}")
+        directory.assert_stable()
+
+    try:
+        walk(held_root, "")
+        return tuple(sorted(files, key=lambda item: item.relative))
+    finally:
+        held_root.close()
 
 
 def _require_directory(path: Path, code: str) -> None:
@@ -831,13 +1180,21 @@ def _open_path_handle(
     writable: bool = False,
 ) -> int:
     if os.name != "nt":
-        flags = (os.O_RDWR if writable else os.O_RDONLY) | getattr(os, "O_BINARY", 0)
+        flags = (
+            os.O_RDWR if writable and not directory else os.O_RDONLY
+        ) | getattr(os, "O_BINARY", 0)
         if create_new:
             flags |= os.O_CREAT | os.O_EXCL
         if directory:
-            flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            directory_flag, nofollow = _required_posix_open_flags(
+                code, "O_DIRECTORY", "O_NOFOLLOW"
+            )
+            flags |= directory_flag | nofollow
         else:
-            flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            nofollow, nonblock = _required_posix_open_flags(
+                code, "O_NOFOLLOW", "O_NONBLOCK"
+            )
+            flags |= nofollow | nonblock
         try:
             if parent is None:
                 return os.open(path, flags, 0o600 if create_new else 0o644)
@@ -1202,9 +1559,9 @@ class _InputLease:
         }
 
     def _held_content(self, path: Path) -> bytes:
-        expected = Path(path).resolve()
+        expected = _absolute_path(path)
         for binding in self._bindings:
-            if binding.path.resolve() == expected:
+            if _absolute_path(binding.path) == expected:
                 return _read_held_bytes(binding.descriptor, "ATTESTATION_MISMATCH")
         raise RunnerError("ATTESTATION_MISMATCH", f"held input is not retained: {path}")
 
@@ -1214,7 +1571,7 @@ class _InputLease:
             raise RunnerError(
                 "ATTESTATION_MISMATCH", "AttemptIdentity runner digest is unavailable"
             )
-        runner_path = Path(__file__).resolve()
+        runner_path = _absolute_path(Path(__file__))
         if hashlib.sha256(self._held_content(runner_path)).hexdigest() != runner_sha256:
             raise RunnerError(
                 "ATTESTATION_MISMATCH", "AttemptIdentity runner digest is not held"
@@ -1225,7 +1582,7 @@ class _InputLease:
                 "ATTESTATION_MISMATCH", "AttemptIdentity attestor digest is unavailable"
             )
         digest = hashlib.sha256()
-        root = Path(__file__).resolve().parent
+        root = _absolute_path(Path(__file__)).parent
         for name in _ATTESTOR_MODULE_NAMES:
             content = self._held_content(root / name)
             encoded_name = name.encode("utf-8")
@@ -2320,36 +2677,21 @@ def _package_path(source_root: Path, package_name: str) -> Path:
     return in_skills if _lexists(in_skills) else source_root / package_name
 
 
+def _tree_snapshot_from_files(
+    files: Sequence[_HeldTreeFile],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "path": item.relative,
+            "size": len(item.content),
+            "sha256": hashlib.sha256(item.content).hexdigest(),
+        }
+        for item in files
+    ]
+
+
 def _tree_snapshot(root: Path, code: str) -> list[dict[str, object]]:
-    _require_directory(root, code)
-    entries: list[dict[str, object]] = []
-    for current, directories, files in os.walk(root, topdown=True, followlinks=False):
-        current_path = Path(current)
-        kept_directories: list[str] = []
-        for name in sorted(directories):
-            if name == "__pycache__":
-                continue
-            path = current_path / name
-            result = _lstat(path, code)
-            if not stat.S_ISDIR(result.st_mode):
-                raise RunnerError(code, f"package entry is not a directory: {path}")
-            kept_directories.append(name)
-        directories[:] = kept_directories
-        for name in sorted(files):
-            if name.endswith(".pyc"):
-                continue
-            path = current_path / name
-            result = _lstat(path, code)
-            if not stat.S_ISREG(result.st_mode):
-                raise RunnerError(code, f"package entry is not a regular file: {path}")
-            entries.append(
-                {
-                    "path": path.relative_to(root).as_posix(),
-                    "size": result.st_size,
-                    "sha256": _sha256(path, code),
-                }
-            )
-    return entries
+    return _tree_snapshot_from_files(_bound_tree_files(root, code))
 
 
 _PACKAGE_MANIFEST = ".skill-package.json"
@@ -2358,30 +2700,28 @@ _PACKAGE_TEXT_SUFFIXES = frozenset(
 )
 
 
-def _package_digest(package_root: Path) -> str:
+def _package_digest_from_files(files: Sequence[_HeldTreeFile]) -> str:
     digest = hashlib.sha256()
-    _require_directory(package_root, "PACKAGE_INVALID")
-    files = sorted(
-        (
-            path
-            for path in package_root.rglob("*")
-            if path.is_file()
-            and path.name != _PACKAGE_MANIFEST
-            and "__pycache__" not in path.parts
-            and path.suffix != ".pyc"
-        ),
-        key=lambda path: path.relative_to(package_root).as_posix(),
-    )
-    for path in files:
-        relative = path.relative_to(package_root).as_posix().encode("utf-8")
-        content = _bound_bytes(path, "PACKAGE_INVALID")[0]
-        if path.suffix.lower() in _PACKAGE_TEXT_SUFFIXES:
+    for item in sorted(files, key=lambda candidate: candidate.relative):
+        if (
+            Path(item.relative).name == _PACKAGE_MANIFEST
+            or "__pycache__" in Path(item.relative).parts
+            or Path(item.relative).suffix == ".pyc"
+        ):
+            continue
+        relative = item.relative.encode("utf-8")
+        content = item.content
+        if Path(item.relative).suffix.lower() in _PACKAGE_TEXT_SUFFIXES:
             content = content.replace(b"\r\n", b"\n")
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
         digest.update(len(content).to_bytes(8, "big"))
         digest.update(content)
     return digest.hexdigest()
+
+
+def _package_digest(package_root: Path) -> str:
+    return _package_digest_from_files(_bound_tree_files(package_root, "PACKAGE_INVALID"))
 
 
 def _expected_package_manifest(
@@ -2399,14 +2739,66 @@ def _expected_package_manifest(
     }
 
 
+def _package_manifest_from_files(
+    package_root: Path,
+    package_name: str,
+    files: Sequence[_HeldTreeFile],
+) -> dict[str, object]:
+    if package_root.name != package_name or package_name not in PACKAGE_NAMES:
+        raise RunnerError(
+            "PACKAGE_MANIFEST_INVALID", f"unknown Skill package: {package_name}"
+        )
+    manifest_file = next(
+        (item for item in files if item.relative == _PACKAGE_MANIFEST),
+        None,
+    )
+    if manifest_file is None:
+        raise RunnerError(
+            "PACKAGE_MANIFEST_INVALID",
+            f"manifest is unavailable: {package_root / _PACKAGE_MANIFEST}",
+        )
+    expected = {
+        "content_sha256": _package_digest_from_files(files),
+        "schema_version": 1,
+        "skill": package_name,
+        "version": EXPECTED_PACKAGE_VERSION,
+    }
+    try:
+        manifest = json.loads(manifest_file.content.decode("utf-8"))
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise RunnerError(
+            "PACKAGE_MANIFEST_INVALID",
+            f"manifest is unavailable: {package_root / _PACKAGE_MANIFEST}",
+        ) from error
+    if type(manifest) is not dict:
+        raise RunnerError(
+            "PACKAGE_MANIFEST_INVALID",
+            f"manifest is not an object: {package_root / _PACKAGE_MANIFEST}",
+        )
+    if manifest != expected:
+        raise RunnerError(
+            "PACKAGE_MANIFEST_INVALID",
+            f"package manifest identity is not the exact expected manifest for {package_name}",
+        )
+    return manifest
+
+
 def _package_manifest(package_root: Path, package_name: str) -> dict[str, object]:
     path = package_root / ".skill-package.json"
-    expected = _expected_package_manifest(package_root, package_name)
     try:
-        _require_regular_file(path, "PACKAGE_MANIFEST_INVALID")
-        raw, _identity = _bound_bytes(path, "PACKAGE_MANIFEST_INVALID")
-        manifest = json.loads(raw.decode("utf-8"))
+        files = _bound_tree_files(package_root, "PACKAGE_MANIFEST_INVALID")
+        return _package_manifest_from_files(
+            package_root,
+            package_name,
+            files,
+        )
     except (
+        RunnerError,
         OSError,
         UnicodeDecodeError,
         json.JSONDecodeError,
@@ -2416,16 +2808,6 @@ def _package_manifest(package_root: Path, package_name: str) -> dict[str, object
         raise RunnerError(
             "PACKAGE_MANIFEST_INVALID", f"manifest is unavailable: {path}"
         ) from error
-    if type(manifest) is not dict:
-        raise RunnerError(
-            "PACKAGE_MANIFEST_INVALID", f"manifest is not an object: {path}"
-        )
-    if manifest != expected:
-        raise RunnerError(
-            "PACKAGE_MANIFEST_INVALID",
-            f"package manifest identity is not the exact expected manifest for {package_name}",
-        )
-    return manifest
 
 
 def _package_snapshot(config: RunnerConfig) -> dict[str, object]:
@@ -2443,16 +2825,21 @@ def _package_snapshot(config: RunnerConfig) -> dict[str, object]:
         _require_directory(root, "INSTALL_ROOT_UNAVAILABLE")
     for package_name in config.package_names:
         source = _package_path(config.repository_root, package_name)
-        source_manifest = _package_manifest(source, package_name)
-        source_manifest_path = source / _PACKAGE_MANIFEST
-        source_manifest_snapshot = _bound_file_snapshot(
-            source_manifest_path,
-            "SOURCE_PACKAGE_INVALID",
+        source_files = _bound_tree_files(source, "SOURCE_PACKAGE_INVALID")
+        source_manifest_file = next(
+            (item for item in source_files if item.relative == _PACKAGE_MANIFEST),
+            None,
         )
-        source_manifest_text = _path_text(source_manifest_path)
-        file_paths.append(source_manifest_text)
-        file_identities[source_manifest_text] = source_manifest_snapshot["identity"]
-        file_hashes[source_manifest_text] = str(source_manifest_snapshot["sha256"])
+        if source_manifest_file is None:
+            raise RunnerError(
+                "PACKAGE_MANIFEST_INVALID",
+                f"manifest is unavailable: {source / _PACKAGE_MANIFEST}",
+            )
+        source_manifest = _package_manifest_from_files(
+            source,
+            package_name,
+            source_files,
+        )
         source_digest = str(source_manifest["content_sha256"])
         expected_content_digests = dict(config.expected_package_content_digests)
         if (
@@ -2463,38 +2850,31 @@ def _package_snapshot(config: RunnerConfig) -> dict[str, object]:
                 "PACKAGE_IDENTITY_MISMATCH",
                 f"source package digest changed: {package_name}",
             )
-        sources[package_name] = _tree_snapshot(source, "SOURCE_PACKAGE_INVALID")
-        source_entries = sources[package_name]
-        if type(source_entries) is list:
-            for entry in source_entries:
-                path = source / str(entry["path"])
-                path_text = _path_text(path)
-                file_paths.append(path_text)
-                snapshot = _bound_file_snapshot(
-                    path,
-                    "SOURCE_PACKAGE_INVALID",
-                )
-                file_identities[path_text] = snapshot["identity"]
-                file_hashes[path_text] = str(snapshot["sha256"])
+        source_entries = _tree_snapshot_from_files(source_files)
+        sources[package_name] = source_entries
+        for item in source_files:
+            path_text = _path_text(item.path)
+            file_paths.append(path_text)
+            file_identities[path_text] = item.identity
+            file_hashes[path_text] = hashlib.sha256(item.content).hexdigest()
         for surface, root in zip(INSTALL_SURFACES, config.install_roots, strict=True):
             package_root = root / package_name
-            installed_manifest = _package_manifest(package_root, package_name)
-            installed_manifest_path = package_root / _PACKAGE_MANIFEST
-            installed_manifest_snapshot = _bound_file_snapshot(
-                installed_manifest_path,
+            installed_files = _bound_tree_files(
+                package_root,
                 "INSTALLED_PACKAGE_INVALID",
             )
-            installed_manifest_text = _path_text(installed_manifest_path)
-            file_paths.append(installed_manifest_text)
-            file_identities[installed_manifest_text] = installed_manifest_snapshot[
-                "identity"
-            ]
-            file_hashes[installed_manifest_text] = str(
-                installed_manifest_snapshot["sha256"]
+            installed_manifest = _package_manifest_from_files(
+                package_root,
+                package_name,
+                installed_files,
             )
-            installed[f"{surface}:{package_name}"] = _tree_snapshot(
-                package_root, "INSTALLED_PACKAGE_INVALID"
-            )
+            installed_entries = _tree_snapshot_from_files(installed_files)
+            installed[f"{surface}:{package_name}"] = installed_entries
+            for item in installed_files:
+                path_text = _path_text(item.path)
+                file_paths.append(path_text)
+                file_identities[path_text] = item.identity
+                file_hashes[path_text] = hashlib.sha256(item.content).hexdigest()
             if installed_manifest != source_manifest:
                 raise RunnerError(
                     "PACKAGE_IDENTITY_MISMATCH",
@@ -2510,18 +2890,6 @@ def _package_snapshot(config: RunnerConfig) -> dict[str, object]:
                     "PACKAGE_IDENTITY_MISMATCH",
                     f"{surface}:{package_name} manifest drifted from source",
                 )
-            installed_entries = installed[f"{surface}:{package_name}"]
-            if type(installed_entries) is list:
-                for entry in installed_entries:
-                    path = package_root / str(entry["path"])
-                    path_text = _path_text(path)
-                    file_paths.append(path_text)
-                    snapshot = _bound_file_snapshot(
-                        path,
-                        "INSTALLED_PACKAGE_INVALID",
-                    )
-                    file_identities[path_text] = snapshot["identity"]
-                    file_hashes[path_text] = str(snapshot["sha256"])
     value = {"sources": sources, "installed": installed}
     package_digest = _exact_digest_value(value)
     if (
@@ -2542,7 +2910,7 @@ def _package_snapshot(config: RunnerConfig) -> dict[str, object]:
 
 def _validate_parented_path(path: Path, evidence_root: Path, code: str) -> None:
     _require_directory(path.parent, code)
-    if path.parent.resolve() != evidence_root.resolve():
+    if _absolute_path(path.parent) != _absolute_path(evidence_root):
         raise RunnerError(code, f"path is outside the evidence root: {path}")
 
 
@@ -2691,38 +3059,27 @@ def _store_snapshots(config: RunnerConfig) -> dict[str, object]:
 
 
 def _local_regular_files(root: Path, code: str) -> tuple[Path, ...]:
-    root = Path(root)
-    _lstat(root, code)
-    if not stat.S_ISDIR(os.lstat(root).st_mode):
-        raise RunnerError(code, f"local input root is not a directory: {root}")
-    result: list[Path] = []
-    pending = [root]
-    while pending:
-        directory = pending.pop()
-        try:
-            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
-        except OSError as error:
-            raise RunnerError(
-                code, f"local input directory is unavailable: {directory}"
-            ) from error
-        for entry in entries:
-            path = Path(entry.path)
-            try:
-                entry_stat = entry.stat(follow_symlinks=False)
-            except OSError as error:
-                raise RunnerError(
-                    code, f"local input entry is unavailable: {path}"
-                ) from error
-            if stat.S_ISLNK(entry_stat.st_mode) or _is_reparse(entry_stat):
-                raise RunnerError(
-                    code, f"local input is a link or reparse point: {path}"
-                )
-            if stat.S_ISDIR(entry_stat.st_mode):
-                pending.append(path)
-            elif stat.S_ISREG(entry_stat.st_mode):
-                if "__pycache__" not in path.parts and path.suffix != ".pyc":
-                    result.append(path)
-    return tuple(result)
+    return tuple(item.path for item in _bound_tree_files(root, code))
+
+
+def _local_tree_roots(config: RunnerConfig) -> tuple[Path, ...]:
+    root = Path(config.repository_root)
+    roots = list(_local_package_roots(config))
+    guard_root = root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+    if _lexists(guard_root):
+        roots.append(guard_root)
+    for install_root in config.install_roots:
+        for package_name in config.package_names:
+            roots.append(Path(install_root) / package_name)
+    return tuple(roots)
+
+
+def _local_tree_file_captures(config: RunnerConfig) -> dict[Path, _HeldTreeFile]:
+    captures: dict[Path, _HeldTreeFile] = {}
+    for root in _local_tree_roots(config):
+        for item in _bound_tree_files(root, "LIVE_INPUT_DRIFT"):
+            captures[item.path] = item
+    return captures
 
 
 def _local_input_files(
@@ -2730,27 +3087,13 @@ def _local_input_files(
     *,
     subject_binding: object | None = None,
 ) -> tuple[Path, ...]:
-    root = Path(config.repository_root)
     paths: set[Path] = set()
     manifest_path = getattr(subject_binding, "manifest_path", None)
     if manifest_path is None:
         manifest_path = Path(config.evidence_root) / _RELEASE_SUBJECT_NAME
     if _lexists(Path(manifest_path)):
         paths.add(Path(manifest_path))
-    package_roots = _local_package_roots(config)
-    for package in package_roots:
-        paths.update(_local_regular_files(package, "LIVE_INPUT_DRIFT"))
-    guard_root = root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
-    if _lexists(guard_root):
-        paths.update(_local_regular_files(guard_root, "LIVE_INPUT_DRIFT"))
-    for install_root in config.install_roots:
-        for package_name in config.package_names:
-            paths.update(
-                _local_regular_files(
-                    Path(install_root) / package_name,
-                    "LIVE_INPUT_DRIFT",
-                )
-            )
+    paths.update(_local_tree_file_captures(config))
     return tuple(sorted(paths, key=_path_text))
 
 
@@ -2758,10 +3101,7 @@ def _local_package_roots(config: RunnerConfig) -> tuple[Path, ...]:
     root = Path(config.repository_root)
     result: list[Path] = []
     for package_name in config.package_names:
-        package = root / "skills" / package_name
-        if not package.is_dir():
-            package = root / package_name
-        result.append(package)
+        result.append(_package_path(root, package_name))
     return tuple(result)
 
 
@@ -2778,7 +3118,7 @@ def _local_input_directories(config: RunnerConfig) -> tuple[Path, ...]:
         Path(config.evidence_path).parent,
         Path(config.gateway_store_path).parent,
         Path(config.artifact_root).parent,
-        Path(__file__).resolve().parent,
+        _absolute_path(Path(__file__)).parent,
         *_local_package_roots(config),
     ]
     guard_root = (
@@ -2809,9 +3149,9 @@ def _lease_input_paths(
         Path(config.prior_store),
         Path(config.fresh_receipt),
         Path(config.runtime_config_path),
-        Path(__file__).resolve(),
-        Path(__file__).resolve().with_name(_REVIEWED_PROVENANCE_NAME),
-        *(Path(__file__).resolve().with_name(name) for name in _ATTESTOR_MODULE_NAMES),
+        _absolute_path(Path(__file__)),
+        _absolute_path(Path(__file__)).with_name(_REVIEWED_PROVENANCE_NAME),
+        *(_absolute_path(Path(__file__)).with_name(name) for name in _ATTESTOR_MODULE_NAMES),
         *_local_input_files(config, subject_binding=subject_binding),
     )
 
@@ -2823,11 +3163,33 @@ def _mechanical_input_snapshot(
 ) -> dict[str, object]:
     file_identities: dict[str, dict[str, int | str]] = {}
     file_hashes: dict[str, str] = {}
-    for path in _lease_input_paths(config, subject_binding=subject_binding):
+    fixed_paths = [
+        Path(config.fresh_store),
+        Path(config.rollback_store),
+        Path(config.prior_store),
+        Path(config.fresh_receipt),
+        Path(config.runtime_config_path),
+        _absolute_path(Path(__file__)),
+        _absolute_path(Path(__file__)).with_name(_REVIEWED_PROVENANCE_NAME),
+        *(
+            _absolute_path(Path(__file__)).with_name(name)
+            for name in _ATTESTOR_MODULE_NAMES
+        ),
+    ]
+    manifest_path = getattr(subject_binding, "manifest_path", None)
+    if manifest_path is None:
+        manifest_path = Path(config.evidence_root) / _RELEASE_SUBJECT_NAME
+    if _lexists(Path(manifest_path)):
+        fixed_paths.append(Path(manifest_path))
+    for path in fixed_paths:
         snapshot = _bound_file_snapshot(path, "ATTESTATION_UNAVAILABLE")
         path_text = _path_text(path)
         file_identities[path_text] = snapshot["identity"]
         file_hashes[path_text] = str(snapshot["sha256"])
+    for item in _local_tree_file_captures(config).values():
+        path_text = _path_text(item.path)
+        file_identities[path_text] = item.identity
+        file_hashes[path_text] = hashlib.sha256(item.content).hexdigest()
     return {
         "file_paths": sorted(file_identities),
         "file_identities": file_identities,
@@ -3369,7 +3731,7 @@ def _write_exclusive_json(
 def _validate_attested_replay(bundle: object, replay: object) -> dict[str, object]:
     try:
         _validate_v8_module_origins()
-        scripts_root = str(Path(__file__).resolve().parent)
+        scripts_root = str(_absolute_path(Path(__file__)).parent)
         if scripts_root not in sys.path:
             sys.path.insert(0, scripts_root)
         from beta3_bootstrap_model import AttestedCutoverBundle  # type: ignore[import-not-found]
@@ -3994,7 +4356,7 @@ class ProductionBootstrapAttestor:
     @staticmethod
     def _bootstrap_contracts() -> tuple[type, type, type, type, type]:
         try:
-            scripts_root = str(Path(__file__).resolve().parent)
+            scripts_root = str(_absolute_path(Path(__file__)).parent)
             if scripts_root not in sys.path:
                 sys.path.insert(0, scripts_root)
             from beta3_bootstrap_model import (  # type: ignore[import-not-found]
@@ -4258,9 +4620,9 @@ def _v8_source_root(
     repository: str | None = None,
 ) -> Path:
     candidate_root = (
-        Path(repository_root).resolve(strict=False)
+        _absolute_path(Path(repository_root))
         if repository_root is not None
-        else Path(__file__).resolve().parent.parent
+        else _absolute_path(Path(__file__)).parent.parent
     )
     configured = candidate_root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
     if configured.is_dir():
@@ -4268,7 +4630,7 @@ def _v8_source_root(
     return (
         configured
         if repository_root is not None
-        else Path(__file__).resolve().parent.parent
+        else _absolute_path(Path(__file__)).parent.parent
         / "skills"
         / "orchestrator"
         / "scripts"
@@ -4284,8 +4646,14 @@ def _validate_v8_module_origins(
     """Require loaded V8 modules to come from the selected checkout."""
 
     if repository_root is not None:
-        _add_repo_import_paths(Path(repository_root).resolve(strict=False))
+        _add_repo_import_paths(_absolute_path(Path(repository_root)))
     expected_root = _v8_source_root(repository_root, repository=repository)
+    if (
+        repository_root is not None
+        and _absolute_path(Path(repository_root)) == REPOSITORY_ROOT
+    ):
+        _load_captured_v8_package(expected_root)
+        return
     package = sys.modules.get("gwo_v8")
     if package is None:
         try:
@@ -4336,22 +4704,34 @@ def _canonical_provenance_path(value: object, label: str) -> Path:
     if type(value) is not str or not value:
         _provenance_mismatch(f"{label} is not an absolute path")
     candidate = Path(value)
-    if not candidate.is_absolute():
+    if not candidate.is_absolute() or candidate != _absolute_path(candidate):
         _provenance_mismatch(f"{label} is not an absolute path")
     try:
-        resolved = candidate.resolve(strict=True)
-    except (OSError, RuntimeError, ValueError) as error:
-        raise RunnerError(
+        descriptor, _identity = _open_bound_handle(
+            candidate,
             "ATTESTATION_PROVENANCE_MISMATCH",
-            f"{label} is not a canonical existing path",
-        ) from error
-    if candidate != resolved:
-        _provenance_mismatch(f"{label} is not a canonical existing path")
-    return resolved
+        )
+    except RunnerError:
+        try:
+            descriptors, _identities = _open_directory_components(
+                candidate,
+                "ATTESTATION_PROVENANCE_MISMATCH",
+            )
+        except RunnerError as directory_error:
+            raise RunnerError(
+                "ATTESTATION_PROVENANCE_MISMATCH",
+                f"{label} is not a canonical existing path",
+            ) from directory_error
+        else:
+            _close_descriptors(descriptors)
+            return candidate
+    else:
+        os.close(descriptor)
+        return candidate
 
 
 def _reviewed_provenance() -> dict[str, object]:
-    manifest_path = Path(__file__).resolve().with_name(_REVIEWED_PROVENANCE_NAME)
+    manifest_path = _absolute_path(Path(__file__)).with_name(_REVIEWED_PROVENANCE_NAME)
     try:
         payload, _identity = _bound_bytes(
             manifest_path, "ATTESTATION_PROVENANCE_MISMATCH"
@@ -4402,8 +4782,8 @@ def _reviewed_provenance() -> dict[str, object]:
         _provenance_mismatch("reviewed provenance entries are not exact")
     runner_path = _canonical_provenance_path(runner["path"], "reviewed runner path")
     if (
-        runner_path != Path(__file__).resolve()
-        or runner["module"] != Path(__file__).stem
+        runner_path != _absolute_path(Path(__file__))
+        or runner["module"] != _absolute_path(Path(__file__)).stem
     ):
         _provenance_mismatch("reviewed runner origin is not canonical")
     runner_module = sys.modules.get(__name__)
@@ -4431,7 +4811,7 @@ def _reviewed_provenance() -> dict[str, object]:
             _provenance_mismatch("runner module spec origin is not canonical")
     if type(runner["sha256"]) is not str or _HEX64.fullmatch(runner["sha256"]) is None:
         _provenance_mismatch("reviewed runner hash is not exact")
-    expected_root = Path(__file__).resolve().parent
+    expected_root = _absolute_path(Path(__file__)).parent
     for entry, name in zip(attestors, _ATTESTOR_MODULE_NAMES, strict=True):
         if (
             type(entry) is not dict
@@ -4448,10 +4828,17 @@ def _reviewed_provenance() -> dict[str, object]:
 
 def _imported_module_with_canonical_origin(name: str, expected_path: Path) -> object:
     module_name = Path(name).stem
+    return _load_captured_module(module_name, _absolute_path(expected_path))
+
+
+def _validate_loaded_module_origin(name: str, expected_path: Path) -> None:
+    module_name = Path(name).stem
+    module = sys.modules.get(module_name)
+    if module is None:
+        return
+    if type(module) is not ModuleType:
+        _provenance_mismatch(f"{module_name} is not an exact module")
     try:
-        module = sys.modules.get(module_name)
-        if module is None:
-            module = importlib.import_module(module_name)
         module_path = _canonical_provenance_path(
             getattr(module, "__file__", None),
             f"{module_name} import origin",
@@ -4468,16 +4855,15 @@ def _imported_module_with_canonical_origin(name: str, expected_path: Path) -> ob
             "ATTESTATION_PROVENANCE_MISMATCH",
             f"{module_name} import origin is unavailable",
         ) from error
-    if module_path != expected_path or spec_path != expected_path:
+    if module_path != _absolute_path(expected_path) or spec_path != module_path:
         _provenance_mismatch(f"{module_name} import origin is not canonical")
-    return module
 
 
 def _runbook_hash() -> str:
     provenance = _reviewed_provenance()
     runner = provenance["runner"]
     assert type(runner) is dict
-    path = Path(__file__).resolve()
+    path = _absolute_path(Path(__file__))
     content, _identity = _bound_bytes(path, "ATTESTATION_PROVENANCE_MISMATCH")
     observed = hashlib.sha256(content).hexdigest()
     if observed != runner["sha256"]:
@@ -4490,11 +4876,11 @@ def _attestor_source_sha256() -> str:
     attestors = provenance["attestors"]
     assert type(attestors) is list
     digest = hashlib.sha256()
-    root = Path(__file__).resolve().parent
+    root = _absolute_path(Path(__file__)).parent
     for entry, name in zip(attestors, _ATTESTOR_MODULE_NAMES, strict=True):
         assert type(entry) is dict
         path = root / name
-        _imported_module_with_canonical_origin(name, path)
+        _validate_loaded_module_origin(name, path)
         content, _identity = _bound_bytes(path, "ATTESTATION_PROVENANCE_MISMATCH")
         observed = hashlib.sha256(content).hexdigest()
         if observed != entry["sha256"]:
@@ -4512,7 +4898,7 @@ def _attestor_source_sha256() -> str:
 
 def _fixture_runbook_hash() -> str:
     content, _identity = _bound_bytes(
-        Path(__file__).resolve(),
+        _absolute_path(Path(__file__)),
         "ATTESTATION_PROVENANCE_MISMATCH",
     )
     return hashlib.sha256(content).hexdigest()
@@ -4520,7 +4906,7 @@ def _fixture_runbook_hash() -> str:
 
 def _fixture_attestor_source_sha256() -> str:
     digest = hashlib.sha256()
-    root = Path(__file__).resolve().parent
+    root = _absolute_path(Path(__file__)).parent
     for name in _ATTESTOR_MODULE_NAMES:
         content, _identity = _bound_bytes(
             root / name,
@@ -4568,15 +4954,50 @@ def _production_dependencies(
         )
     _add_repo_import_paths(config.repository_root)
     try:
-        from beta3_control_ownership_attestor import (  # type: ignore[import-not-found]
-            ControlOwnershipAttestor,
-            production_control_ownership_sources,
-        )
-        from beta3_legacy_attestor import (  # type: ignore[import-not-found]
-            LegacyAttestor,
-            production_legacy_sources,
-        )
-        from beta3_replay_guard import evaluate_attested_bundle  # type: ignore[import-not-found]
+        if strict:
+            source_root = _absolute_path(Path(__file__)).parent
+            _production_release_subject_module()
+            bootstrap_module = _imported_module_with_canonical_origin(
+                "beta3_bootstrap_model.py",
+                source_root / "beta3_bootstrap_model.py",
+            )
+            control_module = _imported_module_with_canonical_origin(
+                "beta3_control_ownership_attestor.py",
+                source_root / "beta3_control_ownership_attestor.py",
+            )
+            legacy_module = _imported_module_with_canonical_origin(
+                "beta3_legacy_attestor.py",
+                source_root / "beta3_legacy_attestor.py",
+            )
+            replay_module = _imported_module_with_canonical_origin(
+                "beta3_replay_guard.py",
+                source_root / "beta3_replay_guard.py",
+            )
+            ControlOwnershipAttestor = getattr(
+                control_module, "ControlOwnershipAttestor"
+            )
+            production_control_ownership_sources = getattr(
+                control_module, "production_control_ownership_sources"
+            )
+            LegacyAttestor = getattr(legacy_module, "LegacyAttestor")
+            production_legacy_sources = getattr(
+                legacy_module, "production_legacy_sources"
+            )
+            evaluate_attested_bundle = getattr(
+                replay_module, "evaluate_attested_bundle"
+            )
+            if not isinstance(getattr(bootstrap_module, "AttemptIdentity"), type):
+                raise TypeError("bootstrap model contract is unavailable")
+        else:
+            from beta3_control_ownership_attestor import (  # type: ignore[import-not-found]
+                ControlOwnershipAttestor,
+                production_control_ownership_sources,
+            )
+            from beta3_legacy_attestor import (  # type: ignore[import-not-found]
+                LegacyAttestor,
+                production_legacy_sources,
+            )
+            from beta3_replay_guard import evaluate_attested_bundle  # type: ignore[import-not-found]
 
         control_sources = production_control_ownership_sources(
             command_runner=_production_source_command,
@@ -4772,13 +5193,24 @@ def _run_bound(
                     subject = _default_subject_factory(
                         config,
                         release_subject,
-                        strict=(config.repository_root.resolve() == REPOSITORY_ROOT),
+                        strict=(_absolute_path(config.repository_root) == REPOSITORY_ROOT),
                     )
                 else:
                     subject = _default_subject_factory(config, release_subject)
                 try:
-                    from beta3_bootstrap_model import AttemptIdentity  # type: ignore[import-not-found]
-                except (ImportError, ModuleNotFoundError, OSError) as error:
+                    if production and _absolute_path(config.repository_root) == REPOSITORY_ROOT:
+                        bootstrap_module = _imported_module_with_canonical_origin(
+                            "beta3_bootstrap_model.py",
+                            _absolute_path(Path(__file__)).with_name(
+                                "beta3_bootstrap_model.py"
+                            ),
+                        )
+                        AttemptIdentity = getattr(bootstrap_module, "AttemptIdentity")
+                        if not isinstance(AttemptIdentity, type):
+                            raise TypeError("AttemptIdentity is not a type")
+                    else:
+                        from beta3_bootstrap_model import AttemptIdentity  # type: ignore[import-not-found]
+                except (ImportError, ModuleNotFoundError, OSError, TypeError) as error:
                     raise RunnerError(
                         "ATTESTATION_UNAVAILABLE", "AttemptIdentity is unavailable"
                     ) from error
@@ -4811,7 +5243,7 @@ def _run_bound(
                     producer_sha256=attempt.attestor_sha256,
                     production=(
                         production
-                        and config.repository_root.resolve() == REPOSITORY_ROOT
+                        and _absolute_path(config.repository_root) == REPOSITORY_ROOT
                     ),
                 )
                 bootstrap_attestor = ProductionBootstrapAttestor(
@@ -5059,37 +5491,548 @@ def _subject_error_result(error: BaseException) -> dict[str, object]:
     return _result("UNAVAILABLE", 3, code=str(code), detail=str(detail))
 
 
-def load_production_release_subject() -> "ReleaseSubjectBinding":
-    _add_repo_import_paths(REPOSITORY_ROOT)
+class _CapturedReleaseSubjectLoader:
+    """Execute one exact source snapshot; never read the loader pathname."""
+
+    def __init__(self, name: str, path: Path, raw: bytes) -> None:
+        self.name = name
+        self.path = path
+        self.raw = raw
+
+    def create_module(self, _spec: object) -> None:
+        return None
+
+    def get_filename(self, fullname: str) -> str:
+        if fullname != self.name:
+            raise ImportError("release-subject loader name mismatch")
+        return str(self.path)
+
+    def exec_module(self, module: ModuleType) -> None:
+        if module.__name__ != self.name:
+            raise ImportError("release-subject module name mismatch")
+        code = compile(self.raw, str(self.path), "exec")
+        exec(code, module.__dict__)
+
+
+def _exact_module_path(value: object, label: str) -> Path:
+    if type(value) is not str or not value:
+        _provenance_mismatch(f"{label} is not an absolute path")
+    candidate = Path(value)
+    if not candidate.is_absolute() or candidate != _absolute_path(candidate):
+        _provenance_mismatch(f"{label} is not a canonical existing path")
+    return candidate
+
+
+def _validate_captured_release_subject_module(
+    module: ModuleType,
+    module_name: str,
+    canonical_path: Path,
+    canonical_raw: bytes,
+) -> _CapturedReleaseSubjectLoader:
+    if type(module) is not ModuleType:
+        _provenance_mismatch("release-subject module is not an exact module")
+    module_path = _exact_module_path(
+        getattr(module, "__file__", None),
+        "release-subject module origin",
+    )
+    module_spec = getattr(module, "__spec__", None)
+    spec_path = _exact_module_path(
+        getattr(module_spec, "origin", None),
+        "release-subject module spec origin",
+    )
+    loader = getattr(module_spec, "loader", None)
+    if type(loader) is not _CapturedReleaseSubjectLoader:
+        _provenance_mismatch("release-subject module loader is not captured-source bound")
+    if (
+        module_path != canonical_path
+        or spec_path != canonical_path
+        or loader.name != module_name
+        or loader.path != canonical_path
+        or type(loader.raw) is not bytes
+        or loader.raw != canonical_raw
+        or getattr(module, "__loader__", None) is not loader
+        or sys.modules.get(module_name) is not module
+    ):
+        _provenance_mismatch("release-subject module bytes are not canonical")
+    return loader
+
+
+def _load_captured_module(module_name: str, canonical_path: Path) -> ModuleType:
+    """Load one module from bytes held from its canonical source handle."""
+
+    module = sys.modules.get(module_name)
+    if module is not None:
+        if type(module) is not ModuleType:
+            sys.modules.pop(module_name, None)
+            _provenance_mismatch(f"{module_name} is not an exact module")
+        try:
+            preloaded_path = _exact_module_path(
+                getattr(module, "__file__", None),
+                f"{module_name} module origin",
+            )
+            preloaded_spec = getattr(module, "__spec__", None)
+            preloaded_spec_path = _exact_module_path(
+                getattr(preloaded_spec, "origin", None),
+                f"{module_name} module spec origin",
+            )
+        except RunnerError:
+            if sys.modules.get(module_name) is module:
+                sys.modules.pop(module_name, None)
+            raise
+        if preloaded_path != canonical_path or preloaded_spec_path != canonical_path:
+            sys.modules.pop(module_name, None)
+            _provenance_mismatch(f"{module_name} origin is not canonical")
+        if type(getattr(preloaded_spec, "loader", None)) is not _CapturedReleaseSubjectLoader:
+            sys.modules.pop(module_name, None)
+            module = None
+
     try:
-        from beta3_release_subject import (  # type: ignore[import-not-found]
-            load_production_release_subject as load_subject,
+        canonical_raw, _identity = _bound_bytes(
+            canonical_path, "ATTESTATION_PROVENANCE_MISMATCH"
         )
-    except (ImportError, ModuleNotFoundError, OSError) as error:
+    except RunnerError:
+        raise
+    except (OSError, RuntimeError, ValueError) as error:
+        raise RunnerError(
+            "ATTESTATION_PROVENANCE_MISMATCH",
+            f"{module_name} source is unavailable",
+        ) from error
+
+    if module is not None:
+        try:
+            _validate_captured_release_subject_module(
+                module,
+                module_name,
+                canonical_path,
+                canonical_raw,
+            )
+        except RunnerError:
+            if sys.modules.get(module_name) is module:
+                sys.modules.pop(module_name, None)
+            module = None
+
+    if module is None:
+        candidate: ModuleType | None = None
+        try:
+            loader = _CapturedReleaseSubjectLoader(
+                module_name,
+                canonical_path,
+                canonical_raw,
+            )
+            spec = importlib.util.spec_from_file_location(
+                module_name,
+                canonical_path,
+                loader=loader,
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(f"{module_name} spec is unavailable")
+            candidate = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = candidate
+            spec.loader.exec_module(candidate)
+            module = candidate
+        except RunnerError:
+            if candidate is not None and sys.modules.get(module_name) is candidate:
+                sys.modules.pop(module_name, None)
+            raise
+        except Exception as error:
+            if candidate is not None and sys.modules.get(module_name) is candidate:
+                sys.modules.pop(module_name, None)
+            raise RunnerError(
+                "ATTESTATION_PROVENANCE_MISMATCH",
+                f"{module_name} could not be loaded from captured bytes",
+            ) from error
+
+    _validate_captured_release_subject_module(
+        module,
+        module_name,
+        canonical_path,
+        canonical_raw,
+    )
+    return module
+
+
+@dataclass(frozen=True)
+class _CapturedV8PackageState:
+    root: Path
+    modules: Mapping[str, tuple[Path, bytes, bool]]
+    finder: object
+
+
+_CAPTURED_V8_PACKAGE_STATE: _CapturedV8PackageState | None = None
+
+
+class _CapturedV8PackageLoader(importlib.abc.Loader):
+    """Execute one held V8 package source file, never its pathname."""
+
+    def __init__(
+        self,
+        name: str,
+        path: Path,
+        raw: bytes,
+        *,
+        is_package: bool,
+    ) -> None:
+        self.name = name
+        self.path = path
+        self.raw = raw
+        self.is_package_value = is_package
+
+    def create_module(self, _spec: object) -> None:
+        return None
+
+    def is_package(self, fullname: str) -> bool:
+        if fullname != self.name:
+            raise ImportError("V8 package loader name mismatch")
+        return self.is_package_value
+
+    def get_filename(self, fullname: str) -> str:
+        if fullname != self.name:
+            raise ImportError("V8 package loader name mismatch")
+        return str(self.path)
+
+    def get_data(self, path: str) -> bytes:
+        if _absolute_path(Path(path)) != self.path:
+            raise OSError("V8 package loader path mismatch")
+        return self.raw
+
+    def exec_module(self, module: ModuleType) -> None:
+        if module.__name__ != self.name:
+            raise ImportError("V8 package module name mismatch")
+        module.__file__ = str(self.path)
+        module.__loader__ = self
+        if self.is_package_value:
+            module.__path__ = [str(self.path.parent)]  # type: ignore[attr-defined]
+        code = compile(self.raw, str(self.path), "exec")
+        exec(code, module.__dict__)
+
+
+class _CapturedV8PackageFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, modules: Mapping[str, tuple[Path, bytes, bool]]) -> None:
+        self.modules = dict(modules)
+
+    def find_spec(
+        self,
+        fullname: str,
+        _path: object = None,
+        _target: object = None,
+    ) -> object:
+        source = self.modules.get(fullname)
+        if source is None:
+            return None
+        path, raw, is_package = source
+        loader = _CapturedV8PackageLoader(
+            fullname,
+            path,
+            raw,
+            is_package=is_package,
+        )
+        spec = importlib.util.spec_from_loader(
+            fullname,
+            loader,
+            origin=str(path),
+            is_package=is_package,
+        )
+        if spec is None:
+            raise ImportError("V8 package spec is unavailable")
+        if is_package:
+            spec.submodule_search_locations = [str(path.parent)]
+        return spec
+
+
+def _captured_v8_module_map(
+    root: Path,
+    files: Sequence[_HeldTreeFile],
+) -> dict[str, tuple[Path, bytes, bool]]:
+    modules: dict[str, tuple[Path, bytes, bool]] = {}
+    for item in files:
+        relative = item.relative.replace("\\", "/")
+        if not relative.endswith(".py"):
+            continue
+        parts = relative.split("/")
+        if parts[-1] == "__init__.py":
+            module_parts = parts[:-1]
+            is_package = True
+        else:
+            module_parts = [*parts[:-1], parts[-1][:-3]]
+            is_package = False
+        name = "gwo_v8"
+        if module_parts:
+            name += "." + ".".join(module_parts)
+        modules[name] = (
+            _absolute_path(root / Path(*parts)),
+            item.content,
+            is_package,
+        )
+    if "gwo_v8" not in modules:
+        raise RunnerError(
+            "ATTESTATION_PROVENANCE_MISMATCH",
+            "gwo_v8 package source snapshot has no package initializer",
+        )
+    return modules
+
+
+def _v8_module_names() -> tuple[str, ...]:
+    return tuple(
+        name
+        for name in sys.modules
+        if name == "gwo_v8" or name.startswith("gwo_v8.")
+    )
+
+
+def _validate_captured_v8_package_modules(
+    state: _CapturedV8PackageState,
+) -> ModuleType:
+    package: ModuleType | None = None
+    for name in _v8_module_names():
+        module = sys.modules.get(name)
+        source = state.modules.get(name)
+        if type(module) is not ModuleType or source is None:
+            _provenance_mismatch(f"{name} is not a captured canonical V8 module")
+        assert module is not None
+        expected_path, expected_raw, is_package = source
+        module_path = _exact_module_path(
+            getattr(module, "__file__", None),
+            f"{name} module origin",
+        )
+        module_spec = getattr(module, "__spec__", None)
+        spec_path = _exact_module_path(
+            getattr(module_spec, "origin", None),
+            f"{name} module spec origin",
+        )
+        loader = getattr(module_spec, "loader", None)
+        if (
+            module_path != expected_path
+            or spec_path != expected_path
+            or type(loader) is not _CapturedV8PackageLoader
+            or loader.name != name
+            or loader.path != expected_path
+            or loader.raw != expected_raw
+            or loader.is_package_value is not is_package
+            or getattr(module, "__loader__", None) is not loader
+        ):
+            _provenance_mismatch(f"{name} was not executed from held V8 bytes")
+        if is_package:
+            expected_path_value = [str(expected_path.parent)]
+            if getattr(module, "__path__", None) != expected_path_value:
+                _provenance_mismatch(f"{name} package path is not captured")
+        if name == "gwo_v8":
+            package = module
+    if package is None:
+        _provenance_mismatch("gwo_v8 package is not loaded")
+    return package
+
+
+def _load_captured_v8_package(root: Path) -> ModuleType:
+    """Bind the production V8 package to one held, exact source snapshot."""
+
+    global _CAPTURED_V8_PACKAGE_STATE
+    root = _absolute_path(root)
+    # Import execution can mutate arbitrary process-global module state (for
+    # example, a package initializer may register a helper module before it
+    # raises).  Retain the complete mapping and its identity so a failed
+    # captured load is observationally atomic to the caller.
+    previous_modules_object = sys.modules
+    previous_modules = dict(previous_modules_object)
+    previous_state = _CAPTURED_V8_PACKAGE_STATE
+    previous_meta_path = sys.meta_path
+    previous_meta_path_contents = list(sys.meta_path)
+    try:
+        files = _bound_tree_files(root, "ATTESTATION_PROVENANCE_MISMATCH")
+        modules = _captured_v8_module_map(root, files)
+        existing_names = _v8_module_names()
+
+        if _CAPTURED_V8_PACKAGE_STATE is not None:
+            state = _CAPTURED_V8_PACKAGE_STATE
+            if state.root != root or state.modules != modules:
+                _provenance_mismatch("V8 package source changed after capture")
+            if state.finder not in sys.meta_path:
+                sys.meta_path.insert(0, state.finder)
+            importlib.import_module("gwo_v8")
+            return _validate_captured_v8_package_modules(state)
+
+        from importlib.machinery import SourceFileLoader
+
+        for name in existing_names:
+            module = sys.modules.get(name)
+            source = modules.get(name)
+            if type(module) is not ModuleType or source is None:
+                _provenance_mismatch(f"{name} is not a canonical V8 module")
+            assert module is not None
+            expected_path = source[0]
+            module_path = _exact_module_path(
+                getattr(module, "__file__", None),
+                f"{name} module origin",
+            )
+            module_spec = getattr(module, "__spec__", None)
+            spec_path = _exact_module_path(
+                getattr(module_spec, "origin", None),
+                f"{name} module spec origin",
+            )
+            if module_path != expected_path or spec_path != expected_path:
+                _provenance_mismatch(f"{name} module origin is not canonical")
+            loader = getattr(module_spec, "loader", None)
+            if type(loader) not in (SourceFileLoader, _CapturedV8PackageLoader):
+                _provenance_mismatch(f"{name} has an unbound V8 module loader")
+
+        for name in existing_names:
+            sys.modules.pop(name, None)
+
+        finder = _CapturedV8PackageFinder(modules)
+        state = _CapturedV8PackageState(root, modules, finder)
+        _CAPTURED_V8_PACKAGE_STATE = state
+        sys.meta_path.insert(0, finder)
+        importlib.invalidate_caches()
+        importlib.import_module("gwo_v8")
+        return _validate_captured_v8_package_modules(state)
+    except Exception:
+        sys.modules = previous_modules_object
+        sys.modules.clear()
+        sys.modules.update(previous_modules)
+        sys.meta_path = previous_meta_path
+        sys.meta_path[:] = previous_meta_path_contents
+        _CAPTURED_V8_PACKAGE_STATE = previous_state
+        raise
+
+
+def _production_release_subject_module() -> ModuleType:
+    """Load and bind the production release-subject module to this checkout."""
+
+    _add_repo_import_paths(REPOSITORY_ROOT)
+    module_name = "beta3_release_subject"
+    canonical_path = _absolute_path(
+        Path(REPOSITORY_ROOT) / "scripts" / "beta3_release_subject.py"
+    )
+
+    module = sys.modules.get(module_name)
+    if module is not None:
+        if type(module) is not ModuleType:
+            sys.modules.pop(module_name, None)
+            _provenance_mismatch("preloaded release-subject is not an exact module")
+        try:
+            preloaded_path = _exact_module_path(
+                getattr(module, "__file__", None),
+                "preloaded release-subject module origin",
+            )
+            preloaded_spec = getattr(module, "__spec__", None)
+            preloaded_spec_path = _exact_module_path(
+                getattr(preloaded_spec, "origin", None),
+                "preloaded release-subject module spec origin",
+            )
+        except RunnerError:
+            if sys.modules.get(module_name) is module:
+                sys.modules.pop(module_name, None)
+            raise
+        if preloaded_path != canonical_path or preloaded_spec_path != canonical_path:
+            sys.modules.pop(module_name, None)
+            _provenance_mismatch("preloaded release-subject module is not canonical")
+        if type(getattr(preloaded_spec, "loader", None)) is not _CapturedReleaseSubjectLoader:
+            sys.modules.pop(module_name, None)
+            module = None
+
+    try:
+        canonical_raw, _identity = _bound_bytes(
+            canonical_path, "ATTESTATION_PROVENANCE_MISMATCH"
+        )
+    except RunnerError:
+        raise
+    except (OSError, RuntimeError, ValueError) as error:
+        raise RunnerError(
+            "ATTESTATION_PROVENANCE_MISMATCH",
+            "canonical release-subject source is unavailable",
+        ) from error
+    canonical_sha256 = hashlib.sha256(canonical_raw).hexdigest()
+
+    if module is not None:
+        try:
+            _validate_captured_release_subject_module(
+                module,
+                module_name,
+                canonical_path,
+                canonical_raw,
+            )
+        except RunnerError:
+            if sys.modules.get(module_name) is module:
+                sys.modules.pop(module_name, None)
+            module = None
+
+    if module is None:
+        candidate: ModuleType | None = None
+        try:
+            loader = _CapturedReleaseSubjectLoader(
+                module_name,
+                canonical_path,
+                canonical_raw,
+            )
+            spec = importlib.util.spec_from_file_location(
+                module_name,
+                canonical_path,
+                loader=loader,
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError("canonical release-subject spec is unavailable")
+            candidate = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = candidate
+            spec.loader.exec_module(candidate)
+            module = candidate
+        except RunnerError:
+            if candidate is not None and sys.modules.get(module_name) is candidate:
+                sys.modules.pop(module_name, None)
+            raise
+        except Exception as error:
+            if candidate is not None and sys.modules.get(module_name) is candidate:
+                sys.modules.pop(module_name, None)
+            raise RunnerError(
+                "ATTESTATION_PROVENANCE_MISMATCH",
+                "canonical release-subject module could not be loaded",
+            ) from error
+
+    _validate_captured_release_subject_module(
+        module,
+        module_name,
+        canonical_path,
+        canonical_raw,
+    )
+    if hashlib.sha256(canonical_raw).hexdigest() != canonical_sha256:
+        _provenance_mismatch("release-subject source digest is not canonical")
+    return module
+
+
+def load_production_release_subject() -> "ReleaseSubjectBinding":
+    module = _production_release_subject_module()
+    load_subject = getattr(module, "load_production_release_subject", None)
+    if not callable(load_subject):
         raise RunnerError(
             "RELEASE_SUBJECT_UNAVAILABLE",
             "release subject loader is unavailable",
-        ) from error
-    return load_subject()
+        )
+    try:
+        binding = load_subject()
+    except Exception as error:
+        try:
+            _production_release_subject_module()
+        except RunnerError as validation_error:
+            raise validation_error from error
+        raise
+    _production_release_subject_module()
+    return binding
 
 
 def _bind_runner_config_from_subject(subject: object) -> RunnerConfig:
-    _add_repo_import_paths(REPOSITORY_ROOT)
-    try:
-        from beta3_release_subject import ReleaseSubject  # type: ignore[import-not-found]
-    except (ImportError, ModuleNotFoundError, OSError) as error:
+    module = _production_release_subject_module()
+    ReleaseSubject = getattr(module, "ReleaseSubject", None)
+    if not isinstance(ReleaseSubject, type):
         raise RunnerError(
             "RELEASE_SUBJECT_UNAVAILABLE",
             "release subject contract is unavailable",
-        ) from error
+        )
     if type(subject) is not ReleaseSubject:
         raise RunnerError(
             "RELEASE_SUBJECT_SCHEMA_INVALID", "release subject is not exact"
         )
     if (
         subject.repository != REPOSITORY
-        or Path(subject.repository_root).resolve() != REPOSITORY_ROOT
-        or Path(subject.evidence_root).resolve() != EVIDENCE_ROOT
+        or _absolute_path(Path(subject.repository_root)) != REPOSITORY_ROOT
+        or _absolute_path(Path(subject.evidence_root)) != EVIDENCE_ROOT
     ):
         raise RunnerError(
             "RELEASE_SUBJECT_SCHEMA_INVALID",

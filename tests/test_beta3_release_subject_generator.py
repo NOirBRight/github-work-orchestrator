@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import builtins
 import hashlib
+import importlib._bootstrap_external
+import importlib.machinery
+import importlib.util
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
+import threading
+from types import ModuleType
 from types import SimpleNamespace
 
 import pytest
@@ -209,6 +216,205 @@ def test_source_digest_does_not_write_bytecode_to_authoritative_repository(
     assert not tuple(repository_root.rglob("__pycache__"))
 
 
+def test_source_digest_fails_closed_when_guard_changes_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, _evidence_root = _write_authoritative_repository(tmp_path)
+    guard_path = (
+        repository_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+        / "cutover_guard.py"
+    )
+    marker = tmp_path / "replacement-executed.txt"
+    replacement = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+        "def source_tree_digest(root, *, root_handle=None):\n"
+        "    return 'f' * 64\n"
+    ).encode("utf-8")
+    original_compile = builtins.compile
+    replaced = False
+
+    def replace_after_validation(
+        source: object,
+        filename: object,
+        mode: str,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal replaced
+        if not replaced and Path(str(filename)).resolve() == guard_path.resolve():
+            guard_path.write_bytes(replacement)
+            replaced = True
+        return original_compile(source, filename, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "compile", replace_after_validation)
+
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.source_tree_digest(repository_root)
+
+    assert error.value.code == "RELEASE_SUBJECT_SOURCE_UNAVAILABLE"
+    assert replaced
+    assert not marker.exists()
+
+
+def test_source_digest_rejects_file_replaced_after_discovery_before_held_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, _evidence_root = _write_authoritative_repository(tmp_path)
+    package_root = (
+        repository_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+    )
+    guard_path = package_root / "cutover_guard.py"
+    marker = tmp_path / "replaced-file-executed.txt"
+    replacement = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+        "def source_tree_digest(root, *, root_handle=None):\n"
+        "    return 'f' * 64\n"
+    ).encode("utf-8")
+    original_open_path_handle = release_subject._open_path_handle
+    replaced = False
+
+    def replace_after_discovery_before_open(
+        path: Path,
+        code: str,
+        **kwargs: object,
+    ):
+        nonlocal replaced
+        if not replaced and not kwargs.get("directory") and Path(path).name == guard_path.name:
+            replacement_path = package_root / "cutover_guard.replacement"
+            replacement_path.write_bytes(replacement)
+            os.replace(replacement_path, guard_path)
+            replaced = True
+        return original_open_path_handle(path, code, **kwargs)
+
+    monkeypatch.setattr(
+        release_subject, "_open_path_handle", replace_after_discovery_before_open
+    )
+
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.source_tree_digest(repository_root)
+
+    assert error.value.code == "RELEASE_SUBJECT_SOURCE_UNAVAILABLE"
+    assert replaced
+    assert not marker.exists()
+
+
+def test_source_digest_rejects_directory_replaced_after_discovery_before_held_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, _evidence_root = _write_authoritative_repository(tmp_path)
+    package_root = (
+        repository_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+    )
+    replacement_package = tmp_path / "replacement-package"
+    shutil.copytree(package_root, replacement_package)
+    marker = tmp_path / "replaced-directory-executed.txt"
+    replacement_guard = replacement_package / "cutover_guard.py"
+    replacement_guard.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+        "def source_tree_digest(root, *, root_handle=None):\n"
+        "    return 'f' * 64\n",
+        encoding="utf-8",
+    )
+    original_open_path_handle = release_subject._open_path_handle
+    replaced = False
+
+    def replace_after_discovery_before_open(
+        path: Path,
+        code: str,
+        **kwargs: object,
+    ):
+        nonlocal replaced
+        if not replaced and kwargs.get("directory") and Path(path).name == package_root.name:
+            original_package = tmp_path / "original-package"
+            package_root.rename(original_package)
+            replacement_package.rename(package_root)
+            replaced = True
+        return original_open_path_handle(path, code, **kwargs)
+
+    monkeypatch.setattr(
+        release_subject, "_open_path_handle", replace_after_discovery_before_open
+    )
+
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.source_tree_digest(repository_root)
+
+    assert error.value.code == "RELEASE_SUBJECT_SOURCE_UNAVAILABLE"
+    assert replaced
+    assert not marker.exists()
+
+
+def test_source_digest_never_uses_planted_pyc_or_source_loader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, _evidence_root = _write_authoritative_repository(tmp_path)
+    guard_path = (
+        repository_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+        / "cutover_guard.py"
+    )
+    marker = tmp_path / "forged-pyc-executed.txt"
+    forged = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+        "def source_tree_digest(root, *, root_handle=None):\n"
+        "    return 'f' * 64\n"
+    )
+    source_stat = guard_path.stat()
+    cache_path = Path(importlib.util.cache_from_source(str(guard_path)))
+    cache_path.parent.mkdir()
+    cache_path.write_bytes(
+        importlib._bootstrap_external._code_to_timestamp_pyc(
+            compile(forged, str(guard_path), "exec"),
+            int(source_stat.st_mtime),
+            source_stat.st_size,
+        )
+    )
+    planted_cache = cache_path.read_bytes()
+    original_exec_module = importlib.machinery.SourceFileLoader.exec_module
+    loader_calls = 0
+
+    def reject_source_loader(self: object, module: ModuleType) -> None:
+        nonlocal loader_calls
+        loader_calls += 1
+        return original_exec_module(self, module)
+
+    monkeypatch.setattr(
+        importlib.machinery.SourceFileLoader,
+        "exec_module",
+        reject_source_loader,
+    )
+
+    observed = release_subject.source_tree_digest(repository_root)
+
+    assert observed != "f" * 64
+    assert not marker.exists()
+    assert loader_calls == 0
+    assert cache_path.read_bytes() == planted_cache
+    assert tuple(repository_root.rglob("__pycache__")) == (cache_path.parent,)
+
+
 def test_source_digest_does_not_use_preloaded_shadowed_gwo_v8_module(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -233,6 +439,251 @@ def test_source_digest_does_not_use_preloaded_shadowed_gwo_v8_module(
     observed = release_subject.source_tree_digest(repository_root)
 
     assert observed != "f" * 64
+
+
+@pytest.mark.parametrize("dependency", ("_source_snapshot", "runtime_gateway"))
+def test_source_digest_rejects_preloaded_shadow_alias_dependencies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dependency: str,
+):
+    repository_root, _evidence_root = _write_authoritative_repository(tmp_path)
+    scripts_root = repository_root / "skills" / "orchestrator" / "scripts"
+    alias = "_gwo_v8_release_subject_" + hashlib.sha256(
+        str(scripts_root).encode("utf-8")
+    ).hexdigest()[:16]
+    shadow_path = tmp_path / "shadow" / f"{dependency}.py"
+    shadow_path.parent.mkdir()
+    shadow_path.write_text("# shadow dependency\n", encoding="utf-8")
+    shadow_module = ModuleType(f"{alias}.{dependency}")
+    shadow_module.__file__ = str(shadow_path)
+    shadow_module.__spec__ = SimpleNamespace(origin=str(shadow_path))
+
+    if dependency == "_source_snapshot":
+
+        class ShadowSnapshot:
+            @classmethod
+            def capture(cls, *_args: object, **_kwargs: object):
+                return cls()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> bool:
+                return False
+
+            def digest(self) -> str:
+                return "f" * 64
+
+        shadow_module.HeldSourceSnapshot = ShadowSnapshot
+        shadow_module.SourceSnapshotError = type(
+            "ShadowSourceSnapshotError", (Exception,), {}
+        )
+    else:
+        shadow_module.RuntimeConfiguration = type("RuntimeConfiguration", (), {})
+        shadow_module.RuntimeSelector = type("RuntimeSelector", (), {})
+        shadow_module._runtime_configuration_canonical = lambda _value: {}
+
+    monkeypatch.setitem(sys.modules, f"{alias}.{dependency}", shadow_module)
+
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.source_tree_digest(repository_root)
+
+    assert error.value.code == "RELEASE_SUBJECT_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor identity contract")
+def test_source_digest_rejects_a_root_handle_for_a_different_tree_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, _evidence_root = _write_authoritative_repository(tmp_path)
+    wrong_root = tmp_path / "wrong-root"
+    shutil.copytree(repository_root / "skills", wrong_root / "skills")
+    marker = tmp_path / "wrong-root-executed.txt"
+    guard_path = (
+        wrong_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+        / "cutover_guard.py"
+    )
+    guard_path.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n"
+        + guard_path.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    root_handle = os.open(wrong_root, os.O_RDONLY)
+    try:
+        with pytest.raises(release_subject.ReleaseSubjectError) as error:
+            release_subject.source_tree_digest(repository_root, root_handle=root_handle)
+    finally:
+        os.close(root_handle)
+
+    assert error.value.code == "RELEASE_SUBJECT_SOURCE_UNAVAILABLE"
+    assert not marker.exists()
+
+
+def test_source_digest_does_not_close_caller_owned_root_handle(tmp_path: Path):
+    repository_root, _evidence_root = _write_authoritative_repository(tmp_path)
+    root_handle = release_subject._open_path_handle(
+        repository_root,
+        "RELEASE_SUBJECT_SOURCE_UNAVAILABLE",
+        directory=True,
+    )
+    try:
+        assert release_subject.source_tree_digest(
+            repository_root,
+            root_handle=root_handle,
+        )
+        os.fstat(root_handle)
+    finally:
+        os.close(root_handle)
+
+
+def test_source_digest_serializes_process_global_import_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, _evidence_root = _write_authoritative_repository(tmp_path)
+    guard_path = (
+        repository_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+        / "cutover_guard.py"
+    ).resolve()
+    original_compile = builtins.compile
+    first_guard_compile = threading.Event()
+    release_first_compile = threading.Event()
+    second_guard_compile = threading.Event()
+    compile_lock = threading.Lock()
+    guard_compile_count = 0
+
+    def controlled_compile(
+        source: object,
+        filename: object,
+        mode: str,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal guard_compile_count
+        if Path(str(filename)).resolve() == guard_path:
+            with compile_lock:
+                guard_compile_count += 1
+                ordinal = guard_compile_count
+            if ordinal == 1:
+                first_guard_compile.set()
+                assert release_first_compile.wait(timeout=5)
+            elif ordinal == 2:
+                second_guard_compile.set()
+        return original_compile(source, filename, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "compile", controlled_compile)
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            results.append(release_subject.source_tree_digest(repository_root))
+        except BaseException as error:  # pragma: no cover - diagnostic capture
+            errors.append(error)
+
+    first = threading.Thread(target=run)
+    second = threading.Thread(target=run)
+    first.start()
+    assert first_guard_compile.wait(timeout=5)
+    second.start()
+    assert not second_guard_compile.wait(timeout=0.5)
+    release_first_compile.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not errors
+    assert len(results) == 2
+
+
+def test_source_digest_rejects_an_alias_dependency_removed_during_execution(
+    tmp_path: Path,
+):
+    repository_root, _evidence_root = _write_authoritative_repository(tmp_path)
+    guard_path = (
+        repository_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+        / "cutover_guard.py"
+    )
+    guard_path.write_text(
+        guard_path.read_text(encoding="utf-8")
+        + "\nimport sys as _gwo_test_sys\n"
+        + "_gwo_test_sys.modules.pop(__package__ + '._canonical', None)\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.source_tree_digest(repository_root)
+
+    assert error.value.code == "RELEASE_SUBJECT_SOURCE_UNAVAILABLE"
+
+
+def test_source_digest_rejects_an_unloader_alias_module_injected_during_execution(
+    tmp_path: Path,
+):
+    repository_root, _evidence_root = _write_authoritative_repository(tmp_path)
+    guard_path = (
+        repository_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+        / "cutover_guard.py"
+    )
+    guard_path.write_text(
+        guard_path.read_text(encoding="utf-8")
+        + "\nimport sys as _gwo_test_sys\n"
+        + "from types import ModuleType as _gwo_test_module_type\n"
+        + "_gwo_test_sys.modules[__package__ + '.injected'] = _gwo_test_module_type(__package__ + '.injected')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.source_tree_digest(repository_root)
+
+    assert error.value.code == "RELEASE_SUBJECT_SOURCE_UNAVAILABLE"
+
+
+def test_source_digest_restores_original_meta_path_object_after_execution(
+    tmp_path: Path,
+):
+    repository_root, _evidence_root = _write_authoritative_repository(tmp_path)
+    package_root = (
+        repository_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+    )
+    (package_root / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "cutover_guard.py").write_text(
+        "import sys as _gwo_test_sys\n"
+        "def source_tree_digest(root, *, root_handle=None):\n"
+        "    _gwo_test_sys.meta_path = []\n"
+        "    return 'a' * 64\n",
+        encoding="utf-8",
+    )
+    original_meta_path = sys.meta_path
+    original_meta_path_contents = list(sys.meta_path)
+
+    assert release_subject.source_tree_digest(repository_root) == "a" * 64
+
+    assert sys.meta_path is original_meta_path
+    assert sys.meta_path == original_meta_path_contents
 
 
 def test_generator_rejects_origin_mismatch_from_real_git_repository(
@@ -609,6 +1060,138 @@ def test_generator_does_not_remove_replaced_subject_after_failure(
     assert subject_path.read_bytes() == replacement_bytes
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cleanup TOCTOU contract")
+def test_generator_does_not_remove_subject_replaced_between_cleanup_check_and_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    subject = release_subject.generate_production_subject()
+    subject_path = evidence_root / release_subject.RELEASE_SUBJECT_FILENAME
+    replacement = evidence_root / "replacement-subject.json"
+    replacement_bytes = b"replacement inserted after cleanup check\n"
+    original_unlink = release_subject.os.unlink
+    unlink_calls = 0
+
+    def replace_checked_leaf_before_unlink(
+        name: object, *, dir_fd: int | None = None
+    ) -> None:
+        nonlocal unlink_calls
+        if Path(name).name == release_subject.RELEASE_SUBJECT_FILENAME and dir_fd is not None:
+            unlink_calls += 1
+            replacement.write_bytes(replacement_bytes)
+            os.replace(replacement, subject_path)
+        original_unlink(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(release_subject.os, "unlink", replace_checked_leaf_before_unlink)
+
+    def fail_loader(*_args: object, **_kwargs: object) -> object:
+        raise release_subject.ReleaseSubjectError(
+            "RELEASE_SUBJECT_WRITE_FAILED", "test loader failure"
+        )
+
+    monkeypatch.setattr(release_subject, "load_release_subject_for_test", fail_loader)
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.write_subject_for_test_exclusive(subject, subject_path)
+
+    assert error.value.code == "RELEASE_SUBJECT_WRITE_FAILED"
+    assert unlink_calls == 1
+    assert subject_path.read_bytes() == replacement_bytes
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cleanup special-entry contract")
+@pytest.mark.parametrize(
+    "replacement_kind",
+    ("symlink", "fifo", "directory", "identity-mismatch"),
+)
+def test_posix_cleanup_restores_special_entry_and_removes_private_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+):
+    subject_path = tmp_path / release_subject.RELEASE_SUBJECT_FILENAME
+    candidate_bytes = b"candidate subject bytes\n"
+    subject_path.write_bytes(candidate_bytes)
+    parent_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    parent = os.open(tmp_path, parent_flags)
+    candidate_descriptor = os.open(
+        subject_path.name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent,
+    )
+    original_rename = release_subject.os.rename
+    replaced = False
+    created_identity = release_subject._windows_handle_identity(
+        candidate_descriptor,
+        "RELEASE_SUBJECT_WRITE_FAILED",
+        directory=False,
+    )
+
+    def replace_detached_entry(
+        source: object,
+        destination: object,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal replaced
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if replaced:
+            return
+        replaced = True
+        assert dst_dir_fd is not None
+        os.unlink(subject_path.name, dir_fd=dst_dir_fd)
+        if replacement_kind == "symlink":
+            os.symlink("replacement-target", subject_path.name, dir_fd=dst_dir_fd)
+        elif replacement_kind == "fifo":
+            os.mkfifo(subject_path.name, 0o600, dir_fd=dst_dir_fd)
+        elif replacement_kind == "directory":
+            os.mkdir(subject_path.name, 0o700, dir_fd=dst_dir_fd)
+        else:
+            replacement_descriptor = os.open(
+                subject_path.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(replacement_descriptor, b"different subject bytes\n")
+            finally:
+                os.close(replacement_descriptor)
+
+    monkeypatch.setattr(release_subject.os, "rename", replace_detached_entry)
+    try:
+        release_subject._remove_created_subject_posix(
+            subject_path,
+            parent,
+            created_identity,
+            candidate_bytes,
+        )
+    finally:
+        os.close(candidate_descriptor)
+        os.close(parent)
+
+    if replacement_kind == "symlink":
+        assert subject_path.is_symlink()
+        assert os.readlink(subject_path) == "replacement-target"
+    elif replacement_kind == "fifo":
+        assert stat.S_ISFIFO(os.lstat(subject_path).st_mode)
+    elif replacement_kind == "directory":
+        assert subject_path.is_dir()
+    else:
+        assert subject_path.read_bytes() == b"different subject bytes\n"
+    assert not list(tmp_path.glob(f".{release_subject.RELEASE_SUBJECT_FILENAME}.cleanup-*"))
+
+
 def test_generator_rejects_fifo_subject_without_blocking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -656,3 +1239,99 @@ def test_open_path_handle_opens_fifo_without_blocking(
         assert observed_flags
     finally:
         os.close(descriptor)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX open-flag contract")
+@pytest.mark.parametrize(
+    ("missing_flag", "directory"),
+    (
+        ("O_DIRECTORY", True),
+        ("O_NOFOLLOW", True),
+        ("O_NOFOLLOW", False),
+        ("O_NONBLOCK", False),
+    ),
+)
+def test_release_subject_posix_open_fails_closed_when_required_flag_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_flag: str,
+    directory: bool,
+):
+    path = tmp_path if directory else tmp_path / "source.py"
+    if not directory:
+        path.write_bytes(b"value = 1\n")
+
+    monkeypatch.delattr(release_subject.os, missing_flag)
+
+    def unexpected_open(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("os.open must not be reached without required flags")
+
+    monkeypatch.setattr(release_subject.os, "open", unexpected_open)
+
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject._open_path_handle(
+            path,
+            "TEST_REQUIRED_POSIX_FLAG",
+            directory=directory,
+        )
+
+    assert error.value.code == "TEST_REQUIRED_POSIX_FLAG"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX open-flag contract")
+@pytest.mark.parametrize("missing_flag", ("O_NOFOLLOW", "O_NONBLOCK"))
+def test_subject_absence_probe_fails_closed_without_required_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_flag: str,
+):
+    parent = os.open(tmp_path, os.O_RDONLY)
+    try:
+        monkeypatch.delattr(release_subject.os, missing_flag)
+
+        def unexpected_open(*_args: object, **_kwargs: object) -> int:
+            raise AssertionError(
+                "os.open must not be reached without required subject flags"
+            )
+
+        monkeypatch.setattr(release_subject.os, "open", unexpected_open)
+        lease = SimpleNamespace(
+            handles=(parent,),
+            assert_stable=lambda: None,
+        )
+
+        with pytest.raises(release_subject.ReleaseSubjectError) as error:
+            release_subject._require_subject_absent_held(
+                tmp_path / "subject",
+                lease,
+            )
+
+        assert error.value.code == "RELEASE_SUBJECT_PATH_INVALID"
+    finally:
+        os.close(parent)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX open-flag contract")
+@pytest.mark.parametrize("missing_flag", ("O_DIRECTORY", "O_NOFOLLOW"))
+def test_cleanup_directory_open_fails_closed_without_required_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_flag: str,
+):
+    parent = os.open(tmp_path, os.O_RDONLY)
+    try:
+        monkeypatch.delattr(release_subject.os, missing_flag)
+
+        def unexpected_open(*_args: object, **_kwargs: object) -> int:
+            raise AssertionError(
+                "os.open must not be reached without cleanup directory flags"
+            )
+
+        monkeypatch.setattr(release_subject.os, "open", unexpected_open)
+
+        with pytest.raises(release_subject.ReleaseSubjectError) as error:
+            release_subject._open_posix_cleanup_directory(parent)
+
+        assert error.value.code == "RELEASE_SUBJECT_WRITE_FAILED"
+    finally:
+        os.close(parent)
