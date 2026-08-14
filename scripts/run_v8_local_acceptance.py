@@ -112,7 +112,6 @@ _TARGET_BRANCH = "main"
 _ROOT_STANDARD_TICKETS = ("issue:101", "issue:102", "issue:103")
 _ROOT_STRICT_TICKET = "issue:104"
 _ROOT_TICKET_KEYS = (*_ROOT_STANDARD_TICKETS, _ROOT_STRICT_TICKET)
-_LAST_ROOT_PUBLIC_ADVANCER_WAKE_REFS: tuple[str | None, ...] = ()
 
 
 def _campaign_key(run_id: str, scenario: str) -> str:
@@ -2643,9 +2642,6 @@ def _run_root_acceptance_in_root(
     root: Path,
     run_id: str,
 ) -> dict[str, Any]:
-    global _LAST_ROOT_PUBLIC_ADVANCER_WAKE_REFS
-    _LAST_ROOT_PUBLIC_ADVANCER_WAKE_REFS = ()
-
     harness, handle = _install_harness(Path(root), run_id, "root")
     initial = gwo_v8.inspect(handle)
     transcript: list[dict[str, Any]] = [
@@ -2693,7 +2689,6 @@ def _run_root_acceptance_in_root(
         advancer=public_advancer,
     )
     lost_wake_outcomes = watchdog.run_once("2026-08-11T00:00:01+00:00")
-    _LAST_ROOT_PUBLIC_ADVANCER_WAKE_REFS = tuple(public_advancer_wake_refs)
     lost_wake = _outcome_record(lost_wake_outcomes[-1])
     transcript.append(
         {
@@ -2729,6 +2724,7 @@ def _run_root_acceptance_in_root(
         "initial_worker_slots": dict(initial_after_advance.worker_slots),
         "watchdog_progressed": bool(lost_wake_outcomes),
         "callback_emitted": emitted_callback_ref,
+        "public_advancer_wake_refs": list(public_advancer_wake_refs),
         "lost_wake": lost_wake,
         "duplicate_callback_ref": duplicate_callback_ref,
         "duplicate_callback": duplicate_callback,
