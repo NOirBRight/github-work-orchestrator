@@ -266,6 +266,8 @@ REPORT_SCHEMA = "gwo-v8-beta3-live-guard-report.v1"
 EVIDENCE_SCHEMA = "gwo-v8-beta3-live-guard-evidence.v1"
 EVIDENCE_MODE = "attested_bundle_replay"
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_FRESH_STORE_FILENAME = re.compile(r"^store-[0-9]{8}T[0-9]{6}Z\.sqlite3$")
+_STORE_GENERATION = re.compile(r"^store:v8:[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 FRESH_RECEIPT_KEYS = frozenset(
     {
         "schema",
@@ -6137,6 +6139,99 @@ def load_production_release_subject() -> "ReleaseSubjectBinding":
     return binding
 
 
+def _bind_fresh_store_identity_from_receipt(
+    config: RunnerConfig, release_subject: object
+) -> RunnerConfig:
+    expected_receipt_digest = getattr(release_subject, "fresh_receipt_sha256", None)
+    if type(expected_receipt_digest) is not str or not _HEX64.fullmatch(
+        expected_receipt_digest
+    ):
+        raise RunnerError(
+            "FRESH_RECEIPT_DIGEST_UNAVAILABLE",
+            "production subject has no valid fresh receipt digest",
+        )
+    receipt, receipt_digest, _receipt_identity = _read_canonical_json(
+        config.fresh_receipt, "FRESH_RECEIPT_INVALID"
+    )
+    if receipt_digest != expected_receipt_digest:
+        raise RunnerError(
+            "FRESH_RECEIPT_DIGEST_MISMATCH",
+            "fresh receipt bytes are not bound to the production subject",
+        )
+    if set(receipt) != FRESH_RECEIPT_KEYS:
+        raise RunnerError(
+            "FRESH_RECEIPT_SCHEMA_MISMATCH",
+            "fresh receipt keys are not the closed exact schema",
+        )
+
+    store_path_value = receipt.get("store_path")
+    if type(store_path_value) is not str:
+        raise RunnerError(
+            "FRESH_RECEIPT_STORE_MISMATCH",
+            "fresh receipt store path is not exact text",
+        )
+    try:
+        store_path = Path(store_path_value)
+    except (OSError, TypeError, ValueError) as error:
+        raise RunnerError(
+            "FRESH_RECEIPT_STORE_MISMATCH",
+            "fresh receipt store path is malformed",
+        ) from error
+    if (
+        not store_path.is_absolute()
+        or _path_text(store_path) != store_path_value
+        or _absolute_path(store_path.parent)
+        != _absolute_path(Path(config.fresh_store).parent)
+        or _FRESH_STORE_FILENAME.fullmatch(store_path.name) is None
+        or _same_path(store_path, config.rollback_store)
+        or _same_path(store_path, config.prior_store)
+    ):
+        raise RunnerError(
+            "FRESH_RECEIPT_STORE_MISMATCH",
+            "fresh receipt store path is outside the canonical fresh Store directory",
+        )
+    _require_directory(store_path.parent, "FRESH_STORE_PARENT_INVALID")
+    _require_regular_file(store_path, "FRESH_STORE_UNAVAILABLE")
+
+    store_generation = receipt.get("store_generation")
+    if type(store_generation) is not str or _STORE_GENERATION.fullmatch(
+        store_generation
+    ) is None:
+        raise RunnerError(
+            "FRESH_RECEIPT_GENERATION_MISMATCH",
+            "fresh receipt Store generation is malformed",
+        )
+    store_sha256 = receipt.get("store_sha256")
+    if type(store_sha256) is not str or _HEX64.fullmatch(store_sha256) is None:
+        raise RunnerError(
+            "FRESH_RECEIPT_SCHEMA_MISMATCH",
+            "fresh receipt store hash is not a digest",
+        )
+    generation_rows = receipt.get("generation_rows")
+    if (
+        type(generation_rows) is not list
+        or len(generation_rows) != 1
+        or type(generation_rows[0]) is not list
+        or len(generation_rows[0]) != 2
+        or any(type(item) is not str or not item for item in generation_rows[0])
+        or generation_rows[0] != [config.repository, store_generation]
+    ):
+        raise RunnerError(
+            "FRESH_RECEIPT_GENERATION_MISMATCH",
+            "fresh receipt Store generation rows are malformed",
+        )
+
+    return replace(
+        config,
+        fresh_store=store_path,
+        store_generation=store_generation,
+        expected_fresh_store_sha256=store_sha256,
+        expected_fresh_receipt_generation_rows=(
+            (config.repository, store_generation),
+        ),
+    )
+
+
 def _bind_runner_config_from_subject(subject: object) -> RunnerConfig:
     module = _production_release_subject_module()
     ReleaseSubject = getattr(module, "ReleaseSubject", None)
@@ -6159,7 +6254,7 @@ def _bind_runner_config_from_subject(subject: object) -> RunnerConfig:
             "release subject roots are not the fixed production roots",
         )
     evidence_root = Path(subject.evidence_root)
-    return replace(
+    bound_config = replace(
         DEFAULT_CONFIG,
         repository_root=Path(subject.repository_root),
         evidence_root=evidence_root,
@@ -6175,6 +6270,7 @@ def _bind_runner_config_from_subject(subject: object) -> RunnerConfig:
         gateway_store_path=evidence_root / DEFAULT_CONFIG.gateway_store_path.name,
         artifact_root=evidence_root / DEFAULT_CONFIG.artifact_root.name,
     )
+    return _bind_fresh_store_identity_from_receipt(bound_config, subject)
 
 
 def _fixture_release_subject(config: RunnerConfig) -> object:

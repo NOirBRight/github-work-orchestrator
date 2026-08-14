@@ -3646,6 +3646,22 @@ def test_default_config_does_not_pin_a_fresh_receipt_digest():
 
 def test_production_subject_binds_nonlegacy_fresh_receipt_digest(tmp_path, monkeypatch):
     config = _fixture_config(tmp_path)
+    controlled_store = config.fresh_store.with_name("store-20260815T081500Z.sqlite3")
+    controlled_store.write_bytes(config.fresh_store.read_bytes())
+    receipt = json.loads(config.fresh_receipt.read_text(encoding="utf-8"))
+    receipt.update(
+        {
+            "store_path": str(controlled_store),
+            "store_sha256": _sha256(controlled_store),
+        }
+    )
+    config.fresh_receipt.write_bytes(runner.canonical_json_bytes(receipt))
+    config = replace(
+        config,
+        fresh_store=controlled_store,
+        expected_fresh_store_sha256=_sha256(controlled_store),
+        expected_fresh_receipt_sha256=_sha256(config.fresh_receipt),
+    )
     receipt_digest = _sha256(config.fresh_receipt)
     legacy_digest = "46814d166c857e3d7f847b7da6f3da5b39c394b42402b2f1d2cdd61d78ce7781"
     assert receipt_digest != legacy_digest
@@ -3683,6 +3699,59 @@ def test_production_subject_binds_nonlegacy_fresh_receipt_digest(tmp_path, monke
     assert bound_config.expected_fresh_receipt_sha256 == receipt_digest
     assert bound_digest == receipt_digest
     assert receipt["source_main_sha"] == config.merged_main_sha
+
+
+def test_production_subject_binds_fresh_store_identity_from_bound_receipt(
+    tmp_path, monkeypatch
+):
+    config = _fixture_config(tmp_path)
+    dynamic_store = config.fresh_store.with_name("store-20260815T081500Z.sqlite3")
+    dynamic_store.write_bytes(config.fresh_store.read_bytes())
+    dynamic_generation = "store:v8:fixture:20260815T081500Z"
+    dynamic_store_sha256 = _sha256(dynamic_store)
+    receipt = json.loads(config.fresh_receipt.read_text(encoding="utf-8"))
+    receipt.update(
+        {
+            "store_path": str(dynamic_store),
+            "store_generation": dynamic_generation,
+            "store_sha256": dynamic_store_sha256,
+            "generation_rows": [[config.repository, dynamic_generation]],
+        }
+    )
+    config.fresh_receipt.write_bytes(runner.canonical_json_bytes(receipt))
+    receipt_digest = _sha256(config.fresh_receipt)
+
+    class ReleaseSubject:
+        pass
+
+    subject = ReleaseSubject()
+    subject.repository = config.repository
+    subject.repository_root = str(config.repository_root)
+    subject.evidence_root = str(config.evidence_root)
+    subject.merged_main_sha = config.merged_main_sha
+    subject.merged_main_git_tree = config.merged_main_git_tree
+    subject.audited_source_tree_digest = config.audited_source_tree_digest
+    subject.subject_digest = config.release_subject_digest
+    subject.fresh_receipt_sha256 = receipt_digest
+
+    monkeypatch.setattr(
+        runner,
+        "_production_release_subject_module",
+        lambda: SimpleNamespace(ReleaseSubject=ReleaseSubject),
+    )
+    monkeypatch.setattr(runner, "DEFAULT_CONFIG", config)
+    monkeypatch.setattr(runner, "REPOSITORY", config.repository)
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", config.repository_root)
+    monkeypatch.setattr(runner, "EVIDENCE_ROOT", config.evidence_root)
+
+    bound_config = runner._bind_runner_config_from_subject(subject)
+
+    assert bound_config.fresh_store == dynamic_store
+    assert bound_config.store_generation == dynamic_generation
+    assert bound_config.expected_fresh_store_sha256 == dynamic_store_sha256
+    assert bound_config.expected_fresh_receipt_generation_rows == (
+        (config.repository, dynamic_generation),
+    )
 
 
 def test_actual_skill_manifest_contract_is_accepted_by_preflight(tmp_path):
@@ -4343,6 +4412,11 @@ def load_production_release_subject():
     monkeypatch.delitem(sys.modules, "beta3_release_subject", raising=False)
 
     binding = runner.load_production_release_subject()
+    monkeypatch.setattr(
+        runner,
+        "_bind_fresh_store_identity_from_receipt",
+        lambda config, _subject: config,
+    )
     config = runner._bind_runner_config_from_subject(binding.subject)
 
     assert binding.subject.repository_root == str(repository_root.resolve())
