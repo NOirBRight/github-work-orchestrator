@@ -2157,6 +2157,27 @@ def test_local_checkout_source_rejects_untracked_path_outside_codex_tmp(tmp_path
     assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX literal backslash name contract")
+def test_local_checkout_source_rejects_untracked_backslash_name_outside_codex_tmp(tmp_path, monkeypatch):
+    subject = _subject()
+    config = _config(tmp_path)
+    _write_static_fixture(tmp_path)
+    responses = iter(
+        (
+            subject.source_commit.encode("ascii"),
+            config.merged_main_git_tree.encode("ascii"),
+            b"?? .codex-tmp\\outside.txt\0",
+        )
+    )
+    monkeypatch.setattr(attestor_module.os, "name", "posix")
+    source = attestor_module._LocalInputsSource(lambda _command: next(responses), "d" * 64)
+
+    with pytest.raises(BootstrapError) as error:
+        source.read(config, subject)
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
 def test_local_checkout_source_rejects_dirty_worktree(tmp_path):
     subject = _subject()
     config = _config(tmp_path)
