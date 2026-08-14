@@ -22,8 +22,9 @@ from typing import Callable, Mapping, Sequence
 import uuid
 
 
-RELEASE_SUBJECT_SCHEMA = "gwo-v8-release-subject.v1"
+RELEASE_SUBJECT_SCHEMA = "gwo-v8-release-subject.v2"
 RELEASE_SUBJECT_FILENAME = "gwo-v8-release-subject.json"
+FRESH_RECEIPT_FILENAME = "fresh-store-exact-main-receipt.json"
 REPOSITORY = "NOirBRight/github-work-orchestrator"
 REMOTE_REF = "origin/main"
 ATTESTOR_FILENAMES = (
@@ -43,6 +44,7 @@ _BODY_KEYS = frozenset(
         "repository",
         "repository_root",
         "evidence_root",
+        "fresh_receipt_sha256",
         "merged_main_sha",
         "merged_main_git_tree",
         "audited_source_tree_digest",
@@ -193,6 +195,7 @@ class ReleaseSubject:
     repository: str
     repository_root: str
     evidence_root: str
+    fresh_receipt_sha256: str
     merged_main_sha: str
     merged_main_git_tree: str
     audited_source_tree_digest: str
@@ -229,6 +232,7 @@ class ReleaseSubject:
             "remote_ref",
         ):
             _require_exact_text(getattr(self, field), field)
+        _require_digest(self.fresh_receipt_sha256, "fresh_receipt_sha256")
         _require_digest(self.merged_main_sha, "merged_main_sha", length=40)
         _require_digest(self.merged_main_git_tree, "merged_main_git_tree", length=40)
         _require_digest(
@@ -263,6 +267,7 @@ class ReleaseSubject:
             "repository": self.repository,
             "repository_root": self.repository_root,
             "evidence_root": self.evidence_root,
+            "fresh_receipt_sha256": self.fresh_receipt_sha256,
             "merged_main_sha": self.merged_main_sha,
             "merged_main_git_tree": self.merged_main_git_tree,
             "audited_source_tree_digest": self.audited_source_tree_digest,
@@ -298,6 +303,7 @@ class ReleaseSubject:
 
     @classmethod
     def from_canonical(cls, value: Mapping[str, object]) -> "ReleaseSubject":
+        _require_closed_keys(value, _TOP_LEVEL_KEYS, "release subject")
         runner = _require_closed_keys(value["runner"], _FILE_IDENTITY_KEYS, "runner")
         raw_attestors = value["attestors"]
         if type(raw_attestors) is not list:
@@ -325,6 +331,9 @@ class ReleaseSubject:
                 value["repository_root"], "repository_root"
             ),
             evidence_root=_require_exact_text(value["evidence_root"], "evidence_root"),
+            fresh_receipt_sha256=_require_digest(
+                value["fresh_receipt_sha256"], "fresh_receipt_sha256"
+            ),
             merged_main_sha=_require_digest(
                 value["merged_main_sha"], "merged_main_sha", length=40
             ),
@@ -421,6 +430,7 @@ def _validate_closed_shape(
     _require_exact_text(value["repository_root"], "repository_root")
     _require_exact_text(value["evidence_root"], "evidence_root")
     _require_exact_text(value["remote_ref"], "remote_ref")
+    _require_digest(value["fresh_receipt_sha256"], "fresh_receipt_sha256")
     _require_digest(value["merged_main_sha"], "merged_main_sha", length=40)
     _require_digest(value["merged_main_git_tree"], "merged_main_git_tree", length=40)
     _require_digest(
@@ -1212,6 +1222,28 @@ def _read_regular_file_once(
     finally:
         os.close(descriptor)
         lease.close()
+
+
+def _fresh_receipt_snapshot(
+    evidence_root: Path,
+    evidence_lease: _DirectoryLease,
+) -> tuple[bytes, dict[str, int | str]]:
+    """Read the fixed fresh receipt beneath the held evidence root."""
+
+    receipt_path = Path(evidence_root) / FRESH_RECEIPT_FILENAME
+    raw, identity = _read_regular_file_once(
+        receipt_path,
+        "RELEASE_SUBJECT_FRESH_RECEIPT_UNAVAILABLE",
+        parent_lease=evidence_lease,
+    )
+    try:
+        _decode_exact_canonical_object(raw)
+    except ReleaseSubjectError as error:
+        raise ReleaseSubjectError(
+            "RELEASE_SUBJECT_FRESH_RECEIPT_INVALID",
+            error.detail,
+        ) from error
+    return raw, identity
 
 
 @dataclass(frozen=True)
@@ -3032,6 +3064,12 @@ def generate_production_subject() -> ReleaseSubject:
             evidence_lease,
         )
         generation_lease.assert_stable()
+        receipt_raw, receipt_identity = _fresh_receipt_snapshot(
+            evidence_root,
+            evidence_lease,
+        )
+        fresh_receipt_sha256 = hashlib.sha256(receipt_raw).hexdigest()
+        generation_lease.assert_stable()
         head, tree = _git_snapshot(repository_lease=repository_lease)
         generation_lease.assert_stable()
         audited_source_tree_digest = source_tree_digest(
@@ -3073,12 +3111,25 @@ def generate_production_subject() -> ReleaseSubject:
                 "RELEASE_SUBJECT_REPOSITORY_DRIFT",
                 "observer inputs changed during subject generation",
             )
+        final_receipt_raw, final_receipt_identity = _fresh_receipt_snapshot(
+            evidence_root,
+            evidence_lease,
+        )
+        if (
+            final_receipt_raw != receipt_raw
+            or not _identity_matches(final_receipt_identity, receipt_identity)
+        ):
+            raise ReleaseSubjectError(
+                "RELEASE_SUBJECT_EVIDENCE_DRIFT",
+                "fresh receipt changed during subject generation",
+            )
         generation_lease.assert_stable()
         body: dict[str, object] = {
             "schema": RELEASE_SUBJECT_SCHEMA,
             "repository": REPOSITORY,
             "repository_root": _canonical_path(repository_root),
             "evidence_root": _canonical_path(evidence_root),
+            "fresh_receipt_sha256": fresh_receipt_sha256,
             "merged_main_sha": head,
             "merged_main_git_tree": tree,
             "audited_source_tree_digest": audited_source_tree_digest,
@@ -3093,6 +3144,7 @@ def generate_production_subject() -> ReleaseSubject:
             repository=REPOSITORY,
             repository_root=_canonical_path(repository_root),
             evidence_root=_canonical_path(evidence_root),
+            fresh_receipt_sha256=fresh_receipt_sha256,
             merged_main_sha=head,
             merged_main_git_tree=tree,
             audited_source_tree_digest=audited_source_tree_digest,

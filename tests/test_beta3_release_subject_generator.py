@@ -46,6 +46,9 @@ def _write_authoritative_repository(tmp_path: Path) -> tuple[Path, Path]:
     evidence_root = (tmp_path / "evidence").resolve()
     repository_root.mkdir()
     evidence_root.mkdir()
+    (evidence_root / release_subject.FRESH_RECEIPT_FILENAME).write_bytes(
+        release_subject.canonical_json_bytes({"receipt": "fresh"})
+    )
 
     source_root = ROOT / "skills" / "orchestrator" / "scripts" / "gwo_v8"
     target_source_root = (
@@ -203,6 +206,94 @@ def test_generator_reads_real_git_source_and_observer_inputs(
     finally:
         pass
         subject.close()
+
+
+def test_generator_binds_exact_fresh_receipt_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    receipt_path = evidence_root / "fresh-store-exact-main-receipt.json"
+    receipt_raw = release_subject.canonical_json_bytes({"receipt": "fresh"})
+    receipt_path.write_bytes(receipt_raw)
+
+    assert generator.main([]) == 0
+
+    subject_path = evidence_root / release_subject.RELEASE_SUBJECT_FILENAME
+    binding = release_subject.load_release_subject_for_test(
+        subject_path,
+        expected_repository_root=repository_root,
+        expected_evidence_root=evidence_root,
+    )
+    try:
+        assert binding.subject.fresh_receipt_sha256 == hashlib.sha256(
+            receipt_raw
+        ).hexdigest()
+    finally:
+        binding.close()
+
+
+def test_generator_fails_closed_when_fresh_receipt_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    (evidence_root / release_subject.FRESH_RECEIPT_FILENAME).unlink()
+
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.generate_production_subject()
+
+    assert error.value.code == "RELEASE_SUBJECT_FRESH_RECEIPT_UNAVAILABLE"
+
+
+def test_generator_fails_closed_for_noncanonical_fresh_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    (evidence_root / release_subject.FRESH_RECEIPT_FILENAME).write_bytes(
+        b'{"receipt":"fresh"}'
+    )
+
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.generate_production_subject()
+
+    assert error.value.code == "RELEASE_SUBJECT_FRESH_RECEIPT_INVALID"
+
+
+def test_generator_rejects_fresh_receipt_replaced_during_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository_root, evidence_root = _write_authoritative_repository(tmp_path)
+    _patch_fixed_roots(monkeypatch, repository_root, evidence_root)
+    receipt_path = evidence_root / release_subject.FRESH_RECEIPT_FILENAME
+    original_git_snapshot = release_subject._git_snapshot
+    replaced = False
+
+    def replace_after_git_snapshot(
+        *, repository_lease: object = None
+    ) -> tuple[str, str]:
+        nonlocal replaced
+        observed = original_git_snapshot(repository_lease=repository_lease)
+        if not replaced:
+            replaced = True
+            receipt_path.write_bytes(
+                release_subject.canonical_json_bytes({"receipt": "replacement"})
+            )
+        return observed
+
+    monkeypatch.setattr(
+        release_subject, "_git_snapshot", replace_after_git_snapshot
+    )
+
+    with pytest.raises(release_subject.ReleaseSubjectError) as error:
+        release_subject.generate_production_subject()
+
+    assert error.value.code == "RELEASE_SUBJECT_EVIDENCE_DRIFT"
 
 
 def test_source_digest_does_not_write_bytecode_to_authoritative_repository(

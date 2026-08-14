@@ -59,10 +59,11 @@ def _canonical_fixture_body(tmp_path: Path) -> dict[str, object]:
     repository_root = (tmp_path / "repository").resolve()
     evidence_root = (tmp_path / "evidence").resolve()
     return {
-        "schema": "gwo-v8-release-subject.v1",
+        "schema": "gwo-v8-release-subject.v2",
         "repository": "NOirBRight/github-work-orchestrator",
         "repository_root": str(repository_root),
         "evidence_root": str(evidence_root),
+        "fresh_receipt_sha256": "5" * 64,
         "merged_main_sha": "a" * 40,
         "merged_main_git_tree": "b" * 40,
         "audited_source_tree_digest": "c" * 64,
@@ -164,6 +165,7 @@ def _valid_subject_value(tmp_path: Path) -> ReleaseSubject:
         "repository": "NOirBRight/github-work-orchestrator",
         "repository_root": str(repository_root),
         "evidence_root": str(evidence_root),
+        "fresh_receipt_sha256": "5" * 64,
         "merged_main_sha": "a" * 40,
         "merged_main_git_tree": "b" * 40,
         "audited_source_tree_digest": "c" * 64,
@@ -214,10 +216,11 @@ def test_subject_digest_excludes_only_subject_digest(tmp_path: Path):
     repository_root = (tmp_path / "repository").resolve()
     evidence_root = (tmp_path / "evidence").resolve()
     body = {
-        "schema": "gwo-v8-release-subject.v1",
+        "schema": "gwo-v8-release-subject.v2",
         "repository": "NOirBRight/github-work-orchestrator",
         "repository_root": str(repository_root),
         "evidence_root": str(evidence_root),
+        "fresh_receipt_sha256": "5" * 64,
         "merged_main_sha": "a" * 40,
         "merged_main_git_tree": "b" * 40,
         "audited_source_tree_digest": "c" * 64,
@@ -259,6 +262,45 @@ def test_subject_digest_excludes_only_subject_digest(tmp_path: Path):
     )
     assert parsed.canonical_body() == body
     assert parsed.canonical() == payload
+
+
+def test_subject_schema_carries_fresh_receipt_digest(tmp_path: Path):
+    payload = _canonical_fixture_payload(tmp_path)
+    payload["fresh_receipt_sha256"] = "a" * 64
+    body = {key: value for key, value in payload.items() if key != "subject_digest"}
+    payload["subject_digest"] = hashlib.sha256(
+        canonical_json_bytes(body)
+    ).hexdigest()
+
+    parsed = parse_release_subject(
+        canonical_json_bytes(payload),
+        expected_repository_root=tmp_path / "repository",
+        expected_evidence_root=tmp_path / "evidence",
+    )
+
+    assert parsed.fresh_receipt_sha256 == "a" * 64
+    assert parsed.canonical() == payload
+
+
+def test_subject_schema_requires_fresh_receipt_digest(tmp_path: Path):
+    payload = _canonical_fixture_payload(tmp_path)
+    payload.pop("fresh_receipt_sha256")
+    body = {key: value for key, value in payload.items() if key != "subject_digest"}
+    payload["subject_digest"] = hashlib.sha256(
+        canonical_json_bytes(body)
+    ).hexdigest()
+
+    with pytest.raises(ReleaseSubjectError) as parse_error:
+        parse_release_subject(
+            canonical_json_bytes(payload),
+            expected_repository_root=tmp_path / "repository",
+            expected_evidence_root=tmp_path / "evidence",
+        )
+    assert parse_error.value.code == "RELEASE_SUBJECT_SCHEMA_INVALID"
+
+    with pytest.raises(ReleaseSubjectError) as constructor_error:
+        ReleaseSubject.from_canonical(payload)
+    assert constructor_error.value.code == "RELEASE_SUBJECT_SCHEMA_INVALID"
 
 
 def test_subject_schema_rejects_extra_key_and_swapped_identity_domains(tmp_path: Path):
@@ -441,7 +483,7 @@ def test_subject_schema_rejects_wrong_roots_and_fixed_literals(tmp_path: Path):
         ("repository_root", str((tmp_path / "other-repository").resolve())),
         ("evidence_root", str((tmp_path / "other-evidence").resolve())),
         ("repository", "other/repository"),
-        ("schema", "gwo-v8-release-subject.v2"),
+        ("schema", "gwo-v8-release-subject.v1"),
         ("remote_ref", "refs/heads/main"),
     )
     for field, value in cases:
@@ -479,8 +521,8 @@ def test_subject_parser_requires_canonical_json_bytes(tmp_path: Path):
 def test_subject_parser_rejects_duplicate_json_keys(tmp_path: Path):
     payload = _canonical_fixture_payload(tmp_path)
     raw = canonical_json_bytes(payload).replace(
-        b'"schema":"gwo-v8-release-subject.v1",',
-        b'"schema":"gwo-v8-release-subject.v1","schema":"gwo-v8-release-subject.v1",',
+        b'"schema":"gwo-v8-release-subject.v2",',
+        b'"schema":"gwo-v8-release-subject.v2","schema":"gwo-v8-release-subject.v2",',
     )
     with pytest.raises(ReleaseSubjectError) as error:
         parse_release_subject(raw, tmp_path / "repository", tmp_path / "evidence")

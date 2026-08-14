@@ -37,6 +37,9 @@ def _authoritative_fixture(tmp_path: Path) -> tuple[Path, Path]:
     evidence_root = (tmp_path / "evidence").resolve()
     repository_root.mkdir()
     evidence_root.mkdir()
+    (evidence_root / release_subject.FRESH_RECEIPT_FILENAME).write_bytes(
+        release_subject.canonical_json_bytes({"receipt": "fresh"})
+    )
 
     source_root = ROOT / "skills" / "orchestrator" / "scripts" / "gwo_v8"
     target_source_root = repository_root / "skills" / "orchestrator" / "scripts" / "gwo_v8"

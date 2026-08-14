@@ -175,10 +175,11 @@ def _release_subject(
 ) -> ReleaseSubject:
     repository_root = ROOT.resolve()
     body = {
-        "schema": "gwo-v8-release-subject.v1",
+        "schema": "gwo-v8-release-subject.v2",
         "repository": "NOirBRight/github-work-orchestrator",
         "repository_root": str(repository_root),
         "evidence_root": str((repository_root / ".codex-tmp" / "evidence").resolve()),
+        "fresh_receipt_sha256": "8" * 64,
         "merged_main_sha": merged_main_sha,
         "merged_main_git_tree": merged_main_git_tree,
         "audited_source_tree_digest": audited_source_tree_digest,
