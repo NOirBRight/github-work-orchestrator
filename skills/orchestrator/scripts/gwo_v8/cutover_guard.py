@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
-import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any, Callable, Literal, Mapping, Protocol
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
+from ._source_snapshot import HeldSourceSnapshot, SourceSnapshotError
 from .runtime_gateway import (
     RuntimeConfiguration,
     RuntimeSelector,
@@ -887,38 +888,38 @@ def _validate_c3_subject_policy(subject: CutoverSubject) -> None:
             )
 
 
-def _audited_files(root: Path) -> tuple[Path, ...]:
-    candidates = [
-        root / "skills" / "implement-gwo" / "SKILL.md",
-        root / "skills" / "orchestrator" / "SKILL.md",
-        *(root / "skills" / "orchestrator" / "scripts" / "gwo_v8").rglob("*.py"),
-    ]
-    return tuple(
-        sorted(
-            (path for path in candidates if path.is_file()),
-            key=lambda path: path.relative_to(root).as_posix(),
-        )
-    )
-
-
-def source_tree_digest(package_root: Path) -> str:
-    digest = hashlib.sha256()
-    root = Path(package_root).resolve()
-    for path in _audited_files(root):
-        relative = path.relative_to(root).as_posix().encode("utf-8")
-        content = path.read_bytes().replace(b"\r\n", b"\n")
-        digest.update(len(relative).to_bytes(4, "big"))
-        digest.update(relative)
-        digest.update(len(content).to_bytes(8, "big"))
-        digest.update(content)
-    return digest.hexdigest()
+def source_tree_digest(
+    package_root: Path,
+    *,
+    root_handle: int | None = None,
+) -> str:
+    try:
+        with HeldSourceSnapshot.capture(
+            Path(package_root),
+            root_handle=root_handle,
+        ) as snapshot:
+            return snapshot.digest()
+    except SourceSnapshotError as error:
+        raise CutoverGuardError(
+            "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+            f"audited source snapshot is unavailable: {error}",
+        ) from error
 
 
 class ProductionPathScanner:
     def __init__(self, package_root: Path) -> None:
-        self._root = Path(package_root).resolve()
+        self._root = Path(os.path.abspath(Path(package_root).expanduser()))
+        self._active_snapshot: HeldSourceSnapshot | None = None
 
-    def _module_path(self, module: str) -> Path:
+    def _snapshot(self) -> HeldSourceSnapshot:
+        if self._active_snapshot is None:
+            raise CutoverGuardError(
+                "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                "production path scanner has no held source snapshot",
+            )
+        return self._active_snapshot
+
+    def _module_path(self, module: str) -> str:
         parts = module.split(".")
         if len(parts) < 2 or parts[0] != "gwo_v8" or any(
             not part.isidentifier() for part in parts
@@ -927,15 +928,15 @@ class ProductionPathScanner:
                 "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
                 f"production path module is not resolvable: {module}",
             )
-        package = self._root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
-        path = (package / Path(*parts[1:])).with_suffix(".py")
-        if path.is_file():
+        package = Path("skills/orchestrator/scripts/gwo_v8")
+        path = (package / Path(*parts[1:])).with_suffix(".py").as_posix()
+        if self._snapshot().has_file(path):
             return path
-        return package.joinpath(*parts[1:], "__init__.py")
+        return (package.joinpath(*parts[1:], "__init__.py")).as_posix()
 
-    def _require_module(self, module: str) -> Path:
+    def _require_module(self, module: str) -> str:
         path = self._module_path(module)
-        if not path.is_file():
+        if not self._snapshot().has_file(path):
             raise CutoverGuardError(
                 "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
                 f"production path module is missing: {module}",
@@ -991,8 +992,11 @@ class ProductionPathScanner:
     def _read_tree(self, module: str) -> ast.Module:
         path = self._require_module(module)
         try:
-            return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (OSError, SyntaxError, UnicodeError) as error:
+            return ast.parse(
+                self._snapshot().bytes_for(path),
+                filename=str(self._root / path),
+            )
+        except (SourceSnapshotError, SyntaxError, UnicodeError) as error:
             raise CutoverGuardError(
                 "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
                 f"production path module cannot be read: {module}",
@@ -1174,9 +1178,9 @@ class ProductionPathScanner:
             return "v3"
         return "legacy"
 
-    def read(self, subject: CutoverSubject) -> CompatibilityPathReadback:
-        package = self._root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
-        if not package.is_dir():
+    def _read_held(self, subject: CutoverSubject) -> CompatibilityPathReadback:
+        package = "skills/orchestrator/scripts/gwo_v8"
+        if not self._snapshot().has_directory(package):
             raise CutoverGuardError(
                 "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
                 "production path audit module root is missing",
@@ -1186,7 +1190,7 @@ class ProductionPathScanner:
                 "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
                 "production path audit has no entry roots",
             )
-        observed_tree = source_tree_digest(self._root)
+        observed_tree = self._snapshot().digest()
         if observed_tree != subject.source_tree_digest:
             raise CutoverGuardError(
                 "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
@@ -1197,8 +1201,7 @@ class ProductionPathScanner:
         queue: list[str] = []
         for entry in subject.production_entry_refs:
             if entry.startswith("skills/"):
-                path = self._root / entry
-                if not path.is_file():
+                if not self._snapshot().has_file(entry):
                     raise CutoverGuardError(
                         "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
                         f"production path entry root is missing: {entry}",
@@ -1239,10 +1242,9 @@ class ProductionPathScanner:
                     queue.append(ref.split(":", 1)[0])
         for entry in subject.production_entry_refs:
             if entry.startswith("skills/"):
-                path = self._root / entry
                 try:
-                    text = path.read_text(encoding="utf-8")
-                except (OSError, UnicodeError) as error:
+                    text = self._snapshot().bytes_for(entry).decode("utf-8")
+                except (SourceSnapshotError, UnicodeError) as error:
                     raise CutoverGuardError(
                         "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
                         f"production path entry root cannot be read: {entry}",
@@ -1265,6 +1267,28 @@ class ProductionPathScanner:
             "proven_unreachable_refs": proven,
         }
         return CompatibilityPathReadback(**values, readback_digest=digest_value(values))
+
+    def read(self, subject: CutoverSubject) -> CompatibilityPathReadback:
+        try:
+            snapshot = HeldSourceSnapshot.capture(self._root)
+        except SourceSnapshotError as error:
+            raise CutoverGuardError(
+                "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                f"audited source snapshot is unavailable: {error}",
+            ) from error
+        self._active_snapshot = snapshot
+        try:
+            result = self._read_held(subject)
+            snapshot.assert_stable()
+            return result
+        except SourceSnapshotError as error:
+            raise CutoverGuardError(
+                "CUTOVER_COMPATIBILITY_AUDIT_INVALID",
+                f"audited source snapshot changed: {error}",
+            ) from error
+        finally:
+            self._active_snapshot = None
+            snapshot.close()
 
 
 class ReadOnlyPackageValidator:
