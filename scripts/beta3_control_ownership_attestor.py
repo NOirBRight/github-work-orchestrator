@@ -578,7 +578,12 @@ def _unexpected_status_records(status: bytes) -> tuple[str, ...]:
         if len(record) < 4 or record[2] != " ":
             unexpected.append(record)
             continue
-        path = record[3:].replace("\\", "/")
+        path = record[3:]
+        if os.name == "nt":
+            path = path.replace("\\", "/")
+        elif os.name != "posix":
+            unexpected.append(record)
+            continue
         if record[:2] != "??" or not (
             path == ".codex-tmp" or path.startswith(".codex-tmp/")
         ):
