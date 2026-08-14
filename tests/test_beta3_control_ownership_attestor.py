@@ -2083,7 +2083,7 @@ def test_local_checkout_source_reads_authoritative_head_and_git_tree(tmp_path):
     responses = (
         subject.source_commit.encode("ascii"),
         config.merged_main_git_tree.encode("ascii"),
-        b"",
+        b"?? .codex-tmp/local-evidence.txt\0",
     )
     calls: list[tuple[str, ...]] = []
 
@@ -2112,6 +2112,24 @@ def test_local_checkout_source_reads_authoritative_head_and_git_tree(tmp_path):
     assert dict(observed.record.identity)["commit_oid"] == subject.source_commit
     assert dict(observed.record.identity)["git_tree_oid"] == config.merged_main_git_tree
     assert load_canonical_json(observed.canonical_payload)["files"]
+
+
+def test_local_checkout_source_rejects_untracked_path_outside_codex_tmp(tmp_path):
+    subject = _subject()
+    config = _config(tmp_path)
+    responses = iter(
+        (
+            subject.source_commit.encode("ascii"),
+            config.merged_main_git_tree.encode("ascii"),
+            b"?? docs/research/temporary.txt\0",
+        )
+    )
+    source = attestor_module._LocalInputsSource(lambda _command: next(responses), "d" * 64)
+
+    with pytest.raises(BootstrapError) as error:
+        source.read(config, subject)
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
 
 
 def test_local_checkout_source_rejects_dirty_worktree(tmp_path):

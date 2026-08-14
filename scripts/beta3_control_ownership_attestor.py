@@ -512,8 +512,14 @@ class _LocalInputsSource:
                 "STATIC_INPUT_SOURCE_UNAVAILABLE",
                 "checkout status identity read failed",
             ) from error
-        if type(status) is not bytes or status != b"":
-            _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "checkout worktree is not exactly clean")
+        if type(status) is not bytes:
+            _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "checkout status is not bytes")
+        unexpected = _unexpected_status_records(status)
+        if unexpected:
+            _fail(
+                "STATIC_INPUT_SOURCE_UNAVAILABLE",
+                "unexpected Git status: " + "; ".join(unexpected),
+            )
         files = []
         checkout_paths = _checkout_source_files(root, subject)
         checkout_snapshots = _checkout_source_snapshots(root, subject)
@@ -558,6 +564,26 @@ class _LocalInputsSource:
 
 def _fail(code: str, detail: str) -> None:
     raise BootstrapError(code, detail)
+
+
+def _unexpected_status_records(status: bytes) -> tuple[str, ...]:
+    try:
+        text = status.decode("utf-8")
+    except UnicodeDecodeError:
+        return ("<invalid utf-8 Git status>",)
+    unexpected: list[str] = []
+    for record in text.split("\0"):
+        if not record:
+            continue
+        if len(record) < 4 or record[2] != " ":
+            unexpected.append(record)
+            continue
+        path = record[3:].replace("\\", "/")
+        if record[:2] != "??" or not (
+            path == ".codex-tmp" or path.startswith(".codex-tmp/")
+        ):
+            unexpected.append(record)
+    return tuple(unexpected)
 
 
 def _require_digest(value: object, name: str, code: str) -> str:
