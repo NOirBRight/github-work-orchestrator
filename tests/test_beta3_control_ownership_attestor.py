@@ -723,7 +723,6 @@ def _production_subject_and_config(tmp_path):
     (
         ("repository_root", Path(r"D:\different")),
         ("fresh_store", Path(r"C:\different\store.sqlite3")),
-        ("expected_fresh_store_sha256", "0" * 64),
         ("fresh_receipt", Path(r"D:\different\receipt.json")),
         ("expected_fresh_receipt_sha256", "0" * 64),
         ("rollback_store", Path(r"C:\different\rollback.sqlite3")),
@@ -754,6 +753,19 @@ def test_production_configuration_requires_every_global_fixed_identity(
 
 def test_production_configuration_accepts_exact_global_fixed_identities(tmp_path):
     subject, config = _production_subject_and_config(tmp_path)
+
+    attestor_module._validate_config_subject(config, subject, _release_subject_for(subject))
+
+
+def test_production_configuration_accepts_subject_bound_fresh_store_identity(tmp_path):
+    subject, config = _production_subject_and_config(tmp_path)
+    subject = replace(subject, store_generation="store:v8:production:20260815T120000Z")
+    config.fresh_store = attestor_module.PRODUCTION_STORE.parent / "store-20260815T120000Z.sqlite3"
+    config.store_generation = subject.store_generation
+    config.expected_fresh_store_sha256 = "9" * 64
+    config.expected_fresh_receipt_generation_rows = (
+        (subject.repository, config.store_generation),
+    )
 
     attestor_module._validate_config_subject(config, subject, _release_subject_for(subject))
 

@@ -83,6 +83,8 @@ PRODUCTION_STORE = Path(
     r"C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator"
     r"\store-20260809T081500Z.sqlite3"
 )
+# The legacy fresh-Store identity above remains evidence data; only
+# PRODUCTION_STORE.parent is the canonical location for a subject-bound Store.
 PRODUCTION_STORE_GENERATION = "store:v8:production:20260809T081500Z"
 PRODUCTION_STORE_SHA256 = "afff1078e7a65fb8acccde28fee78fab3cf2278db9dd6548f5ef96a882076b98"
 PRODUCTION_RECEIPT = Path(
@@ -111,6 +113,10 @@ PRODUCTION_PACKAGE_CONTENT_DIGESTS = (
 )
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
+_STORE_GENERATION = re.compile(r"^store:v8:[A-Za-z0-9][A-Za-z0-9._:-]*$")
+_PRODUCTION_FRESH_STORE_NAME = re.compile(
+    r"^store-[0-9]{8}T[0-9]{6}Z\.sqlite3$"
+)
 _DYNAMIC_SIDE_FILE = re.compile(
     r"^(?P<prefix>.+)\.(?P<token>[0-9a-fA-F-]{16,64})\.(?P<suffix>tmp|staging|partial|lock|wal|shm)$"
 )
@@ -3412,6 +3418,13 @@ def _validate_config_subject(
             "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE",
             "subject Runtime selectors are not the fixed current contract",
         )
+    if (
+        type(subject.store_generation) is not str
+        or _STORE_GENERATION.fullmatch(subject.store_generation) is None
+        or type(config.store_generation) is not str
+        or _STORE_GENERATION.fullmatch(config.store_generation) is None
+    ):
+        _fail("STORE_SOURCE_UNAVAILABLE", "Store generation is malformed")
     expected_values = {
         "repository": subject.repository,
         "control_branch": subject.control_branch,
@@ -3532,9 +3545,26 @@ def _validate_config_subject(
         _fail("PACKAGE_SOURCE_UNAVAILABLE", "configured package version is not exact")
     if type(getattr(config, "expected_store_tables")) is not tuple:
         _fail("STORE_SOURCE_UNAVAILABLE", "configured Store tables are malformed")
-    if type(getattr(config, "expected_fresh_receipt_generation_rows")) is not tuple:
+    generation_rows = getattr(config, "expected_fresh_receipt_generation_rows")
+    if type(generation_rows) is not tuple:
         _fail("STORE_SOURCE_UNAVAILABLE", "configured Store generation rows are malformed")
-    if type(getattr(config, "expected_fresh_receipt_row_counts")) is not tuple:
+    if (
+        len(generation_rows) != 1
+        or type(generation_rows[0]) is not tuple
+        or len(generation_rows[0]) != 2
+        or generation_rows[0] != (subject.repository, config.store_generation)
+    ):
+        _fail("STORE_SOURCE_UNAVAILABLE", "configured Store generation rows are not subject-bound")
+    row_counts = getattr(config, "expected_fresh_receipt_row_counts")
+    if type(row_counts) is not tuple or any(
+        type(row) is not tuple
+        or len(row) != 2
+        or type(row[0]) is not str
+        or not row[0]
+        or type(row[1]) is not int
+        or row[1] < 0
+        for row in row_counts
+    ) or len({row[0] for row in row_counts}) != len(row_counts):
         _fail("STORE_SOURCE_UNAVAILABLE", "configured Store row counts are malformed")
     _install_roots(config, subject)
     try:
@@ -3560,12 +3590,25 @@ def _validate_config_subject(
                 "STORE_SOURCE_UNAVAILABLE",
                 "production fresh receipt digest is not release-subject-bound",
             )
+        try:
+            fresh_store = Path(config.fresh_store)
+        except (OSError, TypeError, ValueError) as error:
+            raise BootstrapError(
+                "STORE_SOURCE_UNAVAILABLE",
+                "production fresh Store path is malformed",
+            ) from error
+        canonical_fresh_store_directory = PRODUCTION_STORE.parent
+        if (
+            fresh_store.parent != canonical_fresh_store_directory
+            or _PRODUCTION_FRESH_STORE_NAME.fullmatch(fresh_store.name) is None
+        ):
+            _fail(
+                "STORE_SOURCE_UNAVAILABLE",
+                "production fresh Store path is not a controlled canonical file",
+            )
         production_store_tables, _ = _fixed_store_contract()
         production_config = {
             "repository_root": PRODUCTION_REPOSITORY_ROOT,
-            "fresh_store": PRODUCTION_STORE,
-            "store_generation": PRODUCTION_STORE_GENERATION,
-            "expected_fresh_store_sha256": PRODUCTION_STORE_SHA256,
             "fresh_receipt": PRODUCTION_RECEIPT,
             "expected_fresh_receipt_sha256": release_receipt_digest,
             "runtime_config_path": PRODUCTION_RUNTIME_CONFIG,
@@ -3575,9 +3618,6 @@ def _validate_config_subject(
             "expected_prior_store_sha256": PRODUCTION_PRIOR_STORE_SHA256,
             "expected_fresh_receipt_runbook_sha256": PRODUCTION_RECEIPT_RUNBOOK_SHA256,
             "expected_fresh_receipt_schema_digest": PRODUCTION_RECEIPT_SCHEMA_DIGEST,
-            "expected_fresh_receipt_generation_rows": (
-                (PRODUCTION_REPOSITORY, PRODUCTION_STORE_GENERATION),
-            ),
             "expected_store_tables": production_store_tables,
             "expected_fresh_receipt_row_counts": tuple(
                 (table, 1 if table == "v8_writer_generations" else 0)
