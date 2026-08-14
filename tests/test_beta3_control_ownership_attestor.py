@@ -2114,6 +2114,31 @@ def test_local_checkout_source_reads_authoritative_head_and_git_tree(tmp_path):
     assert load_canonical_json(observed.canonical_payload)["files"]
 
 
+def test_local_checkout_source_accepts_codex_tmp_status_and_binds_digest(tmp_path):
+    subject = _subject()
+    config = _config(tmp_path)
+    _write_static_fixture(tmp_path)
+    status = b"?? .codex-tmp\0?? .codex-tmp/evidence/subject.json\0"
+    responses = iter(
+        (
+            subject.source_commit.encode("ascii"),
+            config.merged_main_git_tree.encode("ascii"),
+            status,
+        )
+    )
+
+    observed = attestor_module._LocalInputsSource(
+        lambda _command: next(responses),
+        "d" * 64,
+    ).read(config, subject)
+
+    expected_digest = digest_bytes(status)
+    value = load_canonical_json(observed.canonical_payload)
+    assert value["git_status_sha256"] == expected_digest
+    assert dict(observed.record.identity)["git_status_sha256"] == expected_digest
+    attestor_module._validate_checkout_observation(observed, config, subject)
+
+
 def test_local_checkout_source_rejects_untracked_path_outside_codex_tmp(tmp_path):
     subject = _subject()
     config = _config(tmp_path)

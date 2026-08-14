@@ -813,6 +813,9 @@ def _validate_checkout_observation(
         identity = dict(observation.record.identity)
     except Exception as error:
         raise BootstrapError(code, "checkout source identity is malformed") from error
+    status_digest = value.get("git_status_sha256") if type(value) is dict else None
+    if not _is_digest(status_digest):
+        _fail(code, "checkout Git status identity is malformed")
     files = value.get("files") if type(value) is dict else None
     if (
         type(files) is not list
@@ -833,12 +836,12 @@ def _validate_checkout_observation(
         _fail(code, "checkout source file identity set is malformed")
     expected_value = {
         **expected,
-        "git_status_sha256": digest_bytes(b""),
+        "git_status_sha256": status_digest,
         "files": files,
     }
     expected_identity = {
         **expected,
-        "git_status_sha256": digest_bytes(b""),
+        "git_status_sha256": status_digest,
         "file_set_digest": digest_value(files),
         "observation_digest": digest_bytes(observation.canonical_payload),
     }
