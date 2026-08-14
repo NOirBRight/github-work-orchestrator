@@ -3753,6 +3753,50 @@ def test_output_cleanup_is_handle_owned_not_path_stat_owned():
     assert "st_mtime_ns" not in source
 
 
+def test_posix_output_cleanup_does_not_delete_a_replacement_after_identity_check(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "report.json"
+    path.write_bytes(b"owned")
+    replacement_identity = {"st_dev": 2, "st_ino": 3}
+    owned_identity = {"st_dev": 1, "st_ino": 2}
+    state = {"checked": False}
+
+    def identity(_descriptor, _code, *, directory):
+        assert directory is False
+        if not state["checked"]:
+            state["checked"] = True
+            path.write_bytes(b"replacement")
+        return owned_identity
+
+    def replacement_open(*_args, **_kwargs):
+        return 99, replacement_identity
+
+    original_unlink = os.unlink
+
+    def unlink(_name, *, dir_fd):
+        assert dir_fd == 7
+        original_unlink(path)
+
+    parent = SimpleNamespace(descriptor=7, assert_stable=lambda: None)
+    output = runner._OwnedOutput(
+        path=path,
+        descriptor=11,
+        identity=owned_identity,
+        parent=parent,
+        data=b"owned",
+    )
+    monkeypatch.setattr(runner.os, "name", "posix")
+    monkeypatch.setattr(runner, "_windows_handle_identity", identity)
+    monkeypatch.setattr(runner, "_open_bound_handle", replacement_open)
+    monkeypatch.setattr(runner.os, "unlink", unlink)
+    monkeypatch.setattr(runner.os, "close", lambda _descriptor: None)
+
+    runner._delete_owned_handle(output)
+
+    assert path.read_bytes() == b"replacement"
+
+
 def test_round5_retry_rejects_a_self_consistent_exact_typed_durable_readback(
     tmp_path, monkeypatch
 ):

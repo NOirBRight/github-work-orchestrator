@@ -3542,6 +3542,120 @@ def _delete_owned_handle(output: _OwnedOutput) -> None:
     if not _identity_matches(current, output.identity):
         return
     output.parent.assert_stable()
+    if os.name != "nt":
+        if output.data is None or output.parent.descriptor is None:
+            return
+        path_descriptor: int | None = None
+        cleanup_parent: int | None = None
+        cleanup_name: str | None = None
+        detached: int | None = None
+        detached_from_public = False
+        try:
+            path_descriptor, path_identity = _open_bound_handle(
+                output.path,
+                "OUTPUT_WRITE_FAILED",
+                expected_identity=output.identity,
+                parent=output.parent,
+            )
+            try:
+                if (
+                    not _identity_matches(path_identity, output.identity)
+                    or _read_descriptor_bytes(path_descriptor, "OUTPUT_WRITE_FAILED")
+                    != output.data
+                ):
+                    return
+            finally:
+                os.close(path_descriptor)
+                path_descriptor = None
+
+            for _ in range(16):
+                cleanup_name = (
+                    f".{output.path.name}.cleanup-{secrets.token_hex(16)}"
+                )
+                try:
+                    os.mkdir(cleanup_name, 0o700, dir_fd=output.parent.descriptor)
+                except FileExistsError:
+                    continue
+                cleanup_parent = _open_path_handle(
+                    Path(cleanup_name),
+                    "OUTPUT_WRITE_FAILED",
+                    directory=True,
+                    parent=output.parent.descriptor,
+                )
+                break
+            else:
+                raise OSError("could not create a private output cleanup directory")
+
+            os.rename(
+                Path(output.path.name),
+                Path(output.path.name),
+                src_dir_fd=output.parent.descriptor,
+                dst_dir_fd=cleanup_parent,
+            )
+            detached_from_public = True
+            detached = _open_path_handle(
+                Path(output.path.name),
+                "OUTPUT_WRITE_FAILED",
+                directory=False,
+                parent=cleanup_parent,
+            )
+            detached_identity = _windows_handle_identity(
+                detached, "OUTPUT_WRITE_FAILED", directory=False
+            )
+            if (
+                not _identity_matches(detached_identity, output.identity)
+                or _read_descriptor_bytes(detached, "OUTPUT_WRITE_FAILED")
+                != output.data
+            ):
+                try:
+                    os.link(
+                        output.path.name,
+                        output.path.name,
+                        src_dir_fd=cleanup_parent,
+                        dst_dir_fd=output.parent.descriptor,
+                        follow_symlinks=False,
+                    )
+                    os.unlink(output.path.name, dir_fd=cleanup_parent)
+                except OSError:
+                    pass
+                return
+            os.unlink(output.path.name, dir_fd=cleanup_parent)
+        except (FileNotFoundError, OSError, RunnerError):
+            if cleanup_parent is not None and cleanup_name is not None:
+                if detached_from_public:
+                    try:
+                        os.link(
+                            output.path.name,
+                            output.path.name,
+                            src_dir_fd=cleanup_parent,
+                            dst_dir_fd=output.parent.descriptor,
+                            follow_symlinks=False,
+                        )
+                        os.unlink(output.path.name, dir_fd=cleanup_parent)
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(cleanup_name, dir_fd=output.parent.descriptor)
+                except OSError:
+                    pass
+            return
+        finally:
+            if detached is not None:
+                try:
+                    os.close(detached)
+                except OSError:
+                    pass
+            if path_descriptor is not None:
+                try:
+                    os.close(path_descriptor)
+                except OSError:
+                    pass
+            if cleanup_parent is not None:
+                try:
+                    os.close(cleanup_parent)
+                except OSError:
+                    pass
+        return
     if os.name == "nt":
         try:
             import ctypes
