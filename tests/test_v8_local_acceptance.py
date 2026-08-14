@@ -713,6 +713,20 @@ def test_root_watchdog_callback_lost_wake_duplicate_and_restart_are_public_advan
     assert replay["idempotent_effects"] is True
 
 
+def test_root_watchdog_first_callback_routed_through_public_advancer_before_duplicate_replay(
+    tmp_path: Path,
+):
+    runner = _load_runner()
+    record = runner.run_local_acceptance(
+        root=tmp_path, run_id="task2-public-advancer", scenario="root"
+    )
+    replay = record["replay"]
+    callback_ref = replay["callback_emitted"]
+    assert runner._LAST_ROOT_PUBLIC_ADVANCER_WAKE_REFS == (callback_ref,)
+    assert replay["duplicate_callback_ref"] == callback_ref
+    assert replay["duplicate_callback"]["status"] == "Complete"
+
+
 def test_root_worker_slots_release_and_strict_resource_is_exclusive(tmp_path: Path):
     runner = _load_runner()
     record = runner.run_local_acceptance(root=tmp_path, run_id="task2-resources", scenario="root")
