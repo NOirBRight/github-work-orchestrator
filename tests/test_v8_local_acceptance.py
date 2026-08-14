@@ -722,7 +722,7 @@ def test_root_watchdog_first_callback_routed_through_public_advancer_before_dupl
     )
     replay = record["replay"]
     callback_ref = replay["callback_emitted"]
-    assert runner._LAST_ROOT_PUBLIC_ADVANCER_WAKE_REFS == (callback_ref,)
+    assert replay["public_advancer_wake_refs"] == [callback_ref]
     assert replay["duplicate_callback_ref"] == callback_ref
     assert replay["duplicate_callback"]["status"] == "Complete"
 
