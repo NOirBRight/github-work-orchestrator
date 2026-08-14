@@ -3797,6 +3797,72 @@ def test_posix_output_cleanup_does_not_delete_a_replacement_after_identity_check
     assert path.read_bytes() == b"replacement"
 
 
+def test_posix_output_cleanup_removes_private_cleanup_directory_on_ambiguity(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "report.json"
+    owned_identity = {"st_dev": 1, "st_ino": 2}
+    replacement_identity = {"st_dev": 2, "st_ino": 3}
+    cleanup_names = []
+    removed_directories = []
+    opened = iter((100, 101))
+
+    def identity(descriptor, _code, *, directory):
+        assert directory is False
+        return replacement_identity if descriptor == 101 else owned_identity
+
+    def open_path(_path, _code, *, directory, parent):
+        assert parent in (7, 100)
+        assert directory is True or directory is False
+        return next(opened)
+
+    def mkdir(name, _mode, *, dir_fd):
+        assert dir_fd == 7
+        cleanup_names.append(name)
+
+    def link(*_args, **_kwargs):
+        raise FileExistsError("replacement already occupies the public path")
+
+    def unlink(*_args, **_kwargs):
+        raise AssertionError("ambiguous cleanup must not unlink")
+
+    parent = SimpleNamespace(descriptor=7, assert_stable=lambda: None)
+    output = runner._OwnedOutput(
+        path=path,
+        descriptor=11,
+        identity=owned_identity,
+        parent=parent,
+        data=b"owned",
+    )
+    monkeypatch.setattr(runner.os, "name", "posix")
+    monkeypatch.setattr(runner, "_windows_handle_identity", identity)
+    monkeypatch.setattr(
+        runner,
+        "_open_bound_handle",
+        lambda *_args, **_kwargs: (99, owned_identity),
+    )
+    monkeypatch.setattr(runner, "_open_path_handle", open_path)
+    monkeypatch.setattr(
+        runner,
+        "_read_descriptor_bytes",
+        lambda descriptor, _code: b"owned" if descriptor == 99 else b"replacement",
+    )
+    monkeypatch.setattr(runner.os, "mkdir", mkdir)
+    monkeypatch.setattr(runner.os, "rename", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner.os, "link", link)
+    monkeypatch.setattr(runner.os, "unlink", unlink)
+    monkeypatch.setattr(
+        runner.os,
+        "rmdir",
+        lambda name, *, dir_fd: removed_directories.append((name, dir_fd)),
+    )
+    monkeypatch.setattr(runner.os, "close", lambda _descriptor: None)
+
+    runner._delete_owned_handle(output)
+
+    assert removed_directories == [(cleanup_names[0], 7)]
+
+
 def test_round5_retry_rejects_a_self_consistent_exact_typed_durable_readback(
     tmp_path, monkeypatch
 ):

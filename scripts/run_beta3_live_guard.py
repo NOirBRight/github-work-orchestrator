@@ -3655,6 +3655,11 @@ def _delete_owned_handle(output: _OwnedOutput) -> None:
                     os.close(cleanup_parent)
                 except OSError:
                     pass
+            if cleanup_parent is not None and cleanup_name is not None:
+                try:
+                    os.rmdir(cleanup_name, dir_fd=output.parent.descriptor)
+                except OSError:
+                    pass
         return
     if os.name == "nt":
         try:
