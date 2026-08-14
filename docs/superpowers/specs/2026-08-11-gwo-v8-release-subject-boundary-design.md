@@ -4,7 +4,7 @@
 
 This design records the approved **external canonical release-subject manifest** approach for the Phase 3/4 fix wave. It is a release-boundary correction, not a production activation. Until Phase 5 receives the separate owner authorization described below, V6.1 remains the only production writer.
 
-Historical note: an earlier draft named this manifest `gwo-v8-release-subject.v1`. The implemented closed contract is `gwo-v8-release-subject.v2`, which replaces v1; v1 remains historical context only and is not a current compatibility path.
+Historical note: an earlier draft named this manifest `gwo-v8-release-subject.v1`. The implemented closed contract is `gwo-v8-release-subject.v2`, which replaces v1; v1 remains historical context only and is not a current compatibility path. Here, `v1` refers only to the release-subject manifest. The separate existing `gwo-v8-fresh-store-provision.v1` receipt schema remains a fixed receipt contract; it is not a release-subject v1 compatibility path.
 
 The design closes the two load-bearing findings in the Task 6 four-axis review:
 
@@ -126,9 +126,9 @@ Field constraints are closed and exact:
 | `reviewed_provenance` | `path` is the canonical repository `scripts/beta3_reviewed_provenance.json`; `sha256` is the hash of its raw held bytes. The JSON must still pass the existing `gwo-beta3-reviewed-provenance.v1` closed-schema and origin checks. |
 | `subject_digest` | Lowercase SHA-256 over the canonical body defined below. |
 
-The receipt and observer identities are bound in separate stages. `beta3_release_subject.py` reads the fixed fresh receipt as canonical JSON and records its raw-byte SHA-256 in `fresh_receipt_sha256`; the production runner then requires the receipt's `source_main_sha` to equal `merged_main_sha`, `source_main_tree` to equal `merged_main_git_tree`, and the receipt's raw-byte digest to equal `fresh_receipt_sha256`. The runner carries these values from the same typed subject into its fixed configuration, and the control attestor receives that same subject/configuration rather than reconstructing identity values. The subject loader independently compares the held runner bytes, ordered attestor bytes/bundle, and reviewed-provenance bytes to the manifest. `reviewed_provenance` is the exact current in-checkout provenance manifest for those observer bytes; the fresh receipt is a separate readback input and is not substituted for observer provenance.
+The receipt and observer identities are bound in separate stages. `beta3_release_subject.py` reads the fixed fresh receipt as canonical JSON and records its exact raw-byte SHA-256 in `fresh_receipt_sha256`. Before any receipt-derived Store identity is consumed, the production runner reads that receipt as a regular canonical file and requires its raw-byte digest to equal `ReleaseSubject.fresh_receipt_sha256`; only after that check and the closed receipt parse does it derive `fresh_store`, `store_generation`, `store_sha256`, and `generation_rows` for the effective configuration. It then requires the receipt's `source_main_sha` to equal `merged_main_sha` and `source_main_tree` to equal `merged_main_git_tree`. The runner carries the same immutable `ReleaseSubject` and effective `RunnerConfig` through the execution path, and the control attestor receives those same values rather than reconstructing identity values. The subject loader independently compares the held runner bytes, ordered attestor bytes/bundle, and reviewed-provenance bytes to the manifest. `reviewed_provenance` is the exact current in-checkout provenance manifest for those observer bytes; the fresh receipt is a separate readback input and is not substituted for observer provenance.
 
-No package, Store, control-ref, Runtime selector, or target repository value is duplicated into this manifest. Those remain the existing fixed configuration/readback contracts. Duplicating them would create a second source of truth without closing either reviewed finding.
+No package, Store, control-ref, Runtime selector, or target repository value is duplicated into this manifest. The fresh Store path/generation/hash/rows are derived only from the validated receipt; the receipt schema/runbook, package, canonical roots, Git identities/readbacks, rollback/prior Store, and other existing contracts remain fixed. Duplicating those values into the manifest would create a second source of truth without closing either reviewed finding.
 
 ## Canonical body and subject digest
 
@@ -222,14 +222,22 @@ release_subject_digest: str
 expected_fresh_receipt_sha256: str
 ```
 
-The static Store, package, branch, writer-generation, and output settings remain the existing fixed contracts. `run()` loads the fixed external subject and builds an effective immutable `RunnerConfig` from it. A caller cannot replace any of those four identity fields in production. Existing fixture tests retain explicit non-production configuration injection through a test-only construction path and never pass that path to the production CLI.
+The fresh Store identity is receipt-derived, not a static `RunnerConfig` setting. The production binding performs this ordered boundary:
+
+1. Read `EVIDENCE_ROOT / "fresh-store-exact-main-receipt.json"` through the canonical directory and held no-follow file boundary. Require a regular file and canonical JSON, and compute the SHA-256 of its exact raw canonical bytes.
+2. Compare that digest to `ReleaseSubject.fresh_receipt_sha256` and fail closed before using any receipt-derived Store value.
+3. From the validated receipt, derive `fresh_store` from `store_path`, `store_generation` from `store_generation`, `store_sha256` from `store_sha256`, and `generation_rows` from `generation_rows` for the effective `RunnerConfig`.
+4. Require `store_path` to be an absolute canonical path in the fixed fresh-Store directory `C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator` with the controlled timestamp filename `store-YYYYMMDDTHHMMSSZ.sqlite3`. It must not equal `ROLLBACK_STORE` or `PRIOR_STORE`; every ancestor and the leaf must pass non-reparse/no-follow and regular-file checks.
+5. Reject any known or dynamic SQLite sidecar before or during the read. The Store is read only through the existing regular immutable path (`mode=ro&immutable=1`) with held identity/byte stability checked around the read.
+
+The fresh-receipt schema, runbook and Store schema/row contracts, package and package-content contracts, canonical repository/evidence roots, Git commit/tree/source-digest contracts, rollback/prior Store hashes, and `old_stores_untouched` proof remain fixed. `run()` loads the fixed external subject and builds an effective immutable `RunnerConfig` from it. A caller cannot replace any of those fixed contracts in production. Existing fixture tests retain explicit non-production configuration injection through a test-only construction path and never pass that path to the production CLI.
 
 The production runner changes the existing functions as follows:
 
 - `_git_snapshot()` compares `HEAD` and `origin/main` to `config.merged_main_sha`, and `HEAD^{tree}` to `config.merged_main_git_tree`.
-- `_validate_receipt()` compares the raw receipt digest to `config.expected_fresh_receipt_sha256` (bound from `release_subject.fresh_receipt_sha256`), `source_main_sha` to `config.merged_main_sha`, and `source_main_tree` to `config.merged_main_git_tree`.
+- `_bind_fresh_store_identity_from_receipt()` first compares the raw canonical receipt digest to `config.expected_fresh_receipt_sha256` (bound from `release_subject.fresh_receipt_sha256`) and then derives the four receipt-bound Store fields above; `_validate_receipt()` rechecks the fixed receipt schema/runbook/Store/row/old-Store contracts plus `source_main_sha` against `config.merged_main_sha` and `source_main_tree` against `config.merged_main_git_tree`.
 - `_default_subject_factory()` constructs `CutoverSubject.source_commit` from `merged_main_sha` and `CutoverSubject.source_tree_digest` from `audited_source_tree_digest`; it never places the Git tree OID into `source_tree_digest`.
-- `ProductionBootstrapAttestor.attest()` receives the same immutable `ReleaseSubject` object held by the runner, including `fresh_receipt_sha256`. It does not construct a subject from code-local expected values.
+- `ProductionBootstrapAttestor.attest()` receives the same immutable `ReleaseSubject` and effective `RunnerConfig` held by the runner, including `fresh_receipt_sha256` and the receipt-derived Store fields. It does not construct a subject or configuration from code-local expected values.
 - `_local_input_files()` and the input lease include the external manifest path and its held identity. A change after preflight returns `LIVE_INPUT_DRIFT`/`RELEASE_SUBJECT_DRIFT` before nonce or output effects.
 - Reports and evidence retain the existing `subject_digest` for the `CutoverSubject` digest and add an explicit `release_subject_digest` field for the external manifest digest. The latter is required in both the Phase 4 report and evidence and is checked during output readback.
 
@@ -237,7 +245,7 @@ The CLI remains limited to `--execute` and `--run-id`. `--subject`, `--subject-p
 
 ### Control ownership attestor
 
-The control attestor removes `PRODUCTION_SOURCE_COMMIT` and `PRODUCTION_SOURCE_TREE`. Its production `observe()` receives the same `ReleaseSubject` value as the runner and verifies:
+The control attestor removes `PRODUCTION_SOURCE_COMMIT` and `PRODUCTION_SOURCE_TREE`. Its production `observe()` receives the same immutable `ReleaseSubject` and effective `RunnerConfig` as the runner and verifies:
 
 ```text
 config.merged_main_sha == release_subject.merged_main_sha == subject.source_commit
