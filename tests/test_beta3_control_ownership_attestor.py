@@ -675,9 +675,7 @@ def _production_subject_and_config(tmp_path):
         r"D:\gwo-release-evidence\2026-08-09-gwo-v8-beta3-production-cutover"
         r"\fresh-store-exact-main-receipt.json"
     )
-    config.expected_fresh_receipt_sha256 = (
-        "46814d166c857e3d7f847b7da6f3da5b39c394b42402b2f1d2cdd61d78ce7781"
-    )
+    config.expected_fresh_receipt_sha256 = "8" * 64
     config.rollback_store = Path(
         r"C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator\store.sqlite3"
     )
@@ -758,6 +756,53 @@ def test_production_configuration_accepts_exact_global_fixed_identities(tmp_path
     subject, config = _production_subject_and_config(tmp_path)
 
     attestor_module._validate_config_subject(config, subject, _release_subject_for(subject))
+
+
+def test_production_configuration_accepts_nonlegacy_receipt_digest_bound_by_v2_subject(
+    tmp_path,
+):
+    subject, config = _production_subject_and_config(tmp_path)
+    release_subject = _release_subject_for(subject)
+    config.expected_fresh_receipt_sha256 = release_subject.fresh_receipt_sha256
+
+    attestor_module._validate_config_subject(config, subject, release_subject)
+
+
+def test_production_configuration_rejects_receipt_digest_not_bound_to_v2_subject(tmp_path):
+    subject, config = _production_subject_and_config(tmp_path)
+    release_subject = _release_subject_for(subject)
+    config.expected_fresh_receipt_sha256 = "f" * 64
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._validate_config_subject(config, subject, release_subject)
+
+    assert error.value.code == "STORE_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("invalid_digest", (None, "not-a-sha256"))
+def test_production_configuration_rejects_invalid_v2_subject_receipt_digest(
+    tmp_path,
+    invalid_digest,
+):
+    subject, config = _production_subject_and_config(tmp_path)
+    release_subject = _release_subject_for(subject)
+    object.__setattr__(release_subject, "fresh_receipt_sha256", invalid_digest)
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._validate_config_subject(config, subject, release_subject)
+
+    assert error.value.code == "STORE_SOURCE_UNAVAILABLE"
+
+
+def test_production_configuration_rejects_missing_v2_subject_receipt_digest(tmp_path):
+    subject, config = _production_subject_and_config(tmp_path)
+    release_subject = _release_subject_for(subject)
+    object.__delattr__(release_subject, "fresh_receipt_sha256")
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._validate_config_subject(config, subject, release_subject)
+
+    assert error.value.code == "STORE_SOURCE_UNAVAILABLE"
 
 
 def test_production_configuration_rejects_runtime_config_path_alias(tmp_path):

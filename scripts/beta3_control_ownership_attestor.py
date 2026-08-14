@@ -89,7 +89,6 @@ PRODUCTION_RECEIPT = Path(
     r"D:\gwo-release-evidence\2026-08-09-gwo-v8-beta3-production-cutover"
     r"\fresh-store-exact-main-receipt.json"
 )
-PRODUCTION_RECEIPT_SHA256 = "46814d166c857e3d7f847b7da6f3da5b39c394b42402b2f1d2cdd61d78ce7781"
 PRODUCTION_RUNTIME_CONFIG = Path(r"C:\Users\noirb\.orch\config.json")
 PRODUCTION_ROLLBACK_STORE = Path(
     r"C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator\store.sqlite3"
@@ -3551,6 +3550,16 @@ def _validate_config_subject(
     ):
         _fail("PACKAGE_SOURCE_UNAVAILABLE", "configured package content identities are incomplete")
     if subject.repository == PRODUCTION_REPOSITORY:
+        release_receipt_digest = _require_digest(
+            getattr(release_subject, "fresh_receipt_sha256", None),
+            "release subject fresh receipt digest",
+            "STORE_SOURCE_UNAVAILABLE",
+        )
+        if config.expected_fresh_receipt_sha256 != release_receipt_digest:
+            _fail(
+                "STORE_SOURCE_UNAVAILABLE",
+                "production fresh receipt digest is not release-subject-bound",
+            )
         production_store_tables, _ = _fixed_store_contract()
         production_config = {
             "repository_root": PRODUCTION_REPOSITORY_ROOT,
@@ -3558,7 +3567,7 @@ def _validate_config_subject(
             "store_generation": PRODUCTION_STORE_GENERATION,
             "expected_fresh_store_sha256": PRODUCTION_STORE_SHA256,
             "fresh_receipt": PRODUCTION_RECEIPT,
-            "expected_fresh_receipt_sha256": PRODUCTION_RECEIPT_SHA256,
+            "expected_fresh_receipt_sha256": release_receipt_digest,
             "runtime_config_path": PRODUCTION_RUNTIME_CONFIG,
             "rollback_store": PRODUCTION_ROLLBACK_STORE,
             "expected_rollback_store_sha256": PRODUCTION_ROLLBACK_STORE_SHA256,
