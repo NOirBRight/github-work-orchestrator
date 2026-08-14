@@ -1751,6 +1751,16 @@ def test_preflight_rejects_tracked_or_non_codex_tmp_nul_status(tmp_path):
     assert error.value.code == "GIT_STATUS_DIRTY"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX literal backslash name contract")
+def test_parse_porcelain_z_status_rejects_posix_backslash_name_outside_codex_tmp(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    record = r"?? .codex-tmp\outside.txt"
+    monkeypatch.setattr(runner.os, "name", "posix")
+
+    assert runner.parse_porcelain_z_status(record + "\0") == (record,)
+
+
 def test_preflight_rejects_identity_and_hash_drift(tmp_path):
     config = _fixture_config(tmp_path)
     config.fresh_store.write_bytes(b"drift")
