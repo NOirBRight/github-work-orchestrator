@@ -46,6 +46,15 @@ def _fixture_canonical_json_bytes(value: object) -> bytes:
     )
 
 
+def test_unexpected_status_records_rejects_posix_literal_backslash_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(release_subject, "os", SimpleNamespace(name="posix"))
+    record = "?? .codex-tmp\\literal"
+
+    assert release_subject._unexpected_status_records(record + "\0") == (record,)
+
+
 def _canonical_fixture_body(tmp_path: Path) -> dict[str, object]:
     repository_root = (tmp_path / "repository").resolve()
     evidence_root = (tmp_path / "evidence").resolve()
