@@ -1759,12 +1759,10 @@ def _restore_posix_detached_subject(
     try:
         observed = os.stat(name, dir_fd=cleanup_parent, follow_symlinks=False)
         if stat.S_ISDIR(observed.st_mode):
-            os.rename(
-                name,
-                name,
-                src_dir_fd=cleanup_parent,
-                dst_dir_fd=parent,
-            )
+            # A directory cannot be restored with an identity-conditional
+            # rename.  Leave it detached rather than overwriting a public
+            # replacement that may have appeared after the initial check.
+            return
         else:
             os.link(
                 name,

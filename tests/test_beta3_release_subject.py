@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import stat
+from types import SimpleNamespace
 
 import pytest
 
@@ -709,6 +710,27 @@ def test_binding_close_closes_leaf_and_parent_descriptors_at_most_once(
     assert sum(not is_directory for _descriptor, is_directory in close_events) == 1
     assert sum(is_directory for _descriptor, is_directory in close_events) >= 1
     assert all(count <= 1 for count in close_counts.values())
+
+
+def test_posix_cleanup_does_not_restore_a_detached_directory_over_a_replacement(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        release_subject.os,
+        "stat",
+        lambda *_args, **_kwargs: SimpleNamespace(st_mode=stat.S_IFDIR),
+    )
+
+    def forbidden_rename(*_args, **_kwargs):
+        raise AssertionError("directory cleanup must not overwrite the public path")
+
+    monkeypatch.setattr(release_subject.os, "rename", forbidden_rename)
+
+    release_subject._restore_posix_detached_subject(
+        "subject.json",
+        cleanup_parent=11,
+        parent=12,
+    )
 
 
 def test_loader_exception_cleanup_does_not_close_any_descriptor_twice(
