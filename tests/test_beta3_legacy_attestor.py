@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 from pathlib import Path
 import sys
 
@@ -857,6 +858,46 @@ def test_github_dispatch_reader_keeps_complete_response_digest_and_read_only_com
     assert observed.complete is True
     assert observed.record.read_mode == "COMPLETE_DOUBLE_READ"
     assert observed.record.identity == (("observation_digest", observed.record.content_sha256),)
+
+
+def test_command_reader_accepts_strict_noncanonical_json_and_canonicalizes_payload():
+    payload = _github_payload()
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    expected_payload = canonical_bytes(payload)
+    assert raw != expected_payload
+
+    observed = GitHubDispatchSnapshotReader(
+        lambda command: raw,
+        "8" * 64,
+    ).read("owner/repo")
+
+    assert type(observed) is SourceObservation
+    assert observed.complete is True
+    assert observed.canonical_payload == expected_payload
+    assert observed.record.repository == "owner/repo"
+    assert observed.record.role == "legacy.dispatches"
+    assert observed.record.read_mode == "COMPLETE_DOUBLE_READ"
+    assert observed.record.content_sha256 == digest_value(payload)
+    assert observed.record.identity == (
+        ("observation_digest", digest_value(payload)),
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b'{"data": {}, "data": {}}',
+        b'{"data":',
+        b'{"data": {}} trailing garbage',
+    ),
+)
+def test_command_reader_rejects_duplicate_invalid_or_trailing_json(raw: bytes):
+    with pytest.raises(BootstrapError) as error:
+        GitHubDispatchSnapshotReader(
+            lambda command: raw,
+            "8" * 64,
+        ).read("owner/repo")
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
 
 
 def test_github_snapshot_dispatches_are_normalized_into_active_references(

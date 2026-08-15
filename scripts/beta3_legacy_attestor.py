@@ -7,7 +7,13 @@ import shlex
 from typing import Callable, Mapping
 
 import orch_core
-from gwo_v8._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
+from gwo_v8._canonical import (
+    canonical_bytes,
+    digest_bytes,
+    digest_value,
+    load_canonical_json,
+    strict_json_loads,
+)
 from gwo_v8.cutover_guard import CutoverSubject, LegacyReadback
 
 from beta3_bootstrap_model import (
@@ -706,7 +712,7 @@ class _CommandReader:
             raw = self._command_runner(command)
             if type(raw) is not bytes:
                 _unavailable(f"{role} command did not return exact bytes")
-            value = load_canonical_json(raw)
+            value = strict_json_loads(raw)
         except BootstrapError:
             raise
         except Exception as error:
