@@ -163,6 +163,7 @@ def _subject_with_source_tree_digest(source_tree_digest: str) -> CutoverSubject:
     return replace(
         _subject(),
         repository="NOirBRight/github-work-orchestrator",
+        target_writer_generation="v8-generation-1",
         source_tree_digest=source_tree_digest,
         store_generation="store:v8:production:20260809T081500Z",
     )
@@ -654,12 +655,14 @@ def _production_subject_and_config(tmp_path):
     subject = replace(
         _subject(),
         repository="NOirBRight/github-work-orchestrator",
+        target_writer_generation="v8-generation-1",
         source_commit="5de34bdaee45f0aba44077a8d1d3e3ed8293f237",
         source_tree_digest="c" * 64,
         store_generation="store:v8:production:20260809T081500Z",
     )
     config = _config(tmp_path)
     config.repository = subject.repository
+    config.target_writer_generation = subject.target_writer_generation
     config.merged_main_sha = subject.source_commit
     config.merged_main_git_tree = "104ee822dbfb494d33d56b8ccf54092d9d1d9c86"
     config.audited_source_tree_digest = subject.source_tree_digest
