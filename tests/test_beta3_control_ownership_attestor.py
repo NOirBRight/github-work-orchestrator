@@ -33,6 +33,7 @@ from gwo_v8.cutover_guard import (  # noqa: E402
     PackageReadback,
     ReadOnlyPackageValidator,
 )
+from gwo_v8.plan_control import PlanControlError  # noqa: E402
 from gwo_v8.transition import WriterTransitionRecord  # noqa: E402
 import beta3_control_ownership_attestor as attestor_module  # noqa: E402
 from beta3_release_subject import ReleaseSubject, release_subject_digest  # noqa: E402
@@ -713,7 +714,7 @@ def _production_subject_and_config(tmp_path):
     )
     config.expected_package_content_digests = (
         ("implement-gwo", "fcafa60645a2ea18408ec97369fdf5a01402a950b90e701fa2305624a1bfeaa9"),
-        ("orchestrator", "60a035e16407bcb5afb2ec77993baf106772b2cb8f625b205763e6aa80600f90"),
+        ("orchestrator", "aebe7ea61bd41e848dd4c84f68569e4f359a6b2eaba5293507d637d5c47a9c24"),
     )
     return subject, config
 
@@ -2372,6 +2373,287 @@ def test_control_accepts_only_complete_returned_response_identity():
     assert fence.repository == subject.repository
     assert authority.record_id == fence.record_id
     assert len(records) == 4
+
+
+def test_control_accepts_historical_plan_activation_writer_record():
+    subject = replace(_subject(), target_writer_generation="v8-generation-1")
+    plan_one = "1" * 64
+    plan_two = "3" * 64
+    plan_three = "4" * 64
+    pending = _writer_record(
+        repository=subject.repository,
+        kind="cutover_pending",
+        status="pending",
+        previous_writer_generation="v6.1",
+        writer_generation="v8-generation-1",
+        activation_id=None,
+        plan_digest=plan_one,
+        canary_evidence_digest="2" * 64,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason=None,
+        created_at="2026-08-10T00:00:00Z",
+    )
+    cutover = _writer_record(
+        repository=subject.repository,
+        kind="cutover",
+        status="cut_over",
+        previous_writer_generation="v8-generation-1",
+        writer_generation="v8-generation-1",
+        activation_id="activation:1",
+        plan_digest=plan_one,
+        canary_evidence_digest="2" * 64,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+        reason=None,
+        created_at="2026-08-10T00:00:01Z",
+    )
+    plan_activation = _writer_record(
+        repository=subject.repository,
+        kind="plan_activation",
+        status="cut_over",
+        previous_writer_generation="v8-generation-1",
+        writer_generation="v8-generation-1",
+        activation_id="activation:2",
+        plan_digest=plan_two,
+        canary_evidence_digest="2" * 64,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+        reason=None,
+        created_at="2026-08-10T00:00:02Z",
+    )
+    draining = _writer_record(
+        repository=subject.repository,
+        kind="drain",
+        status="draining",
+        previous_writer_generation="v8-generation-1",
+        writer_generation="v8-generation-1",
+        activation_id="activation:2",
+        plan_digest=plan_two,
+        canary_evidence_digest="2" * 64,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="drain",
+        created_at="2026-08-10T00:00:03Z",
+    )
+    corrective_draining = _writer_record(
+        repository=subject.repository,
+        kind="drain",
+        status="draining",
+        previous_writer_generation="v8-generation-1",
+        writer_generation="v8-generation-1",
+        activation_id="activation:3",
+        plan_digest=plan_three,
+        canary_evidence_digest="2" * 64,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="corrective drain",
+        created_at="2026-08-10T00:00:04Z",
+    )
+    rollback = _writer_record(
+        repository=subject.repository,
+        kind="rollback",
+        status="rolled_back",
+        previous_writer_generation="v8-generation-1",
+        writer_generation="v6.1",
+        activation_id="activation:3",
+        plan_digest=plan_three,
+        canary_evidence_digest=None,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="rollback after correction",
+        created_at="2026-08-10T00:00:05Z",
+    )
+    source = _ExactControlFixture()
+    source.writer_bytes = canonical_bytes(
+        {
+            "schema_version": 1,
+            "current": {
+                "repository": subject.repository,
+                "writer_generation": "v6.1",
+                "record_id": rollback.record_id,
+            },
+            "records": [
+                {
+                    **record.__dict__,
+                    "canary_evidence_refs": list(record.canary_evidence_refs),
+                }
+                for record in (
+                    pending,
+                    cutover,
+                    plan_activation,
+                    draining,
+                    corrective_draining,
+                    rollback,
+                )
+            ],
+        }
+    )
+    source.active_plan_bytes = canonical_bytes(
+        {
+            "schema_version": 1,
+            "repository": subject.repository,
+            "active_plan_digest": plan_three,
+            "receipts": [
+                {
+                    "schema_version": 1,
+                    "repository": subject.repository,
+                    "writer_generation": "v8-generation-1",
+                    "activation_id": "activation:1",
+                    "plan_digest": plan_one,
+                    "expected_previous_digest": None,
+                    "plan_record_ref": "plan:1",
+                    "created_at": "2026-08-10T00:00:01Z",
+                },
+                {
+                    "schema_version": 1,
+                    "repository": subject.repository,
+                    "writer_generation": "v8-generation-1",
+                    "activation_id": "activation:2",
+                    "plan_digest": plan_two,
+                    "expected_previous_digest": plan_one,
+                    "plan_record_ref": "plan:2",
+                    "created_at": "2026-08-10T00:00:02Z",
+                },
+                {
+                    "schema_version": 1,
+                    "repository": subject.repository,
+                    "writer_generation": "v8-generation-1",
+                    "activation_id": "activation:3",
+                    "plan_digest": plan_three,
+                    "expected_previous_digest": plan_two,
+                    "plan_record_ref": "plan:3",
+                    "created_at": "2026-08-10T00:00:04Z",
+                },
+            ],
+        }
+    )
+    source.legacy_fence_bytes = canonical_bytes(
+        {
+            "schema_version": 1,
+            "repository": subject.repository,
+            "stopped": True,
+            "events": [{"action_key": "stop:1", "operation": "stop"}],
+        }
+    )
+
+    fence, authority, _records = attestor_module._read_control(
+        source,
+        subject=subject,
+        attempt=_attempt(subject),
+    )
+
+    assert fence.record_id == rollback.record_id
+    assert authority.record_id == rollback.record_id
+
+
+def _historical_cutover_edge():
+    plan_one = "1" * 64
+    plan_two = "3" * 64
+    prior = _writer_record(
+        repository="owner/repo",
+        kind="cutover",
+        status="cut_over",
+        previous_writer_generation="v8",
+        writer_generation="v8",
+        activation_id="activation:1",
+        plan_digest=plan_one,
+        canary_evidence_digest="2" * 64,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+        reason=None,
+        created_at="2026-08-10T00:00:01Z",
+    )
+    successor = _writer_record(
+        repository="owner/repo",
+        kind="plan_activation",
+        status="cut_over",
+        previous_writer_generation="v8",
+        writer_generation="v8",
+        activation_id="activation:2",
+        plan_digest=plan_two,
+        canary_evidence_digest="2" * 64,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+        reason=None,
+        created_at="2026-08-10T00:00:02Z",
+    )
+    receipts = {
+        "activation:1": {
+            "writer_generation": "v8",
+            "plan_digest": plan_one,
+            "expected_previous_digest": None,
+        },
+        "activation:2": {
+            "writer_generation": "v8",
+            "plan_digest": plan_two,
+            "expected_previous_digest": plan_one,
+        },
+    }
+    return prior, successor, receipts
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (("canary_manifest_ref", "manifest:changed"), ("worker_capacity", 7)),
+)
+def test_control_rejects_changed_historical_cutover_invariant(field, replacement):
+    prior, successor, receipts = _historical_cutover_edge()
+    tampered = replace(successor, **{field: replacement})
+
+    with pytest.raises(PlanControlError):
+        attestor_module._WriterLedgerValidator("owner/repo", "v8")._validate_writer_edge(
+            prior,
+            tampered,
+            receipts,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (("activation_id", "activation:1"), ("plan_digest", "1" * 64)),
+)
+def test_control_rejects_duplicate_historical_cutover_authority(field, replacement):
+    prior, successor, receipts = _historical_cutover_edge()
+    tampered = replace(successor, **{field: replacement})
+
+    with pytest.raises(PlanControlError):
+        attestor_module._WriterLedgerValidator("owner/repo", "v8")._validate_writer_edge(
+            prior,
+            tampered,
+            receipts,
+        )
+
+
+def test_control_rejects_non_descendant_historical_cutover_receipt():
+    prior, successor, receipts = _historical_cutover_edge()
+    receipts["activation:2"] = {
+        **receipts["activation:2"],
+        "expected_previous_digest": "9" * 64,
+    }
+
+    with pytest.raises(PlanControlError):
+        attestor_module._WriterLedgerValidator("owner/repo", "v8")._validate_writer_edge(
+            prior,
+            successor,
+            receipts,
+        )
 
 
 def test_github_ref_adapter_retains_response_repository_ref_oid_and_type():

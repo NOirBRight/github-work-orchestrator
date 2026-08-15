@@ -9,7 +9,6 @@ non-executable reservations, not only activated Plans.
 from __future__ import annotations
 
 import base64
-import json
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, TypeVar
@@ -44,7 +43,6 @@ from .transition import (
     _PLANNING_EFFECT_DISPATCH_FIELDS,
     _PLANNING_EFFECT_DISPATCH_MAX_ACTIVE_ENTRIES,
     _PLANNING_EFFECT_DISPATCH_PATH,
-    _PLANNING_EFFECT_DISPATCH_SCHEMA,
     _planning_effect_dispatch_entry_order,
     _planning_effect_dispatch_entries_at_ref,
     _planning_effect_dispatch_ledger_bytes,
@@ -191,12 +189,19 @@ _WRITER_EDGE_RULES: dict[tuple[str | None, str], _WriterEdgeRule] = {
             }
         ),
     ),
-    ("draining", "rolled_back"): _WriterEdgeRule(
+    # Historical control ledgers record successor Plan activation as a
+    # cut-over-status edge while the V8 Writer generation remains unchanged.
+    # Keep that edge explicit: only the activation and Plan binding may
+    # advance; every other authority field remains closed over the prior
+    # cut-over record.
+    ("cut_over", "cut_over"): _WriterEdgeRule(
         invariant=frozenset(
             {
                 "repository",
-                "activation_id",
-                "plan_digest",
+                "status",
+                "previous_writer_generation",
+                "writer_generation",
+                "canary_evidence_digest",
                 "canary_evidence_refs",
                 "canary_manifest_ref",
                 "worker_capacity",
@@ -208,10 +213,61 @@ _WRITER_EDGE_RULES: dict[tuple[str | None, str], _WriterEdgeRule] = {
             {
                 "record_id",
                 "kind",
+                "activation_id",
+                "plan_digest",
+                "created_at",
+            }
+        ),
+    ),
+    # A durable drain may be corrected by another drain record before the
+    # rollback.  It must move to the next Activation Receipt/Plan while the
+    # actual Writer drain authority stays invariant.
+    ("draining", "draining"): _WriterEdgeRule(
+        invariant=frozenset(
+            {
+                "repository",
+                "kind",
                 "status",
                 "previous_writer_generation",
                 "writer_generation",
                 "canary_evidence_digest",
+                "canary_evidence_refs",
+                "canary_manifest_ref",
+                "worker_capacity",
+                "coordinator_capacity",
+            }
+        ),
+        derived=frozenset(
+            {
+                "record_id",
+                "activation_id",
+                "plan_digest",
+                "reason",
+                "created_at",
+            }
+        ),
+    ),
+    ("draining", "rolled_back"): _WriterEdgeRule(
+        invariant=frozenset(
+            {
+                "repository",
+                "activation_id",
+                "plan_digest",
+                "canary_evidence_refs",
+                "canary_manifest_ref",
+                "worker_capacity",
+                "coordinator_capacity",
+            }
+        ),
+        derived=frozenset(
+            {
+                "record_id",
+                "kind",
+                "status",
+                "previous_writer_generation",
+                "writer_generation",
+                "canary_evidence_digest",
+                "reason",
                 "created_at",
             }
         ),
@@ -465,6 +521,35 @@ def _is_digest(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _receipt_descends_from(
+    receipts: Mapping[str, Mapping[str, object]],
+    receipt: Mapping[str, object],
+    ancestor_digest: object,
+) -> bool:
+    """Return whether a receipt is a descendant of an earlier Plan receipt."""
+
+    predecessor = receipt["expected_previous_digest"]
+    seen: set[object] = set()
+    while predecessor is not None:
+        if predecessor == ancestor_digest:
+            return True
+        if predecessor in seen:
+            return False
+        seen.add(predecessor)
+        prior = next(
+            (
+                candidate
+                for candidate in receipts.values()
+                if candidate["plan_digest"] == predecessor
+            ),
+            None,
+        )
+        if prior is None:
+            return False
+        predecessor = prior["expected_previous_digest"]
+    return False
 
 
 def _bytes(value: object, label: str) -> bytes:
@@ -2545,6 +2630,49 @@ class GitHubPlanRepository:
             # invariant in this table row.  The status validator constrains
             # capacities/reason without a second partial field comparison.
             pass
+        elif edge == ("cut_over", "cut_over"):
+            if (
+                prior.kind not in {"cutover", "plan_activation"}
+                or record.kind != "plan_activation"
+                or record.activation_id in {None, prior.activation_id}
+                or record.plan_digest in {None, prior.plan_digest}
+            ):
+                raise PlanControlError(
+                    "WRITER_FENCE_READBACK_INVALID",
+                    "Writer Plan activation did not advance its authority",
+                )
+            receipt = receipts.get(record.activation_id)
+            if (
+                receipt is None
+                or receipt["writer_generation"] != prior.writer_generation
+                or receipt["plan_digest"] != record.plan_digest
+                or not _receipt_descends_from(receipts, receipt, prior.plan_digest)
+            ):
+                raise PlanControlError(
+                    "WRITER_FENCE_READBACK_INVALID",
+                    "Writer Plan activation is not bound to its predecessor receipt",
+                )
+        elif edge == ("draining", "draining"):
+            if (
+                record.kind != "drain"
+                or record.activation_id in {None, prior.activation_id}
+                or record.plan_digest in {None, prior.plan_digest}
+            ):
+                raise PlanControlError(
+                    "WRITER_FENCE_READBACK_INVALID",
+                    "Writer corrective drain did not advance its authority",
+                )
+            receipt = receipts.get(record.activation_id)
+            if (
+                receipt is None
+                or receipt["writer_generation"] != prior.writer_generation
+                or receipt["plan_digest"] != record.plan_digest
+                or not _receipt_descends_from(receipts, receipt, prior.plan_digest)
+            ):
+                raise PlanControlError(
+                    "WRITER_FENCE_READBACK_INVALID",
+                    "Writer corrective drain is not bound to its predecessor receipt",
+                )
         elif edge == ("draining", "rolled_back"):
             if (
                 record.previous_writer_generation != prior.writer_generation
@@ -2600,6 +2728,7 @@ class GitHubPlanRepository:
         legal = {
             ("cutover_pending", "pending"),
             ("cutover", "cut_over"),
+            ("plan_activation", "cut_over"),
             ("drain", "draining"),
             ("rollback", "rolled_back"),
             ("cutover", "blocked"),

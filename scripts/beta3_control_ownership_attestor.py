@@ -109,7 +109,7 @@ PRODUCTION_INSTALL_ROOTS = tuple(
 )
 PRODUCTION_PACKAGE_CONTENT_DIGESTS = (
     ("implement-gwo", "fcafa60645a2ea18408ec97369fdf5a01402a950b90e701fa2305624a1bfeaa9"),
-    ("orchestrator", "60a035e16407bcb5afb2ec77993baf106772b2cb8f625b205763e6aa80600f90"),
+    ("orchestrator", "aebe7ea61bd41e848dd4c84f68569e4f359a6b2eaba5293507d637d5c47a9c24"),
 )
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -1127,7 +1127,6 @@ def _decode_writer_records(
         selected.kind != "rollback"
         or selected.status != "rolled_back"
         or selected.writer_generation != source_generation
-        or selected.activation_id is not None
         or selected.plan_digest != active_plan["active_plan_digest"]
         or current["writer_generation"] != selected.writer_generation
     ):
@@ -1141,6 +1140,11 @@ def _decode_writer_records(
         _fail("WRITER_FENCE_SOURCE_UNAVAILABLE", "Activation Receipt generation is not V8")
     if len(active_receipts) != 1 or active_receipts[0]["writer_generation"] != target_generation:
         _fail("WRITER_FENCE_SOURCE_UNAVAILABLE", "Writer rollback is not bound to the active V8 plan")
+    if (
+        selected.activation_id is not None
+        and selected.activation_id != active_receipts[0]["activation_id"]
+    ):
+        _fail("WRITER_FENCE_SOURCE_UNAVAILABLE", "Writer rollback Activation Receipt binding is invalid")
     return selected, active_receipts[0], tuple(decoded)
 
 
