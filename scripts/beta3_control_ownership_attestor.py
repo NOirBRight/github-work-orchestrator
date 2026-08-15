@@ -84,6 +84,50 @@ RUNTIME_ROLE_PROFILES = (
     "reviewer_standard",
     "reviewer_strict",
 )
+_RUNTIME_CONFIG_TOP_LEVEL_KEYS = frozenset(
+    {
+        "schema_version",
+        "global",
+        "tiers",
+        "role_profiles",
+        "review_profiles",
+        "active_turn_pools",
+        "reviewer_tiers",
+        "repositories",
+    }
+)
+_RUNTIME_CONFIG_GLOBAL_KEYS = frozenset(
+    {
+        "default_tier",
+        "execution_slots",
+        "worker_slots",
+        "integration_wip_limit",
+        "max_attempts",
+        "intake",
+    }
+)
+_RUNTIME_CONFIG_REPOSITORY_KEYS = frozenset(
+    {
+        "integration_branch",
+        "workspace_id",
+        "merge_method",
+        "execution_slots",
+        "worker_slots",
+        "integration_wip_limit",
+        "default_tier",
+        "milestone_tiers",
+        "tiers",
+        "role_profiles",
+        "review_profiles",
+        "active_turn_pools",
+        "project_number",
+        "intake",
+    }
+)
+_RUNTIME_REVIEW_PROFILE_SELECTORS = frozenset(
+    {"standard_axis", "recovery_axis", "strict_specialist"}
+)
+_RUNTIME_ACTIVE_TURN_POOLS = frozenset({"workers", "coordinators"})
 LEGACY_FENCE_PATH = CONTROL_PATHS[2]
 WRITER_PATH = CONTROL_PATHS[0]
 ACTIVE_PLAN_PATH = CONTROL_PATHS[1]
@@ -2199,15 +2243,7 @@ def _runtime_config_value(
         type(value) is not dict
         or value.get("schema_version") != 1
         or not {"global", "tiers", "role_profiles"} <= set(value)
-        or set(value)
-        - {
-            "schema_version",
-            "global",
-            "tiers",
-            "role_profiles",
-            "reviewer_tiers",
-            "repositories",
-        }
+        or set(value) - _RUNTIME_CONFIG_TOP_LEVEL_KEYS
         or type(repository) is not str
         or not repository
     ):
@@ -2220,7 +2256,7 @@ def _runtime_config_value(
         reviewer_tiers = value.get("reviewer_tiers", {})
         if (
             type(global_value) is not dict
-            or set(global_value) - {"default_tier", "execution_slots"}
+            or set(global_value) - _RUNTIME_CONFIG_GLOBAL_KEYS
             or type(tiers) is not dict
             or not tiers
             or type(role_profiles) is not dict
@@ -2247,6 +2283,45 @@ def _runtime_config_value(
             for name, tier in reviewer_tiers.items()
         ):
             raise ValueError("Runtime reviewer tier mapping is malformed")
+
+        def validate_review_profiles(raw: object, scope: str) -> None:
+            if type(raw) is not dict or any(
+                type(selector) is not str
+                or selector not in _RUNTIME_REVIEW_PROFILE_SELECTORS
+                or type(profile_id) is not str
+                or not profile_id
+                for selector, profile_id in raw.items()
+            ):
+                raise ValueError(f"{scope} Review Profile mapping is malformed")
+
+        def validate_active_turn_pools(
+            raw: object, scope: str, *, require_all: bool
+        ) -> None:
+            if type(raw) is not dict or set(raw) - _RUNTIME_ACTIVE_TURN_POOLS:
+                raise ValueError(f"{scope} Active Turn mapping is malformed")
+            if require_all and set(raw) != _RUNTIME_ACTIVE_TURN_POOLS:
+                raise ValueError(f"{scope} Active Turn mapping is incomplete")
+            if any(
+                type(capacity) is not int or isinstance(capacity, bool) or capacity < 1
+                for capacity in raw.values()
+            ):
+                raise ValueError(f"{scope} Active Turn mapping is malformed")
+
+        def validate_milestone_tiers(raw: object, scope: str) -> None:
+            if type(raw) is not dict or any(
+                type(tier) is not str or tier not in RUNTIME_TIERS
+                for tier in raw.values()
+            ):
+                raise ValueError(f"{scope} milestone tier mapping is malformed")
+
+        global_review_profiles = value.get("review_profiles", {})
+        global_active_turn_pools = value.get("active_turn_pools")
+        if global_active_turn_pools is None or global_active_turn_pools == {}:
+            global_active_turn_pools = {"workers": 8, "coordinators": 1}
+        validate_review_profiles(global_review_profiles, "global")
+        validate_active_turn_pools(
+            global_active_turn_pools, "global", require_all=True
+        )
 
         def validate_profile_shape(raw: object) -> tuple[str, dict[str, object]]:
             if (
@@ -2283,7 +2358,7 @@ def _runtime_config_value(
                 type(configured_repository) is not str
                 or "/" not in configured_repository
                 or type(configured_value) is not dict
-                or set(configured_value) - {"default_tier", "tiers", "role_profiles"}
+                or set(configured_value) - _RUNTIME_CONFIG_REPOSITORY_KEYS
             ):
                 raise ValueError("repository Runtime configuration is malformed")
             configured_tiers = configured_value.get("tiers", {})
@@ -2304,15 +2379,34 @@ def _runtime_config_value(
                 )
             ):
                 raise ValueError("repository Runtime mappings are malformed")
+            configured_review_profiles = configured_value.get("review_profiles", {})
+            configured_active_turn_pools = configured_value.get("active_turn_pools", {})
+            configured_milestone_tiers = configured_value.get("milestone_tiers", {})
+            if configured_review_profiles is None:
+                configured_review_profiles = {}
+            if configured_active_turn_pools is None:
+                configured_active_turn_pools = {}
+            if configured_milestone_tiers is None:
+                configured_milestone_tiers = {}
+            validate_review_profiles(
+                configured_review_profiles, f"repository:{configured_repository}"
+            )
+            validate_active_turn_pools(
+                configured_active_turn_pools,
+                f"repository:{configured_repository}",
+                require_all=False,
+            )
+            validate_milestone_tiers(
+                configured_milestone_tiers, f"repository:{configured_repository}"
+            )
             for raw in (*configured_tiers.values(), *configured_roles.values()):
                 validate_profile_shape(raw)
 
         repository_value = repositories.get(repository, {})
-        if type(repository_value) is not dict or set(repository_value) - {
-            "default_tier",
-            "tiers",
-            "role_profiles",
-        }:
+        if (
+            type(repository_value) is not dict
+            or set(repository_value) - _RUNTIME_CONFIG_REPOSITORY_KEYS
+        ):
             raise ValueError("repository Runtime configuration is malformed")
         repository_tiers = repository_value.get("tiers", {})
         repository_roles = repository_value.get("role_profiles", {})

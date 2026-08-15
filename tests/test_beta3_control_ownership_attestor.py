@@ -1308,6 +1308,92 @@ def test_runtime_config_accepts_current_optional_configuration_keys():
     assert tuple(item.selector for item in runtime.selectors) == attestor_module.RUNTIME_SELECTORS
 
 
+def test_runtime_config_accepts_documented_full_configuration_shape():
+    value = json.loads(
+        (ROOT / "skills" / "orchestrator" / "templates" / "config.example.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    _configuration, runtime = attestor_module._runtime_config_value(
+        canonical_bytes(value), "owner/repo"
+    )
+
+    assert tuple(item.selector for item in runtime.selectors) == (
+        "coordinator",
+        "worker",
+        "recovery_worker",
+        "review_primary",
+        "review_strong",
+    )
+
+
+def _documented_runtime_config():
+    return json.loads(
+        (ROOT / "skills" / "orchestrator" / "templates" / "config.example.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def _assert_runtime_config_rejected(value):
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._runtime_config_value(canonical_bytes(value), "owner/repo")
+    assert error.value.code == "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    ("location", "mapping"),
+    (
+        ("top", {"standard_axis": 7}),
+        ("top", {"unknown_axis": "reviewer_standard"}),
+        ("repository", {"standard_axis": 7}),
+        ("repository", {"unknown_axis": "reviewer_standard"}),
+    ),
+)
+def test_runtime_config_rejects_malformed_documented_review_profile_mappings(
+    location, mapping
+):
+    value = _documented_runtime_config()
+    target = value if location == "top" else value["repositories"]["owner/repo"]
+    target["review_profiles"] = mapping
+
+    _assert_runtime_config_rejected(value)
+
+
+@pytest.mark.parametrize(
+    ("location", "mapping"),
+    (
+        ("top", {"workers": 0}),
+        ("top", {"unknown": 1}),
+        ("repository", {"workers": 0}),
+        ("repository", {"unknown": 1}),
+    ),
+)
+def test_runtime_config_rejects_malformed_documented_active_turn_mappings(
+    location, mapping
+):
+    value = _documented_runtime_config()
+    target = value if location == "top" else value["repositories"]["owner/repo"]
+    target["active_turn_pools"] = mapping
+
+    _assert_runtime_config_rejected(value)
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    (
+        {"release": "not-a-tier"},
+        {"release": 7},
+    ),
+)
+def test_runtime_config_rejects_malformed_documented_repository_milestone_tiers(mapping):
+    value = _documented_runtime_config()
+    value["repositories"]["owner/repo"]["milestone_tiers"] = mapping
+
+    _assert_runtime_config_rejected(value)
+
+
 def test_source_observation_rejects_content_hash_drift():
     subject = _subject()
     attempt = _attempt(subject)
@@ -2081,13 +2167,17 @@ def test_runtime_config_uses_current_main_empty_features_default():
 
 @pytest.mark.parametrize("location", ("top", "global", "repository"))
 def test_runtime_config_rejects_unknown_mapping_keys(location):
-    value = load_canonical_json(_RuntimeConfig().read().canonical_payload)
+    value = json.loads(
+        (ROOT / "skills" / "orchestrator" / "templates" / "config.example.json").read_text(
+            encoding="utf-8"
+        )
+    )
     if location == "top":
         value["unknown"] = True
     elif location == "global":
         value["global"]["unknown"] = True
     else:
-        value["repositories"] = {"owner/repo": {"unknown": True}}
+        value["repositories"]["owner/repo"]["unknown"] = True
 
     with pytest.raises(BootstrapError) as error:
         attestor_module._runtime_config_value(canonical_bytes(value), "owner/repo")
