@@ -49,7 +49,12 @@ from gwo_v8.cutover_guard import (
     OwnershipReadback,
 )
 from gwo_v8.plan_control_github import GitHubPlanRepository
-from gwo_v8.runtime_gateway import ProfileMapping, RuntimeConfiguration
+from gwo_v8.runtime_gateway import (
+    ProfileMapping,
+    RuntimeConfiguration,
+    RuntimeGatewayError,
+    _require_paseo_argument,
+)
 from gwo_v8.runtime_profile import RuntimeProfile
 from gwo_v8.transition import WriterTransitionRecord
 
@@ -384,6 +389,46 @@ class _GitHubControlSource:
         return result
 
 
+def _paseo_agent_identity(value: object) -> str:
+    if type(value) is not dict:
+        _fail(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Paseo Agent identity record is not an object",
+        )
+    aliases = ("id", "Id", "agentId", "AgentId")
+    populated = [
+        value[alias]
+        for alias in aliases
+        if alias in value and value[alias] is not None and value[alias] != ""
+    ]
+    if not populated:
+        _fail(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Paseo Agent identity is absent",
+        )
+    expected = populated[0]
+    if any(
+        type(candidate) is not type(expected) or candidate != expected
+        for candidate in populated[1:]
+    ):
+        _fail(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Paseo Agent identity aliases conflict",
+        )
+    if type(expected) is not str or not expected:
+        _fail(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Paseo Agent identity is not exact text",
+        )
+    try:
+        return _require_paseo_argument(expected, "Paseo Agent identity")
+    except RuntimeGatewayError as error:
+        raise BootstrapError(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Paseo Agent identity is unsafe for the command boundary",
+        ) from error
+
+
 class _RuntimeRegistrySource:
     def __init__(
         self,
@@ -415,6 +460,8 @@ class _RuntimeRegistrySource:
                 "Runtime registry command did not return exact bytes",
             )
         value = _decode_json_response(payload, "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE")
+        if type(value) is dict:
+            value = value.get("agents", value)
         if type(value) is not list:
             _fail(
                 "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
@@ -427,12 +474,7 @@ class _RuntimeRegistrySource:
                     "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
                     "Runtime registry enumeration contains a non-object row",
                 )
-            identity = row.get("id")
-            if type(identity) is not str or not identity:
-                _fail(
-                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
-                    "Runtime registry identity is absent",
-                )
+            identity = _paseo_agent_identity(row)
             if identity in identities:
                 _fail(
                     "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
@@ -458,7 +500,9 @@ class _RuntimeRegistrySource:
                 inspect_payload,
                 "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
             )
-            if type(inspect_value) is not dict or inspect_value.get("Id") != identity:
+            if type(inspect_value) is dict:
+                inspect_value = inspect_value.get("agent", inspect_value)
+            if _paseo_agent_identity(inspect_value) != identity:
                 _fail(
                     "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
                     "Runtime registry inspect identity differs from enumeration",

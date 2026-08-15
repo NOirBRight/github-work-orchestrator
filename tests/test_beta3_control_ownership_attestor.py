@@ -2338,7 +2338,7 @@ def test_live_registry_source_rejects_legacy_runtime_registry_command():
             "owner/repo",
             "--json",
         ):
-            return b"[]"
+            raise AssertionError("legacy Paseo runtime registry command is forbidden")
         return b"[]"
 
     observed = attestor_module._RuntimeRegistrySource(
@@ -2409,6 +2409,86 @@ def test_live_registry_source_accepts_pretty_json_and_inspects_every_id():
     assert observed.record.identity == (
         ("observation_digest", observed.record.content_sha256),
     )
+
+
+@pytest.mark.parametrize(
+    "identity_alias,inspection",
+    (
+        ("id", {"id": "runtime-1"}),
+        ("Id", {"Id": "runtime-1"}),
+        ("agentId", {"agentId": "runtime-1"}),
+        ("AgentId", {"agent": {"AgentId": "runtime-1"}}),
+    ),
+)
+def test_live_registry_source_accepts_v8_list_and_inspect_identity_aliases(
+    identity_alias,
+    inspection,
+):
+    calls: list[tuple[str, ...]] = []
+
+    def command_runner(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        if command[1] == "ls":
+            return json.dumps(
+                {"agents": [{identity_alias: "runtime-1"}]},
+                indent=2,
+            ).encode("utf-8")
+        return json.dumps(inspection, indent=2).encode("utf-8")
+
+    observed = attestor_module._RuntimeRegistrySource(
+        command_runner,
+        "d" * 64,
+    ).read("owner/repo")
+
+    assert calls[1:] == [("paseo", "inspect", "runtime-1", "--json")]
+    assert load_canonical_json(observed.canonical_payload) == {
+        "runtimes": [{"identity": "runtime-1"}]
+    }
+
+
+def test_live_registry_source_rejects_conflicting_identity_aliases():
+    def command_runner(command: tuple[str, ...]) -> bytes:
+        if command[1] == "ls":
+            return b'[{"id":"runtime-1","Id":"runtime-other"}]'
+        return b'{"Id":"runtime-1"}'
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._RuntimeRegistrySource(
+            command_runner,
+            "d" * 64,
+        ).read("owner/repo")
+
+    assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("unsafe_identity", ("runtime&injected", "runtime\ninjected"))
+def test_live_registry_source_rejects_unsafe_identity_before_inspect(unsafe_identity):
+    calls: list[tuple[str, ...]] = []
+
+    def command_runner(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        if command[1] == "ls":
+            return json.dumps([{"id": unsafe_identity}]).encode("utf-8")
+        raise AssertionError("unsafe identity must not reach Paseo inspect")
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._RuntimeRegistrySource(
+            command_runner,
+            "d" * 64,
+        ).read("owner/repo")
+
+    assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+    assert calls == [
+        (
+            "paseo",
+            "ls",
+            "--global",
+            "--all",
+            "--label",
+            "gwo.runtime_repository=owner/repo",
+            "--json",
+        )
+    ]
 
 
 def test_live_registry_source_accepts_empty_live_list():
