@@ -16,9 +16,11 @@ for path in (EXACT_SCRIPTS, SCRIPTS):
         sys.path.insert(0, str(path))
 
 from gwo_v8._canonical import (  # noqa: E402
+    CanonicalJsonError,
     canonical_bytes,
     digest_value,
     load_canonical_json,
+    strict_json_loads,
 )
 from gwo_v8.cutover_guard import (  # noqa: E402
     CutoverSubject,
@@ -895,6 +897,9 @@ def test_command_reader_accepts_strict_noncanonical_json_and_canonicalizes_paylo
     ),
 )
 def test_command_reader_rejects_duplicate_invalid_or_trailing_json(raw: bytes):
+    with pytest.raises(CanonicalJsonError):
+        strict_json_loads(raw)
+
     with pytest.raises(BootstrapError) as error:
         GitHubDispatchSnapshotReader(
             lambda command: raw,
