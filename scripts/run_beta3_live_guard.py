@@ -419,9 +419,12 @@ def canonical_json_bytes(value: object) -> bytes:
         ) from error
 
 
-def _exact_digest_value(value: object) -> str:
+def _exact_digest_value(
+    value: object,
+    repository_root: Path | None = None,
+) -> str:
     """Use current-main digest semantics without importing it during preflight."""
-    _validate_v8_module_origins()
+    _validate_v8_module_origins(repository_root)
     try:
         from gwo_v8._canonical import digest_value
     except (ImportError, ModuleNotFoundError, OSError) as error:
@@ -2266,11 +2269,11 @@ class _ImmutableDurableStateReadPort:
                     ) from error
 
 
-def _guard_contract() -> object:
+def _guard_contract(repository_root: Path | None = None) -> object:
     """Compatibility metadata for the runner-owned durable Store reader."""
     from types import SimpleNamespace
 
-    _validate_v8_module_origins()
+    _validate_v8_module_origins(repository_root)
     try:
         from gwo_v8._canonical import digest_value
         from gwo_v8.cutover_guard import DurableStateReadback
@@ -2828,7 +2831,11 @@ def _package_manifest(package_root: Path, package_name: str) -> dict[str, object
         ) from error
 
 
-def _package_snapshot(config: RunnerConfig) -> dict[str, object]:
+def _package_snapshot(
+    config: RunnerConfig,
+    *,
+    repository_root: Path | None = None,
+) -> dict[str, object]:
     labels = tuple(path.parent.name for path in config.install_roots)
     if labels != INSTALL_SURFACES:
         raise RunnerError(
@@ -2909,7 +2916,7 @@ def _package_snapshot(config: RunnerConfig) -> dict[str, object]:
                     f"{surface}:{package_name} manifest drifted from source",
                 )
     value = {"sources": sources, "installed": installed}
-    package_digest = _exact_digest_value(value)
+    package_digest = _exact_digest_value(value, repository_root)
     if (
         config.expected_package_digest is not None
         and package_digest != config.expected_package_digest
@@ -3354,6 +3361,7 @@ def preflight(
     git_runner: Callable[..., subprocess.CompletedProcess[str]] = _default_git_runner,
     allow_existing_outputs: bool = False,
     authoritative_sources: bool = True,
+    module_repository_root: Path | None = None,
 ) -> dict[str, object]:
     _validate_config_paths(config, allow_existing_outputs=allow_existing_outputs)
     git = _git_snapshot(config, git_runner)
@@ -3379,7 +3387,10 @@ def preflight(
     if authoritative_sources:
         receipt, receipt_digest = _validate_receipt(config)
         stores = _store_snapshots(config)
-        packages = _package_snapshot(config)
+        packages = _package_snapshot(
+            config,
+            repository_root=module_repository_root,
+        )
         result.update(
             {
                 "fresh_receipt_sha256": receipt_digest,
@@ -3427,13 +3438,21 @@ def _observation_digest(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(_plain_observation(value))).hexdigest()
 
 
-def _guard_digest(value: object) -> str:
-    return _exact_digest_value(_plain_observation(value))
+def _guard_digest(
+    value: object,
+    repository_root: Path | None = None,
+) -> str:
+    return _exact_digest_value(_plain_observation(value), repository_root)
 
 
-def _digest_without(value: Mapping[str, object], excluded: str) -> str:
+def _digest_without(
+    value: Mapping[str, object],
+    excluded: str,
+    repository_root: Path | None = None,
+) -> str:
     return _guard_digest(
-        {key: child for key, child in value.items() if key != excluded}
+        {key: child for key, child in value.items() if key != excluded},
+        repository_root,
     )
 
 
@@ -3865,9 +3884,14 @@ def _write_exclusive_json(
             local_parent.__exit__(None, None, None)
 
 
-def _validate_attested_replay(bundle: object, replay: object) -> dict[str, object]:
+def _validate_attested_replay(
+    bundle: object,
+    replay: object,
+    *,
+    repository_root: Path | None = None,
+) -> dict[str, object]:
     try:
-        _validate_v8_module_origins()
+        _validate_v8_module_origins(repository_root)
         scripts_root = str(_absolute_path(Path(__file__)).parent)
         if scripts_root not in sys.path:
             sys.path.insert(0, scripts_root)
@@ -3998,9 +4022,13 @@ def _validate_attested_replay(bundle: object, replay: object) -> dict[str, objec
             )
     else:
         raise RunnerError("ATTESTATION_MISMATCH", "replay report decision is not exact")
-    subject_digest = _exact_digest_value(bundle.subject.canonical())
+    subject_digest = _exact_digest_value(
+        bundle.subject.canonical(),
+        repository_root,
+    )
     readback_digest = _exact_digest_value(
-        {name: getattr(bundle, name).canonical() for name in GUARD_PORT_ORDER}
+        {name: getattr(bundle, name).canonical() for name in GUARD_PORT_ORDER},
+        repository_root,
     )
     if (
         report.subject_digest != subject_digest
@@ -4041,7 +4069,10 @@ def _validate_attested_replay(bundle: object, replay: object) -> dict[str, objec
             != bundle.compatibility.readback_digest
             or receipt.package_readback_digest != bundle.packages.readback_digest
             or receipt.receipt_digest
-            != _exact_digest_value(receipt.canonical_without_digest())
+            != _exact_digest_value(
+                receipt.canonical_without_digest(),
+                repository_root,
+            )
         ):
             raise RunnerError(
                 "ATTESTATION_MISMATCH", "GO replay receipt is not attestation-bound"
@@ -4224,6 +4255,7 @@ def _attested_evidence(
     *,
     release_subject: object,
     subject_binding: object | None = None,
+    repository_root: Path | None = None,
 ) -> dict[str, object]:
     flags = _mutation_flags()
     guard_readbacks = report_body["readback_bundle"]
@@ -4257,7 +4289,10 @@ def _attested_evidence(
         "source_records": [record.canonical() for record in bundle.source_records],
         "field_bindings": [binding.canonical() for binding in bundle.field_bindings],
         "fixed_subject": bundle.subject.canonical(),
-        "subject_digest": _exact_digest_value(bundle.subject.canonical()),
+        "subject_digest": _exact_digest_value(
+            bundle.subject.canonical(),
+            repository_root,
+        ),
         "canonical_guard_evidence": dict(replay_value),
         "checks": replay_value["checks"],
         "blocker_codes": [item["code"] for item in replay_value["blockers"]],
@@ -4296,6 +4331,7 @@ def _validate_attested_report_value(
     replay_value: Mapping[str, object],
     release_subject: object,
     subject_binding: object | None = None,
+    repository_root: Path | None = None,
 ) -> None:
     if type(value) is not dict:
         raise RunnerError("OUTPUT_WRITE_FAILED", "report root is not an object")
@@ -4312,7 +4348,10 @@ def _validate_attested_report_value(
         ("runbook", _path_text(Path(__file__))),
         ("runbook_sha256", attempt.runner_sha256),
         ("decision", replay_value["decision"]),
-        ("subject_digest", _exact_digest_value(bundle.subject.canonical())),
+        (
+            "subject_digest",
+            _exact_digest_value(bundle.subject.canonical(), repository_root),
+        ),
         *subject_metadata.items(),
         ("activation_performed", False),
     ):
@@ -4343,6 +4382,7 @@ def _validate_attested_evidence_value(
     evidence_exit_code: int,
     release_subject: object,
     subject_binding: object | None = None,
+    repository_root: Path | None = None,
 ) -> None:
     if type(value) is not dict:
         raise RunnerError("OUTPUT_WRITE_FAILED", "evidence root is not an object")
@@ -4359,7 +4399,10 @@ def _validate_attested_evidence_value(
         ("runbook", _path_text(Path(__file__))),
         ("runbook_sha256", attempt.runner_sha256),
         ("fixed_subject", bundle.subject.canonical()),
-        ("subject_digest", _exact_digest_value(bundle.subject.canonical())),
+        (
+            "subject_digest",
+            _exact_digest_value(bundle.subject.canonical(), repository_root),
+        ),
         *subject_metadata.items(),
         ("report_digest", report_digest),
         ("report_path", _path_text(config.report_path)),
@@ -4785,10 +4828,7 @@ def _validate_v8_module_origins(
     if repository_root is not None:
         _add_repo_import_paths(_absolute_path(Path(repository_root)))
     expected_root = _v8_source_root(repository_root, repository=repository)
-    if (
-        repository_root is not None
-        and _absolute_path(Path(repository_root)) == REPOSITORY_ROOT
-    ):
+    if repository_root is not None:
         _load_captured_v8_package(expected_root)
         return
     package = sys.modules.get("gwo_v8")
@@ -5283,12 +5323,14 @@ def _run_bound(
             )
         except RunnerError as error:
             return _result("UNAVAILABLE", 3, code=error.code, detail=error.detail)
+    module_repository_root = config.repository_root if production else None
     try:
         preflight_result = preflight(
             config,
             git_runner=git_runner,
             allow_existing_outputs=False,
             authoritative_sources=not execute,
+            module_repository_root=module_repository_root,
         )
     except RunnerError as error:
         if error.code in {"OUTPUT_COLLISION", "LIVE_INPUT_DRIFT"}:
@@ -5365,7 +5407,10 @@ def _run_bound(
                     run_id=run_id,
                     repository=config.repository,
                     evidence_root=_path_text(config.evidence_root),
-                    cutover_subject_digest=_exact_digest_value(subject.canonical()),
+                    cutover_subject_digest=_exact_digest_value(
+                        subject.canonical(),
+                        module_repository_root,
+                    ),
                     runner_sha256=runbook_hash,
                     attestor_sha256=attestor_source_sha256,
                     nonce_factory=secrets.token_hex,
@@ -5444,7 +5489,11 @@ def _run_bound(
                     attempt=attempt,
                     subject_binding=subject_binding,
                 )
-                replay_value = _validate_attested_replay(bundle, replay_result)
+                replay_value = _validate_attested_replay(
+                    bundle,
+                    replay_result,
+                    repository_root=module_repository_root,
+                )
                 _assert_subject_binding_stable(subject_binding)
                 _assert_combined_stable(
                     config,
@@ -5524,6 +5573,7 @@ def _run_bound(
                         inputs,
                         release_subject=release_subject,
                         subject_binding=subject_binding,
+                        repository_root=module_repository_root,
                     )
                     _assert_combined_stable(
                         config,
@@ -5569,6 +5619,7 @@ def _run_bound(
                         replay_value=replay_value,
                         release_subject=release_subject,
                         subject_binding=subject_binding,
+                        repository_root=module_repository_root,
                     )
                     _validate_attested_evidence_value(
                         evidence,
@@ -5581,6 +5632,7 @@ def _run_bound(
                         evidence_exit_code=exit_code,
                         release_subject=release_subject,
                         subject_binding=subject_binding,
+                        repository_root=module_repository_root,
                     )
                 except RunnerError:
                     raise

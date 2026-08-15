@@ -4815,6 +4815,47 @@ def test_strict_v8_package_loader_rejects_forged_canonical_module():
         runner._CAPTURED_V8_PACKAGE_STATE = previous_state
 
 
+def test_selected_repository_fallback_rejects_canonical_looking_forged_v8_bytes(
+    tmp_path: Path,
+):
+    repository_root = tmp_path / "selected-repository"
+    package_root = repository_root / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+    package_root.mkdir(parents=True)
+    init_path = package_root / "__init__.py"
+    init_path.write_bytes(b"VALUE = 'canonical'\n")
+    previous_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "gwo_v8" or name.startswith("gwo_v8.")
+    }
+    previous_state = runner._CAPTURED_V8_PACKAGE_STATE
+    previous_meta_path = list(sys.meta_path)
+    try:
+        for name in previous_modules:
+            sys.modules.pop(name, None)
+        forged = ModuleType("gwo_v8")
+        forged.__file__ = str(init_path)
+        forged.__path__ = [str(package_root)]
+        forged.__spec__ = SimpleNamespace(origin=str(init_path), loader=object())
+        forged.VALUE = "forged"
+        sys.modules["gwo_v8"] = forged
+
+        with pytest.raises(runner.RunnerError) as error:
+            runner._validate_v8_module_origins(
+                repository_root,
+                repository="owner/repo",
+            )
+
+        assert error.value.code == "ATTESTATION_PROVENANCE_MISMATCH"
+    finally:
+        for name in tuple(sys.modules):
+            if name == "gwo_v8" or name.startswith("gwo_v8."):
+                sys.modules.pop(name, None)
+        sys.modules.update(previous_modules)
+        sys.meta_path[:] = previous_meta_path
+        runner._CAPTURED_V8_PACKAGE_STATE = previous_state
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX open-flag contract")
 @pytest.mark.parametrize(
     ("missing_flag", "directory"),
