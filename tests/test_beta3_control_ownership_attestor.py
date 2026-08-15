@@ -713,7 +713,7 @@ def _production_subject_and_config(tmp_path):
     )
     config.expected_package_content_digests = (
         ("implement-gwo", "fcafa60645a2ea18408ec97369fdf5a01402a950b90e701fa2305624a1bfeaa9"),
-        ("orchestrator", "1a10f3f19e6db951150bd97a40561de1093ae20ba07d8c503a244cd1f0123639"),
+        ("orchestrator", "60a035e16407bcb5afb2ec77993baf106772b2cb8f625b205763e6aa80600f90"),
     )
     return subject, config
 
@@ -755,6 +755,20 @@ def test_production_configuration_accepts_exact_global_fixed_identities(tmp_path
     subject, config = _production_subject_and_config(tmp_path)
 
     attestor_module._validate_config_subject(config, subject, _release_subject_for(subject))
+
+
+def test_production_package_digest_constants_match_source_manifests():
+    observed = {
+        package.name: json.loads(
+            (package / ".skill-package.json").read_text(encoding="utf-8")
+        )["content_sha256"]
+        for package in (
+            ROOT / "skills" / "implement-gwo",
+            ROOT / "skills" / "orchestrator",
+        )
+    }
+
+    assert dict(attestor_module.PRODUCTION_PACKAGE_CONTENT_DIGESTS) == observed
 
 
 def test_production_configuration_accepts_subject_bound_fresh_store_identity(tmp_path):
