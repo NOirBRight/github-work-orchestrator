@@ -4,6 +4,8 @@
 
 This design records the approved **external canonical release-subject manifest** approach for the Phase 3/4 fix wave. It is a release-boundary correction, not a production activation. Until Phase 5 receives the separate owner authorization described below, V6.1 remains the only production writer.
 
+Historical note: an earlier draft named this manifest `gwo-v8-release-subject.v1`. The implemented closed contract is `gwo-v8-release-subject.v2`, which replaces v1; v1 remains historical context only and is not a current compatibility path. Here, `v1` refers only to the release-subject manifest. The separate existing `gwo-v8-fresh-store-provision.v1` receipt schema remains a fixed receipt contract; it is not a release-subject v1 compatibility path.
+
 The design closes the two load-bearing findings in the Task 6 four-axis review:
 
 1. `scripts/run_beta3_live_guard.py` and `scripts/beta3_control_ownership_attestor.py` currently name the old production commit/tree inside the source that is supposed to attest the final merged source. Updating those constants after merge is a Git self-reference and cannot produce a stable exact-main subject.
@@ -16,7 +18,7 @@ The smallest safe boundary is a canonical JSON object outside the tracked checko
 ### In scope
 
 - One fixed production manifest path: `EVIDENCE_ROOT / "gwo-v8-release-subject.json"`.
-- A closed schema named `gwo-v8-release-subject.v1`.
+- A closed schema named `gwo-v8-release-subject.v2`.
 - A non-self-referential subject digest over the canonical body.
 - Exact binding of the repository, canonical roots, merged-main commit/tree, audited source digest, runner, four ordered attestors, attestor bundle, and reviewed provenance.
 - A held-handle/byte-identity loader that runs before nonce creation, production dependency/source access, GitHub, Paseo, CIM, or output creation.
@@ -54,9 +56,10 @@ The production constants remain fixed in the focused release-subject module:
 REPOSITORY_ROOT = Path(r"D:\Workstation\github-work-orchestrator").resolve()
 EVIDENCE_ROOT = Path(r"D:\gwo-release-evidence\2026-08-09-gwo-v8-beta3-production-cutover").resolve()
 RELEASE_SUBJECT_PATH = EVIDENCE_ROOT / "gwo-v8-release-subject.json"
+FRESH_RECEIPT_FILENAME = "fresh-store-exact-main-receipt.json"
 REPOSITORY = "NOirBRight/github-work-orchestrator"
 REMOTE_REF = "origin/main"
-RELEASE_SUBJECT_SCHEMA = "gwo-v8-release-subject.v1"
+RELEASE_SUBJECT_SCHEMA = "gwo-v8-release-subject.v2"
 ```
 
 The production loader does not accept a path argument. The production generator does not accept a root, path, or value argument. Test-only fixture functions may receive temporary paths explicitly, but they are not used by `run_beta3_live_guard.py` or the generator entry point.
@@ -68,6 +71,7 @@ schema
 repository
 repository_root
 evidence_root
+fresh_receipt_sha256
 merged_main_sha
 merged_main_git_tree
 audited_source_tree_digest
@@ -107,10 +111,11 @@ Field constraints are closed and exact:
 
 | Field | Constraint and meaning |
 | --- | --- |
-| `schema` | Exact string `gwo-v8-release-subject.v1`. |
+| `schema` | Exact string `gwo-v8-release-subject.v2`; this replaces the historical v1 name. |
 | `repository` | Exact string `NOirBRight/github-work-orchestrator`. |
 | `repository_root` | Absolute canonical path equal to `D:\Workstation\github-work-orchestrator`. Every ancestor is a non-link, non-reparse directory. |
 | `evidence_root` | Absolute canonical path equal to the fixed `EVIDENCE_ROOT`. Every ancestor is a non-link, non-reparse directory. |
+| `fresh_receipt_sha256` | Lowercase SHA-256 of the exact raw bytes of `EVIDENCE_ROOT / "fresh-store-exact-main-receipt.json"`, read through the held evidence-root boundary. The receipt must be canonical JSON; this byte digest is not `subject_digest`. |
 | `merged_main_sha` | Lowercase hexadecimal Git commit OID matching `^[0-9a-f]{40}$`. It is used for `HEAD`, `origin/main`, and receipt `source_main_sha`. |
 | `merged_main_git_tree` | Lowercase hexadecimal Git root-tree OID matching `^[0-9a-f]{40}$`. It is used for `HEAD^{tree}` and receipt `source_main_tree`. It is not an audited source digest. |
 | `audited_source_tree_digest` | Lowercase SHA-256 matching `^[0-9a-f]{64}$`, returned by `gwo_v8.cutover_guard.source_tree_digest(REPOSITORY_ROOT)`. It remains the value of `CutoverSubject.source_tree_digest`. |
@@ -121,7 +126,9 @@ Field constraints are closed and exact:
 | `reviewed_provenance` | `path` is the canonical repository `scripts/beta3_reviewed_provenance.json`; `sha256` is the hash of its raw held bytes. The JSON must still pass the existing `gwo-beta3-reviewed-provenance.v1` closed-schema and origin checks. |
 | `subject_digest` | Lowercase SHA-256 over the canonical body defined below. |
 
-No package, Store, control-ref, Runtime selector, or target repository value is duplicated into this manifest. Those remain the existing fixed configuration/readback contracts. Duplicating them would create a second source of truth without closing either reviewed finding.
+The receipt and observer identities are bound in separate stages. `beta3_release_subject.py` reads the fixed fresh receipt as canonical JSON and records its exact raw-byte SHA-256 in `fresh_receipt_sha256`. Before any receipt-derived Store identity is consumed, the production runner reads that receipt as a regular canonical file and requires its raw-byte digest to equal `ReleaseSubject.fresh_receipt_sha256`; only after that check and the closed receipt parse does it derive `fresh_store`, `store_generation`, `store_sha256`, and `generation_rows` for the effective configuration. It then requires the receipt's `source_main_sha` to equal `merged_main_sha` and `source_main_tree` to equal `merged_main_git_tree`. The runner carries the same immutable `ReleaseSubject` and effective `RunnerConfig` through the execution path, and the control attestor receives those same values rather than reconstructing identity values. The subject loader independently compares the held runner bytes, ordered attestor bytes/bundle, and reviewed-provenance bytes to the manifest. `reviewed_provenance` is the exact current in-checkout provenance manifest for those observer bytes; the fresh receipt is a separate readback input and is not substituted for observer provenance.
+
+No package, Store, control-ref, Runtime selector, or target repository value is duplicated into this manifest. The fresh Store path/generation/hash/rows are derived only from the validated receipt; the receipt schema/runbook, package, canonical roots, Git identities/readbacks, rollback/prior Store, and other existing contracts remain fixed. Duplicating those values into the manifest would create a second source of truth without closing either reviewed finding.
 
 ## Canonical body and subject digest
 
@@ -148,6 +155,7 @@ class ReleaseSubject:
     repository: str
     repository_root: str
     evidence_root: str
+    fresh_receipt_sha256: str
     merged_main_sha: str
     merged_main_git_tree: str
     audited_source_tree_digest: str
@@ -175,7 +183,7 @@ class ReviewedProvenanceIdentity:
 
 The dataclass method declarations above are interface notation. The implementation plan gives concrete method behavior and tests; no interface is permitted to return an open-ended mapping or accept unknown keys.
 
-`ReleaseSubject.canonical_body()` returns the exact 12 body keys in canonical projection. `ReleaseSubject.canonical()` returns those keys plus `subject_digest`. `parse_release_subject(raw, expected_repository_root, expected_evidence_root)` recomputes the digest and returns an immutable value or raises `ReleaseSubjectError` with a stable code.
+`ReleaseSubject.canonical_body()` returns the exact 13 body keys in canonical projection. `ReleaseSubject.canonical()` returns those keys plus `subject_digest`. `parse_release_subject(raw, expected_repository_root, expected_evidence_root)` recomputes the digest and returns an immutable value or raises `ReleaseSubjectError` with a stable code.
 
 ## Held manifest loading protocol
 
@@ -198,6 +206,8 @@ The loader is run before:
 
 A test-only `load_release_subject_for_test(path, expected_repository_root, expected_evidence_root)` may use a temporary fixture and a supplied held-reader seam. It must be impossible for the production function to reach that seam through the CLI or `run()` default.
 
+The subject loader validates the closed `fresh_receipt_sha256` field but does not replace the runner's semantic receipt validation. The production runner reads the fixed receipt after the subject boundary, checks its raw digest and `source_main_sha`/`source_main_tree` against the subject-bound values, and passes the same receipt-bound subject to the control attestor.
+
 ## Runner and control-attestor binding
 
 ### Runner configuration
@@ -209,16 +219,25 @@ merged_main_sha: str
 merged_main_git_tree: str
 audited_source_tree_digest: str
 release_subject_digest: str
+expected_fresh_receipt_sha256: str
 ```
 
-The static Store, package, branch, writer-generation, and output settings remain the existing fixed contracts. `run()` loads the fixed external subject and builds an effective immutable `RunnerConfig` from it. A caller cannot replace any of those four identity fields in production. Existing fixture tests retain explicit non-production configuration injection through a test-only construction path and never pass that path to the production CLI.
+The fresh Store identity is receipt-derived, not a static `RunnerConfig` setting. The production binding performs this ordered boundary:
+
+1. Read `EVIDENCE_ROOT / "fresh-store-exact-main-receipt.json"` through the canonical directory and held no-follow file boundary. Require a regular file and canonical JSON, and compute the SHA-256 of its exact raw canonical bytes.
+2. Compare that digest to `ReleaseSubject.fresh_receipt_sha256` and fail closed before using any receipt-derived Store value.
+3. From the validated receipt, derive `fresh_store` from `store_path`, `store_generation` from `store_generation`, `store_sha256` from `store_sha256`, and `generation_rows` from `generation_rows` for the effective `RunnerConfig`.
+4. Require `store_path` to be an absolute canonical path in the fixed fresh-Store directory `C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator` with the controlled timestamp filename `store-YYYYMMDDTHHMMSSZ.sqlite3`. It must not equal `ROLLBACK_STORE` or `PRIOR_STORE`; every ancestor and the leaf must pass non-reparse/no-follow and regular-file checks.
+5. Reject any known or dynamic SQLite sidecar before or during the read. The Store is read only through the existing regular immutable path (`mode=ro&immutable=1`) with held identity/byte stability checked around the read.
+
+The fresh-receipt schema, runbook and Store schema/row contracts, package and package-content contracts, canonical repository/evidence roots, Git commit/tree/source-digest contracts, rollback/prior Store hashes, and `old_stores_untouched` proof remain fixed. `run()` loads the fixed external subject and builds an effective immutable `RunnerConfig` from it. A caller cannot replace any of those fixed contracts in production. Existing fixture tests retain explicit non-production configuration injection through a test-only construction path and never pass that path to the production CLI.
 
 The production runner changes the existing functions as follows:
 
 - `_git_snapshot()` compares `HEAD` and `origin/main` to `config.merged_main_sha`, and `HEAD^{tree}` to `config.merged_main_git_tree`.
-- `_validate_receipt()` compares `source_main_sha` to `config.merged_main_sha` and `source_main_tree` to `config.merged_main_git_tree`.
+- `_bind_fresh_store_identity_from_receipt()` first compares the raw canonical receipt digest to `config.expected_fresh_receipt_sha256` (bound from `release_subject.fresh_receipt_sha256`) and then derives the four receipt-bound Store fields above; `_validate_receipt()` rechecks the fixed receipt schema/runbook/Store/row/old-Store contracts plus `source_main_sha` against `config.merged_main_sha` and `source_main_tree` against `config.merged_main_git_tree`.
 - `_default_subject_factory()` constructs `CutoverSubject.source_commit` from `merged_main_sha` and `CutoverSubject.source_tree_digest` from `audited_source_tree_digest`; it never places the Git tree OID into `source_tree_digest`.
-- `ProductionBootstrapAttestor.attest()` receives the same immutable `ReleaseSubject` object held by the runner. It does not construct a subject from code-local expected values.
+- `ProductionBootstrapAttestor.attest()` receives the same immutable `ReleaseSubject` and effective `RunnerConfig` held by the runner, including `fresh_receipt_sha256` and the receipt-derived Store fields. It does not construct a subject or configuration from code-local expected values.
 - `_local_input_files()` and the input lease include the external manifest path and its held identity. A change after preflight returns `LIVE_INPUT_DRIFT`/`RELEASE_SUBJECT_DRIFT` before nonce or output effects.
 - Reports and evidence retain the existing `subject_digest` for the `CutoverSubject` digest and add an explicit `release_subject_digest` field for the external manifest digest. The latter is required in both the Phase 4 report and evidence and is checked during output readback.
 
@@ -226,15 +245,16 @@ The CLI remains limited to `--execute` and `--run-id`. `--subject`, `--subject-p
 
 ### Control ownership attestor
 
-The control attestor removes `PRODUCTION_SOURCE_COMMIT` and `PRODUCTION_SOURCE_TREE`. Its production `observe()` receives the same `ReleaseSubject` value as the runner and verifies:
+The control attestor removes `PRODUCTION_SOURCE_COMMIT` and `PRODUCTION_SOURCE_TREE`. Its production `observe()` receives the same immutable `ReleaseSubject` and effective `RunnerConfig` as the runner and verifies:
 
 ```text
 config.merged_main_sha == release_subject.merged_main_sha == subject.source_commit
 config.merged_main_git_tree == release_subject.merged_main_git_tree
 config.audited_source_tree_digest == release_subject.audited_source_tree_digest == subject.source_tree_digest
+config.expected_fresh_receipt_sha256 == release_subject.fresh_receipt_sha256
 ```
 
-The first and second lines are 40-character Git identity checks. The third line is a 64-character audited-source check. No comparison aliases `merged_main_git_tree` to `source_tree_digest`.
+The first and second lines are 40-character Git identity checks. The third line is a 64-character audited-source check. The fourth line binds the exact fresh-receipt bytes to the subject. No comparison aliases `merged_main_git_tree` to `source_tree_digest` or treats the receipt digest as either Git identity.
 
 The local checkout `SourceObservation` has an explicitly named `git_tree_oid` field in its canonical payload and identity. Its `commit_oid` remains the 40-character commit OID. `CompatibilityPathReadback.source_tree_digest` remains the 64-character audited source digest. This is the only new Git-tree name in the control/source observation domain; `CutoverSubject.source_tree_digest` is not renamed or widened.
 
@@ -252,12 +272,14 @@ It accepts no CLI options. It performs this exact sequence:
 
 1. Require the fixed canonical repository and evidence-root directories to exist and be non-reparse.
 2. Require the fixed subject path to be absent. An existing file produces `RELEASE_SUBJECT_EXISTS`; it is never replaced, truncated, or deleted.
-3. Read `HEAD`, `HEAD^{tree}`, and `origin/main` from the canonical checkout and require `origin/main == HEAD`. Require the Git status rule used by the Guard: no status other than the explicitly permitted `.codex-tmp` untracked subtree.
-4. Compute `audited_source_tree_digest` from the exact audited source function.
-5. Read and hash the runner, four attestors, and reviewed-provenance file through held no-follow handles. Require the reviewed-provenance cross-check and existing canonical origins.
-6. Construct the closed `ReleaseSubject`, compute its body digest, and serialize its full canonical bytes.
-7. Open `EVIDENCE_ROOT / "gwo-v8-release-subject.json"` with exclusive-create semantics (`O_CREAT|O_EXCL`, or `CREATE_NEW` on Windows), write only those bytes, flush and `fsync` the descriptor, then validate the written identity and bytes through the runtime loader.
-8. Print the canonical subject digest and exit zero. It does not create a directory, temporary file, SQLite database, staging file, report, evidence file, Git ref, provider action, or tag.
+3. Read the fixed `EVIDENCE_ROOT / "fresh-store-exact-main-receipt.json"` through a held no-follow handle, require canonical JSON, and compute `fresh_receipt_sha256` from its raw bytes.
+4. Read `HEAD`, `HEAD^{tree}`, and `origin/main` from the canonical checkout and require `origin/main == HEAD`. Require the Git status rule used by the Guard: no status other than the explicitly permitted `.codex-tmp` untracked subtree.
+5. Compute `audited_source_tree_digest` from the exact audited source function.
+6. Read and hash the runner, four attestors, and reviewed-provenance file through held no-follow handles. Require the reviewed-provenance cross-check and existing canonical origins.
+7. Re-read the receipt, Git revision/tree, audited source, and observer inputs; reject any byte, identity, or source drift before construction.
+8. Construct the closed `ReleaseSubject`, compute its body digest, and serialize its full canonical bytes.
+9. Open `EVIDENCE_ROOT / "gwo-v8-release-subject.json"` with exclusive-create semantics (`O_CREAT|O_EXCL`, or `CREATE_NEW` on Windows), write only those bytes, flush and `fsync` the descriptor, then validate the written identity and bytes through the runtime loader.
+10. Print the canonical subject digest and exit zero. It does not create a directory, temporary file, SQLite database, staging file, report, evidence file, Git ref, provider action, or tag.
 
 The generator's pure test function may receive a temporary repository and evidence root. The production entry point cannot receive those values, so a typo or CLI override cannot select a different subject.
 
@@ -272,7 +294,7 @@ merged_main_sha
 merged_main_git_tree
 ```
 
-The existing Cutover Guard readbacks continue to prove the observed Git and audited source values. The report/evidence validator checks that the four fields agree with the held manifest and with the authoritative readbacks. A changed manifest invalidates the rehearsal; evidence is not repaired in place.
+The existing Cutover Guard readbacks continue to prove the observed Git and audited source values. The report/evidence validator checks that the four fields agree with the held manifest and with the authoritative readbacks, and that `fresh_receipt_sha256` matches the exact receipt bytes whose `source_main_sha` and `source_main_tree` match the merged SHA/tree. A changed manifest or receipt invalidates the rehearsal; evidence is not repaired in place.
 
 Before Phase 5 mutation, the owner approval must name all of these exact values:
 
@@ -312,7 +334,7 @@ TDD VALID
 OPEN 0
 ```
 
-The Phase 4 sequence then freezes the canonical merged `main`, regenerates `scripts/beta3_reviewed_provenance.json`, generates the external subject exactly once, runs local focused/full verification, and performs the read-only Beta3 rehearsal. The rehearsal may create only its declared report/evidence pair; it does not activate V8 or change V6.1 authority. `BETA3_CUTOVER_REHEARSAL_GO` is not recorded until the report/evidence `release_subject_digest`, Git readbacks, source digest, runner/attestor hashes, and local verification all agree.
+The Phase 4 sequence then freezes the canonical merged `main`, regenerates `scripts/beta3_reviewed_provenance.json`, generates the external subject exactly once, runs local focused/full verification, and performs the read-only Beta3 rehearsal. The rehearsal may create only its declared report/evidence pair; it does not activate V8 or change V6.1 authority. `BETA3_CUTOVER_REHEARSAL_GO` is not recorded until the report/evidence `release_subject_digest`, fresh receipt digest and source-main SHA/tree, Git readbacks, source digest, runner/attestor hashes, reviewed provenance, and local verification all agree.
 
 No failure path in this design performs rollback, deletes an existing subject/receipt, changes a writer, contacts GitHub CI, executes a provider action, creates a tag, or publishes a release.
 

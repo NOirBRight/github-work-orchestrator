@@ -2976,6 +2976,20 @@ def _default_git_output(
     return result.stdout
 
 
+def _is_allowed_codex_tmp_path(path: str) -> bool:
+    if not path or path.startswith("/"):
+        return False
+    components = path.split("/")
+    if components[0] != ".codex-tmp":
+        return False
+    for component in components[1:]:
+        if component == "..":
+            return False
+        if component in ("", "."):
+            continue
+    return True
+
+
 def _unexpected_status_records(output: str) -> tuple[str, ...]:
     unexpected: list[str] = []
     for record in output.split("\0"):
@@ -2991,9 +3005,7 @@ def _unexpected_status_records(output: str) -> tuple[str, ...]:
         elif os.name != "posix":
             unexpected.append(record)
             continue
-        if status != "??" or not (
-            path == ".codex-tmp" or path.startswith(".codex-tmp/")
-        ):
+        if status != "??" or not _is_allowed_codex_tmp_path(path):
             unexpected.append(record)
     return tuple(unexpected)
 

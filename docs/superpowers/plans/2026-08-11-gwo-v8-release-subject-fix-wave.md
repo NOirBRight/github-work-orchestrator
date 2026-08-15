@@ -4,6 +4,8 @@
 
 **Goal:** Replace the self-referential Beta3 production identity constants with an externally bound, held canonical release-subject manifest; separate the Git root-tree OID from the audited source digest; restore complete Task 2 RED/GREEN evidence; and make the exact-main Phase 4 rehearsal locally executable without activating V8.
 
+Historical note: the initial draft named the manifest `gwo-v8-release-subject.v1`. The implementation described by this plan replaces it with the closed `gwo-v8-release-subject.v2`; v1 is retained only as historical context and is not a compatibility path. Here, `v1` refers only to the release-subject manifest. The separate existing `gwo-v8-fresh-store-provision.v1` receipt schema remains a fixed receipt contract, not a release-subject v1 compatibility path.
+
 **Architecture:** Add a focused `scripts/beta3_release_subject.py` deep module that owns the closed manifest schema, canonical-body digest, no-follow held-file loader, and exclusive-create generator seam. The live Guard builds one immutable `RunnerConfig` from that manifest and passes the same `ReleaseSubject` object to the control attestor. Git and existing source/Store/Runtime/control readbacks remain authoritative, while reports and evidence carry the manifest digest as a separate identity.
 
 **Tech Stack:** Python 3.13, frozen dataclasses, canonical JSON, SHA-256, Windows no-follow/held-handle file identity, `subprocess` Git readback, pytest, Ruff, Python AST checks, existing Beta3 attestors and V8 cutover contracts.
@@ -16,9 +18,12 @@
 - GitHub CI is disabled. All checks in this plan run locally.
 - V6.1 remains the only production writer until a separate Phase 5 owner authorization and durable Activation Receipt exist.
 - The fixed production subject path is `EVIDENCE_ROOT / "gwo-v8-release-subject.json"`; no CLI path or subject-value override is permitted.
-- The canonical manifest schema is exactly `gwo-v8-release-subject.v1`.
+- The canonical manifest schema is exactly `gwo-v8-release-subject.v2`.
 - The manifest digest is computed over the canonical body with `subject_digest` excluded; it is not a self-hash of the full manifest file.
-- The manifest binds repository, canonical repository/evidence roots, `merged_main_sha`, `merged_main_git_tree`, `audited_source_tree_digest`, runner path/hash, the exact ordered four attestor paths/hashes/bundle, and reviewed-provenance path/hash.
+- The manifest binds repository, canonical repository/evidence roots, `fresh_receipt_sha256`, `merged_main_sha`, `merged_main_git_tree`, `audited_source_tree_digest`, runner path/hash, the exact ordered four attestor paths/hashes/bundle, and reviewed-provenance path/hash.
+- Before any receipt-derived Store identity is consumed, the runner validates `ReleaseSubject.fresh_receipt_sha256` against the exact raw canonical bytes at `EVIDENCE_ROOT / "fresh-store-exact-main-receipt.json"`. Only after that digest and closed-receipt check does it derive `fresh_store`, `store_generation`, `store_sha256`, and `generation_rows` from the receipt; it then binds `source_main_sha == merged_main_sha` and `source_main_tree == merged_main_git_tree`.
+- The derived fresh Store path must be in the fixed canonical directory `C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator` with controlled timestamp filename `store-YYYYMMDDTHHMMSSZ.sqlite3`, must exclude the rollback and prior Stores, and must reject reparse/link ancestors, non-regular files, and any SQLite sidecar. The Store is read only through `mode=ro&immutable=1` with identity/byte stability around the read.
+- Fresh Store identity is therefore not a static setting. The fresh-receipt schema/runbook, Store schema and row contracts, package/package-content contracts, canonical repository/evidence roots, Git commit/tree/source-digest contracts, rollback/prior Store hashes, and `old_stores_untouched` proof remain fixed. The runner carries the same subject-bound receipt/Git identities and effective `RunnerConfig` through its path, passes that same config and typed subject to the control attestor, and uses the held runner/attestor/reviewed-provenance identities as the observer provenance boundary; the receipt digest does not replace observer provenance or either Git identity.
 - The manifest is loaded and validated with no-follow/held-handle/byte identity before nonce creation, production dependency/source access, GitHub/Paseo/CIM, or output creation.
 - Git readback remains authoritative. The manifest declares intended identity and never substitutes for `HEAD`, `HEAD^{tree}`, `origin/main`, Store, receipt, package, control, Runtime, legacy, or target readback.
 - Production code no longer depends on self-naming `EXPECTED_HEAD`, `EXPECTED_TREE`, `PRODUCTION_SOURCE_COMMIT`, or `PRODUCTION_SOURCE_TREE`. Test injection remains available only through explicit non-production fixtures.
@@ -55,14 +60,15 @@ Task 5 integrates lanes A and B and therefore is serial. Task 6 records the miss
 - Produces `ReleaseSubjectError(code: str, detail: str)`.
 - Produces frozen `ReleaseFileIdentity(module: str, path: str, sha256: str)`.
 - Produces frozen `ReviewedProvenanceIdentity(path: str, sha256: str)`.
-- Produces frozen `ReleaseSubject` with fields `schema`, `repository`, `repository_root`, `evidence_root`, `merged_main_sha`, `merged_main_git_tree`, `audited_source_tree_digest`, `remote_ref`, `runner`, `attestors`, `attestor_bundle_sha256`, `reviewed_provenance`, and `subject_digest`.
+- Produces frozen `ReleaseSubject` with fields `schema`, `repository`, `repository_root`, `evidence_root`, `fresh_receipt_sha256`, `merged_main_sha`, `merged_main_git_tree`, `audited_source_tree_digest`, `remote_ref`, `runner`, `attestors`, `attestor_bundle_sha256`, `reviewed_provenance`, and `subject_digest`.
 - Produces `canonical_json_bytes(value: object) -> bytes`, `parse_release_subject(raw: bytes, expected_repository_root: Path, expected_evidence_root: Path) -> ReleaseSubject`, and `release_subject_digest(body: Mapping[str, object]) -> str`.
 
 **Files and constants:**
 
 ```python
-RELEASE_SUBJECT_SCHEMA = "gwo-v8-release-subject.v1"
+RELEASE_SUBJECT_SCHEMA = "gwo-v8-release-subject.v2"
 RELEASE_SUBJECT_FILENAME = "gwo-v8-release-subject.json"
+FRESH_RECEIPT_FILENAME = "fresh-store-exact-main-receipt.json"
 REPOSITORY = "NOirBRight/github-work-orchestrator"
 REMOTE_REF = "origin/main"
 ATTESTOR_FILENAMES = (
@@ -84,10 +90,11 @@ def test_subject_digest_excludes_only_subject_digest(tmp_path: Path):
     repository_root = (tmp_path / "repository").resolve()
     evidence_root = (tmp_path / "evidence").resolve()
     body = {
-        "schema": "gwo-v8-release-subject.v1",
+        "schema": "gwo-v8-release-subject.v2",
         "repository": "NOirBRight/github-work-orchestrator",
         "repository_root": str(repository_root),
         "evidence_root": str(evidence_root),
+        "fresh_receipt_sha256": "5" * 64,
         "merged_main_sha": "a" * 40,
         "merged_main_git_tree": "b" * 40,
         "audited_source_tree_digest": "c" * 64,
@@ -148,7 +155,7 @@ def test_subject_schema_rejects_extra_key_and_swapped_identity_domains(tmp_path:
     assert identity.value.code == "RELEASE_SUBJECT_SCHEMA_INVALID"
 ```
 
-Define `_canonical_fixture_payload(tmp_path)` in the test file with the same twelve body keys and the exact four attestor entries; it must not call production code or read a production path.
+Define `_canonical_fixture_payload(tmp_path)` in the test file with the same thirteen body keys and the exact four attestor entries; it must not call production code or read a production path.
 
 - [ ] **Step 2: Run the tests to prove RED.**
 
@@ -162,7 +169,7 @@ Expected: collection fails because `scripts/beta3_release_subject.py` does not e
 
 - [ ] **Step 3: Write the minimal value implementation.**
 
-Implement the frozen dataclasses with exact-type checks. `canonical_body()` returns exactly the twelve body keys. `canonical()` returns the body plus `subject_digest`. `canonical_json_bytes()` uses `json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)` followed by UTF-8 encoding and one LF. `release_subject_digest()` hashes the canonical bytes of the body. `parse_release_subject()` requires the exact top-level and nested key sets, lowercase 40/64-character digests, the ordered four attestors, exact `schema` and `remote_ref`, canonical paths equal to the two expected roots, and a matching body digest.
+Implement the frozen dataclasses with exact-type checks. `canonical_body()` returns exactly the thirteen body keys. `canonical()` returns the body plus `subject_digest`. `canonical_json_bytes()` uses `json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)` followed by UTF-8 encoding and one LF. `release_subject_digest()` hashes the canonical bytes of the body. `parse_release_subject()` requires the exact top-level and nested key sets, lowercase 40/64-character digests, the ordered four attestors, exact `schema` and `remote_ref`, canonical paths equal to the two expected roots, and a matching body digest.
 
 ```python
 def release_subject_digest(body: Mapping[str, object]) -> str:
@@ -299,7 +306,7 @@ def load_production_release_subject() -> ReleaseSubjectBinding:
 
 - [ ] **Step 4: Implement the no-option deterministic generator.**
 
-`generate_production_subject()` reads only fixed `REPOSITORY_ROOT` and `EVIDENCE_ROOT`, requires `origin/main == HEAD`, computes `HEAD^{tree}`, computes `audited_source_tree_digest = source_tree_digest(REPOSITORY_ROOT)`, hashes the ordered observer files, and constructs the subject. It refuses a dirty status other than the existing `.codex-tmp` allowance. `write_production_subject_exclusive()` writes only the fixed subject path and validates it through the runtime loader.
+`generate_production_subject()` reads only fixed `REPOSITORY_ROOT` and `EVIDENCE_ROOT`, reads and hashes the fixed fresh receipt as canonical JSON, requires `origin/main == HEAD`, computes `HEAD^{tree}`, computes `audited_source_tree_digest = source_tree_digest(REPOSITORY_ROOT)`, hashes the ordered observer files, and constructs the subject. It re-reads the receipt and all repository/observer inputs before construction and refuses any byte or identity drift. It refuses a dirty status other than the existing `.codex-tmp` allowance. `write_production_subject_exclusive()` writes only the fixed subject path and validates it through the runtime loader.
 
 ```python
 def main(argv: Sequence[str] | None = None) -> int:
@@ -342,7 +349,7 @@ git commit -m "feat: add held external release subject"
 - Modify: `tests/test_beta3_live_guard_runner.py`
 
 **Interfaces:**
-- `RunnerConfig` now has `merged_main_sha: str`, `merged_main_git_tree: str`, `audited_source_tree_digest: str`, and `release_subject_digest: str`.
+- `RunnerConfig` now has `merged_main_sha: str`, `merged_main_git_tree: str`, `audited_source_tree_digest: str`, `release_subject_digest: str`, and production-bound `expected_fresh_receipt_sha256: str`.
 - `GitRunner` is a callable with signature `(args: list[str], *, cwd: Path, env: Mapping[str, str]) -> subprocess.CompletedProcess[str]`; `GuardFactory` is `(config: RunnerConfig, subject: object) -> object`; `ControlReader` is `() -> object`; and `PackageReader` is `(config: RunnerConfig) -> object`. These aliases match the existing runner call sites without creating a CLI surface.
 - `ProductionBootstrapAttestor.__init__(*, control_ownership_attestor: object, legacy_attestor: object, subject_factory: Callable[[RunnerConfig, ReleaseSubject], CutoverSubject] | None = None) -> None`; the factory is accepted only by fixture construction.
 - `ProductionBootstrapAttestor.attest(config: RunnerConfig, attempt: AttemptIdentity, release_subject: ReleaseSubject) -> tuple[AttestedCutoverBundle, BootstrapLease, dict[str, object]]`.
@@ -393,7 +400,7 @@ Expected: RED for the missing loader-first boundary and the missing `merged_main
 
 - [ ] **Step 3: Remove code-local production subject constants.**
 
-Delete `EXPECTED_HEAD` and `EXPECTED_TREE` from the production identity path. Remove their use from `DEFAULT_CONFIG` and from `_is_fixed_production_subject()`/`_is_production_subject_gate()`; `DEFAULT_CONFIG` is no longer a production default and fixture execution uses the explicit `run_fixture()` path in Task 5. Preserve static Store/package/output validation and explicit fixture-only construction. Replace every production identity reference as follows:
+Delete `EXPECTED_HEAD` and `EXPECTED_TREE` from the production identity path. Remove their use from `DEFAULT_CONFIG` and from `_is_fixed_production_subject()`/`_is_production_subject_gate()`; `DEFAULT_CONFIG` is no longer a production default and fixture execution uses the explicit `run_fixture()` path in Task 5. Preserve the fixed fresh-receipt schema/runbook, Store schema and row, package, canonical-root, Git, rollback/prior-Store, and output contracts, plus explicit fixture-only construction. Do not treat fresh Store settings as static: the production path must validate `ReleaseSubject.fresh_receipt_sha256` against the receipt's raw canonical bytes before deriving its `fresh_store`, `store_generation`, `store_sha256`, and `generation_rows`. Replace every production identity reference as follows:
 
 ```text
 config.expected_head       -> config.merged_main_sha
@@ -424,7 +431,9 @@ finally:
 
 - [ ] **Step 5: Update Git, receipt, and CutoverSubject construction.**
 
-Use `merged_main_sha` for `HEAD`, `origin/main`, and receipt `source_main_sha`. Use `merged_main_git_tree` for `HEAD^{tree}` and receipt `source_main_tree`. Pass `audited_source_tree_digest` to `CutoverSubject.source_tree_digest`. Add `release_subject_digest` to the preflight/result context.
+Use `merged_main_sha` for `HEAD`, `origin/main`, and receipt `source_main_sha`. Use `merged_main_git_tree` for `HEAD^{tree}` and receipt `source_main_tree`. Bind `expected_fresh_receipt_sha256` from `release_subject.fresh_receipt_sha256` and compare it with the exact receipt bytes. Pass `audited_source_tree_digest` to `CutoverSubject.source_tree_digest`. Add `release_subject_digest` to the preflight/result context.
+
+The receipt-to-Store step is ordered and fail-closed: first require the fixed receipt to be canonical JSON and compare its exact raw-byte SHA-256 with `ReleaseSubject.fresh_receipt_sha256`; only then derive `fresh_store`, `store_generation`, `expected_fresh_store_sha256` (the `store_sha256` receipt field), and `expected_fresh_receipt_generation_rows` (the `generation_rows` receipt field). Require the derived path to be the absolute canonical path under the fixed fresh-Store directory, with filename `store-YYYYMMDDTHHMMSSZ.sqlite3`, and reject rollback/prior aliases, reparse ancestors, non-regular leaves, and sidecars. Keep the existing fixed schema/runbook/package/root/Git/old-Store contracts and immutable `mode=ro&immutable=1` read unchanged.
 
 ```python
 def _default_subject_factory(
@@ -526,7 +535,7 @@ Expected: the first test fails because `_validate_config_subject()` does not acc
 
 - [ ] **Step 3: Remove production constants and add the shared subject parameter.**
 
-Delete `PRODUCTION_SOURCE_COMMIT` and `PRODUCTION_SOURCE_TREE`. Update `ProductionBootstrapAttestor._observe_pair()` to pass the same `ReleaseSubject` to `ControlOwnershipAttestor.observe()`. Update `_validate_config_subject()` to compare the three exact identity lines:
+Delete `PRODUCTION_SOURCE_COMMIT` and `PRODUCTION_SOURCE_TREE`. Update `ProductionBootstrapAttestor._observe_pair()` to pass the same effective `RunnerConfig` and exact `ReleaseSubject` to `ControlOwnershipAttestor.observe()`. The control attestor must validate the same receipt-derived Store fields and fixed Store/old-Store contracts; it must not reconstruct either value from code-local constants. Update `_validate_config_subject()` to compare the three exact identity lines:
 
 ```python
 if config.merged_main_sha != release_subject.merged_main_sha:
@@ -591,6 +600,8 @@ git commit -m "fix: separate git tree and audited source digest"
 - `_lease_input_paths()` includes the fixed subject path.
 - `build_parser()` accepts only `--execute` and `--run-id`.
 - Test-only `run_fixture(config: RunnerConfig, binding: ReleaseSubjectBinding, *, execute: bool, run_id: str) -> dict[str, object]` is the only injected execution helper.
+
+The held observer provenance is the runner raw hash, the ordered four attestor raw hashes/bundle, and the reviewed-provenance raw hash. `fresh_receipt_sha256` is a separate evidence-input identity: the production runner and control attestor receive the same effective `RunnerConfig` and exact `ReleaseSubject`, retain the same subject-bound digest, and validate the receipt's raw bytes and source-main SHA/tree, without treating the receipt as observer provenance.
 
 - [ ] **Step 1: Write the report, drift, and CLI RED tests.**
 
@@ -1001,7 +1012,7 @@ Expected: one canonical file at `D:\gwo-release-evidence\2026-08-09-gwo-v8-beta3
 
 - [ ] **Step 5: Validate the frozen subject independently.**
 
-Run a local read-only validation that loads the fixed file through `load_production_release_subject()`, checks `subject_digest`, verifies `merged_main_sha`, `merged_main_git_tree`, `audited_source_tree_digest`, runner hash, exact attestor list/bundle, and reviewed-provenance hash, then closes the binding. This validation must not call the Guard, GitHub, Paseo, CIM, activation, or provider code.
+Run a local read-only validation that loads the fixed file through `load_production_release_subject()`, checks `subject_digest`, first verifies `fresh_receipt_sha256` against the exact raw canonical receipt bytes, then derives and verifies the canonical fresh Store path/generation/store hash/generation rows, excludes rollback/prior Stores, rejects reparse and sidecars, and proves regular immutable read behavior. Also verify the fixed receipt schema/runbook, Store schema/row, package, root, Git, and old-Store contracts, plus `merged_main_sha`, `merged_main_git_tree`, `audited_source_tree_digest`, runner hash, exact attestor list/bundle, and reviewed-provenance hash, then close the binding. The receipt readback must also show `source_main_sha == merged_main_sha` and `source_main_tree == merged_main_git_tree`. This validation must not call the Guard, GitHub, Paseo, CIM, activation, or provider code.
 
 ---
 
@@ -1052,7 +1063,7 @@ report.mutation_flags is all false
 evidence.mutation_flags is all false
 ```
 
-Also compare Git `HEAD`, `HEAD^{tree}`, `origin/main`, compatibility `source_tree_digest`, runner/attestor hashes, Store/receipt/package readbacks, and legacy quiescence to the same subject. If any field differs, the gate is HOLD and the evidence pair is not repaired in place.
+Also compare Git `HEAD`, `HEAD^{tree}`, `origin/main`, compatibility `source_tree_digest`, the receipt digest and its source-main SHA/tree, runner/attestor hashes, reviewed provenance, Store/receipt/package readbacks, and legacy quiescence to the same subject. If any field differs, the gate is HOLD and the evidence pair is not repaired in place.
 
 - [ ] **Step 4: Record the Phase 4 gate and stop before Phase 5.**
 
@@ -1069,9 +1080,14 @@ The next action requires a fresh owner approval naming repository, exact merged-
 Before declaring this fix wave ready for Phase 4/Phase 5 authorization, verify every item below on one exact final commit:
 
 ```text
-release-subject schema is gwo-v8-release-subject.v1
+release-subject schema is gwo-v8-release-subject.v2; v1 is superseded and not accepted
 subject path is fixed and external
 subject digest hashes canonical body without subject_digest
+fresh_receipt_sha256 hashes the exact raw canonical fresh receipt bytes
+fresh receipt digest is checked before fresh_store/store_generation/store_sha256/generation_rows are derived
+fresh Store uses the canonical directory and controlled timestamp filename, excludes rollback/prior, rejects reparse/sidecars, and is read as a regular immutable file
+fresh receipt schema/runbook, Store schema/rows, package, roots, Git, and old-Store contracts remain fixed
+fresh receipt digest, source_main_sha/source_main_tree, and merged_main_sha/merged_main_git_tree agree
 held no-follow load precedes nonce, source, provider, CIM, and output
 runner/attestor/reviewed-provenance paths and raw hashes match
 attestor order and bundle match the existing length-delimited algorithm
