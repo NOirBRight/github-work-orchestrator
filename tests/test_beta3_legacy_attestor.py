@@ -1053,6 +1053,66 @@ def test_process_reader_uses_stable_candidate_query_and_sorts_rows():
     assert [row["ProcessId"] for row in value] == [17, 22]
 
 
+def test_process_reader_projects_only_stable_lease_candidates():
+    matching = {
+        "ProcessId": 17,
+        "ParentProcessId": 1,
+        "CreationDate": "20260810000017.000000+000",
+        "Name": "python.exe",
+        "ExecutablePath": r"D:\repo\.venv\Scripts\python.exe",
+        "CommandLine": "python -m orch integrate owner/repo v6.1",
+    }
+    unrelated_reads = (
+        {
+            "ProcessId": 901,
+            "ParentProcessId": 1,
+            "CreationDate": "20260810000901.000000+000",
+            "Name": "python.exe",
+            "ExecutablePath": r"D:\other\.venv\Scripts\python.exe",
+            "CommandLine": "python -m helper other/repo",
+        },
+        {
+            "ProcessId": 902,
+            "ParentProcessId": 1,
+            "CreationDate": "20260810000902.000000+000",
+            "Name": "python.exe",
+            "ExecutablePath": r"D:\other\.venv\Scripts\python.exe",
+            "CommandLine": "python -m helper other/repo",
+        },
+    )
+    read_count = 0
+
+    def run(command: tuple[str, ...]) -> bytes:
+        nonlocal read_count
+        row = unrelated_reads[read_count]
+        read_count += 1
+        return canonical_bytes([matching, row])
+
+    reader = CooperativeHostProcessReader(
+        run,
+        "8" * 64,
+        repository_path=r"D:\repo",
+    )
+    first = reader.read("owner/repo")
+    second = reader.read("owner/repo")
+    expected = [
+        {
+            "ProcessId": 17,
+            "ParentProcessId": 1,
+            "CreationDate": "20260810000017.000000+000",
+            "ExecutablePath": r"D:\repo\.venv\Scripts\python.exe",
+            "CommandLine": "python -m orch integrate owner/repo v6.1",
+            "integration_lease": True,
+        }
+    ]
+
+    assert load_canonical_json(first.canonical_payload) == expected
+    assert load_canonical_json(second.canonical_payload) == expected
+    assert first.canonical_payload == second.canonical_payload
+    assert first.record.content_sha256 == second.record.content_sha256
+    assert first.record.identity == second.record.identity
+
+
 def test_github_snapshot_dispatches_are_normalized_into_active_references(
     subject: CutoverSubject,
     attempt: AttemptIdentity,
@@ -1392,7 +1452,7 @@ def test_process_reader_requires_complete_cim_fields_and_marks_exact_lease_match
     assert value[0]["integration_lease"] is True
 
 
-def test_process_reader_keeps_unavailable_fields_for_unrelated_host_processes():
+def test_process_reader_ignores_unavailable_fields_for_unrelated_host_processes():
     row = {
         "ProcessId": 17,
         "ParentProcessId": 1,
@@ -1407,16 +1467,7 @@ def test_process_reader_keeps_unavailable_fields_for_unrelated_host_processes():
         repository_path=r"D:\repo",
     ).read("owner/repo")
     value = load_canonical_json(observed.canonical_payload)
-    assert value == [
-        {
-            "ProcessId": 17,
-            "ParentProcessId": 1,
-            "CreationDate": "20260810000000.000000+000",
-            "ExecutablePath": None,
-            "CommandLine": None,
-            "integration_lease": False,
-        }
-    ]
+    assert value == []
 
 
 def test_process_reader_rejects_incomplete_possible_v61_process():
@@ -1515,7 +1566,12 @@ def test_process_reader_requires_exact_repository_action_and_v61_tokens(
         "8" * 64,
         repository_path=r"D:\repo",
     ).read("owner/repo")
-    assert load_canonical_json(observed.canonical_payload)[0]["integration_lease"] is expected
+    value = load_canonical_json(observed.canonical_payload)
+    if expected:
+        assert len(value) == 1
+        assert value[0]["integration_lease"] is True
+    else:
+        assert value == []
 
 
 def test_production_process_reader_requires_fixed_production_repository_path():
@@ -1541,7 +1597,8 @@ def test_production_process_reader_requires_fixed_production_repository_path():
     ).processes
     observed = reader.read("owner/repo")
     values = load_canonical_json(observed.canonical_payload)
-    assert [row["integration_lease"] for row in values] == [False, True]
+    assert [row["ProcessId"] for row in values] == [2]
+    assert values[0]["integration_lease"] is True
 
 
 def test_process_reader_without_repository_path_cannot_match_lease_owner():
@@ -1556,7 +1613,7 @@ def test_process_reader_without_repository_path_cannot_match_lease_owner():
         lambda command: canonical_bytes([row]),
         "8" * 64,
     ).read("owner/repo")
-    assert load_canonical_json(observed.canonical_payload)[0]["integration_lease"] is False
+    assert load_canonical_json(observed.canonical_payload) == []
 
 
 def test_process_reader_rejects_unqueried_repository_path_claim():
