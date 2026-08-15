@@ -740,7 +740,7 @@ class _CommandReader:
         except BootstrapError:
             raise
         except Exception as error:
-            _unavailable(f"{role} command returned invalid canonical JSON")
+            _unavailable(f"{role} command returned invalid strict JSON")
             raise AssertionError from error
         payload = canonical_bytes(value)
         digest = digest_bytes(payload)
@@ -912,6 +912,16 @@ class CooperativeHostProcessReader(_CommandReader):
     def _matches(self, repository: str, row: Mapping[str, object]) -> bool:
         command_line = row.get("CommandLine", row.get("command_line"))
         if command_line is None:
+            executable = row.get("ExecutablePath", row.get("executable_path"))
+            if executable is not None and self._repository_path is not None:
+                try:
+                    Path(executable).relative_to(self._repository_path)
+                except ValueError:
+                    pass
+                else:
+                    _unavailable(
+                        "process under repository root has no command line"
+                    )
             return False
         if type(command_line) is not str or not command_line:
             _unavailable("process command line is malformed")

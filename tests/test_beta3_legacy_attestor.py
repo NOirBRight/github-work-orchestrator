@@ -908,6 +908,33 @@ def test_command_reader_rejects_duplicate_invalid_or_trailing_json(raw: bytes):
     assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
 
 
+@pytest.mark.parametrize(
+    ("reader_type", "expected_detail"),
+    (
+        (
+            PaseoWorkerInventoryReader,
+            "legacy.workers command returned invalid strict JSON",
+        ),
+        (
+            CooperativeHostProcessReader,
+            "legacy.processes command returned invalid strict JSON",
+        ),
+    ),
+)
+def test_paseo_and_process_readers_reject_invalid_strict_json_at_read_entry(
+    reader_type: type[object],
+    expected_detail: str,
+):
+    raw = b'{"records":'
+
+    with pytest.raises(BootstrapError) as error:
+        reader_type(lambda command: raw, "8" * 64).read("owner/repo")
+
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+    assert error.value.detail == expected_detail
+    assert "invalid canonical JSON" not in error.value.detail
+
+
 def test_paseo_worker_reader_accepts_strict_noncanonical_empty_inventory():
     calls: list[tuple[str, ...]] = []
     raw = b" \n[\n]\n"
@@ -1370,6 +1397,56 @@ def test_process_reader_rejects_incomplete_possible_v61_process():
             "8" * 64,
             repository_path=r"D:\repo",
         ).read("owner/repo")
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    ("executable", "command_line"),
+    (
+        (r"D:\repo\.venv\Scripts\python.exe", None),
+        (None, "python -m orch integrate owner/repo v6.1"),
+    ),
+)
+def test_process_reader_rejects_any_single_invisible_field_for_possible_v61_process(
+    executable: str | None,
+    command_line: str | None,
+):
+    row = {
+        "ProcessId": 17,
+        "ParentProcessId": 1,
+        "CreationDate": "20260810000000.000000+000",
+        "Name": "python.exe",
+        "ExecutablePath": executable,
+        "CommandLine": command_line,
+    }
+
+    with pytest.raises(BootstrapError) as error:
+        CooperativeHostProcessReader(
+            lambda command: canonical_bytes([row]),
+            "8" * 64,
+            repository_path=r"D:\repo",
+        ).read("owner/repo")
+
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+def test_process_reader_rejects_root_wrapper_with_unavailable_command_line():
+    row = {
+        "ProcessId": 17,
+        "ParentProcessId": 1,
+        "CreationDate": "20260810000000.000000+000",
+        "Name": "orch.exe",
+        "ExecutablePath": r"D:\repo\orch.exe",
+        "CommandLine": None,
+    }
+
+    with pytest.raises(BootstrapError) as error:
+        CooperativeHostProcessReader(
+            lambda command: canonical_bytes([row]),
+            "8" * 64,
+            repository_path=r"D:\repo",
+        ).read("owner/repo")
+
     assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
 
 
