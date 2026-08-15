@@ -396,10 +396,11 @@ class _RuntimeRegistrySource:
     def read(self, repository: str) -> SourceObservation:
         command = (
             "paseo",
-            "runtime",
-            "registry",
-            "--repository",
-            repository,
+            "ls",
+            "--global",
+            "--all",
+            "--label",
+            f"gwo.runtime_repository={repository}",
             "--json",
         )
         try:
@@ -413,19 +414,65 @@ class _RuntimeRegistrySource:
                 "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
                 "Runtime registry command did not return exact bytes",
             )
-        try:
-            value = load_canonical_json(payload)
-        except Exception as error:
-            raise BootstrapError(
-                "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
-                "Runtime registry response is not canonical JSON",
-            ) from error
-        canonical = canonical_bytes(value)
-        if canonical != payload:
+        value = _decode_json_response(payload, "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE")
+        if type(value) is not list:
             _fail(
                 "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
-                "Runtime registry bytes are not canonical",
+                "Runtime registry enumeration is not a list",
             )
+        identities: list[str] = []
+        for row in value:
+            if type(row) is not dict:
+                _fail(
+                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+                    "Runtime registry enumeration contains a non-object row",
+                )
+            identity = row.get("id")
+            if type(identity) is not str or not identity:
+                _fail(
+                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+                    "Runtime registry identity is absent",
+                )
+            if identity in identities:
+                _fail(
+                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+                    "Runtime registry identity is duplicated",
+                )
+            identities.append(identity)
+
+        for identity in identities:
+            inspect_command = ("paseo", "inspect", identity, "--json")
+            try:
+                inspect_payload = self._command_runner(inspect_command)
+            except Exception as error:
+                raise BootstrapError(
+                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+                    "Runtime registry inspect read failed",
+                ) from error
+            if type(inspect_payload) is not bytes:
+                _fail(
+                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+                    "Runtime registry inspect did not return exact bytes",
+                )
+            inspect_value = _decode_json_response(
+                inspect_payload,
+                "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            )
+            if type(inspect_value) is not dict or inspect_value.get("Id") != identity:
+                _fail(
+                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+                    "Runtime registry inspect identity differs from enumeration",
+                )
+
+        canonical = _canonical_payload(
+            {
+                "runtimes": [
+                    {"identity": identity}
+                    for identity in sorted(identities)
+                ]
+            },
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+        )
         record = _source_record(
             role="runtime.registry",
             locator=f"runtime-registry://{repository}",
