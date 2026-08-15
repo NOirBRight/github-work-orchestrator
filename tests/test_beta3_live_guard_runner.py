@@ -996,7 +996,7 @@ def test_attestor_observes_control_then_legacy_and_freezes_one_bundle(
     )
     all_targets = tuple(
         target
-        for name, value in (("subject", subject), *readbacks.items())
+        for name, value in readbacks.items()
         for target in (f"{name}.{field}" for field in value.canonical())
     )
     bindings = tuple(
@@ -1087,6 +1087,53 @@ def test_attestor_observes_control_then_legacy_and_freezes_one_bundle(
     assert bundle.attestation_digest
     assert type(lease).__name__ == "BootstrapLease"
     assert set(metadata) >= {"attestation_a", "attestation_b"}
+
+
+def test_attestor_composes_subject_bindings_for_readback_only_components(
+    tmp_path, monkeypatch
+):
+    config = _fixture_config(tmp_path)
+    subject = _exact_fixture_subject(config)
+    dependencies, _calls, _counts = _attested_dependencies(config)
+    monkeypatch.setattr(
+        runner,
+        "_default_subject_factory",
+        lambda _config, _release_subject: subject,
+    )
+    attempt = AttemptIdentity(
+        run_id="beta3-prod-001",
+        challenge_nonce="a" * 32,
+        repository=config.repository,
+        evidence_root=str(config.evidence_root),
+        cutover_subject_digest=digest_value(subject.canonical()),
+        runner_sha256="4" * 64,
+        attestor_sha256="2" * 64,
+    )
+    attestor = runner.ProductionBootstrapAttestor(
+        control_ownership_attestor=dependencies.control_ownership_attestor,
+        legacy_attestor=dependencies.legacy_attestor,
+    )
+
+    bundle, _lease, _metadata = attestor.attest(
+        config,
+        attempt,
+        runner._fixture_release_subject(config),
+    )
+
+    expected_targets = tuple(
+        sorted(
+            target
+            for name, value in (
+                ("subject", subject),
+                *_exact_fixture_readbacks(config, subject).items(),
+            )
+            for target in (f"{name}.{field}" for field in value.canonical())
+        )
+    )
+    assert tuple(binding.target for binding in bundle.field_bindings) == expected_targets
+    assert bundle.attestation_digest == digest_value(
+        bundle.canonical_without_attestation_digest()
+    )
 
 
 def test_attestor_passes_the_same_release_subject_to_control_initial_and_refresh(
@@ -1295,7 +1342,7 @@ def _attested_dependencies(
         )
         all_targets = tuple(
             target
-            for name, value in (("subject", subject), *readbacks.items())
+            for name, value in readbacks.items()
             for target in (f"{name}.{field}" for field in value.canonical())
         )
         bindings = tuple(

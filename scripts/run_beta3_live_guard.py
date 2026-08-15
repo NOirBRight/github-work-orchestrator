@@ -4535,7 +4535,7 @@ class ProductionBootstrapAttestor:
         self._subject_factory = subject_factory
 
     @staticmethod
-    def _bootstrap_contracts() -> tuple[type, type, type, type, type]:
+    def _bootstrap_contracts() -> tuple[type, type, type, type, type, type]:
         try:
             scripts_root = str(_absolute_path(Path(__file__)).parent)
             if scripts_root not in sys.path:
@@ -4545,6 +4545,7 @@ class ProductionBootstrapAttestor:
                 BootstrapError,
                 BootstrapLease,
                 ComponentObservation,
+                FieldBinding,
                 WriterAuthorityObservation,
             )
         except (ImportError, ModuleNotFoundError, OSError) as error:
@@ -4557,6 +4558,7 @@ class ProductionBootstrapAttestor:
             BootstrapError,
             BootstrapLease,
             ComponentObservation,
+            FieldBinding,
             WriterAuthorityObservation,
         )
 
@@ -4573,7 +4575,9 @@ class ProductionBootstrapAttestor:
         control: object,
         legacy: object,
         *,
+        subject: object,
         component_type: type,
+        field_binding_type: type,
     ) -> tuple[object, object]:
         if type(control) is not component_type or type(legacy) is not component_type:
             raise ValueError(
@@ -4587,9 +4591,20 @@ class ProductionBootstrapAttestor:
         )
         if not records or len({record.digest for record in records}) != len(records):
             raise ValueError("component source records are not unique")
+        canonical = getattr(subject, "canonical", None)
+        if not callable(canonical):
+            raise ValueError("subject has no canonical projection")
+        subject_bindings = tuple(
+            field_binding_type(
+                target=f"subject.{field}",
+                source_record_digests=tuple(record.digest for record in records),
+                derivation="subject.canonical",
+            )
+            for field in canonical()
+        )
         bindings = tuple(
             sorted(
-                (*control.field_bindings, *legacy.field_bindings),
+                (*control.field_bindings, *legacy.field_bindings, *subject_bindings),
                 key=lambda binding: binding.target,
             )
         )
@@ -4673,6 +4688,7 @@ class ProductionBootstrapAttestor:
             bootstrap_error,
             lease_type,
             component_type,
+            field_binding_type,
             writer_type,
         ) = self._bootstrap_contracts()
         try:
@@ -4713,7 +4729,9 @@ class ProductionBootstrapAttestor:
             merged_control, merged_legacy = self._merge_components(
                 control_a,
                 legacy_a,
+                subject=subject,
                 component_type=component_type,
+                field_binding_type=field_binding_type,
             )
             bundle = bundle_type.create(
                 attempt=attempt,
@@ -5457,9 +5475,16 @@ def _run_bound(
                     _bootstrap_error,
                     bootstrap_lease_type,
                     _component_type,
+                    _field_binding_type,
                     _writer_type,
                 ) = ProductionBootstrapAttestor._bootstrap_contracts()
-                del _bundle_type, _bootstrap_error, _component_type, _writer_type
+                del (
+                    _bundle_type,
+                    _bootstrap_error,
+                    _component_type,
+                    _field_binding_type,
+                    _writer_type,
+                )
                 if type(lease) is not bootstrap_lease_type:
                     raise RunnerError(
                         "LEASE_INVALID", "attestation did not return a BootstrapLease"
