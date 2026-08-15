@@ -967,7 +967,7 @@ def test_process_reader_accepts_strict_noncanonical_empty_inventory():
             "-NonInteractive",
             "-Command",
             "Get-CimInstance Win32_Process | Select-Object ProcessId, "
-            "ParentProcessId, CreationDate, ExecutablePath, CommandLine | "
+            "ParentProcessId, CreationDate, Name, ExecutablePath, CommandLine | "
             "ConvertTo-Json -Compress",
         )
     ]
@@ -1297,6 +1297,7 @@ def test_process_reader_requires_complete_cim_fields_and_marks_exact_lease_match
             "ProcessId": 17,
             "ParentProcessId": 1,
             "CreationDate": "20260810000000.000000+000",
+            "Name": "python.exe",
             "ExecutablePath": r"D:\repo\.venv\Scripts\python.exe",
             "CommandLine": "python -m orch integrate owner/repo v6.1",
         },
@@ -1320,11 +1321,56 @@ def test_process_reader_requires_complete_cim_fields_and_marks_exact_lease_match
             "-NonInteractive",
             "-Command",
             "Get-CimInstance Win32_Process | Select-Object ProcessId, "
-            "ParentProcessId, CreationDate, ExecutablePath, CommandLine | "
+            "ParentProcessId, CreationDate, Name, ExecutablePath, CommandLine | "
             "ConvertTo-Json -Compress",
         )
     ]
     assert value[0]["integration_lease"] is True
+
+
+def test_process_reader_keeps_unavailable_fields_for_unrelated_host_processes():
+    row = {
+        "ProcessId": 17,
+        "ParentProcessId": 1,
+        "CreationDate": "20260810000000.000000+000",
+        "Name": "svchost.exe",
+        "ExecutablePath": None,
+        "CommandLine": None,
+    }
+    observed = CooperativeHostProcessReader(
+        lambda command: canonical_bytes([row]),
+        "8" * 64,
+        repository_path=r"D:\repo",
+    ).read("owner/repo")
+    value = load_canonical_json(observed.canonical_payload)
+    assert value == [
+        {
+            "ProcessId": 17,
+            "ParentProcessId": 1,
+            "CreationDate": "20260810000000.000000+000",
+            "ExecutablePath": None,
+            "CommandLine": None,
+            "integration_lease": False,
+        }
+    ]
+
+
+def test_process_reader_rejects_incomplete_possible_v61_process():
+    row = {
+        "ProcessId": 17,
+        "ParentProcessId": 1,
+        "CreationDate": "20260810000000.000000+000",
+        "Name": "python.exe",
+        "ExecutablePath": None,
+        "CommandLine": None,
+    }
+    with pytest.raises(BootstrapError) as error:
+        CooperativeHostProcessReader(
+            lambda command: canonical_bytes([row]),
+            "8" * 64,
+            repository_path=r"D:\repo",
+        ).read("owner/repo")
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
 
 
 @pytest.mark.parametrize(
