@@ -1308,6 +1308,26 @@ def test_runtime_config_accepts_current_optional_configuration_keys():
     assert tuple(item.selector for item in runtime.selectors) == attestor_module.RUNTIME_SELECTORS
 
 
+def test_runtime_config_accepts_documented_full_configuration_shape():
+    value = json.loads(
+        (ROOT / "skills" / "orchestrator" / "templates" / "config.example.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    _configuration, runtime = attestor_module._runtime_config_value(
+        canonical_bytes(value), "owner/repo"
+    )
+
+    assert tuple(item.selector for item in runtime.selectors) == (
+        "coordinator",
+        "worker",
+        "recovery_worker",
+        "review_primary",
+        "review_strong",
+    )
+
+
 def test_source_observation_rejects_content_hash_drift():
     subject = _subject()
     attempt = _attempt(subject)
@@ -2081,13 +2101,17 @@ def test_runtime_config_uses_current_main_empty_features_default():
 
 @pytest.mark.parametrize("location", ("top", "global", "repository"))
 def test_runtime_config_rejects_unknown_mapping_keys(location):
-    value = load_canonical_json(_RuntimeConfig().read().canonical_payload)
+    value = json.loads(
+        (ROOT / "skills" / "orchestrator" / "templates" / "config.example.json").read_text(
+            encoding="utf-8"
+        )
+    )
     if location == "top":
         value["unknown"] = True
     elif location == "global":
         value["global"]["unknown"] = True
     else:
-        value["repositories"] = {"owner/repo": {"unknown": True}}
+        value["repositories"]["owner/repo"]["unknown"] = True
 
     with pytest.raises(BootstrapError) as error:
         attestor_module._runtime_config_value(canonical_bytes(value), "owner/repo")

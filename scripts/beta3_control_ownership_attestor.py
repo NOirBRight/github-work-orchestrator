@@ -84,6 +84,46 @@ RUNTIME_ROLE_PROFILES = (
     "reviewer_standard",
     "reviewer_strict",
 )
+_RUNTIME_CONFIG_TOP_LEVEL_KEYS = frozenset(
+    {
+        "schema_version",
+        "global",
+        "tiers",
+        "role_profiles",
+        "review_profiles",
+        "active_turn_pools",
+        "reviewer_tiers",
+        "repositories",
+    }
+)
+_RUNTIME_CONFIG_GLOBAL_KEYS = frozenset(
+    {
+        "default_tier",
+        "execution_slots",
+        "worker_slots",
+        "integration_wip_limit",
+        "max_attempts",
+        "intake",
+    }
+)
+_RUNTIME_CONFIG_REPOSITORY_KEYS = frozenset(
+    {
+        "integration_branch",
+        "workspace_id",
+        "merge_method",
+        "execution_slots",
+        "worker_slots",
+        "integration_wip_limit",
+        "default_tier",
+        "milestone_tiers",
+        "tiers",
+        "role_profiles",
+        "review_profiles",
+        "active_turn_pools",
+        "project_number",
+        "intake",
+    }
+)
 LEGACY_FENCE_PATH = CONTROL_PATHS[2]
 WRITER_PATH = CONTROL_PATHS[0]
 ACTIVE_PLAN_PATH = CONTROL_PATHS[1]
@@ -2199,15 +2239,7 @@ def _runtime_config_value(
         type(value) is not dict
         or value.get("schema_version") != 1
         or not {"global", "tiers", "role_profiles"} <= set(value)
-        or set(value)
-        - {
-            "schema_version",
-            "global",
-            "tiers",
-            "role_profiles",
-            "reviewer_tiers",
-            "repositories",
-        }
+        or set(value) - _RUNTIME_CONFIG_TOP_LEVEL_KEYS
         or type(repository) is not str
         or not repository
     ):
@@ -2220,7 +2252,7 @@ def _runtime_config_value(
         reviewer_tiers = value.get("reviewer_tiers", {})
         if (
             type(global_value) is not dict
-            or set(global_value) - {"default_tier", "execution_slots"}
+            or set(global_value) - _RUNTIME_CONFIG_GLOBAL_KEYS
             or type(tiers) is not dict
             or not tiers
             or type(role_profiles) is not dict
@@ -2283,7 +2315,7 @@ def _runtime_config_value(
                 type(configured_repository) is not str
                 or "/" not in configured_repository
                 or type(configured_value) is not dict
-                or set(configured_value) - {"default_tier", "tiers", "role_profiles"}
+                or set(configured_value) - _RUNTIME_CONFIG_REPOSITORY_KEYS
             ):
                 raise ValueError("repository Runtime configuration is malformed")
             configured_tiers = configured_value.get("tiers", {})
@@ -2308,11 +2340,10 @@ def _runtime_config_value(
                 validate_profile_shape(raw)
 
         repository_value = repositories.get(repository, {})
-        if type(repository_value) is not dict or set(repository_value) - {
-            "default_tier",
-            "tiers",
-            "role_profiles",
-        }:
+        if (
+            type(repository_value) is not dict
+            or set(repository_value) - _RUNTIME_CONFIG_REPOSITORY_KEYS
+        ):
             raise ValueError("repository Runtime configuration is malformed")
         repository_tiers = repository_value.get("tiers", {})
         repository_roles = repository_value.get("role_profiles", {})
