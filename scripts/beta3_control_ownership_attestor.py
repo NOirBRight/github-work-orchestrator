@@ -3493,7 +3493,11 @@ def _validate_config_subject(
         "control_branch": "gwo-control",
         "target_branch": "main",
         "source_writer_generation": "v6.1",
-        "target_writer_generation": "v8",
+        "target_writer_generation": (
+            "v8-generation-1"
+            if subject.repository == PRODUCTION_REPOSITORY
+            else "v8"
+        ),
         "required_runtime_selectors": RUNTIME_SELECTORS,
         "package_names": ("implement-gwo", "orchestrator"),
         "install_surfaces": (".agents", ".codex", ".claude"),

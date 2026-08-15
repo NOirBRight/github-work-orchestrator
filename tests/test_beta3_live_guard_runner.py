@@ -59,6 +59,10 @@ from beta3_bootstrap_model import (  # noqa: E402
 from beta3_replay_guard import ReplayResult, evaluate_attested_bundle  # noqa: E402
 
 
+def test_production_default_targets_established_v8_generation():
+    assert runner.DEFAULT_CONFIG.target_writer_generation == "v8-generation-1"
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

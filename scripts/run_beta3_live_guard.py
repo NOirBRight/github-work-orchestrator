@@ -39,7 +39,7 @@ REPOSITORY = "NOirBRight/github-work-orchestrator"
 CONTROL_BRANCH = "gwo-control"
 TARGET_BRANCH = "main"
 SOURCE_WRITER_GENERATION = "v6.1"
-TARGET_WRITER_GENERATION = "v8"
+TARGET_WRITER_GENERATION = "v8-generation-1"
 FRESH_STORE = Path(
     r"C:\Users\noirb\.orch\v8\NOirBRight__github-work-orchestrator"
     r"\store-20260809T081500Z.sqlite3"
