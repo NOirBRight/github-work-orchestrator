@@ -40,6 +40,7 @@ from beta3_legacy_attestor import (  # noqa: E402
     LegacyAttestor,
     LegacySourceSet,
     PaseoWorkerInventoryReader,
+    _process_query,
     assert_same_legacy_observation,
     production_legacy_sources,
 )
@@ -993,9 +994,7 @@ def test_process_reader_accepts_strict_noncanonical_empty_inventory():
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Get-CimInstance Win32_Process | Select-Object ProcessId, "
-            "ParentProcessId, CreationDate, Name, ExecutablePath, CommandLine | "
-            "ConvertTo-Json -Compress",
+            _process_query(None, "owner/repo"),
         )
     ]
     assert observed == SourceObservation(
@@ -1012,6 +1011,46 @@ def test_process_reader_accepts_strict_noncanonical_empty_inventory():
         canonical_bytes([]),
         True,
     )
+
+
+def test_process_reader_uses_stable_candidate_query_and_sorts_rows():
+    calls: list[tuple[str, ...]] = []
+    rows = [
+        {
+            "ProcessId": 22,
+            "ParentProcessId": 1,
+            "CreationDate": "20260810000022.000000+000",
+            "Name": "python.exe",
+            "ExecutablePath": r"D:\repo\.venv\Scripts\python.exe",
+            "CommandLine": "python -m orch integrate owner/repo v6.1",
+        },
+        {
+            "ProcessId": 17,
+            "ParentProcessId": 1,
+            "CreationDate": "20260810000017.000000+000",
+            "Name": "python.exe",
+            "ExecutablePath": r"D:\repo\.venv\Scripts\python.exe",
+            "CommandLine": "python -m orch deliver owner/repo v6.1",
+        },
+    ]
+
+    def run(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        return canonical_bytes(rows)
+
+    observed = CooperativeHostProcessReader(
+        run,
+        "8" * 64,
+        repository_path=r"D:\repo",
+    ).read("owner/repo")
+    value = load_canonical_json(observed.canonical_payload)
+
+    assert len(calls) == 1
+    query = calls[0][-1]
+    assert "$observerPid = $PID" in query
+    assert "Where-Object" in query
+    assert "Sort-Object ProcessId, CreationDate" in query
+    assert [row["ProcessId"] for row in value] == [17, 22]
 
 
 def test_github_snapshot_dispatches_are_normalized_into_active_references(
@@ -1347,9 +1386,7 @@ def test_process_reader_requires_complete_cim_fields_and_marks_exact_lease_match
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Get-CimInstance Win32_Process | Select-Object ProcessId, "
-            "ParentProcessId, CreationDate, Name, ExecutablePath, CommandLine | "
-            "ConvertTo-Json -Compress",
+            _process_query(r"D:\repo", "owner/repo"),
         )
     ]
     assert value[0]["integration_lease"] is True

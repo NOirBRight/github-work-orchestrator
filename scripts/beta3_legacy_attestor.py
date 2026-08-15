@@ -868,7 +868,7 @@ class CooperativeHostProcessReader(_CommandReader):
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            _PROCESS_QUERY,
+            _process_query(self._repository_path, repository),
         )
         observation = self._json(
             command,
@@ -895,6 +895,7 @@ class CooperativeHostProcessReader(_CommandReader):
             item = {field: row[field] for field in fixed_fields}
             item["integration_lease"] = self._matches(repository, row)
             normalized.append(item)
+        normalized.sort(key=lambda item: (item["ProcessId"], item["CreationDate"]))
         payload = canonical_bytes(normalized)
         digest = digest_bytes(payload)
         record = SourceRecord(
@@ -1240,11 +1241,40 @@ commits(last:1){totalCount pageInfo{hasNextPage} nodes{commit{statusCheckRollup{
 )
 
 
-_PROCESS_QUERY = (
-    "Get-CimInstance Win32_Process | "
-    "Select-Object ProcessId, ParentProcessId, CreationDate, Name, ExecutablePath, CommandLine | "
-    "ConvertTo-Json -Compress"
-)
+def _powershell_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _process_query(repository_path: str | None, repository: str) -> str:
+    root = "" if repository_path is None else repository_path
+    return (
+        "$observerPid = $PID; "
+        f"$root = {_powershell_literal(root)}; "
+        f"$repository = {_powershell_literal(repository)}; "
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { "
+        "if ($_.ProcessId -eq $observerPid) { return $false }; "
+        "$name = [string]$_.Name; "
+        "$executable = [string]$_.ExecutablePath; "
+        "$commandLine = [string]$_.CommandLine; "
+        "$underRoot = $false; "
+        "if ($root) { "
+        "$underRoot = $executable.StartsWith($root + '\\', "
+        "[System.StringComparison]::OrdinalIgnoreCase) -or "
+        "$executable.Equals($root, [System.StringComparison]::OrdinalIgnoreCase) "
+        "}; "
+        "$v61Command = $commandLine -and "
+        "$commandLine.IndexOf($repository, "
+        "[System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and "
+        "$commandLine -match '(?i)\\b(integrate|deliver)\\b' -and "
+        "$commandLine -match '(?i)\\bv6\\.1\\b'; "
+        "return ($name -match '^(?i:python(?:\\d+(?:\\.\\d+)?)?w?\\.exe)$' "
+        "-or $underRoot -or $v61Command) "
+        "} | "
+        "Sort-Object ProcessId, CreationDate | "
+        "Select-Object ProcessId, ParentProcessId, CreationDate, Name, ExecutablePath, CommandLine | "
+        "ConvertTo-Json -Compress"
+    )
 
 _PRODUCTION_REPOSITORY_PATH = r"D:\Workstation\github-work-orchestrator"
 
