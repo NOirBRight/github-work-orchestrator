@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 from pathlib import Path
 import sys
 
@@ -15,9 +16,11 @@ for path in (EXACT_SCRIPTS, SCRIPTS):
         sys.path.insert(0, str(path))
 
 from gwo_v8._canonical import (  # noqa: E402
+    CanonicalJsonError,
     canonical_bytes,
     digest_value,
     load_canonical_json,
+    strict_json_loads,
 )
 from gwo_v8.cutover_guard import (  # noqa: E402
     CutoverSubject,
@@ -859,6 +862,131 @@ def test_github_dispatch_reader_keeps_complete_response_digest_and_read_only_com
     assert observed.record.identity == (("observation_digest", observed.record.content_sha256),)
 
 
+def test_command_reader_accepts_strict_noncanonical_json_and_canonicalizes_payload():
+    payload = _github_payload()
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    expected_payload = canonical_bytes(payload)
+    assert raw != expected_payload
+
+    observed = GitHubDispatchSnapshotReader(
+        lambda command: raw,
+        "8" * 64,
+    ).read("owner/repo")
+
+    assert type(observed) is SourceObservation
+    assert observed.complete is True
+    assert observed.canonical_payload == expected_payload
+    assert observed.record.repository == "owner/repo"
+    assert observed.record.role == "legacy.dispatches"
+    assert observed.record.read_mode == "COMPLETE_DOUBLE_READ"
+    assert observed.record.content_sha256 == digest_value(payload)
+    assert observed.record.identity == (
+        ("observation_digest", digest_value(payload)),
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        pytest.param(b'{"data": {}, "data": {}}', id="duplicate-key"),
+        pytest.param(b'{"data":', id="malformed-json"),
+        pytest.param(b'{"data": {}} trailing garbage', id="trailing-garbage"),
+        pytest.param(b'{"data": NaN}', id="nan"),
+        pytest.param(b'{"data": Infinity}', id="infinity"),
+        pytest.param(b"\xff", id="invalid-utf8"),
+    ),
+)
+def test_command_reader_rejects_duplicate_invalid_or_trailing_json(raw: bytes):
+    with pytest.raises(CanonicalJsonError):
+        strict_json_loads(raw)
+
+    with pytest.raises(BootstrapError) as error:
+        GitHubDispatchSnapshotReader(
+            lambda command: raw,
+            "8" * 64,
+        ).read("owner/repo")
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+def test_paseo_worker_reader_accepts_strict_noncanonical_empty_inventory():
+    calls: list[tuple[str, ...]] = []
+    raw = b" \n[\n]\n"
+
+    def run(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        return raw
+
+    observed = PaseoWorkerInventoryReader(run, "8" * 64).read("owner/repo")
+    expected = {"repository": "owner/repo", "workers": [], "inventory": []}
+    digest = digest_value(expected)
+
+    assert calls == [
+        (
+            "paseo",
+            "ls",
+            "--global",
+            "--all",
+            "--label",
+            "orch.repository=owner/repo",
+            "--label",
+            "orch.role=worker",
+            "--json",
+        )
+    ]
+    assert observed == SourceObservation(
+        SourceRecord(
+            role="legacy.workers",
+            locator="paseo://global/worker-inventory/owner/repo",
+            repository="owner/repo",
+            read_mode="COMPLETE_DOUBLE_READ",
+            identity=(("observation_digest", digest),),
+            content_sha256=digest,
+            readback_digest=None,
+            producer_sha256="8" * 64,
+        ),
+        canonical_bytes(expected),
+        True,
+    )
+
+
+def test_process_reader_accepts_strict_noncanonical_empty_inventory():
+    calls: list[tuple[str, ...]] = []
+    raw = b" \n[\n]\n"
+
+    def run(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        return raw
+
+    observed = CooperativeHostProcessReader(run, "8" * 64).read("owner/repo")
+    digest = digest_value([])
+
+    assert calls == [
+        (
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process | Select-Object ProcessId, "
+            "ParentProcessId, CreationDate, Name, ExecutablePath, CommandLine | "
+            "ConvertTo-Json -Compress",
+        )
+    ]
+    assert observed == SourceObservation(
+        SourceRecord(
+            role="legacy.processes",
+            locator="host://cim/win32-process",
+            repository="owner/repo",
+            read_mode="COMPLETE_DOUBLE_READ",
+            identity=(("observation_digest", digest),),
+            content_sha256=digest,
+            readback_digest=None,
+            producer_sha256="8" * 64,
+        ),
+        canonical_bytes([]),
+        True,
+    )
+
+
 def test_github_snapshot_dispatches_are_normalized_into_active_references(
     subject: CutoverSubject,
     attempt: AttemptIdentity,
@@ -1169,6 +1297,7 @@ def test_process_reader_requires_complete_cim_fields_and_marks_exact_lease_match
             "ProcessId": 17,
             "ParentProcessId": 1,
             "CreationDate": "20260810000000.000000+000",
+            "Name": "python.exe",
             "ExecutablePath": r"D:\repo\.venv\Scripts\python.exe",
             "CommandLine": "python -m orch integrate owner/repo v6.1",
         },
@@ -1192,11 +1321,56 @@ def test_process_reader_requires_complete_cim_fields_and_marks_exact_lease_match
             "-NonInteractive",
             "-Command",
             "Get-CimInstance Win32_Process | Select-Object ProcessId, "
-            "ParentProcessId, CreationDate, ExecutablePath, CommandLine | "
+            "ParentProcessId, CreationDate, Name, ExecutablePath, CommandLine | "
             "ConvertTo-Json -Compress",
         )
     ]
     assert value[0]["integration_lease"] is True
+
+
+def test_process_reader_keeps_unavailable_fields_for_unrelated_host_processes():
+    row = {
+        "ProcessId": 17,
+        "ParentProcessId": 1,
+        "CreationDate": "20260810000000.000000+000",
+        "Name": "svchost.exe",
+        "ExecutablePath": None,
+        "CommandLine": None,
+    }
+    observed = CooperativeHostProcessReader(
+        lambda command: canonical_bytes([row]),
+        "8" * 64,
+        repository_path=r"D:\repo",
+    ).read("owner/repo")
+    value = load_canonical_json(observed.canonical_payload)
+    assert value == [
+        {
+            "ProcessId": 17,
+            "ParentProcessId": 1,
+            "CreationDate": "20260810000000.000000+000",
+            "ExecutablePath": None,
+            "CommandLine": None,
+            "integration_lease": False,
+        }
+    ]
+
+
+def test_process_reader_rejects_incomplete_possible_v61_process():
+    row = {
+        "ProcessId": 17,
+        "ParentProcessId": 1,
+        "CreationDate": "20260810000000.000000+000",
+        "Name": "python.exe",
+        "ExecutablePath": None,
+        "CommandLine": None,
+    }
+    with pytest.raises(BootstrapError) as error:
+        CooperativeHostProcessReader(
+            lambda command: canonical_bytes([row]),
+            "8" * 64,
+            repository_path=r"D:\repo",
+        ).read("owner/repo")
+    assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
 
 
 @pytest.mark.parametrize(

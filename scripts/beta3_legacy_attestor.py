@@ -7,7 +7,13 @@ import shlex
 from typing import Callable, Mapping
 
 import orch_core
-from gwo_v8._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
+from gwo_v8._canonical import (
+    canonical_bytes,
+    digest_bytes,
+    digest_value,
+    load_canonical_json,
+    strict_json_loads,
+)
 from gwo_v8.cutover_guard import CutoverSubject, LegacyReadback
 
 from beta3_bootstrap_model import (
@@ -460,12 +466,36 @@ def _process_fields(record: Mapping[str, object]) -> tuple[object, ...]:
         value = record.get(primary, record.get(alternate))
         if index < 2:
             valid = type(value) is int
-        else:
+        elif index == 2:
             valid = type(value) is str and bool(value)
+        else:
+            valid = value is None or (type(value) is str and bool(value))
         if not valid:
             _unavailable(f"process inventory field is missing: {primary}")
         values.append(value)
     return tuple(values)
+
+
+_POSSIBLE_V61_PROCESS_NAME = re.compile(
+    r"^python(?:\d+(?:\.\d+)?)?w?\.exe$",
+    re.IGNORECASE,
+)
+
+
+def _validate_process_visibility(record: Mapping[str, object]) -> None:
+    executable = record.get("ExecutablePath", record.get("executable_path"))
+    command_line = record.get("CommandLine", record.get("command_line"))
+    if executable is not None and (type(executable) is not str or not executable):
+        _unavailable("process executable path is malformed")
+    if command_line is not None and (type(command_line) is not str or not command_line):
+        _unavailable("process command line is malformed")
+    if executable is not None and command_line is not None:
+        return
+    name = record.get("Name")
+    if type(name) is not str or not name:
+        _unavailable("incomplete process visibility has no executable name")
+    if _POSSIBLE_V61_PROCESS_NAME.fullmatch(name):
+        _unavailable("possible V6.1 process has incomplete visibility")
 
 
 class LegacyAttestor:
@@ -706,7 +736,7 @@ class _CommandReader:
             raw = self._command_runner(command)
             if type(raw) is not bytes:
                 _unavailable(f"{role} command did not return exact bytes")
-            value = load_canonical_json(raw)
+            value = strict_json_loads(raw)
         except BootstrapError:
             raise
         except Exception as error:
@@ -851,16 +881,18 @@ class CooperativeHostProcessReader(_CommandReader):
         rows = _process_inventory_rows(value)
         normalized: list[dict[str, object]] = []
         for row in rows:
-            if set(row) != {
+            fixed_fields = {
                 "ProcessId",
                 "ParentProcessId",
                 "CreationDate",
                 "ExecutablePath",
                 "CommandLine",
-            }:
+            }
+            if set(row) not in (fixed_fields, fixed_fields | {"Name"}):
                 _unavailable("process inventory row differs from the fixed CIM projection")
             _process_fields(row)
-            item = dict(row)
+            _validate_process_visibility(row)
+            item = {field: row[field] for field in fixed_fields}
             item["integration_lease"] = self._matches(repository, row)
             normalized.append(item)
         payload = canonical_bytes(normalized)
@@ -879,7 +911,9 @@ class CooperativeHostProcessReader(_CommandReader):
 
     def _matches(self, repository: str, row: Mapping[str, object]) -> bool:
         command_line = row.get("CommandLine", row.get("command_line"))
-        if type(command_line) is not str:
+        if command_line is None:
+            return False
+        if type(command_line) is not str or not command_line:
             _unavailable("process command line is malformed")
         try:
             tokens = tuple(token.strip('"') for token in shlex.split(command_line, posix=False))
@@ -895,8 +929,8 @@ class CooperativeHostProcessReader(_CommandReader):
         if self._repository_path is None:
             return False
         executable = row.get("ExecutablePath", row.get("executable_path"))
-        if type(executable) is not str:
-            return False
+        if type(executable) is not str or not executable:
+            _unavailable("possible V6.1 process has no executable path")
         executable_path = Path(executable)
         try:
             return str(executable_path.parent.parent.parent) == self._repository_path
@@ -1198,7 +1232,7 @@ commits(last:1){totalCount pageInfo{hasNextPage} nodes{commit{statusCheckRollup{
 
 _PROCESS_QUERY = (
     "Get-CimInstance Win32_Process | "
-    "Select-Object ProcessId, ParentProcessId, CreationDate, ExecutablePath, CommandLine | "
+    "Select-Object ProcessId, ParentProcessId, CreationDate, Name, ExecutablePath, CommandLine | "
     "ConvertTo-Json -Compress"
 )
 
