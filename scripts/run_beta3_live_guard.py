@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -5098,10 +5099,17 @@ def _fixture_attestor_source_sha256() -> str:
 
 
 def _production_source_command(command: tuple[str, ...]) -> bytes:
-    if type(command) is not tuple or any(type(item) is not str for item in command):
+    if (
+        type(command) is not tuple
+        or not command
+        or any(type(item) is not str for item in command)
+    ):
         raise OSError("source command is not an exact tuple")
+    executable = shutil.which(command[0])
+    if type(executable) is not str:
+        raise OSError("source command executable is unavailable")
     completed = subprocess.run(
-        list(command),
+        [executable, *command[1:]],
         check=True,
         capture_output=True,
     )
