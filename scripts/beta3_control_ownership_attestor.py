@@ -1127,7 +1127,6 @@ def _decode_writer_records(
         selected.kind != "rollback"
         or selected.status != "rolled_back"
         or selected.writer_generation != source_generation
-        or selected.activation_id is not None
         or selected.plan_digest != active_plan["active_plan_digest"]
         or current["writer_generation"] != selected.writer_generation
     ):
@@ -1141,6 +1140,11 @@ def _decode_writer_records(
         _fail("WRITER_FENCE_SOURCE_UNAVAILABLE", "Activation Receipt generation is not V8")
     if len(active_receipts) != 1 or active_receipts[0]["writer_generation"] != target_generation:
         _fail("WRITER_FENCE_SOURCE_UNAVAILABLE", "Writer rollback is not bound to the active V8 plan")
+    if (
+        selected.activation_id is not None
+        and selected.activation_id != active_receipts[0]["activation_id"]
+    ):
+        _fail("WRITER_FENCE_SOURCE_UNAVAILABLE", "Writer rollback Activation Receipt binding is invalid")
     return selected, active_receipts[0], tuple(decoded)
 
 

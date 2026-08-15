@@ -2374,6 +2374,190 @@ def test_control_accepts_only_complete_returned_response_identity():
     assert len(records) == 4
 
 
+def test_control_accepts_historical_plan_activation_writer_record():
+    subject = replace(_subject(), target_writer_generation="v8-generation-1")
+    plan_one = "1" * 64
+    plan_two = "3" * 64
+    plan_three = "4" * 64
+    pending = _writer_record(
+        repository=subject.repository,
+        kind="cutover_pending",
+        status="pending",
+        previous_writer_generation="v6.1",
+        writer_generation="v8-generation-1",
+        activation_id=None,
+        plan_digest=plan_one,
+        canary_evidence_digest="2" * 64,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason=None,
+        created_at="2026-08-10T00:00:00Z",
+    )
+    cutover = _writer_record(
+        repository=subject.repository,
+        kind="cutover",
+        status="cut_over",
+        previous_writer_generation="v8-generation-1",
+        writer_generation="v8-generation-1",
+        activation_id="activation:1",
+        plan_digest=plan_one,
+        canary_evidence_digest="2" * 64,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+        reason=None,
+        created_at="2026-08-10T00:00:01Z",
+    )
+    plan_activation = _writer_record(
+        repository=subject.repository,
+        kind="plan_activation",
+        status="cut_over",
+        previous_writer_generation="v8-generation-1",
+        writer_generation="v8-generation-1",
+        activation_id="activation:2",
+        plan_digest=plan_two,
+        canary_evidence_digest="2" * 64,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=8,
+        coordinator_capacity=1,
+        reason=None,
+        created_at="2026-08-10T00:00:02Z",
+    )
+    draining = _writer_record(
+        repository=subject.repository,
+        kind="drain",
+        status="draining",
+        previous_writer_generation="v8-generation-1",
+        writer_generation="v8-generation-1",
+        activation_id="activation:2",
+        plan_digest=plan_two,
+        canary_evidence_digest="2" * 64,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="drain",
+        created_at="2026-08-10T00:00:03Z",
+    )
+    corrective_draining = _writer_record(
+        repository=subject.repository,
+        kind="drain",
+        status="draining",
+        previous_writer_generation="v8-generation-1",
+        writer_generation="v8-generation-1",
+        activation_id="activation:3",
+        plan_digest=plan_three,
+        canary_evidence_digest="2" * 64,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="corrective drain",
+        created_at="2026-08-10T00:00:04Z",
+    )
+    rollback = _writer_record(
+        repository=subject.repository,
+        kind="rollback",
+        status="rolled_back",
+        previous_writer_generation="v8-generation-1",
+        writer_generation="v6.1",
+        activation_id="activation:3",
+        plan_digest=plan_three,
+        canary_evidence_digest=None,
+        canary_evidence_refs=("canary:1",),
+        canary_manifest_ref="manifest:1",
+        worker_capacity=0,
+        coordinator_capacity=0,
+        reason="rollback after correction",
+        created_at="2026-08-10T00:00:05Z",
+    )
+    source = _ExactControlFixture()
+    source.writer_bytes = canonical_bytes(
+        {
+            "schema_version": 1,
+            "current": {
+                "repository": subject.repository,
+                "writer_generation": "v6.1",
+                "record_id": rollback.record_id,
+            },
+            "records": [
+                {
+                    **record.__dict__,
+                    "canary_evidence_refs": list(record.canary_evidence_refs),
+                }
+                for record in (
+                    pending,
+                    cutover,
+                    plan_activation,
+                    draining,
+                    corrective_draining,
+                    rollback,
+                )
+            ],
+        }
+    )
+    source.active_plan_bytes = canonical_bytes(
+        {
+            "schema_version": 1,
+            "repository": subject.repository,
+            "active_plan_digest": plan_three,
+            "receipts": [
+                {
+                    "schema_version": 1,
+                    "repository": subject.repository,
+                    "writer_generation": "v8-generation-1",
+                    "activation_id": "activation:1",
+                    "plan_digest": plan_one,
+                    "expected_previous_digest": None,
+                    "plan_record_ref": "plan:1",
+                    "created_at": "2026-08-10T00:00:01Z",
+                },
+                {
+                    "schema_version": 1,
+                    "repository": subject.repository,
+                    "writer_generation": "v8-generation-1",
+                    "activation_id": "activation:2",
+                    "plan_digest": plan_two,
+                    "expected_previous_digest": plan_one,
+                    "plan_record_ref": "plan:2",
+                    "created_at": "2026-08-10T00:00:02Z",
+                },
+                {
+                    "schema_version": 1,
+                    "repository": subject.repository,
+                    "writer_generation": "v8-generation-1",
+                    "activation_id": "activation:3",
+                    "plan_digest": plan_three,
+                    "expected_previous_digest": plan_two,
+                    "plan_record_ref": "plan:3",
+                    "created_at": "2026-08-10T00:00:04Z",
+                },
+            ],
+        }
+    )
+    source.legacy_fence_bytes = canonical_bytes(
+        {
+            "schema_version": 1,
+            "repository": subject.repository,
+            "stopped": True,
+            "events": [{"action_key": "stop:1", "operation": "stop"}],
+        }
+    )
+
+    fence, authority, _records = attestor_module._read_control(
+        source,
+        subject=subject,
+        attempt=_attempt(subject),
+    )
+
+    assert fence.record_id == rollback.record_id
+    assert authority.record_id == rollback.record_id
+
+
 def test_github_ref_adapter_retains_response_repository_ref_oid_and_type():
     oid = "1" * 40
     response = {
