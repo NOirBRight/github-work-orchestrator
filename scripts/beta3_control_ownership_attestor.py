@@ -33,7 +33,10 @@ from beta3_bootstrap_model import (
     SourceRecord,
     WriterAuthorityObservation,
 )
-from beta3_release_subject import ReleaseSubject
+from beta3_release_subject import (
+    ReleaseSubject,
+    canonical_json_bytes as release_canonical_json_bytes,
+)
 from gwo_v8._canonical import (
     canonical_bytes,
     digest_bytes,
@@ -1140,6 +1143,21 @@ def _load_canonical_object(payload: bytes, code: str) -> object:
         raise BootstrapError(code, "control bytes are not canonical JSON") from error
 
 
+def _load_receipt_object(payload: bytes, code: str) -> object:
+    """Accept the receipt's release-subject JSON spelling as well as fixtures."""
+
+    try:
+        try:
+            return load_canonical_json(payload)
+        except Exception:
+            value = strict_json_loads(payload)
+            if release_canonical_json_bytes(value) != payload:
+                raise ValueError("receipt is not release-subject canonical JSON")
+            return value
+    except Exception as error:
+        raise BootstrapError(code, "fresh Store receipt bytes are not canonical JSON") from error
+
+
 def _exact_object(value: object, keys: set[str], code: str) -> dict[str, object]:
     if type(value) is not dict or set(value) != keys:
         _fail(code, "control object has unknown or missing keys")
@@ -1701,7 +1719,7 @@ def _receipt(
     observed_store_sha256: str | None = None,
 ) -> dict[str, object]:
     try:
-        value = _load_canonical_object(snapshot.content, "STORE_SOURCE_UNAVAILABLE")
+        value = _load_receipt_object(snapshot.content, "STORE_SOURCE_UNAVAILABLE")
     except BootstrapError:
         raise
     if type(value) is not dict:

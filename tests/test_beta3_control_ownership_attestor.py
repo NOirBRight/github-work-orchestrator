@@ -36,7 +36,11 @@ from gwo_v8.cutover_guard import (  # noqa: E402
 from gwo_v8.plan_control import PlanControlError  # noqa: E402
 from gwo_v8.transition import WriterTransitionRecord  # noqa: E402
 import beta3_control_ownership_attestor as attestor_module  # noqa: E402
-from beta3_release_subject import ReleaseSubject, release_subject_digest  # noqa: E402
+from beta3_release_subject import (  # noqa: E402
+    ReleaseSubject,
+    canonical_json_bytes as release_canonical_json_bytes,
+    release_subject_digest,
+)
 from beta3_bootstrap_model import (  # noqa: E402
     AttemptIdentity,
     BootstrapError,
@@ -3996,6 +4000,19 @@ def test_ownership_reads_real_immutable_store_and_reports_active_facts(
     assert "mode=ro&immutable=1" in str(sqlite_calls[0][0])
     assert sqlite_calls[0][1] is True
     assert mutation_calls == []
+
+
+def test_store_accepts_release_subject_canonical_receipt_bytes(tmp_path):
+    config = _create_store_fixture(tmp_path)
+    receipt = json.loads(config.fresh_receipt.read_bytes())
+    config.fresh_receipt.write_bytes(release_canonical_json_bytes(receipt))
+    config.expected_fresh_receipt_sha256 = digest_bytes(
+        config.fresh_receipt.read_bytes()
+    )
+
+    observed = attestor_module._read_store(config, _subject(), _attempt(_subject()))
+
+    assert observed.durable.generation_id == config.store_generation
 
 
 @pytest.mark.parametrize(
