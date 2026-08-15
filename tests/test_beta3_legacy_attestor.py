@@ -886,9 +886,12 @@ def test_command_reader_accepts_strict_noncanonical_json_and_canonicalizes_paylo
 @pytest.mark.parametrize(
     "raw",
     (
-        b'{"data": {}, "data": {}}',
-        b'{"data":',
-        b'{"data": {}} trailing garbage',
+        pytest.param(b'{"data": {}, "data": {}}', id="duplicate-key"),
+        pytest.param(b'{"data":', id="malformed-json"),
+        pytest.param(b'{"data": {}} trailing garbage', id="trailing-garbage"),
+        pytest.param(b'{"data": NaN}', id="nan"),
+        pytest.param(b'{"data": Infinity}', id="infinity"),
+        pytest.param(b"\xff", id="invalid-utf8"),
     ),
 )
 def test_command_reader_rejects_duplicate_invalid_or_trailing_json(raw: bytes):
@@ -898,6 +901,85 @@ def test_command_reader_rejects_duplicate_invalid_or_trailing_json(raw: bytes):
             "8" * 64,
         ).read("owner/repo")
     assert error.value.code == "LEGACY_SOURCE_UNAVAILABLE"
+
+
+def test_paseo_worker_reader_accepts_strict_noncanonical_empty_inventory():
+    calls: list[tuple[str, ...]] = []
+    raw = b" \n[\n]\n"
+
+    def run(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        return raw
+
+    observed = PaseoWorkerInventoryReader(run, "8" * 64).read("owner/repo")
+    expected = {"repository": "owner/repo", "workers": [], "inventory": []}
+    digest = digest_value(expected)
+
+    assert calls == [
+        (
+            "paseo",
+            "ls",
+            "--global",
+            "--all",
+            "--label",
+            "orch.repository=owner/repo",
+            "--label",
+            "orch.role=worker",
+            "--json",
+        )
+    ]
+    assert observed == SourceObservation(
+        SourceRecord(
+            role="legacy.workers",
+            locator="paseo://global/worker-inventory/owner/repo",
+            repository="owner/repo",
+            read_mode="COMPLETE_DOUBLE_READ",
+            identity=(("observation_digest", digest),),
+            content_sha256=digest,
+            readback_digest=None,
+            producer_sha256="8" * 64,
+        ),
+        canonical_bytes(expected),
+        True,
+    )
+
+
+def test_process_reader_accepts_strict_noncanonical_empty_inventory():
+    calls: list[tuple[str, ...]] = []
+    raw = b" \n[\n]\n"
+
+    def run(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        return raw
+
+    observed = CooperativeHostProcessReader(run, "8" * 64).read("owner/repo")
+    digest = digest_value([])
+
+    assert calls == [
+        (
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process | Select-Object ProcessId, "
+            "ParentProcessId, CreationDate, ExecutablePath, CommandLine | "
+            "ConvertTo-Json -Compress",
+        )
+    ]
+    assert observed == SourceObservation(
+        SourceRecord(
+            role="legacy.processes",
+            locator="host://cim/win32-process",
+            repository="owner/repo",
+            read_mode="COMPLETE_DOUBLE_READ",
+            identity=(("observation_digest", digest),),
+            content_sha256=digest,
+            readback_digest=None,
+            producer_sha256="8" * 64,
+        ),
+        canonical_bytes([]),
+        True,
+    )
 
 
 def test_github_snapshot_dispatches_are_normalized_into_active_references(
