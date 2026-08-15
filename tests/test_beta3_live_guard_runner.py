@@ -899,6 +899,19 @@ def test_attestor_configuration_is_part_of_fixed_production_subject():
     assert runner.DEFAULT_CONFIG.release_subject_digest == ""
 
 
+def test_production_config_package_digests_match_source_manifests():
+    observed = {}
+    for package_name in runner.PACKAGE_NAMES:
+        package_root = runner._package_path(runner.REPOSITORY_ROOT, package_name)
+        files = runner._bound_tree_files(package_root, "PACKAGE_INVALID")
+        manifest = runner._package_manifest_from_files(
+            package_root, package_name, files
+        )
+        observed[package_name] = manifest["content_sha256"]
+
+    assert dict(runner.DEFAULT_CONFIG.expected_package_content_digests) == observed
+
+
 def test_execution_dependencies_are_attestation_only():
     dependencies = runner.ExecutionDependencies(
         control_ownership_attestor=object(),
