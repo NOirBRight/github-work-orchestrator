@@ -34,7 +34,13 @@ from beta3_bootstrap_model import (
     WriterAuthorityObservation,
 )
 from beta3_release_subject import ReleaseSubject
-from gwo_v8._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
+from gwo_v8._canonical import (
+    canonical_bytes,
+    digest_bytes,
+    digest_value,
+    load_canonical_json,
+    strict_json_loads,
+)
 from gwo_v8.cutover_guard import (
     CompatibilityPathReadback,
     CutoverSubject,
@@ -49,7 +55,12 @@ from gwo_v8.cutover_guard import (
     OwnershipReadback,
 )
 from gwo_v8.plan_control_github import GitHubPlanRepository
-from gwo_v8.runtime_gateway import ProfileMapping, RuntimeConfiguration
+from gwo_v8.runtime_gateway import (
+    ProfileMapping,
+    RuntimeConfiguration,
+    RuntimeGatewayError,
+    _require_paseo_argument,
+)
 from gwo_v8.runtime_profile import RuntimeProfile
 from gwo_v8.transition import WriterTransitionRecord
 
@@ -384,6 +395,97 @@ class _GitHubControlSource:
         return result
 
 
+_PASEO_AGENT_ID_ALIASES = ("id", "Id", "agentId", "AgentId")
+_MAX_RUNTIME_REGISTRY_RESPONSE_BYTES = 1_048_576
+
+
+def _paseo_agent_identity(value: object) -> str:
+    if type(value) is not dict:
+        _fail(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Paseo Agent identity record is not an object",
+        )
+    populated = [
+        value[alias]
+        for alias in _PASEO_AGENT_ID_ALIASES
+        if alias in value and value[alias] is not None and value[alias] != ""
+    ]
+    if not populated:
+        _fail(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Paseo Agent identity is absent",
+        )
+    expected = populated[0]
+    if any(
+        type(candidate) is not type(expected) or candidate != expected
+        for candidate in populated[1:]
+    ):
+        _fail(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Paseo Agent identity aliases conflict",
+        )
+    if type(expected) is not str or not expected:
+        _fail(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Paseo Agent identity is not exact text",
+        )
+    try:
+        return _require_paseo_argument(expected, "Paseo Agent identity")
+    except RuntimeGatewayError as error:
+        raise BootstrapError(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Paseo Agent identity is unsafe for the command boundary",
+        ) from error
+
+
+def _paseo_inspect_identity(value: object) -> str:
+    if type(value) is not dict:
+        _fail(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Paseo inspect response is not an object",
+        )
+    if "agent" not in value:
+        return _paseo_agent_identity(value)
+    inner = value["agent"]
+    outer_populated = [
+        value[alias]
+        for alias in _PASEO_AGENT_ID_ALIASES
+        if alias in value and value[alias] is not None and value[alias] != ""
+    ]
+    inner_identity = _paseo_agent_identity(inner)
+    if outer_populated:
+        outer_identity = _paseo_agent_identity(value)
+        if outer_identity != inner_identity:
+            _fail(
+                "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+                "Paseo inspect wrapper identities conflict",
+            )
+    return inner_identity
+
+
+def _decode_runtime_registry_response(payload: bytes, code: str) -> object:
+    if type(payload) is not bytes or len(payload) > _MAX_RUNTIME_REGISTRY_RESPONSE_BYTES:
+        _fail(code, "Runtime registry response exceeds the bounded transport size")
+    try:
+        return strict_json_loads(payload)
+    except Exception as error:
+        raise BootstrapError(code, "Runtime registry response is not strict JSON") from error
+
+
+def _paseo_runtime_repository_label(repository: str) -> str:
+    try:
+        _require_paseo_argument(repository, "Paseo runtime repository")
+        return _require_paseo_argument(
+            f"gwo.runtime_repository={repository}",
+            "Paseo runtime repository label",
+        )
+    except RuntimeGatewayError as error:
+        raise BootstrapError(
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            "Paseo runtime repository label is unsafe for the command boundary",
+        ) from error
+
+
 class _RuntimeRegistrySource:
     def __init__(
         self,
@@ -394,12 +496,14 @@ class _RuntimeRegistrySource:
         self._producer_sha256 = producer_sha256
 
     def read(self, repository: str) -> SourceObservation:
+        repository_label = _paseo_runtime_repository_label(repository)
         command = (
             "paseo",
-            "runtime",
-            "registry",
-            "--repository",
-            repository,
+            "ls",
+            "--global",
+            "--all",
+            "--label",
+            repository_label,
             "--json",
         )
         try:
@@ -413,19 +517,65 @@ class _RuntimeRegistrySource:
                 "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
                 "Runtime registry command did not return exact bytes",
             )
-        try:
-            value = load_canonical_json(payload)
-        except Exception as error:
-            raise BootstrapError(
-                "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
-                "Runtime registry response is not canonical JSON",
-            ) from error
-        canonical = canonical_bytes(value)
-        if canonical != payload:
+        value = _decode_runtime_registry_response(
+            payload,
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+        )
+        if type(value) is dict:
+            value = value.get("agents", value)
+        if type(value) is not list:
             _fail(
                 "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
-                "Runtime registry bytes are not canonical",
+                "Runtime registry enumeration is not a list",
             )
+        identities: list[str] = []
+        for row in value:
+            if type(row) is not dict:
+                _fail(
+                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+                    "Runtime registry enumeration contains a non-object row",
+                )
+            identity = _paseo_agent_identity(row)
+            if identity in identities:
+                _fail(
+                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+                    "Runtime registry identity is duplicated",
+                )
+            identities.append(identity)
+
+        for identity in identities:
+            inspect_command = ("paseo", "inspect", identity, "--json")
+            try:
+                inspect_payload = self._command_runner(inspect_command)
+            except Exception as error:
+                raise BootstrapError(
+                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+                    "Runtime registry inspect read failed",
+                ) from error
+            if type(inspect_payload) is not bytes:
+                _fail(
+                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+                    "Runtime registry inspect did not return exact bytes",
+                )
+            inspect_value = _decode_runtime_registry_response(
+                inspect_payload,
+                "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+            )
+            if _paseo_inspect_identity(inspect_value) != identity:
+                _fail(
+                    "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+                    "Runtime registry inspect identity differs from enumeration",
+                )
+
+        canonical = _canonical_payload(
+            {
+                "runtimes": [
+                    {"identity": identity}
+                    for identity in sorted(identities)
+                ]
+            },
+            "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE",
+        )
         record = _source_record(
             role="runtime.registry",
             locator=f"runtime-registry://{repository}",

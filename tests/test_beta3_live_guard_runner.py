@@ -11,6 +11,7 @@ import multiprocessing
 from dataclasses import replace
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -61,6 +62,34 @@ from beta3_replay_guard import ReplayResult, evaluate_attested_bundle  # noqa: E
 
 def test_production_default_targets_established_v8_generation():
     assert runner.DEFAULT_CONFIG.target_writer_generation == "v8-generation-1"
+
+
+def test_production_source_command_resolves_launcher_before_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    resolved_launcher = r"C:\Users\noirb\.local\bin\paseo.CMD"
+    which_calls: list[str] = []
+    subprocess_calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_which(executable: str) -> str:
+        which_calls.append(executable)
+        return resolved_launcher
+
+    def fake_run(args, **kwargs):
+        subprocess_calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, stdout=b"paseo 1.0\n")
+
+    monkeypatch.setattr(shutil, "which", fake_which)
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    assert runner._production_source_command(("paseo", "--version")) == b"paseo 1.0\n"
+    assert which_calls == ["paseo"]
+    assert subprocess_calls == [
+        (
+            [resolved_launcher, "--version"],
+            {"check": True, "capture_output": True},
+        )
+    ]
 
 
 def _sha256(path: Path) -> str:
