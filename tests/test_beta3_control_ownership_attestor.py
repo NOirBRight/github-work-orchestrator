@@ -2461,6 +2461,168 @@ def test_live_registry_source_rejects_conflicting_identity_aliases():
     assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
 
 
+def test_live_registry_source_rejects_conflicting_outer_and_inner_inspect_identity():
+    def command_runner(command: tuple[str, ...]) -> bytes:
+        if command[1] == "ls":
+            return b'[{"id":"runtime-1"}]'
+        return b'{"Id":"runtime-other","agent":{"id":"runtime-1"}}'
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._RuntimeRegistrySource(
+            command_runner,
+            "d" * 64,
+        ).read("owner/repo")
+
+    assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'[{"id":"runtime-1","id":"runtime-1"}]',
+        b'[{"id":"runtime-1","status":NaN}]',
+    ),
+)
+def test_live_registry_source_rejects_non_strict_ls_json(payload):
+    calls: list[tuple[str, ...]] = []
+
+    def command_runner(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        if command[1] == "ls":
+            return payload
+        return b'{"id":"runtime-1"}'
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._RuntimeRegistrySource(
+            command_runner,
+            "d" * 64,
+        ).read("owner/repo")
+
+    assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+    assert calls == [
+        (
+            "paseo",
+            "ls",
+            "--global",
+            "--all",
+            "--label",
+            "gwo.runtime_repository=owner/repo",
+            "--json",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"id":"runtime-1","id":"runtime-1"}',
+        b'{"id":"runtime-1","status":NaN}',
+    ),
+)
+def test_live_registry_source_rejects_non_strict_inspect_json(payload):
+    calls: list[tuple[str, ...]] = []
+
+    def command_runner(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        if command[1] == "ls":
+            return b'[{"id":"runtime-1"}]'
+        return payload
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._RuntimeRegistrySource(
+            command_runner,
+            "d" * 64,
+        ).read("owner/repo")
+
+    assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+    assert calls == [
+        (
+            "paseo",
+            "ls",
+            "--global",
+            "--all",
+            "--label",
+            "gwo.runtime_repository=owner/repo",
+            "--json",
+        ),
+        ("paseo", "inspect", "runtime-1", "--json"),
+    ]
+
+
+def test_live_registry_source_rejects_oversized_ls_response():
+    payload = b"[]" + b" " * (1_048_576 + 1 - len(b"[]"))
+    assert len(payload) == 1_048_577
+    calls: list[tuple[str, ...]] = []
+
+    def command_runner(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        return payload
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._RuntimeRegistrySource(
+            command_runner,
+            "d" * 64,
+        ).read("owner/repo")
+
+    assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+    assert len(calls) == 1
+    assert calls[0][1] == "ls"
+
+
+def test_live_registry_source_rejects_oversized_inspect_response():
+    payload = b'{"id":"runtime-1"}'
+    payload += b" " * (1_048_576 + 1 - len(payload))
+    assert len(payload) == 1_048_577
+    calls: list[tuple[str, ...]] = []
+
+    def command_runner(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        if command[1] == "ls":
+            return b'[{"id":"runtime-1"}]'
+        return payload
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._RuntimeRegistrySource(
+            command_runner,
+            "d" * 64,
+        ).read("owner/repo")
+
+    assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+    assert calls == [
+        (
+            "paseo",
+            "ls",
+            "--global",
+            "--all",
+            "--label",
+            "gwo.runtime_repository=owner/repo",
+            "--json",
+        ),
+        ("paseo", "inspect", "runtime-1", "--json"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "unsafe_repository",
+    ("owner/repo&injected", "owner/repo\ninjected"),
+)
+def test_live_registry_source_rejects_unsafe_repository_before_ls(unsafe_repository):
+    calls: list[tuple[str, ...]] = []
+
+    def command_runner(command: tuple[str, ...]) -> bytes:
+        calls.append(command)
+        return b"[]"
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._RuntimeRegistrySource(
+            command_runner,
+            "d" * 64,
+        ).read(unsafe_repository)
+
+    assert error.value.code == "RUNTIME_REGISTRY_SOURCE_UNAVAILABLE"
+    assert calls == []
+
+
 @pytest.mark.parametrize("unsafe_identity", ("runtime&injected", "runtime\ninjected"))
 def test_live_registry_source_rejects_unsafe_identity_before_inspect(unsafe_identity):
     calls: list[tuple[str, ...]] = []
