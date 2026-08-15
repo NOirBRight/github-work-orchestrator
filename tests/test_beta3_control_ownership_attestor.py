@@ -1965,6 +1965,48 @@ def test_runtime_config_requires_complete_file_identity():
     assert error.value.code == "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE"
 
 
+def test_runtime_config_accepts_windows_hex_file_id():
+    path = Path(r"C:\fixture\.orch\config.json")
+    observation = _RuntimeConfig().read(path)
+    identity = dict(observation.record.identity)
+    identity["inode"] = "00112233445566778899aabbccddeeff"
+    record = replace(
+        observation.record,
+        identity=tuple(sorted(identity.items())),
+    )
+
+    attestor_module._validate_runtime_config_source(
+        SourceObservation(
+            record=record,
+            canonical_payload=observation.canonical_payload,
+            complete=True,
+        ),
+        path,
+    )
+
+
+def test_runtime_config_rejects_malformed_file_id():
+    path = Path(r"C:\fixture\.orch\config.json")
+    observation = _RuntimeConfig().read(path)
+    identity = dict(observation.record.identity)
+    identity["inode"] = "not-a-file-id"
+    record = replace(
+        observation.record,
+        identity=tuple(sorted(identity.items())),
+    )
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._validate_runtime_config_source(
+            SourceObservation(
+                record=record,
+                canonical_payload=observation.canonical_payload,
+                complete=True,
+            ),
+            path,
+        )
+    assert error.value.code == "RUNTIME_CONFIGURATION_SOURCE_UNAVAILABLE"
+
+
 def test_package_records_reject_missing_package_provenance(tmp_path):
     subject = _subject()
     with pytest.raises(BootstrapError) as error:
