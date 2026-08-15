@@ -892,8 +892,10 @@ class CooperativeHostProcessReader(_CommandReader):
                 _unavailable("process inventory row differs from the fixed CIM projection")
             _process_fields(row)
             _validate_process_visibility(row)
+            if not self._matches(repository, row):
+                continue
             item = {field: row[field] for field in fixed_fields}
-            item["integration_lease"] = self._matches(repository, row)
+            item["integration_lease"] = True
             normalized.append(item)
         normalized.sort(key=lambda item: (item["ProcessId"], item["CreationDate"]))
         payload = canonical_bytes(normalized)
