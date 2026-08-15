@@ -1177,9 +1177,9 @@ def _legacy_fence(payload: bytes, repository: str) -> bool:
         if prior != operation:
             _fail("WRITER_FENCE_SOURCE_UNAVAILABLE", "legacy Writer action key was reused")
     expected = bool(events and events[-1]["operation"] == "stop")
-    if value["stopped"] is not expected or value["stopped"] is not True:
-        _fail("WRITER_FENCE_SOURCE_UNAVAILABLE", "legacy Writer fence is not finally stopped")
-    return True
+    if value["stopped"] is not expected:
+        _fail("WRITER_FENCE_SOURCE_UNAVAILABLE", "legacy Writer fence state does not match its final event")
+    return value["stopped"]
 
 
 def _read_control(
@@ -1239,7 +1239,7 @@ def _read_control(
     )
     if active_receipt["plan_digest"] != selected.plan_digest:
         _fail("WRITER_FENCE_SOURCE_UNAVAILABLE", "Writer and active-plan bindings differ")
-    _legacy_fence(legacy_payload, subject.repository)
+    legacy_stopped = _legacy_fence(legacy_payload, subject.repository)
     control_binding = {
         "repository": subject.repository,
         "branch": subject.control_branch,
@@ -1341,7 +1341,7 @@ def _read_control(
         record_id=selected.record_id,
         authority_state="authoritative",
         activation_id=None,
-        legacy_stopped=True,
+        legacy_stopped=legacy_stopped,
         source_record_digests=tuple(sorted(record.digest for record in source_records)),
     )
     return fence, authority, source_records

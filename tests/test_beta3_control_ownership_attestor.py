@@ -2375,7 +2375,33 @@ def test_control_accepts_only_complete_returned_response_identity():
 
     assert fence.repository == subject.repository
     assert authority.record_id == fence.record_id
+    assert authority.legacy_stopped is True
     assert len(records) == 4
+
+
+def test_control_accepts_legacy_fence_restored_after_stop_and_reports_not_stopped():
+    subject = _subject()
+    source = _ExactControlFixture()
+    source.writer_bytes, source.active_plan_bytes, _legacy = _control_bytes(subject)
+    source.legacy_fence_bytes = canonical_bytes(
+        {
+            "schema_version": 1,
+            "repository": subject.repository,
+            "stopped": False,
+            "events": [
+                {"action_key": "stop:1", "operation": "stop"},
+                {"action_key": "restore:1", "operation": "restore"},
+            ],
+        }
+    )
+
+    _fence, authority, _records = attestor_module._read_control(
+        source,
+        subject=subject,
+        attempt=_attempt(subject),
+    )
+
+    assert authority.legacy_stopped is False
 
 
 def test_control_accepts_historical_plan_activation_writer_record():
