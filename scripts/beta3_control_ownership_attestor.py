@@ -124,6 +124,7 @@ PRODUCTION_PACKAGE_CONTENT_DIGESTS = (
 )
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
+_WINDOWS_FILE_ID = re.compile(r"^[0-9a-f]{32}$")
 _STORE_GENERATION = re.compile(r"^store:v8:[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _PRODUCTION_FRESH_STORE_NAME = re.compile(
     r"^store-[0-9]{8}T[0-9]{6}Z\.sqlite3$"
@@ -2429,7 +2430,10 @@ def _validate_runtime_config_source(
         or identity.get("byte_sha256") != digest_bytes(observation.canonical_payload)
         or identity.get("size") != str(len(observation.canonical_payload))
         or type(identity.get("inode")) is not str
-        or not identity["inode"].isdigit()
+        or not (
+            identity["inode"].isdigit()
+            or _WINDOWS_FILE_ID.fullmatch(identity["inode"]) is not None
+        )
         or type(identity.get("mtime_ns")) is not str
         or not identity["mtime_ns"].isdigit()
     ):
