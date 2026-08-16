@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from ._canonical import canonical_bytes, digest_bytes, digest_value, load_canonical_json
 from .activation import ActivationError, GitHubContentClient, LocalPlanPublication
