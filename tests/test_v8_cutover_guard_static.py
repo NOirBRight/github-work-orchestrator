@@ -49,6 +49,42 @@ def test_production_path_scanner_reports_a_reachable_predecessor_edge(tmp_path):
     )
 
 
+def test_production_path_scanner_bounds_stability_revalidation_per_read(
+    tmp_path, monkeypatch
+):
+    package = tmp_path / "skills" / "orchestrator" / "scripts" / "gwo_v8"
+    package.mkdir(parents=True)
+    (package / "public.py").write_text(
+        "from .legacy import LegacyWriter\n\n"
+        "def start():\n    return LegacyWriter().write()\n",
+        encoding="utf-8",
+    )
+    (package / "legacy.py").write_text(
+        "class LegacyWriter:\n"
+        "    def write(self):\n        return None\n",
+        encoding="utf-8",
+    )
+    subject = scanned_subject(tmp_path, ("gwo_v8.public:start",))
+    calls = 0
+    original_assert_stable = source_snapshot.HeldSourceSnapshot.assert_stable
+
+    def count_assert_stable(snapshot):
+        nonlocal calls
+        if snapshot._stability_suspension_depth == 0:
+            calls += 1
+        return original_assert_stable(snapshot)
+
+    monkeypatch.setattr(
+        source_snapshot.HeldSourceSnapshot,
+        "assert_stable",
+        count_assert_stable,
+    )
+
+    ProductionPathScanner(package_root=tmp_path).read(subject)
+
+    assert calls == 2
+
+
 def test_production_path_scanner_rejects_a_missing_entry_module_fail_closed(tmp_path):
     package = tmp_path / "skills" / "orchestrator" / "scripts" / "gwo_v8"
     package.mkdir(parents=True)
