@@ -12,7 +12,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
 import hashlib
 import inspect
 import json
@@ -2672,6 +2672,9 @@ class _HeldDirectory:
     component_identities: list[dict[str, int | str]]
     code: str
     assert_directory_handles: Callable[..., None]
+    _stability_suspension_depth: int = dataclass_field(
+        default=0, init=False, repr=False, compare=False
+    )
 
     @property
     def descriptor(self) -> int:
@@ -2680,12 +2683,29 @@ class _HeldDirectory:
         return self.component_descriptors[-1]
 
     def assert_stable(self) -> None:
+        if self._stability_suspension_depth:
+            return
         self.assert_directory_handles(
             self.path,
             self.component_descriptors,
             self.component_identities,
             self.code,
         )
+
+    @contextmanager
+    def _stable_read_view(self):
+        """Validate once around a read-only operation over the held directory."""
+
+        self.assert_stable()
+        self._stability_suspension_depth += 1
+        completed = False
+        try:
+            yield self
+            completed = True
+        finally:
+            self._stability_suspension_depth -= 1
+            if completed:
+                self.assert_stable()
 
 
 @contextmanager
@@ -2905,10 +2925,9 @@ def _held_directory_scan(
         expected_leaf_identity=expected_leaf_identity,
     ) as held:
         try:
-            held.assert_stable()
-            with _enumerate_held_directory(path, held, code) as scanner:
-                yield held, scanner
-            held.assert_stable()
+            with held._stable_read_view():
+                with _enumerate_held_directory(path, held, code) as scanner:
+                    yield held, scanner
         except BootstrapError:
             raise
         except Exception as error:

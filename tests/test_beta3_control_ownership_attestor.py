@@ -53,6 +53,38 @@ from beta3_control_ownership_attestor import (  # noqa: E402
 )
 
 
+def test_local_tree_snapshot_bounds_directory_stability_revalidation(
+    tmp_path, monkeypatch
+):
+    package = tmp_path / "package"
+    package.mkdir()
+    for name in ("one.py", "two.py", "three.py"):
+        (package / name).write_text(f"# {name}\n", encoding="utf-8")
+
+    import run_beta3_live_guard as live_guard_module
+
+    calls = 0
+    original_assert_directory_handles = live_guard_module._assert_directory_handles
+
+    def count_assert_directory_handles(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_assert_directory_handles(*args, **kwargs)
+
+    monkeypatch.setattr(
+        live_guard_module,
+        "_assert_directory_handles",
+        count_assert_directory_handles,
+    )
+
+    snapshots = attestor_module._local_tree_snapshots(
+        package, "PACKAGE_SOURCE_UNAVAILABLE"
+    )
+
+    assert len(snapshots) == 3
+    assert calls == 2
+
+
 @dataclass
 class _Blob:
     content: bytes
