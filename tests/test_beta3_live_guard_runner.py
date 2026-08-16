@@ -3052,6 +3052,169 @@ def test_production_composition_uses_attestors_without_mutation(tmp_path):
     assert not config.artifact_root.exists()
 
 
+def test_production_execute_publishes_authoritative_readback_digests(
+    tmp_path, monkeypatch
+):
+    config = _fixture_config(tmp_path)
+    binding = _FixtureBinding(config)
+    dependencies, _ = _stable_dependencies()
+
+    monkeypatch.setattr(runner, "load_production_release_subject", lambda: binding)
+    monkeypatch.setattr(
+        runner, "_bind_runner_config_from_subject", lambda _subject: config
+    )
+    monkeypatch.setattr(
+        runner,
+        "_production_dependencies",
+        lambda *_args, **_kwargs: dependencies,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_git_snapshot",
+        lambda *_args, **_kwargs: {
+            "head": config.merged_main_sha,
+            "tree": config.merged_main_git_tree,
+            "origin_main": config.merged_main_sha,
+            "status": "clean-except-.codex-tmp",
+        },
+    )
+    monkeypatch.setattr(
+        runner, "_exact_digest_value", lambda value, *_args, **_kwargs: digest_value(value)
+    )
+    monkeypatch.setattr(runner, "_validate_v8_module_origins", lambda *_args, **_kwargs: None)
+    attestor_digest = hashlib.sha256()
+    for name in runner._ATTESTOR_MODULE_NAMES:
+        path = Path(runner.__file__).with_name(name)
+        content = path.read_bytes()
+        encoded_name = name.encode("utf-8")
+        attestor_digest.update(len(encoded_name).to_bytes(4, "big"))
+        attestor_digest.update(encoded_name)
+        attestor_digest.update(len(content).to_bytes(8, "big"))
+        attestor_digest.update(content)
+    monkeypatch.setattr(
+        runner, "_runbook_hash", lambda: _sha256(Path(runner.__file__))
+    )
+    monkeypatch.setattr(
+        runner, "_attestor_source_sha256", lambda: attestor_digest.hexdigest()
+    )
+    result = runner.run(execute=True, run_id="production-authoritative-readback")
+
+    assert result["status"] == "GO", result
+    report = json.loads(config.report_path.read_text(encoding="utf-8"))
+    evidence = json.loads(config.evidence_path.read_text(encoding="utf-8"))
+    assert report["fresh_receipt_sha256"] == config.expected_fresh_receipt_sha256
+    assert report["fresh_store_sha256"] == config.expected_fresh_store_sha256
+    assert report["rollback_store_sha256"] == config.expected_rollback_store_sha256
+    assert report["prior_store_sha256"] == config.expected_prior_store_sha256
+    assert type(report["package_snapshot_digest"]) is str
+    assert evidence["report_digest"] == _sha256(config.report_path)
+    assert all(value is False for value in report["mutation_flags"].values())
+    assert not config.gateway_store_path.exists()
+    assert not config.artifact_root.exists()
+
+
+def test_authoritative_package_snapshot_ignores_non_package_local_inputs(tmp_path):
+    config = replace(_fixture_config(tmp_path), package_names=("implement-gwo",))
+    guard_path = (
+        config.repository_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+        / "guard.py"
+    )
+    guard_path.parent.mkdir(parents=True)
+    guard_path.write_text("GUARD = True\n", encoding="utf-8")
+    binding = _FixtureBinding(config)
+    try:
+        preflight_result = runner.preflight(
+            config,
+            git_runner=_git_runner_factory(config),
+            authoritative_sources=True,
+        )
+        local_paths = runner._lease_input_paths(
+            config,
+            subject_binding=binding,
+        )
+        expected_package_paths = set()
+        for package_name in config.package_names:
+            roots = (
+                runner._package_path(config.repository_root, package_name),
+                *(root / package_name for root in config.install_roots),
+            )
+            for root in roots:
+                expected_package_paths.update(
+                    runner._path_text(path)
+                    for path in runner._local_regular_files(root, "PACKAGE_INVALID")
+                )
+
+        assert set(preflight_result["_packages"]["file_paths"]) == (
+            expected_package_paths
+        )
+        assert {
+            runner._path_text(path) for path in runner._package_file_paths(config)
+        } == expected_package_paths
+        assert guard_path in local_paths
+        assert binding.manifest_path in local_paths
+        assert runner._path_text(guard_path) not in expected_package_paths
+        assert runner._path_text(binding.manifest_path) not in expected_package_paths
+        assert runner._path_text(config.runtime_config_path) not in expected_package_paths
+        assert runner._path_text(Path(runner.__file__)) not in expected_package_paths
+
+        with runner._input_lease(
+            config,
+            preflight_result,
+            subject_binding=binding,
+        ) as lease:
+            lease.assert_stable()
+            lease_input_paths = {item.path for item in lease._bindings}
+            assert guard_path in lease_input_paths
+            assert binding.manifest_path in lease_input_paths
+
+        runner._preflight_file_snapshots(
+            config,
+            preflight_result,
+            local_paths,
+            subject_binding=binding,
+        )
+    finally:
+        binding.close()
+
+
+def test_authoritative_preflight_rejects_non_package_input_drift_before_lease(
+    tmp_path,
+):
+    config = replace(_fixture_config(tmp_path), package_names=("implement-gwo",))
+    guard_path = (
+        config.repository_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+        / "guard.py"
+    )
+    guard_path.parent.mkdir(parents=True)
+    guard_path.write_bytes(b"ONE\n")
+    preflight_result = runner.preflight(
+        config,
+        git_runner=_git_runner_factory(config),
+        authoritative_sources=True,
+    )
+    input_snapshot = preflight_result.get("_input_snapshot")
+    assert type(input_snapshot) is dict
+    assert runner._path_text(guard_path) in input_snapshot["file_paths"]
+    assert input_snapshot["file_hashes"][runner._path_text(guard_path)] == hashlib.sha256(
+        b"ONE\n"
+    ).hexdigest()
+    guard_path.write_bytes(b"TWO\n")
+
+    with pytest.raises(runner.RunnerError) as error:
+        with runner._input_lease(config, preflight_result) as lease:
+            lease.assert_stable()
+
+    assert error.value.code == "LIVE_INPUT_DRIFT"
+
+
 def test_real_composition_requires_a_proven_immutable_durable_adapter(tmp_path):
     config = _fixture_config(tmp_path)
     dependencies = runner._production_dependencies(config, "8" * 64)
