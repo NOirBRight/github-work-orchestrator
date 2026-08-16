@@ -35,7 +35,7 @@ ATTESTOR_FILENAMES = (
 )
 REPOSITORY_ROOT = Path(r"D:\Workstation\github-work-orchestrator").resolve()
 EVIDENCE_ROOT = Path(
-    r"D:\gwo-release-evidence\2026-08-09-gwo-v8-beta3-production-cutover"
+    r"D:\gwo-release-evidence\2026-08-17-gwo-v8-beta3-production-cutover"
 ).resolve()
 
 _BODY_KEYS = frozenset(
