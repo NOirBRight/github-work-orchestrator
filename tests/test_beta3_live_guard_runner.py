@@ -3161,6 +3161,16 @@ def test_authoritative_package_snapshot_ignores_non_package_local_inputs(tmp_pat
         assert runner._path_text(config.runtime_config_path) not in expected_package_paths
         assert runner._path_text(Path(runner.__file__)) not in expected_package_paths
 
+        with runner._input_lease(
+            config,
+            preflight_result,
+            subject_binding=binding,
+        ) as lease:
+            lease.assert_stable()
+            lease_input_paths = {item.path for item in lease._bindings}
+            assert guard_path in lease_input_paths
+            assert binding.manifest_path in lease_input_paths
+
         runner._preflight_file_snapshots(
             config,
             preflight_result,
