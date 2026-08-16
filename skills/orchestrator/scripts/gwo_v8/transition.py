@@ -1577,26 +1577,59 @@ class WriterCutoverController:
             and durable_activation.plan_digest == compiled_plan.digest
         ):
             expected_active_digest = durable_activation.expected_previous_digest
-        if durable_activation is not None:
-            try:
-                self.publication.read_authoritative_rollback_identity(repository)
-            except ActivationError as error:
-                if resuming_pending and error.code == "ACTIVATION_PENDING":
+        if resuming_pending:
+            if (
+                durable_activation is not None
+                and durable_activation.plan_digest == compiled_plan.digest
+            ):
+                try:
+                    self.publication.read_authoritative_rollback_identity(repository)
+                except ActivationError as error:
+                    if error.code != "ACTIVATION_PENDING":
+                        blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+                    else:
+                        try:
+                            self.publication.validate_pending_activation(
+                                repository,
+                                writer_generation=writer_generation,
+                                plan_digest=compiled_plan.digest,
+                                activation_id=durable_activation.activation_id,
+                                expected_previous_digest=expected_active_digest,
+                            )
+                        except ActivationError:
+                            blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+            else:
+                if self.publication.has_pending_activation(repository):
                     try:
                         self.publication.validate_pending_activation(
                             repository,
                             writer_generation=writer_generation,
                             plan_digest=compiled_plan.digest,
-                            activation_id=(
-                                durable_activation.activation_id
-                                if durable_activation.plan_digest == compiled_plan.digest
-                                else None
-                            ),
+                            activation_id=None,
+                            expected_previous_digest=expected_active_digest,
+                        )
+                    except ActivationError:
+                        blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+                elif durable_activation is not None:
+                    try:
+                        self.publication.read_authoritative_rollback_identity(
+                            repository
                         )
                     except ActivationError:
                         blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
                 else:
-                    blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+                    try:
+                        local_active = self.publication.read_active(repository)
+                    except ActivationError:
+                        blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+                    else:
+                        if local_active is not None:
+                            blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+        elif durable_activation is not None:
+            try:
+                self.publication.read_authoritative_rollback_identity(repository)
+            except ActivationError:
+                blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
         else:
             try:
                 local_active = self.publication.read_active(repository)
@@ -1747,18 +1780,51 @@ class WriterCutoverController:
                 if durable_activation is None
                 else durable_activation.activation_id
             )
+            pending_plan_digest = (
+                current_record.plan_digest if was_pending else None
+            )
+            pending_activation_id = None
+            pending_expected_previous_digest = None
+            if was_pending:
+                pending_activation_id = (
+                    activation_id
+                    if (
+                        durable_activation is not None
+                        and durable_activation.plan_digest == pending_plan_digest
+                    )
+                    else None
+                )
+                pending_expected_previous_digest = (
+                    None
+                    if durable_activation is None
+                    else (
+                        durable_activation.expected_previous_digest
+                        if durable_activation.plan_digest == pending_plan_digest
+                        else durable_activation.plan_digest
+                    )
+                )
             drain_plan_digest = (
                 authoritative_plan_digest
                 if authoritative_plan_digest is not None
                 else current_record.plan_digest
             )
-            if was_pending:
+            if was_pending and self.publication.has_pending_activation(repository):
                 self.publication.validate_pending_activation(
                     repository,
                     writer_generation=current.writer_generation,
-                    plan_digest=drain_plan_digest,
-                    activation_id=activation_id,
+                    plan_digest=pending_plan_digest,
+                    activation_id=pending_activation_id,
+                    expected_previous_digest=pending_expected_previous_digest,
                 )
+            elif was_pending and durable_activation is not None:
+                self.publication.read_authoritative_rollback_identity(repository)
+            elif was_pending:
+                active = self.publication.read_active(repository)
+                if active is not None:
+                    raise ActivationError(
+                        "ROLLBACK_LOCAL_IDENTITY_MISMATCH",
+                        "local active Plan exists without a durable Activation Receipt",
+                    )
             current_identity_matches = (
                 current_record.activation_id == activation_id
                 and current_record.plan_digest == drain_plan_digest
@@ -1804,28 +1870,34 @@ class WriterCutoverController:
                         blockers=(error.code,),
                     )
                 current_record = drain_record
+            if activation_id is not None and pending_activation_id is None:
+                self.publication.begin_writer_drain(
+                    repository,
+                    writer_generation=current.writer_generation,
+                    activation_id=activation_id,
+                )
             if (
                 was_pending
-                and activation_id is None
-                and current_record.plan_digest is not None
+                and pending_activation_id is None
+                and pending_plan_digest is not None
             ):
                 self.publication.abandon_pending_activation(
                     repository,
                     writer_generation=current.writer_generation,
-                    plan_digest=current_record.plan_digest,
+                    plan_digest=pending_plan_digest,
                 )
             if (
                 was_pending
-                and activation_id is not None
-                and current_record.plan_digest is not None
+                and pending_activation_id is not None
+                and pending_plan_digest is not None
             ):
                 receipt = self.publication.durable.read_activation(
                     repository,
-                    activation_id,
+                    pending_activation_id,
                 )
                 plan_record = self.publication.durable.read_plan(
                     repository,
-                    current_record.plan_digest,
+                    pending_plan_digest,
                 )
                 if receipt is None or plan_record is None:
                     raise ValueError(
@@ -1835,7 +1907,7 @@ class WriterCutoverController:
                     plan_record,
                     receipt,
                 )
-            if activation_id is not None:
+            if activation_id is not None and pending_activation_id is not None:
                 self.publication.begin_writer_drain(
                     repository,
                     writer_generation=current.writer_generation,
