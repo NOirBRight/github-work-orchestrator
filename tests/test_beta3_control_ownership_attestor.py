@@ -721,7 +721,7 @@ def _production_subject_and_config(tmp_path):
     )
     config.expected_package_content_digests = (
         ("implement-gwo", "fcafa60645a2ea18408ec97369fdf5a01402a950b90e701fa2305624a1bfeaa9"),
-        ("orchestrator", "aebe7ea61bd41e848dd4c84f68569e4f359a6b2eaba5293507d637d5c47a9c24"),
+        ("orchestrator", "cdf238c481bf875ac4d7c86cfb90f9bf1b5a939b738b2e04cbb0edd127f21f0c"),
     )
     return subject, config
 

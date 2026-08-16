@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import ctypes
 import hashlib
@@ -394,6 +395,9 @@ class HeldSourceSnapshot:
     entries: dict[str, tuple[tuple[str, bool, bool, Mapping[str, object]], ...]]
     borrowed_handles: frozenset[int] = field(default_factory=frozenset)
     _closed: bool = False
+    _stability_suspension_depth: int = field(
+        default=0, init=False, repr=False, compare=False
+    )
 
     @classmethod
     def capture(
@@ -577,6 +581,8 @@ class HeldSourceSnapshot:
     def assert_stable(self) -> None:
         if self._closed:
             raise SourceSnapshotError("source snapshot is closed")
+        if self._stability_suspension_depth:
+            return
         fresh_ancestors: list[int] = []
         try:
             parent: int | None = None
@@ -676,6 +682,21 @@ class HeldSourceSnapshot:
                 or path_content != file.content
             ):
                 raise SourceSnapshotError(f"source file changed: {file.relative}")
+
+    @contextmanager
+    def _stable_read_view(self):
+        """Validate once around a read-only operation over the held tree."""
+
+        self.assert_stable()
+        self._stability_suspension_depth += 1
+        completed = False
+        try:
+            yield self
+            completed = True
+        finally:
+            self._stability_suspension_depth -= 1
+            if completed:
+                self.assert_stable()
 
     def digest(self) -> str:
         self.assert_stable()

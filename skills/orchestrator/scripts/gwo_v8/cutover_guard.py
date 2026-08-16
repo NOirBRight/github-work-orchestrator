@@ -1278,8 +1278,8 @@ class ProductionPathScanner:
             ) from error
         self._active_snapshot = snapshot
         try:
-            result = self._read_held(subject)
-            snapshot.assert_stable()
+            with snapshot._stable_read_view():
+                result = self._read_held(subject)
             return result
         except SourceSnapshotError as error:
             raise CutoverGuardError(
