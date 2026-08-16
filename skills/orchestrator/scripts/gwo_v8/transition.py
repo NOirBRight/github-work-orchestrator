@@ -1565,6 +1565,18 @@ class WriterCutoverController:
         if blockers:
             return blocked_outcome(blockers)
 
+        durable_activation = self.publication.durable.read_current_activation(
+            repository
+        )
+        expected_active_digest = (
+            None if durable_activation is None else durable_activation.plan_digest
+        )
+        if (
+            resuming_pending
+            and durable_activation is not None
+            and durable_activation.plan_digest == compiled_plan.digest
+        ):
+            expected_active_digest = durable_activation.expected_previous_digest
         stop_action = (
             f"stop-v61:{digest_value({'repository': repository})[:24]}"
         )
@@ -1598,7 +1610,7 @@ class WriterCutoverController:
             self.transitions.publish(pending)
         activation = self.publication.publish_and_activate(
             compiled_plan,
-            expected_active_digest=None,
+            expected_active_digest=expected_active_digest,
             writer_generation=writer_generation,
         )
         record = _record(
