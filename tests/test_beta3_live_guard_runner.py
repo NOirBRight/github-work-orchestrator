@@ -3052,6 +3052,67 @@ def test_production_composition_uses_attestors_without_mutation(tmp_path):
     assert not config.artifact_root.exists()
 
 
+def test_production_execute_publishes_authoritative_readback_digests(
+    tmp_path, monkeypatch
+):
+    config = _fixture_config(tmp_path)
+    binding = _FixtureBinding(config)
+    dependencies, _ = _stable_dependencies()
+
+    monkeypatch.setattr(runner, "load_production_release_subject", lambda: binding)
+    monkeypatch.setattr(
+        runner, "_bind_runner_config_from_subject", lambda _subject: config
+    )
+    monkeypatch.setattr(
+        runner,
+        "_production_dependencies",
+        lambda *_args, **_kwargs: dependencies,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_git_snapshot",
+        lambda *_args, **_kwargs: {
+            "head": config.merged_main_sha,
+            "tree": config.merged_main_git_tree,
+            "origin_main": config.merged_main_sha,
+            "status": "clean-except-.codex-tmp",
+        },
+    )
+    monkeypatch.setattr(
+        runner, "_exact_digest_value", lambda value, *_args, **_kwargs: digest_value(value)
+    )
+    monkeypatch.setattr(runner, "_validate_v8_module_origins", lambda *_args, **_kwargs: None)
+    attestor_digest = hashlib.sha256()
+    for name in runner._ATTESTOR_MODULE_NAMES:
+        path = Path(runner.__file__).with_name(name)
+        content = path.read_bytes()
+        encoded_name = name.encode("utf-8")
+        attestor_digest.update(len(encoded_name).to_bytes(4, "big"))
+        attestor_digest.update(encoded_name)
+        attestor_digest.update(len(content).to_bytes(8, "big"))
+        attestor_digest.update(content)
+    monkeypatch.setattr(
+        runner, "_runbook_hash", lambda: _sha256(Path(runner.__file__))
+    )
+    monkeypatch.setattr(
+        runner, "_attestor_source_sha256", lambda: attestor_digest.hexdigest()
+    )
+    result = runner.run(execute=True, run_id="production-authoritative-readback")
+
+    assert result["status"] == "GO", result
+    report = json.loads(config.report_path.read_text(encoding="utf-8"))
+    evidence = json.loads(config.evidence_path.read_text(encoding="utf-8"))
+    assert report["fresh_receipt_sha256"] == config.expected_fresh_receipt_sha256
+    assert report["fresh_store_sha256"] == config.expected_fresh_store_sha256
+    assert report["rollback_store_sha256"] == config.expected_rollback_store_sha256
+    assert report["prior_store_sha256"] == config.expected_prior_store_sha256
+    assert type(report["package_snapshot_digest"]) is str
+    assert evidence["report_digest"] == _sha256(config.report_path)
+    assert all(value is False for value in report["mutation_flags"].values())
+    assert not config.gateway_store_path.exists()
+    assert not config.artifact_root.exists()
+
+
 def test_real_composition_requires_a_proven_immutable_durable_adapter(tmp_path):
     config = _fixture_config(tmp_path)
     dependencies = runner._production_dependencies(config, "8" * 64)

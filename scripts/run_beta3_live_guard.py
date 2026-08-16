@@ -5355,7 +5355,7 @@ def _run_bound(
             config,
             git_runner=git_runner,
             allow_existing_outputs=False,
-            authoritative_sources=not execute,
+            authoritative_sources=(not execute or production),
             module_repository_root=module_repository_root,
         )
     except RunnerError as error:
