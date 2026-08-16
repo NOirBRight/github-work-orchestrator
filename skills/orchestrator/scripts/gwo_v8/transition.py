@@ -1577,11 +1577,35 @@ class WriterCutoverController:
             and durable_activation.plan_digest == compiled_plan.digest
         ):
             expected_active_digest = durable_activation.expected_previous_digest
-        if durable_activation is not None and not resuming_pending:
+        if durable_activation is not None:
             try:
                 self.publication.read_authoritative_rollback_identity(repository)
-            except ActivationError:
-                blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+            except ActivationError as error:
+                if resuming_pending and error.code == "ACTIVATION_PENDING":
+                    try:
+                        self.publication.validate_pending_activation(
+                            repository,
+                            writer_generation=writer_generation,
+                            plan_digest=compiled_plan.digest,
+                            activation_id=(
+                                durable_activation.activation_id
+                                if durable_activation.plan_digest == compiled_plan.digest
+                                else None
+                            ),
+                        )
+                    except ActivationError:
+                        blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+                else:
+                    blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+        else:
+            try:
+                local_active = self.publication.read_active(repository)
+            except ActivationError as error:
+                if not (resuming_pending and error.code == "ACTIVATION_PENDING"):
+                    blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+            else:
+                if local_active is not None:
+                    blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
         if blockers:
             return blocked_outcome(blockers)
         stop_action = (
