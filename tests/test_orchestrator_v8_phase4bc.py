@@ -1975,6 +1975,15 @@ def test_rollback_rejects_mismatched_local_pending_reservation_before_drain(
             expected_active_digest=authoritative.plan_digest,
             writer_generation=authoritative.writer_generation,
         )
+    with sqlite3.connect(publication.store_path) as connection:
+        connection.execute(
+            """
+            UPDATE v8_pending_activations
+            SET expected_previous_digest = ?
+            WHERE repository = ?
+            """,
+            ("0" * 64, compiled.repository),
+        )
 
     current = transitions.read_current(compiled.repository)
     current_record = transitions.read(compiled.repository, current.record_id)

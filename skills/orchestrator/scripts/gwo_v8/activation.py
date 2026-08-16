@@ -30,6 +30,9 @@ class ActivationCheckpointCrash(RuntimeError):
     """Test-only process crash injected after a committed protocol boundary."""
 
 
+_EXPECTED_PREVIOUS_DIGEST_UNSET = object()
+
+
 @dataclass(frozen=True)
 class ActivationReceipt:
     schema_version: int
@@ -1403,6 +1406,21 @@ class LocalPlanPublication:
             )
         return receipt, active
 
+    def has_pending_activation(self, repository: str) -> bool:
+        """Report whether Store has a local pending Activation reservation."""
+        with self._connect() as connection:
+            return (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM v8_pending_activations
+                    WHERE repository = ?
+                    """,
+                    (repository,),
+                ).fetchone()
+                is not None
+            )
+
     def validate_pending_activation(
         self,
         repository: str,
@@ -1410,6 +1428,9 @@ class LocalPlanPublication:
         writer_generation: str,
         plan_digest: str,
         activation_id: str | None,
+        expected_previous_digest: str | None | object = (
+            _EXPECTED_PREVIOUS_DIGEST_UNSET
+        ),
     ) -> None:
         """Validate a local pending reservation without mutating the Store."""
         with self._connect() as connection:
@@ -1419,6 +1440,7 @@ class LocalPlanPublication:
                     plan_digest,
                     writer_generation,
                     activation_id,
+                    expected_previous_digest,
                     receipt_json
                 FROM v8_pending_activations
                 WHERE repository = ?
@@ -1444,6 +1466,19 @@ class LocalPlanPublication:
                 "PENDING_FINALIZE_LOCAL_MISMATCH",
                 "local pending Activation reservation is malformed",
             ) from error
+        durable_pending = (
+            None
+            if pending_receipt is None
+            else self.durable.read_activation(
+                repository,
+                pending_receipt.activation_id,
+            )
+        )
+        durable_current = (
+            None
+            if durable_pending is None
+            else self.durable.read_current_activation(repository)
+        )
         if (
             pending is None
             or pending_receipt is None
@@ -1456,6 +1491,22 @@ class LocalPlanPublication:
             or (
                 activation_id is not None
                 and pending_receipt.activation_id != activation_id
+            )
+            or (
+                expected_previous_digest is not _EXPECTED_PREVIOUS_DIGEST_UNSET
+                and pending["expected_previous_digest"] != expected_previous_digest
+            )
+            or (
+                expected_previous_digest is not _EXPECTED_PREVIOUS_DIGEST_UNSET
+                and pending_receipt.expected_previous_digest
+                != expected_previous_digest
+            )
+            or (
+                durable_pending is not None
+                and (
+                    durable_pending != pending_receipt
+                    or durable_current != pending_receipt
+                )
             )
             or revision is None
             or revision["writer_generation"] != writer_generation
@@ -1622,24 +1673,54 @@ class LocalPlanPublication:
                 """,
                 (record.repository,),
             ).fetchone()
+            pending = connection.execute(
+                """
+                SELECT plan_digest, writer_generation, activation_id
+                FROM v8_pending_activations WHERE repository = ?
+                """,
+                (record.repository,),
+            ).fetchone()
             if active is not None:
-                if (
-                    active["plan_digest"] != record.plan_digest
-                    or active["writer_generation"] != receipt.writer_generation
-                    or active["activation_id"] != receipt.activation_id
-                ):
+                active_is_target = (
+                    active["plan_digest"] == record.plan_digest
+                    and active["writer_generation"] == receipt.writer_generation
+                    and active["activation_id"] == receipt.activation_id
+                )
+                active_is_predecessor = (
+                    receipt.expected_previous_digest is not None
+                    and active["plan_digest"] == receipt.expected_previous_digest
+                    and active["writer_generation"] == receipt.writer_generation
+                )
+                if not active_is_target and not active_is_predecessor:
                     raise ActivationError(
                         "PENDING_FINALIZE_ACTIVE_CONFLICT",
                         "local active Activation differs from durable Receipt",
                     )
+                if active_is_predecessor and (
+                    pending is None
+                    or pending["plan_digest"] != record.plan_digest
+                    or pending["writer_generation"] != receipt.writer_generation
+                    or pending["activation_id"] != receipt.activation_id
+                ):
+                    raise ActivationError(
+                        "PENDING_FINALIZE_LOCAL_MISMATCH",
+                        "local pending reservation is required to replace the predecessor",
+                    )
+                if active_is_predecessor:
+                    connection.execute(
+                        """
+                        UPDATE v8_active_plans
+                        SET plan_digest = ?, writer_generation = ?, activation_id = ?
+                        WHERE repository = ?
+                        """,
+                        (
+                            record.plan_digest,
+                            receipt.writer_generation,
+                            receipt.activation_id,
+                            record.repository,
+                        ),
+                    )
             else:
-                pending = connection.execute(
-                    """
-                    SELECT plan_digest, writer_generation, activation_id
-                    FROM v8_pending_activations WHERE repository = ?
-                    """,
-                    (record.repository,),
-                ).fetchone()
                 revision = connection.execute(
                     """
                     SELECT canonical_bytes, writer_generation
@@ -1676,6 +1757,14 @@ class LocalPlanPublication:
                         receipt.activation_id,
                     ),
                 )
+                connection.execute(
+                    """
+                    DELETE FROM v8_pending_activations
+                    WHERE repository = ? AND activation_id = ?
+                    """,
+                    (record.repository, receipt.activation_id),
+                )
+            if active is not None and pending is not None:
                 connection.execute(
                     """
                     DELETE FROM v8_pending_activations
@@ -1842,7 +1931,11 @@ class LocalPlanPublication:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             active = connection.execute(
-                "SELECT 1 FROM v8_active_plans WHERE repository = ?",
+                """
+                SELECT plan_digest, writer_generation
+                FROM v8_active_plans
+                WHERE repository = ?
+                """,
                 (repository,),
             ).fetchone()
             pending = connection.execute(
@@ -1852,10 +1945,13 @@ class LocalPlanPublication:
                 """,
                 (repository,),
             ).fetchone()
-            if active is not None:
+            if active is not None and (
+                active["writer_generation"] != writer_generation
+                or active["plan_digest"] == plan_digest
+            ):
                 raise ActivationError(
                     "PENDING_ABANDON_ACTIVE_CONFLICT",
-                    "an active Activation cannot be abandoned as pending",
+                    "the pending Activation conflicts with the active identity",
                 )
             if pending is None:
                 return
