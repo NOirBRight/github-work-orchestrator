@@ -146,7 +146,7 @@ PRODUCTION_STORE = Path(
 PRODUCTION_STORE_GENERATION = "store:v8:production:20260809T081500Z"
 PRODUCTION_STORE_SHA256 = "afff1078e7a65fb8acccde28fee78fab3cf2278db9dd6548f5ef96a882076b98"
 PRODUCTION_RECEIPT = Path(
-    r"D:\gwo-release-evidence\2026-08-09-gwo-v8-beta3-production-cutover"
+    r"D:\gwo-release-evidence\2026-08-17-gwo-v8-beta3-production-cutover"
     r"\fresh-store-exact-main-receipt.json"
 )
 PRODUCTION_RUNTIME_CONFIG = Path(r"C:\Users\noirb\.orch\config.json")
