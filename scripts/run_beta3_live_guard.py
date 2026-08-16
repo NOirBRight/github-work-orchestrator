@@ -3246,6 +3246,9 @@ def _preflight_file_snapshots(
     subject_binding: object | None = None,
 ) -> dict[str, dict[str, object]]:
     snapshots: dict[str, dict[str, object]] = {}
+    authoritative_preflight = any(
+        key in preflight_result for key in ("_receipt", "_stores", "_packages")
+    )
 
     def add(path: Path, identity: object, sha256: object) -> None:
         if type(identity) is dict and type(sha256) is str:
@@ -3253,8 +3256,17 @@ def _preflight_file_snapshots(
                 "identity": dict(identity),
                 "sha256": sha256,
             }
+        elif authoritative_preflight:
+            raise RunnerError(
+                "LIVE_INPUT_DRIFT",
+                f"preflight input snapshot is missing: {path}",
+            )
 
     input_snapshot = preflight_result.get("_input_snapshot")
+    if authoritative_preflight and type(input_snapshot) is not dict:
+        raise RunnerError(
+            "LIVE_INPUT_DRIFT", "preflight input snapshot is unavailable"
+        )
     if type(input_snapshot) is dict:
         file_paths = input_snapshot.get("file_paths")
         identities = input_snapshot.get("file_identities")
@@ -3297,13 +3309,20 @@ def _preflight_file_snapshots(
 
     packages = preflight_result.get("_packages")
     if type(packages) is dict:
+        package_paths = packages.get("file_paths")
         identities = packages.get("file_identities")
         hashes = packages.get("file_hashes")
-        if type(identities) is dict and type(hashes) is dict:
+        if (
+            type(package_paths) is list
+            and all(type(path) is str for path in package_paths)
+            and type(identities) is dict
+            and type(hashes) is dict
+        ):
+            package_path_texts = set(package_paths)
             for path in local_paths:
                 path_text = _path_text(path)
-                add(path, identities.get(path_text), hashes.get(path_text))
-        package_paths = packages.get("file_paths")
+                if path_text in package_path_texts:
+                    add(path, identities.get(path_text), hashes.get(path_text))
         if type(package_paths) is list and all(
             type(path) is str for path in package_paths
         ):
@@ -3374,6 +3393,7 @@ def preflight(
     allow_existing_outputs: bool = False,
     authoritative_sources: bool = True,
     module_repository_root: Path | None = None,
+    subject_binding: object | None = None,
 ) -> dict[str, object]:
     _validate_config_paths(config, allow_existing_outputs=allow_existing_outputs)
     git = _git_snapshot(config, git_runner)
@@ -3416,10 +3436,15 @@ def preflight(
                 "_receipt_digest": receipt_digest,
                 "_stores": stores,
                 "_packages": packages,
+                "_input_snapshot": _mechanical_input_snapshot(
+                    config, subject_binding=subject_binding
+                ),
             }
         )
     else:
-        result["_input_snapshot"] = _mechanical_input_snapshot(config)
+        result["_input_snapshot"] = _mechanical_input_snapshot(
+            config, subject_binding=subject_binding
+        )
     return result
 
 
@@ -5368,6 +5393,7 @@ def _run_bound(
             allow_existing_outputs=False,
             authoritative_sources=(not execute or production),
             module_repository_root=module_repository_root,
+            subject_binding=subject_binding,
         )
     except RunnerError as error:
         if error.code in {"OUTPUT_COLLISION", "LIVE_INPUT_DRIFT"}:

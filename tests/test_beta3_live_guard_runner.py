@@ -3181,6 +3181,40 @@ def test_authoritative_package_snapshot_ignores_non_package_local_inputs(tmp_pat
         binding.close()
 
 
+def test_authoritative_preflight_rejects_non_package_input_drift_before_lease(
+    tmp_path,
+):
+    config = replace(_fixture_config(tmp_path), package_names=("implement-gwo",))
+    guard_path = (
+        config.repository_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+        / "guard.py"
+    )
+    guard_path.parent.mkdir(parents=True)
+    guard_path.write_bytes(b"ONE\n")
+    preflight_result = runner.preflight(
+        config,
+        git_runner=_git_runner_factory(config),
+        authoritative_sources=True,
+    )
+    input_snapshot = preflight_result.get("_input_snapshot")
+    assert type(input_snapshot) is dict
+    assert runner._path_text(guard_path) in input_snapshot["file_paths"]
+    assert input_snapshot["file_hashes"][runner._path_text(guard_path)] == hashlib.sha256(
+        b"ONE\n"
+    ).hexdigest()
+    guard_path.write_bytes(b"TWO\n")
+
+    with pytest.raises(runner.RunnerError) as error:
+        with runner._input_lease(config, preflight_result) as lease:
+            lease.assert_stable()
+
+    assert error.value.code == "LIVE_INPUT_DRIFT"
+
+
 def test_real_composition_requires_a_proven_immutable_durable_adapter(tmp_path):
     config = _fixture_config(tmp_path)
     dependencies = runner._production_dependencies(config, "8" * 64)
