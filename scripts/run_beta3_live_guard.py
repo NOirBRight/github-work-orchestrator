@@ -3134,7 +3134,7 @@ def _local_input_files(
         manifest_path = Path(config.evidence_root) / _RELEASE_SUBJECT_NAME
     if _lexists(Path(manifest_path)):
         paths.add(Path(manifest_path))
-    paths.update(_package_file_paths(config))
+    paths.update(_local_tree_file_captures(config))
     return tuple(sorted(paths, key=_path_text))
 
 

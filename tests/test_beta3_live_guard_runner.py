@@ -3114,7 +3114,17 @@ def test_production_execute_publishes_authoritative_readback_digests(
 
 
 def test_authoritative_package_snapshot_ignores_non_package_local_inputs(tmp_path):
-    config = _fixture_config(tmp_path)
+    config = replace(_fixture_config(tmp_path), package_names=("implement-gwo",))
+    guard_path = (
+        config.repository_root
+        / "skills"
+        / "orchestrator"
+        / "scripts"
+        / "gwo_v8"
+        / "guard.py"
+    )
+    guard_path.parent.mkdir(parents=True)
+    guard_path.write_text("GUARD = True\n", encoding="utf-8")
     binding = _FixtureBinding(config)
     try:
         preflight_result = runner.preflight(
@@ -3144,6 +3154,9 @@ def test_authoritative_package_snapshot_ignores_non_package_local_inputs(tmp_pat
         assert {
             runner._path_text(path) for path in runner._package_file_paths(config)
         } == expected_package_paths
+        assert guard_path in local_paths
+        assert binding.manifest_path in local_paths
+        assert runner._path_text(guard_path) not in expected_package_paths
         assert runner._path_text(binding.manifest_path) not in expected_package_paths
         assert runner._path_text(config.runtime_config_path) not in expected_package_paths
         assert runner._path_text(Path(runner.__file__)) not in expected_package_paths
