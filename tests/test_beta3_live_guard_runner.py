@@ -3113,6 +3113,51 @@ def test_production_execute_publishes_authoritative_readback_digests(
     assert not config.artifact_root.exists()
 
 
+def test_authoritative_package_snapshot_ignores_non_package_local_inputs(tmp_path):
+    config = _fixture_config(tmp_path)
+    binding = _FixtureBinding(config)
+    try:
+        preflight_result = runner.preflight(
+            config,
+            git_runner=_git_runner_factory(config),
+            authoritative_sources=True,
+        )
+        local_paths = runner._lease_input_paths(
+            config,
+            subject_binding=binding,
+        )
+        expected_package_paths = set()
+        for package_name in config.package_names:
+            roots = (
+                runner._package_path(config.repository_root, package_name),
+                *(root / package_name for root in config.install_roots),
+            )
+            for root in roots:
+                expected_package_paths.update(
+                    runner._path_text(path)
+                    for path in runner._local_regular_files(root, "PACKAGE_INVALID")
+                )
+
+        assert set(preflight_result["_packages"]["file_paths"]) == (
+            expected_package_paths
+        )
+        assert {
+            runner._path_text(path) for path in runner._package_file_paths(config)
+        } == expected_package_paths
+        assert runner._path_text(binding.manifest_path) not in expected_package_paths
+        assert runner._path_text(config.runtime_config_path) not in expected_package_paths
+        assert runner._path_text(Path(runner.__file__)) not in expected_package_paths
+
+        runner._preflight_file_snapshots(
+            config,
+            preflight_result,
+            local_paths,
+            subject_binding=binding,
+        )
+    finally:
+        binding.close()
+
+
 def test_real_composition_requires_a_proven_immutable_durable_adapter(tmp_path):
     config = _fixture_config(tmp_path)
     dependencies = runner._production_dependencies(config, "8" * 64)

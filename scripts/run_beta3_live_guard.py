@@ -3108,6 +3108,21 @@ def _local_tree_file_captures(config: RunnerConfig) -> dict[Path, _HeldTreeFile]
     return captures
 
 
+def _package_file_paths(config: RunnerConfig) -> tuple[Path, ...]:
+    roots = [*_local_package_roots(config)]
+    roots.extend(
+        Path(install_root) / package_name
+        for install_root in config.install_roots
+        for package_name in config.package_names
+    )
+    paths = {
+        item.path
+        for root in roots
+        for item in _bound_tree_files(root, "LIVE_INPUT_DRIFT")
+    }
+    return tuple(sorted(paths, key=_path_text))
+
+
 def _local_input_files(
     config: RunnerConfig,
     *,
@@ -3119,7 +3134,7 @@ def _local_input_files(
         manifest_path = Path(config.evidence_root) / _RELEASE_SUBJECT_NAME
     if _lexists(Path(manifest_path)):
         paths.add(Path(manifest_path))
-    paths.update(_local_tree_file_captures(config))
+    paths.update(_package_file_paths(config))
     return tuple(sorted(paths, key=_path_text))
 
 
@@ -3293,11 +3308,7 @@ def _preflight_file_snapshots(
             type(path) is str for path in package_paths
         ):
             observed_package_paths = {
-                _path_text(path)
-                for path in _local_input_files(
-                    config,
-                    subject_binding=subject_binding,
-                )
+                _path_text(path) for path in _package_file_paths(config)
             }
             if observed_package_paths != set(package_paths):
                 raise RunnerError(
