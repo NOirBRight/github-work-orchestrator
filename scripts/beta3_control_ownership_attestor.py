@@ -3347,6 +3347,11 @@ def _read_stable_static_inputs(
     if not before:
         _fail("STATIC_INPUT_SOURCE_UNAVAILABLE", "audited static input set is empty")
     snapshot_tree_sha256 = _snapshot_tree_digest(root, before)
+    if snapshot_tree_sha256 != subject.source_tree_digest:
+        _fail(
+            "STATIC_INPUT_SOURCE_UNAVAILABLE",
+            "snapshot source tree digest differs from the release subject",
+        )
     scan_subject = replace(subject, source_tree_digest=snapshot_tree_sha256)
     try:
         scanned = ProductionPathScanner(root).read(scan_subject)

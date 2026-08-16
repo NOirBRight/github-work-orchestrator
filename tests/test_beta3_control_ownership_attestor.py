@@ -3636,9 +3636,34 @@ def test_static_scan_rejects_file_replacement_between_validation_and_recording(
     assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
 
 
+def test_static_scan_rejects_subject_source_tree_digest_mismatch(tmp_path, monkeypatch):
+    _write_static_fixture(tmp_path)
+    subject = replace(_subject(), source_tree_digest="c" * 64)
+    monkeypatch.setattr(
+        attestor_module,
+        "ProductionPathScanner",
+        lambda _root: SimpleNamespace(read=lambda scan_subject: _compatibility(scan_subject)),
+    )
+
+    with pytest.raises(BootstrapError) as error:
+        attestor_module._read_stable_static_inputs(
+            tmp_path,
+            subject,
+            producer_sha256="d" * 64,
+        )
+
+    assert error.value.code == "STATIC_INPUT_SOURCE_UNAVAILABLE"
+
+
 def test_static_scan_binds_every_scanned_file_snapshot(tmp_path, monkeypatch):
     _write_static_fixture(tmp_path)
-    subject = _subject()
+    subject = replace(
+        _subject(),
+        source_tree_digest=attestor_module._snapshot_tree_digest(
+            tmp_path,
+            attestor_module._audited_file_snapshots(tmp_path),
+        ),
+    )
     monkeypatch.setattr(
         attestor_module,
         "ProductionPathScanner",
@@ -3810,7 +3835,13 @@ def test_static_and_package_attestation_never_installs_copies_or_replaces(
         for surface in (".agents", ".codex", ".claude")
     }
     _write_package_fixture(root, install_roots)
-    subject = _subject()
+    subject = replace(
+        _subject(),
+        source_tree_digest=attestor_module._snapshot_tree_digest(
+            root,
+            attestor_module._audited_file_snapshots(root),
+        ),
+    )
     monkeypatch.setattr(
         attestor_module,
         "ProductionPathScanner",
