@@ -1577,6 +1577,13 @@ class WriterCutoverController:
             and durable_activation.plan_digest == compiled_plan.digest
         ):
             expected_active_digest = durable_activation.expected_previous_digest
+        if durable_activation is not None and not resuming_pending:
+            try:
+                self.publication.read_authoritative_rollback_identity(repository)
+            except ActivationError:
+                blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+        if blockers:
+            return blocked_outcome(blockers)
         stop_action = (
             f"stop-v61:{digest_value({'repository': repository})[:24]}"
         )
