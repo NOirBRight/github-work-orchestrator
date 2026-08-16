@@ -3664,10 +3664,18 @@ def test_static_scan_binds_every_scanned_file_snapshot(tmp_path, monkeypatch):
             attestor_module._audited_file_snapshots(tmp_path),
         ),
     )
+
+    scanned_subjects = []
+
+    class RecordingScanner:
+        def read(self, scan_subject):
+            scanned_subjects.append(scan_subject)
+            return _compatibility(scan_subject)
+
     monkeypatch.setattr(
         attestor_module,
         "ProductionPathScanner",
-        lambda _root: SimpleNamespace(read=lambda scan_subject: _compatibility(scan_subject)),
+        lambda _root: RecordingScanner(),
     )
 
     readback, records = attestor_module._read_stable_static_inputs(
@@ -3676,6 +3684,8 @@ def test_static_scan_binds_every_scanned_file_snapshot(tmp_path, monkeypatch):
         producer_sha256="d" * 64,
     )
 
+    assert len(scanned_subjects) == 1
+    assert scanned_subjects[0] is subject
     assert readback.source_tree_digest == subject.source_tree_digest
     assert {dict(record.identity)["relative_path"] for record in records} == {
         "skills/implement-gwo/SKILL.md",
