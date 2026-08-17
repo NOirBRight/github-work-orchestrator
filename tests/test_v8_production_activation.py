@@ -30,10 +30,13 @@ def _authorization(fixture, tmp_path):
     return ProductionActivationAuthorization(
         run_id="task-8-run",
         repository=fixture.repository,
-        source_main_sha=fixture.subject.source_commit,
-        source_main_tree="c" * 40,
-        target_writer_generation=fixture.subject.target_writer_generation,
+        merged_main_sha=fixture.subject.source_commit,
+        merged_main_git_tree="c" * 40,
+        release_subject_digest="d" * 64,
         evidence_root=str(tmp_path / "evidence"),
+        target_repository=fixture.repository,
+        writer_transition="v6.1 -> v8",
+        target_writer_generation=fixture.subject.target_writer_generation,
     )
 
 
@@ -48,12 +51,7 @@ class _AuthorizationSource:
 
 def _authorization_receipt(authorization):
     identity = {
-        "run_id": authorization.run_id,
-        "repository": authorization.repository,
-        "source_main_sha": authorization.source_main_sha,
-        "source_main_tree": authorization.source_main_tree,
-        "target_writer_generation": authorization.target_writer_generation,
-        "evidence_root": authorization.evidence_root,
+        **authorization.canonical_without_receipt_fields(),
         "approval_ref": (
             f"github://{authorization.repository}/owner-approval/{authorization.run_id}"
         ),
@@ -125,7 +123,7 @@ def _publish_pending(fixture, request, *, manifest_ref=None, plan_digest=None):
     fixture.transitions.publish(
         WriterTransitionRecord(
             record_id="writer-transition:pending",
-            repository=authorization.repository,
+            repository=authorization.target_repository,
             kind="cutover_pending",
             status="pending",
             previous_writer_generation="v6.1",
@@ -155,8 +153,11 @@ def _publish_pending(fixture, request, *, manifest_ref=None, plan_digest=None):
     (
         "run_id",
         "repository",
-        "source_main_sha",
-        "source_main_tree",
+        "merged_main_sha",
+        "merged_main_git_tree",
+        "release_subject_digest",
+        "target_repository",
+        "writer_transition",
         "target_writer_generation",
         "evidence_root",
     ),
@@ -165,8 +166,11 @@ def test_authorization_rejects_empty_identity_fields(field, tmp_path):
     values = {
         "run_id": "run",
         "repository": "owner/repository",
-        "source_main_sha": "a" * 40,
-        "source_main_tree": "b" * 40,
+        "merged_main_sha": "a" * 40,
+        "merged_main_git_tree": "b" * 40,
+        "release_subject_digest": "c" * 64,
+        "target_repository": "owner/repository",
+        "writer_transition": "v6.1 -> v8",
         "target_writer_generation": "v8",
         "evidence_root": str(tmp_path / "evidence"),
     }
@@ -179,18 +183,21 @@ def test_authorization_rejects_empty_identity_fields(field, tmp_path):
 @pytest.mark.parametrize(
     ("field", "value"),
     (
-        ("source_main_sha", "A" * 40),
-        ("source_main_sha", "a" * 39),
-        ("source_main_tree", "b" * 64),
-        ("source_main_tree", "g" * 40),
+        ("merged_main_sha", "A" * 40),
+        ("merged_main_sha", "a" * 39),
+        ("merged_main_git_tree", "b" * 64),
+        ("merged_main_git_tree", "g" * 40),
     ),
 )
 def test_authorization_rejects_noncanonical_main_commit_or_tree(field, value, tmp_path):
     values = {
         "run_id": "run",
         "repository": "owner/repository",
-        "source_main_sha": "a" * 40,
-        "source_main_tree": "b" * 40,
+        "merged_main_sha": "a" * 40,
+        "merged_main_git_tree": "b" * 40,
+        "release_subject_digest": "c" * 64,
+        "target_repository": "owner/repository",
+        "writer_transition": "v6.1 -> v8",
         "target_writer_generation": "v8",
         "evidence_root": str(tmp_path / "evidence"),
     }
@@ -218,8 +225,8 @@ def test_preflight_requires_authoritative_authorization_provenance_readback(tmp_
     (
         ("run_id", "different-run"),
         ("repository", "other/repository"),
-        ("source_main_sha", "d" * 40),
-        ("source_main_tree", "e" * 40),
+        ("merged_main_sha", "d" * 40),
+        ("merged_main_git_tree", "e" * 40),
         ("target_writer_generation", "v8-other"),
         ("evidence_root", "other-evidence-root"),
     ),

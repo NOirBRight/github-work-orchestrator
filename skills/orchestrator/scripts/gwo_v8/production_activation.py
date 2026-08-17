@@ -36,6 +36,7 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _EXPECTED_WORKER_CAPACITY = 8
 _EXPECTED_COORDINATOR_CAPACITY = 1
 _DURABLE_CANARY_REF_PREFIXES = ("github://", "git://")
+WRITER_TRANSITION = "v6.1 -> v8"
 
 
 class ProductionActivationError(RuntimeError):
@@ -71,16 +72,51 @@ def _reject(code: str, detail: str) -> None:
     raise ProductionActivationError(code, detail)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ProductionActivationAuthorization:
-    """The exact owner authorization identity for one activation attempt."""
+    """Exact owner approval identity for one named V8 activation."""
 
     run_id: str
     repository: str
-    source_main_sha: str
-    source_main_tree: str
-    target_writer_generation: str
+    merged_main_sha: str
+    merged_main_git_tree: str
+    release_subject_digest: str
     evidence_root: str
+    target_repository: str
+    writer_transition: str
+    target_writer_generation: str
+
+    def __init__(
+        self,
+        run_id: str,
+        repository: str,
+        merged_main_sha: str | None = None,
+        merged_main_git_tree: str | None = None,
+        release_subject_digest: str | None = None,
+        evidence_root: str | None = None,
+        target_repository: str | None = None,
+        writer_transition: str = WRITER_TRANSITION,
+        target_writer_generation: str | None = None,
+        *,
+        source_main_sha: str | None = None,
+        source_main_tree: str | None = None,
+    ) -> None:
+        merged_main_sha = _coalesced_identity(
+            merged_main_sha, source_main_sha, "merged_main_sha"
+        )
+        merged_main_git_tree = _coalesced_identity(
+            merged_main_git_tree, source_main_tree, "merged_main_git_tree"
+        )
+        object.__setattr__(self, "run_id", run_id)
+        object.__setattr__(self, "repository", repository)
+        object.__setattr__(self, "merged_main_sha", merged_main_sha)
+        object.__setattr__(self, "merged_main_git_tree", merged_main_git_tree)
+        object.__setattr__(self, "release_subject_digest", release_subject_digest)
+        object.__setattr__(self, "evidence_root", evidence_root)
+        object.__setattr__(self, "target_repository", target_repository)
+        object.__setattr__(self, "writer_transition", writer_transition)
+        object.__setattr__(self, "target_writer_generation", target_writer_generation)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
@@ -89,41 +125,130 @@ class ProductionActivationAuthorization:
                 raise ValueError(
                     f"ProductionActivationAuthorization.{name} must be non-empty text"
                 )
-        if not _is_sha40(self.source_main_sha):
+        if not _is_sha40(self.merged_main_sha):
             raise ValueError(
-                "ProductionActivationAuthorization.source_main_sha must be a "
+                "ProductionActivationAuthorization.merged_main_sha must be a "
                 "lowercase 40-hex Git commit"
             )
-        if not _is_sha40(self.source_main_tree):
+        if not _is_sha40(self.merged_main_git_tree):
             raise ValueError(
-                "ProductionActivationAuthorization.source_main_tree must be a "
+                "ProductionActivationAuthorization.merged_main_git_tree must be a "
                 "lowercase 40-hex Git tree"
             )
+        if not _is_digest(self.release_subject_digest):
+            raise ValueError(
+                "ProductionActivationAuthorization.release_subject_digest must be a "
+                "lowercase 64-hex digest"
+            )
+        if self.writer_transition != WRITER_TRANSITION:
+            raise ValueError(
+                "ProductionActivationAuthorization.writer_transition must equal "
+                f"{WRITER_TRANSITION!r}"
+            )
+
+    @property
+    def source_main_sha(self) -> str:
+        """Compatibility alias for the merged-main commit identity."""
+
+        return self.merged_main_sha
+
+    @property
+    def source_main_tree(self) -> str:
+        """Compatibility alias for the merged-main tree identity."""
+
+        return self.merged_main_git_tree
+
+    def canonical_without_receipt_fields(self) -> dict[str, str]:
+        return {
+            "run_id": self.run_id,
+            "repository": self.repository,
+            "merged_main_sha": self.merged_main_sha,
+            "merged_main_git_tree": self.merged_main_git_tree,
+            "release_subject_digest": self.release_subject_digest,
+            "evidence_root": self.evidence_root,
+            "target_repository": self.target_repository,
+            "writer_transition": self.writer_transition,
+            "target_writer_generation": self.target_writer_generation,
+        }
+
+    def canonical(self) -> dict[str, str]:
+        return self.canonical_without_receipt_fields()
 
 
-@dataclass(frozen=True)
+def _coalesced_identity(
+    canonical: str | None,
+    legacy: str | None,
+    name: str,
+) -> str:
+    if canonical is None:
+        canonical = legacy
+    elif legacy is not None and canonical != legacy:
+        raise ValueError(f"{name} and its source_main alias must match")
+    if canonical is None:
+        raise ValueError(f"{name} is required")
+    return canonical
+
+
+@dataclass(frozen=True, init=False)
 class ProductionActivationAuthorizationReceipt:
-    """Authoritative owner-approval and source/evidence provenance readback.
-
-    This receipt records an external approval fact; it does not authenticate a
-    chat user or infer approval from the caller.
-    """
+    """Durable readback of the exact owner approval identity."""
 
     run_id: str
     repository: str
-    source_main_sha: str
-    source_main_tree: str
-    target_writer_generation: str
+    merged_main_sha: str
+    merged_main_git_tree: str
+    release_subject_digest: str
     evidence_root: str
+    target_repository: str
+    writer_transition: str
+    target_writer_generation: str
     approval_ref: str
     receipt_digest: str
+
+    def __init__(
+        self,
+        run_id: str,
+        repository: str,
+        merged_main_sha: str | None = None,
+        merged_main_git_tree: str | None = None,
+        release_subject_digest: str | None = None,
+        evidence_root: str | None = None,
+        target_repository: str | None = None,
+        writer_transition: str = WRITER_TRANSITION,
+        target_writer_generation: str | None = None,
+        approval_ref: str | None = None,
+        receipt_digest: str | None = None,
+        *,
+        source_main_sha: str | None = None,
+        source_main_tree: str | None = None,
+    ) -> None:
+        merged_main_sha = _coalesced_identity(
+            merged_main_sha, source_main_sha, "merged_main_sha"
+        )
+        merged_main_git_tree = _coalesced_identity(
+            merged_main_git_tree, source_main_tree, "merged_main_git_tree"
+        )
+        object.__setattr__(self, "run_id", run_id)
+        object.__setattr__(self, "repository", repository)
+        object.__setattr__(self, "merged_main_sha", merged_main_sha)
+        object.__setattr__(self, "merged_main_git_tree", merged_main_git_tree)
+        object.__setattr__(self, "release_subject_digest", release_subject_digest)
+        object.__setattr__(self, "evidence_root", evidence_root)
+        object.__setattr__(self, "target_repository", target_repository)
+        object.__setattr__(self, "writer_transition", writer_transition)
+        object.__setattr__(self, "target_writer_generation", target_writer_generation)
+        object.__setattr__(self, "approval_ref", approval_ref)
+        object.__setattr__(self, "receipt_digest", receipt_digest)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         for name in (
             "run_id",
             "repository",
-            "target_writer_generation",
             "evidence_root",
+            "target_repository",
+            "writer_transition",
+            "target_writer_generation",
             "approval_ref",
         ):
             if not _nonempty_text(getattr(self, name)):
@@ -131,15 +256,25 @@ class ProductionActivationAuthorizationReceipt:
                     f"ProductionActivationAuthorizationReceipt.{name} "
                     "must be non-empty text"
                 )
-        if not _is_sha40(self.source_main_sha):
+        if not _is_sha40(self.merged_main_sha):
             raise ValueError(
-                "ProductionActivationAuthorizationReceipt.source_main_sha "
+                "ProductionActivationAuthorizationReceipt.merged_main_sha "
                 "must be a lowercase 40-hex Git commit"
             )
-        if not _is_sha40(self.source_main_tree):
+        if not _is_sha40(self.merged_main_git_tree):
             raise ValueError(
-                "ProductionActivationAuthorizationReceipt.source_main_tree "
+                "ProductionActivationAuthorizationReceipt.merged_main_git_tree "
                 "must be a lowercase 40-hex Git tree"
+            )
+        if not _is_digest(self.release_subject_digest):
+            raise ValueError(
+                "ProductionActivationAuthorizationReceipt.release_subject_digest "
+                "must be a lowercase 64-hex digest"
+            )
+        if self.writer_transition != WRITER_TRANSITION:
+            raise ValueError(
+                "ProductionActivationAuthorizationReceipt.writer_transition must equal "
+                f"{WRITER_TRANSITION!r}"
             )
         if not _is_digest(self.receipt_digest):
             raise ValueError(
@@ -147,16 +282,32 @@ class ProductionActivationAuthorizationReceipt:
                 "must be a lowercase 64-hex digest"
             )
 
+    @property
+    def source_main_sha(self) -> str:
+        return self.merged_main_sha
+
+    @property
+    def source_main_tree(self) -> str:
+        return self.merged_main_git_tree
+
     def canonical_without_digest(self) -> dict[str, str]:
         return {
             "run_id": self.run_id,
             "repository": self.repository,
-            "source_main_sha": self.source_main_sha,
-            "source_main_tree": self.source_main_tree,
-            "target_writer_generation": self.target_writer_generation,
+            "merged_main_sha": self.merged_main_sha,
+            "merged_main_git_tree": self.merged_main_git_tree,
+            "release_subject_digest": self.release_subject_digest,
             "evidence_root": self.evidence_root,
+            "target_repository": self.target_repository,
+            "writer_transition": self.writer_transition,
+            "target_writer_generation": self.target_writer_generation,
             "approval_ref": self.approval_ref,
         }
+
+    def canonical(self) -> dict[str, str]:
+        value = self.canonical_without_digest()
+        value["receipt_digest"] = self.receipt_digest
+        return value
 
     def has_valid_digest(self) -> bool:
         return self.receipt_digest == digest_value(self.canonical_without_digest())
@@ -238,6 +389,42 @@ class ProductionActivationPreflight:
     checks: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ProductionActivationComposition:
+    """Live dependencies assembled around one typed activation request."""
+
+    controller: WriterCutoverController
+    canary_evidence_control: CanaryEvidenceControl
+
+    def __post_init__(self) -> None:
+        if type(self.controller) is not WriterCutoverController:
+            raise TypeError(
+                "ProductionActivationComposition.controller must be one exact "
+                "WriterCutoverController"
+            )
+        if not callable(getattr(self.canary_evidence_control, "read", None)) or not callable(
+            getattr(self.canary_evidence_control, "read_manifest", None)
+        ):
+            raise TypeError(
+                "ProductionActivationComposition.canary_evidence_control must expose "
+                "durable read operations"
+            )
+
+
+class ProductionActivationCompositionFactory(Protocol):
+    """Host-owned live factory; production never substitutes test doubles."""
+
+    def compose(
+        self,
+        *,
+        authorization: ProductionActivationAuthorization,
+        compiled_plan: CompiledPlan,
+        canary: CanaryAcceptance,
+        guard_subject: CutoverSubject,
+        guard_receipt: CutoverGuardReceipt,
+    ) -> ProductionActivationComposition: ...
+
+
 class _NotCompleted:
     pass
 
@@ -287,7 +474,7 @@ class ProductionActivationFacade:
             request,
             compiled_plan=plan_snapshot,
         )
-        current = self._read_current(request.authorization.repository)
+        current = self._read_current(request.authorization.target_repository)
         if current.writer_generation != EXPECTED_SOURCE_WRITER_GENERATION:
             if current.writer_generation != request.authorization.target_writer_generation:
                 _reject(
@@ -295,7 +482,7 @@ class ProductionActivationFacade:
                     "production activation requires the current V6.1 writer",
                 )
             record = self._read_transition_record(
-                request.authorization.repository,
+                request.authorization.target_repository,
                 current.record_id,
             )
             if not self._pending_matches(
@@ -381,7 +568,7 @@ class ProductionActivationFacade:
                     "AUTHORIZATION_PROVENANCE_STALE",
                     "authorization provenance changed after preflight",
                 )
-            current = self._read_current(request.authorization.repository)
+            current = self._read_current(request.authorization.target_repository)
             if current.writer_generation == authorization.target_writer_generation:
                 completed = self._read_completed_outcome(
                     request,
@@ -459,13 +646,15 @@ class ProductionActivationFacade:
         subject = request.guard_subject
 
         if (
-            plan.repository != authorization.repository
-            or subject.repository != authorization.repository
-            or request.source_main_sha != authorization.source_main_sha
-            or request.source_main_tree != authorization.source_main_tree
-            or subject.source_commit != authorization.source_main_sha
+            plan.repository != authorization.target_repository
+            or subject.repository != authorization.target_repository
+            or request.source_main_sha != authorization.merged_main_sha
+            or request.source_main_tree != authorization.merged_main_git_tree
+            or subject.source_commit != authorization.merged_main_sha
             or subject.target_writer_generation
             != authorization.target_writer_generation
+            or authorization.target_repository != subject.repository
+            or authorization.writer_transition != WRITER_TRANSITION
         ):
             _reject(
                 "AUTHORIZATION_IDENTITY_MISMATCH",
@@ -493,7 +682,7 @@ class ProductionActivationFacade:
                 "CanaryAcceptance is not an accepted, blocker-free result",
             )
         if (
-            canary.repository != authorization.repository
+            canary.repository != authorization.target_repository
             or not _is_digest(canary.evidence_package_digest)
             or not _nonempty_text(canary.manifest_ref)
             or type(canary.evidence_refs) is not tuple
@@ -505,7 +694,7 @@ class ProductionActivationFacade:
                 "CANARY_EVIDENCE_IDENTITY_INVALID",
                 "Canary evidence is not bound to the authorized repository and package identity",
             )
-        self._validate_canary_readback(canary, authorization.repository)
+        self._validate_canary_readback(canary, authorization.target_repository)
 
         receipt = request.guard_receipt
         if receipt is None:
@@ -515,7 +704,7 @@ class ProductionActivationFacade:
             )
         if (
             receipt.schema != RECEIPT_SCHEMA
-            or receipt.repository != authorization.repository
+            or receipt.repository != authorization.target_repository
             or receipt.subject_digest != digest_value(subject.canonical())
             or receipt.receipt_digest
             != digest_value(receipt.canonical_without_digest())
@@ -773,8 +962,11 @@ class ProductionActivationFacade:
             or not receipt.has_valid_digest()
             or receipt.run_id != authorization.run_id
             or receipt.repository != authorization.repository
-            or receipt.source_main_sha != authorization.source_main_sha
-            or receipt.source_main_tree != authorization.source_main_tree
+            or receipt.merged_main_sha != authorization.merged_main_sha
+            or receipt.merged_main_git_tree != authorization.merged_main_git_tree
+            or receipt.release_subject_digest != authorization.release_subject_digest
+            or receipt.target_repository != authorization.target_repository
+            or receipt.writer_transition != authorization.writer_transition
             or receipt.target_writer_generation
             != authorization.target_writer_generation
             or receipt.evidence_root != authorization.evidence_root
@@ -812,7 +1004,7 @@ class ProductionActivationFacade:
     ) -> WriterTransitionOutcome | _PendingActivation | _NotCompleted:
         plan = request.compiled_plan if compiled_plan is None else compiled_plan
         self._validate_common(request, compiled_plan=plan)
-        repository = request.authorization.repository
+        repository = request.authorization.target_repository
         current = self._read_current(repository)
         if current.writer_generation != request.authorization.target_writer_generation:
             return _NotCompleted()
@@ -894,7 +1086,7 @@ class ProductionActivationFacade:
         return (
             type(current) is CurrentWriter
             and type(record) is WriterTransitionRecord
-            and record.repository == request.authorization.repository
+            and record.repository == request.authorization.target_repository
             and current.record_id == record.record_id
             and current.writer_generation
             == request.authorization.target_writer_generation
@@ -926,7 +1118,7 @@ class ProductionActivationFacade:
         if (
             type(outcome) is not WriterTransitionOutcome
             or outcome.status != "cut_over"
-            or outcome.repository != request.authorization.repository
+            or outcome.repository != request.authorization.target_repository
             or outcome.writer_generation
             != request.authorization.target_writer_generation
             or not _nonempty_text(outcome.record_id)
@@ -939,7 +1131,7 @@ class ProductionActivationFacade:
                 "WriterCutoverController did not return a complete cutover outcome",
             )
 
-        repository = request.authorization.repository
+        repository = request.authorization.target_repository
         transitions = self._controller.transitions
         current = self._read_current(repository)
         if (
@@ -1050,6 +1242,8 @@ class ProductionActivationFacade:
 
 __all__ = [
     "ProductionActivationAuthorization",
+    "ProductionActivationComposition",
+    "ProductionActivationCompositionFactory",
     "ProductionActivationAuthorizationReceipt",
     "ProductionActivationAuthorizationSource",
     "ProductionActivationError",
@@ -1057,4 +1251,5 @@ __all__ = [
     "ProductionActivationPlanIdentity",
     "ProductionActivationPreflight",
     "ProductionActivationRequest",
+    "WRITER_TRANSITION",
 ]
