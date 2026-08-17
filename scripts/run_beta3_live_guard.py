@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 REPOSITORY_ROOT = Path(os.path.abspath(r"D:\Workstation\github-work-orchestrator"))
 EVIDENCE_ROOT = Path(
     os.path.abspath(
-        r"D:\gwo-release-evidence\2026-08-17-gwo-v8-beta3-production-cutover"
+        r"D:\gwo-release-evidence\2026-08-18-gwo-v8-beta3-production-cutover"
     )
 )
 REPOSITORY = "NOirBRight/github-work-orchestrator"

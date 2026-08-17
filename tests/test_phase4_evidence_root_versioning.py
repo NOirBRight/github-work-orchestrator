@@ -15,7 +15,7 @@ import run_beta3_live_guard as live_guard  # noqa: E402
 
 
 CURRENT_EVIDENCE_ROOT = Path(
-    r"D:\gwo-release-evidence\2026-08-17-gwo-v8-beta3-production-cutover"
+    r"D:\gwo-release-evidence\2026-08-18-gwo-v8-beta3-production-cutover"
 ).resolve()
 LEGACY_EVIDENCE_ROOT = Path(
     r"D:\gwo-release-evidence\2026-08-09-gwo-v8-beta3-production-cutover"

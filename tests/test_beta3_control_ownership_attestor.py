@@ -712,7 +712,7 @@ def _production_subject_and_config(tmp_path):
         "afff1078e7a65fb8acccde28fee78fab3cf2278db9dd6548f5ef96a882076b98"
     )
     config.fresh_receipt = Path(
-        r"D:\gwo-release-evidence\2026-08-17-gwo-v8-beta3-production-cutover"
+        r"D:\gwo-release-evidence\2026-08-18-gwo-v8-beta3-production-cutover"
         r"\fresh-store-exact-main-receipt.json"
     )
     config.expected_fresh_receipt_sha256 = "8" * 64
