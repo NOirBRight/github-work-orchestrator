@@ -40,6 +40,7 @@ from gwo_v8.production_activation import (
     ProductionActivationComposition,
 )
 from gwo_v8.production_effects import ProductionCompositionError
+from gwo_v8_live_guard_host import LiveGuardHostError, install_live_guard_host
 from gwo_v8.transition import (
     CanaryAcceptance,
     GitHubCanaryEvidenceControl,
@@ -177,6 +178,10 @@ class ProductionCompositionConfig:
     canary_locations: tuple[tuple[str, str, str, str], ...] = ()
     guard_package_root: Path | None = None
     guard_install_roots: tuple[Path, Path, Path] | None = None
+    repository_root: Path | None = None
+    runtime_config_path: Path | None = None
+    gateway_store_path: Path | None = None
+    artifact_root: Path | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.store_path, Path):
@@ -227,6 +232,21 @@ class ProductionCompositionConfig:
             raise ValueError(
                 "guard_package_root and guard_install_roots must be configured together"
             )
+        live_host_values = (
+            self.repository_root,
+            self.runtime_config_path,
+            self.gateway_store_path,
+            self.artifact_root,
+        )
+        if any(value is not None for value in live_host_values):
+            if any(not isinstance(value, Path) for value in live_host_values):
+                raise TypeError(
+                    "live host paths must be configured as exact Path values"
+                )
+            if any(value is None for value in live_host_values):
+                raise ValueError(
+                    "repository_root, runtime_config_path, gateway_store_path, and artifact_root must be configured together"
+                )
 
 
 # Public spellings used by the CLI host and the Phase 5 draft are identical
@@ -505,6 +525,7 @@ def _validate_identity(
 def _compose_live_guard(
     config: ProductionCompositionConfig,
     subject: CutoverSubject,
+    run_id: str,
 ) -> tuple[ProductionCutoverGuardHost, object]:
     if config.guard_package_root is None or config.guard_install_roots is None:
         raise _error(
@@ -522,11 +543,56 @@ def _compose_live_guard(
     try:
         guard = load_production_cutover_guard(request)
     except Exception as error:
-        source_code = getattr(error, "code", "GUARD_RESOLVER_UNAVAILABLE")
-        raise _error(
-            "FACTORY_GUARD_LIVE_UNAVAILABLE",
-            f"{source_code}: {error}",
-        ) from error
+        if getattr(error, "code", None) != "CUTOVER_GUARD_COMPOSITION_INVALID":
+            source_code = getattr(error, "code", "GUARD_RESOLVER_UNAVAILABLE")
+            raise _error(
+                "FACTORY_GUARD_LIVE_UNAVAILABLE",
+                f"{source_code}: {error}",
+            ) from error
+        if any(
+            value is None
+            for value in (
+                config.repository_root,
+                config.runtime_config_path,
+                config.gateway_store_path,
+                config.artifact_root,
+            )
+        ):
+            raise _error(
+                "FACTORY_GUARD_CONFIGURATION_REQUIRED",
+                "live host bootstrap requires repository, runtime, gateway, and artifact paths",
+            ) from error
+        try:
+            install_live_guard_host(
+                subject=subject,
+                run_id=run_id,
+                repository_root=config.repository_root,
+                runtime_config_path=config.runtime_config_path,
+                gateway_store_path=config.gateway_store_path,
+                artifact_root=config.artifact_root,
+                store_path=config.store_path,
+                package_root=config.guard_package_root,
+                install_roots=config.guard_install_roots,
+                github_executable=config.github_executable,
+                github_timeout_seconds=config.github_timeout_seconds,
+            )
+        except LiveGuardHostError as host_error:
+            raise _error(
+                "FACTORY_GUARD_LIVE_UNAVAILABLE",
+                f"{host_error.code}: {host_error.detail}",
+            ) from host_error
+        try:
+            guard = load_production_cutover_guard(request)
+        except Exception as retry_error:
+            source_code = getattr(
+                retry_error,
+                "code",
+                "GUARD_RESOLVER_UNAVAILABLE",
+            )
+            raise _error(
+                "FACTORY_GUARD_LIVE_UNAVAILABLE",
+                f"{source_code}: {retry_error}",
+            ) from retry_error
     if type(guard) is not ProductionCutoverGuardHost:
         raise _error(
             "FACTORY_GUARD_LIVE_UNAVAILABLE",
@@ -636,7 +702,11 @@ class ProductionActivationCompositionFactory:
             config.store_path,
             config.source_writer_generation,
         )
-        guard, legacy_source = _compose_live_guard(config, guard_subject)
+        guard, legacy_source = _compose_live_guard(
+            config,
+            guard_subject,
+            authorization.run_id,
+        )
 
         client = GitHubCliContentClient(
             config.github_executable,

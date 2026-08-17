@@ -488,6 +488,77 @@ def test_factory_live_guard_unavailability_is_a_concrete_fail_closed_error(
     assert "resolver-backed read ports" in raised.value.detail
 
 
+def test_factory_bootstraps_live_host_only_for_missing_installed_host(
+    tmp_path,
+    monkeypatch,
+):
+    import gwo_v8_production_factory as module
+    from gwo_v8.plan_control import PlanControlError
+
+    host = _install_test_live_guard(monkeypatch)
+    base_config = _config(tmp_path)
+    package_root = base_config.guard_package_root
+    install_roots = base_config.guard_install_roots
+    runtime_config = tmp_path / "config.json"
+    runtime_config.write_text("{}", encoding="utf-8")
+    config = replace(
+        base_config,
+        repository_root=tmp_path,
+        runtime_config_path=runtime_config,
+        gateway_store_path=tmp_path / "gateway.sqlite3",
+        artifact_root=tmp_path / "artifacts",
+        guard_package_root=package_root,
+        guard_install_roots=install_roots,
+    )
+    calls: list[object] = []
+    load_calls = 0
+
+    def load(request):
+        nonlocal load_calls
+        load_calls += 1
+        if load_calls == 1:
+            raise PlanControlError(
+                "CUTOVER_GUARD_COMPOSITION_INVALID",
+                "installed host is unavailable",
+            )
+        return host
+
+    def bootstrap(**kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(module, "load_production_cutover_guard", load)
+    monkeypatch.setattr(module, "install_live_guard_host", bootstrap)
+
+    _compose(ProductionActivationCompositionFactory(config))
+
+    assert len(calls) == 1
+    assert calls[0]["run_id"] == "phase5-factory-test"
+    assert calls[0]["repository_root"] == tmp_path
+    assert calls[0]["runtime_config_path"] == runtime_config
+    assert calls[0]["package_root"] == package_root
+    assert calls[0]["install_roots"] == install_roots
+    assert load_calls == 2
+
+
+def test_factory_does_not_bootstrap_for_unrelated_guard_failure(tmp_path, monkeypatch):
+    import gwo_v8_production_factory as module
+
+    calls: list[object] = []
+    monkeypatch.setattr(
+        module,
+        "load_production_cutover_guard",
+        lambda _request: (_ for _ in ()).throw(RuntimeError("unrelated failure")),
+    )
+    monkeypatch.setattr(module, "install_live_guard_host", lambda **kwargs: calls.append(kwargs))
+
+    with pytest.raises(ProductionCompositionError) as raised:
+        _compose(ProductionActivationCompositionFactory(_config(tmp_path)))
+
+    assert raised.value.code == "FACTORY_GUARD_LIVE_UNAVAILABLE"
+    assert calls == []
+
+
 def test_factory_requires_guard_composition_inputs_instead_of_static_go(tmp_path):
     with pytest.raises(ProductionCompositionError) as raised:
         _compose(
