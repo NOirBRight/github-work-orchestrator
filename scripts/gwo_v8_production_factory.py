@@ -333,7 +333,7 @@ def _validate_store(
     path: Path,
     *,
     repository: str,
-    expected_writer_generation: str,
+    expected_store_generation: str,
 ) -> None:
     _absolute_path(path, "store_path", "FACTORY_STORE_UNSAFE")
     _validate_regular_path(path, "store_path", "FACTORY_STORE_UNSAFE")
@@ -369,10 +369,10 @@ def _validate_store(
             """,
             (repository,),
         ).fetchone()
-        if writer_row is not None and writer_row[0] != expected_writer_generation:
+        if writer_row is not None and writer_row[0] != expected_store_generation:
             raise _error(
                 "FACTORY_STORE_WRITER_IDENTITY_INVALID",
-                "configured Store already belongs to a different writer generation",
+                "configured Store already belongs to a different Store generation",
             )
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         if integrity is None or integrity[0] != "ok":
@@ -625,10 +625,10 @@ class ProductionActivationCompositionFactory:
         _validate_store(
             config.store_path,
             repository=authorization.target_repository,
-            expected_writer_generation=(
-                config.target_writer_generation
-                if config.target_writer_generation is not None
-                else authorization.target_writer_generation
+            expected_store_generation=(
+                config.store_generation
+                if config.store_generation is not None
+                else guard_subject.store_generation
             ),
         )
         _validate_rollback_lineage(

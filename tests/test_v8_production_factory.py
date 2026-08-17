@@ -346,7 +346,7 @@ def test_factory_separates_store_identity_from_writer_generation(
     assert composition.controller.publication.store_path == config.store_path
 
 
-def test_factory_blocks_store_writer_generation_collision_before_activation(
+def test_factory_accepts_provisioned_store_genesis_without_mutating_store(
     tmp_path,
     monkeypatch,
 ):
@@ -376,6 +376,54 @@ def test_factory_blocks_store_writer_generation_collision_before_activation(
         connection.execute(
             "INSERT INTO v8_writer_generations(repository, writer_generation) VALUES (?, ?)",
             (REPOSITORY, store_generation),
+        )
+    before = config.store_path.read_bytes()
+
+    composition = _compose(
+        ProductionActivationCompositionFactory(config),
+        authorization=authorization,
+        subject=subject,
+        receipt=receipt,
+    )
+
+    assert composition.controller.publication.store_path == config.store_path
+    assert config.store_path.read_bytes() == before
+    with sqlite3.connect(config.store_path) as connection:
+        assert connection.execute(
+            "SELECT repository, writer_generation FROM v8_writer_generations"
+        ).fetchall() == [(REPOSITORY, store_generation)]
+
+
+def test_factory_rejects_non_genesis_store_writer_identity(
+    tmp_path,
+    monkeypatch,
+):
+    _install_test_live_guard(monkeypatch)
+    store_generation = "store:v8:production:20260817T205916Z"
+    writer_generation = "v8-generation-1"
+    config = replace(
+        _config(tmp_path),
+        store_generation=store_generation,
+        target_writer_generation=writer_generation,
+    )
+    authorization = replace(
+        _authorization(),
+        target_writer_generation=writer_generation,
+    )
+    subject = replace(
+        _subject(),
+        store_generation=store_generation,
+        target_writer_generation=writer_generation,
+    )
+    receipt = replace(
+        _guard_receipt(),
+        store_generation=store_generation,
+        target_writer_generation=writer_generation,
+    )
+    with sqlite3.connect(config.store_path) as connection:
+        connection.execute(
+            "INSERT INTO v8_writer_generations(repository, writer_generation) VALUES (?, ?)",
+            (REPOSITORY, writer_generation),
         )
 
     with pytest.raises(ProductionCompositionError) as raised:
