@@ -25,6 +25,9 @@ def _valid_source(tmp_path: Path) -> Path:
             ".ruff_cache",
             "__pycache__",
             "*.pyc",
+            ".gwo-worktrees",
+            ".tmp",
+            ".gwo-test-pycache-111-20260728-1",
         ),
     )
     subprocess.run(
