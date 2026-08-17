@@ -35,11 +35,13 @@ from gwo_v8.plan_control_host import (
     ProductionCutoverReadAdapterResolver,
     install_cutover_guard,
 )
-from gwo_v8.runtime_gateway import ProfileMapping, RuntimeConfiguration, RuntimeGateway
+from gwo_v8.runtime_gateway import ProfileMapping, RuntimeConfiguration
 from gwo_v8.runtime_profile import RuntimeProfile
 from gwo_v8.transition import (
     CanaryAcceptance,
+    CanaryRunVerifier,
     InMemoryLegacyWriterControl,
+    InMemoryCanaryEvidenceControl,
     InMemoryV8OwnershipControl,
     InMemoryWriterTransitionControl,
     V8OwnershipReadback,
@@ -406,6 +408,7 @@ class ActivationFixture:
     repository: str
     compiled_plan: CompiledPlan
     accepted_canary: CanaryAcceptance
+    canary_evidence_control: InMemoryCanaryEvidenceControl
     subject: CutoverSubject
     guard: ProductionCutoverGuardHost
     writer_readback: FakeReadPort
@@ -425,7 +428,7 @@ def activation_fixture(
     *,
     fail_after: set[str] | frozenset[str] = frozenset(),
 ) -> ActivationFixture:
-    from test_orchestrator_v8_phase4bc import _accepted_canary, _compiled, _verify_canary
+    from test_orchestrator_v8_phase4bc import _accepted_canary, _compiled
 
     calls: list[str] = []
     harness = GuardHarness.valid()
@@ -449,7 +452,16 @@ def activation_fixture(
             value,
             readback_digest=digest_value(body),
         )
-    accepted_canary = _verify_canary(_accepted_canary())
+    canary_readback = _accepted_canary(repository=compiled_plan.repository)
+    evidence = (
+        *canary_readback.scenario_evidence.values(),
+        *canary_readback.candidate_evidence.values(),
+        *canary_readback.review_evidence.values(),
+    )
+    canary_evidence_control = InMemoryCanaryEvidenceControl(tuple(evidence))
+    accepted_canary = CanaryRunVerifier(canary_evidence_control).verify(
+        canary_readback,
+    )
     legacy = RecordingLegacyControl(calls)
     transitions = RecordingTransitions(calls)
 
@@ -490,6 +502,7 @@ def activation_fixture(
         repository=compiled_plan.repository,
         compiled_plan=compiled_plan,
         accepted_canary=accepted_canary,
+        canary_evidence_control=canary_evidence_control,
         subject=harness.subject,
         guard=guard,
         writer_readback=harness.writer,
