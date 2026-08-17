@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -10,12 +13,7 @@ import pytest
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "orchestrator" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from v8_production_test_support import (
-    action,
-    delivery_action,
-    make_production_effects,
-    support,
-)
+from v8_production_test_support import make_production_effects  # noqa: E402
 
 
 def test_production_effects_requires_the_merged_candidate_and_batch_ports(tmp_path):
@@ -195,6 +193,41 @@ def test_repeated_runtime_execution_uses_the_persisted_effect_readback(
     assert third == first
     assert support.runtime.calls == [("progress", action.stable_action_id)]
     assert support.candidate.calls == [(action.stable_action_id, "gate_candidate")]
+
+
+def test_concurrent_runtime_execution_claims_before_the_provider_boundary(
+    tmp_path,
+    action,
+    support,
+):
+    support.candidate.result = support.accepted_candidate_result(action)
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    class BlockingRuntime:
+        def progress(self, subject, *, wake_cursor=None):
+            calls.append(subject.stable_action_id)
+            started.set()
+            if not release.wait(3):
+                raise AssertionError("blocking Runtime was not released")
+            return support.runtime_completed_receipt(action)
+
+    support.runtime_factory.gateway = BlockingRuntime()
+    first_effects = make_production_effects(tmp_path, support)
+    second_effects = make_production_effects(tmp_path, support)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(first_effects.execute, action)
+        assert started.wait(3)
+        second = pool.submit(second_effects.execute, action)
+        time.sleep(0.05)
+        release.set()
+        first_observation = first.result(timeout=5)
+        second_observation = second.result(timeout=5)
+
+    assert second_observation == first_observation
+    assert calls == [action.stable_action_id]
 
 
 def test_repeated_batch_execution_uses_the_persisted_delivery_readback(

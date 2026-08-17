@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
+import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Protocol
 
-from ._canonical import digest_bytes
+from ._canonical import digest_bytes, digest_value
 from .batch_integrator import (
     BatchDeliveryAction,
     BatchDeliveryObservation,
@@ -135,6 +138,8 @@ WorkRunEffectObservation = (
 )
 
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_EFFECT_CLAIM_WAIT_SECONDS = 10.0
+_EFFECT_CLAIM_POLL_SECONDS = 0.01
 
 
 @contextmanager
@@ -198,6 +203,8 @@ class ProductionWorkRunEffects:
         self._public_advance_active = False
         self._replayed_effect: tuple[str, str] | None = None
         self._suppress_replay_tracking = False
+        self._fault_proxy: object | None = None
+        self._claim_owner_prefix = f"{id(self)}:{uuid.uuid4().hex}"
         self._store_path.parent.mkdir(parents=True, exist_ok=True)
         with _ledger_connection(self._store_path) as connection:
             connection.execute(
@@ -222,6 +229,28 @@ class ProductionWorkRunEffects:
                     "ALTER TABLE v8_production_effect_receipts "
                     "ADD COLUMN accepted_candidate_receipt_json TEXT"
                 )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS v8_production_effect_claims(
+                    stable_action_id TEXT PRIMARY KEY,
+                    action_json TEXT NOT NULL,
+                    owner_token TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    claimed_at REAL NOT NULL,
+                    completed_observation_digest TEXT
+                )
+                """
+            )
+
+    def bind_fault_proxy(self, proxy: object) -> None:
+        """Install the named-Canary adapter on the real effect boundary."""
+
+        if not callable(getattr(proxy, "execute", None)):
+            raise ProductionCompositionError(
+                "ROOT_CANARY_FAULT_CONFIGURATION_INVALID",
+                "fault proxy must expose execute",
+            )
+        self._fault_proxy = proxy
 
     def _begin_public_advance(self) -> None:
         self._public_advance_active = True
@@ -386,11 +415,417 @@ class ProductionWorkRunEffects:
                 "effect ledger row is not an exact closed-union observation",
             ) from error
 
+    def _claim_token(self, action: WorkRunAction) -> str:
+        return (
+            f"{self._claim_owner_prefix}:{action.stable_action_id}:"
+            f"{threading.get_ident()}:{uuid.uuid4().hex}"
+        )
+
+    def _claim_or_wait(
+        self,
+        action: WorkRunAction,
+        owner: str,
+    ) -> WorkRunEffectObservation | None:
+        """Reserve an effect before any provider/deep-module call.
+
+        A committed claim is the authoritative duplicate fence.  A competing
+        caller waits for the owner to publish the effect receipt; it never
+        speculatively enters RuntimeGateway, CandidateGate, or BatchIntegrator.
+        An in-flight claim is never taken over on a timer: an ambiguous
+        provider boundary must be recovered by readback, not by risking a
+        second provider effect.
+        """
+
+        action_json = self._claim_action_json(action)
+        deadline = time.monotonic() + _EFFECT_CLAIM_WAIT_SECONDS
+        while True:
+            now = time.time()
+            stale_owner: str | None = None
+            stale_claimed_at: float | None = None
+            try:
+                with _ledger_connection(self._store_path) as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO v8_production_effect_claims(
+                            stable_action_id, action_json, owner_token,
+                            state, claimed_at, completed_observation_digest
+                        ) VALUES (?, ?, ?, 'in_flight', ?, NULL)
+                        ON CONFLICT(stable_action_id) DO NOTHING
+                        """,
+                        (
+                            action.stable_action_id,
+                            action_json,
+                            owner,
+                            now,
+                        ),
+                    )
+                    row = connection.execute(
+                        """
+                        SELECT action_json, owner_token, state, claimed_at
+                          FROM v8_production_effect_claims
+                         WHERE stable_action_id = ?
+                        """,
+                        (action.stable_action_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise ProductionCompositionError(
+                            "EFFECT_READBACK_INVALID",
+                            "durable effect claim disappeared during reservation",
+                        )
+                    recorded_action, recorded_owner, state, claimed_at = row
+                    if recorded_action != action_json:
+                        raise ProductionCompositionError(
+                            "EFFECT_READBACK_INVALID",
+                            "durable effect claim identity changed",
+                        )
+                    if state not in {"in_flight", "completed"} or type(claimed_at) is not float:
+                        raise ProductionCompositionError(
+                            "EFFECT_READBACK_INVALID",
+                            "durable effect claim state is malformed",
+                        )
+                    cached = self.readback(action)
+                    if cached is not None:
+                        return cached
+                    if state == "completed":
+                        raise ProductionCompositionError(
+                            "EFFECT_READBACK_INVALID",
+                            "completed effect claim has no effect receipt",
+                        )
+                    if recorded_owner == owner:
+                        return None
+                    if now - claimed_at >= _EFFECT_CLAIM_WAIT_SECONDS:
+                        stale_owner = recorded_owner
+                        stale_claimed_at = claimed_at
+            except sqlite3.Error as error:
+                raise ProductionCompositionError(
+                    "EFFECT_READBACK_INVALID",
+                    "effect claim could not be durably read or reserved",
+                ) from error
+            if (
+                stale_owner is not None
+                and stale_claimed_at is not None
+                and action.kind == "batch_delivery"
+                and self._has_authoritative_batch_readback(action)
+            ):
+                try:
+                    with _ledger_connection(self._store_path) as connection:
+                        updated = connection.execute(
+                            """
+                            UPDATE v8_production_effect_claims
+                               SET owner_token = ?, claimed_at = ?, state = 'in_flight'
+                             WHERE stable_action_id = ?
+                               AND action_json = ?
+                               AND owner_token = ?
+                               AND claimed_at = ?
+                               AND state = 'in_flight'
+                            """,
+                            (
+                                owner,
+                                time.time(),
+                                action.stable_action_id,
+                                action_json,
+                                stale_owner,
+                                stale_claimed_at,
+                            ),
+                        )
+                    if updated.rowcount == 1:
+                        cached = self.readback(action)
+                        if cached is not None:
+                            return cached
+                        return None
+                except sqlite3.Error as error:
+                    raise ProductionCompositionError(
+                        "EFFECT_READBACK_INVALID",
+                        "effect claim takeover could not be durably recorded",
+                    ) from error
+            if time.monotonic() >= deadline:
+                # A live owner that has not produced a receipt is ambiguous;
+                # fail closed rather than entering the provider concurrently.
+                raise ProductionCompositionError(
+                    "EFFECT_EXECUTION_IN_PROGRESS",
+                    "another owner has the authoritative effect claim",
+                )
+            time.sleep(_EFFECT_CLAIM_POLL_SECONDS)
+
+    def _release_claim(self, action: WorkRunAction, owner: str) -> None:
+        try:
+            with _ledger_connection(self._store_path) as connection:
+                connection.execute(
+                    """
+                    DELETE FROM v8_production_effect_claims
+                     WHERE stable_action_id = ?
+                       AND owner_token = ?
+                       AND state = 'in_flight'
+                    """,
+                    (action.stable_action_id, owner),
+                )
+        except sqlite3.Error:
+            # The original error is the useful failure.  If the claim cannot
+            # be released, retaining it is the safe duplicate fence.
+            return
+
+    def _fault_after_record(
+        self,
+        action: WorkRunAction,
+        observation: WorkRunEffectObservation,
+        *,
+        role: str,
+        point: str,
+        proxy_action_id: str | None = None,
+    ) -> None:
+        proxy = self._fault_proxy
+        if proxy is None:
+            return
+        try:
+            from scripts.v8_root_canary_fault_proxy import FaultRequest
+        except ModuleNotFoundError:
+            from v8_root_canary_fault_proxy import FaultRequest
+
+        stable_action_id = proxy_action_id or action.stable_action_id
+        payload_digest = digest_value(
+            {
+                "kind": "gwo.fault-payload.v1",
+                "action": self._action_json(action),
+                "observation": observation.canonical(),
+            }
+        )
+        request = FaultRequest(
+            role=role,
+            point=point,
+            stable_action_id=stable_action_id,
+            payload_digest=payload_digest,
+            command=(role, point, action.stable_action_id),
+            plan_revision_digest=action.plan_revision_digest,
+        )
+        proxy.execute(
+            request,
+            run_command=lambda _command: observation.canonical(),
+        )
+
+    def campaign_proof_readback(
+        self,
+        campaign: CampaignHandle,
+        plan_revision_digest: str,
+    ) -> dict[str, object]:
+        """Read the Task 3 proof projection from owner durable records."""
+
+        if type(campaign) is not CampaignHandle or not _DIGEST_PATTERN.fullmatch(plan_revision_digest):
+            raise ProductionCompositionError(
+                "EFFECT_READBACK_INVALID",
+                "Campaign proof source identity is malformed",
+            )
+        semantic_ids: list[str] = []
+        external_ids: list[str] = []
+        batch_receipts: list[str] = []
+        review_ledgers: list[str] = []
+        try:
+            with _ledger_connection(self._store_path) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT action_json, observation_json, observation_digest,
+                           accepted_candidate_receipt_json
+                      FROM v8_production_effect_receipts
+                    """
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise ProductionCompositionError(
+                "EFFECT_READBACK_INVALID",
+                "Campaign proof effect ledger could not be read",
+            ) from error
+        for action_json, observation_json, observation_digest, accepted_json in rows:
+            action_value = self._decode_recorded_action(action_json)
+            if (
+                action_value["repository"] != campaign.repository
+                or action_value["campaign_key"] != campaign.campaign_key
+                or action_value["plan_revision_digest"] != plan_revision_digest
+            ):
+                continue
+            observation = self._decode_recorded_observation(
+                observation_json,
+                observation_digest,
+            )
+            stable_action_id = action_value["stable_action_id"]
+            kind = action_value["kind"]
+            if kind in {"semantic_execution", "semantic_resume"}:
+                semantic_ids.append(stable_action_id)
+            elif kind == "batch_delivery":
+                external_ids.append(stable_action_id)
+                if type(observation) is WorkRunObservation:
+                    batch_receipts.append(observation.receipt_digest)
+            if accepted_json is not None:
+                if type(accepted_json) is not str:
+                    raise ProductionCompositionError(
+                        "EFFECT_READBACK_INVALID",
+                        "Finding ledger receipt is malformed",
+                    )
+                try:
+                    accepted = self._accepted_receipt_from_canonical(
+                        json.loads(accepted_json)
+                    )
+                except (TypeError, json.JSONDecodeError) as error:
+                    raise ProductionCompositionError(
+                        "EFFECT_READBACK_INVALID",
+                        "Finding ledger receipt is not canonical JSON",
+                    ) from error
+                review_ledgers.append(accepted.review_finding_ledger_digest)
+
+        runtime = self._runtime_proof_readback(campaign, plan_revision_digest)
+        return {
+            "runtime_selector_digest": runtime["runtime_selector_digest"],
+            "permission_binding_pairs": runtime["permission_binding_pairs"],
+            "review_finding_ledger_digests": sorted(set(review_ledgers)),
+            "batch_receipt_digests": sorted(set(batch_receipts)),
+            "semantic_effect_ids": sorted(set(semantic_ids)),
+            "external_effect_ids": sorted(set(external_ids)),
+            "duplicate_effect_ids": [],
+        }
+
+    def _runtime_proof_readback(
+        self,
+        campaign: CampaignHandle,
+        plan_revision_digest: str,
+    ) -> dict[str, object]:
+        gateway = self._runtime_gateways.for_campaign(campaign)
+        reader = getattr(gateway, "campaign_proof_readback", None)
+        if callable(reader):
+            value = reader(campaign, plan_revision_digest)
+            if type(value) is not dict:
+                raise ProductionCompositionError(
+                    "EFFECT_READBACK_INVALID",
+                    "Runtime proof source is not a mapping",
+                )
+            return value
+        refresh = getattr(gateway, "_refresh", None)
+        if callable(refresh):
+            refresh()
+        data = getattr(gateway, "_data", None)
+        if type(data) is not dict:
+            raise ProductionCompositionError(
+                "EFFECT_READBACK_INVALID",
+                "Runtime Gateway has no authoritative durable proof source",
+            )
+        assignments: list[dict[str, object]] = []
+        permission_pairs: list[tuple[str, str]] = []
+        actions = data.get("actions")
+        if type(actions) is not dict:
+            raise ProductionCompositionError(
+                "EFFECT_READBACK_INVALID",
+                "Runtime Gateway action ledger is malformed",
+            )
+        for stable_action_id, record in sorted(actions.items()):
+            if type(stable_action_id) is not str or type(record) is not dict:
+                raise ProductionCompositionError(
+                    "EFFECT_READBACK_INVALID",
+                    "Runtime Gateway action ledger is malformed",
+                )
+            subject = record.get("subject")
+            if type(subject) is not dict:
+                raise ProductionCompositionError(
+                    "EFFECT_READBACK_INVALID",
+                    "Runtime Gateway action subject is malformed",
+                )
+            if (
+                subject.get("repository") != campaign.repository
+                or subject.get("campaign_key") != campaign.campaign_key
+                or subject.get("plan_revision_digest") != plan_revision_digest
+            ):
+                continue
+            fields = (
+                "subject_digest",
+                "selector",
+                "configuration_source",
+                "profile_digest",
+                "availability_fallback_profile_digest",
+                "fallback_selected",
+                "assignment_digest",
+            )
+            if any(field not in record for field in fields):
+                raise ProductionCompositionError(
+                    "EFFECT_READBACK_INVALID",
+                    "Runtime Gateway assignment record is incomplete",
+                )
+            assignments.append(
+                {
+                    "stable_action_id": stable_action_id,
+                    **{field: record[field] for field in fields},
+                }
+            )
+            observation = record.get("last_observation")
+            if observation is None:
+                continue
+            if type(observation) is not dict:
+                raise ProductionCompositionError(
+                    "EFFECT_READBACK_INVALID",
+                    "Runtime Gateway observation record is malformed",
+                )
+            completed = observation.get("completed_permission_response")
+            if completed is None:
+                continue
+            if type(completed) is not dict:
+                raise ProductionCompositionError(
+                    "EFFECT_READBACK_INVALID",
+                    "Runtime permission completion record is malformed",
+                )
+            request = completed.get("request")
+            requested_binding = request.get("binding_ref") if type(request) is dict else None
+            readback_binding = completed.get("binding_ref")
+            if (
+                type(requested_binding) is not str
+                or not requested_binding
+                or type(readback_binding) is not str
+                or not readback_binding
+            ):
+                raise ProductionCompositionError(
+                    "EFFECT_READBACK_INVALID",
+                    "Runtime permission Binding readback is malformed",
+                )
+            permission_pairs.append((requested_binding, readback_binding))
+        selector_digest = digest_value(
+            {
+                "kind": "gwo.runtime-selector-readback.v1",
+                "repository": campaign.repository,
+                "campaign_key": campaign.campaign_key,
+                "plan_revision_digest": plan_revision_digest,
+                "assignments": assignments,
+            }
+        )
+        return {
+            "runtime_selector_digest": selector_digest,
+            "permission_binding_pairs": sorted(set(permission_pairs)),
+        }
+
     def execute(self, action: WorkRunAction) -> WorkRunEffectObservation:
         self._validate_action(action)
         cached = self.readback(action)
         if cached is not None:
             return cached
+        owner = self._claim_token(action)
+        claimed = self._claim_or_wait(action, owner)
+        if claimed is not None:
+            return claimed
+        return self._execute_claimed(action, owner)
+
+    def _execute_claimed(
+        self,
+        action: WorkRunAction,
+        owner: str,
+    ) -> WorkRunEffectObservation:
+        try:
+            return self._execute_claimed_inner(action, owner)
+        except BaseException as error:
+            # A deep module may explicitly prove that no provider effect was
+            # dispatched.  Every other failure keeps the claim for
+            # readback-first recovery and therefore cannot authorize a
+            # duplicate provider call.
+            if getattr(error, "provider_dispatched", None) is False:
+                self._release_claim(action, owner)
+            raise
+
+    def _execute_claimed_inner(
+        self,
+        action: WorkRunAction,
+        owner: str,
+    ) -> WorkRunEffectObservation:
         if action.kind in {"stale_readback", "stale_diagnosis"}:
             observation = self._runtime_stale_readbacks.read_stale(action)
             self._validate_effect_observation(action, observation)
@@ -405,11 +840,35 @@ class ProductionWorkRunEffects:
                 "PRODUCTION_EFFECT_ACTION_INVALID",
                 f"unsupported WorkRunAction kind: {action.kind}",
             )
-        return self._record(
+        saved = self._record(
             action,
             observation,
             accepted_candidate=accepted_candidate,
+            claim_owner=owner,
         )
+        if action.kind in {"semantic_execution", "semantic_resume"}:
+            if accepted_candidate is not None:
+                self._fault_after_record(
+                    action,
+                    saved,
+                    role="worker",
+                    point="candidate_persisted_before_ack",
+                )
+                self._fault_after_record(
+                    action,
+                    saved,
+                    role="review",
+                    point="finding_ledger_persisted_before_ack",
+                    proxy_action_id=f"{action.stable_action_id}:review",
+                )
+        elif action.kind == "batch_delivery":
+            self._fault_after_record(
+                action,
+                saved,
+                role="delivery",
+                point="hosted_receipt_persisted_before_ack",
+            )
+        return saved
 
     @staticmethod
     def _validate_action(action: WorkRunAction) -> None:
@@ -452,6 +911,12 @@ class ProductionWorkRunEffects:
             separators=(",", ":"),
             sort_keys=True,
         )
+
+    @classmethod
+    def _claim_action_json(cls, action: WorkRunAction) -> str:
+        value = json.loads(cls._action_json(action))
+        value["wake_ref"] = None
+        return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
     @staticmethod
     def _validate_subject(subject: WorkRunSubject, action: WorkRunAction) -> None:
@@ -639,12 +1104,10 @@ class ProductionWorkRunEffects:
             None,
         )
 
-    def _execute_batch(self, action: WorkRunAction) -> WorkRunObservation:
-        if self._replayed_effect is not None and self._replayed_effect[1] in {
-            "semantic_execution",
-            "semantic_resume",
-        }:
-            raise _ProductionReplayDeferred()
+    def _prepare_batch_action(
+        self,
+        action: WorkRunAction,
+    ) -> tuple[AcceptedCandidateReceipt, BatchDeliveryRequest, BatchDeliveryAction]:
         accepted_digest = action.accepted_candidate_receipt_digest
         if not accepted_digest:
             raise ProductionCompositionError(
@@ -673,6 +1136,28 @@ class ProductionWorkRunEffects:
                 "BATCH_READBACK_INVALID",
                 "BatchIntegrator prepare returned a changed Batch action identity",
             )
+        return accepted_candidate, request, batch_action
+
+    def _has_authoritative_batch_readback(self, action: WorkRunAction) -> bool:
+        """Probe the owner journal without entering the provider boundary."""
+
+        try:
+            _accepted_candidate, _request, batch_action = self._prepare_batch_action(action)
+            batch_observation = self._batch_integrator.readback(batch_action)
+            if batch_observation is None:
+                return False
+            self._validate_batch_observation(batch_action, batch_observation)
+            return True
+        except Exception:
+            return False
+
+    def _execute_batch(self, action: WorkRunAction) -> WorkRunObservation:
+        if self._replayed_effect is not None and self._replayed_effect[1] in {
+            "semantic_execution",
+            "semantic_resume",
+        }:
+            raise _ProductionReplayDeferred()
+        accepted_candidate, request, batch_action = self._prepare_batch_action(action)
         batch_observation = self._batch_integrator.readback(batch_action)
         if batch_observation is None:
             executed_observation = self._batch_integrator.execute(batch_action)
@@ -1205,6 +1690,7 @@ class ProductionWorkRunEffects:
         observation: WorkRunEffectObservation,
         *,
         accepted_candidate: AcceptedCandidateReceipt | None = None,
+        claim_owner: str,
     ) -> WorkRunEffectObservation:
         self._validate_effect_observation(action, observation)
         if accepted_candidate is not None:
@@ -1223,6 +1709,7 @@ class ProductionWorkRunEffects:
                     "AcceptedCandidateReceipt is not bound to the observation",
                 )
         action_json = self._action_json(action)
+        claim_action_json = self._claim_action_json(action)
         observation_json = json.dumps(
             observation.canonical(),
             separators=(",", ":"),
@@ -1256,6 +1743,48 @@ class ProductionWorkRunEffects:
                         accepted_json,
                     ),
                 )
+                row = connection.execute(
+                    """
+                    SELECT action_json, observation_json, observation_digest,
+                           accepted_candidate_receipt_json
+                      FROM v8_production_effect_receipts
+                     WHERE stable_action_id = ?
+                    """,
+                    (action.stable_action_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or row[0] != action_json
+                    or row[1] != observation_json
+                    or row[2] != observation_digest
+                    or row[3] != accepted_json
+                ):
+                    raise ProductionCompositionError(
+                        "EFFECT_READBACK_INVALID",
+                        "effect ledger duplicate observation changed its identity",
+                    )
+                updated = connection.execute(
+                    """
+                    UPDATE v8_production_effect_claims
+                       SET state = 'completed',
+                           owner_token = ?,
+                           completed_observation_digest = ?
+                     WHERE stable_action_id = ? AND action_json = ?
+                       AND owner_token = ? AND state = 'in_flight'
+                    """,
+                    (
+                        claim_owner,
+                        observation_digest,
+                        action.stable_action_id,
+                        claim_action_json,
+                        claim_owner,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ProductionCompositionError(
+                        "EFFECT_READBACK_INVALID",
+                        "effect ledger observation had no authoritative claim",
+                    )
         except sqlite3.Error as error:
             raise ProductionCompositionError(
                 "EFFECT_READBACK_INVALID",
