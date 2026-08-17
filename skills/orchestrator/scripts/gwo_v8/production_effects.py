@@ -237,10 +237,22 @@ class ProductionWorkRunEffects:
                     owner_token TEXT NOT NULL,
                     state TEXT NOT NULL,
                     claimed_at REAL NOT NULL,
-                    completed_observation_digest TEXT
+                    completed_observation_digest TEXT,
+                    provider_dispatched INTEGER
                 )
                 """
             )
+            claim_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(v8_production_effect_claims)"
+                )
+            }
+            if "provider_dispatched" not in claim_columns:
+                connection.execute(
+                    "ALTER TABLE v8_production_effect_claims "
+                    "ADD COLUMN provider_dispatched INTEGER"
+                )
 
     def bind_fault_proxy(self, proxy: object) -> None:
         """Install the named-Canary adapter on the real effect boundary."""
@@ -425,7 +437,7 @@ class ProductionWorkRunEffects:
         self,
         action: WorkRunAction,
         owner: str,
-    ) -> WorkRunEffectObservation | None:
+    ) -> tuple[WorkRunEffectObservation | None, RuntimeProgressReceipt | None]:
         """Reserve an effect before any provider/deep-module call.
 
         A committed claim is the authoritative duplicate fence.  A competing
@@ -438,6 +450,7 @@ class ProductionWorkRunEffects:
 
         action_json = self._claim_action_json(action)
         deadline = time.monotonic() + _EFFECT_CLAIM_WAIT_SECONDS
+        semantic_readback_attempted = False
         while True:
             now = time.time()
             stale_owner: str | None = None
@@ -448,8 +461,9 @@ class ProductionWorkRunEffects:
                         """
                         INSERT INTO v8_production_effect_claims(
                             stable_action_id, action_json, owner_token,
-                            state, claimed_at, completed_observation_digest
-                        ) VALUES (?, ?, ?, 'in_flight', ?, NULL)
+                            state, claimed_at, completed_observation_digest,
+                            provider_dispatched
+                        ) VALUES (?, ?, ?, 'in_flight', ?, NULL, NULL)
                         ON CONFLICT(stable_action_id) DO NOTHING
                         """,
                         (
@@ -462,6 +476,7 @@ class ProductionWorkRunEffects:
                     row = connection.execute(
                         """
                         SELECT action_json, owner_token, state, claimed_at
+                               , provider_dispatched
                           FROM v8_production_effect_claims
                          WHERE stable_action_id = ?
                         """,
@@ -472,27 +487,37 @@ class ProductionWorkRunEffects:
                             "EFFECT_READBACK_INVALID",
                             "durable effect claim disappeared during reservation",
                         )
-                    recorded_action, recorded_owner, state, claimed_at = row
+                    (
+                        recorded_action,
+                        recorded_owner,
+                        state,
+                        claimed_at,
+                        provider_dispatched,
+                    ) = row
                     if recorded_action != action_json:
                         raise ProductionCompositionError(
                             "EFFECT_READBACK_INVALID",
                             "durable effect claim identity changed",
                         )
-                    if state not in {"in_flight", "completed"} or type(claimed_at) is not float:
+                    if (
+                        state not in {"in_flight", "completed"}
+                        or type(claimed_at) is not float
+                        or provider_dispatched not in {None, 0, 1}
+                    ):
                         raise ProductionCompositionError(
                             "EFFECT_READBACK_INVALID",
                             "durable effect claim state is malformed",
                         )
                     cached = self.readback(action)
                     if cached is not None:
-                        return cached
+                        return cached, None
                     if state == "completed":
                         raise ProductionCompositionError(
                             "EFFECT_READBACK_INVALID",
                             "completed effect claim has no effect receipt",
                         )
                     if recorded_owner == owner:
-                        return None
+                        return None, None
                     if now - claimed_at >= _EFFECT_CLAIM_WAIT_SECONDS:
                         stale_owner = recorded_owner
                         stale_claimed_at = claimed_at
@@ -501,6 +526,16 @@ class ProductionWorkRunEffects:
                     "EFFECT_READBACK_INVALID",
                     "effect claim could not be durably read or reserved",
                 ) from error
+            terminal_runtime: RuntimeProgressReceipt | None = None
+            if (
+                stale_owner is not None
+                and stale_claimed_at is not None
+                and action.kind in {"semantic_execution", "semantic_resume"}
+                and provider_dispatched in {None, 1}
+                and not semantic_readback_attempted
+            ):
+                semantic_readback_attempted = True
+                terminal_runtime = self._read_terminal_runtime(action)
             if (
                 stale_owner is not None
                 and stale_claimed_at is not None
@@ -531,8 +566,44 @@ class ProductionWorkRunEffects:
                     if updated.rowcount == 1:
                         cached = self.readback(action)
                         if cached is not None:
-                            return cached
-                        return None
+                            return cached, None
+                        return None, None
+                except sqlite3.Error as error:
+                    raise ProductionCompositionError(
+                        "EFFECT_READBACK_INVALID",
+                        "effect claim takeover could not be durably recorded",
+                    ) from error
+            if (
+                stale_owner is not None
+                and stale_claimed_at is not None
+                and terminal_runtime is not None
+            ):
+                try:
+                    with _ledger_connection(self._store_path) as connection:
+                        updated = connection.execute(
+                            """
+                            UPDATE v8_production_effect_claims
+                               SET owner_token = ?, claimed_at = ?, state = 'in_flight'
+                             WHERE stable_action_id = ?
+                               AND action_json = ?
+                               AND owner_token = ?
+                               AND claimed_at = ?
+                               AND state = 'in_flight'
+                            """,
+                            (
+                                owner,
+                                time.time(),
+                                action.stable_action_id,
+                                action_json,
+                                stale_owner,
+                                stale_claimed_at,
+                            ),
+                        )
+                    if updated.rowcount == 1:
+                        cached = self.readback(action)
+                        if cached is not None:
+                            return cached, None
+                        return None, terminal_runtime
                 except sqlite3.Error as error:
                     raise ProductionCompositionError(
                         "EFFECT_READBACK_INVALID",
@@ -562,6 +633,33 @@ class ProductionWorkRunEffects:
         except sqlite3.Error:
             # The original error is the useful failure.  If the claim cannot
             # be released, retaining it is the safe duplicate fence.
+            return
+
+    def _mark_claim_provider_dispatch(
+        self,
+        action: WorkRunAction,
+        owner: str,
+        dispatched: bool,
+    ) -> None:
+        try:
+            with _ledger_connection(self._store_path) as connection:
+                connection.execute(
+                    """
+                    UPDATE v8_production_effect_claims
+                       SET provider_dispatched = ?
+                     WHERE stable_action_id = ?
+                       AND owner_token = ?
+                       AND state = 'in_flight'
+                    """,
+                    (
+                        1 if dispatched else 0,
+                        action.stable_action_id,
+                        owner,
+                    ),
+                )
+        except sqlite3.Error:
+            # Retain an unknown claim if its dispatch evidence cannot be
+            # durably classified.  The duplicate fence is the safe outcome.
             return
 
     def _fault_after_record(
@@ -800,18 +898,28 @@ class ProductionWorkRunEffects:
         if cached is not None:
             return cached
         owner = self._claim_token(action)
-        claimed = self._claim_or_wait(action, owner)
+        claimed, terminal_runtime = self._claim_or_wait(action, owner)
         if claimed is not None:
             return claimed
-        return self._execute_claimed(action, owner)
+        return self._execute_claimed(
+            action,
+            owner,
+            terminal_runtime=terminal_runtime,
+        )
 
     def _execute_claimed(
         self,
         action: WorkRunAction,
         owner: str,
+        *,
+        terminal_runtime: RuntimeProgressReceipt | None = None,
     ) -> WorkRunEffectObservation:
         try:
-            return self._execute_claimed_inner(action, owner)
+            return self._execute_claimed_inner(
+                action,
+                owner,
+                terminal_runtime=terminal_runtime,
+            )
         except BaseException as error:
             # A deep module may explicitly prove that no provider effect was
             # dispatched.  Every other failure keeps the claim for
@@ -819,19 +927,30 @@ class ProductionWorkRunEffects:
             # duplicate provider call.
             if getattr(error, "provider_dispatched", None) is False:
                 self._release_claim(action, owner)
+            else:
+                self._mark_claim_provider_dispatch(
+                    action,
+                    owner,
+                    getattr(error, "provider_dispatched", None) is True,
+                )
             raise
 
     def _execute_claimed_inner(
         self,
         action: WorkRunAction,
         owner: str,
+        *,
+        terminal_runtime: RuntimeProgressReceipt | None = None,
     ) -> WorkRunEffectObservation:
         if action.kind in {"stale_readback", "stale_diagnosis"}:
             observation = self._runtime_stale_readbacks.read_stale(action)
             self._validate_effect_observation(action, observation)
             accepted_candidate = None
         elif action.kind in {"semantic_execution", "semantic_resume"}:
-            observation, accepted_candidate = self._execute_semantic(action)
+            observation, accepted_candidate = self._execute_semantic(
+                action,
+                terminal_runtime=terminal_runtime,
+            )
         elif action.kind == "batch_delivery":
             observation = self._execute_batch(action)
             accepted_candidate = None
@@ -977,16 +1096,44 @@ class ProductionWorkRunEffects:
             )
         return binding_id
 
+    def _read_terminal_runtime(
+        self,
+        action: WorkRunAction,
+    ) -> RuntimeProgressReceipt | None:
+        """Read a terminal Runtime outcome without entering CandidateGate."""
+
+        try:
+            subject = self._work_run_subjects.for_action(action)
+            self._validate_subject(subject, action)
+            gateway = self._runtime_gateways.for_campaign(
+                CampaignHandle(action.repository, action.campaign_key)
+            )
+            runtime = gateway.progress(subject, wake_cursor=action.wake_ref)
+            self._validate_runtime_receipt(runtime, subject, action)
+        except Exception:
+            # A stale claim is still ambiguous unless the Gateway proves the
+            # exact terminal outcome.  In particular, readback failures must
+            # never turn into a second provider dispatch.
+            return None
+        if runtime.status != "completed" or runtime.output_artifact_digest is None:
+            return None
+        return runtime
+
     def _execute_semantic(
         self,
         action: WorkRunAction,
+        *,
+        terminal_runtime: RuntimeProgressReceipt | None = None,
     ) -> tuple[WorkRunObservation, AcceptedCandidateReceipt | None]:
         subject = self._work_run_subjects.for_action(action)
         self._validate_subject(subject, action)
-        gateway = self._runtime_gateways.for_campaign(
-            CampaignHandle(action.repository, action.campaign_key)
-        )
-        runtime = gateway.progress(subject, wake_cursor=action.wake_ref)
+        if terminal_runtime is None:
+            gateway = self._runtime_gateways.for_campaign(
+                CampaignHandle(action.repository, action.campaign_key)
+            )
+            runtime = gateway.progress(subject, wake_cursor=action.wake_ref)
+        else:
+            runtime = terminal_runtime
         self._validate_runtime_receipt(runtime, subject, action)
         if runtime.status in {"running", "parked"}:
             return self._observation_from_runtime(runtime, action), None

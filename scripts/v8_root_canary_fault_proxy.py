@@ -8,7 +8,7 @@ can terminate once after that response is durable.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 import hashlib
 import json
 import os
@@ -25,6 +25,7 @@ _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _JOURNAL_LOCKS_GUARD = threading.Lock()
 _JOURNAL_LOCKS: dict[str, threading.RLock] = {}
+_PathIdentity = tuple[int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +181,18 @@ def _validate_regular_leaf(path: Path, *, allow_missing: bool) -> None:
         raise ValueError("ROOT_CANARY_FAULT_PATH_INVALID")
 
 
+def _path_identity(path: Path, *, directory: bool = False) -> _PathIdentity:
+    try:
+        info = os.lstat(_absolute_path(path))
+    except (OSError, ValueError) as error:
+        raise ValueError("ROOT_CANARY_FAULT_PATH_INVALID") from error
+    if directory and not stat.S_ISDIR(info.st_mode):
+        raise ValueError("ROOT_CANARY_FAULT_PATH_INVALID")
+    if _is_reparse(_absolute_path(path)):
+        raise ValueError("ROOT_CANARY_FAULT_PATH_REPARSE")
+    return (int(info.st_dev), int(info.st_ino))
+
+
 def _safe_read_bytes(path: Path) -> bytes:
     _check_path_components(path, allow_missing=False)
     _validate_regular_leaf(path, allow_missing=False)
@@ -257,12 +270,31 @@ class FaultProxy:
     events: tuple[Mapping[str, object], ...]
     run_command: Callable[[tuple[str, ...]], object]
     run_root: Path | None = None
+    run_root_identity: _PathIdentity | None = dataclass_field(default=None, repr=False)
+    _journal_parent_identity: _PathIdentity | None = dataclass_field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.journal_path = Path(self.journal_path)
         if self.run_root is not None:
-            self.run_root = Path(self.run_root)
+            self.run_root = _absolute_path(Path(self.run_root))
+            expected_root_identity = self.run_root_identity
+            if expected_root_identity is None:
+                expected_root_identity = _path_identity(
+                    self.run_root,
+                    directory=True,
+                )
+            self.run_root_identity = expected_root_identity
             self.journal_path = _require_child(self.journal_path, self.run_root)
+            self._assert_held_path_identity()
+            if self.journal_path.parent.exists():
+                self._journal_parent_identity = _path_identity(
+                    self.journal_path.parent,
+                    directory=True,
+                )
         else:
             _check_path_components(self.journal_path, allow_missing=True)
         if not callable(self.run_command):
@@ -297,6 +329,32 @@ class FaultProxy:
             ):
                 raise ValueError("FAULT_PROXY_PLAN_INVALID")
 
+    def _assert_held_path_identity(self) -> None:
+        if self.run_root is None or self.run_root_identity is None:
+            return
+        if _path_identity(self.run_root, directory=True) != self.run_root_identity:
+            raise ValueError("ROOT_CANARY_FAULT_PATH_INVALID")
+        if self._journal_parent_identity is not None:
+            if (
+                _path_identity(self.journal_path.parent, directory=True)
+                != self._journal_parent_identity
+            ):
+                raise ValueError("ROOT_CANARY_FAULT_PATH_INVALID")
+
+    def _validated_child_path(self, path: Path) -> Path:
+        if self.run_root is None:
+            _check_path_components(path, allow_missing=True)
+            _validate_regular_leaf(path, allow_missing=True)
+            return path
+        self._assert_held_path_identity()
+        validated = _require_child(path, self.run_root)
+        self._assert_held_path_identity()
+        _validate_regular_leaf(validated, allow_missing=True)
+        return validated
+
+    def _validated_journal_path(self) -> Path:
+        return self._validated_child_path(self.journal_path)
+
     @classmethod
     def from_files(
         cls,
@@ -305,15 +363,28 @@ class FaultProxy:
         *,
         run_root: Path | None = None,
     ) -> "FaultProxy":
+        root_identity: _PathIdentity | None = None
         if run_root is not None:
-            plan_path = _require_child(Path(plan_path), Path(run_root))
-            journal_path = _require_child(Path(journal_path), Path(run_root))
+            run_root = _absolute_path(Path(run_root))
+            root_identity = _path_identity(run_root, directory=True)
+            plan_path = _require_child(Path(plan_path), run_root)
+            if _path_identity(run_root, directory=True) != root_identity:
+                raise ValueError("ROOT_CANARY_FAULT_PATH_INVALID")
+            journal_path = _require_child(Path(journal_path), run_root)
+            if _path_identity(run_root, directory=True) != root_identity:
+                raise ValueError("ROOT_CANARY_FAULT_PATH_INVALID")
         else:
             _check_path_components(Path(plan_path), allow_missing=False)
         try:
             plan = json.loads(_safe_read_bytes(Path(plan_path)).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise ValueError("FAULT_PROXY_PLAN_INVALID") from error
+        if (
+            run_root is not None
+            and root_identity is not None
+            and _path_identity(run_root, directory=True) != root_identity
+        ):
+            raise ValueError("ROOT_CANARY_FAULT_PATH_INVALID")
         if (
             type(plan) is not dict
             or set(plan) != {"events"}
@@ -325,6 +396,7 @@ class FaultProxy:
             journal_path=Path(journal_path),
             events=tuple(dict(event) for event in plan["events"]),
             run_root=run_root,
+            run_root_identity=root_identity,
             run_command=lambda command: subprocess.run(
                 command,
                 text=True,
@@ -334,16 +406,14 @@ class FaultProxy:
         )
 
     def _read_unlocked(self) -> dict[str, object]:
-        if self.run_root is not None:
-            _require_child(self.journal_path, self.run_root)
-        else:
-            _check_path_components(self.journal_path, allow_missing=True)
-        if not self.journal_path.exists():
+        journal_path = self._validated_journal_path()
+        if not journal_path.exists():
             return {"effects": {}, "consumed_faults": []}
         try:
-            raw = json.loads(_safe_read_bytes(self.journal_path).decode("utf-8"))
+            raw = json.loads(_safe_read_bytes(journal_path).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise ValueError("FAULT_PROXY_JOURNAL_INVALID") from error
+        self._assert_held_path_identity()
         if type(raw) is not dict or set(raw) != {"effects", "consumed_faults"}:
             raise ValueError("FAULT_PROXY_JOURNAL_INVALID")
         effects = raw["effects"]
@@ -359,24 +429,20 @@ class FaultProxy:
         return {"effects": dict(effects), "consumed_faults": list(consumed)}
 
     def _read(self) -> dict[str, object]:
-        with _file_lock(self.journal_path.with_name(self.journal_path.name + ".lock")):
+        journal_path = self._validated_journal_path()
+        with _file_lock(journal_path.with_name(journal_path.name + ".lock")):
+            self._assert_held_path_identity()
             return self._read_unlocked()
 
     def _write_atomically_unlocked(self, payload: Mapping[str, object]) -> None:
-        if self.run_root is not None:
-            _require_child(self.journal_path, self.run_root)
-        else:
-            _check_path_components(self.journal_path, allow_missing=True)
-        _validate_regular_leaf(self.journal_path, allow_missing=True)
-        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
-        if self.run_root is not None:
-            _require_child(self.journal_path, self.run_root)
-        else:
-            _check_path_components(self.journal_path, allow_missing=True)
-        temporary = self.journal_path.with_name(
-            f".{self.journal_path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+        journal_path = self._validated_journal_path()
+        journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self._assert_held_path_identity()
+        journal_path = self._validated_journal_path()
+        temporary = journal_path.with_name(
+            f".{journal_path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
         )
-        _check_path_components(temporary, allow_missing=True)
+        temporary = self._validated_child_path(temporary)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(temporary, flags | nofollow, 0o600)
@@ -386,14 +452,12 @@ class FaultProxy:
                 stream.write(_canonical_bytes(payload))
                 stream.flush()
                 os.fsync(stream.fileno())
-            if self.run_root is not None:
-                _require_child(self.journal_path, self.run_root)
-            else:
-                _check_path_components(self.journal_path, allow_missing=True)
-            _validate_regular_leaf(self.journal_path, allow_missing=True)
-            os.replace(temporary, self.journal_path)
+            journal_path = self._validated_journal_path()
+            temporary = self._validated_child_path(temporary)
+            os.replace(temporary, journal_path)
+            self._assert_held_path_identity()
             if os.name != "nt":
-                directory = os.open(self.journal_path.parent, os.O_RDONLY)
+                directory = os.open(journal_path.parent, os.O_RDONLY)
                 try:
                     os.fsync(directory)
                 finally:
@@ -407,7 +471,9 @@ class FaultProxy:
                 pass
 
     def _write_atomically(self, payload: Mapping[str, object]) -> None:
-        with _file_lock(self.journal_path.with_name(self.journal_path.name + ".lock")):
+        journal_path = self._validated_journal_path()
+        with _file_lock(journal_path.with_name(journal_path.name + ".lock")):
+            self._assert_held_path_identity()
             self._write_atomically_unlocked(payload)
 
     @staticmethod
@@ -488,8 +554,10 @@ class FaultProxy:
             raise ValueError("FAULT_REQUEST_INVALID")
         if _DIGEST_RE.fullmatch(request.plan_revision_digest) is None:
             raise ValueError("FAULT_REQUEST_PLAN_IDENTITY_INVALID")
-        lock_path = self.journal_path.with_name(self.journal_path.name + ".lock")
+        journal_path = self._validated_journal_path()
+        lock_path = journal_path.with_name(journal_path.name + ".lock")
         with _file_lock(lock_path):
+            self._assert_held_path_identity()
             journal = self._read_unlocked()
             effects = journal["effects"]
             assert type(effects) is dict
