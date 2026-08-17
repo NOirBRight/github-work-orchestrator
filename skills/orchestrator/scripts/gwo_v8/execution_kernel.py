@@ -8567,7 +8567,11 @@ class ExecutionKernel:
             due_run = state.get("runs", {}).get(refill_ticket_key)
             if type(due_run) is dict and due_run.get("phase") == "pending":
                 prospective += 1
-            if prospective > max(history):
+            worker_slot_limit = self._configuration.worker_slots_for(handle.repository)
+            if (
+                prospective <= worker_slot_limit
+                and prospective > max(history)
+            ):
                 history.append(prospective)
                 changed = True
 
