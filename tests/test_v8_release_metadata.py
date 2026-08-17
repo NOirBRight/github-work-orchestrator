@@ -45,6 +45,35 @@ def _readback(**payload: object) -> SimpleNamespace:
     return SimpleNamespace(**payload, receipt_digest=digest_value(payload))
 
 
+def _post_release_receipt_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "version": "8.0.0",
+        "repository": "NOirBRight/github-work-orchestrator",
+        "evidence_base_sha": "1" * 40,
+        "canary_target_sha": "2" * 40,
+        "tag_candidate_sha": "3" * 40,
+        "tag_candidate_tree_sha": "4" * 40,
+        "ci_run_id": 987,
+        "ci_head_sha": "3" * 40,
+        "pytest_pass_count": 42,
+        "canary_receipt_digest": "canary:receipt",
+        "activation_receipt_digest": "activation:receipt",
+        "default_writer_receipt_digest": "default:receipt",
+        "campaign_key": "campaign:root",
+        "activation_id": "activation:1",
+        "writer_generation": "v8",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _empty_tar_bytes() -> bytes:
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w"):
+        pass
+    return archive.getvalue()
+
+
 def _canonical_pre_tag_case(
     *,
     canary_repository: str = "NOirBRight/github-work-orchestrator",
@@ -681,6 +710,195 @@ def test_renderer_syncs_staged_documents_before_publication(tmp_path, monkeypatc
     assert fsync_calls
 
 
+def test_post_release_rejects_pre_tag_receipt_not_bound_to_static_record(
+    tmp_path, monkeypatch
+):
+    record_path = write_ga_release_record(
+        tmp_path / "record.json", CompleteReleaseFixture()
+    )
+    pre_tag = tmp_path / "pre-tag.json"
+    pre_tag.write_bytes(
+        verifier.canonical_json_bytes(
+            _post_release_receipt_payload(evidence_base_sha="9" * 40)
+        )
+    )
+
+    class FakeGit:
+        repository = "NOirBRight/github-work-orchestrator"
+
+        def __init__(self, repository, checkout=None):
+            assert repository == self.repository
+            del checkout
+
+        def tag_subject(self, tag):
+            assert tag == "v8.0.0"
+            return "3" * 40, "4" * 40
+
+        def archive_tag(self, subject):
+            assert subject == "v8.0.0"
+            return _empty_tar_bytes()
+
+    monkeypatch.setattr(verifier, "GitCliReadback", FakeGit)
+    monkeypatch.setattr(
+        verifier,
+        "clean_install_and_smoke",
+        lambda source, run_root: verifier.CleanInstallResult(
+            (".agents", ".codex", ".claude"),
+            ("advance", "inspect", "start"),
+            False,
+        ),
+    )
+
+    output = tmp_path / "result.json"
+    result = verify_main(
+        [
+            "--post-release",
+            "--tag",
+            "v8.0.0",
+            "--record",
+            str(record_path),
+            "--pre-tag-receipt",
+            str(pre_tag),
+            "--run-root",
+            str(tmp_path / "run"),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 2
+    assert not output.exists()
+
+
+def test_post_release_rechecks_pre_tag_commit_tree_invariants_before_archive(
+    tmp_path, monkeypatch
+):
+    record_path = write_ga_release_record(
+        tmp_path / "record.json", CompleteReleaseFixture()
+    )
+    pre_tag = tmp_path / "pre-tag.json"
+    pre_tag.write_bytes(
+        verifier.canonical_json_bytes(_post_release_receipt_payload())
+    )
+
+    class FakeGit:
+        repository = "NOirBRight/github-work-orchestrator"
+
+        def __init__(self, repository, checkout=None):
+            assert repository == self.repository
+            del checkout
+
+        def tag_subject(self, tag):
+            assert tag == "v8.0.0"
+            return "3" * 40, "4" * 40
+
+        def tree_sha(self, commit):
+            assert commit == "3" * 40
+            return "9" * 40
+
+        def archive_tag(self, subject):
+            raise AssertionError("pre-tag tree mismatch must fail before archive")
+
+    monkeypatch.setattr(verifier, "GitCliReadback", FakeGit)
+
+    output = tmp_path / "result.json"
+    result = verify_main(
+        [
+            "--post-release",
+            "--tag",
+            "v8.0.0",
+            "--record",
+            str(record_path),
+            "--pre-tag-receipt",
+            str(pre_tag),
+            "--run-root",
+            str(tmp_path / "run"),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 2
+    assert not output.exists()
+
+
+def test_post_release_archives_tag_subject_by_immutable_commit_sha(
+    tmp_path, monkeypatch
+):
+    record_path = write_ga_release_record(
+        tmp_path / "record.json", CompleteReleaseFixture()
+    )
+    pre_tag = tmp_path / "pre-tag.json"
+    pre_tag.write_bytes(
+        verifier.canonical_json_bytes(_post_release_receipt_payload())
+    )
+    archived_subjects: list[str] = []
+
+    class FakeGit:
+        repository = "NOirBRight/github-work-orchestrator"
+
+        def __init__(self, repository, checkout=None):
+            assert repository == self.repository
+            del checkout
+
+        def tag_subject(self, tag):
+            assert tag == "v8.0.0"
+            return "3" * 40, "4" * 40
+
+        def tree_sha(self, commit):
+            assert commit == "3" * 40
+            return "4" * 40
+
+        def is_ancestor(self, ancestor, descendant):
+            assert ancestor in {"1" * 40, "2" * 40}
+            assert descendant == "3" * 40
+            return True
+
+        def changed_paths(self, ancestor, descendant):
+            assert ancestor == "1" * 40
+            assert descendant == "3" * 40
+            return (
+                "CHANGELOG.md",
+                "docs/e2e/gwo-v8-root-canary.md",
+                "docs/releases/v8.0.0.md",
+            )
+
+        def archive_tag(self, subject):
+            archived_subjects.append(subject)
+            return _empty_tar_bytes()
+
+    monkeypatch.setattr(verifier, "GitCliReadback", FakeGit)
+    monkeypatch.setattr(
+        verifier,
+        "clean_install_and_smoke",
+        lambda source, run_root: verifier.CleanInstallResult(
+            (".agents", ".codex", ".claude"),
+            ("advance", "inspect", "start"),
+            False,
+        ),
+    )
+
+    output = tmp_path / "result.json"
+    result = verify_main(
+        [
+            "--post-release",
+            "--tag",
+            "v8.0.0",
+            "--record",
+            str(record_path),
+            "--pre-tag-receipt",
+            str(pre_tag),
+            "--run-root",
+            str(tmp_path / "run"),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 0
+    assert archived_subjects == ["3" * 40]
+
+
 def test_post_release_rejects_tag_tree_different_from_pre_tag_subject(
     tmp_path, monkeypatch
 ):
@@ -706,6 +924,9 @@ def test_post_release_rejects_tag_tree_different_from_pre_tag_subject(
                 "writer_generation": "v8",
             }
         )
+    )
+    record_path = write_ga_release_record(
+        tmp_path / "record.json", CompleteReleaseFixture()
     )
     archive_buffer = io.BytesIO()
     with tarfile.open(fileobj=archive_buffer, mode="w"):
@@ -736,6 +957,8 @@ def test_post_release_rejects_tag_tree_different_from_pre_tag_subject(
             "--post-release",
             "--tag",
             "v8.0.0",
+            "--record",
+            str(record_path),
             "--pre-tag-receipt",
             str(pre_tag),
             "--run-root",
@@ -747,6 +970,41 @@ def test_post_release_rejects_tag_tree_different_from_pre_tag_subject(
 
     assert result == 2
     assert not (tmp_path / "result.json").exists()
+
+
+def test_renderer_rejects_symlinked_output_target_before_backup_or_replace(tmp_path):
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    outside = tmp_path / "outside-changelog.md"
+    outside.write_text("outside sentinel\n", encoding="utf-8")
+    target = output_root / "CHANGELOG.md"
+    try:
+        target.symlink_to(outside)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+
+    with pytest.raises(ReleaseGateError) as error:
+        render_ga_documents(
+            output_root,
+            evidence_base_sha="4" * 40,
+            tickets={"tickets": [{"number": 1}]},
+            acceptance={
+                "repository": "NOirBRight/github-work-orchestrator",
+                "campaign_key": "campaign:root",
+                "canary_target_sha": "5" * 40,
+                "receipt_digest": "canary:1",
+            },
+            named_admission={"receipt_digest": "named:1"},
+            default_writer={
+                "receipt_digest": "default:1",
+                "activation_id": "activation:1",
+                "writer_generation": "v8",
+            },
+        )
+
+    assert error.value.code == "GA_METADATA_PUBLICATION_TARGET_INVALID"
+    assert outside.read_text(encoding="utf-8") == "outside sentinel\n"
+    assert target.is_symlink()
 
 
 def test_renderer_retains_legitimate_nested_receipt_values(tmp_path):

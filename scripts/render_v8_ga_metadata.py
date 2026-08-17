@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 from types import SimpleNamespace
 import tempfile
 from typing import Sequence
@@ -227,11 +228,47 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+_REPARSE_POINT_ATTRIBUTE = 0x0400
+
+
+def _absolute_without_resolving(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _reject_reparse_path(path: Path) -> None:
+    current = _absolute_without_resolving(path)
+    while True:
+        try:
+            observed = os.lstat(current)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise ReleaseGateError("GA_METADATA_PUBLICATION_TARGET_INVALID") from error
+        else:
+            if stat.S_ISLNK(observed.st_mode) or bool(
+                getattr(observed, "st_file_attributes", 0)
+                & _REPARSE_POINT_ATTRIBUTE
+            ):
+                raise ReleaseGateError("GA_METADATA_PUBLICATION_TARGET_INVALID")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
+
+
+def _validate_publication_targets(staged: Mapping[Path, Path]) -> None:
+    if not staged:
+        raise ReleaseGateError("GA_METADATA_PUBLICATION_INVALID")
+    for target, temporary in staged.items():
+        _reject_reparse_path(target)
+        _reject_reparse_path(temporary)
+
+
 def _publication_root(staged: Mapping[Path, Path]) -> Path:
     try:
-        return Path(
-            os.path.commonpath(str(target.parent) for target in staged)
-        ).resolve()
+        return _absolute_without_resolving(
+            Path(os.path.commonpath(str(target.parent) for target in staged))
+        )
     except (OSError, ValueError) as error:
         raise ReleaseGateError("GA_METADATA_PUBLICATION_INVALID") from error
 
@@ -259,7 +296,7 @@ def _journal_entries(
     entries = journal.get("entries")
     if not isinstance(entries, list):
         raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED")
-    root = output_root.resolve()
+    root = _absolute_without_resolving(output_root)
     result: list[tuple[Path, Path | None]] = []
     for entry in entries:
         if not isinstance(entry, Mapping):
@@ -270,8 +307,15 @@ def _journal_entries(
             backup_value is not None and not isinstance(backup_value, str)
         ):
             raise ReleaseGateError("GA_METADATA_PUBLICATION_RECOVERY_FAILED")
-        target = Path(target_value).resolve()
-        backup = Path(backup_value).resolve() if backup_value is not None else None
+        target = _absolute_without_resolving(Path(target_value))
+        backup = (
+            _absolute_without_resolving(Path(backup_value))
+            if backup_value is not None
+            else None
+        )
+        _reject_reparse_path(target)
+        if backup is not None:
+            _reject_reparse_path(backup)
         if not target.is_relative_to(root) or (
             backup is not None and not backup.is_relative_to(root)
         ):
@@ -301,18 +345,20 @@ def _rollback_publication(output_root: Path, journal: Mapping[str, object]) -> N
         _fsync_directory(target.parent)
     _remove_publication_journal(output_root)
     staged_paths = [
-        Path(entry["staged"]).resolve()
+        _absolute_without_resolving(Path(entry["staged"]))
         for entry in journal.get("entries", [])
         if isinstance(entry, Mapping) and isinstance(entry.get("staged"), str)
     ]
     if staged_paths:
         staging_root = Path(os.path.commonpath(tuple(map(str, staged_paths))))
-        if staging_root.is_relative_to(output_root.resolve()):
+        if staging_root.is_relative_to(_absolute_without_resolving(output_root)):
             shutil.rmtree(staging_root, ignore_errors=True)
 
 
 def _recover_metadata_publication(output_root: Path) -> None:
     journal_path = _publication_journal_path(output_root)
+    _reject_reparse_path(output_root)
+    _reject_reparse_path(journal_path)
     if not journal_path.exists():
         return
     journal = _read_publication_journal(journal_path)
@@ -320,21 +366,24 @@ def _recover_metadata_publication(output_root: Path) -> None:
 
 
 def _publish_staged_documents(staged: Mapping[Path, Path]) -> None:
+    _validate_publication_targets(staged)
     output_root = _publication_root(staged)
+    _reject_reparse_path(output_root)
     _recover_metadata_publication(output_root)
     journal_path = _publication_journal_path(output_root)
     entries: list[dict[str, str | None]] = []
     expected_bytes: dict[Path, bytes] = {}
-    staging_root = Path(
-        os.path.commonpath(tuple(map(str, staged.values())))
-    ).resolve()
+    staging_root = _absolute_without_resolving(
+        Path(os.path.commonpath(tuple(map(str, staged.values()))))
+    )
     backup_root = staging_root / ".backups"
     backup_root.mkdir(parents=True, exist_ok=True)
     for index, (target, temporary) in enumerate(
         sorted(staged.items(), key=lambda item: str(item[0]))
     ):
-        target = target.resolve()
-        temporary = temporary.resolve()
+        target = _absolute_without_resolving(target)
+        temporary = _absolute_without_resolving(temporary)
+        _reject_reparse_path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         if not temporary.is_file():
             raise ReleaseGateError("GA_METADATA_PUBLICATION_INVALID")
@@ -451,9 +500,14 @@ def render_ga_documents(
         "activation_id": activation_id,
         "writer_generation": writer_generation,
     }
-    output_root.mkdir(parents=True, exist_ok=True)
-    _recover_metadata_publication(output_root)
+    _reject_reparse_path(output_root)
     changelog = output_root / "CHANGELOG.md"
+    acceptance_doc = output_root / "docs/e2e/gwo-v8-root-canary.md"
+    release_note = output_root / "docs/releases/v8.0.0.md"
+    output_root.mkdir(parents=True, exist_ok=True)
+    for target in (changelog, acceptance_doc, release_note):
+        _reject_reparse_path(target)
+    _recover_metadata_publication(output_root)
     entry = (
         "## 8.0.0\n\n"
         f"- Accepted root Canary receipt `{common['canary_receipt_digest']}`.\n"
@@ -470,8 +524,6 @@ def render_ga_documents(
     changelog_content = (
         "# Changelog\n\n" + entry + ("\n" + previous if previous else "")
     )
-    acceptance_doc = output_root / "docs/e2e/gwo-v8-root-canary.md"
-    release_note = output_root / "docs/releases/v8.0.0.md"
     with tempfile.TemporaryDirectory(prefix=".ga-metadata-", dir=output_root) as raw:
         staging_root = Path(raw)
         staged: dict[Path, Path] = {}

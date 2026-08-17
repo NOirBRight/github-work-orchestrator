@@ -810,6 +810,59 @@ def verify_pre_tag(
     )
 
 
+def _verify_post_release_pre_tag_receipt(
+    record: GaReleaseRecord,
+    receipt: ReleaseGateReceipt,
+    git: GitAncestryReadback,
+) -> None:
+    if (
+        receipt.version != record.version
+        or receipt.repository != record.repository
+        or receipt.evidence_base_sha != record.evidence_base_sha
+        or receipt.canary_target_sha != record.canary_target_sha
+        or receipt.canary_receipt_digest != record.canary_receipt_digest
+        or receipt.activation_receipt_digest != record.activation_receipt_digest
+        or receipt.default_writer_receipt_digest
+        != record.default_writer_receipt_digest
+        or receipt.campaign_key != record.campaign_key
+        or receipt.activation_id != record.activation_id
+        or receipt.writer_generation != record.writer_generation
+        or receipt.tag_candidate_sha != receipt.ci_head_sha
+    ):
+        raise ReleaseGateError("GA_PRE_TAG_RECEIPT_RECORD_MISMATCH")
+
+    repository = _attribute(git, "repository", "GA_REPOSITORY_READBACK_INVALID")
+    if repository != record.repository:
+        raise ReleaseGateError("GA_REPOSITORY_READBACK_INVALID")
+    try:
+        main_tree_sha = git.tree_sha(receipt.tag_candidate_sha)
+    except (AttributeError, OSError, subprocess.CalledProcessError) as error:
+        raise ReleaseGateError("GA_GIT_TREE_READBACK_REQUIRED") from error
+    if main_tree_sha != receipt.tag_candidate_tree_sha:
+        raise ReleaseGateError("GA_TAG_RELEASE_SUBJECT_MISMATCH")
+    try:
+        if not git.is_ancestor(
+            record.evidence_base_sha, receipt.tag_candidate_sha
+        ) or not git.is_ancestor(record.canary_target_sha, receipt.tag_candidate_sha):
+            raise ReleaseGateError("GA_CANARY_SHA_NOT_ANCESTOR")
+        changed_paths = tuple(
+            str(path)
+            for path in git.changed_paths(
+                record.evidence_base_sha, receipt.tag_candidate_sha
+            )
+        )
+    except ReleaseGateError:
+        raise
+    except Exception as error:
+        raise ReleaseGateError("GA_GIT_READBACK_FAILED", str(error)) from error
+    if (
+        len(changed_paths) != len(set(changed_paths))
+        or set(changed_paths) != set(record.post_canary_changed_paths)
+        or set(changed_paths) - set(ALLOWED_METADATA_PATHS)
+    ):
+        raise ReleaseGateError("GA_POST_CANARY_DELTA_NOT_METADATA_ONLY")
+
+
 def parse_pytest_count(log: str) -> int:
     matches = re.findall(r"(\d+) passed", log)
     if not matches:
@@ -1052,6 +1105,9 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
             if not isinstance(tag, str) or not tag:
                 raise ReleaseGateError("GA_TAG_REQUIRED")
             output = _required_path(args.output, "GA_OUTPUT_REQUIRED")
+            record = load_ga_release_record(
+                _required_path(args.record, "GA_RELEASE_RECORD_REQUIRED")
+            )
             pre_tag = _load_release_gate_receipt(
                 _required_path(args.pre_tag_receipt, "GA_PRE_TAG_RECEIPT_REQUIRED")
             )
@@ -1064,10 +1120,11 @@ def verify_main(argv: Sequence[str] | None = None) -> int:
                 or tag_tree_sha != pre_tag.tag_candidate_tree_sha
             ):
                 raise ReleaseGateError("GA_TAG_RELEASE_SUBJECT_MISMATCH")
+            _verify_post_release_pre_tag_receipt(record, pre_tag, git)
             run_root.mkdir(parents=True, exist_ok=True)
             source = run_root / "tag-source"
             source.mkdir(parents=True, exist_ok=True)
-            archive = git.archive_tag(tag)
+            archive = git.archive_tag(tag_commit_sha)
             with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
                 tar.extractall(source, filter="data")
             result = clean_install_and_smoke(source, run_root)
@@ -1124,11 +1181,14 @@ freezes the candidate commit and tree. The renderer rejects dynamic SHA/CI
 fields at any nesting or alias, cross-binds its input identities, and uses a
 durable staged publication journal with flushed files, atomic replacement,
 directory sync, and exact final readback. The post-release gate requires that
-pre-tag receipt and rejects a tag whose peeled commit or tree differs before
-archiving it into an isolated temporary source. It checks existing package
-manifests before any regeneration, then installs both Skill packages into
-temporary `.agents`, `.codex`, and `.claude` surfaces before smoking only the
-public `start`, `advance`, and `inspect` operations.
+the supplied pre-tag receipt is bound to the static record and rechecks the
+pre-tag ancestry, metadata-delta, and commit/tree invariants. It rejects a tag
+whose peeled commit or tree differs, then archives by the captured immutable
+commit SHA rather than the mutable tag name. Publication rejects symlink and
+reparse output targets before any backup or replacement. It checks existing
+package manifests before any regeneration, then installs both Skill packages
+into temporary `.agents`, `.codex`, and `.claude` surfaces before smoking only
+the public `start`, `advance`, and `inspect` operations.
 """
 
 

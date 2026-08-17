@@ -22,8 +22,11 @@ freezes the candidate commit and tree. The renderer rejects dynamic SHA/CI
 fields at any nesting or alias, cross-binds its input identities, and uses a
 durable staged publication journal with flushed files, atomic replacement,
 directory sync, and exact final readback. The post-release gate requires that
-pre-tag receipt and rejects a tag whose peeled commit or tree differs before
-archiving it into an isolated temporary source. It checks existing package
-manifests before any regeneration, then installs both Skill packages into
-temporary `.agents`, `.codex`, and `.claude` surfaces before smoking only the
-public `start`, `advance`, and `inspect` operations.
+the supplied pre-tag receipt is bound to the static record and rechecks the
+pre-tag ancestry, metadata-delta, and commit/tree invariants. It rejects a tag
+whose peeled commit or tree differs, then archives by the captured immutable
+commit SHA rather than the mutable tag name. Publication rejects symlink and
+reparse output targets before any backup or replacement. It checks existing
+package manifests before any regeneration, then installs both Skill packages
+into temporary `.agents`, `.codex`, and `.claude` surfaces before smoking only
+the public `start`, `advance`, and `inspect` operations.
