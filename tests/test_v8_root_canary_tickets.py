@@ -7,6 +7,7 @@ import pytest
 from scripts.provision_v8_root_canary import (
     APPROVAL,
     GhIssuePort,
+    POLICY_WITNESS_PATH,
     ROOT_REPOSITORY,
     RootCanaryBlockerReadback,
     RootCanaryProvisionError,
@@ -98,8 +99,11 @@ class FakeGithub:
     existing: dict[str, object] = field(default_factory=dict)
     readbacks: dict[int, object] = field(default_factory=dict)
     create_calls: list[tuple[str, str, str, tuple[str, ...]]] = field(default_factory=list)
+    find_calls: list[str] = field(default_factory=list)
+    read_complete_calls: list[int] = field(default_factory=list)
     preflight_error: Exception | None = None
     preflight_calls: int = 0
+    read_complete_fail_after: int | None = None
     _next_number: int = 101
 
     def preflight_readback(self, _repository):
@@ -108,6 +112,7 @@ class FakeGithub:
             raise self.preflight_error
 
     def find_exact_title(self, _repository, title):
+        self.find_calls.append(title)
         return self.existing.get(title)
 
     def create_issue(self, repository, title, body, labels):
@@ -120,9 +125,16 @@ class FakeGithub:
             spec,
             body=body,
         )
+        self.existing[title] = self.readbacks[number]
         return self.readbacks[number]
 
     def read_complete(self, _repository, number):
+        self.read_complete_calls.append(number)
+        if (
+            self.read_complete_fail_after is not None
+            and len(self.read_complete_calls) > self.read_complete_fail_after
+        ):
+            raise RuntimeError("synthetic readback failure")
         if self.next_readback is not None:
             return self.next_readback
         return self.readbacks[number]
@@ -162,10 +174,11 @@ def test_root_ticket_specs_are_disjoint_and_derive_three_standard_one_strict():
         "multi",
         "singleton",
     ]
-    policy = json.loads((ROOT / ".gwo" / "policy.json").read_text("utf-8"))
-    assert policy["assurance"]["strict_path_prefixes"] == [
-        "docs/canary/protected/"
-    ]
+    snapshot_source = (
+        ROOT / "skills" / "orchestrator" / "scripts" / "gwo_v8" / "github_snapshot.py"
+    ).read_text("utf-8")
+    assert POLICY_WITNESS_PATH == ".gwo-v8/policy-witness.json"
+    assert f'policy_path: str = "{POLICY_WITNESS_PATH}"' in snapshot_source
 
 
 def test_provision_refuses_issue_mutation_without_named_owner_approval(fake_github):
@@ -287,19 +300,103 @@ def test_manifest_is_deterministic_and_contains_all_authoritative_readbacks(
 
     assert first.read_bytes() == second.read_bytes()
     payload = json.loads(first.read_text("utf-8"))
-    assert payload["schema"] == "gwo-v8-root-canary-tickets.v1"
+    assert payload["schema"] == "gwo-v8-root-canary-tickets.v2"
     assert payload["repository"] == ROOT_REPOSITORY
     assert payload["ready_refs"] == [
-        f"github://{ROOT_REPOSITORY}/issues/{number}"
+        f"issue:{number}"
         for number in (101, 102, 103, 104)
     ]
-    assert [item["ticket_key"] for item in payload["tickets"]] == [
+    assert [item["key"] for item in payload["tickets"]] == [
         "issue:101",
         "issue:102",
         "issue:103",
         "issue:104",
     ]
+    assert all(
+        set(item) == {"key", "labels", "source", "contract", "native_blockers"}
+        for item in payload["tickets"]
+    )
+    assert all(
+        set(item["contract"]) == {
+            "id",
+            "node_id",
+            "number",
+            "title",
+            "body",
+            "state",
+            "state_reason",
+            "type",
+            "repository",
+            "labels",
+            "comments",
+            "updated_at",
+        }
+        for item in payload["tickets"]
+    )
+    assert all(item["contract"]["state"] == "open" for item in payload["tickets"])
     assert first.read_bytes() == canonical_json_bytes(payload)
+
+
+def test_manifest_writer_requires_exact_fixed_order_and_four_unique_issue_numbers(
+    fake_github, approved_token, tmp_path
+):
+    entries = provision_root_tickets(fake_github, ROOT_REPOSITORY, approved_token)
+
+    with pytest.raises(RootCanaryProvisionError, match="ROOT_TICKET_MANIFEST_INVALID"):
+        write_ticket_manifest(tmp_path / "too-few.json", entries[:3])
+
+    with pytest.raises(RootCanaryProvisionError, match="ROOT_TICKET_MANIFEST_INVALID"):
+        write_ticket_manifest(tmp_path / "reordered.json", (entries[1], entries[0], *entries[2:]))
+
+    duplicate = replace(
+        entries[1],
+        readback=replace(entries[1].readback, number=entries[0].readback.number),
+    )
+    with pytest.raises(RootCanaryProvisionError, match="ROOT_TICKET_MANIFEST_INVALID"):
+        write_ticket_manifest(tmp_path / "duplicate.json", (entries[0], duplicate, *entries[2:]))
+
+
+def test_manifest_ticket_digest_matches_current_snapshot_projection(
+    fake_github, approved_token, tmp_path
+):
+    entries = provision_root_tickets(fake_github, ROOT_REPOSITORY, approved_token)
+    path = tmp_path / "tickets.json"
+    write_ticket_manifest(path, entries)
+    payload = json.loads(path.read_text("utf-8"))
+
+    for item in payload["tickets"]:
+        projection = {
+            "number": item["contract"]["number"],
+            "contract": item["contract"],
+            "labels": item["labels"],
+            "source_ref": item["key"],
+            "native_blockers": item["native_blockers"],
+        }
+        assert item["source"] == {
+            "ref": item["key"],
+            "digest": digest_value(projection),
+        }
+
+
+def test_manifest_tickets_are_consumable_by_current_plancontrol_snapshot_parser(
+    fake_github, approved_token, tmp_path
+):
+    import sys
+
+    scripts = ROOT / "skills" / "orchestrator" / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    from gwo_v8.plan_control import _normalize_ticket
+
+    entries = provision_root_tickets(fake_github, ROOT_REPOSITORY, approved_token)
+    path = tmp_path / "tickets.json"
+    write_ticket_manifest(path, entries)
+    payload = json.loads(path.read_text("utf-8"))
+
+    assert [
+        _normalize_ticket(item, repository=ROOT_REPOSITORY)
+        for item in payload["tickets"]
+    ] == payload["tickets"]
 
 
 def test_github_port_rejects_duplicate_exact_titles():
@@ -340,29 +437,188 @@ def test_github_port_paginates_title_lookup_before_deciding_no_duplicate():
     ]
 
 
-def test_github_port_preflight_uses_graphql_complete_readback_capability():
+def test_github_port_preflight_uses_paginated_rest_issue_readback():
     commands = []
 
     def run_gh_json(command):
         commands.append(command)
-        return {
-            "data": {
-                "repository": {
-                    "issues": {
-                        "nodes": [],
-                        "pageInfo": {"hasNextPage": False, "endCursor": None},
-                    }
-                }
-            }
-        }
+        return [[]]
 
     GhIssuePort(run_gh_json=run_gh_json).preflight_readback(ROOT_REPOSITORY)
 
     assert len(commands) == 1
-    assert commands[0][0:2] == ("api", "graphql")
-    assert "blockedBy" in commands[0][3]
-    assert "comments" in commands[0][3]
-    assert "labels" in commands[0][3]
+    assert commands == [
+        (
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{ROOT_REPOSITORY}/issues?state=all&per_page=100",
+        )
+    ]
+
+
+def test_github_port_never_sends_unsupported_graphql_blocked_by_query():
+    commands = []
+
+    def run_gh_json(command):
+        commands.append(command)
+        return [[]]
+
+    GhIssuePort(run_gh_json=run_gh_json).preflight_readback(ROOT_REPOSITORY)
+
+    assert all(command[0:2] != ("api", "graphql") for command in commands)
+    assert all("blockedBy" not in " ".join(command) for command in commands)
+
+
+def test_github_port_parses_the_actual_issue_create_url_output_safely():
+    commands = []
+    repository_url = f"https://api.github.com/repos/{ROOT_REPOSITORY}"
+
+    def run_gh_json(command):
+        commands.append(command)
+        if command[-1] == f"repos/{ROOT_REPOSITORY}/issues/321":
+            return {
+                "id": 321,
+                "node_id": "issue-node-321",
+                "number": 321,
+                "title": root_ticket_specs()[0].title,
+                "state": "open",
+                "body": canonical_body(root_ticket_specs()[0]),
+                "repository_url": repository_url,
+                "url": f"{repository_url}/issues/321",
+                "html_url": f"https://github.com/{ROOT_REPOSITORY}/issues/321",
+                "updated_at": "2026-08-17T00:00:00Z",
+                "labels": [],
+            }
+        if command[-1].endswith("/issues/321/comments?per_page=100"):
+            return [[]]
+        if command[-1].endswith("/issues/321/dependencies/blocked_by?per_page=100"):
+            return [[]]
+        raise AssertionError(command)
+
+    def run_gh_text(command):
+        commands.append(command)
+        return "https://github.com/NOirBRight/github-work-orchestrator/issues/321\n"
+
+    port = GhIssuePort(run_gh_json=run_gh_json, run_gh_text=run_gh_text)
+
+    result = port.create_issue(
+        ROOT_REPOSITORY,
+        root_ticket_specs()[0].title,
+        canonical_body(root_ticket_specs()[0]),
+        ("ready-for-agent",),
+    )
+
+    assert result.number == 321
+    assert commands[0] == (
+        "issue",
+        "create",
+        "--repo",
+        ROOT_REPOSITORY,
+        "--title",
+        root_ticket_specs()[0].title,
+        "--body",
+        canonical_body(root_ticket_specs()[0]),
+        "--label",
+        "ready-for-agent",
+    )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "https://github.com/other/repository/issues/321\n",
+        "https://github.com/NOirBRight/github-work-orchestrator/issues/0\n",
+        "created https://github.com/NOirBRight/github-work-orchestrator/issues/321\n",
+    ],
+)
+def test_github_port_rejects_unsafe_issue_create_output(output):
+    port = GhIssuePort(run_gh_json=lambda _command: output)
+    with pytest.raises(RootCanaryProvisionError, match="ROOT_TICKET_READBACK_INVALID"):
+        port.create_issue(
+            ROOT_REPOSITORY,
+            root_ticket_specs()[0].title,
+            canonical_body(root_ticket_specs()[0]),
+            ("ready-for-agent",),
+        )
+
+
+def test_provision_preflights_and_validates_all_existing_tickets_before_creating(
+    fake_github, approved_token, tmp_path
+):
+    wrong_spec = root_ticket_specs()[1]
+    wrong = _readback(
+        701,
+        wrong_spec,
+        body=canonical_body(wrong_spec).replace(
+            wrong_spec.path, "docs/canary/not-beta.md"
+        ),
+    )
+    fake_github.existing[wrong_spec.title] = wrong
+    fake_github.readbacks[wrong.number] = wrong
+
+    with pytest.raises(RootCanaryProvisionError, match="ROOT_TICKET_NOT_READY"):
+        provision_root_tickets(
+            fake_github,
+            ROOT_REPOSITORY,
+            approved_token,
+            lock_path=tmp_path / "root.lock",
+        )
+
+    assert fake_github.create_calls == []
+
+
+def test_provision_fails_closed_when_readback_breaks_after_a_partial_create(
+    fake_github, approved_token, tmp_path
+):
+    fake_github.read_complete_fail_after = 0
+
+    with pytest.raises(
+        RootCanaryProvisionError, match="ROOT_TICKET_READBACK_UNAVAILABLE"
+    ):
+        provision_root_tickets(
+            fake_github,
+            ROOT_REPOSITORY,
+            approved_token,
+            lock_path=tmp_path / "root.lock",
+        )
+
+    assert len(fake_github.create_calls) == 1
+
+
+def test_provision_uses_a_durable_lock_and_releases_it_after_success(
+    fake_github, approved_token, tmp_path
+):
+    lock_path = tmp_path / "root.lock"
+    entries = provision_root_tickets(
+        fake_github,
+        ROOT_REPOSITORY,
+        approved_token,
+        lock_path=lock_path,
+    )
+    assert len(entries) == 4
+    assert not lock_path.exists()
+
+    lock_path.write_text("held\n", encoding="utf-8")
+    with pytest.raises(RootCanaryProvisionError, match="ROOT_CANARY_LOCK_UNAVAILABLE"):
+        provision_root_tickets(
+            fake_github,
+            ROOT_REPOSITORY,
+            approved_token,
+            lock_path=lock_path,
+        )
+
+
+def test_final_four_ticket_consistency_barrier_reads_back_every_ticket_again(
+    fake_github, approved_token, tmp_path
+):
+    provision_root_tickets(
+        fake_github,
+        ROOT_REPOSITORY,
+        approved_token,
+        lock_path=tmp_path / "root.lock",
+    )
+    assert len(fake_github.find_calls) == 8
 
 
 def test_github_port_readback_includes_complete_comments_and_blocker_pages():
@@ -380,6 +636,8 @@ def test_github_port_readback_includes_complete_comments_and_blocker_pages():
                 "number": 77,
                 "title": "contract",
                 "state": "open",
+                "state_reason": "reopened",
+                "type": {"id": "type-1", "name": "Task"},
                 "body": "body",
                 "repository_url": repository_url,
                 "url": f"{repository_url}/issues/77",
@@ -462,6 +720,8 @@ def test_github_port_readback_includes_complete_comments_and_blocker_pages():
     assert [comment.body for comment in readback.comments] == ["first", "second"]
     assert readback.blocked_by == (11, 12)
     assert readback.blocker_states == ((11, "CLOSED"), (12, "OPEN"))
+    assert readback.state_reason == "reopened"
+    assert readback.type == {"id": "type-1", "name": "Task"}
     assert readback.contract_digest == digest_value(readback.canonical_without_digest())
     assert commands == [
         (
@@ -484,3 +744,101 @@ def test_github_port_readback_includes_complete_comments_and_blocker_pages():
             f"repos/{ROOT_REPOSITORY}/issues/77/dependencies/blocked_by?per_page=100",
         ),
     ]
+
+
+def _identity_test_issue(number=77, *, labels=()):
+    repository_url = f"https://api.github.com/repos/{ROOT_REPOSITORY}"
+    return {
+        "id": number,
+        "node_id": f"issue-node-{number}",
+        "number": number,
+        "title": "contract",
+        "state": "open",
+        "state_reason": None,
+        "type": None,
+        "body": "body",
+        "repository_url": repository_url,
+        "url": f"{repository_url}/issues/{number}",
+        "html_url": f"https://github.com/{ROOT_REPOSITORY}/issues/{number}",
+        "updated_at": "2026-08-17T00:00:00Z",
+        "labels": list(labels),
+    }
+
+
+def test_github_port_rejects_foreign_label_identity():
+    label = {
+        "id": 1,
+        "node_id": "label-node-1",
+        "url": "https://api.github.com/repos/other/repository/labels/ready-for-agent",
+        "name": "ready-for-agent",
+        "color": "1f883d",
+        "default": False,
+        "description": None,
+    }
+
+    def run_gh_json(command):
+        if command[-1] == f"repos/{ROOT_REPOSITORY}/issues/77":
+            return _identity_test_issue(labels=(label,))
+        if command[-1].endswith("/issues/77/comments?per_page=100"):
+            return [[]]
+        if command[-1].endswith("/issues/77/dependencies/blocked_by?per_page=100"):
+            return [[]]
+        raise AssertionError(command)
+
+    with pytest.raises(RootCanaryProvisionError, match="ROOT_TICKET_READBACK_INVALID"):
+        GhIssuePort(run_gh_json=run_gh_json).read_complete(ROOT_REPOSITORY, 77)
+
+
+def test_github_port_rejects_foreign_comment_issue_identity():
+    def run_gh_json(command):
+        if command[-1] == f"repos/{ROOT_REPOSITORY}/issues/77":
+            return _identity_test_issue()
+        if command[-1].endswith("/issues/77/comments?per_page=100"):
+            return [
+                [
+                    {
+                        "id": 2,
+                        "node_id": "comment-node-2",
+                        "url": "https://api.github.com/repos/other/repository/issues/comments/2",
+                        "html_url": f"https://github.com/{ROOT_REPOSITORY}/issues/77#issuecomment-2",
+                        "body": "comment",
+                        "user": {"login": "reviewer"},
+                        "created_at": "2026-08-17T00:00:02Z",
+                        "updated_at": "2026-08-17T00:00:02Z",
+                        "author_association": "MEMBER",
+                    }
+                ]
+            ]
+        if command[-1].endswith("/issues/77/dependencies/blocked_by?per_page=100"):
+            return [[]]
+        raise AssertionError(command)
+
+    with pytest.raises(RootCanaryProvisionError, match="ROOT_TICKET_READBACK_INVALID"):
+        GhIssuePort(run_gh_json=run_gh_json).read_complete(ROOT_REPOSITORY, 77)
+
+
+def test_github_port_rejects_foreign_blocker_issue_identity():
+    def run_gh_json(command):
+        if command[-1] == f"repos/{ROOT_REPOSITORY}/issues/77":
+            return _identity_test_issue()
+        if command[-1].endswith("/issues/77/comments?per_page=100"):
+            return [[]]
+        if command[-1].endswith("/issues/77/dependencies/blocked_by?per_page=100"):
+            return [
+                [
+                    {
+                        "id": 12,
+                        "node_id": "blocker-node-12",
+                        "number": 12,
+                        "state": "open",
+                        "repository_url": "https://api.github.com/repos/other/repository",
+                        "url": "https://api.github.com/repos/other/repository/issues/12",
+                        "html_url": "https://github.com/other/repository/issues/12",
+                        "updated_at": "2026-08-17T00:00:12Z",
+                    }
+                ]
+            ]
+        raise AssertionError(command)
+
+    with pytest.raises(RootCanaryProvisionError, match="ROOT_TICKET_READBACK_INVALID"):
+        GhIssuePort(run_gh_json=run_gh_json).read_complete(ROOT_REPOSITORY, 77)
