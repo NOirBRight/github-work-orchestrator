@@ -167,7 +167,7 @@ PRODUCTION_INSTALL_ROOTS = tuple(
 )
 PRODUCTION_PACKAGE_CONTENT_DIGESTS = (
     ("implement-gwo", "fcafa60645a2ea18408ec97369fdf5a01402a950b90e701fa2305624a1bfeaa9"),
-    ("orchestrator", "28188cc0bf78efb6e9e6f2a692065ed7ddaea715ea8912c654adecdaf79b26b8"),
+    ("orchestrator", "53d92c1c5b63589724bb8c8abed57aecf5e34c1b09f982b02160b5c4c6b6dec8"),
 )
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
