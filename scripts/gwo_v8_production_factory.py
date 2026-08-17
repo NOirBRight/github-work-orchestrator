@@ -22,11 +22,14 @@ from gwo_v8.activation import (
     GitHubDurablePlanControl,
     LocalPlanPublication,
 )
+from gwo_v8._canonical import canonical_bytes, digest_value
 from gwo_v8.compiler import CompiledPlan
 from gwo_v8.cutover_guard import (
     CutoverGuardReceipt,
     CutoverGuardSources,
     CutoverSubject,
+    EXPECTED_SOURCE_WRITER_GENERATION,
+    RECEIPT_SCHEMA,
     GuardActivationValidator,
     LegacyReadback,
 )
@@ -38,6 +41,7 @@ from gwo_v8.plan_control_host import (
 from gwo_v8.production_activation import (
     ProductionActivationAuthorization,
     ProductionActivationComposition,
+    WRITER_TRANSITION,
 )
 from gwo_v8.production_effects import ProductionCompositionError
 from gwo_v8_live_guard_host import LiveGuardHostError, install_live_guard_host
@@ -83,6 +87,8 @@ _STORE_TABLE_COLUMNS = {
     },
 }
 _STORE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+_MISSING_INSTALLED_HOST_CODE = "CUTOVER_GUARD_COMPOSITION_INVALID"
+_MISSING_INSTALLED_HOST_DETAIL = "installed host is unavailable"
 
 
 def _error(code: str, detail: str) -> ProductionCompositionError:
@@ -91,6 +97,17 @@ def _error(code: str, detail: str) -> ProductionCompositionError:
 
 def _text(value: object) -> bool:
     return type(value) is str and bool(value.strip())
+
+
+def _digest(value: object) -> bool:
+    return type(value) is str and _HEX64.fullmatch(value) is not None
+
+
+def _is_missing_installed_host(error: BaseException) -> bool:
+    return (
+        getattr(error, "code", None) == _MISSING_INSTALLED_HOST_CODE
+        and getattr(error, "detail", None) == _MISSING_INSTALLED_HOST_DETAIL
+    )
 
 
 @dataclass(frozen=True, init=False)
@@ -182,6 +199,7 @@ class ProductionCompositionConfig:
     runtime_config_path: Path | None = None
     gateway_store_path: Path | None = None
     artifact_root: Path | None = None
+    target_branch: str = "main"
 
     def __post_init__(self) -> None:
         if not isinstance(self.store_path, Path):
@@ -192,6 +210,7 @@ class ProductionCompositionConfig:
             "control_branch",
             "control_root",
             "github_executable",
+            "target_branch",
         ):
             if not _text(getattr(self, name)):
                 raise ValueError(f"{name} is required")
@@ -501,12 +520,18 @@ def _validate_identity(
         if config.store_generation is not None
         else subject.store_generation
     )
+    if expected_source != EXPECTED_SOURCE_WRITER_GENERATION:
+        raise _error(
+            "FACTORY_IDENTITY_DISJOINT",
+            "production composition requires the V6.1 source writer generation",
+        )
     if (
         compiled_plan.repository != target
         or canary.repository != target
         or subject.repository != target
         or receipt.repository != target
         or subject.control_branch != config.control_branch
+        or subject.target_branch != config.target_branch
         or subject.source_writer_generation != expected_source
         or receipt.source_writer_generation != expected_source
         or authorization.target_writer_generation != expected_target
@@ -515,10 +540,75 @@ def _validate_identity(
         or subject.store_generation != expected_store
         or receipt.store_generation != expected_store
         or subject.source_commit != authorization.merged_main_sha
+        or authorization.writer_transition != WRITER_TRANSITION
     ):
         raise _error(
             "FACTORY_IDENTITY_DISJOINT",
             "authorization, Plan, Canary, Guard subject, receipt, and configured target are disjoint",
+        )
+
+    try:
+        plan_valid = compiled_plan.has_valid_digest()
+        canonical_bytes(compiled_plan.compilation_record)
+    except Exception as error:
+        raise _error(
+            "FACTORY_PLAN_INVALID",
+            "CompiledPlan identity could not be validated",
+        ) from error
+    if not plan_valid:
+        raise _error(
+            "FACTORY_PLAN_INVALID",
+            "CompiledPlan bytes do not match its digest",
+        )
+
+    if (
+        canary.accepted is not True
+        or canary.blockers
+        or not _digest(canary.evidence_package_digest)
+        or not _text(canary.manifest_ref)
+        or type(canary.evidence_refs) is not tuple
+        or not canary.evidence_refs
+        or any(not _text(value) for value in canary.evidence_refs)
+        or len(set(canary.evidence_refs)) != len(canary.evidence_refs)
+    ):
+        raise _error(
+            "FACTORY_CANARY_INVALID",
+            "CanaryAcceptance is not an accepted, blocker-free identity",
+        )
+
+    receipt_digest_fields = (
+        "subject_digest",
+        "readback_digest",
+        "writer_control_ref_digest",
+        "runtime_configuration_digest",
+        "compatibility_audit_digest",
+        "package_readback_digest",
+        "receipt_digest",
+    )
+    if any(
+        not _digest(getattr(receipt, name, ""))
+        for name in receipt_digest_fields
+    ):
+        raise _error(
+            "FACTORY_GUARD_RECEIPT_INVALID",
+            "Guard receipt contains a non-canonical digest",
+        )
+    try:
+        subject_digest = digest_value(subject.canonical())
+        receipt_digest = digest_value(receipt.canonical_without_digest())
+    except Exception as error:
+        raise _error(
+            "FACTORY_GUARD_RECEIPT_INVALID",
+            "Guard subject or receipt is outside the canonical identity domain",
+        ) from error
+    if (
+        receipt.schema != RECEIPT_SCHEMA
+        or receipt.subject_digest != subject_digest
+        or receipt.receipt_digest != receipt_digest
+    ):
+        raise _error(
+            "FACTORY_GUARD_RECEIPT_INVALID",
+            "Guard receipt is not bound to the exact canonical subject",
         )
 
 
@@ -543,7 +633,7 @@ def _compose_live_guard(
     try:
         guard = load_production_cutover_guard(request)
     except Exception as error:
-        if getattr(error, "code", None) != "CUTOVER_GUARD_COMPOSITION_INVALID":
+        if not _is_missing_installed_host(error):
             source_code = getattr(error, "code", "GUARD_RESOLVER_UNAVAILABLE")
             raise _error(
                 "FACTORY_GUARD_LIVE_UNAVAILABLE",

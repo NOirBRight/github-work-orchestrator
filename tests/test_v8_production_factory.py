@@ -23,10 +23,12 @@ from gwo_v8.activation import (  # noqa: E402
     GitHubDurablePlanControl,
     LocalPlanPublication,
 )
+from gwo_v8._canonical import digest_value  # noqa: E402
 from gwo_v8.compiler import CompiledPlan  # noqa: E402
 from gwo_v8.cutover_guard import (  # noqa: E402
     CutoverGuardReceipt,
     CutoverSubject,
+    RECEIPT_SCHEMA,
 )
 from gwo_v8.plan_control_host import (  # noqa: E402
     ProductionCutoverGuardHost,
@@ -161,7 +163,7 @@ def _compiled_plan() -> CompiledPlan:
     return CompiledPlan(
         repository=REPOSITORY,
         canonical_bytes=b"{}",
-        digest="d" * 64,
+        digest=sha256(b"{}").hexdigest(),
         compilation_record={},
     )
 
@@ -195,20 +197,29 @@ def _subject(
     )
 
 
-def _guard_receipt(*, repository: str = REPOSITORY) -> CutoverGuardReceipt:
-    return CutoverGuardReceipt(
-        schema="gwo.cutover-guard.v1",
+def _guard_receipt(
+    *,
+    repository: str = REPOSITORY,
+    subject: CutoverSubject | None = None,
+) -> CutoverGuardReceipt:
+    bound_subject = _subject(repository=repository) if subject is None else subject
+    receipt = CutoverGuardReceipt(
+        schema=RECEIPT_SCHEMA,
         repository=repository,
-        subject_digest="1" * 64,
+        subject_digest=digest_value(bound_subject.canonical()),
         readback_digest="2" * 64,
-        source_writer_generation="v6.1",
-        target_writer_generation="v8",
-        store_generation="store:v8:test",
+        source_writer_generation=bound_subject.source_writer_generation,
+        target_writer_generation=bound_subject.target_writer_generation,
+        store_generation=bound_subject.store_generation,
         writer_control_ref_digest="3" * 64,
         runtime_configuration_digest="4" * 64,
         compatibility_audit_digest="5" * 64,
         package_readback_digest="6" * 64,
-        receipt_digest="7" * 64,
+        receipt_digest="0" * 64,
+    )
+    return replace(
+        receipt,
+        receipt_digest=digest_value(receipt.canonical_without_digest()),
     )
 
 
@@ -221,12 +232,15 @@ def _compose(
     subject: CutoverSubject | None = None,
     receipt: CutoverGuardReceipt | None = None,
 ) -> ProductionActivationComposition:
+    resolved_subject = _subject() if subject is None else subject
     return factory.compose(
         authorization=_authorization() if authorization is None else authorization,
         compiled_plan=_compiled_plan() if compiled_plan is None else compiled_plan,
         canary=_canary() if canary is None else canary,
-        guard_subject=_subject() if subject is None else subject,
-        guard_receipt=_guard_receipt() if receipt is None else receipt,
+        guard_subject=resolved_subject,
+        guard_receipt=(
+            _guard_receipt(subject=resolved_subject) if receipt is None else receipt
+        ),
     )
 
 
@@ -264,6 +278,71 @@ def test_factory_rejects_disjoint_activation_identity_before_store_access(
         _compose(factory, authorization=_authorization(target_repository="other/repo"))
 
     assert raised.value.code == "FACTORY_IDENTITY_DISJOINT"
+
+
+def test_factory_rejects_a_guard_receipt_bound_to_another_subject_before_store_access(
+    tmp_path,
+    monkeypatch,
+):
+    import gwo_v8_production_factory as module
+
+    monkeypatch.setattr(
+        module,
+        "_validate_store",
+        lambda *args, **kwargs: pytest.fail(
+            "store must not be opened for a stale Guard receipt"
+        ),
+    )
+    subject = _subject()
+
+    with pytest.raises(ProductionCompositionError) as raised:
+        _compose(
+            ProductionActivationCompositionFactory(_config(tmp_path)),
+            subject=subject,
+            receipt=replace(_guard_receipt(), subject_digest="f" * 64),
+        )
+
+    assert raised.value.code == "FACTORY_GUARD_RECEIPT_INVALID"
+
+
+@pytest.mark.parametrize("identity", ("plan", "canary"))
+def test_factory_rejects_invalid_plan_or_canary_identity_before_store_access(
+    tmp_path,
+    monkeypatch,
+    identity,
+):
+    import gwo_v8_production_factory as module
+
+    monkeypatch.setattr(
+        module,
+        "_validate_store",
+        lambda *args, **kwargs: pytest.fail(
+            "store must not be opened for an invalid activation identity"
+        ),
+    )
+    plan = CompiledPlan(
+        repository=REPOSITORY,
+        canonical_bytes=b"{}",
+        digest=sha256(b"{}").hexdigest(),
+        compilation_record={},
+    )
+    canary = _canary()
+    if identity == "plan":
+        plan = replace(plan, digest="0" * 64)
+    else:
+        canary = replace(canary, accepted=False)
+
+    with pytest.raises(ProductionCompositionError) as raised:
+        _compose(
+            ProductionActivationCompositionFactory(_config(tmp_path)),
+            compiled_plan=plan,
+            canary=canary,
+        )
+
+    assert raised.value.code in {
+        "FACTORY_PLAN_INVALID",
+        "FACTORY_CANARY_INVALID",
+    }
 
 
 @pytest.mark.parametrize("case", ("missing", "directory", "invalid_sqlite", "sidecar"))
@@ -329,11 +408,7 @@ def test_factory_separates_store_identity_from_writer_generation(
         store_generation=store_generation,
         target_writer_generation=writer_generation,
     )
-    receipt = replace(
-        _guard_receipt(),
-        store_generation=store_generation,
-        target_writer_generation=writer_generation,
-    )
+    receipt = _guard_receipt(subject=subject)
 
     composition = _compose(
         ProductionActivationCompositionFactory(config),
@@ -367,11 +442,7 @@ def test_factory_accepts_provisioned_store_genesis_without_mutating_store(
         store_generation=store_generation,
         target_writer_generation=writer_generation,
     )
-    receipt = replace(
-        _guard_receipt(),
-        store_generation=store_generation,
-        target_writer_generation=writer_generation,
-    )
+    receipt = _guard_receipt(subject=subject)
     with sqlite3.connect(config.store_path) as connection:
         connection.execute(
             "INSERT INTO v8_writer_generations(repository, writer_generation) VALUES (?, ?)",
@@ -415,11 +486,7 @@ def test_factory_rejects_non_genesis_store_writer_identity(
         store_generation=store_generation,
         target_writer_generation=writer_generation,
     )
-    receipt = replace(
-        _guard_receipt(),
-        store_generation=store_generation,
-        target_writer_generation=writer_generation,
-    )
+    receipt = _guard_receipt(subject=subject)
     with sqlite3.connect(config.store_path) as connection:
         connection.execute(
             "INSERT INTO v8_writer_generations(repository, writer_generation) VALUES (?, ?)",
@@ -554,6 +621,43 @@ def test_factory_does_not_bootstrap_for_unrelated_guard_failure(tmp_path, monkey
 
     with pytest.raises(ProductionCompositionError) as raised:
         _compose(ProductionActivationCompositionFactory(_config(tmp_path)))
+
+    assert raised.value.code == "FACTORY_GUARD_LIVE_UNAVAILABLE"
+    assert calls == []
+
+
+def test_factory_does_not_bootstrap_for_non_missing_installed_host_error(
+    tmp_path,
+    monkeypatch,
+):
+    import gwo_v8_production_factory as module
+    from gwo_v8.plan_control import PlanControlError
+
+    calls: list[object] = []
+    base_config = _config(tmp_path)
+    runtime_config = tmp_path / "config.json"
+    runtime_config.write_text("{}", encoding="utf-8")
+    config = replace(
+        base_config,
+        repository_root=tmp_path,
+        runtime_config_path=runtime_config,
+        gateway_store_path=tmp_path / "gateway.sqlite3",
+        artifact_root=tmp_path / "artifacts",
+    )
+    monkeypatch.setattr(
+        module,
+        "load_production_cutover_guard",
+        lambda _request: (_ for _ in ()).throw(
+            PlanControlError(
+                "CUTOVER_GUARD_COMPOSITION_INVALID",
+                "installed host exposes a mutating surface",
+            )
+        ),
+    )
+    monkeypatch.setattr(module, "install_live_guard_host", lambda **kwargs: calls.append(kwargs))
+
+    with pytest.raises(ProductionCompositionError) as raised:
+        _compose(ProductionActivationCompositionFactory(config))
 
     assert raised.value.code == "FACTORY_GUARD_LIVE_UNAVAILABLE"
     assert calls == []
