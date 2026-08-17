@@ -1402,6 +1402,98 @@ def _record(
     )
 
 
+_CUTOVER_LINEAGE_TABLES = (
+    "v8_plan_revisions",
+    "v8_active_plans",
+    "v8_pending_activations",
+    "v8_writer_generations",
+    "v8_writer_fences",
+)
+
+
+def _local_store_is_fresh_for_cutover(
+    publication: LocalPlanPublication,
+    repository: str,
+    *,
+    store_generation: str,
+) -> bool:
+    """Read local lineage, allowing only the provisioned Store genesis row."""
+    database_uri = f"{publication.store_path.resolve().as_uri()}?mode=ro"
+    try:
+        with sqlite3.connect(database_uri, uri=True) as connection:
+            for table in _CUTOVER_LINEAGE_TABLES:
+                if table == "v8_writer_generations":
+                    rows = connection.execute(
+                        """
+                        SELECT writer_generation
+                        FROM v8_writer_generations
+                        WHERE repository = ?
+                        """,
+                        (repository,),
+                    ).fetchall()
+                    if len(rows) > 1 or any(
+                        row[0] != store_generation for row in rows
+                    ):
+                        return False
+                    continue
+                if connection.execute(
+                    f"SELECT 1 FROM {table} WHERE repository = ? LIMIT 1",
+                    (repository,),
+                ).fetchone():
+                    return False
+    except (OSError, sqlite3.Error):
+        return False
+    return True
+
+
+def _prepare_fresh_store_reconstruction(
+    connection: sqlite3.Connection,
+    *,
+    repository: str,
+    store_generation: str,
+) -> None:
+    """Atomically replace an optional Store genesis row during reconstruction."""
+    for table in _CUTOVER_LINEAGE_TABLES:
+        if table == "v8_writer_generations":
+            rows = connection.execute(
+                """
+                SELECT writer_generation
+                FROM v8_writer_generations
+                WHERE repository = ?
+                """,
+                (repository,),
+            ).fetchall()
+            if len(rows) > 1 or any(
+                row[0] != store_generation for row in rows
+            ):
+                raise ActivationError(
+                    "RECONSTRUCTION_STORE_LINEAGE_MISMATCH",
+                    "Store genesis identity changed before reconstruction",
+                )
+            if rows:
+                deleted = connection.execute(
+                    """
+                    DELETE FROM v8_writer_generations
+                    WHERE repository = ? AND writer_generation = ?
+                    """,
+                    (repository, store_generation),
+                ).rowcount
+                if deleted != 1:
+                    raise ActivationError(
+                        "RECONSTRUCTION_STORE_LINEAGE_MISMATCH",
+                        "Store genesis identity changed during reconstruction",
+                    )
+            continue
+        if connection.execute(
+            f"SELECT 1 FROM {table} WHERE repository = ? LIMIT 1",
+            (repository,),
+        ).fetchone():
+            raise ActivationError(
+                "RECONSTRUCTION_STORE_LINEAGE_MISMATCH",
+                "Store has unrelated lineage during reconstruction",
+            )
+
+
 class WriterCutoverController:
     """Fence V6.1, activate V8, and append compensating rollback records."""
 
@@ -1513,13 +1605,14 @@ class WriterCutoverController:
                 )
 
         def blocked_outcome(blockers: set[str]) -> WriterTransitionOutcome:
+            blocked_current = self.transitions.read_current(repository)
             ordered = tuple(sorted(blockers))
             record = _record(
                 repository=repository,
                 kind="cutover",
                 status="blocked",
-                previous_writer_generation=current.writer_generation,
-                writer_generation=current.writer_generation,
+                previous_writer_generation=blocked_current.writer_generation,
+                writer_generation=blocked_current.writer_generation,
                 activation_id=None,
                 plan_digest=compiled_plan.digest,
                 canary_evidence_digest=canary.evidence_package_digest,
@@ -1533,7 +1626,7 @@ class WriterCutoverController:
             return WriterTransitionOutcome(
                 status="blocked",
                 repository=repository,
-                writer_generation=current.writer_generation,
+                writer_generation=blocked_current.writer_generation,
                 record_id=record.record_id,
                 activation_id=None,
                 worker_capacity=0,
@@ -1577,6 +1670,15 @@ class WriterCutoverController:
             and durable_activation.plan_digest == compiled_plan.digest
         ):
             expected_active_digest = durable_activation.expected_previous_digest
+        reconstruction_authority = None
+
+        def prepare_reconstruction(connection: sqlite3.Connection) -> None:
+            _prepare_fresh_store_reconstruction(
+                connection,
+                repository=repository,
+                store_generation=guard_subject.store_generation,
+            )
+
         if resuming_pending:
             if (
                 durable_activation is not None
@@ -1628,8 +1730,48 @@ class WriterCutoverController:
         elif durable_activation is not None:
             try:
                 self.publication.read_authoritative_rollback_identity(repository)
-            except ActivationError:
-                blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+            except ActivationError as error:
+                if error.code != "ROLLBACK_LOCAL_IDENTITY_MISMATCH":
+                    blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+                elif self.publication.has_pending_activation(repository):
+                    blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+                else:
+                    try:
+                        local_active = self.publication.read_active(repository)
+                    except ActivationError:
+                        blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+                    else:
+                        if local_active is not None:
+                            blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+                        else:
+                            if not _local_store_is_fresh_for_cutover(
+                                self.publication,
+                                repository,
+                                store_generation=guard_subject.store_generation,
+                            ):
+                                blockers.add(
+                                    "CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH"
+                                )
+                            else:
+                                try:
+                                    authority = self.publication.read_authoritative_durable_activation(
+                                        repository
+                                    )
+                                    if (
+                                        authority is None
+                                        or authority[0] != durable_activation
+                                        or authority[0].writer_generation
+                                        != writer_generation
+                                    ):
+                                        blockers.add(
+                                            "CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH"
+                                        )
+                                    else:
+                                        reconstruction_authority = authority
+                                except ActivationError:
+                                    blockers.add(
+                                        "CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH"
+                                    )
         else:
             try:
                 local_active = self.publication.read_active(repository)
@@ -1672,6 +1814,28 @@ class WriterCutoverController:
                 reason=None,
             )
             self.transitions.publish(pending)
+        if reconstruction_authority is not None:
+            receipt, record = reconstruction_authority
+            if not _local_store_is_fresh_for_cutover(
+                self.publication,
+                repository,
+                store_generation=guard_subject.store_generation,
+            ):
+                blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+            else:
+                try:
+                    LocalPlanPublication(
+                        self.publication.store_path,
+                        durable=self.publication.durable,
+                    ).reconstruct_active_from_readback(
+                        record,
+                        receipt,
+                        populate=prepare_reconstruction,
+                    )
+                except (ActivationError, OSError, sqlite3.Error):
+                    blockers.add("CUTOVER_LOCAL_DURABLE_IDENTITY_MISMATCH")
+        if blockers:
+            return blocked_outcome(blockers)
         activation = self.publication.publish_and_activate(
             compiled_plan,
             expected_active_digest=expected_active_digest,

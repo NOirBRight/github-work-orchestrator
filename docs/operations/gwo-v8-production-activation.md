@@ -115,3 +115,32 @@ requires a concrete live composition factory that binds the production GitHub,
 Store, V6.1 readback, Guard, and Canary controls before a real `--execute` can
 be authorized. Until that factory and its live evidence are present, the
 fail-closed result is intentional; no production mutation is attempted.
+
+## Concrete Phase 5 factory boundary
+
+`D:\Workstation\github-work-orchestrator\scripts\gwo_v8_production_factory.py`
+is the bounded production composition implementation. Its
+`ProductionCompositionConfig` is immutable and must explicitly provide the
+activation `store_path`, `rollback_lineage`, and the package/install roots
+needed by the existing resolver-backed live Guard host. The module-level
+`factory` is intentionally unconfigured; an omitted configuration never
+selects a Store or an in-memory test double.
+
+The factory keeps `store_generation` separate from
+`target_writer_generation`. If the configured Store already has a
+`v8_writer_generations` row for the target repository, its value must exactly
+match the authorized `store_generation` from the configuration/Guard subject.
+A matching provisioned Store-genesis row is accepted read-only; any other
+writer identity stops composition with
+`FACTORY_STORE_WRITER_IDENTITY_INVALID`. The factory does not reconstruct,
+overwrite, or otherwise mutate the row. This specifically prevents a Store
+identity such as `store:v8:production:20260817T205916Z` from being treated as
+`v8-generation-1`; the cutover transition owns that later lineage step.
+
+Composition validates the Store through an immutable SQLite read and binds the
+real GitHub controls to one client and one unopened `LocalPlanPublication`.
+It obtains the authoritative read-only Guard and legacy read through
+`load_production_cutover_guard`; if the installed V3 resolver-backed host is
+unavailable, composition raises `FACTORY_GUARD_LIVE_UNAVAILABLE` rather than
+returning a synthetic GO validator. No activation, rollback, tag, or Store
+write is performed by composition or by the zero-write CLI preflight.
