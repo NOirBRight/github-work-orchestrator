@@ -1473,6 +1473,23 @@ def reinstall_production_host(
 class ReopenedRuntimeGateway:
     calls: list[str] = field(default_factory=list)
 
+    def campaign_proof_readback(
+        self,
+        campaign: CampaignHandle,
+        plan_revision_digest: str,
+    ) -> dict[str, object]:
+        return {
+            "runtime_selector_digest": digest_value(
+                {
+                    "kind": "reopened-137-runtime-selector-readback.v1",
+                    "repository": campaign.repository,
+                    "campaign_key": campaign.campaign_key,
+                    "plan_revision_digest": plan_revision_digest,
+                }
+            ),
+            "permission_binding_pairs": [],
+        }
+
     def progress(
         self,
         subject: WorkRunSubject,
